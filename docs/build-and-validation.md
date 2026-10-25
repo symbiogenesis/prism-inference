@@ -58,7 +58,9 @@ try {
 
 The current [Foundation workflow](../.github/workflows/foundation.yml) runs
 complete workspace correctness tests, formatting, Release Clippy/rustdoc,
-feature variants and scalar fallback checks on Windows ARM64 and x64.
+feature variants, loader-ABI Clippy/rustdoc and scalar fallback checks on Windows
+ARM64 and x64. These workspace checks run once per target; the manual compiler
+workflow does not repeat them.
 Its Linux ARM64 gate separately builds the pinned Prism engine with the Rust
 storage overlay and checks native linking and rejection behavior. Fixtures cover
 bounded loading, exact codecs/rounding, graph state, output reuse, checkpoint
@@ -80,18 +82,23 @@ remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftB
 
 This repository also owns the [complete upstream conformance guide](prism-upstream-tests.md).
 Its [runtime workflow](../.github/workflows/runtime-conformance.yml) preserves
-four ordinary source partitions,16 planning partitions and32 execution partitions,
+four ordinary source partitions, 16 planning partitions and 32 execution partitions,
 plus native codec parity and a fail-closed aggregate. Measurements and gradients
 remain explicit manual opt-ins. The [focused workflow](../.github/workflows/prism-focused.yml)
 diagnoses one named source without replacing the complete gate.
 
 The [standards workflow](../.github/workflows/standards.yml) owns PowerShell and
 embedded-C# analysis for the migrated orchestration. The manual
-[compiler trial](../.github/workflows/rust-nightly.yml) retains Runtime
-Core/Supporting checks and isolated stable/nightly acceptance probes. Runner
+[compiler acceptance workflow](../.github/workflows/rust-nightly.yml) compares
+isolated stable/nightly language probes and preserves the fail-closed
+`compatibility` check. Dispatch Foundation to rerun workspace validation. Runner
 contains only app/provisioning/released-runtime integration gates; none of these
 runtime suites bootstrap through its maintenance executable or released source.
 All full suites and every benchmark remain hosted-only.
+
+Automatic workflows skip pushes limited to root Markdown files and `docs/`;
+manual dispatch remains available. Test fixtures and package READMEs outside
+those paths still trigger validation.
 
 ## Bounded actual-model correctness captures
 

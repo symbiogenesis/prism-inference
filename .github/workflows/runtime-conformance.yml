@@ -2,6 +2,9 @@ name: Runtime conformance
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
   workflow_dispatch:
     inputs:
       prism_benchmarks:
@@ -154,10 +157,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Reuse the pinned native Windows ARM64 Rust compiler
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
       - name: Build local conformance policy for source regressions
         uses: ./.github/actions/conformance-policy
       - name: Verify the native acceptance host and identify the Rust cache
@@ -255,29 +254,6 @@ jobs:
             ${{ env.PRISM_UPSTREAM_EVIDENCE }}/rust-results.json
             ${{ env.PRISM_UPSTREAM_EVIDENCE }}/receipt.json
           if-no-files-found: error
-      - name: Run explicitly requested safe Rust benchmark workloads
-        if: matrix.partition == 3 && github.event_name == 'workflow_dispatch' && inputs.prism_benchmarks
-        shell: pwsh
-        working-directory: ${{ runner.temp }}
-        run: |
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = 'Stop'
-          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Native.psm1')
-          $receipt = Get-Content -LiteralPath (Join-Path $env:PRISM_UPSTREAM_EVIDENCE 'receipt.json') -Raw | ConvertFrom-Json
-          $bridge = @($receipt.NativeBuilds | Where-Object { $_.Family -ceq 'common' })
-          if ($receipt.Status -cnotin @('complete','awaiting-backend') -or $bridge.Count -ne 1) { throw 'Benchmark requires the settled reference build.' }
-          foreach ($benchmark in @('peg-deserialize', 'sampling', 'chat-peg')) {
-            foreach ($target in @('cpp', 'rust')) {
-              $output = Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-$target-benchmark.json"
-              $arguments = @('--target', $target, '--benchmark', $benchmark, '--output', $output)
-              if ($target -eq 'cpp') { $arguments += @('--common-bridge', $bridge[0].Executable, '--evidence-directory', (Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-benchmark-bridge")) }
-              $result = Invoke-BonsaiNativeProcess -Executable $receipt.HarnessExecutable -ArgumentList $arguments -WorkingDirectory $env:PRISM_UPSTREAM_EVIDENCE -TimeoutSeconds 300 -LogPath (Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-$target-benchmark.log")
-              if ($result.ExitCode -ne 0) { throw "Benchmark infrastructure failed for $target." }
-              $report = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
-              if ($report.Measure -cne 'benchmark-workloads' -or $report.Cases.Count -ne 1 -or ($target -eq 'cpp' -and $report.Cases[0].Status -cne 'measured')) { throw 'Benchmark workload report is incomplete.' }
-              ($report | ConvertTo-Json -Depth 8) >> $env:GITHUB_STEP_SUMMARY
-            }
-          }
       - name: Summarize imported Prism coverage
         if: always() && env.PRISM_UPSTREAM_EVIDENCE != ''
         shell: pwsh

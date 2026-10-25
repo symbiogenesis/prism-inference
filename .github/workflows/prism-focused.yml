@@ -45,10 +45,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Reuse the pinned native Windows ARM64 Rust compiler
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
       - name: Build the local source and catalog policy
         uses: ./.github/actions/conformance-policy
       - name: Verify the native reference host and identify the Rust cache

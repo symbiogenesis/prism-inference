@@ -2,6 +2,9 @@ name: Foundation
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
   workflow_dispatch:
 permissions:
   contents: read
@@ -74,13 +77,13 @@ jobs:
           try {
             cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
             cargo +nightly-2026-10-22 fmt --manifest-path $manifest --all -- --check
-            # Native bonsai-prism features require ggml and are checked in native-overlay.
+            # bonsai-prism's native-tests feature requires ggml; checked in native-overlay.
             cargo +nightly-2026-10-22 clippy --manifest-path $manifest --workspace --all-targets --locked --offline --release -- -D warnings
             cargo +nightly-2026-10-22 doc --manifest-path $manifest --workspace --no-deps --locked --offline --release
             cargo +nightly-2026-10-22 test --manifest-path $manifest --workspace --locked --offline --release --no-fail-fast
             cargo +nightly-2026-10-22 build --manifest-path $manifest --workspace --bins --locked --offline --release
           } finally { Stop-Transcript | Out-Null }
-      - name: Check feature-disabled compilation and scalar fallback
+      - name: Check feature variants, scalar fallback and loader ABI
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -95,6 +98,9 @@ jobs:
             cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
             cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
             cargo +nightly-2026-10-22 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
+            # Check the loader ABI without enabling the native-tests link feature.
+            cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
+            cargo +nightly-2026-10-22 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
           } finally { Stop-Transcript | Out-Null }
       - name: Verify immutable reference fixtures and kill the bounded mutation catalog
         if: matrix.target == 'aarch64-pc-windows-msvc'

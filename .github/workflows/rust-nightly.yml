@@ -1,164 +1,12 @@
-name: Rust nightly validation
+name: Rust compiler acceptance
 on:
   workflow_dispatch:
 permissions:
   contents: read
-env:
-  # Reuse restored compilation outputs after content validation rather than checkout mtimes.
-  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
-  CARGO_BUILD_FINGERPRINT: content
 concurrency:
   group: rust-nightly-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  checks:
-    name: ${{ matrix.toolchain }} / ${{ matrix.group }} / ${{ matrix.partition }}
-    if: github.ref == 'refs/heads/main'
-    runs-on: windows-11-arm
-    timeout-minutes: 15
-    strategy:
-      # Collect every package partition even when another lane fails.
-      fail-fast: false
-      matrix:
-        toolchain: [nightly]
-        group: [Runtime]
-        # Run the two large correctness suites alongside their supporting packages.
-        partition: [Core, Supporting]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Select external evidence and cache directories
-        shell: pwsh
-        working-directory: ${{ runner.temp }}
-        env:
-          TRIAL_TOOLCHAIN: ${{ matrix.toolchain }}
-          TRIAL_GROUP: ${{ matrix.group }}
-          TRIAL_PARTITION: ${{ matrix.partition }}
-        run: |
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-          $evidence = Join-Path $env:RUNNER_TEMP ('Prism-RustNightly-' + [guid]::NewGuid().ToString('N'))
-          $target = Join-Path $env:RUNNER_TEMP "Prism-RustTrialTargets/$env:TRIAL_TOOLCHAIN/$env:TRIAL_GROUP/$env:TRIAL_PARTITION"
-          foreach ($path in @($cargoHome, $evidence, $target)) {
-            if (-not [IO.Path]::IsPathFullyQualified($path) -or $path -match '%[^%]+%') { throw 'Expected expanded absolute Cargo and evidence paths.' }
-          }
-          [void][IO.Directory]::CreateDirectory($evidence)
-          "CARGO_HOME=$cargoHome" >> $env:GITHUB_ENV
-          "RUST_TRIAL_EVIDENCE=$evidence" >> $env:GITHUB_ENV
-          "RUST_TRIAL_TARGET=$target" >> $env:GITHUB_ENV
-          "RUST_TRIAL_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
-          $configuration = Get-Content -Raw -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'config/rust-nightly-trial.json') | ConvertFrom-Json -DateKind String -NoEnumerate
-          if ($configuration.SchemaVersion -ne 1) { throw 'Unsupported Rust trial configuration schema.' }
-          "RUST_TRIAL_TOOLCHAIN=$($configuration.NightlyToolchain)" >> $env:GITHUB_ENV
-      - name: Reuse the pinned native Rust compiler
-        id: rust-toolchain
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: ${{ env.RUST_TRIAL_TOOLCHAIN }}
-      - name: Identify the pinned native Rust compiler
-        shell: pwsh
-        working-directory: ${{ runner.temp }}
-        env:
-          TRIAL_TOOLCHAIN: ${{ matrix.toolchain }}
-          TOOLCHAIN_CACHE_HIT: ${{ steps.rust-toolchain.outputs.cache-hit }}
-        run: |
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Expected a native ARM64 runner process.' }
-          $configuration = Get-Content -Raw -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'config/rust-nightly-trial.json') | ConvertFrom-Json -DateKind String -NoEnumerate
-          if ($configuration.SchemaVersion -ne 1) { throw 'Unsupported Rust trial configuration schema.' }
-          $toolchain = $configuration.NightlyToolchain
-          "Exact compiler cache hit: $env:TOOLCHAIN_CACHE_HIT" | Set-Content -LiteralPath (Join-Path $env:RUST_TRIAL_EVIDENCE 'install.log')
-          $identity = @(rustc ('+' + $toolchain) -vV)
-          if ($identity -notcontains 'host: aarch64-pc-windows-msvc') { throw 'Expected native ARM64 Rust.' }
-          $identity | Tee-Object -FilePath (Join-Path $env:RUST_TRIAL_EVIDENCE 'rustc.txt')
-          $digest = [Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($identity -join "`n"))))
-          "RUST_TRIAL_IDENTITY=$digest" >> $env:GITHUB_ENV
-          "RUST_TRIAL_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
-      - name: Reuse locked Cargo source downloads
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          # Retain source downloads only; never cache credentials or Cargo home.
-          path: |
-            ${{ env.CARGO_HOME }}/registry/index
-            ${{ env.CARGO_HOME }}/registry/cache
-            ${{ env.CARGO_HOME }}/git/db
-          key: rust-trial-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'tools/prism/source.lock.json') }}
-          restore-keys: |
-            rust-trial-downloads-v1-${{ runner.os }}-${{ runner.arch }}-
-      - name: Reuse compiler and partition build artifacts
-        id: build-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RUST_TRIAL_TARGET }}
-          key: rust-trial-targets-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.toolchain }}-${{ matrix.group }}-${{ matrix.partition }}-${{ env.RUST_TRIAL_CACHE_HOST }}-${{ env.RUST_TRIAL_IDENTITY }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', 'config/rust-nightly-trial.json', 'tools/prism/source.lock.json') }}-${{ hashFiles('src/**/*.rs', 'server/**/*.rs', 'tools/**/*.rs', 'config/**/*.json', 'tests/Test-RustNightly.ps1', 'tests/Test-Rust.ps1', 'scripts/Bonsai.Rust.psm1', 'config/rust-packages.psd1', 'scripts/Bonsai.Native.psm1', 'scripts/Bonsai.Common.psm1', 'rustfmt.toml', '.github/workflows/rust-nightly.yml') }}-content-v1
-          # Cargo validates fingerprints after either restore. Lockfile/config
-          # changes can reuse unchanged dependencies without sharing compilers.
-          restore-keys: |
-            rust-trial-targets-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.toolchain }}-${{ matrix.group }}-${{ matrix.partition }}-${{ env.RUST_TRIAL_CACHE_HOST }}-${{ env.RUST_TRIAL_IDENTITY }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', 'config/rust-nightly-trial.json', 'tools/prism/source.lock.json') }}-
-            rust-trial-targets-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.toolchain }}-${{ matrix.group }}-${{ matrix.partition }}-${{ env.RUST_TRIAL_CACHE_HOST }}-${{ env.RUST_TRIAL_IDENTITY }}-
-      - name: Formatting, Release analyzers, documentation and complete correctness suites
-        id: checks
-        shell: pwsh
-        working-directory: ${{ runner.temp }}
-        env:
-          TRIAL_GROUP: ${{ matrix.group }}
-          TRIAL_PARTITION: ${{ matrix.partition }}
-        run: |
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Rust.psm1')
-          $corePackage = switch ($env:TRIAL_GROUP) {
-            'Runtime' { 'prism-inference' }
-            default { throw 'Unknown Rust package group.' }
-          }
-          $groupPackages = @(Get-BonsaiRustPackage -Group $env:TRIAL_GROUP)
-          if ($corePackage -cnotin $groupPackages.Name) { throw 'The core package must belong to its registered group.' }
-          # Derive the complement from the registry so new packages remain covered.
-          $packages = @(if ($env:TRIAL_PARTITION -ceq 'Core') {
-            $corePackage
-          } elseif ($env:TRIAL_PARTITION -ceq 'Supporting') {
-            $groupPackages.Name | Where-Object { $_ -cne $corePackage }
-          } else { throw 'Unknown Rust package partition.' })
-          if (-not $packages.Count) { throw 'A Rust package partition must not be empty.' }
-          "RUST_TRIAL_PACKAGES=$($packages -join ', ')" >> $env:GITHUB_ENV
-          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-RustNightly.ps1') -Mode Compatibility -FullTests -PackageGroup $env:TRIAL_GROUP -Package $packages -Toolchain $env:RUST_TRIAL_TOOLCHAIN -TargetDirectory $env:RUST_TRIAL_TARGET -EvidenceDirectory (Join-Path $env:RUST_TRIAL_EVIDENCE 'compatibility')
-      - name: Record lane outcome
-        if: always()
-        shell: pwsh
-        working-directory: ${{ runner.temp }}
-        env:
-          TRIAL_TOOLCHAIN: ${{ matrix.toolchain }}
-          TRIAL_GROUP: ${{ matrix.group }}
-          TRIAL_PARTITION: ${{ matrix.partition }}
-          CHECKS_OUTCOME: ${{ steps.checks.outcome }}
-          TOOLCHAIN_CACHE_HIT: ${{ steps.rust-toolchain.outputs.cache-hit }}
-          BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.cache-hit }}
-        run: |
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          @(
-            "Revision: $env:GITHUB_SHA"
-            "Compiler: $env:RUST_TRIAL_TOOLCHAIN ($env:TRIAL_TOOLCHAIN)"
-            "Runner image: $env:RUST_TRIAL_CACHE_HOST"
-            "Exact compiler/build cache hits: $env:TOOLCHAIN_CACHE_HIT / $env:BUILD_CACHE_HIT"
-            "Package group: $env:TRIAL_GROUP / $env:TRIAL_PARTITION"
-            "Packages: $env:RUST_TRIAL_PACKAGES"
-            "Compatibility and complete correctness suites: $env:CHECKS_OUTCOME"
-          ) >> $env:GITHUB_STEP_SUMMARY
-      - name: Retain compiler identity, receipt and command logs
-        if: always() && env.RUST_TRIAL_EVIDENCE != ''
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: rust-nightly-${{ matrix.toolchain }}-${{ matrix.group }}-${{ matrix.partition }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.RUST_TRIAL_EVIDENCE }}
-          if-no-files-found: error
   probe:
     name: Compiler acceptance probes
     if: github.ref == 'refs/heads/main'
@@ -193,6 +41,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           toolchain: ${{ env.RUST_PROBE_NIGHTLY_TOOLCHAIN }}
+          components: ''
       - name: Compare borrowing and trait-solver acceptance
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -211,27 +60,25 @@ jobs:
   compatibility:
     name: compatibility
     if: always() && github.ref == 'refs/heads/main'
-    needs: [checks, probe]
+    needs: probe
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
-      - name: Require every package partition and acceptance probe
+      - name: Require compiler acceptance probes
         shell: bash
         working-directory: ${{ runner.temp }}
         env:
-          CHECKS_RESULT: ${{ needs.checks.result }}
           PROBE_RESULT: ${{ needs.probe.result }}
         run: |
           {
             printf '%s\n' \
               "Revision: $GITHUB_SHA" \
-              "Production nightly x Runtime x Core/Supporting: $CHECKS_RESULT" \
               "Compiler acceptance probes: $PROBE_RESULT" \
               '' \
               'The pinned nightly is the production toolchain; stable is an isolated compiler-probe control. Compiler acceptance and correctness do not establish inference performance gains.' \
-              'Runtime/compiler validation and upstream conformance are owned here; SwiftBonsai Runner retains app and released-runtime integration checks.'
+              'Foundation owns workspace correctness and loader feature checks; this workflow only compares compiler acceptance.'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$CHECKS_RESULT" != 'success' || "$PROBE_RESULT" != 'success' ]]; then
-            echo 'Every compiler/package partition and the acceptance probes must succeed; failed, cancelled or skipped jobs are not accepted.' >&2
+          if [[ "$PROBE_RESULT" != 'success' ]]; then
+            echo 'Compiler acceptance probes must succeed; failed, cancelled or skipped jobs are not accepted.' >&2
             exit 1
           fi

@@ -106,6 +106,13 @@ impl Arithmetic {
         }
     }
 
+    fn attention_softmax(self, scores: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Source => softmax(scores),
+            Self::PinnedSwift => crate::kernels::pinned_attention::softmax(scores),
+        }
+    }
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::as_conversions,
@@ -1406,7 +1413,7 @@ impl Evaluation<'_> {
                     .attention_current_dot(q, &key[offset..offset + g.head])?
                     * scale,
             );
-            softmax(scores)?;
+            self.arithmetic.attention_softmax(scores)?;
             // Nonflash V(F16) x softmax(F32) also converts its RHS to F16.
             for probability in scores.iter_mut() {
                 *probability = round_f16(*probability);

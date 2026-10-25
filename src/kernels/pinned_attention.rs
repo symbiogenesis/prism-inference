@@ -50,12 +50,52 @@ pub(crate) fn dot(mut values: impl Iterator<Item = f32>, weights: &[f32]) -> Res
     super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
 }
 
+/// Normalizes logical scores as the pinned physically padded masked row.
+///
+/// Native groups use four vector exponentials and a binary32 pairwise sum;
+/// their totals and reciprocal are evaluated in binary64 before final scaling.
+/// Masked padding contributes exact zeros without allocating padded storage.
+///
+/// # Errors
+/// Rejects empty, oversized or nonfinite input before mutation.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "Match the native binary64 reciprocal rounded once to binary32."
+)]
+pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
+    if scores.is_empty()
+        || scores.len() > crate::model::swift::CONTEXT_TOKENS
+        || scores.iter().any(|score| !score.is_finite())
+    {
+        return Err(invalid("invalid pinned attention softmax row"));
+    }
+    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let physical = scores.len().div_ceil(CACHE_PADDING) * CACHE_PADDING;
+    let mut total = 0.0_f64;
+    for offset in (0..physical).step_by(4) {
+        let mut group = [0.0; 4];
+        for (lane, output) in group.iter_mut().enumerate() {
+            if let Some(score) = scores.get_mut(offset + lane) {
+                *score = super::pinned_activations::vector_exp(*score - maximum);
+                *output = *score;
+            }
+        }
+        total += f64::from((group[0] + group[1]) + (group[2] + group[3]));
+    }
+    let inverse = (1.0_f64 / total) as f32;
+    for score in scores {
+        *score *= inverse;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use bonsai_ternary::half_to_float;
     use serde::Deserialize;
 
-    use super::dot;
+    use super::{dot, softmax};
 
     #[derive(Deserialize)]
     struct Capture {
@@ -78,6 +118,20 @@ mod tests {
         value_half_bits: Vec<u16>,
         probability_half_bits: Vec<u16>,
         native_bits: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct SoftmaxCapture {
+        runtime_commit: String,
+        ggml_cpu_sha256: String,
+        cases: Vec<SoftmaxCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct SoftmaxCase {
+        valid_keys: usize,
+        input_bits: Vec<u32>,
+        native_bits: Vec<u32>,
     }
 
     #[test]
@@ -124,6 +178,44 @@ mod tests {
         assert!(dot([1.0].into_iter(), &[]).is_err());
         assert!(dot([].into_iter(), &[1.0]).is_err());
         assert!(dot([1.0, 2.0].into_iter(), &[1.0]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_attention_softmax_matches_native_masked_physical_rows() -> crate::Result<()> {
+        let capture: SoftmaxCapture = serde_json::from_str(include_str!(
+            "../../tests/fixtures/swift-attention-softmax.json"
+        ))?;
+        assert_eq!(
+            capture.runtime_commit,
+            "73bfe6cc485554822f80c473a3c0c4f25e80f41b"
+        );
+        assert_eq!(
+            capture.ggml_cpu_sha256,
+            "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab"
+        );
+        for case in capture.cases {
+            let mut scores = case
+                .input_bits
+                .into_iter()
+                .map(f32::from_bits)
+                .collect::<Vec<_>>();
+            assert_eq!(scores.len(), case.valid_keys);
+            softmax(&mut scores)?;
+            assert_eq!(
+                scores.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                case.native_bits,
+                "{} valid keys",
+                case.valid_keys
+            );
+        }
+        assert!(softmax(&mut []).is_err());
+        let mut invalid = [1.0, f32::INFINITY];
+        assert!(softmax(&mut invalid).is_err());
+        assert_eq!(
+            invalid.map(f32::to_bits),
+            [1.0_f32.to_bits(), f32::INFINITY.to_bits()]
+        );
         Ok(())
     }
 }

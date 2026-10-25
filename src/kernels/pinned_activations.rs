@@ -14,7 +14,7 @@ use crate::{Result, invalid};
 // Reproduce the pinned ggml_v_expf NEON instructions lane by lane. Explicit
 // mul_add retains their single rounding; bit arithmetic mirrors uint32 lanes.
 // Scalar tails deliberately continue to call the ordinary exp implementation.
-fn vector_exp(value: f32) -> f32 {
+pub(super) fn vector_exp(value: f32) -> f32 {
     let z = value.mul_add(f32::from_bits(0x3fb8_aa3b), 12_582_912.0);
     let n = z - 12_582_912.0;
     let remainder = (-n).mul_add(f32::from_bits(0x3f31_7200), value);

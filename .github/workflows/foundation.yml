@@ -8,7 +8,7 @@ permissions:
 env:
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
   CARGO_BUILD_FINGERPRINT: content
-  PRISM_VERSION: '0.1.0'
+  PRISM_VERSION: '0.1.1'
 concurrency:
   group: foundation-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}

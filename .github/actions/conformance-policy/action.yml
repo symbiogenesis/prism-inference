@@ -1,0 +1,39 @@
+name: Build local Prism conformance policy
+description: Build the checked-out revision's narrow offline source/catalog policy CLI.
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/rust-toolchain
+      with:
+        toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+    - name: Select external policy build storage
+      shell: pwsh
+      working-directory: ${{ runner.temp }}
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Conformance policy CI requires native Windows ARM64.' }
+        "PRISM_POLICY_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
+        "PRISM_POLICY_TARGET=$(Join-Path $env:RUNNER_TEMP 'Prism-ConformancePolicyTarget')" >> $env:GITHUB_ENV
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ${{ env.PRISM_POLICY_TARGET }}
+        key: prism-policy-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_POLICY_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/conformance-policy/**', 'rust-toolchain.toml') }}-content-v1
+        restore-keys: |
+          prism-policy-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_POLICY_CACHE_HOST }}-nightly-2026-10-22-
+    - name: Build the local policy without Runner tools or released source
+      shell: pwsh
+      working-directory: ${{ runner.temp }}
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        cargo +nightly-2026-10-22-aarch64-pc-windows-msvc build --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package prism-conformance-policy --target-dir $env:PRISM_POLICY_TARGET --locked --release
+        $tool = Join-Path $env:PRISM_POLICY_TARGET 'release/prism-conformance-policy.exe'
+        Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
+        Assert-Arm64PE -Path $tool
+        & $tool --version
+        "PRISM_CONFORMANCE_POLICY_PATH=$tool" >> $env:GITHUB_ENV

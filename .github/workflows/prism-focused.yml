@@ -1,0 +1,246 @@
+name: Prism focused reference
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Upstream source contract to diagnose on Windows ARM64
+        type: choice
+        default: Chat
+        options:
+          - Chat
+          - DsparkForward
+          - DsparkRealEval
+          - TokenizerBpe
+          - TokenizersRepo
+          - QuantizeStats
+          - QuantizePerf
+          - TokenizerPython
+          - TokenizerShell
+          - TokenizerRandom
+          - BackendSampler
+          - ModelResolution
+          - SaveLoadState
+          - ThreadSafety
+          - BackendPlan
+      gradients:
+        description: Include optional gradient mode in BackendPlan; upstream backward operations may abort
+        type: boolean
+        default: false
+permissions:
+  contents: read
+env:
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+  CARGO_BUILD_FINGERPRINT: content
+  PRISM_FOCUSED_CASE: ${{ inputs.case }}
+  PRISM_FOCUSED_GRADIENTS: ${{ inputs.gradients }}
+concurrency:
+  group: prism-focused-${{ github.ref }}-${{ inputs.case }}
+  cancel-in-progress: false
+jobs:
+  focused-reference:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reuse the pinned native Windows ARM64 Rust compiler
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+      - name: Build the local source and catalog policy
+        uses: ./.github/actions/conformance-policy
+      - name: Verify the native reference host and identify the Rust cache
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) { throw 'Prism reference diagnostics require native Windows ARM64.' }
+          $identity = rustc +nightly-2026-10-22-aarch64-pc-windows-msvc -vV
+          if ($identity -notcontains 'host: aarch64-pc-windows-msvc') { throw 'Expected native Windows ARM64 Rust.' }
+          $identity
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          if (-not [IO.File]::Exists($vswhere)) { throw 'Visual Studio Installer discovery is required for the ClangCL toolset.' }
+          $visualStudio = (& $vswhere -latest -products '*' -version '[18.0,19.0)' -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath | Out-String).Trim()
+          if (-not $visualStudio -or -not [IO.Directory]::Exists($visualStudio)) { throw 'Visual Studio 2026 with the LLVM Clang component is required for ARM64 ggml.' }
+          "Native C++ reference uses Visual Studio 2026 ClangCL ARM64: $visualStudio"
+          "PRISM_UPSTREAM_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
+          $visualStudioVersion = (& $vswhere -latest -products '*' -version '[18.0,19.0)' -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationVersion | Out-String).Trim()
+          $msvcVersion = (Get-Content -LiteralPath (Join-Path $visualStudio 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+          $llvmCompilers = @(Get-ChildItem -LiteralPath (Join-Path $visualStudio 'VC/Tools/Llvm') -Recurse -File -Filter clang-cl.exe)
+          if (-not $llvmCompilers.Count) { throw 'The pinned Visual Studio LLVM compiler is missing.' }
+          $llvmIdentity = @($llvmCompilers | Sort-Object FullName | ForEach-Object { "$($_.FullName):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" }) -join ';'
+          $cmakeVersion = cmake --version | Out-String
+          $nativeIdentity = "$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)-$visualStudioVersion-$msvcVersion-$llvmIdentity-$cmakeVersion"
+          $nativeDigest = [Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($nativeIdentity)))
+          "PRISM_UPSTREAM_NATIVE_HOST=$nativeDigest" >> $env:GITHUB_ENV
+      # Tests and evidence are always fresh. Verified source and native bridge
+      # outputs can survive checkout timestamps in a stable external directory.
+      - name: Reuse the pinned upstream archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/SwiftBonsai-PrismUpstreamDownloads
+          key: prism-upstream-download-v1-${{ runner.os }}-${{ hashFiles('tools/prism/source.lock.json') }}
+      - name: Reuse shared-assertion Rust dependencies and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/SwiftBonsai-PrismUpstreamRust
+          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-content-v1
+          restore-keys: |
+            prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-
+      - name: Reuse exact pinned upstream native builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/SwiftBonsai-PrismUpstreamNative
+          # Orchestration changes can reuse the same native source/compiler tree.
+          # Never restore across source pins, adapter code or compiler identities;
+          # source verification and CMake still run before every correctness test.
+          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-${{ hashFiles('tools/prism/upstream/**', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1') }}
+      - name: Run the selected source contract on upstream and Rust
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:GITHUB_ACTIONS -cne 'true' -or $env:GITHUB_REF -cne 'refs/heads/main') { throw 'Focused reference diagnostics require main-branch GitHub Actions.' }
+          $allowed = @('Chat', 'DsparkForward', 'DsparkRealEval', 'TokenizerBpe', 'TokenizersRepo', 'QuantizeStats', 'QuantizePerf', 'TokenizerPython', 'TokenizerShell', 'TokenizerRandom', 'BackendSampler', 'ModelResolution', 'SaveLoadState', 'ThreadSafety', 'BackendPlan')
+          if ($env:PRISM_FOCUSED_CASE -cnotin $allowed) { throw 'Select one supported focused source contract.' }
+          $evidence = Join-Path $env:RUNNER_TEMP ('SwiftBonsai-PrismFocused-' + [guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($evidence)
+          "PRISM_FOCUSED_EVIDENCE=$evidence" >> $env:GITHUB_ENV
+          $caseEvidence = Join-Path $evidence 'case'
+          $provenancePath = Join-Path $evidence 'workflow-provenance.json'
+          $provenance = [ordered]@{
+            SchemaVersion = 1
+            Measure = 'focused-source-diagnostic'
+            FullSourceGate = $false
+            ProjectRevision = $env:GITHUB_SHA
+            Ref = $env:GITHUB_REF
+            RunId = $env:GITHUB_RUN_ID
+            RunAttempt = $env:GITHUB_RUN_ATTEMPT
+            RunUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            Case = $env:PRISM_FOCUSED_CASE
+            Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            Toolchain = 'nightly-2026-10-22-aarch64-pc-windows-msvc'
+            Generator = 'Visual Studio 18 2026'
+            NativePlatform = 'ARM64'
+            NativeCompilerIdentity = $env:PRISM_UPSTREAM_NATIVE_HOST
+            RecordedAtUtc = [DateTime]::UtcNow.ToString('o')
+            ControllerStatus = 'running'
+          }
+          if ($env:PRISM_FOCUSED_CASE -ceq 'BackendPlan') {
+            $provenance.Measure = 'backend-plan-diagnostic'
+            $provenance.SourceCount = 0
+            $provenance.PartitionIndex = 0
+            $provenance.PartitionCount = 16
+            $provenance.Modes = @('eval','support')
+            if ($env:PRISM_FOCUSED_GRADIENTS -ceq 'true') { $provenance.Modes += 'grad' }
+            $provenance.Modes += 'perf'
+            $provenance.Targets = @('cpp','rust')
+          }
+          [IO.File]::WriteAllText($provenancePath, ($provenance | ConvertTo-Json -Depth 8))
+          Start-Transcript -LiteralPath (Join-Path $evidence 'workflow.log') | Out-Null
+          try {
+            Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
+            Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.PrismSource.psm1')
+            $inference = Resolve-PrismSource
+            $lock = Get-Content -LiteralPath (Join-Path $inference 'tools/prism/source.lock.json') -Raw | ConvertFrom-Json
+            $provenance.SourceCommit = $lock.Commit
+            $provenance.SourceArchiveSha256 = $lock.ArchiveSha256
+            $downloads = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamDownloads'
+            [void][IO.Directory]::CreateDirectory($downloads)
+            $archive = Join-Path $downloads ("prism-$($lock.ArchiveSha256).zip")
+            $null = Receive-LockedArtifact -Uri $lock.ArchiveUrl -Path $archive -Bytes $lock.ArchiveBytes -Sha256 $lock.ArchiveSha256 -TimeoutSeconds 600
+              cargo +nightly-2026-10-22-aarch64-pc-windows-msvc fetch --locked --manifest-path (Join-Path $inference 'Cargo.toml')
+            if ($env:PRISM_FOCUSED_CASE -ceq 'BackendPlan') {
+              $prepared = & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case BackendOps -PrepareBackendToolsOnly -SourceArchive $archive -EvidenceDirectory $caseEvidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1
+              if ($prepared.Status -cne 'backend-tools-ready' -or $prepared.ProjectRevision -cne $env:GITHUB_SHA -or $prepared.FullSourceGate -isnot [bool] -or $prepared.FullSourceGate -ne $false) { throw 'Backend preparation did not produce the expected diagnostic handoff.' }
+              $prepared | ConvertTo-Json -Depth 12
+              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismBackend.ps1') -Phase Plan -BundleDirectory $prepared.BackendBundleDirectory -EvidenceDirectory (Join-Path $evidence 'backend-plan') -Index 0 -Benchmarks -Gradients:($env:PRISM_FOCUSED_GRADIENTS -ceq 'true') | ConvertTo-Json -Depth 12
+            } else {
+              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case $env:PRISM_FOCUSED_CASE -SourceArchive $archive -EvidenceDirectory $caseEvidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1 | ConvertTo-Json -Depth 12
+            }
+            $provenance.ControllerStatus = 'complete'
+          } catch {
+            $provenance.ControllerStatus = 'failed'
+            throw
+          } finally {
+            $provenance.CompletedAtUtc = [DateTime]::UtcNow.ToString('o')
+            [IO.File]::WriteAllText($provenancePath, ($provenance | ConvertTo-Json -Depth 8))
+            Stop-Transcript | Out-Null
+          }
+      - name: Summarize only the selected source diagnostic
+        if: always() && env.PRISM_FOCUSED_EVIDENCE != ''
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          '### Focused Prism reference diagnostic' >> $env:GITHUB_STEP_SUMMARY
+          "Selected source: $env:PRISM_FOCUSED_CASE; revision: $env:GITHUB_SHA; run: $env:GITHUB_RUN_ID/$env:GITHUB_RUN_ATTEMPT." >> $env:GITHUB_STEP_SUMMARY
+          if ($env:PRISM_FOCUSED_CASE -ceq 'BackendPlan') {
+            'Partition 0 of 16 planning only, for cpp/rust and the selected modes. No graph execution, source correctness verdicts or benchmark measurements run here; Foundation owns complete acceptance.' >> $env:GITHUB_STEP_SUMMARY
+            $planPath = Join-Path $env:PRISM_FOCUSED_EVIDENCE 'backend-plan/record.json'
+            if ([IO.File]::Exists($planPath)) {
+              if ((Get-Item -LiteralPath $planPath).Length -gt 128MB) { throw 'Backend plan diagnostic exceeds its record bound.' }
+              $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json -Depth 100
+              '| Target | Mode | Planning status |' >> $env:GITHUB_STEP_SUMMARY
+              '| --- | --- | --- |' >> $env:GITHUB_STEP_SUMMARY
+              foreach ($target in @('cpp','rust')) {
+                foreach ($mode in $plan.Modes) {
+                  "| $target | $mode | $($plan.Targets.$target.$mode.Payload.Status) |" >> $env:GITHUB_STEP_SUMMARY
+                }
+              }
+            } else {
+              'No complete planning record was produced; inspect retained preparation and native logs.' >> $env:GITHUB_STEP_SUMMARY
+            }
+            return
+          }
+          'This run covers the selected source only. The complete source and backend gates run in Foundation.' >> $env:GITHUB_STEP_SUMMARY
+          '' >> $env:GITHUB_STEP_SUMMARY
+          '| Source | Target | Status | Detail |' >> $env:GITHUB_STEP_SUMMARY
+          '| --- | --- | --- | --- |' >> $env:GITHUB_STEP_SUMMARY
+          foreach ($target in @('cpp', 'rust')) {
+            $path = Join-Path $env:PRISM_FOCUSED_EVIDENCE "case/$target-results.json"
+            if ([IO.File]::Exists($path)) {
+              $result = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+              foreach ($case in @($result.Cases)) {
+                $detail = ([string]$case.Detail).Replace('|', '/').Replace([char]10, ' ').Replace([char]13, ' ')
+                "| $($case.Id) | $target | $($case.Status) | $detail |" >> $env:GITHUB_STEP_SUMMARY
+              }
+            } else {
+              "No complete $target result report was produced; inspect the retained workflow and command logs." >> $env:GITHUB_STEP_SUMMARY
+            }
+          }
+      - name: Retain focused source outcomes and failure diagnostics
+        if: always() && env.PRISM_FOCUSED_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-focused-${{ inputs.case }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/*.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/*.log
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/case/*.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/case/*.log
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/case/native-*/**
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/case/*-bridge/**
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/*.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/phase-record.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/transport-failure.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/case-receipt.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/retention-receipt.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/input-state.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/checkpoint-*.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/actions-*.json
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/*.bin
+            ${{ env.PRISM_FOCUSED_EVIDENCE }}/backend-plan/**/*.log
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 14

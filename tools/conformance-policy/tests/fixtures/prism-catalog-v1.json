@@ -1,0 +1,365 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "ArchiveSha256": "333ab1cc57bdb1be0b52f894fe8c6822eb7da667a239d7a587dce79283782e58",
+  "Measure": "upstream-source-files",
+  "Cases": [
+    {
+      "Id": "tests/peg-parser/test-basic.cpp",
+      "SourceSha256": "24c5c31c65b2f5fc88919a4b5d06506ae644f8f0460c14c0134cd5439c5a7694"
+    },
+    {
+      "Id": "tests/peg-parser/test-gbnf-generation.cpp",
+      "SourceSha256": "d14973bb98faaa87d1e17af30b76d413e2ac6541ab800c20eb55d48c8fa1952a"
+    },
+    {
+      "Id": "tests/peg-parser/test-json-parser.cpp",
+      "SourceSha256": "2731298bf7f28047852e4f420243fc533bdb1408611257f47a5fff2adacb36fc"
+    },
+    {
+      "Id": "tests/peg-parser/test-json-serialization.cpp",
+      "SourceSha256": "276f50faa0f1f50da7d5289b3e13110c26cf9120ff23bbdb4a6a8c12c384a028"
+    },
+    {
+      "Id": "tests/peg-parser/test-python-dict-parser.cpp",
+      "SourceSha256": "ab6b20f141fed193bc93e810608c1b6800415d14ff832ad3ff84671594d18d4f"
+    },
+    {
+      "Id": "tests/peg-parser/test-unicode.cpp",
+      "SourceSha256": "5eda6c6457af1ff1a62081dadac597d7706bb656e9941bb828de6421d9c563cf"
+    },
+    {
+      "Id": "tests/test-alloc.cpp",
+      "SourceSha256": "89de1c9549888a37b388474aca89cad3052c1751fbdace09c81e79d5844633db"
+    },
+    {
+      "Id": "tests/test-arg-parser.cpp",
+      "SourceSha256": "935b2cd08b63799a26fb804991380c541a45406c76dceb38589d78c8b28befc1"
+    },
+    {
+      "Id": "tests/test-autorelease.cpp",
+      "SourceSha256": "71d51cea2eefa5810189156e76ac1d87a46e244081cedc16eae384f2d19dc02d"
+    },
+    {
+      "Id": "tests/test-backend-ops.cpp",
+      "SourceSha256": "8bf7a5cf29d3b3e88aa0c30611f5f1679f46a71ec00306908c44a73ec98ac425"
+    },
+    {
+      "Id": "tests/test-backend-sampler.cpp",
+      "SourceSha256": "93711ee1d33e6a8a7b30973732c5dc1faee5a4cb742177eb0133bba1800271d8"
+    },
+    {
+      "Id": "tests/test-barrier.cpp",
+      "SourceSha256": "44a60801134d178c8e2c6789c471909ed83c0b8c71055b259478b4d396220cee"
+    },
+    {
+      "Id": "tests/test-batch-alloc.cpp",
+      "SourceSha256": "341b3c4291cb46e412d6e750c2ab2e19131812d08ee3b236938c587e99341d79"
+    },
+    {
+      "Id": "tests/test-c.c",
+      "SourceSha256": "c973865e5e86263a71a1210003e80cffa6269572de31cfa647cc3d01b4bea99e"
+    },
+    {
+      "Id": "tests/test-chat-analysis.cpp",
+      "SourceSha256": "d895ae1736845640b8dab486c68189726821abfbbfc0ca96f98cd419633ad1a1"
+    },
+    {
+      "Id": "tests/test-chat-auto-parser.cpp",
+      "SourceSha256": "d69af3154f3ed738e47a74280bcd63d2e90cd60b05dff7f5f1f7a5b26c59478c"
+    },
+    {
+      "Id": "tests/test-chat-peg-parser.cpp",
+      "SourceSha256": "c0583c716c65fa7c06fc9b282fc8d24aecde29fa55271536e8c23dfbbc0429e0"
+    },
+    {
+      "Id": "tests/test-chat-template.cpp",
+      "SourceSha256": "7a790605222858ca5d5a2de94de27115d693e2c293638c392b7726a44ad3451f"
+    },
+    {
+      "Id": "tests/test-chat.cpp",
+      "SourceSha256": "9920d484dfe35d8ccec4e34f3dd6a23e1788a479a419cab231c361d3cad4e8b4"
+    },
+    {
+      "Id": "tests/test-col2im-1d.cpp",
+      "SourceSha256": "8b0b9fec8a5f7177722060fccfa67ddcd4b1073c833e1511bc4106b03f6c8323"
+    },
+    {
+      "Id": "tests/test-dfly-fusion.cpp",
+      "SourceSha256": "504161d9c3ec6f5ca621b12dc952b5a9cc2e631edb4ad225132b219057eb1fdd"
+    },
+    {
+      "Id": "tests/test-double-float.cpp",
+      "SourceSha256": "1a967f5a89c959260d1884740ac0b2f25a8db9dcc96f4c6eed05fcdb35c9627b"
+    },
+    {
+      "Id": "tests/test-dspark-forward.cpp",
+      "SourceSha256": "b47fb55a0911ad7b8ac6a6cce370d8cce8d6c23e45a732b82c0ec5a0f35fe94e"
+    },
+    {
+      "Id": "tests/test-dspark-logsnr-meta.cpp",
+      "SourceSha256": "2fef2521dbc0985a3aed6bbe50de5a54b7a75dc6c3c5933e04fc8ceb4c7e3112"
+    },
+    {
+      "Id": "tests/test-dspark-loop.cpp",
+      "SourceSha256": "8ad2915c406b296439d0d1474cb147ea35e4543f2b4d479120e67b2151f8a80f"
+    },
+    {
+      "Id": "tests/test-dspark-real-eval.cpp",
+      "SourceSha256": "d420abbcdf9d7c191d0fa1ac2e9859ab9c67e09a3f59e9b79db45875f3dbc7c9"
+    },
+    {
+      "Id": "tests/test-export-graph-ops.cpp",
+      "SourceSha256": "cfc871218eb04130cb0d6aa8241ff9bdb459c607a27a283701a85cc6325075f7"
+    },
+    {
+      "Id": "tests/test-gbnf-validator.cpp",
+      "SourceSha256": "21eb0bac296c0e0dd497cc438ab8f10ba9cad66488c00288321d939afbdf310f"
+    },
+    {
+      "Id": "tests/test-gguf-model-data.cpp",
+      "SourceSha256": "7bb9c074b5e0f8140d560a182d66f5150e4c7e2932319c9c6fd61e8b845cf02c"
+    },
+    {
+      "Id": "tests/test-gguf.cpp",
+      "SourceSha256": "38515758a58762f3084db5cd0ce8ddf28d84c78774598a0bbae0fd4c612ea023"
+    },
+    {
+      "Id": "tests/test-grammar-integration.cpp",
+      "SourceSha256": "6acd7735c8f6db1d3869bd2de5ea7a585accc75e3f8627eb163be11bc123716a"
+    },
+    {
+      "Id": "tests/test-grammar-llguidance.cpp",
+      "SourceSha256": "050d42e1577bdb537bd8c133e3a71354d5b64a9ea5cc8606962531095e28d56f"
+    },
+    {
+      "Id": "tests/test-grammar-parser.cpp",
+      "SourceSha256": "4c3f3b8ba3f4aa426b750815c7420c5af88672037c98f324168038dedd913ece"
+    },
+    {
+      "Id": "tests/test-jinja.cpp",
+      "SourceSha256": "ef2da16176a8e914cbd54341e4b77f675a8f3b5b15a8bfd0c9a7a2305c30c8ab"
+    },
+    {
+      "Id": "tests/test-json-schema-to-grammar.cpp",
+      "SourceSha256": "409361847bab0707ee02749c4e6978a63f9cc9f119ffff40de8c69b0c948e99d"
+    },
+    {
+      "Id": "tests/test-kv-mean-center.cpp",
+      "SourceSha256": "376c3c7b5b00811e06d30c2dc275f76c6b434cc87464f90ee8eac25de01c01e9"
+    },
+    {
+      "Id": "tests/test-llama-archs.cpp",
+      "SourceSha256": "7d542af7b20f6e43d2b174f1dddf9b9480a3130db36c005c3f17c164c032b44d"
+    },
+    {
+      "Id": "tests/test-llama-grammar.cpp",
+      "SourceSha256": "18405dcd2ff94a2625e8d6e884ac74b704fc60f9c039dbb270ca550f6b2dad76"
+    },
+    {
+      "Id": "tests/test-log.cpp",
+      "SourceSha256": "f668c6d6987b0e8888a3823c0425971356c16ca77b44819236fb00c30e4b60c1"
+    },
+    {
+      "Id": "tests/test-lora-conversion-inference.sh",
+      "SourceSha256": "69584616380bdaa7f6ee1e53d165408118fb0897e1280f964eb7bc3b932b9c9a"
+    },
+    {
+      "Id": "tests/test-model-load-cancel.cpp",
+      "SourceSha256": "92b561c68b058db20722873c5f9dbced7c240fba37de5ffbda4f4296b111e2b6"
+    },
+    {
+      "Id": "tests/test-model-resolution.cpp",
+      "SourceSha256": "d596a6befca98035acfab4e71e72f50a698a11062fcac138735b3fe1aa9af593"
+    },
+    {
+      "Id": "tests/test-moe-weighted-reduce.cpp",
+      "SourceSha256": "099680dac156e3289db96ad1143973271205d27b878ea07661097fa9eba699eb"
+    },
+    {
+      "Id": "tests/test-mtmd-c-api.c",
+      "SourceSha256": "bdeb47199c1bc878566c7b47dd4905e6b82fb42586ad92aabc6ee27e1647d884"
+    },
+    {
+      "Id": "tests/test-mtmd-impl.cpp",
+      "SourceSha256": "b6cffd8cbe193c590cb25b98e480f5db6615f8da3ef7e732ca85b19a2345388b"
+    },
+    {
+      "Id": "tests/test-mtp-catchup-batch.cpp",
+      "SourceSha256": "48d136ab03706c888eb393a771a6e1c7ec0c4ac0be1d7581d58a35bb57f1aae0"
+    },
+    {
+      "Id": "tests/test-opt.cpp",
+      "SourceSha256": "24af6c26293d328ad42820cc817ab891869c93ec744950e6505018cfd33d04bb"
+    },
+    {
+      "Id": "tests/test-peg-parser.cpp",
+      "SourceSha256": "52ebb967feae3aec877a1d3cb1c509b2598a9c799e60401a82253a5d4844038b"
+    },
+    {
+      "Id": "tests/test-pq2-row-shapes.cpp",
+      "SourceSha256": "5f8a346808b1cf6a77defc022d210023bad0d0dbb00f3a5c4f2ac9ec1c70db92"
+    },
+    {
+      "Id": "tests/test-ptq1_0-cuda-dot.cpp",
+      "SourceSha256": "17d72e91495a7ffe4e726e90ebe99bf9d7b9acbe1d451a38c865352c3559092a"
+    },
+    {
+      "Id": "tests/test-ptq1_0-element-map.cpp",
+      "SourceSha256": "3147d23eb3177a57dcd4c40ef87351f572c512a3bac4a5c15405ad611750f17d"
+    },
+    {
+      "Id": "tests/test-quant-type-selection.cpp",
+      "SourceSha256": "9a4879f21341efb4adb14c0f08c6fa414735f5a8132ed22181de41efecaa9cb4"
+    },
+    {
+      "Id": "tests/test-quantize-fns.cpp",
+      "SourceSha256": "830e197b34efc57030cef3b83449264f8b2d4db76121796ae962602cdf675d6b"
+    },
+    {
+      "Id": "tests/test-quantize-perf.cpp",
+      "SourceSha256": "09de1812b11836bd899a63dfa6b06927a2d0a012edc1e702a33fb51c95d63563"
+    },
+    {
+      "Id": "tests/test-quantize-stats.cpp",
+      "SourceSha256": "1866b300a8966c3797740a5b4543236d92d1c7b8f2ca67829f453ffcd5b9707b"
+    },
+    {
+      "Id": "tests/test-reasoning-budget.cpp",
+      "SourceSha256": "1499e08757ff9e6f52ddd84134a1454346e92cd78a3dc5a9141f8ba775f57979"
+    },
+    {
+      "Id": "tests/test-recurrent-state-rollback.cpp",
+      "SourceSha256": "51c1ab7b2acfcbad88651ae8f4d4ad055ab5196c4794949255545bcb82abc299"
+    },
+    {
+      "Id": "tests/test-rope.cpp",
+      "SourceSha256": "cca4b2a3acbce6c410ec808f1cf263b191aea2c7a3b5df6d14b17c6be13871df"
+    },
+    {
+      "Id": "tests/test-rset-release.cpp",
+      "SourceSha256": "29482cb9369f0357c0ea8107c43caacdc22357910ca25872e42d86a9bdad03d5"
+    },
+    {
+      "Id": "tests/test-sampling.cpp",
+      "SourceSha256": "817543792852df22e78f705192793ec5797c872708274d572c24c2fb0c95a8ac"
+    },
+    {
+      "Id": "tests/test-save-load-state.cpp",
+      "SourceSha256": "126af9ad38b3540e0cea3052af5987a0fc8d4d05e0680f8faf3380bda50c6cc1"
+    },
+    {
+      "Id": "tests/test-state-restore-fragmented.cpp",
+      "SourceSha256": "623ac05b4ea99556d741f0c4c8016967e3260e057ce073d1080830237cf5a9bd"
+    },
+    {
+      "Id": "tests/test-thread-safety.cpp",
+      "SourceSha256": "7fb63816a7033566ff1dfb76001b7bdf812a475de2cfe16e544ab14550f56039"
+    },
+    {
+      "Id": "tests/test-tokenizer-0.cpp",
+      "SourceSha256": "3ab4be406c0bd04f0ddf951f3dc6a1cc594bb3fe1f56ae7da08ba077bd5f9d18"
+    },
+    {
+      "Id": "tests/test-tokenizer-0.py",
+      "SourceSha256": "6c225af1d7a2dce88fdc1b885ca4b525de588067508c72b15eef62cf6112c788"
+    },
+    {
+      "Id": "tests/test-tokenizer-0.sh",
+      "SourceSha256": "85baee7afaac6928e23f915fd7bfa01b7c34547e90fee67d36205a5ca095f3f4"
+    },
+    {
+      "Id": "tests/test-tokenizer-1-bpe.cpp",
+      "SourceSha256": "2de134d10ff27590c714cfa70a75beb07be4dbeb971f78f2d9969ed0daaee36a"
+    },
+    {
+      "Id": "tests/test-tokenizer-1-spm.cpp",
+      "SourceSha256": "87ca4367b6acd9ddf1e3fc694f2ae02b569070eb66faa5f88068f81aaed35bfb"
+    },
+    {
+      "Id": "tests/test-tokenizer-random.py",
+      "SourceSha256": "34e3b5edcb16a019faa2d7f17f88d82419cf821e964f921db8b53484037d7929"
+    },
+    {
+      "Id": "tests/test-tokenizers-repo.sh",
+      "SourceSha256": "79ceac92fb148da980aea8da8cbcc879a129239ce1a7c6774f76b079d2a8aac1"
+    },
+    {
+      "Id": "tests/test-unicode.cpp",
+      "SourceSha256": "3f90e347bc639d914a360b197c75f9754d01b751a9a39a240d84b31f8303373a"
+    }
+  ],
+  "TestCMakeSourceSha256": "6e98c7ef99797bd07514931fb175df6c8d30fb373349c57448ffee6b5ca9b75e",
+  "AdapterIds": [
+    "tests/peg-parser/test-basic.cpp",
+    "tests/peg-parser/test-gbnf-generation.cpp",
+    "tests/peg-parser/test-json-parser.cpp",
+    "tests/peg-parser/test-json-serialization.cpp",
+    "tests/peg-parser/test-python-dict-parser.cpp",
+    "tests/peg-parser/test-unicode.cpp",
+    "tests/test-alloc.cpp",
+    "tests/test-arg-parser.cpp",
+    "tests/test-autorelease.cpp",
+    "tests/test-backend-ops.cpp",
+    "tests/test-backend-sampler.cpp",
+    "tests/test-barrier.cpp",
+    "tests/test-batch-alloc.cpp",
+    "tests/test-c.c",
+    "tests/test-chat-analysis.cpp",
+    "tests/test-chat-auto-parser.cpp",
+    "tests/test-chat-peg-parser.cpp",
+    "tests/test-chat-template.cpp",
+    "tests/test-chat.cpp",
+    "tests/test-col2im-1d.cpp",
+    "tests/test-dfly-fusion.cpp",
+    "tests/test-double-float.cpp",
+    "tests/test-dspark-forward.cpp",
+    "tests/test-dspark-logsnr-meta.cpp",
+    "tests/test-dspark-loop.cpp",
+    "tests/test-dspark-real-eval.cpp",
+    "tests/test-export-graph-ops.cpp",
+    "tests/test-gbnf-validator.cpp",
+    "tests/test-gguf-model-data.cpp",
+    "tests/test-gguf.cpp",
+    "tests/test-grammar-integration.cpp",
+    "tests/test-grammar-llguidance.cpp",
+    "tests/test-grammar-parser.cpp",
+    "tests/test-jinja.cpp",
+    "tests/test-json-schema-to-grammar.cpp",
+    "tests/test-kv-mean-center.cpp",
+    "tests/test-llama-archs.cpp",
+    "tests/test-llama-grammar.cpp",
+    "tests/test-log.cpp",
+    "tests/test-lora-conversion-inference.sh",
+    "tests/test-model-load-cancel.cpp",
+    "tests/test-model-resolution.cpp",
+    "tests/test-moe-weighted-reduce.cpp",
+    "tests/test-mtmd-c-api.c",
+    "tests/test-mtmd-impl.cpp",
+    "tests/test-mtp-catchup-batch.cpp",
+    "tests/test-opt.cpp",
+    "tests/test-peg-parser.cpp",
+    "tests/test-pq2-row-shapes.cpp",
+    "tests/test-ptq1_0-cuda-dot.cpp",
+    "tests/test-ptq1_0-element-map.cpp",
+    "tests/test-quant-type-selection.cpp",
+    "tests/test-quantize-fns.cpp",
+    "tests/test-quantize-perf.cpp",
+    "tests/test-quantize-stats.cpp",
+    "tests/test-reasoning-budget.cpp",
+    "tests/test-recurrent-state-rollback.cpp",
+    "tests/test-rope.cpp",
+    "tests/test-sampling.cpp",
+    "tests/test-save-load-state.cpp",
+    "tests/test-state-restore-fragmented.cpp",
+    "tests/test-thread-safety.cpp",
+    "tests/test-tokenizer-0.cpp",
+    "tests/test-tokenizer-0.py",
+    "tests/test-tokenizer-0.sh",
+    "tests/test-tokenizer-1-bpe.cpp",
+    "tests/test-tokenizer-1-spm.cpp",
+    "tests/test-tokenizer-random.py",
+    "tests/test-tokenizers-repo.sh",
+    "tests/test-unicode.cpp"
+  ]
+}

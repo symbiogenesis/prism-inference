@@ -552,6 +552,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-conformance-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "prism-inference"
 version = "0.1.1"
 dependencies = [

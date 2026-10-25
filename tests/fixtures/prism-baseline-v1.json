@@ -1,0 +1,165 @@
+{
+  "SchemaVersion": 1,
+  "Origin": "Pre-port PowerShell baseline policy at a716406",
+  "Catalog": {
+    "SchemaVersion": 1,
+    "UpstreamCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ArchiveSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "TestCMakeSourceSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "Measure": "upstream-source-files",
+    "AdapterIds": [
+      "tests/test-one.cpp"
+    ],
+    "Cases": [
+      {
+        "SourceSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "Id": "tests/test-one.cpp"
+      },
+      {
+        "SourceSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "Id": "tests/test-two.cpp"
+      },
+      {
+        "SourceSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "Id": "tests/nested/test-three.py"
+      }
+    ],
+    "CatalogSha256": "e414af09121b0b66adfd53a7df7e8594b76f514e5ad5da06ee7416e8d6b68722"
+  },
+  "TargetResults": {
+    "SchemaVersion": 1,
+    "Cases": [
+      {
+        "Id": "tests/test-one.cpp",
+        "Detail": "Unicode café 🌱, quote \" and newline\n",
+        "Status": "pass"
+      },
+      {
+        "Id": "tests/test-two.cpp",
+        "Detail": "Retained target skip.",
+        "Status": "skip"
+      }
+    ],
+    "UpstreamCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "ReferenceResults": {
+    "SchemaVersion": 1,
+    "Cases": [
+      {
+        "Id": "tests/test-one.cpp",
+        "Detail": "Independent C++ failure.",
+        "Status": "fail"
+      },
+      {
+        "Id": "tests/nested/test-three.py",
+        "Detail": "Reference-only green.",
+        "Status": "pass"
+      }
+    ],
+    "UpstreamCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "Baseline": {
+    "SchemaVersion": 1,
+    "UpstreamCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "CatalogSha256": "e414af09121b0b66adfd53a7df7e8594b76f514e5ad5da06ee7416e8d6b68722",
+    "Measure": "upstream-source-files",
+    "Total": 3,
+    "MinimumPassed": 1,
+    "RequiredPassedIds": [
+      "tests/test-two.cpp"
+    ],
+    "RequiredReferencePassedIds": [
+      "tests/test-one.cpp",
+      "tests/nested/test-three.py"
+    ]
+  },
+  "Report": {
+    "SchemaVersion": 1,
+    "UpstreamCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "CatalogSha256": "e414af09121b0b66adfd53a7df7e8594b76f514e5ad5da06ee7416e8d6b68722",
+    "Measure": "upstream-source-files",
+    "Cases": [
+      {
+        "Id": "tests/test-one.cpp",
+        "SourceSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "Status": "pass",
+        "Detail": "Unicode café 🌱, quote \" and newline\n",
+        "ReferenceStatus": "fail",
+        "ReferenceDetail": "Independent C++ failure."
+      },
+      {
+        "Id": "tests/test-two.cpp",
+        "SourceSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "Status": "skip",
+        "Detail": "Retained target skip.",
+        "ReferenceStatus": "unsupported",
+        "ReferenceDetail": "No C++ reference adapter result was supplied."
+      },
+      {
+        "Id": "tests/nested/test-three.py",
+        "SourceSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "Status": "unsupported",
+        "Detail": "No Rust adapter is implemented for this upstream source.",
+        "ReferenceStatus": "pass",
+        "ReferenceDetail": "Reference-only green."
+      }
+    ],
+    "Summary": {
+      "Total": 3,
+      "Passed": 1,
+      "Red": 2,
+      "Failed": 0,
+      "Skipped": 1,
+      "Unsupported": 1,
+      "GreenRatio": 0.3333333333333333,
+      "ReferencePassed": false,
+      "ReferencePassedCount": 1,
+      "ReferenceUnsupportedCount": 1,
+      "PassedIds": [
+        "tests/test-one.cpp"
+      ],
+      "RedIds": [
+        "tests/test-two.cpp",
+        "tests/nested/test-three.py"
+      ],
+      "ReferenceFailureIds": [
+        "tests/test-one.cpp",
+        "tests/test-two.cpp"
+      ]
+    }
+  },
+  "Gate": {
+    "Passed": false,
+    "Issues": [
+      "Previously green case regressed: tests/test-two.cpp (skip).",
+      "Previously passing C++ reference regressed: tests/test-one.cpp (fail).",
+      "C++ reference did not pass for adapted case: tests/test-one.cpp.",
+      "C++ reference did not pass for adapted case: tests/test-two.cpp."
+    ],
+    "Summary": {
+      "Total": 3,
+      "Passed": 1,
+      "Red": 2,
+      "Failed": 0,
+      "Skipped": 1,
+      "Unsupported": 1,
+      "GreenRatio": 0.3333333333333333,
+      "ReferencePassed": false,
+      "ReferencePassedCount": 1,
+      "ReferenceUnsupportedCount": 1,
+      "PassedIds": [
+        "tests/test-one.cpp"
+      ],
+      "RedIds": [
+        "tests/test-two.cpp",
+        "tests/nested/test-three.py"
+      ],
+      "ReferenceFailureIds": [
+        "tests/test-one.cpp",
+        "tests/test-two.cpp"
+      ]
+    },
+    "MinimumPassed": 1,
+    "BaselineTotal": 3
+  }
+}

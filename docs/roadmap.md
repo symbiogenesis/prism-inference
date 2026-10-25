@@ -17,18 +17,27 @@ ordinary SwiftBonsai builds do not compile this runtime.
 ## What the evidence establishes
 
 The retained model-loading evidence covers the pinned 851-tensor artifact and
-initialization of its 8K graph within the configured CPU budget. Scalar and NEON
-state/logits match on the retained three-step trajectory. Differences from the
-native reference exceed the declared numerical tolerance.
+initialization of its 8K graph within the configured CPU budget. At source
+revision `9899a25`, NEON consumes a 61-token Swift chat prefix and three generated
+greedy tokens. All 166,078,464 checked logit and complete logical state elements
+match the pinned native reference byte-for-byte, as do the greedy token IDs.
+The current scalar three-token run also matches native byte-for-byte. Earlier
+full-prefix scalar/NEON equality is retained at its separate tested revision.
+The [follow-up receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/config/swift-native-mvp-followup.evidence.json)
+records exact scopes, revisions, hashes and resource observations.
 
 The pinned Swift chat path has native template-byte/tokenizer-ID captures and
 seeded full-vocabulary MT19937 sampler comparisons. The exact verified Swift
 identity selects the pinned Windows ARM64 binary's weighted RMS, fused Q8_K
-preparation and PQ2 accumulation, GDN updates, SiLU/SwiGLU and nonflash attention
-arithmetic. Independent native captures cover those
+preparation and PQ2 accumulation, GDN updates, convolution FMA, SiLU/SwiGLU and
+nonflash attention arithmetic, including native in-place RoPE ordering.
+Independent native captures cover those
 operators; other model identities and public scalar APIs preserve their existing
 source-order contracts. Decoder identity records the pinned arithmetic choice.
-These operator repairs do not close the failed full-model numerical comparison.
+The operator controls and complete model comparison qualify these bounded Swift
+CPU workloads. Other inputs, longer trajectories and full-context behavior
+still require their own evidence. Runner's released runtime lock remains
+`0.1.1`; ordinary Runner builds do not yet consume these source repairs.
 
 The private server also cancels model work when an in-flight request future is
 dropped. Focused recovery checks cover rollback, reset-required admission and a
@@ -46,7 +55,7 @@ establish full-model parity, throughput or complete device qualification.
 | Area | Next work |
 | --- | --- |
 | Model support | Add broader Prism architectures and general model selection |
-| Numerical qualification | Compare full-model logits, recurrent/attention states and generated tokens with the pinned native reference |
+| Numerical qualification | Broaden paired full-model inputs, context lengths and generated trajectories beyond the retained pinned Swift workloads |
 | Tokenization and chat | Broaden inputs/templates beyond the pinned Swift prompt-byte and tokenizer-ID captures |
 | Sampling | Broaden qualification beyond the pinned Swift MT19937 sampler/RNG captures |
 | Adapters | Implement adapter forward execution; immutable B-vector sharing alone does not apply an adapter |

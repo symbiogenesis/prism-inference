@@ -8,17 +8,45 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 env:
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
   CARGO_BUILD_FINGERPRINT: content
   PRISM_VERSION: '0.1.2'
 concurrency:
-  group: foundation-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: foundation-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
+  changes:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.impact.outputs.packages }}
+      plan: ${{ steps.impact.outputs.plan }}
+      windows: ${{ steps.impact.outputs.windows }}
+      overlay: ${{ steps.impact.outputs.overlay }}
+      mutations: ${{ steps.impact.outputs.mutations }}
+      release: ${{ steps.impact.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify affected-crate selection and aggregate-gate contracts
+        shell: bash
+        run: python3 -B -m unittest discover -s .github/ci -p 'test_*.py'
+      - name: Select affected crates and validation groups
+        id: impact
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/ci/impact.py --before "$BEFORE" --after "$GITHUB_SHA" --workflow foundation.yml
   windows:
     name: windows / ${{ matrix.target }}
-    if: github.ref == 'refs/heads/main'
+    needs: changes
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.windows == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     strategy:
@@ -31,6 +59,8 @@ jobs:
             target: x86_64-pc-windows-msvc
     env:
       CARGO_BUILD_TARGET: ${{ matrix.target }}
+      PRISM_PACKAGES: ${{ needs.changes.outputs.packages }}
+      PRISM_RELEASE: ${{ needs.changes.outputs.release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,7 +94,7 @@ jobs:
           key: prism-runtime-v1-${{ matrix.target }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
             prism-runtime-v1-${{ matrix.target }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-
-      - name: Check formatting, Release analyzers, documentation and complete correctness
+      - name: Check affected crates and build their executables
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -72,17 +102,29 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
+          $selection = @($packages | ForEach-Object { '--package'; $_ })
           [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'workspace.log') | Out-Null
           try {
-            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-ReleaseBundle.ps1') -Case All
             cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
-            cargo +nightly-2026-10-22 fmt --manifest-path $manifest --all -- --check
-            # bonsai-prism's native-tests feature requires ggml; checked in native-overlay.
-            cargo +nightly-2026-10-22 clippy --manifest-path $manifest --workspace --all-targets --locked --offline --release -- -D warnings
-            cargo +nightly-2026-10-22 doc --manifest-path $manifest --workspace --no-deps --locked --offline --release
-            cargo +nightly-2026-10-22 test --manifest-path $manifest --workspace --locked --offline --release --no-fail-fast
-            cargo +nightly-2026-10-22 build --manifest-path $manifest --workspace --bins --locked --offline --release
+            if ($packages.Count) {
+              cargo +nightly-2026-10-22 fmt --manifest-path $manifest @selection -- --check
+              # Native linking is covered separately by the selected overlay gate.
+              cargo +nightly-2026-10-22 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
+              cargo +nightly-2026-10-22 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
+              cargo +nightly-2026-10-22 test --manifest-path $manifest @selection --locked --offline --release --no-fail-fast
+            }
+            $binaryPackages = @('prism-inference','prism-inference-server','bonsai-gguf','prism-conformance-policy','bonsai-codec-probe')
+            $buildPackages = @($binaryPackages | Where-Object { $_ -cin $packages })
+            if ($env:PRISM_RELEASE -ceq 'true') {
+              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-ReleaseBundle.ps1') -Case All
+              $buildPackages = @($buildPackages + @('prism-inference','prism-inference-server','bonsai-gguf') | Sort-Object -Unique)
+            }
+            if ($buildPackages.Count) {
+              $buildSelection = @($buildPackages | ForEach-Object { '--package'; $_ })
+              cargo +nightly-2026-10-22 build --manifest-path $manifest @buildSelection --bins --locked --offline --release
+            }
           } finally { Stop-Transcript | Out-Null }
       - name: Check feature variants, scalar fallback and loader ABI
         shell: pwsh
@@ -92,19 +134,26 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'feature-variants.log') | Out-Null
           try {
-            cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
-            cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
-            cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
-            cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
-            cargo +nightly-2026-10-22 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
-            # Check the loader ABI without enabling the native-tests link feature.
-            cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
-            cargo +nightly-2026-10-22 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
+            if ('prism-inference' -cin $packages) {
+              cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
+              cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
+              cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
+            }
+            if ('bonsai-gguf' -cin $packages) {
+              cargo +nightly-2026-10-22 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
+            }
+            if ('bonsai-prism' -cin $packages) {
+              # Check the loader ABI without enabling the native-tests link feature.
+              cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
+              cargo +nightly-2026-10-22 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
+            }
           } finally { Stop-Transcript | Out-Null }
       - name: Verify immutable reference fixtures and kill the bounded mutation catalog
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+        if: matrix.target == 'aarch64-pc-windows-msvc' && needs.changes.outputs.mutations == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -116,6 +165,7 @@ jobs:
           if ((Get-FileHash -LiteralPath (Join-Path $fixtures 'ptq-reference.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $provenance.fixtureSha256) { throw 'The immutable C++ codec corpus differs from its provenance.' }
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Mutations.ps1') -EvidenceDirectory (Join-Path $env:PRISM_CHECK_EVIDENCE 'mutations')
       - name: Package the five checked Windows executables
+        if: needs.changes.outputs.release == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         env:
@@ -132,6 +182,7 @@ jobs:
           & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $env:RELEASE_TARGET -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-10-22-$env:RELEASE_TARGET" | ConvertTo-Json -Depth 8
           "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
       - name: Retain the checked release bundle and source receipt
+        if: needs.changes.outputs.release == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: prism-inference-${{ env.PRISM_VERSION }}-${{ matrix.target }}
@@ -147,7 +198,8 @@ jobs:
           path: ${{ env.PRISM_CHECK_EVIDENCE }}
           if-no-files-found: error
   native-overlay:
-    if: github.ref == 'refs/heads/main'
+    needs: changes
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.overlay == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 35
     steps:
@@ -288,17 +340,15 @@ jobs:
 
   foundation:
     if: always() && github.ref == 'refs/heads/main'
-    needs: [windows, native-overlay]
+    needs: [changes, windows, native-overlay]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     steps:
-      - name: Require both Windows targets and the native overlay gate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require every selected validation group
         shell: bash
-        working-directory: ${{ runner.temp }}
         env:
-          JOB_RESULTS: ${{ toJSON(needs) }}
-        run: |
-          if ! jq -e 'all(.[]; .result == "success")' <<< "$JOB_RESULTS"; then
-            echo "$JOB_RESULTS"
-            exit 1
-          fi
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/ci/gate.py --workflow foundation

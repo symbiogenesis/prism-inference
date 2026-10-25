@@ -57,12 +57,12 @@ try {
 ## Correctness checks
 
 The current [Foundation workflow](../.github/workflows/foundation.yml) runs
-complete workspace correctness tests, formatting, Release Clippy/rustdoc,
-feature variants, loader-ABI Clippy/rustdoc and scalar fallback checks on Windows
-ARM64 and x64. These workspace checks run once per target; the manual compiler
-workflow does not repeat them.
-Its Linux ARM64 gate separately builds the pinned Prism engine with the Rust
-storage overlay and checks native linking and rejection behavior. Fixtures cover
+formatting, Release Clippy/rustdoc and complete correctness tests for affected
+workspace crates and their transitive consumers on Windows ARM64 and x64.
+Feature variants, loader-ABI checks and mutation guards run only when their
+packages or inputs are selected. Its Linux ARM64 gate builds the pinned Prism
+engine with the Rust storage overlay only when that overlay's inputs change.
+Fixtures cover
 bounded loading, exact codecs/rounding, graph state, output reuse, checkpoint
 isolation and transactional recovery. They do not load the full model. Locally
 run focused named regressions, from the same external working directory
@@ -88,17 +88,32 @@ remain explicit manual opt-ins. The [focused workflow](../.github/workflows/pris
 diagnoses one named source without replacing the complete gate.
 
 The [standards workflow](../.github/workflows/standards.yml) owns PowerShell and
-embedded-C# analysis for the migrated orchestration. The manual
+embedded-C# analysis; Rust-only pushes do not start it. The
 [compiler acceptance workflow](../.github/workflows/rust-nightly.yml) compares
 isolated stable/nightly language probes and preserves the fail-closed
-`compatibility` check. Dispatch Foundation to rerun workspace validation. Runner
+`compatibility` check. It runs when probe inputs change or on manual dispatch.
+Dispatch Foundation to rerun complete workspace validation. Runner
 contains only app/provisioning/released-runtime integration gates; none of these
 runtime suites bootstrap through its maintenance executable or released source.
 All full suites and every benchmark remain hosted-only.
 
-Automatic workflows skip pushes limited to root Markdown files and `docs/`;
-manual dispatch remains available. Test fixtures and package READMEs outside
-those paths still trigger validation.
+Automatic workflows skip pushes limited to root Markdown files and `docs/`.
+For other pushes, the [impact map](../.github/ci/impact.json) combines changed
+paths with Cargo's local dependency graph. A server-only change checks the
+server; a ternary-codec change also checks its GGUF/runtime/server consumers and
+the native codec lane. Runtime changes select upstream conformance; unrelated
+server or policy-tool changes do not start its backend partitions. Shared
+manifests, lockfiles, toolchains, CI policy and unclassified inputs select full
+validation. Manual dispatch always selects every group in that workflow.
+Known unrelated server, compiler-trial, policy-tool, packaging and C# analyzer
+paths also bypass the conformance workflow at its push trigger. The native
+codec lane builds its probe and checks parity; Foundation owns its Rust analyzers.
+
+Each workflow compares with its most recent successful push revision on the
+current ancestry, so changes from failed or cancelled pushes remain covered.
+If that baseline cannot be established, selection falls back to full validation.
+Each revision retains its own run. Aggregate gates require successful planning
+and successful selected jobs; they permit skips only for unselected groups.
 
 ## Bounded actual-model correctness captures
 
@@ -122,10 +137,13 @@ The evidence-write guards run in the ordinary hosted correctness suite.
 
 ## Release bundles and compatibility
 
-The Windows jobs build five executables and package them with the four root
+Manual Foundation dispatch and shared or packaging-input changes build five
+executables and package them with the four root
 license/notice files. Each bundle has a receipt identifying its exact source
-revision, target, version, file hashes and archive hash. The aggregate Foundation
-check requires both Windows targets and the Linux native overlay gate.
+revision, target, version, file hashes and archive hash. Isolated crate changes
+check and build their affected packages without rebuilding a complete bundle.
+The aggregate Foundation check requires both Windows targets when selected and
+the Linux native overlay gate when its inputs are selected.
 
 The checkout prepares version `0.1.2`; the published crates.io installation
 examples above remain at `0.1.1`. Packaging rejects a changed or untracked source

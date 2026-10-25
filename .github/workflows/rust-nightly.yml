@@ -1,11 +1,22 @@
 name: Rust compiler acceptance
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/rust-trial/fixtures/**'
+      - 'config/rust-nightly-trial.json'
+      - 'rust-toolchain.toml'
+      - 'tests/Test-RustNightly.ps1'
+      - 'scripts/Bonsai.Common.psm1'
+      - 'scripts/Bonsai.Native.psm1'
+      - '.github/actions/rust-toolchain/**'
+      - '.github/workflows/rust-nightly.yml'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: rust-nightly-${{ github.ref }}
-  cancel-in-progress: true
+  group: rust-nightly-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
   probe:
     name: Compiler acceptance probes

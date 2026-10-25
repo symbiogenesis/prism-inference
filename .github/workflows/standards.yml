@@ -2,15 +2,21 @@ name: Script standards
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
+    paths:
+      - '**/*.ps1'
+      - '**/*.psm1'
+      - '**/*.psd1'
+      - '**/*.cs'
+      - 'tools/validation/**'
+      - '.github/workflows/standards.yml'
+      - '.editorconfig'
+      - 'global.json'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: script-standards-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: script-standards-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
   standards:
     if: github.ref == 'refs/heads/main'

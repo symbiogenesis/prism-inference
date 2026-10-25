@@ -5,6 +5,14 @@ on:
     paths-ignore:
       - '*.md'
       - 'docs/**'
+      - 'server/**'
+      - 'tools/rust-trial/**'
+      - 'tools/conformance-policy/**'
+      - 'tools/validation/**'
+      - 'scripts/New-ReleaseBundle.ps1'
+      - 'tests/Test-ReleaseBundle.ps1'
+      - 'tests/Test-RustNightly.ps1'
+      - 'config/rust-nightly-trial.json'
   workflow_dispatch:
     inputs:
       prism_benchmarks:
@@ -17,6 +25,7 @@ on:
         default: false
 permissions:
   contents: read
+  actions: read
 env:
   # Checkout timestamps change on every runner. Reuse compiled Rust only when
   # Cargo verifies the source contents, while every check and test still runs.
@@ -26,13 +35,36 @@ env:
   # proof. Keep this in sync with the prism-backend-run matrix below.
   PRISM_BACKEND_EXECUTION_COUNT: '32'
 concurrency:
-  group: runtime-conformance-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: runtime-conformance-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
+  changes:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      plan: ${{ steps.impact.outputs.plan }}
+      conformance: ${{ steps.impact.outputs.conformance }}
+      codec: ${{ steps.impact.outputs.codec }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify affected-crate selection and aggregate-gate contracts
+        shell: bash
+        run: python3 -B -m unittest discover -s .github/ci -p 'test_*.py'
+      - name: Select affected runtime conformance groups
+        id: impact
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/ci/impact.py --before "$BEFORE" --after "$GITHUB_SHA" --workflow runtime-conformance.yml
   prism-upstream:
     name: prism-upstream / ${{ matrix.partition }}
-    if: github.ref == 'refs/heads/main'
-    needs: prism-backend-tools
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.conformance == 'true'
+    needs: [changes, prism-backend-tools]
     runs-on: windows-11-arm
     timeout-minutes: 330
     strategy:
@@ -146,7 +178,8 @@ jobs:
           archive: false
   prism-upstream-grammar:
     name: prism-upstream / ${{ matrix.partition }}
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.conformance == 'true'
+    needs: changes
     runs-on: windows-11-arm
     timeout-minutes: 330
     strategy:
@@ -295,7 +328,8 @@ jobs:
   # verdicts. Prepare the checked bundle independently so all backend partitions
   # can overlap the exhaustive tokenizer, grammar and model workloads.
   prism-backend-tools:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.conformance == 'true'
+    needs: changes
     runs-on: windows-11-arm
     timeout-minutes: 35
     steps:
@@ -418,8 +452,8 @@ jobs:
             ${{ env.PRISM_BACKEND_TOOLS_EVIDENCE }}/transport-checks
           if-no-files-found: error
   prism-backend-plan:
-    if: github.ref == 'refs/heads/main'
-    needs: prism-backend-tools
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.conformance == 'true'
+    needs: [changes, prism-backend-tools]
     runs-on: windows-11-arm
     timeout-minutes: 120
     strategy:
@@ -468,8 +502,8 @@ jobs:
           if-no-files-found: error
           archive: false
   prism-backend-join-plan:
-    if: always() && !cancelled() && github.ref == 'refs/heads/main' && needs.prism-backend-plan.result == 'success'
-    needs: prism-backend-plan
+    if: always() && !cancelled() && github.ref == 'refs/heads/main' && needs.prism-backend-plan.result == 'success' && needs.changes.outputs.conformance == 'true'
+    needs: [changes, prism-backend-plan]
     runs-on: windows-11-arm
     timeout-minutes: 20
     steps:
@@ -500,8 +534,8 @@ jobs:
           if-no-files-found: error
           compression-level: 1
   prism-backend-run:
-    if: always() && !cancelled() && github.ref == 'refs/heads/main' && needs.prism-backend-join-plan.result == 'success'
-    needs: prism-backend-join-plan
+    if: always() && !cancelled() && github.ref == 'refs/heads/main' && needs.prism-backend-join-plan.result == 'success' && needs.changes.outputs.conformance == 'true'
+    needs: [changes, prism-backend-join-plan]
     runs-on: windows-11-arm
     timeout-minutes: 330
     strategy:
@@ -554,8 +588,8 @@ jobs:
           if-no-files-found: error
           archive: false
   prism-upstream-gate:
-    if: github.ref == 'refs/heads/main'
-    needs: [prism-upstream, prism-upstream-grammar, prism-backend-run]
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.conformance == 'true'
+    needs: [changes, prism-upstream, prism-upstream-grammar, prism-backend-run]
     runs-on: windows-11-arm
     timeout-minutes: 20
     steps:
@@ -596,7 +630,8 @@ jobs:
           if-no-files-found: error
           compression-level: 1
   codec-native:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.codec == 'true'
+    needs: changes
     runs-on: windows-11-arm
     timeout-minutes: 15
     steps:
@@ -637,7 +672,7 @@ jobs:
           Start-Transcript -LiteralPath (Join-Path $checks 'codec-workflow.log') | Out-Null
           try {
             cargo +nightly-2026-10-22-aarch64-pc-windows-msvc fetch --manifest-path $manifest --locked
-            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-codec-probe -TargetDirectory $target -EvidenceDirectory (Join-Path $checks 'rust') -FullTests -Build -Offline | ConvertTo-Json -Depth 8
+            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-codec-probe -Phase build -TargetDirectory $target -EvidenceDirectory (Join-Path $checks 'rust') -Offline | ConvertTo-Json -Depth 8
             Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
             $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/codec-probe/native.lock.json') -Raw | ConvertFrom-Json
             $downloads = Join-Path $env:RUNNER_TEMP 'Prism-CodecDownloads'
@@ -662,17 +697,15 @@ jobs:
 
   runtime-conformance:
     if: always() && github.ref == 'refs/heads/main'
-    needs: [prism-upstream, prism-upstream-grammar, prism-backend-tools, prism-backend-plan, prism-backend-join-plan, prism-backend-run, prism-upstream-gate, codec-native]
+    needs: [changes, prism-upstream, prism-upstream-grammar, prism-backend-tools, prism-backend-plan, prism-backend-join-plan, prism-backend-run, prism-upstream-gate, codec-native]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     steps:
-      - name: Require the complete runtime source gate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require every selected validation group
         shell: bash
-        working-directory: ${{ runner.temp }}
         env:
-          JOB_RESULTS: ${{ toJSON(needs) }}
-        run: |
-          if ! jq -e 'all(.[]; .result == "success")' <<< "$JOB_RESULTS"; then
-            echo "$JOB_RESULTS"
-            exit 1
-          fi
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/ci/gate.py --workflow runtime-conformance

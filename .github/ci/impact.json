@@ -1,0 +1,59 @@
+{
+  "shared": [
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", ".cargo/**",
+    ".github/ci/**", ".github/actions/rust-toolchain/**",
+    ".github/workflows/foundation.yml", ".github/workflows/runtime-conformance.yml",
+    "scripts/Bonsai.Rust.psm1", "scripts/Bonsai.Common.psm1", "scripts/Bonsai.Native.psm1",
+    "tests/Test-Rust.ps1", "tests/Bonsai.TestSupport.psm1", "config/rust-packages.psd1"
+  ],
+  "ignored": ["*.md", "docs/**", ".gitignore"],
+  "package_paths": {
+    "prism-inference": ["src/**", "tests/**/*.rs", "tests/fixtures/**", "tests/upstream_prism/**", "examples/**"],
+    "bonsai-prism": [
+      "tools/prism/Cargo.toml", "tools/prism/build.rs", "tools/prism/cbindgen.toml",
+      "tools/prism/src/**", "tools/prism/tests/**", "tools/prism/README.md",
+      "tools/prism/LICENSE", "tools/prism/NOTICE", "tools/prism/PRISM-LICENSE.txt"
+    ]
+  },
+  "package_inputs": {},
+  "groups": {
+    "windows": {"packages": ["*"], "groups": ["release", "mutations"]},
+    "overlay": {
+      "paths": [
+        "tools/prism/src/**", "tools/prism/tests/**", "tools/prism/build.rs",
+        "tools/prism/Cargo.toml", "tools/prism/cbindgen.toml", "tools/prism/CMakeLists.txt",
+        "tools/prism/source.lock.json", "tools/prism/Apply-Overlay.ps1",
+        "scripts/Build-PrismEngine.ps1", "tests/Test-PrismOverlay.ps1"
+      ]
+    },
+    "conformance": {
+      "packages": ["prism-inference"],
+      "paths": [
+        "tools/prism/upstream/**", "tools/prism/source.lock.json",
+        "scripts/Bonsai.Prism*.psm1", "scripts/Compress-PrismEvidence.ps1",
+        "tests/Test-PrismBackend*.ps1", "tests/Test-PrismBaseline.ps1",
+        "tests/Test-PrismEvidence.ps1", "tests/Test-PrismNativeCache.ps1",
+        "tests/Test-PrismRunner.ps1", "tests/Test-PrismTaskRunner.ps1",
+        "tests/Test-PrismSource*.ps1", "tests/Test-PrismUpstream.ps1",
+        ".github/actions/conformance-policy/**", ".github/workflows/prism-focused.yml"
+      ]
+    },
+    "codec": {"packages": ["bonsai-codec-probe", "bonsai-ternary"], "paths": ["tests/Test-PrismCodec.ps1"]},
+    "mutations": {"packages": ["bonsai-ternary"], "paths": ["tests/Test-Mutations.ps1"]},
+    "release": {"paths": ["scripts/New-ReleaseBundle.ps1", "tests/Test-ReleaseBundle.ps1", "LICENSE", "NOTICE", "CAMELID-LICENSE.txt", "PRISM-LICENSE.txt"]},
+    "probes": {"paths": ["tools/rust-trial/fixtures/**", "config/rust-nightly-trial.json", "tests/Test-RustNightly.ps1", ".github/workflows/rust-nightly.yml"]},
+    "standards": {
+      "paths": ["tests/Test-Standards.ps1", "PSScriptAnalyzerSettings.psd1", "tools/validation/**", ".editorconfig", "global.json", ".github/workflows/standards.yml"],
+      "observes": ["**/*.ps1", "**/*.psm1", "**/*.psd1", "**/*.cs"]
+    }
+  },
+  "workflows": {
+    "foundation": {"windows": "windows", "native-overlay": "overlay"},
+    "runtime-conformance": {
+      "prism-upstream": "conformance", "prism-upstream-grammar": "conformance",
+      "prism-backend-tools": "conformance", "prism-backend-plan": "conformance",
+      "prism-backend-join-plan": "conformance", "prism-backend-run": "conformance",
+      "prism-upstream-gate": "conformance", "codec-native": "codec"
+    }
+  }
+}

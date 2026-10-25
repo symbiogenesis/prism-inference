@@ -22,10 +22,12 @@ state/logits match on the retained three-step trajectory. Differences from the
 native reference exceed the declared numerical tolerance.
 
 The pinned Swift chat path has native template-byte/tokenizer-ID captures and
-seeded full-vocabulary MT19937 sampler comparisons. A separate weighted RMS path
-now matches the pinned Windows ARM64 binary's multiplication order while the
-public scalar RMS API preserves its source-order contract. That operator repair
-does not close the failed full-model numerical comparison.
+seeded full-vocabulary MT19937 sampler comparisons. The exact verified Swift
+identity selects the pinned Windows ARM64 binary's weighted RMS, PQ2 fused
+accumulation and SiLU/SwiGLU arithmetic. Independent native captures cover those
+operators; other model identities and public scalar APIs preserve their existing
+source-order contracts. Decoder identity records the pinned arithmetic choice.
+These operator repairs do not close the failed full-model numerical comparison.
 
 The private server also cancels model work when an in-flight request future is
 dropped. Focused recovery checks cover rollback, reset-required admission and a

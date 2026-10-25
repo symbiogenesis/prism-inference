@@ -21,6 +21,17 @@ initialization of its 8K graph within the configured CPU budget. Scalar and NEON
 state/logits match on the retained three-step trajectory. Differences from the
 native reference exceed the declared numerical tolerance.
 
+The pinned Swift chat path has native template-byte/tokenizer-ID captures and
+seeded full-vocabulary MT19937 sampler comparisons. A separate weighted RMS path
+now matches the pinned Windows ARM64 binary's multiplication order while the
+public scalar RMS API preserves its source-order contract. That operator repair
+does not close the failed full-model numerical comparison.
+
+The private server also cancels model work when an in-flight request future is
+dropped. Focused recovery checks cover rollback, reset-required admission and a
+successful request after explicit reset. Complete device lifecycle evidence
+remains pending.
+
 Synthetic checks cover bounded parsing, exact codec arithmetic, graph state,
 checkpoint isolation, rollback, tokenization and service contracts. The
 [Foundation workflow](../.github/workflows/foundation.yml) checks both Windows
@@ -33,8 +44,8 @@ establish full-model parity, throughput or complete device qualification.
 | --- | --- |
 | Model support | Add broader Prism architectures and general model selection |
 | Numerical qualification | Compare full-model logits, recurrent/attention states and generated tokens with the pinned native reference |
-| Tokenization and chat | Complete model-level tokenizer/template comparisons and broaden supported inputs |
-| Sampling | Establish native sampler/RNG parity beyond the explicit reference sampler |
+| Tokenization and chat | Broaden inputs/templates beyond the pinned Swift prompt-byte and tokenizer-ID captures |
+| Sampling | Broaden qualification beyond the pinned Swift MT19937 sampler/RNG captures |
 | Adapters | Implement adapter forward execution; immutable B-vector sharing alone does not apply an adapter |
 | CPU execution | Profile allocation, prefill, checkpoint and packed-kernel behavior; qualify further SIMD paths |
 | Other accelerators | Investigate Adreno and additional backends after their execution and ownership contracts are established |

@@ -126,6 +126,267 @@ fn hybrid_fixture() -> Model {
     model
 }
 
+fn scratch_lifetime_fixture(feed_forward: u8) -> Model {
+    let mut model = preparation_fixture(false, false);
+    model
+        .metadata
+        .insert("qwen35.block_count".to_owned(), metadata!(2));
+    model.metadata.insert(
+        "qwen35.attention.recurrent_layers".to_owned(),
+        metadata!([false, true]),
+    );
+    model.metadata.insert(
+        "qwen35.feed_forward_length".to_owned(),
+        MetadataValue::from(u64::from(feed_forward)),
+    );
+    for (name, mut tensor) in preparation_fixture(true, false).tensors {
+        if let Some(suffix) = name.strip_prefix("blk.0.") {
+            let name = format!("blk.1.{suffix}");
+            tensor.name.clone_from(&name);
+            model.tensors.insert(name, tensor);
+        }
+    }
+    let feed_forward = usize::from(feed_forward);
+    for block in 0..2 {
+        for (suffix, values) in [
+            (
+                "ffn_up.weight",
+                [1.5, -0.25, -0.5, 0.75].repeat(feed_forward / 2),
+            ),
+            (
+                "ffn_gate.weight",
+                [0.5, 0.25, -0.125, 1.25].repeat(feed_forward / 2),
+            ),
+            (
+                "ffn_down.weight",
+                [
+                    [0.25, -0.5].repeat(feed_forward / 2),
+                    [0.75, 0.125].repeat(feed_forward / 2),
+                ]
+                .concat(),
+            ),
+        ] {
+            let name = format!("blk.{block}.{suffix}");
+            let dimensions = if suffix == "ffn_down.weight" {
+                vec![feed_forward, 2]
+            } else {
+                vec![2, feed_forward]
+            };
+            model
+                .tensors
+                .insert(name.clone(), weight(&name, &dimensions, &values));
+        }
+    }
+    model
+}
+
+fn scratch_state_bits(decoder: &Qwen35) -> Result<Vec<u32>> {
+    let mut state = Vec::new();
+    decoder.visit_state(&mut |_, _, values| {
+        state.extend(values.iter().map(|value| value.to_bits()));
+        Ok(())
+    })?;
+    Ok(state)
+}
+
+fn scratch_step_bits(decoder: &mut Qwen35, token: u32) -> Result<Vec<u32>> {
+    let mut bits = decoder
+        .evaluate(token)?
+        .into_iter()
+        .map(f32::to_bits)
+        .collect::<Vec<_>>();
+    bits.extend(scratch_state_bits(decoder)?);
+    Ok(bits)
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Retain the complete independent pre-sharing logits and state bit fixtures with their recovery assertions."
+)]
+fn phase_shared_scratch_preserves_frozen_hybrid_state_and_recovery() -> Result<()> {
+    // Captured before lifetime-based scratch sharing at
+    // 1f22c4dd2236513a239eea4d172864a8b7332419, native Windows ARM64.
+    // Each row contains both logits, then every committed KV, convolution and
+    // GDN element in visit_state order. Both blocks have nonzero FFN gates.
+    let expected: [[&[u32]; 3]; 2] = [
+        [
+            &[
+                0x3fa1_1d29,
+                0x3f25_0c96,
+                0x3f48_e000,
+                0xbf96_a000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x3fa5_10d0,
+                0x3f14_9c66,
+                0x3fa5_10d0,
+                0x3f14_9c66,
+                0x3fa5_10d0,
+                0x3f14_9c66,
+                0x3ef4_dd0c,
+                0x3e34_4743,
+                0x3e34_4743,
+                0x3d84_ba6c,
+            ],
+            &[
+                0xbef1_12f4,
+                0x3faa_b11c,
+                0x3f48_e000,
+                0xbf96_a000,
+                0x3e1a_e000,
+                0x3fb4_0000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x0000_0000,
+                0x3fb5_0000,
+                0xbe7b_119b,
+                0x3fb2_472a,
+                0xbe7b_119b,
+                0x3fb2_472a,
+                0xbe7b_119b,
+                0x3fb2_472a,
+                0x3e5d_2120,
+                0x3d79_405f,
+                0x3dc3_c520,
+                0x3f07_d81c,
+            ],
+            &[
+                0x3f70_ba49,
+                0x3f87_349e,
+                0x3f48_e000,
+                0xbf96_a000,
+                0x3e1a_e000,
+                0x3fb4_0000,
+                0x3f3e_6000,
+                0x3f9a_0000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x0000_0000,
+                0x3fb5_0000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x3f8b_63da,
+                0x3f66_fbe6,
+                0x3f8b_63da,
+                0x3f66_fbe6,
+                0x3f8b_63da,
+                0x3f66_fbe6,
+                0x3e9a_7cfd,
+                0x3e90_3c88,
+                0x3e86_e938,
+                0x3f09_adbe,
+            ],
+        ],
+        [
+            &[
+                0x3f0c_aaf9,
+                0x3fa6_cbf4,
+                0x3f48_e000,
+                0xbf96_a000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x3f5d_c2c2,
+                0x3f8f_15f4,
+                0x3f5d_c2c2,
+                0x3f8f_15f4,
+                0x3f5d_c2c2,
+                0x3f8f_15f4,
+                0x3e27_7313,
+                0x3e67_517c,
+                0x3e67_517d,
+                0x3e9f_c625,
+            ],
+            &[
+                0xbf8d_e975,
+                0x3f60_c1f4,
+                0x3f48_e000,
+                0xbf96_a000,
+                0x3e1a_e000,
+                0x3fb4_0000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x0000_0000,
+                0x3fb5_0000,
+                0xbf7c_9aaa,
+                0x3f81_acf9,
+                0xbf7c_9aaa,
+                0x3f81_acf9,
+                0xbf7c_9aaa,
+                0x3f81_acf9,
+                0x3dd7_334a,
+                0xbcda_0164,
+                0x3c88_e484,
+                0x3efe_d447,
+            ],
+            &[
+                0x3ea8_521b,
+                0x3fb0_0f74,
+                0x3f48_e000,
+                0xbf96_a000,
+                0x3e1a_e000,
+                0x3fb4_0000,
+                0x3f3e_6000,
+                0x3f9a_0000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x0000_0000,
+                0x3fb5_0000,
+                0x3fb5_0000,
+                0x0000_0000,
+                0x3f4c_560d,
+                0x3f95_6e63,
+                0x3f4c_560d,
+                0x3f95_6e63,
+                0x3f4c_560d,
+                0x3f95_6e63,
+                0x3dc4_818c,
+                0x3e0c_d6f6,
+                0x3e04_14b7,
+                0x3f21_f92e,
+            ],
+        ],
+    ];
+    // Attention QKV is larger than the narrow FFN; the wide FFN is larger than
+    // QKV. Exercise both high-water transitions on every hybrid token step.
+    for (width, expected) in [2, 8].into_iter().zip(expected) {
+        let mut decoder =
+            Qwen35::with_backend(scratch_lifetime_fixture(width), 16, MatvecBackend::Scalar)?;
+        assert_eq!(scratch_step_bits(&mut decoder, 0)?, expected[0]);
+        let checkpoint = decoder.checkpoint()?;
+        assert_eq!(scratch_step_bits(&mut decoder, 1)?, expected[1]);
+        assert_eq!(scratch_step_bits(&mut decoder, 0)?, expected[2]);
+        assert!(decoder.evaluate(2).is_err());
+        assert_eq!(scratch_state_bits(&decoder)?, expected[2][2..]);
+        decoder.restore(&checkpoint)?;
+        assert_eq!(scratch_step_bits(&mut decoder, 1)?, expected[1]);
+        decoder.reset()?;
+        assert_eq!(scratch_step_bits(&mut decoder, 0)?, expected[0]);
+        decoder.restore(&checkpoint)?;
+        assert_eq!(scratch_step_bits(&mut decoder, 1)?, expected[1]);
+    }
+
+    let mut fault = scratch_lifetime_fixture(2);
+    fault.tensors.insert(
+        "output.weight".to_owned(),
+        weight("output.weight", &[2, 2], &[0.0, f32::MAX, 0.0, 0.0]),
+    );
+    let mut decoder = Qwen35::with_backend(fault, 16, MatvecBackend::Scalar)?;
+    decoder.evaluate(0)?;
+    let before_failure = scratch_state_bits(&decoder)?;
+    let mut logits = vec![f32::NAN; 2];
+    // Token 1 overflows only the final output projection, after both layer
+    // deltas and every shared attention/FFN temporary have been populated.
+    assert!(decoder.evaluate_into(1, &mut logits).is_err());
+    assert_eq!(logits, Vec::<f32>::new());
+    assert_eq!(scratch_state_bits(&decoder)?, before_failure);
+    // Retrying the same token without output must overwrite all stale scratch
+    // and produce exactly the ordinary trajectory's committed state.
+    decoder.ingest(1)?;
+    assert_eq!(scratch_state_bits(&decoder)?, expected[0][1][2..]);
+    Ok(())
+}
+
 fn paged_hybrid_fixture() -> Model {
     let mut model = hybrid_fixture();
     model.metadata.insert(

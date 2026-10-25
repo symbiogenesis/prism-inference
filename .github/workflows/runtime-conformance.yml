@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Reuse maintenance tools for ordinary source partition policy
+      - name: Build local conformance policy for ordinary source partitions
         uses: ./.github/actions/conformance-policy
       - name: Reuse the pinned upstream archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -158,7 +158,7 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
-      - name: Reuse maintenance tools for source policy regressions
+      - name: Build local conformance policy for source regressions
         uses: ./.github/actions/conformance-policy
       - name: Verify the native acceptance host and identify the Rust cache
         shell: pwsh
@@ -211,7 +211,6 @@ jobs:
           # Never restore across source pins, adapter code or compiler identities;
           # source verification and CMake still run before every correctness test.
           key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-source-${{ matrix.partition }}-${{ hashFiles('tools/prism/upstream/**', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1') }}
-            prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-
       - name: Run safe Rust conformance on upstream and Rust
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -380,7 +379,6 @@ jobs:
           # Never restore across source pins, adapter code or compiler identities;
           # source verification and CMake still run before every correctness test.
           key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-backend-tools-${{ hashFiles('tools/prism/upstream/**', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1') }}
-            prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-source-0-
       - name: Prepare revision-bound native backend tools without running source workloads
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -621,9 +619,74 @@ jobs:
           path: ${{ runner.temp }}/prism-upstream-gate
           if-no-files-found: error
           compression-level: 1
+  codec-native:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+      - name: Reuse the immutable released runtime archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/Prism-CodecDownloads
+          key: prism-codec-download-v1-${{ runner.os }}-${{ hashFiles('tools/codec-probe/native.lock.json') }}
+      - name: Reuse native codec probe compiler artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/Prism-CodecTarget
+          key: prism-codec-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/codec-probe/**', 'tools/ternary/**', 'rust-toolchain.toml') }}-content-v1
+          restore-keys: |
+            prism-codec-v1-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check the probe and consume every preserved synthetic native codec input
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Native codec acceptance requires Windows ARM64.' }
+          $checks = Join-Path $env:RUNNER_TEMP ('Prism-CodecChecks-' + [guid]::NewGuid().ToString('N'))
+          "PRISM_CODEC_EVIDENCE=$checks" >> $env:GITHUB_ENV
+          [void][IO.Directory]::CreateDirectory($checks)
+          $target = Join-Path $env:RUNNER_TEMP 'Prism-CodecTarget'
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          Start-Transcript -LiteralPath (Join-Path $checks 'codec-workflow.log') | Out-Null
+          try {
+            cargo +nightly-2026-10-22-aarch64-pc-windows-msvc fetch --manifest-path $manifest --locked
+            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-codec-probe -TargetDirectory $target -EvidenceDirectory (Join-Path $checks 'rust') -FullTests -Build -Offline | ConvertTo-Json -Depth 8
+            Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
+            $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/codec-probe/native.lock.json') -Raw | ConvertFrom-Json
+            $downloads = Join-Path $env:RUNNER_TEMP 'Prism-CodecDownloads'
+            [void][IO.Directory]::CreateDirectory($downloads)
+            $archive = Join-Path $downloads $lock.Runtime.asset.filename
+            $null = Receive-LockedArtifact -Uri $lock.Runtime.asset.url -Path $archive -Bytes $lock.Runtime.asset.bytes -Sha256 $lock.Runtime.asset.sha256 -TimeoutSeconds 600
+            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismCodec.ps1') -RuntimeArchive $archive -ProbeToolPath (Join-Path $target 'release/bonsai-codec-probe.exe') -EvidenceDirectory (Join-Path $checks 'native')
+          } finally { Stop-Transcript | Out-Null }
+      - name: Retain codec corpus, ABI, package and process receipts
+        if: always() && env.PRISM_CODEC_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-native-codec-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            ${{ env.PRISM_CODEC_EVIDENCE }}/*.log
+            ${{ env.PRISM_CODEC_EVIDENCE }}/rust
+            ${{ env.PRISM_CODEC_EVIDENCE }}/native/*.json
+            ${{ env.PRISM_CODEC_EVIDENCE }}/native/*.log
+            ${{ env.PRISM_CODEC_EVIDENCE }}/native/*.stdout
+            ${{ env.PRISM_CODEC_EVIDENCE }}/native/*.stderr
+          if-no-files-found: error
+
   runtime-conformance:
     if: always() && github.ref == 'refs/heads/main'
-    needs: [prism-upstream, prism-upstream-grammar, prism-backend-tools, prism-backend-plan, prism-backend-join-plan, prism-backend-run, prism-upstream-gate]
+    needs: [prism-upstream, prism-upstream-grammar, prism-backend-tools, prism-backend-plan, prism-backend-join-plan, prism-backend-run, prism-upstream-gate, codec-native]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     steps:

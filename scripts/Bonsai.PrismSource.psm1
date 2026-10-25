@@ -1,6 +1,7 @@
 #requires -Version 7.6
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 
 function Resolve-PrismSource {
     <# .SYNOPSIS

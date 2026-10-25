@@ -1,0 +1,28 @@
+[package]
+name = "bonsai-codec-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+description = "Bounded synthetic native PQ2/PTQ1 codec evidence for the pinned Prism runtime"
+keywords = ["ternary", "validation", "ggml"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[[bin]]
+name = "bonsai-codec-probe"
+path = "src/main.rs"
+# Native parity is exercised by the probe, rather than an empty unit harness.
+test = false
+
+[dependencies]
+bonsai-ternary = { version = "=0.1.0", path = "../ternary" }
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+bonsai-windows-process = "=0.1.0"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true

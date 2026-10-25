@@ -62,6 +62,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonsai-codec-probe"
+version = "0.1.0"
+dependencies = [
+ "bonsai-ternary",
+ "bonsai-windows-process",
+ "serde_json",
+ "windows-sys",
+]
+
+[[package]]
 name = "bonsai-gguf"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,106 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "CatalogSha256": "2a262f01c68f4137f01519188323fa4ad9edb55a5b5ec05f1b7d00df40f03efd",
+  "Measure": "upstream-source-files",
+  "Total": 71,
+  "MinimumPassed": 1,
+  "RequiredPassedIds": [
+    "tests/test-pq2-row-shapes.cpp"
+  ],
+  "RequiredReferencePassedIds": [
+    "tests/test-alloc.cpp",
+    "tests/test-batch-alloc.cpp",
+    "tests/test-col2im-1d.cpp",
+    "tests/test-dfly-fusion.cpp",
+    "tests/test-gguf.cpp",
+    "tests/test-grammar-integration.cpp",
+    "tests/test-grammar-parser.cpp",
+    "tests/test-jinja.cpp",
+    "tests/test-llama-grammar.cpp",
+    "tests/test-log.cpp",
+    "tests/test-moe-weighted-reduce.cpp",
+    "tests/test-mtp-catchup-batch.cpp",
+    "tests/test-pq2-row-shapes.cpp",
+    "tests/test-ptq1_0-cuda-dot.cpp",
+    "tests/test-ptq1_0-element-map.cpp",
+    "tests/test-quantize-fns.cpp",
+    "tests/test-reasoning-budget.cpp",
+    "tests/test-rope.cpp",
+    "tests/test-unicode.cpp"
+  ],
+  "Provenance": {
+    "Status": "hosted-baseline-confirmed",
+    "MeasuredOn": "2026-10-24",
+    "CppReference": "Pinned original C++ test-pq2-row-shapes executable, MSVC x64: all 15 source shape variants passed.",
+    "SharedAssertionsCpp": "The common Rust assertion runner against C++-generated fixtures passed all 15 variants; worst relative RMS error 0.00678326 against the upstream 0.05 threshold.",
+    "SharedAssertionsRust": "The same assertion runner against the native ARM64 Rust runtime passed all 15 variants; worst relative RMS error 0.00678327.",
+    "Pq2Corpus": "Original upstream C++ make_weights, seed 1234+K; activations seed 99; original MSVC std::normal_distribution.",
+    "Pq2FixtureSha256": "9e9c5b960d2b60d90e055158256988f6769dc1d1f89ed06003af40438b2a4d80",
+    "Pq2CppResultSha256": "cd1a89a3ad41e92a9c9119e5bc2aa70138555e65421818cab603c0cdd558a9a0",
+    "Pq2RustResultSha256": "39afdf2779786b4935cc0d757deb71c4c2f6a0656cb393c08bc5e4675229babb",
+    "KnownRedIds": [
+      "tests/test-ptq1_0-element-map.cpp"
+    ],
+    "KnownRedReason": "The original random-byte PTQ1 element-map source passes its C++ control, while Rust rejects noncanonical blocks. Target rejection is retained as a failed source suite, rather than dropping cases or narrowing the original input domain.",
+    "Explanation": "Minimum 1/71 preserves each measured Rust green source. The two independently measured C++ reference sources must remain passing even when the Rust source is red. Unported, skipped and failed source suites remain in the denominator. Hosted CI independently rebuilds both C++ controls and repeats these paired assertions. Baseline policy is never automatically rewritten by CI.",
+    "Hosted": {
+      "ProjectRevision": "afe66d881b8828183b9ffe7ef3119463b5d58bc2",
+      "RunUrl": "https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40112751630",
+      "Verdict": "Foundation and imported Prism baseline passed",
+      "Platform": "Ubuntu 24.04.5 LTS ARM64",
+      "RustPassed": 1,
+      "RustFailed": 1,
+      "RustUnsupported": 69,
+      "TotalSources": 71,
+      "CppPassed": 19,
+      "CppUnsupported": 52,
+      "ReportSha256": "3368fd51550c3b4e8f08296186341e5a62e8c5fd5e9ff8cb94ecd0f6f8c56bbf",
+      "Pq2FixtureSha256": "279cac324e1382b93650dcfe3b4e2a1a80c346e7c481ba8ef966f47f6f7b1621",
+      "Ptq1FixtureSha256": "db47bed002bb2ac699dbe8cc324ba4607cbf4cc12982081f1059b0cce6980036"
+    },
+    "SafeRustMigration": "Seventy applicable source contracts have Rust-owned inputs, control flow and assertions where present. All 70 Windows ARM64 adapters must emit target results and passing C++ reference results at the complete source gate. Implemented coverage is not a claim of completed hosted qualification. The excluded Apple wired-memory source remains unsupported in the 71-source inventory. MinimumPassed, the required Rust PQ2 identity and the 19 historically qualified reference identities are preserved. Optional benchmark measurements remain separate from source acceptance. Sources without original correctness assertions establish workload completion, not model quality or performance. MTMD chunk tests explicitly call the public upstream opaque fixture factory; Rust owns requests and predicates.",
+    "WindowsArm64": {
+      "ProjectRevision": "2daa94c3fd0c7dde84b05609b61cde43ec18e105",
+      "RunUrl": "https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40120815419",
+      "Verdict": "Foundation passed; all33 Rust-owned upstream contracts passed and original GGUF qualification replay passed",
+      "Platform": "Microsoft Windows 10.0.26200",
+      "Architecture": "Arm64",
+      "NativeToolset": "ClangCL",
+      "VerifiedPeMachine": "0xAA64",
+      "TestedCatalogSha256": "c41947a5fdb985766a2120499bca1d6afffb6314517dd3a2e1bb0391caeb6186",
+      "RustPassed": 1,
+      "RustFailed": 32,
+      "RustUnsupported": 38,
+      "TotalSources": 71,
+      "CppPassed": 33,
+      "CppUnsupported": 38,
+      "ReportSha256": "892c106c1678b26241437ef3fdd3dfd7e0455e112f78c816848b1ee9824762ec",
+      "ReceiptSha256": "f126f16859fe086f4b7d10fd1a64c19be647547a80afcf64ebfbd4942df37a68"
+    },
+    "OriginalCppRetirement": {
+      "QualificationRun": "https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40120815419",
+      "Reason": "All19 required original reference identities have complete safe Rust replacements proven against native Windows ARM64 upstream; the final original GGUF replay can be removed.",
+      "QualificationRevision": "2daa94c3fd0c7dde84b05609b61cde43ec18e105"
+    },
+    "SourceCorrections": [
+      {
+        "Policy": "Explicit user instruction to restore intended UTF8 skip",
+        "Reason": "Restore the intended malformed UTF8 skip in safe Rust before retokenizing raw BPE pieces. The pinned decoder swallows invalid_argument; valid pieces and all original Unicode predicates remain required. No CI gate waiver.",
+        "OriginalFailureRun": "https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40122224434",
+        "Id": "tests/test-tokenizer-1-bpe.cpp"
+      },
+      {
+        "Id": "tests/test-llama-archs.cpp",
+        "OriginalFailureRun": "https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40124618551",
+        "Reason": "Supply three required DSpark fixture keys omitted by the pinned generic architecture test: block_size128, mask_token_id127 and target_layers[1,16]. All151 variants, 128-row comparisons and saver roundtrips remain required; the upstream saver omissions have a separately pinned production fix."
+      }
+    ],
+    "ReferenceProductionFix": {
+      "Qualification": "Focused reproductions and patched build validation; complete corrected-reference qualification remains pending hosted CI",
+      "Variant": "pinned-upstream-with-documented-production-fixes",
+      "Reason": "DSpark saver omits required/optional metadata and 16 global tensors. Canonical Llama 3 decoding inherits punctuation cleanup contrary to its publisher's byte-preserving decoding contract. Both explicit production corrections preserve every test predicate.",
+      "Lock": "reference-patches.lock.json"
+    }
+  }
+}

@@ -1,0 +1,77 @@
+[package]
+name = "prism-inference-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.101"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/symbiogenesis/prism-inference"
+description = "Bounded private HTTP server for Prism CPU inference"
+keywords = ["inference", "prism", "gguf"]
+categories = ["science"]
+
+
+[dependencies]
+bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.0" }
+http = "=1.5.0"
+httparse = "=1.10.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+subtle = "=2.6.1"
+tokio = { version = "=1.54.1", features = ["io-util", "net", "rt", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+bonsai-windows-process = "=0.1.0"
+bonsai-windows-credentials = "=0.1.0"
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["test-util"] }
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+non_ascii_idents = "forbid"
+# Native-boundary unsafe allowances must never waive these safety checks.
+unsafe_op_in_unsafe_fn = "forbid"
+invalid_reference_casting = "forbid"
+static_mut_refs = "forbid"
+ffi_unwind_calls = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+elided_lifetimes_in_paths = "deny"
+explicit_outlives_requirements = "deny"
+missing_docs = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+redundant_imports = "deny"
+redundant_lifetimes = "deny"
+unused_import_braces = "deny"
+meta_variable_misuse = "deny"
+
+[lints.rustdoc]
+all = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+as_conversions = "deny"
+dbg_macro = "deny"
+exit = "deny"
+mem_forget = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+allow_attributes_without_reason = "deny"

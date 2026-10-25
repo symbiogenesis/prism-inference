@@ -1,0 +1,2232 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "Source": "tests/test-jinja.cpp",
+  "SourceSha256": "ef2da16176a8e914cbd54341e4b77f675a8f3b5b15a8bfd0c9a7a2305c30c8ab",
+  "Cases": [
+    {
+      "Group": "test_whitespace_control",
+      "Name": "trim_blocks removes newline after tag",
+      "Template": "{% if true %}\nhello\n{% endif %}\n",
+      "Expected": "hello\n",
+      "SourceLine": 87,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_whitespace_control",
+      "Name": "lstrip_blocks removes leading whitespace",
+      "Template": "    {% if true %}\n    hello\n    {% endif %}\n",
+      "Expected": "    hello\n",
+      "SourceLine": 95,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_whitespace_control",
+      "Name": "for loop with trim_blocks",
+      "Template": "{% for i in items %}\n{{ i }}\n{% endfor %}\n",
+      "Expected": "1\n2\n3\n",
+      "SourceLine": 103,
+      "VariablesJson": "{\"items\":[1,2,3]}"
+    },
+    {
+      "Group": "test_whitespace_control",
+      "Name": "explicit strip both",
+      "Template": "  {%- if true -%}  \nhello\n  {%- endif -%}  \n",
+      "Expected": "hello",
+      "SourceLine": 111,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_whitespace_control",
+      "Name": "expression whitespace control",
+      "Template": "  {{- 'hello' -}}  \n",
+      "Expected": "hello",
+      "SourceLine": 119,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_whitespace_control",
+      "Name": "inline block no newline",
+      "Template": "{% if true %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 125,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "if true",
+      "Template": "{% if cond %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 133,
+      "VariablesJson": "{\"cond\":true}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "if false",
+      "Template": "{% if cond %}yes{% endif %}",
+      "Expected": "",
+      "SourceLine": 139,
+      "VariablesJson": "{\"cond\":false}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "if else",
+      "Template": "{% if cond %}yes{% else %}no{% endif %}",
+      "Expected": "no",
+      "SourceLine": 145,
+      "VariablesJson": "{\"cond\":false}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "if elif else",
+      "Template": "{% if a %}A{% elif b %}B{% else %}C{% endif %}",
+      "Expected": "B",
+      "SourceLine": 151,
+      "VariablesJson": "{\"a\":false,\"b\":true}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "nested if",
+      "Template": "{% if outer %}{% if inner %}both{% endif %}{% endif %}",
+      "Expected": "both",
+      "SourceLine": 157,
+      "VariablesJson": "{\"outer\":true,\"inner\":true}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "comparison operators",
+      "Template": "{% if x > 5 %}big{% endif %}",
+      "Expected": "big",
+      "SourceLine": 163,
+      "VariablesJson": "{\"x\":10}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "object comparison",
+      "Template": "{% if {0: 1, none: 2, 1.0: 3, '0': 4, true: 5} == {false: 1, none: 2, 1: 5, '0': 4} %}equal{% endif %}",
+      "Expected": "equal",
+      "SourceLine": 169,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "array comparison",
+      "Template": "{% if [0, 1.0, false] == [false, 1, 0.0] %}equal{% endif %}",
+      "Expected": "equal",
+      "SourceLine": 175,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "logical and",
+      "Template": "{% if a and b %}both{% endif %}",
+      "Expected": "both",
+      "SourceLine": 181,
+      "VariablesJson": "{\"a\":true,\"b\":true}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "logical or",
+      "Template": "{% if a or b %}either{% endif %}",
+      "Expected": "either",
+      "SourceLine": 187,
+      "VariablesJson": "{\"a\":false,\"b\":true}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "logical not",
+      "Template": "{% if not a %}negated{% endif %}",
+      "Expected": "negated",
+      "SourceLine": 193,
+      "VariablesJson": "{\"a\":false}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "in operator (element in array)",
+      "Template": "{% if 'x' in items %}found{% endif %}",
+      "Expected": "found",
+      "SourceLine": 199,
+      "VariablesJson": "{\"items\":[\"x\",\"y\"]}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "in operator (substring)",
+      "Template": "{% if 'bc' in 'abcd' %}found{% endif %}",
+      "Expected": "found",
+      "SourceLine": 205,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "in operator (object key)",
+      "Template": "{% if 'key' in obj %}found{% endif %}",
+      "Expected": "found",
+      "SourceLine": 211,
+      "VariablesJson": "{\"obj\":{\"key\":1,\"other\":2}}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is defined",
+      "Template": "{% if x is defined %}yes{% else %}no{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 217,
+      "VariablesJson": "{\"x\":1}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is not defined",
+      "Template": "{% if y is not defined %}yes{% else %}no{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 223,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is undefined falsy",
+      "Template": "{{ 'yes' if not y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 229,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is undefined attribute falsy",
+      "Template": "{{ 'yes' if not y.x else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 235,
+      "VariablesJson": "{\"y\":true}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is undefined key falsy",
+      "Template": "{{ 'yes' if not y['x'] else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 241,
+      "VariablesJson": "{\"y\":[null]}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is empty array falsy",
+      "Template": "{{ 'yes' if not y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 247,
+      "VariablesJson": "{\"y\":[]}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is empty object falsy",
+      "Template": "{{ 'yes' if not y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 253,
+      "VariablesJson": "{\"y\":{}}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is empty string falsy",
+      "Template": "{{ 'yes' if not y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 259,
+      "VariablesJson": "{\"y\":\"\"}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is 0 falsy",
+      "Template": "{{ 'yes' if not y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 265,
+      "VariablesJson": "{\"y\":0}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is 0.0 falsy",
+      "Template": "{{ 'yes' if not y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 271,
+      "VariablesJson": "{\"y\":0.0}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is non-empty array truthy",
+      "Template": "{{ 'yes' if y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 277,
+      "VariablesJson": "{\"y\":[\"\"]}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is non-empty object truthy",
+      "Template": "{{ 'yes' if y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 283,
+      "VariablesJson": "{\"y\":[\"x\",false]}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is non-empty string truthy",
+      "Template": "{{ 'yes' if y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 289,
+      "VariablesJson": "{\"y\":\"0\"}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is 1 truthy",
+      "Template": "{{ 'yes' if y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 295,
+      "VariablesJson": "{\"y\":1}"
+    },
+    {
+      "Group": "test_conditionals",
+      "Name": "is 1.0 truthy",
+      "Template": "{{ 'yes' if y else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 301,
+      "VariablesJson": "{\"y\":1.0}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "simple for",
+      "Template": "{% for i in items %}{{ i }}{% endfor %}",
+      "Expected": "123",
+      "SourceLine": 309,
+      "VariablesJson": "{\"items\":[1,2,3]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "loop.index",
+      "Template": "{% for i in items %}{{ loop.index }}{% endfor %}",
+      "Expected": "123",
+      "SourceLine": 315,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "loop.index0",
+      "Template": "{% for i in items %}{{ loop.index0 }}{% endfor %}",
+      "Expected": "012",
+      "SourceLine": 321,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "loop.first and loop.last",
+      "Template": "{% for i in items %}{% if loop.first %}[{% endif %}{{ i }}{% if loop.last %}]{% endif %}{% endfor %}",
+      "Expected": "[123]",
+      "SourceLine": 327,
+      "VariablesJson": "{\"items\":[1,2,3]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "loop.length",
+      "Template": "{% for i in items %}{{ loop.length }}{% endfor %}",
+      "Expected": "22",
+      "SourceLine": 333,
+      "VariablesJson": "{\"items\":[\"a\",\"b\"]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "for over dict items",
+      "Template": "{% for k, v in data.items() %}{{ k }}={{ v }} {% endfor %}",
+      "Expected": "x=1 y=2 ",
+      "SourceLine": 339,
+      "VariablesJson": "{\"data\":{\"x\":1,\"y\":2}}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "for else empty",
+      "Template": "{% for i in items %}{{ i }}{% else %}empty{% endfor %}",
+      "Expected": "empty",
+      "SourceLine": 345,
+      "VariablesJson": "{\"items\":[]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "for undefined empty",
+      "Template": "{% for i in items %}{{ i }}{% else %}empty{% endfor %}",
+      "Expected": "empty",
+      "SourceLine": 351,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "nested for",
+      "Template": "{% for i in a %}{% for j in b %}{{ i }}{{ j }}{% endfor %}{% endfor %}",
+      "Expected": "1x1y2x2y",
+      "SourceLine": 357,
+      "VariablesJson": "{\"a\":[1,2],\"b\":[\"x\",\"y\"]}"
+    },
+    {
+      "Group": "test_loops",
+      "Name": "for with range",
+      "Template": "{% for i in range(3) %}{{ i }}{% endfor %}",
+      "Expected": "012",
+      "SourceLine": 363,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "simple variable",
+      "Template": "{{ x }}",
+      "Expected": "42",
+      "SourceLine": 371,
+      "VariablesJson": "{\"x\":42}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "dot notation",
+      "Template": "{{ user.name }}",
+      "Expected": "Bob",
+      "SourceLine": 377,
+      "VariablesJson": "{\"user\":{\"name\":\"Bob\"}}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "negative float (not dot notation)",
+      "Template": "{{ -1.0 }}",
+      "Expected": "-1.0",
+      "SourceLine": 383,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "bracket notation",
+      "Template": "{{ user['name'] }}",
+      "Expected": "Bob",
+      "SourceLine": 389,
+      "VariablesJson": "{\"user\":{\"name\":\"Bob\"}}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "empty computed member defaults to undefined",
+      "Template": "{{ a[]|default('fallback') }}",
+      "Expected": "fallback",
+      "SourceLine": 395,
+      "VariablesJson": "{\"a\":{\"name\":\"Bob\"}}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "empty computed member is undefined",
+      "Template": "{{ a[] is undefined }}",
+      "Expected": "True",
+      "SourceLine": 401,
+      "VariablesJson": "{\"a\":{\"name\":\"Bob\"}}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "undefined computed member is undefined",
+      "Template": "{{ a[undefined] is undefined }}",
+      "Expected": "True",
+      "SourceLine": 407,
+      "VariablesJson": "{\"a\":{\"name\":\"Bob\"}}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "array access",
+      "Template": "{{ items[1] }}",
+      "Expected": "b",
+      "SourceLine": 413,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "array negative access",
+      "Template": "{{ items[-1] }}",
+      "Expected": "c",
+      "SourceLine": 419,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "array slice",
+      "Template": "{{ items[1:-1]|string }}",
+      "Expected": "['b']",
+      "SourceLine": 425,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "array slice step",
+      "Template": "{{ items[::2]|string }}",
+      "Expected": "['a', 'c']",
+      "SourceLine": 431,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "tuple slice",
+      "Template": "{{ ('a', 'b', 'c')[::-1]|string }}",
+      "Expected": "('c', 'b', 'a')",
+      "SourceLine": 437,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "string slice negative step",
+      "Template": "{{ 'abcdef'[::-2] }}",
+      "Expected": "fdb",
+      "SourceLine": 443,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "string slice negative start and step",
+      "Template": "{{ 'abcdef'[-1:1:-1] }}",
+      "Expected": "fedc",
+      "SourceLine": 449,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "string slice negative start, stop and step",
+      "Template": "{{ 'abcdef'[-1:-5:-1] }}",
+      "Expected": "fedc",
+      "SourceLine": 455,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "arithmetic",
+      "Template": "{{ (a + b) * c }}",
+      "Expected": "20",
+      "SourceLine": 461,
+      "VariablesJson": "{\"a\":2,\"b\":3,\"c\":4}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "string concat ~",
+      "Template": "{{ 'hello' ~ ' ' ~ 'world' }}",
+      "Expected": "hello world",
+      "SourceLine": 467,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "string repetition",
+      "Template": "{{ 'ab' * 3 }}",
+      "Expected": "ababab",
+      "SourceLine": 473,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "reversed string repetition",
+      "Template": "{{ 3 * 'ab' }}",
+      "Expected": "ababab",
+      "SourceLine": 479,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_expressions",
+      "Name": "ternary",
+      "Template": "{{ 'yes' if cond else 'no' }}",
+      "Expected": "yes",
+      "SourceLine": 485,
+      "VariablesJson": "{\"cond\":true}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "simple set",
+      "Template": "{% set x = 5 %}{{ x }}",
+      "Expected": "5",
+      "SourceLine": 493,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "set with expression",
+      "Template": "{% set x = a + b %}{{ x }}",
+      "Expected": "30",
+      "SourceLine": 499,
+      "VariablesJson": "{\"a\":10,\"b\":20}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "set list",
+      "Template": "{% set items = [1, 2, 3] %}{{ items|length }}",
+      "Expected": "3",
+      "SourceLine": 505,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "set dict",
+      "Template": "{% set d = {'a': 1} %}{{ d.a }}",
+      "Expected": "1",
+      "SourceLine": 511,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "set dict with mixed type keys",
+      "Template": "{% set d = {0: 1, none: 2, 1.0: 3, '0': 4, (0, 0): 5, false: 6, 1: 7} %}{{ d[(0, 0)] + d[0] + d[none] + d['0'] + d[false] + d[1.0] + d[1] }}",
+      "Expected": "37",
+      "SourceLine": 517,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "print dict with mixed type keys",
+      "Template": "{% set d = {0: 1, none: 2, 1.0: 3, '0': 4, (0, 0): 5, true: 6} %}{{ d|string }}",
+      "Expected": "{0: 1, None: 2, 1.0: 6, '0': 4, (0, 0): 5}",
+      "SourceLine": 523,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "print array with mixed types",
+      "Template": "{% set d = [0, none, 1.0, '0', true, (0, 0)] %}{{ d|string }}",
+      "Expected": "[0, None, 1.0, '0', True, (0, 0)]",
+      "SourceLine": 529,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "object member assignment with mixed key types",
+      "Template": "{% set d = namespace() %}{% set d.a = 123 %}{{ d['a'] == 123 }}",
+      "Expected": "True",
+      "SourceLine": 535,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_set_statement",
+      "Name": "tuple unpacking",
+      "Template": "{% set t = (1, 2, 3) %}{% set a, b, c = t %}{{ a + b + c }}",
+      "Expected": "6",
+      "SourceLine": 541,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "upper",
+      "Template": "{{ 'hello'|upper }}",
+      "Expected": "HELLO",
+      "SourceLine": 549,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "lower",
+      "Template": "{{ 'HELLO'|lower }}",
+      "Expected": "hello",
+      "SourceLine": 555,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "upper array",
+      "Template": "{{ items|upper }}",
+      "Expected": "['HELLO', 'WORLD']",
+      "SourceLine": 561,
+      "VariablesJson": "{\"items\":[\"hello\",\"world\"]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "upper dict",
+      "Template": "{{ items|upper }}",
+      "Expected": "{'HELLO': 'WORLD'}",
+      "SourceLine": 567,
+      "VariablesJson": "{\"items\":{\"hello\":\"world\"}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "capitalize",
+      "Template": "{{ 'heLlo World'|capitalize }}",
+      "Expected": "Hello world",
+      "SourceLine": 573,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "title",
+      "Template": "{{ 'hello world'|title }}",
+      "Expected": "Hello World",
+      "SourceLine": 579,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "trim",
+      "Template": "{{ '  \r\n\thello\t\n\r  '|trim }}",
+      "Expected": "hello",
+      "SourceLine": 585,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "trim chars",
+      "Template": "{{ 'xyxhelloxyx'|trim('xy') }}",
+      "Expected": "hello",
+      "SourceLine": 591,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "length string",
+      "Template": "{{ 'hello'|length }}",
+      "Expected": "5",
+      "SourceLine": 597,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "replace",
+      "Template": "{{ 'hello world'|replace('world', 'jinja') }}",
+      "Expected": "hello jinja",
+      "SourceLine": 603,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "length (count alias) list",
+      "Template": "{{ items|count }}",
+      "Expected": "3",
+      "SourceLine": 609,
+      "VariablesJson": "{\"items\":[1,2,3]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "first",
+      "Template": "{{ items|first }}",
+      "Expected": "10",
+      "SourceLine": 615,
+      "VariablesJson": "{\"items\":[10,20,30]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "last",
+      "Template": "{{ items|last }}",
+      "Expected": "30",
+      "SourceLine": 621,
+      "VariablesJson": "{\"items\":[10,20,30]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "reverse",
+      "Template": "{% for i in items|reverse %}{{ i }}{% endfor %}",
+      "Expected": "321",
+      "SourceLine": 627,
+      "VariablesJson": "{\"items\":[1,2,3]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "sort",
+      "Template": "{% for i in items|sort %}{{ i }}{% endfor %}",
+      "Expected": "123",
+      "SourceLine": 633,
+      "VariablesJson": "{\"items\":[3,1,2]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "sort reverse",
+      "Template": "{% for i in items|sort(true) %}{{ i }}{% endfor %}",
+      "Expected": "321",
+      "SourceLine": 639,
+      "VariablesJson": "{\"items\":[3,1,2]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "sort with attribute",
+      "Template": "{{ items|sort(attribute='name')|join(attribute='age') }}",
+      "Expected": "123",
+      "SourceLine": 645,
+      "VariablesJson": "{\"items\":[{\"name\":\"c\",\"age\":3},{\"name\":\"a\",\"age\":1},{\"name\":\"b\",\"age\":2}]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "sort with numeric attribute",
+      "Template": "{{ items|sort(attribute=0)|join(attribute=1) }}",
+      "Expected": "xyz",
+      "SourceLine": 655,
+      "VariablesJson": "{\"items\":[[3,\"z\"],[1,\"x\"],[2,\"y\"]]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "join",
+      "Template": "{{ items|join(', ') }}",
+      "Expected": "a, b, c",
+      "SourceLine": 665,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "join default separator",
+      "Template": "{{ items|join }}",
+      "Expected": "xyz",
+      "SourceLine": 671,
+      "VariablesJson": "{\"items\":[\"x\",\"y\",\"z\"]}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "abs",
+      "Template": "{{ -5|abs }}",
+      "Expected": "5",
+      "SourceLine": 677,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "int from string",
+      "Template": "{{ '42'|int }}",
+      "Expected": "42",
+      "SourceLine": 683,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "int from string with default",
+      "Template": "{{ ''|int(1) }}",
+      "Expected": "1",
+      "SourceLine": 689,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "int from string with base",
+      "Template": "{{ '11'|int(base=2) }}",
+      "Expected": "3",
+      "SourceLine": 695,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "float from string",
+      "Template": "{{ '3.14'|float }}",
+      "Expected": "3.14",
+      "SourceLine": 701,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "default with value",
+      "Template": "{{ x|default('fallback') }}",
+      "Expected": "actual",
+      "SourceLine": 707,
+      "VariablesJson": "{\"x\":\"actual\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "default without value",
+      "Template": "{{ y|default('fallback') }}",
+      "Expected": "fallback",
+      "SourceLine": 713,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "default (d alias) with falsy value",
+      "Template": "{{ ''|d('fallback', true) }}",
+      "Expected": "fallback",
+      "SourceLine": 719,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson ensure_ascii=true",
+      "Template": "{{ data|tojson(ensure_ascii=true) }}",
+      "Expected": "\"\\u2713\"",
+      "SourceLine": 725,
+      "VariablesJson": "{\"data\":\"✓\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson ensure_ascii=true nested object",
+      "Template": "{{ data|tojson(ensure_ascii=true) }}",
+      "Expected": "{\"text\": \"\\u2713\", \"items\": [\"\\u00e9\", {\"snowman\": \"\\u2603\"}]}",
+      "SourceLine": 731,
+      "VariablesJson": "{\"data\":{\"text\":\"✓\",\"items\":[\"é\",{\"snowman\":\"☃\"}]}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson ensure_ascii=true indent=2",
+      "Template": "{{ data|tojson(ensure_ascii=true, indent=2) }}",
+      "Expected": "{\n  \"text\": \"\\u2713\",\n  \"nested\": {\n    \"accent\": \"\\u00e9\"\n  }\n}",
+      "SourceLine": 740,
+      "VariablesJson": "{\"data\":{\"text\":\"✓\",\"nested\":{\"accent\":\"é\"}}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson ensure_ascii=true preserves existing escapes",
+      "Template": "{{ data|tojson(ensure_ascii=true) }}",
+      "Expected": "{\"emoji\": \"\\ud83d\\ude00\", \"line\": \"a\\nb\"}",
+      "SourceLine": 749,
+      "VariablesJson": "{\"data\":{\"emoji\":\"😀\",\"line\":\"a\\nb\"}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson sort_keys=true",
+      "Template": "{{ data|tojson(sort_keys=true) }}",
+      "Expected": "{\"a\": 1, \"b\": 2}",
+      "SourceLine": 758,
+      "VariablesJson": "{\"data\":{\"b\":2,\"a\":1}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson",
+      "Template": "{{ data|tojson }}",
+      "Expected": "{\"a\": 1, \"b\": [1, 2]}",
+      "SourceLine": 764,
+      "VariablesJson": "{\"data\":{\"a\":1,\"b\":[1,2]}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson indent=4",
+      "Template": "{{ data|tojson(indent=4) }}",
+      "Expected": "{\n    \"a\": 1,\n    \"b\": [\n        1,\n        2\n    ]\n}",
+      "SourceLine": 770,
+      "VariablesJson": "{\"data\":{\"a\":1,\"b\":[1,2]}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson separators=(',',':')",
+      "Template": "{{ data|tojson(separators=(',',':')) }}",
+      "Expected": "{\"a\":1,\"b\":[1,2]}",
+      "SourceLine": 776,
+      "VariablesJson": "{\"data\":{\"a\":1,\"b\":[1,2]}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "tojson separators=(',',': ') indent=2",
+      "Template": "{{ data|tojson(separators=(',',': '), indent=2) }}",
+      "Expected": "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}",
+      "SourceLine": 782,
+      "VariablesJson": "{\"data\":{\"a\":1,\"b\":[1,2]}}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent",
+      "Template": "{{ data|indent(2) }}",
+      "Expected": "foo\n  bar",
+      "SourceLine": 788,
+      "VariablesJson": "{\"data\":\"foo\\nbar\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent first only",
+      "Template": "{{ data|indent(width=3,first=true) }}",
+      "Expected": "   foo\n   bar",
+      "SourceLine": 794,
+      "VariablesJson": "{\"data\":\"foo\\nbar\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent blank lines and first line",
+      "Template": "{{ data|indent(width=5,blank=true,first=true) }}",
+      "Expected": "     foo\n     \n     bar",
+      "SourceLine": 800,
+      "VariablesJson": "{\"data\":\"foo\\n\\nbar\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent with default width",
+      "Template": "{{ data|indent() }}",
+      "Expected": "foo\n    bar",
+      "SourceLine": 806,
+      "VariablesJson": "{\"data\":\"foo\\nbar\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent with no newline",
+      "Template": "{{ data|indent }}",
+      "Expected": "foo",
+      "SourceLine": 812,
+      "VariablesJson": "{\"data\":\"foo\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent with trailing newline",
+      "Template": "{{ data|indent(blank=true) }}",
+      "Expected": "foo\n    ",
+      "SourceLine": 818,
+      "VariablesJson": "{\"data\":\"foo\\n\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "indent with string",
+      "Template": "{{ data|indent(width='>>>>') }}",
+      "Expected": "foo\n>>>>bar",
+      "SourceLine": 824,
+      "VariablesJson": "{\"data\":\"foo\\nbar\"}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "chained filters",
+      "Template": "{{ '  HELLO  '|trim|lower }}",
+      "Expected": "hello",
+      "SourceLine": 830,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "int filter on integer is identity",
+      "Template": "{{ value|int }}",
+      "Expected": "7",
+      "SourceLine": 836,
+      "VariablesJson": "{\"value\":7}"
+    },
+    {
+      "Group": "test_filters",
+      "Name": "none to string",
+      "Template": "{{ x|string }}",
+      "Expected": "None",
+      "SourceLine": 842,
+      "VariablesJson": "{\"x\":null}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "integer",
+      "Template": "{{ 42 }}",
+      "Expected": "42",
+      "SourceLine": 850,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "float",
+      "Template": "{{ 3.14 }}",
+      "Expected": "3.14",
+      "SourceLine": 856,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "string",
+      "Template": "{{ 'hello' }}",
+      "Expected": "hello",
+      "SourceLine": 862,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "boolean true",
+      "Template": "{{ true }}",
+      "Expected": "True",
+      "SourceLine": 868,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "boolean false",
+      "Template": "{{ false }}",
+      "Expected": "False",
+      "SourceLine": 874,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "none",
+      "Template": "{% if x is none %}null{% endif %}",
+      "Expected": "null",
+      "SourceLine": 880,
+      "VariablesJson": "{\"x\":null}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "list literal",
+      "Template": "{% for i in [1, 2, 3] %}{{ i }}{% endfor %}",
+      "Expected": "123",
+      "SourceLine": 886,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "dict literal",
+      "Template": "{% set d = {'a': 1} %}{{ d.a }}",
+      "Expected": "1",
+      "SourceLine": 892,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "integer|abs",
+      "Template": "{{ -42 | abs }}",
+      "Expected": "42",
+      "SourceLine": 898,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "integer|float",
+      "Template": "{{ 42 | float }}",
+      "Expected": "42.0",
+      "SourceLine": 904,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "integer|tojson",
+      "Template": "{{ 42 | tojson }}",
+      "Expected": "42",
+      "SourceLine": 910,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "float|abs",
+      "Template": "{{ -3.14 | abs }}",
+      "Expected": "3.14",
+      "SourceLine": 916,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "float|int",
+      "Template": "{{ 3.14 | int }}",
+      "Expected": "3",
+      "SourceLine": 922,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "float|tojson",
+      "Template": "{{ 3.14 | tojson }}",
+      "Expected": "3.14",
+      "SourceLine": 928,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "string|tojson",
+      "Template": "{{ 'hello' | tojson }}",
+      "Expected": "\"hello\"",
+      "SourceLine": 934,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "boolean|int",
+      "Template": "{{ true | int }}",
+      "Expected": "1",
+      "SourceLine": 940,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "boolean|float",
+      "Template": "{{ true | float }}",
+      "Expected": "1.0",
+      "SourceLine": 946,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_literals",
+      "Name": "boolean|tojson",
+      "Template": "{{ true | tojson }}",
+      "Expected": "true",
+      "SourceLine": 952,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_comments",
+      "Name": "inline comment",
+      "Template": "before{# comment #}after",
+      "Expected": "beforeafter",
+      "SourceLine": 960,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_comments",
+      "Name": "comment ignores code",
+      "Template": "{% set x = 1 %}{# {% set x = 999 %} #}{{ x }}",
+      "Expected": "1",
+      "SourceLine": 966,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_macros",
+      "Name": "simple macro",
+      "Template": "{% macro greet(name) %}Hello {{ name }}{% endmacro %}{{ greet('World') }}",
+      "Expected": "Hello World",
+      "SourceLine": 974,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_macros",
+      "Name": "macro default arg",
+      "Template": "{% macro greet(name='Guest') %}Hi {{ name }}{% endmacro %}{{ greet() }}",
+      "Expected": "Hi Guest",
+      "SourceLine": 980,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_macros",
+      "Name": "macro kwargs input",
+      "Template": "{% macro my_func(a, b=False) %}{% if b %}{{ a }}{% else %}nope{% endif %}{% endmacro %}{{ my_func(1, b=True) }}",
+      "Expected": "1",
+      "SourceLine": 986,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_macros",
+      "Name": "macro with multiple args",
+      "Template": "{% macro add(a, b, c=0) %}{{ a + b + c }}{% endmacro %}{{ add(1, 2) }},{{ add(1, 2, 3) }},{{ add(1, b=10) }},{{ add(1, 2, c=5) }}",
+      "Expected": "3,6,11,8",
+      "SourceLine": 992,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_macros",
+      "Name": "macro with kwarg out-of-order input",
+      "Template": "{% macro greet(first, last, greeting='Hello') %}{{ greeting }}, {{ first }} {{ last }}{% endmacro %}{{ greet(last='Smith', first='John') }},{{ greet(last='Doe', greeting='Hi', first='Jane') }}",
+      "Expected": "Hello, John Smith,Hi, Jane Doe",
+      "SourceLine": 998,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_macros",
+      "Name": "macro with caller",
+      "Template": "{%- macro nest_dict(o, i, ff='') %}\n  {{- caller(ff) }}\n  {%- for k, v in o|items %}\n    {{- i + k + ': ' }}\n    {%- if v is mapping %}\n      {{- '{' }}\n      {% call(f) nest_dict(v, i + '    ') %}\n        {{- 'fail' if ff is undefined }}\n      {%- endcall %}\n      {{- i + '}' }}\n    {% else %}\n      {{- v|string }}\n    {% endif %}\n  {%- endfor %}\n{%- endmacro %}\n{%- call(f) nest_dict({'root1': 1, 'root2': {'nest1': 1, 'nest2': {'nest3': 2}}}, '    ', 'Dict') %}\n  {{- 'fail' if ff is defined }}\n  {{- f + ' {' }}\n{% endcall %}\n{{- '}' }}",
+      "Expected": "Dict {\n    root1: 1\n    root2: {\n        nest1: 1\n        nest2: {\n            nest3: 2\n        }\n    }\n}",
+      "SourceLine": 1004,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_namespace",
+      "Name": "namespace counter",
+      "Template": "{% set ns = namespace(count=0) %}{% for i in range(3) %}{% set ns.count = ns.count + 1 %}{% endfor %}{{ ns.count }}",
+      "Expected": "3",
+      "SourceLine": 1032,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is odd",
+      "Template": "{% if 3 is odd %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1040,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is even",
+      "Template": "{% if 4 is even %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1046,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is false",
+      "Template": "{{ 'yes' if x is false }}",
+      "Expected": "yes",
+      "SourceLine": 1052,
+      "VariablesJson": "{\"x\":false}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is true",
+      "Template": "{{ 'yes' if x is true }}",
+      "Expected": "yes",
+      "SourceLine": 1058,
+      "VariablesJson": "{\"x\":true}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "string is false",
+      "Template": "{{ 'yes' if x is false else 'no' }}",
+      "Expected": "no",
+      "SourceLine": 1064,
+      "VariablesJson": "{\"x\":\"\"}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is divisibleby",
+      "Template": "{{ 'yes' if x is divisibleby(2) }}",
+      "Expected": "yes",
+      "SourceLine": 1070,
+      "VariablesJson": "{\"x\":2}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is eq",
+      "Template": "{{ 'yes' if 3 is eq(3) }}",
+      "Expected": "yes",
+      "SourceLine": 1076,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is not equalto",
+      "Template": "{{ 'yes' if 3 is not equalto(4) }}",
+      "Expected": "yes",
+      "SourceLine": 1082,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is ge",
+      "Template": "{{ 'yes' if 3 is ge(3) }}",
+      "Expected": "yes",
+      "SourceLine": 1088,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is gt",
+      "Template": "{{ 'yes' if 3 is gt(2) }}",
+      "Expected": "yes",
+      "SourceLine": 1094,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is greaterthan",
+      "Template": "{{ 'yes' if 3 is greaterthan(2) }}",
+      "Expected": "yes",
+      "SourceLine": 1100,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is lt",
+      "Template": "{{ 'yes' if 2 is lt(3) }}",
+      "Expected": "yes",
+      "SourceLine": 1106,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is lessthan",
+      "Template": "{{ 'yes' if 2 is lessthan(3) }}",
+      "Expected": "yes",
+      "SourceLine": 1112,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is ne",
+      "Template": "{{ 'yes' if 2 is ne(3) }}",
+      "Expected": "yes",
+      "SourceLine": 1118,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is lower",
+      "Template": "{{ 'yes' if 'lowercase' is lower }}",
+      "Expected": "yes",
+      "SourceLine": 1124,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is upper",
+      "Template": "{{ 'yes' if 'UPPERCASE' is upper }}",
+      "Expected": "yes",
+      "SourceLine": 1130,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is sameas",
+      "Template": "{{ 'yes' if x is sameas(false) }}",
+      "Expected": "yes",
+      "SourceLine": 1136,
+      "VariablesJson": "{\"x\":false}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is boolean",
+      "Template": "{{ 'yes' if x is boolean }}",
+      "Expected": "yes",
+      "SourceLine": 1142,
+      "VariablesJson": "{\"x\":true}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is callable",
+      "Template": "{{ 'yes' if ''.strip is callable }}",
+      "Expected": "yes",
+      "SourceLine": 1148,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is escaped",
+      "Template": "{{ 'yes' if 'foo'|safe is escaped }}",
+      "Expected": "yes",
+      "SourceLine": 1154,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is filter",
+      "Template": "{{ 'yes' if 'trim' is filter }}",
+      "Expected": "yes",
+      "SourceLine": 1160,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is float",
+      "Template": "{{ 'yes' if x is float }}",
+      "Expected": "yes",
+      "SourceLine": 1166,
+      "VariablesJson": "{\"x\":1.1}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is integer",
+      "Template": "{{ 'yes' if x is integer }}",
+      "Expected": "yes",
+      "SourceLine": 1172,
+      "VariablesJson": "{\"x\":1}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is sequence",
+      "Template": "{{ 'yes' if x is sequence }}",
+      "Expected": "yes",
+      "SourceLine": 1178,
+      "VariablesJson": "{\"x\":[1,2,3]}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is test",
+      "Template": "{{ 'yes' if 'sequence' is test }}",
+      "Expected": "yes",
+      "SourceLine": 1184,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is undefined",
+      "Template": "{{ 'yes' if x is undefined }}",
+      "Expected": "yes",
+      "SourceLine": 1190,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is none",
+      "Template": "{% if x is none %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1196,
+      "VariablesJson": "{\"x\":null}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is string",
+      "Template": "{% if x is string %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1202,
+      "VariablesJson": "{\"x\":\"hello\"}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is number",
+      "Template": "{% if x is number %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1208,
+      "VariablesJson": "{\"x\":42}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is iterable",
+      "Template": "{% if x is iterable %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1214,
+      "VariablesJson": "{\"x\":[1,2,3]}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is mapping",
+      "Template": "{% if x is mapping %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1220,
+      "VariablesJson": "{\"x\":{\"a\":1}}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "undefined is sequence",
+      "Template": "{{ 'yes' if x is sequence }}",
+      "Expected": "yes",
+      "SourceLine": 1226,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "undefined is iterable",
+      "Template": "{{ 'yes' if x is iterable }}",
+      "Expected": "yes",
+      "SourceLine": 1232,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is in (array, true)",
+      "Template": "{{ 'yes' if 2 is in([1, 2, 3]) }}",
+      "Expected": "yes",
+      "SourceLine": 1238,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is in (array, false)",
+      "Template": "{{ 'yes' if 5 is in([1, 2, 3]) else 'no' }}",
+      "Expected": "no",
+      "SourceLine": 1244,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is in (string)",
+      "Template": "{{ 'yes' if 'bc' is in('abcde') }}",
+      "Expected": "yes",
+      "SourceLine": 1250,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "is in (object keys)",
+      "Template": "{{ 'yes' if 'a' is in(obj) }}",
+      "Expected": "yes",
+      "SourceLine": 1256,
+      "VariablesJson": "{\"obj\":{\"a\":1,\"b\":2}}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "reject with in test",
+      "Template": "{{ items | reject('in', skip) | join(', ') }}",
+      "Expected": "a, c",
+      "SourceLine": 1262,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\",\"d\"],\"skip\":[\"b\",\"d\"]}"
+    },
+    {
+      "Group": "test_tests",
+      "Name": "select with in test",
+      "Template": "{{ items | select('in', keep) | join(', ') }}",
+      "Expected": "b, c",
+      "SourceLine": 1268,
+      "VariablesJson": "{\"items\":[\"a\",\"b\",\"c\",\"d\"],\"keep\":[\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.upper()",
+      "Template": "{{ s.upper() }}",
+      "Expected": "HELLO",
+      "SourceLine": 1276,
+      "VariablesJson": "{\"s\":\"hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.lower()",
+      "Template": "{{ s.lower() }}",
+      "Expected": "hello",
+      "SourceLine": 1282,
+      "VariablesJson": "{\"s\":\"HELLO\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.strip()",
+      "Template": "[{{ s.strip() }}]",
+      "Expected": "[hello]",
+      "SourceLine": 1288,
+      "VariablesJson": "{\"s\":\"  hello  \"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.lstrip()",
+      "Template": "[{{ s.lstrip() }}]",
+      "Expected": "[hello]",
+      "SourceLine": 1294,
+      "VariablesJson": "{\"s\":\"   hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.rstrip()",
+      "Template": "[{{ s.rstrip() }}]",
+      "Expected": "[hello]",
+      "SourceLine": 1300,
+      "VariablesJson": "{\"s\":\"hello   \"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.title()",
+      "Template": "{{ s.title() }}",
+      "Expected": "Hello World",
+      "SourceLine": 1306,
+      "VariablesJson": "{\"s\":\"hello world\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.capitalize()",
+      "Template": "{{ s.capitalize() }}",
+      "Expected": "Hello world",
+      "SourceLine": 1312,
+      "VariablesJson": "{\"s\":\"heLlo World\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.startswith() true",
+      "Template": "{% if s.startswith('hel') %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1318,
+      "VariablesJson": "{\"s\":\"hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.startswith() false",
+      "Template": "{% if s.startswith('xyz') %}yes{% else %}no{% endif %}",
+      "Expected": "no",
+      "SourceLine": 1324,
+      "VariablesJson": "{\"s\":\"hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.endswith() true",
+      "Template": "{% if s.endswith('lo') %}yes{% endif %}",
+      "Expected": "yes",
+      "SourceLine": 1330,
+      "VariablesJson": "{\"s\":\"hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.endswith() false",
+      "Template": "{% if s.endswith('xyz') %}yes{% else %}no{% endif %}",
+      "Expected": "no",
+      "SourceLine": 1336,
+      "VariablesJson": "{\"s\":\"hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.split() with sep",
+      "Template": "{{ s.split(',')|join('-') }}",
+      "Expected": "a-b-c",
+      "SourceLine": 1342,
+      "VariablesJson": "{\"s\":\"a,b,c\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.split() with maxsplit",
+      "Template": "{{ s.split(',', 1)|join('-') }}",
+      "Expected": "a-b,c",
+      "SourceLine": 1348,
+      "VariablesJson": "{\"s\":\"a,b,c\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.rsplit() with sep",
+      "Template": "{{ s.rsplit(',')|join('-') }}",
+      "Expected": "a-b-c",
+      "SourceLine": 1354,
+      "VariablesJson": "{\"s\":\"a,b,c\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.rsplit() with maxsplit",
+      "Template": "{{ s.rsplit(',', 1)|join('-') }}",
+      "Expected": "a,b-c",
+      "SourceLine": 1360,
+      "VariablesJson": "{\"s\":\"a,b,c\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.replace() basic",
+      "Template": "{{ s.replace('world', 'jinja') }}",
+      "Expected": "hello jinja",
+      "SourceLine": 1366,
+      "VariablesJson": "{\"s\":\"hello world\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.replace() empty",
+      "Template": "{{ s.replace('', '.') }}",
+      "Expected": ".h.e.l.l.o. .w.o.r.l.d.",
+      "SourceLine": 1372,
+      "VariablesJson": "{\"s\":\"hello world\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.replace() with count",
+      "Template": "{{ s.replace('a', 'X', 2) }}",
+      "Expected": "bXnXna",
+      "SourceLine": 1378,
+      "VariablesJson": "{\"s\":\"banana\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.format() auto numbering",
+      "Template": "{{ '<{}|{}>'.format(s, 42) }}",
+      "Expected": "<hello|42>",
+      "SourceLine": 1384,
+      "VariablesJson": "{\"s\":\"hello\"}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.format() manual numbering",
+      "Template": "{{ '{1}-{0}-{1}'.format('a', 'b') }}",
+      "Expected": "b-a-b",
+      "SourceLine": 1390,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.format() named fields",
+      "Template": "{{ '{name} is {age}'.format(name='Bob', age=7) }}",
+      "Expected": "Bob is 7",
+      "SourceLine": 1396,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.format() escaped braces",
+      "Template": "{{ '{{}} {} {{x}}'.format('mid') }}",
+      "Expected": "{} mid {x}",
+      "SourceLine": 1402,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "string.format() no fields",
+      "Template": "{{ 'plain'.format() }}",
+      "Expected": "plain",
+      "SourceLine": 1408,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|capitalize",
+      "Template": "{{ arr|capitalize }}",
+      "Expected": "",
+      "SourceLine": 1414,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|title",
+      "Template": "{{ arr|title }}",
+      "Expected": "",
+      "SourceLine": 1420,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|truncate",
+      "Template": "{{ arr|truncate(9) }}",
+      "Expected": "",
+      "SourceLine": 1426,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|upper",
+      "Template": "{{ arr|upper }}",
+      "Expected": "",
+      "SourceLine": 1432,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|lower",
+      "Template": "{{ arr|lower }}",
+      "Expected": "",
+      "SourceLine": 1438,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|replace",
+      "Template": "{{ arr|replace('a', 'b') }}",
+      "Expected": "",
+      "SourceLine": 1444,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|trim",
+      "Template": "{{ arr|trim }}",
+      "Expected": "",
+      "SourceLine": 1450,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_string_methods",
+      "Name": "undefined|wordcount",
+      "Template": "{{ arr|wordcount }}",
+      "Expected": "0",
+      "SourceLine": 1456,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|selectattr by attribute",
+      "Template": "{% for item in items|selectattr('active') %}{{ item.name }} {% endfor %}",
+      "Expected": "a c ",
+      "SourceLine": 1464,
+      "VariablesJson": "{\"items\":[{\"name\":\"a\",\"active\":true},{\"name\":\"b\",\"active\":false},{\"name\":\"c\",\"active\":true}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|selectattr with operator",
+      "Template": "{% for item in items|selectattr('value', 'equalto', 5) %}{{ item.name }} {% endfor %}",
+      "Expected": "b c ",
+      "SourceLine": 1474,
+      "VariablesJson": "{\"items\":[{\"name\":\"a\",\"value\":3},{\"name\":\"b\",\"value\":5},{\"name\":\"c\",\"value\":5}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|tojson",
+      "Template": "{{ arr|tojson }}",
+      "Expected": "[1, 2, 3]",
+      "SourceLine": 1484,
+      "VariablesJson": "{\"arr\":[1,2,3]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|tojson with strings",
+      "Template": "{{ arr|tojson }}",
+      "Expected": "[\"a\", \"b\", \"c\"]",
+      "SourceLine": 1490,
+      "VariablesJson": "{\"arr\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|tojson nested",
+      "Template": "{{ arr|tojson }}",
+      "Expected": "[[1, 2], [3, 4]]",
+      "SourceLine": 1496,
+      "VariablesJson": "{\"arr\":[[1,2],[3,4]]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|last",
+      "Template": "{{ arr|last }}",
+      "Expected": "30",
+      "SourceLine": 1502,
+      "VariablesJson": "{\"arr\":[10,20,30]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|last single element",
+      "Template": "{{ arr|last }}",
+      "Expected": "42",
+      "SourceLine": 1508,
+      "VariablesJson": "{\"arr\":[42]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|join with separator",
+      "Template": "{{ arr|join(', ') }}",
+      "Expected": "a, b, c",
+      "SourceLine": 1514,
+      "VariablesJson": "{\"arr\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|join with custom separator",
+      "Template": "{{ arr|join(' | ') }}",
+      "Expected": "1 | 2 | 3",
+      "SourceLine": 1520,
+      "VariablesJson": "{\"arr\":[1,2,3]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|join default separator",
+      "Template": "{{ arr|join }}",
+      "Expected": "xyz",
+      "SourceLine": 1526,
+      "VariablesJson": "{\"arr\":[\"x\",\"y\",\"z\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|join attribute",
+      "Template": "{{ arr|join(attribute='age') }}",
+      "Expected": "123",
+      "SourceLine": 1532,
+      "VariablesJson": "{\"arr\":[{\"name\":\"a\",\"age\":1},{\"name\":\"b\",\"age\":2},{\"name\":\"c\",\"age\":3}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|join numeric attribute",
+      "Template": "{{ arr|join(attribute=-1) }}",
+      "Expected": "123",
+      "SourceLine": 1542,
+      "VariablesJson": "{\"arr\":[[1],[2],[3]]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array.pop() last",
+      "Template": "{{ arr.pop() }}-{{ arr|join(',') }}",
+      "Expected": "c-a,b",
+      "SourceLine": 1548,
+      "VariablesJson": "{\"arr\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array.pop() with index",
+      "Template": "{{ arr.pop(0) }}-{{ arr|join(',') }}",
+      "Expected": "a-b,c",
+      "SourceLine": 1554,
+      "VariablesJson": "{\"arr\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array.append()",
+      "Template": "{% set _ = arr.append('d') %}{{ arr|join(',') }}",
+      "Expected": "a,b,c,d",
+      "SourceLine": 1560,
+      "VariablesJson": "{\"arr\":[\"a\",\"b\",\"c\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|map with attribute",
+      "Template": "{% for v in arr|map(attribute='age') %}{{ v }} {% endfor %}",
+      "Expected": "1 2 3 ",
+      "SourceLine": 1566,
+      "VariablesJson": "{\"arr\":[{\"name\":\"a\",\"age\":1},{\"name\":\"b\",\"age\":2},{\"name\":\"c\",\"age\":3}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|map with attribute default",
+      "Template": "{% for v in arr|map(attribute='age', default=3) %}{{ v }} {% endfor %}",
+      "Expected": "1 2 3 ",
+      "SourceLine": 1576,
+      "VariablesJson": "{\"arr\":[{\"name\":\"a\",\"age\":1},{\"name\":\"b\",\"age\":2},{\"name\":\"c\"}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|map without attribute default",
+      "Template": "{% for v in arr|map(attribute='age') %}{{ v }} {% endfor %}",
+      "Expected": "1 2  ",
+      "SourceLine": 1586,
+      "VariablesJson": "{\"arr\":[{\"name\":\"a\",\"age\":1},{\"name\":\"b\",\"age\":2},{\"name\":\"c\"}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|map with numeric attribute",
+      "Template": "{% for v in arr|map(attribute=0) %}{{ v }} {% endfor %}",
+      "Expected": "10 20 30 ",
+      "SourceLine": 1596,
+      "VariablesJson": "{\"arr\":[[10,\"x\"],[20,\"y\"],[30,\"z\"]]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|map with negative attribute",
+      "Template": "{% for v in arr|map(attribute=-1) %}{{ v }} {% endfor %}",
+      "Expected": "x y z ",
+      "SourceLine": 1606,
+      "VariablesJson": "{\"arr\":[[10,\"x\"],[20,\"y\"],[30,\"z\"]]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|map with filter",
+      "Template": "{{ arr|map('int')|sum }}",
+      "Expected": "6",
+      "SourceLine": 1616,
+      "VariablesJson": "{\"arr\":[\"1\",\"2\",\"3\"]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|min",
+      "Template": "{{ [tool_calls_count, tool_sep_count]|min }}",
+      "Expected": "1",
+      "SourceLine": 1622,
+      "VariablesJson": "{\"tool_calls_count\":2,\"tool_sep_count\":1}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|max",
+      "Template": "{{ [tool_calls_count, tool_sep_count]|max }}",
+      "Expected": "2",
+      "SourceLine": 1628,
+      "VariablesJson": "{\"tool_calls_count\":2,\"tool_sep_count\":1}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|min attribute",
+      "Template": "{{ items|min(attribute='x') }}",
+      "Expected": "{'x': 1}",
+      "SourceLine": 1634,
+      "VariablesJson": "{\"items\":[{\"x\":2},{\"x\":1}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "array|max attribute",
+      "Template": "{{ items|max(attribute='x') }}",
+      "Expected": "{'x': 2}",
+      "SourceLine": 1643,
+      "VariablesJson": "{\"items\":[{\"x\":2},{\"x\":1}]}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|select",
+      "Template": "{% for item in items|select('odd') %}{{ item.name }} {% endfor %}",
+      "Expected": "",
+      "SourceLine": 1659,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|selectattr",
+      "Template": "{% for item in items|selectattr('active') %}{{ item.name }} {% endfor %}",
+      "Expected": "",
+      "SourceLine": 1665,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|reject",
+      "Template": "{% for item in items|reject('even') %}{{ item.name }} {% endfor %}",
+      "Expected": "",
+      "SourceLine": 1671,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|rejectattr",
+      "Template": "{% for item in items|rejectattr('active') %}{{ item.name }} {% endfor %}",
+      "Expected": "",
+      "SourceLine": 1677,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|list",
+      "Template": "{{ arr|list|string }}",
+      "Expected": "[]",
+      "SourceLine": 1683,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|string",
+      "Template": "{{ arr|string }}",
+      "Expected": "",
+      "SourceLine": 1689,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|first",
+      "Template": "{{ arr|first }}",
+      "Expected": "",
+      "SourceLine": 1695,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|last",
+      "Template": "{{ arr|last }}",
+      "Expected": "",
+      "SourceLine": 1701,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|length",
+      "Template": "{{ arr|length }}",
+      "Expected": "0",
+      "SourceLine": 1707,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|join",
+      "Template": "{{ arr|join }}",
+      "Expected": "",
+      "SourceLine": 1713,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|sort",
+      "Template": "{{ arr|sort|string }}",
+      "Expected": "[]",
+      "SourceLine": 1719,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|reverse",
+      "Template": "{{ arr|reverse|join }}",
+      "Expected": "",
+      "SourceLine": 1725,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|map",
+      "Template": "{% for v in arr|map(attribute='age') %}{{ v }} {% endfor %}",
+      "Expected": "",
+      "SourceLine": 1731,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|min",
+      "Template": "{{ arr|min }}",
+      "Expected": "",
+      "SourceLine": 1737,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|max",
+      "Template": "{{ arr|max }}",
+      "Expected": "",
+      "SourceLine": 1743,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|unique",
+      "Template": "{{ arr|unique|join }}",
+      "Expected": "",
+      "SourceLine": 1749,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_array_methods",
+      "Name": "undefined|sum",
+      "Template": "{{ arr|sum }}",
+      "Expected": "0",
+      "SourceLine": 1755,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object.get() existing key",
+      "Template": "{{ obj.get('a') }}",
+      "Expected": "1",
+      "SourceLine": 1763,
+      "VariablesJson": "{\"obj\":{\"a\":1,\"b\":2}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object.get() missing key",
+      "Template": "[{{ obj.get('c') is none }}]",
+      "Expected": "[True]",
+      "SourceLine": 1769,
+      "VariablesJson": "{\"obj\":{\"a\":1}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object.get() missing key with default",
+      "Template": "{{ obj.get('c', 'default') }}",
+      "Expected": "default",
+      "SourceLine": 1775,
+      "VariablesJson": "{\"obj\":{\"a\":1}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object.items()",
+      "Template": "{% for k, v in obj.items() %}{{ k }}={{ v }} {% endfor %}",
+      "Expected": "x=1 y=2 ",
+      "SourceLine": 1781,
+      "VariablesJson": "{\"obj\":{\"x\":1,\"y\":2}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object.keys()",
+      "Template": "{% for k in obj.keys() %}{{ k }} {% endfor %}",
+      "Expected": "a b ",
+      "SourceLine": 1787,
+      "VariablesJson": "{\"obj\":{\"a\":1,\"b\":2}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object.values()",
+      "Template": "{% for v in obj.values() %}{{ v }} {% endfor %}",
+      "Expected": "1 2 ",
+      "SourceLine": 1793,
+      "VariablesJson": "{\"obj\":{\"a\":1,\"b\":2}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "dictsort ascending by key",
+      "Template": "{% for k, v in obj|dictsort %}{{ k }}={{ v }} {% endfor %}",
+      "Expected": "a=3 m=1 z=2 ",
+      "SourceLine": 1799,
+      "VariablesJson": "{\"obj\":{\"z\":2,\"a\":3,\"m\":1}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "dictsort descending by key",
+      "Template": "{% for k, v in obj|dictsort(reverse=true) %}{{ k }}={{ v }} {% endfor %}",
+      "Expected": "c=3 b=2 a=1 ",
+      "SourceLine": 1805,
+      "VariablesJson": "{\"obj\":{\"a\":1,\"b\":2,\"c\":3}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "dictsort by value",
+      "Template": "{% for k, v in obj|dictsort(by='value') %}{{ k }}={{ v }} {% endfor %}",
+      "Expected": "b=1 c=2 a=3 ",
+      "SourceLine": 1811,
+      "VariablesJson": "{\"obj\":{\"a\":3,\"b\":1,\"c\":2}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "dictsort case sensitive",
+      "Template": "{% for k, v in obj|dictsort(case_sensitive=true) %}{{ k }}={{ v }} {% endfor %}",
+      "Expected": "A=1 B=2 a=1 b=2 c=3 ",
+      "SourceLine": 1817,
+      "VariablesJson": "{\"obj\":{\"a\":1,\"A\":1,\"b\":2,\"B\":2,\"c\":3}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object|tojson",
+      "Template": "{{ obj|tojson }}",
+      "Expected": "{\"name\": \"test\", \"value\": 42}",
+      "SourceLine": 1823,
+      "VariablesJson": "{\"obj\":{\"name\":\"test\",\"value\":42}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "nested object|tojson",
+      "Template": "{{ obj|tojson }}",
+      "Expected": "{\"outer\": {\"inner\": \"value\"}}",
+      "SourceLine": 1829,
+      "VariablesJson": "{\"obj\":{\"outer\":{\"inner\":\"value\"}}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "array in object|tojson",
+      "Template": "{{ obj|tojson }}",
+      "Expected": "{\"items\": [1, 2, 3]}",
+      "SourceLine": 1835,
+      "VariablesJson": "{\"obj\":{\"items\":[1,2,3]}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "object attribute and key access",
+      "Template": "{{ obj.keys()|join(',') }} vs {{ obj['keys'] }} vs {{ obj.test }}",
+      "Expected": "keys,test vs value vs attr_value",
+      "SourceLine": 1841,
+      "VariablesJson": "{\"obj\":{\"keys\":\"value\",\"test\":\"attr_value\"}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "env should not have object methods",
+      "Template": "{{ keys is undefined }} {{ obj.keys is defined }}",
+      "Expected": "True True",
+      "SourceLine": 1847,
+      "VariablesJson": "{\"obj\":{\"a\":\"b\"}}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "expression as object key",
+      "Template": "{% set d = {'ab': 123} %}{{ d['a' + 'b'] == 123 }}",
+      "Expected": "True",
+      "SourceLine": 1853,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "numeric as object key (template: Seed-OSS)",
+      "Template": "{% set d = {1: 'a', 2: 'b'} %}{{ d[1] == 'a' and d[2] == 'b' }}",
+      "Expected": "True",
+      "SourceLine": 1859,
+      "VariablesJson": "{}"
+    },
+    {
+      "Group": "test_object_methods",
+      "Name": "undefined|items",
+      "Template": "{{ arr|items|join }}",
+      "Expected": "",
+      "SourceLine": 1865,
+      "VariablesJson": "{}"
+    }
+  ]
+}

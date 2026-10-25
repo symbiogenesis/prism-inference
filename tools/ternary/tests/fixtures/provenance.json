@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "sourceRevision": "d7bab354d0848215f0a9bb4d6699b218cc1e90f7",
+  "sourceCppSha256": "2258495bcde9358cfc63d7b30a3b1eaa5df8d9765cf415d037b47dd4ac890c3d",
+  "sourceHeaderSha256": "c34fc0232cf406dd2f3c702de731020334228807f1a5e41b72440500a5bac253",
+  "generatorSha256": "05960156c2b1bd839da5464b995c57591dcba93709d52086a661a1acb81f5420",
+  "originalFixtureSha256": "e49b6937fb0d40e3784c2e994740b280a7e4e9aa23f1ab7d4609a13a7a463431",
+  "fixtureSha256": "de86d0ff0e31037635ae5f607bcb68d4e62ee7cb5d1b5db5e739ef900114fd79",
+  "fixtureBytes": 62964,
+  "format": "PTPAR001",
+  "cases": 161,
+  "rows": 169,
+  "halfPatterns": 26,
+  "compiler": "MSVC 19.51.36260.0",
+  "architecture": "ARM64",
+  "configuration": "Release /fp:strict",
+  "projection": "Original half-conversion records and row-major PQ2/PTQ bytes retained in original order; all other fields removed",
+  "comparison": "Rust PQ2/PTQ packing, decoding and FP16 conversion agree with captured native C++ bytes and result bits",
+  "scope": "model-free focused codec correctness; no inference or performance qualification"
+}

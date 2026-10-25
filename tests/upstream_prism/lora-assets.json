@@ -1,0 +1,205 @@
+{
+  "Repository": "ggml-org/lora-tests",
+  "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+  "Source": "tests/test-lora-conversion-inference.sh",
+  "SourceSha256": "69584616380bdaa7f6ee1e53d165408118fb0897e1280f964eb7bc3b932b9c9a",
+  "AssetPrefix": "lora-tests/",
+  "Files": [
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/data/bohemian_rhapsody.txt",
+      "Bytes": 326,
+      "Sha256": "9aa5b3cbe0f1271ce9fad91aa2783d8bc32d83b0e64a44997ce7571acfb5d893",
+      "GitBlobSha1": "ab00a7a6718c84736f1447f433c0455aa6713e7a",
+      "Path": "data/bohemian_rhapsody.txt"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/data/pale_blue_dot.txt",
+      "Bytes": 708,
+      "Sha256": "e1df76315c7a764764846c13b7e19a971d52985793da2f9b4517b35994f7fb9b",
+      "GitBlobSha1": "98111125d3167df2a8914ffa19451421f6dfe7b4",
+      "Path": "data/pale_blue_dot.txt"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/config.json",
+      "Bytes": 890,
+      "Sha256": "ad3b665321303c815d252ad611ea6c9e781e3783ca3a1f9993e6fd38128b33dc",
+      "GitBlobSha1": "5c537e052eb12ae3f73371323aceec7b0f21173f",
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/config.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/generation_config.json",
+      "Bytes": 168,
+      "Sha256": "9dfc4f324ba2c40d2a68a1512fd026394dcaab1f88ed901346ae213e8a3d9fb4",
+      "GitBlobSha1": "0d58f39b18a4d5a2d35a08d818890d28066fc68a",
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/generation_config.json"
+    },
+    {
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/model.safetensors",
+      "GitBlobSha1": "22039144a5ce0362b2ad31dd58b84eef8f9d738a",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/model.safetensors",
+      "Bytes": 77095912,
+      "Sha256": "ee0835eae25ed356316ddfa77e644e7a2a82c801332f218c55687996a742b98e"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/special_tokens_map.json",
+      "Bytes": 636,
+      "Sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351",
+      "GitBlobSha1": "8d6368f7e735fbe4781bf6e956b7c6ad0586df80",
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/special_tokens_map.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer_config.json",
+      "Bytes": 46379,
+      "Sha256": "bb8245b8d39a065fdf869ee4fce48db9cc491473eb7ff1b41d321fb4caf540d1",
+      "GitBlobSha1": "2357fc1a512dc3881eb99b9df3ef8e97ef7ffd51",
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/tokenizer_config.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer.json",
+      "Sha256": "3f289bc05132635a8bc7aca7aa21255efd5e18f3710f43e3cdb96bcd41be4922",
+      "Bytes": 17525357,
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/tokenizer.json",
+      "GitBlobSha1": "af0eac5c0056f83b8f3fcdb79165f8847111c305"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer.model",
+      "Sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+      "Bytes": 4241003,
+      "Path": "Gemma2ForCausalLM/hidden_size=64/base/tokenizer.model",
+      "GitBlobSha1": "796efe9ab515c15e146ce7588e6d7b9b8134dbf8"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/lora/adapter_config.json",
+      "Bytes": 733,
+      "Sha256": "9fce65d3de44765e22ca00a58cdba43457451a0f17844e7935d89bcf8767e20a",
+      "GitBlobSha1": "a55320e1f6ae0b2cfacc66f8fb366e4843eefbc5",
+      "Path": "Gemma2ForCausalLM/hidden_size=64/lora/adapter_config.json"
+    },
+    {
+      "Path": "Gemma2ForCausalLM/hidden_size=64/lora/adapter_model.safetensors",
+      "GitBlobSha1": "2b8038b7c64014744ff13838e00c00ce29c9b9b2",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/lora/adapter_model.safetensors",
+      "Bytes": 5364960,
+      "Sha256": "7a60d30f1ed226ee9361bb4337380d22a6b84039ba026014fe9d9a4cf3eb1b7f"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/base/config.json",
+      "Bytes": 741,
+      "Sha256": "192e3617a38cf053aead450d240cb35dc9c7464655292e4d5d2f4c37c9f190f7",
+      "GitBlobSha1": "32b9cf61fb6c203ab79070e202af5ef959cbe801",
+      "Path": "LlamaForCausalLM/hidden_size=64/base/config.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/base/generation_config.json",
+      "Bytes": 194,
+      "Sha256": "aa72afb017dc4b8717fb38f540cb1a89b3200a35ef2e158550f18ee7791200cf",
+      "GitBlobSha1": "a466d704364294327cf15da1f64e227f98aa4bb2",
+      "Path": "LlamaForCausalLM/hidden_size=64/base/generation_config.json"
+    },
+    {
+      "Path": "LlamaForCausalLM/hidden_size=64/base/model.safetensors",
+      "GitBlobSha1": "a69ce612f7b2824af1dc8eab3ea085c47d7b6bae",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/base/model.safetensors",
+      "Bytes": 68598584,
+      "Sha256": "8f88983f4a197958c8e1e88802495b9ddd090421bfd43b4cb13276d4471d4d83"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/base/special_tokens_map.json",
+      "Bytes": 439,
+      "Sha256": "208d307467cabecb563e033fdb478b7c11a1bc6eca9a9c761bf6a303ccfce4c1",
+      "GitBlobSha1": "344c8261025248cbe380e52f8730a03149d599e1",
+      "Path": "LlamaForCausalLM/hidden_size=64/base/special_tokens_map.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/base/tokenizer_config.json",
+      "Bytes": 51006,
+      "Sha256": "cdaab4a243135459480bf2f80139e65da594efe9486bf1171b457561856f44c1",
+      "GitBlobSha1": "061e40d9db3253624f86e8e364c15ef546527c9d",
+      "Path": "LlamaForCausalLM/hidden_size=64/base/tokenizer_config.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/base/tokenizer.json",
+      "Sha256": "e134af98b985517b4f068e3755ae90d4e9cd2d45d328325dc503f1c6b2d06cc7",
+      "Bytes": 9085698,
+      "Path": "LlamaForCausalLM/hidden_size=64/base/tokenizer.json",
+      "GitBlobSha1": "b197f72effb9d5ed16ee0f5663e11e4cfac2ba62"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/lora/adapter_config.json",
+      "Bytes": 747,
+      "Sha256": "811e9d4f8e3877e87db30f14b5d36a7bbb1c9a695ebd4d9c9890de0411d774fd",
+      "GitBlobSha1": "c8ef502cc5f1a83bfbc5c9ddc4ed5a6cf90cf61d",
+      "Path": "LlamaForCausalLM/hidden_size=64/lora/adapter_config.json"
+    },
+    {
+      "Path": "LlamaForCausalLM/hidden_size=64/lora/adapter_model.safetensors",
+      "GitBlobSha1": "d58b374bb010fcf05282d1ef2e7bb7af11131a1b",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/LlamaForCausalLM/hidden_size=64/lora/adapter_model.safetensors",
+      "Bytes": 52061632,
+      "Sha256": "6cf1e0f1254d5b391eebf7168ff4313a44794b10a82e276d72bd9a0499a5fd62"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/config.json",
+      "Bytes": 1023,
+      "Sha256": "011bb62bea753a319c6fc53662b26fce85b5548c16e0732e64e40cdea59b3ec4",
+      "GitBlobSha1": "55a8e02c99cc52bec5b85586b74ef65d0e6fe635",
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/config.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/generation_config.json",
+      "Bytes": 172,
+      "Sha256": "9423e64061d949f5987b7ae79a3747fb6a7a6e172a4743f91933753180a9c2ae",
+      "GitBlobSha1": "bc13e36b1e0af63278590b3fb9064f7c220510b9",
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/generation_config.json"
+    },
+    {
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/model.safetensors",
+      "GitBlobSha1": "5290bca7ec63b2f8648f683789eb4dd85042accf",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/model.safetensors",
+      "Bytes": 20124656,
+      "Sha256": "0826589ddd9614f3de9d4a7831be9758283c2a5e6fc55a444463356f59684c03"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/special_tokens_map.json",
+      "Bytes": 569,
+      "Sha256": "474d699677e264edd3851559548cbbb61801ad8da6b249c81455007602313c34",
+      "GitBlobSha1": "50b4d340a6844ec4ac9e7c9b194cdd75b108aca1",
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/special_tokens_map.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/tokenizer_config.json",
+      "Bytes": 3339,
+      "Sha256": "83cc1cd0a237101b3bd508a40e53a066548493525a2a49572e12fe467fd119c0",
+      "GitBlobSha1": "44bb4ab9f06a6863364f855ffe19c6e21488f2fe",
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/tokenizer_config.json"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/tokenizer.json",
+      "Sha256": "d0f067e1e15cd0a36ebef3668024882cb67a80b86fb4b7b4b128481f0d474db7",
+      "Bytes": 1844436,
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/tokenizer.json",
+      "GitBlobSha1": "2f4cf1e18cb543d31aedc307a6b5968a201569bc"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/base/tokenizer.model",
+      "Sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+      "Bytes": 499723,
+      "Path": "Phi3ForCausalLM/hidden_size=64/base/tokenizer.model",
+      "GitBlobSha1": "6c00c742ce03c627d6cd5b795984876fa49fa899"
+    },
+    {
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/lora/adapter_config.json",
+      "Bytes": 746,
+      "Sha256": "fbbe970cc605a473cc650182542933371945d3791d8193fee028138ce13d11ab",
+      "GitBlobSha1": "bed729bc42af0152ea011dc0370d92a98a9df4b7",
+      "Path": "Phi3ForCausalLM/hidden_size=64/lora/adapter_config.json"
+    },
+    {
+      "Path": "Phi3ForCausalLM/hidden_size=64/lora/adapter_model.safetensors",
+      "GitBlobSha1": "eb836ee8c5ab54d3d381754f2d4bfa9eee347213",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Phi3ForCausalLM/hidden_size=64/lora/adapter_model.safetensors",
+      "Bytes": 12853720,
+      "Sha256": "ccacc822bab2b05660b4dcfedf945804fbb49032cfdcf70238ca91d738c91cbc"
+    }
+  ]
+}

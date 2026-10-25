@@ -1,0 +1,126 @@
+{
+  "Source": "tests/test-dspark-real-eval.cpp",
+  "SourceSha256": "d420abbcdf9d7c191d0fa1ac2e9859ab9c67e09a3f59e9b79db45875f3dbc7c9",
+  "Prompts": [
+    {
+      "Category": "code",
+      "Text": "def is_prime(n):\n    \"\"\"Return True if n is a prime number, else False.\"\"\"\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "import heapq\n\ndef k_smallest(nums, k):\n    \"\"\"Return the k smallest elements of nums, sorted.\"\"\"\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "class LRUCache:\n    \"\"\"A least-recently-used cache with fixed capacity.\"\"\"\n    def __init__(self, capacity: int):\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "// Reverse a singly linked list in place.\nstruct Node { int val; Node* next; };\nNode* reverse(Node* head) {\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "def merge_intervals(intervals):\n    \"\"\"Given a list of [start, end] intervals, merge all overlapping ones.\"\"\"\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "#include <vector>\n#include <algorithm>\n// Binary search for the first index where arr[i] >= target.\nint lower_bound_idx(std::vector<int>& arr, int target) {\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "def quicksort(arr):\n    \"\"\"Sort arr in place using the quicksort algorithm.\"\"\"\n    if len(arr) <= 1:\n        return arr\n",
+      "Messages": []
+    },
+    {
+      "Category": "code",
+      "Text": "-- SQL: return the top 3 highest-paid employees per department.\nSELECT\n",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: What's the difference between a list and a tuple in Python?\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: Can you explain how photosynthesis works, in simple terms?\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: I have $500 and want to invest it for 5 years. What are some options to consider?\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: Write a short, friendly email declining a meeting invite because of a scheduling conflict.\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: What are three practical tips for improving sleep quality?\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: Explain the plot of Romeo and Juliet in two sentences.\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: My laptop fan is very loud under light load. What should I check first?\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "chat",
+      "Text": "Q: Summarize the main causes of the French Revolution in a short paragraph.\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: A train leaves city A at 60 mph and another leaves city B (300 miles away) at 90 mph, heading toward each other. How long until they meet?\nA: Let's think step by step.",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: If all bloops are razzies and all razzies are lazzies, are all bloops definitely lazzies? Explain.\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: A store marks up an item by 40% then offers a 25% discount off the marked-up price. Is the final price higher or lower than the original? By how much?\nA: Let's think step by step.",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: Why is the sky blue during the day but red/orange at sunset?\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: You have 8 identical-looking balls, one of which is heavier. Using a balance scale only twice, how do you find the heavier ball?\nA: Let's think step by step.",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: Which is a better estimate of the number of piano tuners in a large city: 50, 500, or 5000? Explain your reasoning.\nA:",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: Two coworkers, Alice and Bob, always tell the truth or always lie. Alice says \"Bob always lies.\" What can you conclude?\nA: Let's think step by step.",
+      "Messages": []
+    },
+    {
+      "Category": "reasoning",
+      "Text": "Q: A recipe calls for 3/4 cup of sugar for 12 cookies. How much sugar is needed for 30 cookies?\nA: Let's think step by step.",
+      "Messages": []
+    }
+  ]
+}

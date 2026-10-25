@@ -1,0 +1,134 @@
+{
+  "InputSelectionVersion": 3,
+  "DefaultBpeAcceptance": ["aquila", "gpt-2", "gpt-neox", "llama-bpe", "mpt", "refact", "starcoder"],
+  "OriginalBpeDiagnostics": ["falcon"],
+  "ProductionCorrection": {
+    "RelativeSource": "src/llama-vocab.cpp",
+    "PatchPath": "tools/prism/upstream/patches/llama3-cleanup.patch",
+    "BeforeSha256": "32b8b7ac4a023bc6367eb7832e56e988ab7373a676ddcca4977665f78932ab88",
+    "AfterSha256": "ecb6ffd1b5248384b96360acbb47bd3a6b8f8aebb547dade3b9429d8c00ff6e2",
+    "CanonicalPatchSha256": "b52f1cceb6a36f9f511503c2e550a9b18a718c4b10272dbdf64cbfae8ae5fd01",
+    "Scope": ["llama3", "llama-v3", "llama-bpe"],
+    "Reason": "Canonical Meta Llama3 tiktoken decoding preserves punctuation spaces; disable destructive cleanup only for its three metadata aliases. All input bytes, merges, regexes and source predicates remain unchanged."
+  },
+  "InputSelectionPolicy": {
+    "SourceParameters": "The original source accepts a vocabulary path and optional --ignore-merges; its eight CMake examples are commented out, not an exhaustive mandatory input list.",
+    "Acceptance": "Six compatible original false-flag inputs plus the original unchanged llama-bpe vocabulary with --ignore-merges and the explicit production cleanup correction exercise every original predicate and flag branch. Full source qualification remains required in hosted CI.",
+    "FalconDiagnostic": "Original input and false flag retained. Its vocabulary has no representation for byte04, so the unconditional full-Unicode equality assertion is unsatisfiable for that input.",
+    "LlamaBpeRestoration": "Original input and true flag restored after correcting the independently proven production decoder defect. The unpatched engine changes raw token24268 from space-!-$ to !-$; canonical Meta/tiktoken decoding preserves the space.",
+    "RejectedQwen2Profile": "Version2 incorrectly paired ordinary Qwen2 BPE with the source --ignore-merges assertion. Hosted40135284111 failed normal token77150 fullwidth10, correctly split by the published one-numeric-codepoint regex. No Qwen2 production change is justified; its speculative extra asset is removed.",
+    "PreviousHostedEvidence": "40131582460 original Falcon/Llama failures; 40135284111 six complete original false-flag passes and incompatible Qwen2 true-flag failure. Diagnostics retain actual failure status and SourceCount0, never an expected-failure pass."
+  },
+  "Sources": [
+    {
+      "Source": "tests/test-tokenizer-1-spm.cpp",
+      "Sha256": "87ca4367b6acd9ddf1e3fc694f2ae02b569070eb66faa5f88068f81aaed35bfb"
+    },
+    {
+      "Source": "tests/test-tokenizer-1-bpe.cpp",
+      "Sha256": "2de134d10ff27590c714cfa70a75beb07be4dbeb971f78f2d9969ed0daaee36a"
+    }
+  ],
+  "Vocabularies": [
+    {
+      "Name": "llama-spm",
+      "ExpectedType": 1,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 32000,
+      "RawTokenBytes": 210919,
+      "MaxRawTokenBytes": 48,
+      "Length": 723869,
+      "Sha256": "16c3724582d59aa8bf84711894e833f916ee46a31d80e21312759c48bf8d0e69"
+    },
+    {
+      "Name": "baichuan",
+      "ExpectedType": 1,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 64000,
+      "RawTokenBytes": 316144,
+      "MaxRawTokenBytes": 27,
+      "Length": 1340998,
+      "Sha256": "4f5b955697f3bd3108070b1d5936c7eb9fc542b81c6932e59abddec75bca1963"
+    },
+    {
+      "Name": "aquila",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 100008,
+      "RawTokenBytes": 1163775,
+      "MaxRawTokenBytes": 1024,
+      "Length": 4825676,
+      "Sha256": "7c53c3c516ac67c7ca12977b9690fdea3d2ef13bbaed6378f98191a13ef5ca00"
+    },
+    {
+      "Name": "falcon",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 65024,
+      "RawTokenBytes": 462041,
+      "MaxRawTokenBytes": 130,
+      "Length": 2287728,
+      "Sha256": "9f0bf8b0733680398b72e652e90f260f43782f326e75545fc0e49611a5ba35ad"
+    },
+    {
+      "Name": "gpt-2",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 50257,
+      "RawTokenBytes": 356735,
+      "MaxRawTokenBytes": 256,
+      "Length": 1766807,
+      "Sha256": "cedc56ca6e2e89f63e781696d1fd76b4b1d49e6720dee86463e915f6e90016ac"
+    },
+    {
+      "Name": "gpt-neox",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 50432,
+      "RawTokenBytes": 358831,
+      "MaxRawTokenBytes": 1024,
+      "Length": 1771431,
+      "Sha256": "ae593a7f9b8bb174ed4f5019e41530463e4dac7aa06e42dee8aa650d2bdac53d"
+    },
+    {
+      "Name": "llama-bpe",
+      "ExpectedType": 2,
+      "IgnoreMerges": true,
+      "TokenMetadataCount": 128256,
+      "RawTokenBytes": 1073445,
+      "MaxRawTokenBytes": 256,
+      "Length": 7818140,
+      "Sha256": "97272e430d53bc7688f52d5e0ad8ea8f163ede9f1bbd1694feaa504797d5d96e"
+    },
+    {
+      "Name": "mpt",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 50432,
+      "RawTokenBytes": 358831,
+      "MaxRawTokenBytes": 1024,
+      "Length": 1771393,
+      "Sha256": "59dc382612866d1fc6c11ea531318d327598f3412d9c8f8600607cdf3030898f"
+    },
+    {
+      "Name": "refact",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 49216,
+      "RawTokenBytes": 345288,
+      "MaxRawTokenBytes": 512,
+      "Length": 1720710,
+      "Sha256": "ac3ceda902fed91ccf74312b305d9b86c37e4f8e35fa9cc6ef3ce34fca7d4678"
+    },
+    {
+      "Name": "starcoder",
+      "ExpectedType": 2,
+      "IgnoreMerges": false,
+      "TokenMetadataCount": 49152,
+      "RawTokenBytes": 344855,
+      "MaxRawTokenBytes": 512,
+      "Length": 1719346,
+      "Sha256": "fedb892b4e1bd3c1f2fcdae356440b14fb458f4264d586e5c987ed93df4e174d"
+    }
+  ]
+}

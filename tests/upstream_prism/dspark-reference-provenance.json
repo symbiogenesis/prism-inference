@@ -1,0 +1,34 @@
+{
+  "Repository": "https://github.com/deepseek-ai/DeepSpec",
+  "Revision": "005e03b81cec38b7da6399833d609ee89a2587f2",
+  "Files": [
+    {
+      "Path": "deepspec/modeling/dspark/qwen3/modeling.py",
+      "Url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/deepspec/modeling/dspark/qwen3/modeling.py",
+      "SHA256": "9ad90bcb926b32b5144e8a27816ef18b51e9e5ee083108c5fbd8f63bc92b3953"
+    },
+    {
+      "Path": "deepspec/eval/dspark/draft_ops.py",
+      "Url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/deepspec/eval/dspark/draft_ops.py",
+      "SHA256": "9d07a301fa643ee3b558a093647ff3db2918a47c96267d3546081eb9df44b799"
+    },
+    {
+      "Path": "deepspec/eval/dspark/evaluator.py",
+      "Url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/deepspec/eval/dspark/evaluator.py",
+      "SHA256": "8a07b84e6ba94578677b6e77eba010eef4bad847f6104d5c96821c194a8ed465"
+    },
+    {
+      "Path": "LICENSE",
+      "Url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/LICENSE",
+      "SHA256": "474817ff0d848f0d44cea7f5ac0b488fe74f599f2a656476a94f215e5e4094c7"
+    },
+    {
+      "SHA256": "6659bcdc12d923d4fc16cc2280c03078c2110a4792305e1f3f42b5468f75ef46",
+      "Url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/deepspec/modeling/dspark/markov_head.py",
+      "Path": "deepspec/modeling/dspark/markov_head.py"
+    }
+  ],
+  "LicenseText": "MIT License\n\nCopyright (c) 2026 The DeepSpec Authors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
+  "ReferencePolicy": "All reference arithmetic and token expectations computed independently in safe Rust before opening the production session; no production output fixtures",
+  "OriginalAdHocGenerator": "dspark_phase2_py_ref.py is absent from pinned source and its introduction commit; published DeepSpec backbone/VanillaMarkov/cache equations used instead"
+}

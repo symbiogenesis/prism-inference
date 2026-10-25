@@ -1,0 +1,771 @@
+{
+  "Source": "tests/test-grammar-llguidance.cpp",
+  "SourceSha256": "050d42e1577bdb537bd8c133e3a71354d5b64a9ea5cc8606962531095e28d56f",
+  "Purpose": "Literal source inputs and expected acceptance; no engine-generated outputs.",
+  "Cases": [
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min 0",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": 0\n        }",
+      "Passing": [
+        "0",
+        "10",
+        "12",
+        "10000"
+      ],
+      "Failing": [
+        "-1",
+        "-10",
+        "-10000",
+        "-100000000000000000000000000000000",
+        "00",
+        "01",
+        "-0"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min 2",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": 2\n        }",
+      "Passing": [
+        "2",
+        "3",
+        "4",
+        "10",
+        "20",
+        "1234567890000000"
+      ],
+      "Failing": [
+        "0",
+        "1",
+        "-1",
+        "-100",
+        "0",
+        "1",
+        "01",
+        "02"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min 456",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": 456\n        }",
+      "Passing": [
+        "456",
+        "4560",
+        "457",
+        "460",
+        "500"
+      ],
+      "Failing": [
+        "455",
+        "356",
+        "50",
+        "050",
+        "-1",
+        "-456"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min -123",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": -123\n        }",
+      "Passing": [
+        "-123",
+        "-122",
+        "-11",
+        "-1",
+        "0",
+        "1",
+        "123",
+        "1234",
+        "2345"
+      ],
+      "Failing": [
+        "-1234",
+        "-124"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "max 9999",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"maximum\": 9999\n        }",
+      "Passing": [
+        "-99999",
+        "0",
+        "9999"
+      ],
+      "Failing": [
+        "10000",
+        "99991"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "max -9999",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"maximum\": -9999\n        }",
+      "Passing": [
+        "-10000",
+        "-9999"
+      ],
+      "Failing": [
+        "-9998",
+        "0",
+        "9999"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min 5 max 30",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": 5,\n            \"maximum\": 30\n        }",
+      "Passing": [
+        "5",
+        "10",
+        "30"
+      ],
+      "Failing": [
+        "05",
+        "4",
+        "-1",
+        "31",
+        "123",
+        "0123"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min -1 max 1",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": -1,\n            \"maximum\": 1\n        }",
+      "Passing": [
+        "-1",
+        "0",
+        "1"
+      ],
+      "Failing": [
+        "-11",
+        "-10",
+        "-2",
+        "2",
+        "10",
+        "11"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "min -123 max 42",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"minimum\": -123,\n            \"maximum\": 42\n        }",
+      "Passing": [
+        "-123",
+        "-122",
+        "-13",
+        "-11",
+        "-2",
+        "-1",
+        "0",
+        "1",
+        "5",
+        "10",
+        "39",
+        "40",
+        "42"
+      ],
+      "Failing": [
+        "-0123",
+        "-124",
+        "-1123",
+        "-200",
+        "43",
+        "123",
+        "0123"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "exclusive min / max",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\",\n            \"exclusiveMinimum\": 0,\n            \"exclusiveMaximum\": 10000\n        }",
+      "Passing": [
+        "1",
+        "9999"
+      ],
+      "Failing": [
+        "0",
+        "01",
+        "10000",
+        "99999"
+      ]
+    },
+    {
+      "Group": "test_simple_grammar",
+      "Description": "simple grammar",
+      "Kind": "grammar",
+      "Literal": "\n            start: expr\n            expr: term (\"+\" term)*\n            term: number\n            number: /[0-9]+/ ",
+      "Passing": [
+        "42",
+        "1+2+3+4+5",
+        "123+456"
+      ],
+      "Failing": [
+        "+",
+        "/ 3",
+        "1+2+3+4+5+",
+        "12a45"
+      ]
+    },
+    {
+      "Group": "test_complex_grammar",
+      "Description": "medium complexity grammar",
+      "Kind": "grammar",
+      "Literal": "\n            start: expression\n            expression: term ws ((\"+\"|\"-\") ws term)*\n            term: factor ws ((\"*\"|\"/\") ws factor)*\n            factor: number | variable | \"(\" expression \")\" | function-call\n            number: /[0-9]+/\n            variable: /[a-zA-Z_][a-zA-Z0-9_]*/\n            function-call: variable ws \"(\" (expression (\",\" ws expression)*)? \")\"\n            ws: /[ \\t\\n\\r]?/ ",
+      "Passing": [
+        "42",
+        "1*2*3*4*5",
+        "x",
+        "x+10",
+        "x1+y2",
+        "(a+b)*(c-d)",
+        "func()",
+        "func(x,y+2)",
+        "a*(b+c)-d/e",
+        "f(g(x),h(y,z))",
+        "x + 10",
+        "x1 + y2",
+        "(a + b) * (c - d)",
+        "func()",
+        "func(x, y + 2)",
+        "a * (b + c) - d / e",
+        "f(g(x), h(y, z))",
+        "123+456",
+        "123*456*789-123/456+789*123",
+        "123+456*789-123/456+789*123-456/789+123*456-789/123+456*789-123/456+789*123-456"
+      ],
+      "Failing": [
+        "+",
+        "/ 3x",
+        "x + + y",
+        "a * / b",
+        "func(,)",
+        "func(x y)",
+        "(a + b",
+        "x + y)",
+        "a + b * (c - d",
+        "42 +",
+        "x +",
+        "x + 10 +",
+        "(a + b) * (c - d",
+        "func(",
+        "func(x, y + 2",
+        "a * (b + c) - d /",
+        "f(g(x), h(y, z)",
+        "123+456*789-123/456+789*123-456/789+123*456-789/123+456*789-123/456+789*123-456/"
+      ]
+    },
+    {
+      "Group": "test_special_chars",
+      "Description": "special characters",
+      "Kind": "grammar",
+      "Literal": "\n            start: /.../ \"abc\" /.../\n            ",
+      "Passing": [
+        "abcabcabc",
+        "aaaabcccc",
+        "🔵🟠✅abc❌🟠🔵"
+      ],
+      "Failing": [
+        "aaabcccc",
+        "aaaaabcccc",
+        "aaaabccc",
+        "aaaabccccc",
+        "🔵🟠✅❌abc❌✅🟠🔵",
+        "🔵🟠abc🟠🔵"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "* quantifier",
+      "Kind": "grammar",
+      "Literal": "start: \"a\"*",
+      "Passing": [
+        "",
+        "a",
+        "aaaaa",
+        "aaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "Failing": [
+        "b",
+        "ab",
+        "aab",
+        "ba",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "+ quantifier",
+      "Kind": "grammar",
+      "Literal": "start: \"a\"+",
+      "Passing": [
+        "a",
+        "aaaaa",
+        "aaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "Failing": [
+        "",
+        "b",
+        "ab",
+        "aab",
+        "ba",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "? quantifier",
+      "Kind": "grammar",
+      "Literal": "start: \"a\"?",
+      "Passing": [
+        "",
+        "a"
+      ],
+      "Failing": [
+        "b",
+        "ab",
+        "aa",
+        "ba"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "mixed quantifiers",
+      "Kind": "grammar",
+      "Literal": "\n            start: cons+ vowel* cons? (vowel cons)*\n            vowel: /[aeiouy]/\n            cons: /[bcdfghjklmnpqrstvwxyz]/\n            ",
+      "Passing": [
+        "yes",
+        "no",
+        "noyes",
+        "crwth",
+        "four",
+        "bryyyy"
+      ],
+      "Failing": [
+        "yess",
+        "yesno",
+        "forty",
+        "catyyy"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "simple exact repetition",
+      "Kind": "grammar",
+      "Literal": "\n            start: /[ab]{4}/\n        ",
+      "Passing": [
+        "aaaa",
+        "bbbb",
+        "abab"
+      ],
+      "Failing": [
+        "a",
+        "b",
+        "aaaaa"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "simple min repetition",
+      "Kind": "grammar",
+      "Literal": "\n            start: /[ab]{4,}/\n        ",
+      "Passing": [
+        "aaaa",
+        "aaaaab",
+        "bbbb",
+        "ababab"
+      ],
+      "Failing": [
+        "",
+        "aba"
+      ]
+    },
+    {
+      "Group": "test_quantifiers",
+      "Description": "simple max repetition",
+      "Kind": "grammar",
+      "Literal": "\n            start: /[ab]{0,4}/\n        ",
+      "Passing": [
+        "",
+        "a",
+        "aa",
+        "aaa",
+        "aaab"
+      ],
+      "Failing": [
+        "aaaaa"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "empty schema (object)",
+      "Kind": "schema",
+      "Literal": "\n            {\"type\":\"object\"}\n        ",
+      "Passing": [
+        "{}",
+        "{\"foo\": \"bar\"}"
+      ],
+      "Failing": [
+        "",
+        "[]",
+        "null",
+        "\"\"",
+        "true"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "exotic formats (list)",
+      "Kind": "schema",
+      "Literal": "{\n            \"items\": [\n                { \"format\": \"date\" },\n                { \"format\": \"uuid\" },\n                { \"format\": \"time\" },\n                { \"format\": \"date-time\" }\n            ]\n        }",
+      "Passing": [
+        "[\"2012-04-23\", \"12345678-1234-1234-1234-1234567890ab\", \"18:25:43.511Z\", \"2012-04-23T18:25:43.511Z\"]"
+      ],
+      "Failing": [
+        "[\"foo\", \"bar\"]",
+        "[\"12345678-1234-1234-1234-1234567890ab\"]"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "string",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"string\"\n        }",
+      "Passing": [
+        "\"foo\"",
+        "\"bar\"",
+        "\"\""
+      ],
+      "Failing": [
+        "{}",
+        "\"foo\": \"bar\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "string w/ min length 1",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"string\",\n            \"minLength\": 1\n        }",
+      "Passing": [
+        "\"foo\"",
+        "\"bar\""
+      ],
+      "Failing": [
+        "\"\"",
+        "{}",
+        "\"foo\": \"bar\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "string w/ min length 3",
+      "Kind": "schema",
+      "Literal": "{\n                \"type\": \"string\",\n                \"minLength\": 3\n        }",
+      "Passing": [
+        "\"foo\"",
+        "\"bar\"",
+        "\"foobar\""
+      ],
+      "Failing": [
+        "\"\"",
+        "\"f\"",
+        "\"fo\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "string w/ max length",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"string\",\n            \"maxLength\": 3\n        }",
+      "Passing": [
+        "\"foo\"",
+        "\"bar\"",
+        "\"\"",
+        "\"f\"",
+        "\"fo\""
+      ],
+      "Failing": [
+        "\"foobar\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "string w/ min & max length",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"string\",\n            \"minLength\": 1,\n            \"maxLength\": 4\n        }",
+      "Passing": [
+        "\"foo\"",
+        "\"bar\"",
+        "\"f\"",
+        "\"barf\""
+      ],
+      "Failing": [
+        "\"\"",
+        "\"barfo\"",
+        "\"foobar\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "boolean",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"boolean\"\n        }",
+      "Passing": [
+        "true",
+        "false"
+      ],
+      "Failing": [
+        "\"\"",
+        "\"true\"",
+        "True",
+        "FALSE"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "integer",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"integer\"\n        }",
+      "Passing": [
+        "0",
+        "12345",
+        "1234567890123456"
+      ],
+      "Failing": [
+        "",
+        "01",
+        "007",
+        "12345678901234567  "
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "string const",
+      "Kind": "schema",
+      "Literal": "{\n            \"const\": \"foo\"\n        }",
+      "Passing": [
+        "\"foo\""
+      ],
+      "Failing": [
+        "foo",
+        "\"bar\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "non-string const",
+      "Kind": "schema",
+      "Literal": "{\n            \"const\": true\n        }",
+      "Passing": [
+        "true"
+      ],
+      "Failing": [
+        "",
+        "foo",
+        "\"true\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "non-string const",
+      "Kind": "schema",
+      "Literal": "{\n            \"enum\": [\"red\", \"amber\", \"green\", null, 42, [\"foo\"]]\n        }",
+      "Passing": [
+        "\"red\"",
+        "null",
+        "42",
+        "[\"foo\"]"
+      ],
+      "Failing": [
+        "",
+        "420",
+        "true",
+        "foo"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "simple pattern",
+      "Kind": "schema",
+      "Literal": "{\n            \"pattern\": \"^[a-zA-Z0-9_-]*$\"\n        }",
+      "Passing": [
+        "\"\"",
+        "\"He_llo-12\""
+      ],
+      "Failing": [
+        "\"!\"",
+        "\"Hello World\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "pattern with escapes",
+      "Kind": "schema",
+      "Literal": "{\n            \"pattern\": \"^a\\\\^\\\\$\\\\.\\\\[\\\\]\\\\(\\\\)\\\\|\\\\{\\\\}\\\\*\\\\+\\\\?b$\"\n        }",
+      "Passing": [
+        "\"a^$.[]()|{}*+?b\""
+      ],
+      "Failing": [
+        "\"ab\""
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "",
+      "Kind": "schema",
+      "Literal": "\n            {\n                \"type\": [\"array\", \"null\"],\n                \"items\": { \"type\": \"string\" }\n            }\n        ",
+      "Passing": [
+        "null",
+        "[]",
+        "[\"123\"]",
+        "[\"foo\", \"bar\"]"
+      ],
+      "Failing": [
+        "",
+        "[123]",
+        "\"foo\"",
+        "[\"foo\", 42]"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "min+max items",
+      "Kind": "schema",
+      "Literal": "{\n            \"items\": {\n                \"type\": [\"number\", \"integer\"]\n            },\n            \"minItems\": 3,\n            \"maxItems\": 5\n        }",
+      "Passing": [
+        "[1, 2, 3]",
+        "[1, 2, 3, 4]",
+        "[1, 2, 3, 4, 5]",
+        "1"
+      ],
+      "Failing": [
+        "[1, 2]",
+        "[1, 2, 3, 4, 5, 6]"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "object properties",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"object\",\n            \"properties\": {\n                \"number\": { \"type\": \"number\" },\n                \"street_name\": { \"type\": \"string\" },\n                \"street_type\": { \"enum\": [\"Street\", \"Avenue\", \"Boulevard\"] }\n            },\n            \"additionalProperties\": false\n        }",
+      "Passing": [
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+        "{ \"street_name\": \"Pennsylvania\" }",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\" }",
+        "{}",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\" }"
+      ],
+      "Failing": [
+        "{ \"number\": \"1600\", \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+        "{ \"street_name\": \"Pennsylvania\", \"number\": 1600 }",
+        "{ \"number\": \"1600\", \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\", \"direction\":\"NW\"}"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "additional properties can't override other properties",
+      "Kind": "schema",
+      "Literal": "{\n            \"properties\": {\n                \"a\": {\"type\": \"integer\"},\n                \"b\": {\"type\": \"integer\"}\n            },\n            \"additionalProperties\": true\n        }",
+      "Passing": [
+        "{\"a\": 42}",
+        "{\"c\": \"\"}",
+        "{\"a\": 42, \"c\": \"\"}",
+        "{\"a_\": \"\"}"
+      ],
+      "Failing": [
+        "",
+        "{\"a\": \"\"}",
+        "{\"a\": \"\", \"b\": \"\"}"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "object properties, additionalProperties: true",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"object\",\n            \"properties\": {\n                \"number\": { \"type\": \"number\" },\n                \"street_name\": { \"type\": \"string\" },\n                \"street_type\": { \"enum\": [\"Street\", \"Avenue\", \"Boulevard\"] }\n            },\n            \"additionalProperties\": true\n        }",
+      "Passing": [
+        "{}",
+        "{\"number\":1600,\"street_name\":\"Pennsylvania\",\"street_type\":\"Avenue\"}",
+        "{ \"street_name\": \"Pennsylvania\" }",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\" }",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\", \"direction\":\"NW\"}",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\" }"
+      ],
+      "Failing": [
+        "{ \"number\": \"1600\", \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+        "{ \"street_name\": \"Pennsylvania\", \"number\": 1600, \"street_type\":\"Avenue\"}"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "required + optional props each in original order",
+      "Kind": "schema",
+      "Literal": "{\n            \"type\": \"object\",\n            \"properties\": {\n                \"number\": { \"type\": \"number\" },\n                \"street_name\": { \"type\": \"string\" },\n                \"street_type\": { \"enum\": [\"Street\", \"Avenue\", \"Boulevard\"] }\n            },\n            \"additionalProperties\": false\n        }",
+      "Passing": [
+        "{ \"street_name\": \"Pennsylvania\" }",
+        "{ \"number\": 1600, \"street_type\":\"Avenue\"}",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\" }",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\" }"
+      ],
+      "Failing": [
+        "{ \"street_type\": \"Avenue\", \"number\": 1600 }",
+        "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\", \"direction\": \"NW\" }"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "required + optional props each in original order",
+      "Kind": "schema",
+      "Literal": "{\n            \"properties\": {\n                \"b\": {\"type\": \"string\"},\n                \"a\": {\"type\": \"string\"},\n                \"d\": {\"type\": \"string\"},\n                \"c\": {\"type\": \"string\"}\n            },\n            \"required\": [\"a\", \"b\"],\n            \"additionalProperties\": false\n        }",
+      "Passing": [
+        "{\"b\": \"foo\", \"a\": \"bar\"}",
+        "{\"b\":\"foo\",\"a\":\"bar\",\"d\":\"qux\"}",
+        "{\"b\":\"foo\", \"a\":\"bar\", \"d\":\"qux\", \"c\":\"baz\"}"
+      ],
+      "Failing": [
+        "{\"a\": \"foo\", \"b\": \"bar\"}",
+        "{\"b\": \"bar\"}",
+        "{\"a\": \"foo\", \"c\": \"baz\"}",
+        "{\"a\":\"foo\", \"b\":\"bar\", \"c\":\"baz\", \"d\":\"qux\"}"
+      ]
+    },
+    {
+      "Group": "test_json_schema",
+      "Description": "required props",
+      "Kind": "schema",
+      "Literal": "{\n            \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n            \"$id\": \"https://example.com/product.schema.json\",\n            \"title\": \"Product\",\n            \"description\": \"A product from Acme's catalog\",\n            \"type\": \"object\",\n            \"properties\": {\n                \"productId\": {\n                \"description\": \"The unique identifier for a product\",\n                \"type\": \"integer\"\n                },\n                \"productName\": {\n                \"description\": \"Name of the product\",\n                \"type\": \"string\"\n                },\n                \"price\": {\n                \"description\": \"The price of the product\",\n                \"type\": \"number\",\n                \"exclusiveMinimum\": 0\n                },\n                \"tags\": {\n                \"description\": \"Tags for the product\",\n                \"type\": \"array\",\n                \"items\": {\n                    \"type\": \"string\"\n                },\n                \"minItems\": 1,\n                \"DISABLED_uniqueItems\": true\n                },\n                \"dimensions\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"length\": {\n                    \"type\": \"number\"\n                    },\n                    \"width\": {\n                    \"type\": \"number\"\n                    },\n                    \"height\": {\n                    \"type\": \"number\"\n                    }\n                },\n                \"required\": [ \"length\", \"width\", \"height\" ]\n                }\n            },\n            \"required\": [ \"productId\", \"productName\", \"price\" ]\n        }",
+      "Passing": [
+        "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50}",
+        "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"tags\": [\"home\", \"green\"]}",
+        "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"tags\": [\"home\", \"green\"], \"dimensions\": {\"length\": 785, \"width\": 250.5, \"height\": -0.359}}"
+      ],
+      "Failing": [
+        "{}",
+        "{\"productName\": \"A green door\", \"price\": 12.50, \"productId\": 1}",
+        "{\"productId\": 1, \"productName\": \"A green door\", \"price\": -12.50}",
+        "{\"productId\": 1, \"productName\": \"A green door\"}",
+        "{\"productName\": \"A green door\", \"price\": 12.50}",
+        "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"tags\": []}",
+        "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"dimensions\": {\"length\": 785, \"width\": 250.5, \"height\": -0.359}, \"tags\": [\"home\", \"green\"]}"
+      ]
+    }
+  ]
+}

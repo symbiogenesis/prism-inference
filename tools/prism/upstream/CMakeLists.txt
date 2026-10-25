@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.24)
+project(BonsaiPrismUpstreamAdapter LANGUAGES C CXX)
+
+if(NOT DEFINED PRISM_SOURCE_DIR)
+  message(FATAL_ERROR "PRISM_SOURCE_DIR must name the verified, unmodified pinned Prism source")
+endif()
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(GGML_CCACHE OFF CACHE BOOL "Only an explicit compiler launcher is permitted" FORCE)
+set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
+set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
+set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${PRISM_SOURCE_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
+
+# This process is an adapter to production ggml only. The safe Rust suite owns
+# case generation, independent references and pass/fail decisions.
+add_executable(prism-upstream-bridge bridge.cpp)
+target_link_libraries(prism-upstream-bridge PRIVATE ggml ggml-cpu)

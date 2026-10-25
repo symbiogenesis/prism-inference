@@ -1,0 +1,1153 @@
+{
+  "Source": "tests/test-sampling.cpp",
+  "SourceSha256": "817543792852df22e78f705192793ec5797c872708274d572c24c2fb0c95a8ac",
+  "LiteralCases": [
+    {
+      "Type": "temp",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "TemperatureBits": 1065353216
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "temp",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        0,
+        0,
+        0,
+        1065353216
+      ],
+      "Parameters": {
+        "TemperatureBits": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "temp-ext",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "TemperatureBits": 1065353216,
+        "DeltaBits": 0,
+        "ExponentBits": 1065353216
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "temp-ext",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        0,
+        0,
+        0,
+        1065353216
+      ],
+      "Parameters": {
+        "TemperatureBits": 0,
+        "DeltaBits": 0,
+        "ExponentBits": 1065353216
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-k",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1065353216
+      ],
+      "Parameters": {
+        "K": 1
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-k",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1055100324,
+        1051372091,
+        1046711716
+      ],
+      "Parameters": {
+        "K": 3
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-k",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1053609165,
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "Parameters": {
+        "K": 4
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-k",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "K": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1065353216
+      ],
+      "Parameters": {
+        "ProbabilityBits": 0,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1058162988,
+        1054567848
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1060320051,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1055100324,
+        1051372091,
+        1046711716
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1061997773,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065353216,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "ProbabilityBits": 0,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1047904911,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1046711866,
+        1051372203,
+        1055100474
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1048911544,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1046711866,
+        1051372203,
+        1055100474
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1056629064,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1054567864,
+        1058162981
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1057132380,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1054567864,
+        1058162981
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1060991140,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1065353216
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1061326684,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1065353216
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065353216,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "min-p",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1065353216
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065772646,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "xtc",
+      "ProbabilityBits": [
+        1053609165,
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "ExpectedBits": [
+        1036831949
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065185444,
+        "ThresholdBits": 1035489772,
+        "MinKeep": 0,
+        "Seed": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": false,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "xtc",
+      "ProbabilityBits": [
+        1053609165,
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "ExpectedBits": [
+        1045220557,
+        1036831949
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065185444,
+        "ThresholdBits": 1044549468,
+        "MinKeep": 0,
+        "Seed": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": false,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "xtc",
+      "ProbabilityBits": [
+        1053609165,
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "ExpectedBits": [
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065185444,
+        "ThresholdBits": 1049918177,
+        "MinKeep": 0,
+        "Seed": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": false,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "xtc",
+      "ProbabilityBits": [
+        1053609165,
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "ExpectedBits": [
+        1053609165,
+        1050253722,
+        1045220557,
+        1036831949
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1065185444,
+        "ThresholdBits": 1053273620,
+        "MinKeep": 0,
+        "Seed": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": false,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "typical",
+      "ProbabilityBits": [
+        1064849900,
+        1008981770,
+        1008981770,
+        1008981770
+      ],
+      "ExpectedBits": [
+        1064849900
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1056964608,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": false,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "typical",
+      "ProbabilityBits": [
+        1053609165,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "Parameters": {
+        "ProbabilityBits": 1056964608,
+        "MinKeep": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": false,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "penalties",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        0,
+        1048576000,
+        1048576000,
+        1048576000,
+        1048576000
+      ],
+      "Parameters": {
+        "VocabularySize": 5,
+        "PenaltyLastN": 1,
+        "RepeatBits": 1112014848,
+        "FrequencyBits": 0,
+        "PresenceBits": 0
+      },
+      "AcceptedTokens": [
+        0
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "penalties",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        0,
+        0,
+        0,
+        1056964608,
+        1056964608
+      ],
+      "Parameters": {
+        "VocabularySize": 5,
+        "PenaltyLastN": 3,
+        "RepeatBits": 1112014848,
+        "FrequencyBits": 0,
+        "PresenceBits": 0
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "penalties",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        0,
+        0,
+        0,
+        1056964608,
+        1056964608
+      ],
+      "Parameters": {
+        "VocabularySize": 5,
+        "PenaltyLastN": 5,
+        "RepeatBits": 1112014848,
+        "FrequencyBits": 0,
+        "PresenceBits": 0
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2,
+        0,
+        0
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "penalties",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        926452900,
+        1048575799,
+        1048575799,
+        1048575799,
+        1048575799
+      ],
+      "Parameters": {
+        "VocabularySize": 5,
+        "PenaltyLastN": 1,
+        "RepeatBits": 1065353216,
+        "FrequencyBits": 1084227584,
+        "PresenceBits": 1084227584
+      },
+      "AcceptedTokens": [
+        0
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "penalties",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        935391264,
+        935391264,
+        935391264,
+        1056963467,
+        1056963467
+      ],
+      "Parameters": {
+        "VocabularySize": 5,
+        "PenaltyLastN": 3,
+        "RepeatBits": 1065353216,
+        "FrequencyBits": 1084227584,
+        "PresenceBits": 1084227584
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "penalties",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        0,
+        935391264,
+        935391264,
+        1056963836,
+        1056963836
+      ],
+      "Parameters": {
+        "VocabularySize": 5,
+        "PenaltyLastN": 5,
+        "RepeatBits": 1065353216,
+        "FrequencyBits": 1084227584,
+        "PresenceBits": 1084227584
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2,
+        0,
+        0
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "dry-testing",
+      "ProbabilityBits": [
+        1048576000,
+        1048576000,
+        1048576000,
+        1048576000
+      ],
+      "ExpectedBits": [
+        1048576000,
+        1048576000,
+        1048576000,
+        1048576000
+      ],
+      "Parameters": {
+        "MultiplierBits": 1065353216,
+        "BaseBits": 1066192077,
+        "AllowedLength": 2,
+        "PenaltyLastN": 4,
+        "SequenceBreakers": []
+      },
+      "AcceptedTokens": [
+        0,
+        1
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "dry-testing",
+      "ProbabilityBits": [
+        1048576000,
+        1048576000,
+        1048576000,
+        1048576000
+      ],
+      "ExpectedBits": [
+        1050150475,
+        1050150475,
+        1038071047,
+        1050150475
+      ],
+      "Parameters": {
+        "MultiplierBits": 1065353216,
+        "BaseBits": 1066192077,
+        "AllowedLength": 2,
+        "PenaltyLastN": 5,
+        "SequenceBreakers": []
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2,
+        0,
+        1
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "dry-testing",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "Parameters": {
+        "MultiplierBits": 1065353216,
+        "BaseBits": 1066192077,
+        "AllowedLength": 2,
+        "PenaltyLastN": 6,
+        "SequenceBreakers": [
+          [
+            3
+          ]
+        ]
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        3,
+        4,
+        0,
+        1
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "dry-testing",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        1048026915,
+        1048026915,
+        1023806655,
+        1048026915,
+        1048026915
+      ],
+      "Parameters": {
+        "MultiplierBits": 1073741824,
+        "BaseBits": 1066192077,
+        "AllowedLength": 2,
+        "PenaltyLastN": 5,
+        "SequenceBreakers": []
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2,
+        0,
+        1
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "dry-testing",
+      "ProbabilityBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "ExpectedBits": [
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557,
+        1045220557
+      ],
+      "Parameters": {
+        "MultiplierBits": 1065353216,
+        "BaseBits": 1066192077,
+        "AllowedLength": 4,
+        "PenaltyLastN": 7,
+        "SequenceBreakers": []
+      },
+      "AcceptedTokens": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        0,
+        1
+      ],
+      "Normalize": true,
+      "CheckInputSize": true
+    },
+    {
+      "Type": "top-n-sigma",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        0,
+        0,
+        1054567848,
+        1058162988
+      ],
+      "Parameters": {
+        "NBits": 1065353216
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-n-sigma",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "NBits": 0
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    },
+    {
+      "Type": "top-n-sigma",
+      "ProbabilityBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "ExpectedBits": [
+        1036831949,
+        1045220557,
+        1050253722,
+        1053609165
+      ],
+      "Parameters": {
+        "NBits": 1077936128
+      },
+      "AcceptedTokens": [],
+      "Normalize": true,
+      "CheckInputSize": false
+    }
+  ],
+  "Queues": [
+    {
+      "VocabularySize": 10000,
+      "Sequence": "k",
+      "TopK": 10000,
+      "TopPBits": 1065353216,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "k",
+      "TopK": 1,
+      "TopPBits": 1065353216,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "p",
+      "TopK": 10000,
+      "TopPBits": 1065353216,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "p",
+      "TopK": 10000,
+      "TopPBits": 0,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "m",
+      "TopK": 10000,
+      "TopPBits": 1065353216,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "m",
+      "TopK": 10000,
+      "TopPBits": 1065353216,
+      "MinPBits": 730643660
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "k",
+      "TopK": 100,
+      "TopPBits": 1065353216,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "p",
+      "TopK": 10000,
+      "TopPBits": 966609234,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "p",
+      "TopK": 10000,
+      "TopPBits": 1061997773,
+      "MinPBits": 1065353216
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "m",
+      "TopK": 10000,
+      "TopPBits": 1065353216,
+      "MinPBits": 1065351371
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "m",
+      "TopK": 10000,
+      "TopPBits": 1065353216,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "kp",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "km",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "pk",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "pm",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "mk",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "mp",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1065351371
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "mp",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "kpm",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "kmp",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "pkm",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "pmk",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "mkp",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    },
+    {
+      "VocabularySize": 10000,
+      "Sequence": "mpk",
+      "TopK": 100,
+      "TopPBits": 1061997773,
+      "MinPBits": 1036831949
+    }
+  ]
+}

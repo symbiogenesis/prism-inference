@@ -1,0 +1,1587 @@
+{
+  "MptCanonicalDependency": {
+    "SourceCorrection": "Unavailable mosaicml/mpt-7b tokenizer files are obtained from its explicitly declared canonical EleutherAI/gpt-neox-20b dependency, with all input vocabulary/merge/special IDs checked against the original pinned vocabulary",
+    "PinnedInputIdentity": {
+      "InputOnly": true,
+      "OriginalGgufSha256": "59dc382612866d1fc6c11ea531318d327598f3412d9c8f8600607cdf3030898f",
+      "TokenEntriesVerified": 50254,
+      "AddedDescriptorsVerified": 25,
+      "MergesVerified": 50009,
+      "Normalizer": {
+        "type": "NFC"
+      },
+      "PreTokenizer": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
+      },
+      "PostProcessor": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
+      },
+      "Decoder": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
+      },
+      "TokenizerConfig": {
+        "unk_token": "<|endoftext|>",
+        "bos_token": "<|endoftext|>",
+        "eos_token": "<|endoftext|>",
+        "add_prefix_space": false,
+        "tokenizer_class": "GPTNeoXTokenizer"
+      },
+      "OriginalMetadata": {
+        "general.architecture": "mpt",
+        "general.name": "mpt",
+        "mpt.context_length": 2048,
+        "mpt.embedding_length": 4096,
+        "mpt.block_count": 32,
+        "mpt.feed_forward_length": 16384,
+        "mpt.attention.head_count": 32,
+        "mpt.attention.layer_norm_epsilon": 9.999999747378752E-06,
+        "mpt.attention.max_alibi_bias": 8.0,
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "mpt",
+        "tokenizer.ggml.bos_token_id": 0,
+        "tokenizer.ggml.eos_token_id": 0,
+        "tokenizer.ggml.unknown_token_id": 0
+      },
+      "ExactInputVocabularyAndMergeMatch": true
+    },
+    "Publisher": {
+      "Url": "https://raw.githubusercontent.com/mosaicml/llm-foundry/cc8351c4d732f091098f13d13b55232a54913edb/scripts/train/yamls/pretrain/mpt-7b.yaml",
+      "Bytes": 2632,
+      "OnlyWrapperKwarg": "model_max_length=2048",
+      "TokenizationOverrides": {},
+      "Sha256": "3eb010463251b35ec830ca2dae45e9619e23ac38167db47307c9c78cee096ce4",
+      "Repository": "mosaicml/llm-foundry",
+      "Tokenizer": "EleutherAI/gpt-neox-20b",
+      "Revision": "cc8351c4d732f091098f13d13b55232a54913edb"
+    }
+  },
+  "AssetPrefix": "tokenizer-reference/",
+  "Cases": [
+    {
+      "Name": "llama-spm",
+      "OriginalRepository": "meta-llama/Llama-2-7b-hf",
+      "OriginalRevision": "01c7f73d771dfac7d292323805ebc428287df4f9",
+      "Files": [
+        "llama-spm/special_tokens_map.json",
+        "llama-spm/tokenizer.json",
+        "llama-spm/tokenizer_config.json",
+        "llama-spm/tokenizer.model"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-llama-spm.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 723869,
+        "Sha256": "16c3724582d59aa8bf84711894e833f916ee46a31d80e21312759c48bf8d0e69"
+      }
+    },
+    {
+      "Name": "phi-3",
+      "OriginalRepository": "microsoft/Phi-3-mini-4k-instruct",
+      "OriginalRevision": "f39ac1d28e925b323eae81227eaba4464caced4e",
+      "Files": [
+        "phi-3/added_tokens.json",
+        "phi-3/config.json",
+        "phi-3/special_tokens_map.json",
+        "phi-3/tokenizer.json",
+        "phi-3/tokenizer.model",
+        "phi-3/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-phi-3.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 726019,
+        "Sha256": "967d7190d11c4842eab697079d98d56c2116e10eb617be355a2733bfc132e326"
+      }
+    },
+    {
+      "Name": "gemma",
+      "OriginalRepository": "google/gemma-2b",
+      "OriginalRevision": "9cf48e52b224239de00d483ec8eb84fb8d0f3a3a",
+      "Files": [
+        "gemma/tokenizer.json",
+        "gemma/config.json",
+        "gemma/tokenizer_config.source.json",
+        "gemma/special_tokens_map.json",
+        "gemma/tokenizer.model"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "gemma-2",
+      "OriginalRepository": "google/gemma-2-9b",
+      "OriginalRevision": "33c193028431c2fde6c6e51f29e6f17b60cbfac6",
+      "Files": [
+        "gemma-2/special_tokens_map.json",
+        "gemma-2/tokenizer_config.json",
+        "gemma-2/tokenizer.json",
+        "gemma-2/tokenizer.model"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "baichuan",
+      "OriginalRepository": "baichuan-inc/Baichuan-7B",
+      "OriginalRevision": "5d86e56a58fe4a5b3292cd9bb7468afef6f93eab",
+      "Files": [
+        "baichuan/config.json",
+        "baichuan/special_tokens_map.json",
+        "baichuan/tokenizer.model",
+        "baichuan/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-baichuan.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 1340998,
+        "Sha256": "4f5b955697f3bd3108070b1d5936c7eb9fc542b81c6932e59abddec75bca1963"
+      }
+    },
+    {
+      "Name": "bert-bge",
+      "OriginalRepository": "BAAI/bge-small-en-v1.5",
+      "OriginalRevision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+      "Files": [
+        "bert-bge/config.json",
+        "bert-bge/special_tokens_map.json",
+        "bert-bge/tokenizer.json",
+        "bert-bge/tokenizer_config.json",
+        "bert-bge/vocab.txt"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-bert-bge.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 627549,
+        "Sha256": "fbcbe22278fb302694d5f4a41bfe48c5f90e8e3554eab1c0435387dff654a854"
+      }
+    },
+    {
+      "Name": "jina-v2-en",
+      "OriginalRepository": "jinaai/jina-embeddings-v2-base-en",
+      "OriginalRevision": "322d4d7e2f35e84137961a65af894fda0385eb7a",
+      "Files": [
+        "jina-v2-en/config.json",
+        "jina-v2-en/special_tokens_map.json",
+        "jina-v2-en/tokenizer.json",
+        "jina-v2-en/tokenizer_config.json",
+        "jina-v2-en/vocab.txt"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "llama-bpe",
+      "OriginalRepository": "meta-llama/Meta-Llama-3-8B",
+      "OriginalRevision": "8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920",
+      "Files": [
+        "llama-bpe/special_tokens_map.json",
+        "llama-bpe/tokenizer_config.json",
+        "llama-bpe/tokenizer.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-llama-bpe.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 7818140,
+        "Sha256": "97272e430d53bc7688f52d5e0ad8ea8f163ede9f1bbd1694feaa504797d5d96e"
+      }
+    },
+    {
+      "Name": "phi-2",
+      "OriginalRepository": "microsoft/phi-2",
+      "OriginalRevision": "810d367871c1d460086d9f82db8696f2e0a0fcd0",
+      "Files": [
+        "phi-2/added_tokens.json",
+        "phi-2/config.json",
+        "phi-2/merges.txt",
+        "phi-2/special_tokens_map.json",
+        "phi-2/tokenizer.json",
+        "phi-2/tokenizer_config.json",
+        "phi-2/vocab.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "deepseek-llm",
+      "OriginalRepository": "deepseek-ai/deepseek-llm-7b-base",
+      "OriginalRevision": "7683fea62db869066ddaff6a41d032262c490d4f",
+      "Files": [
+        "deepseek-llm/config.json",
+        "deepseek-llm/tokenizer.json",
+        "deepseek-llm/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-deepseek-llm.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 3970167,
+        "Sha256": "867f77537b54565f0d81d508c04edc41aa1d4ffc1a92745f225b4c1b02755f76"
+      }
+    },
+    {
+      "Name": "deepseek-coder",
+      "OriginalRepository": "deepseek-ai/deepseek-coder-6.7b-base",
+      "OriginalRevision": "ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912",
+      "Files": [
+        "deepseek-coder/config.json",
+        "deepseek-coder/tokenizer.json",
+        "deepseek-coder/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-deepseek-coder.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 1156067,
+        "Sha256": "91cb1379f2e33af1c4866b194622b7a0e12e8f0c9dba7ba2f10d55978730bec1"
+      }
+    },
+    {
+      "Name": "falcon",
+      "OriginalRepository": "tiiuae/falcon-7b",
+      "OriginalRevision": "ec89142b67d748a1865ea4451372db8313ada0d8",
+      "Files": [
+        "falcon/config.json",
+        "falcon/special_tokens_map.json",
+        "falcon/tokenizer.json",
+        "falcon/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-falcon.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 2287728,
+        "Sha256": "9f0bf8b0733680398b72e652e90f260f43782f326e75545fc0e49611a5ba35ad"
+      }
+    },
+    {
+      "Name": "mpt",
+      "OriginalRepository": "mosaicml/mpt-7b",
+      "OriginalRevision": null,
+      "Files": [
+        "mpt/merges.txt",
+        "mpt/special_tokens_map.json",
+        "mpt/tokenizer.json",
+        "mpt/tokenizer_config.json",
+        "mpt/vocab.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-mpt.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 1771393,
+        "Sha256": "59dc382612866d1fc6c11ea531318d327598f3412d9c8f8600607cdf3030898f"
+      }
+    },
+    {
+      "Name": "starcoder",
+      "OriginalRepository": "bigcode/starcoder2-3b",
+      "OriginalRevision": "733247c55e3f73af49ce8e9c7949bf14af205928",
+      "Files": [
+        "starcoder/config.json",
+        "starcoder/merges.txt",
+        "starcoder/special_tokens_map.json",
+        "starcoder/tokenizer.json",
+        "starcoder/tokenizer_config.json",
+        "starcoder/vocab.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-starcoder.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 1719346,
+        "Sha256": "fedb892b4e1bd3c1f2fcdae356440b14fb458f4264d586e5c987ed93df4e174d"
+      }
+    },
+    {
+      "Name": "gpt-2",
+      "OriginalRepository": "evilfreelancer/ruGPT3XL",
+      "OriginalRevision": "d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41",
+      "Files": [
+        "gpt-2/config.json",
+        "gpt-2/merges.txt",
+        "gpt-2/tokenizer.json",
+        "gpt-2/tokenizer_config.json",
+        "gpt-2/vocab.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-gpt-2.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 1766807,
+        "Sha256": "cedc56ca6e2e89f63e781696d1fd76b4b1d49e6720dee86463e915f6e90016ac"
+      }
+    },
+    {
+      "Name": "stablelm2",
+      "OriginalRepository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "OriginalRevision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4",
+      "Files": [
+        "stablelm2/config.json",
+        "stablelm2/merges.txt",
+        "stablelm2/special_tokens_map.json",
+        "stablelm2/tokenizer.json",
+        "stablelm2/tokenizer_config.json",
+        "stablelm2/vocab.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "refact",
+      "OriginalRepository": "smallcloudai/Refact-1_6-base",
+      "OriginalRevision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0",
+      "Files": [
+        "refact/config.json",
+        "refact/merges.txt",
+        "refact/special_tokens_map.json",
+        "refact/tokenizer.json",
+        "refact/tokenizer_config.json",
+        "refact/vocab.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-refact.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 1720710,
+        "Sha256": "ac3ceda902fed91ccf74312b305d9b86c37e4f8e35fa9cc6ef3ce34fca7d4678"
+      }
+    },
+    {
+      "Name": "qwen2",
+      "OriginalRepository": "Qwen/Qwen3-Embedding-0.6B",
+      "OriginalRevision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+      "Files": [
+        "qwen2/config.json",
+        "qwen2/merges.txt",
+        "qwen2/tokenizer.json",
+        "qwen2/tokenizer_config.json",
+        "qwen2/vocab.json"
+      ],
+      "Vocabulary": {
+        "Path": "models/ggml-vocab-qwen2.gguf",
+        "Kind": "PinnedSourceArchive",
+        "Bytes": 5928681,
+        "Sha256": "44c2f46b715f585c6ab513970e8a006bfa5badd6108560054921cf598d154d8c"
+      }
+    },
+    {
+      "Name": "olmo",
+      "OriginalRepository": "allenai/OLMo-1.7-7B-hf",
+      "OriginalRevision": "e3c82a0871580b424d74e68acee866bb007df7df",
+      "Files": [
+        "olmo/config.json",
+        "olmo/special_tokens_map.json",
+        "olmo/tokenizer.json",
+        "olmo/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "jina-v2-es",
+      "OriginalRepository": "jinaai/jina-embeddings-v2-base-es",
+      "OriginalRevision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e",
+      "Files": [
+        "jina-v2-es/config.json",
+        "jina-v2-es/merges.txt",
+        "jina-v2-es/special_tokens_map.json",
+        "jina-v2-es/tokenizer.json",
+        "jina-v2-es/tokenizer_config.json",
+        "jina-v2-es/vocab.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "jina-v2-de",
+      "OriginalRepository": "aari1995/German_Semantic_V3",
+      "OriginalRevision": "38403d438de2aa13d8e553dec44c8e8785dbe9c5",
+      "Files": [
+        "jina-v2-de/config.json",
+        "jina-v2-de/special_tokens_map.json",
+        "jina-v2-de/tokenizer.json",
+        "jina-v2-de/tokenizer_config.json",
+        "jina-v2-de/vocab.txt"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "smaug-bpe",
+      "OriginalRepository": "abacusai/Smaug-Llama-3-70B-Instruct",
+      "OriginalRevision": "8f558d6211b9d8f1712b80df40c5b65bea0b56ea",
+      "Files": [
+        "smaug-bpe/config.json",
+        "smaug-bpe/special_tokens_map.json",
+        "smaug-bpe/tokenizer.json",
+        "smaug-bpe/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "poro-chat",
+      "OriginalRepository": "LumiOpen/Poro-34B-chat",
+      "OriginalRevision": "ee6c811710fca78f7be364d3ff08565804f27b8a",
+      "Files": [
+        "poro-chat/config.json",
+        "poro-chat/special_tokens_map.json",
+        "poro-chat/tokenizer.json",
+        "poro-chat/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "jina-v2-code",
+      "OriginalRepository": "jinaai/jina-embeddings-v2-base-code",
+      "OriginalRevision": "516f4baf13dec4ddddda8631e019b5737c8bc250",
+      "Files": [
+        "jina-v2-code/config.json",
+        "jina-v2-code/special_tokens_map.json",
+        "jina-v2-code/tokenizer.json",
+        "jina-v2-code/tokenizer_config.json",
+        "jina-v2-code/vocab.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "viking",
+      "OriginalRepository": "LumiOpen/Viking-7B",
+      "OriginalRevision": "efee9d2387fb39829f792aab1980016514e1291e",
+      "Files": [
+        "viking/config.json",
+        "viking/special_tokens_map.json",
+        "viking/tokenizer.json",
+        "viking/tokenizer_config.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    },
+    {
+      "Name": "jais",
+      "OriginalRepository": "core42/jais-13b",
+      "OriginalRevision": "0d5eb87f91e6577dac17bc319eee940fb875b899",
+      "Files": [
+        "jais/special_tokens_map.json",
+        "jais/tokenizer.json",
+        "jais/tokenizer_config.json",
+        "jais/config.json"
+      ],
+      "Vocabulary": {
+        "Converter": "Safe Rust transcription of pinned original converter input rules",
+        "Kind": "GeneratedVocabFixture",
+        "NoProductionObservations": true,
+        "NoWeights": true
+      }
+    }
+  ],
+  "Reference": {
+    "AllTestCodeSafeRust": true,
+    "TransformersWrapperVersion": "4.57.6",
+    "SentencePieceRustVersion": "0.2.2",
+    "TokenizersRustVersion": "0.22.2"
+  },
+  "Sources": {
+    "tests/test-tokenizer-0.sh": "85baee7afaac6928e23f915fd7bfa01b7c34547e90fee67d36205a5ca095f3f4",
+    "tests/test-tokenizer-0.py": "6c225af1d7a2dce88fdc1b885ca4b525de588067508c72b15eef62cf6112c788",
+    "tests/test-tokenizer-random.py": "34e3b5edcb16a019faa2d7f17f88d82419cf821e964f921db8b53484037d7929"
+  },
+  "Files": [
+    {
+      "Path": "llama-spm/special_tokens_map.json",
+      "Url": "https://huggingface.co/TheBloke/Llama-2-7B-AWQ/resolve/476ced46c72442322db9e6fe1ec55dc6b0b36277/special_tokens_map.json",
+      "Bytes": 414,
+      "Sha256": "6fa06efa2785e450051989a6f8fb4416b10149ded485ddd3f127a40734f5cfd0",
+      "Repository": "TheBloke/Llama-2-7B-AWQ",
+      "Revision": "476ced46c72442322db9e6fe1ec55dc6b0b36277",
+      "OriginalGitBlobSha1": "451134b2ddc2e78555d1e857518c54b4bdc2e87d",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "llama-spm/tokenizer.json",
+      "Url": "https://huggingface.co/TheBloke/Llama-2-7B-AWQ/resolve/476ced46c72442322db9e6fe1ec55dc6b0b36277/tokenizer.json",
+      "Bytes": 1842767,
+      "Sha256": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+      "Repository": "TheBloke/Llama-2-7B-AWQ",
+      "Revision": "476ced46c72442322db9e6fe1ec55dc6b0b36277",
+      "OriginalGitBlobSha1": "a6e931b92caff4c79c5c56282f1e89569a0ae558",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "llama-spm/tokenizer_config.json",
+      "Url": "https://huggingface.co/TheBloke/Llama-2-7B-AWQ/resolve/476ced46c72442322db9e6fe1ec55dc6b0b36277/tokenizer_config.json",
+      "Bytes": 776,
+      "Sha256": "f514e7c3008881b6ba7e6a0cdb44c71ce47dc335920dac143ae7bc788197e53a",
+      "Repository": "TheBloke/Llama-2-7B-AWQ",
+      "Revision": "476ced46c72442322db9e6fe1ec55dc6b0b36277",
+      "OriginalGitBlobSha1": "2ef41cbc275000b29afe157ba487f0530b8c26dc",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "llama-spm/tokenizer.model",
+      "Url": "https://huggingface.co/NousResearch/Llama-2-7b-hf/resolve/8efe6c9b93655b934e27bd9981e3ec13e55aee9d/tokenizer.model",
+      "Bytes": 499723,
+      "Sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+      "Repository": "NousResearch/Llama-2-7b-hf",
+      "Revision": "8efe6c9b93655b934e27bd9981e3ec13e55aee9d",
+      "OriginalGitBlobSha1": "6c00c742ce03c627d6cd5b795984876fa49fa899",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "phi-3/added_tokens.json",
+      "Url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/f39ac1d28e925b323eae81227eaba4464caced4e/added_tokens.json",
+      "Bytes": 306,
+      "Sha256": "f8e5a880c6c563a126d9efacb654e105fc4b66f21e5a540f04436e9487a955fb",
+      "Repository": "microsoft/Phi-3-mini-4k-instruct",
+      "Revision": "f39ac1d28e925b323eae81227eaba4464caced4e"
+    },
+    {
+      "Path": "phi-3/config.json",
+      "Url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/f39ac1d28e925b323eae81227eaba4464caced4e/config.json",
+      "Bytes": 967,
+      "Sha256": "072d4df63228ef806a6b2b2f02a93f1d048ebd31584d0f61d1180aef36e5bcea",
+      "Repository": "microsoft/Phi-3-mini-4k-instruct",
+      "Revision": "f39ac1d28e925b323eae81227eaba4464caced4e"
+    },
+    {
+      "Path": "phi-3/special_tokens_map.json",
+      "Url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/f39ac1d28e925b323eae81227eaba4464caced4e/special_tokens_map.json",
+      "Bytes": 599,
+      "Sha256": "810adc6e6c6ef2f56c285ef930d243358a3a9f05e36a01c5a10bafc6fac4609b",
+      "Repository": "microsoft/Phi-3-mini-4k-instruct",
+      "Revision": "f39ac1d28e925b323eae81227eaba4464caced4e"
+    },
+    {
+      "Path": "phi-3/tokenizer.json",
+      "Url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/f39ac1d28e925b323eae81227eaba4464caced4e/tokenizer.json",
+      "Bytes": 1937869,
+      "Sha256": "072ab882d6c7192a42f78790945d16c064691321a73251a4b18f6a380f0fbe39",
+      "Repository": "microsoft/Phi-3-mini-4k-instruct",
+      "Revision": "f39ac1d28e925b323eae81227eaba4464caced4e"
+    },
+    {
+      "Path": "phi-3/tokenizer.model",
+      "Url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/f39ac1d28e925b323eae81227eaba4464caced4e/tokenizer.model",
+      "Bytes": 499723,
+      "Sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+      "Repository": "microsoft/Phi-3-mini-4k-instruct",
+      "Revision": "f39ac1d28e925b323eae81227eaba4464caced4e"
+    },
+    {
+      "Path": "phi-3/tokenizer_config.json",
+      "Url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/f39ac1d28e925b323eae81227eaba4464caced4e/tokenizer_config.json",
+      "Bytes": 3441,
+      "Sha256": "32f66c2bab499baaa8341819ad9a13342f957501ce1e989bcb90853a01336cc0",
+      "Repository": "microsoft/Phi-3-mini-4k-instruct",
+      "Revision": "f39ac1d28e925b323eae81227eaba4464caced4e"
+    },
+    {
+      "Path": "gemma/tokenizer.json",
+      "Url": "https://huggingface.co/unsloth/gemma-2b/resolve/930de3c3dde10c360e6a842e21e6d7370e8df1a5/tokenizer.json",
+      "Bytes": 17518497,
+      "Sha256": "c15eb04bc5ad609fb26533e8525302c5640a945e5f67f65b7c849900acda7d99",
+      "Repository": "unsloth/gemma-2b",
+      "Revision": "930de3c3dde10c360e6a842e21e6d7370e8df1a5",
+      "OriginalGitBlobSha1": "e7caf9f7f6e58c4bd4563dc5b2fd2e596f0ad070",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma/config.json",
+      "Url": "https://huggingface.co/alpindale/gemma-2b/resolve/42d7363b2235a8a087199d8f856ca2d511ede0b6/config.json",
+      "Bytes": 627,
+      "Sha256": "4d8c4b061fad0e3f51df4f8501873531a4d9fc5b70a7b09e2231d18a12ad7d27",
+      "Repository": "alpindale/gemma-2b",
+      "Revision": "42d7363b2235a8a087199d8f856ca2d511ede0b6",
+      "OriginalGitBlobSha1": "583327915e2ce21dbdd7c44a90a9dcb2b02559a1",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma/tokenizer_config.source.json",
+      "Url": "https://huggingface.co/Ray2333/GRM-Gemma-2B-sftreg/resolve/cd3304be57e073738772762fd71698449d61e271/tokenizer_config.json",
+      "Bytes": 34146,
+      "Sha256": "cf30d1343d0f49bb205784423ba38cb55caaf1be4776048ca1c3fd625f866f27",
+      "Repository": "Ray2333/GRM-Gemma-2B-sftreg",
+      "Revision": "cd3304be57e073738772762fd71698449d61e271",
+      "MaterializedPath": "gemma/tokenizer_config.json",
+      "Transformation": {
+        "Kind": "exact-byte-reconstruction",
+        "Encoding": "UTF-8 without BOM; LF line endings; preserve final LF",
+        "Steps": [
+          {
+            "Kind": "remove-exactly-one-whole-line",
+            "LinePrefix": "  \"chat_template\": ",
+            "RemovedBytes": 617
+          },
+          {
+            "Kind": "replace-exactly-once",
+            "From": "  \"model_max_length\": 3000,",
+            "To": "  \"model_max_length\": 1000000000000000019884624838656,"
+          },
+          {
+            "Kind": "replace-exactly-once",
+            "From": "  \"pad_token\": \"<eos>\",",
+            "To": "  \"pad_token\": \"<pad>\","
+          }
+        ]
+      },
+      "Target": {
+        "Sha256": "d1cc6e515e5900205fcc07b62fd16503bbff92b9c2c22bed56fd64400402fbb5",
+        "GitBlobSha1": "f23acead1a712a3017d73e25881ac441c71f45ce",
+        "Bytes": 33556,
+        "ExactOriginal": true
+      }
+    },
+    {
+      "Path": "gemma/special_tokens_map.json",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/special_tokens_map.json",
+      "Bytes": 636,
+      "Sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351",
+      "Repository": "ggml-org/lora-tests",
+      "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+      "OriginalGitBlobSha1": "8d6368f7e735fbe4781bf6e956b7c6ad0586df80",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma/tokenizer.model",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer.model",
+      "Bytes": 4241003,
+      "Sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+      "Repository": "ggml-org/lora-tests",
+      "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+      "OriginalGitBlobSha1": "796efe9ab515c15e146ce7588e6d7b9b8134dbf8",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma-2/special_tokens_map.json",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/special_tokens_map.json",
+      "Bytes": 636,
+      "Sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351",
+      "Repository": "ggml-org/lora-tests",
+      "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+      "OriginalGitBlobSha1": "8d6368f7e735fbe4781bf6e956b7c6ad0586df80",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma-2/tokenizer_config.json",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer_config.json",
+      "Bytes": 46379,
+      "Sha256": "bb8245b8d39a065fdf869ee4fce48db9cc491473eb7ff1b41d321fb4caf540d1",
+      "Repository": "ggml-org/lora-tests",
+      "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+      "OriginalGitBlobSha1": "2357fc1a512dc3881eb99b9df3ef8e97ef7ffd51",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma-2/tokenizer.json",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer.json",
+      "Bytes": 17525357,
+      "Sha256": "3f289bc05132635a8bc7aca7aa21255efd5e18f3710f43e3cdb96bcd41be4922",
+      "Repository": "ggml-org/lora-tests",
+      "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+      "OriginalGitBlobSha1": "af0eac5c0056f83b8f3fcdb79165f8847111c305",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "gemma-2/tokenizer.model",
+      "Url": "https://huggingface.co/ggml-org/lora-tests/resolve/c26d5fb85b4070a9e9c4e65d132c783b98086890/Gemma2ForCausalLM/hidden_size=64/base/tokenizer.model",
+      "Bytes": 4241003,
+      "Sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+      "Repository": "ggml-org/lora-tests",
+      "Revision": "c26d5fb85b4070a9e9c4e65d132c783b98086890",
+      "OriginalGitBlobSha1": "796efe9ab515c15e146ce7588e6d7b9b8134dbf8",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "baichuan/config.json",
+      "Url": "https://huggingface.co/baichuan-inc/Baichuan-7B/resolve/5d86e56a58fe4a5b3292cd9bb7468afef6f93eab/config.json",
+      "Bytes": 656,
+      "Sha256": "bb7438075814a6e1903e21b0c349a64de96bbddac0a2893319a25c3259d5cc3a",
+      "Repository": "baichuan-inc/Baichuan-7B",
+      "Revision": "5d86e56a58fe4a5b3292cd9bb7468afef6f93eab"
+    },
+    {
+      "Path": "baichuan/special_tokens_map.json",
+      "Url": "https://huggingface.co/baichuan-inc/Baichuan-7B/resolve/5d86e56a58fe4a5b3292cd9bb7468afef6f93eab/special_tokens_map.json",
+      "Bytes": 411,
+      "Sha256": "ff3b4a612c4e447acb02d40071bddd989fe0da87eb5b7fe0dbadfc4f74de7531",
+      "Repository": "baichuan-inc/Baichuan-7B",
+      "Revision": "5d86e56a58fe4a5b3292cd9bb7468afef6f93eab"
+    },
+    {
+      "Path": "baichuan/tokenizer.model",
+      "Url": "https://huggingface.co/baichuan-inc/Baichuan-7B/resolve/5d86e56a58fe4a5b3292cd9bb7468afef6f93eab/tokenizer.model",
+      "Bytes": 1136699,
+      "Sha256": "4be54af290d93c113bcbf421115ae9eed9d6340408f564898f1e966dc738ef01",
+      "Repository": "baichuan-inc/Baichuan-7B",
+      "Revision": "5d86e56a58fe4a5b3292cd9bb7468afef6f93eab"
+    },
+    {
+      "Path": "baichuan/tokenizer_config.json",
+      "Url": "https://huggingface.co/baichuan-inc/Baichuan-7B/resolve/5d86e56a58fe4a5b3292cd9bb7468afef6f93eab/tokenizer_config.json",
+      "Bytes": 802,
+      "Sha256": "e7f263d362cf88171770abfb726120409c049c615f5de154e4eb706e24d2d6c5",
+      "Repository": "baichuan-inc/Baichuan-7B",
+      "Revision": "5d86e56a58fe4a5b3292cd9bb7468afef6f93eab"
+    },
+    {
+      "Path": "bert-bge/config.json",
+      "Url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/config.json",
+      "Bytes": 743,
+      "Sha256": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750",
+      "Repository": "BAAI/bge-small-en-v1.5",
+      "Revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+    },
+    {
+      "Path": "bert-bge/special_tokens_map.json",
+      "Url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/special_tokens_map.json",
+      "Bytes": 125,
+      "Sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+      "Repository": "BAAI/bge-small-en-v1.5",
+      "Revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+    },
+    {
+      "Path": "bert-bge/tokenizer.json",
+      "Url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json",
+      "Bytes": 711396,
+      "Sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+      "Repository": "BAAI/bge-small-en-v1.5",
+      "Revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+    },
+    {
+      "Path": "bert-bge/tokenizer_config.json",
+      "Url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer_config.json",
+      "Bytes": 366,
+      "Sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+      "Repository": "BAAI/bge-small-en-v1.5",
+      "Revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+    },
+    {
+      "Path": "bert-bge/vocab.txt",
+      "Url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/vocab.txt",
+      "Bytes": 231508,
+      "Sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+      "Repository": "BAAI/bge-small-en-v1.5",
+      "Revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+    },
+    {
+      "Path": "jina-v2-en/config.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-en/resolve/322d4d7e2f35e84137961a65af894fda0385eb7a/config.json",
+      "Bytes": 1176,
+      "Sha256": "93d07cb65c3fc338e2f67f6a039f4c0857de9f8f7b377a6a60afc53532722d4e",
+      "Repository": "jinaai/jina-embeddings-v2-base-en",
+      "Revision": "322d4d7e2f35e84137961a65af894fda0385eb7a"
+    },
+    {
+      "Path": "jina-v2-en/special_tokens_map.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-en/resolve/322d4d7e2f35e84137961a65af894fda0385eb7a/special_tokens_map.json",
+      "Bytes": 125,
+      "Sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+      "Repository": "jinaai/jina-embeddings-v2-base-en",
+      "Revision": "322d4d7e2f35e84137961a65af894fda0385eb7a"
+    },
+    {
+      "Path": "jina-v2-en/tokenizer.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-en/resolve/322d4d7e2f35e84137961a65af894fda0385eb7a/tokenizer.json",
+      "Bytes": 711577,
+      "Sha256": "65253d92409e63bf4cf61361085cd4657c735713aa239002d496d8413a6ed5dc",
+      "Repository": "jinaai/jina-embeddings-v2-base-en",
+      "Revision": "322d4d7e2f35e84137961a65af894fda0385eb7a"
+    },
+    {
+      "Path": "jina-v2-en/tokenizer_config.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-en/resolve/322d4d7e2f35e84137961a65af894fda0385eb7a/tokenizer_config.json",
+      "Bytes": 373,
+      "Sha256": "25cbd867af916b5a5718e80e9a702cf72c61bf890a1bc141c6fbce6d74c99632",
+      "Repository": "jinaai/jina-embeddings-v2-base-en",
+      "Revision": "322d4d7e2f35e84137961a65af894fda0385eb7a"
+    },
+    {
+      "Path": "jina-v2-en/vocab.txt",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-en/resolve/322d4d7e2f35e84137961a65af894fda0385eb7a/vocab.txt",
+      "Bytes": 231589,
+      "Sha256": "109753d618dbb576a35112f9c20ef35cf3517d46106175bcf010c986a4bef1df",
+      "Repository": "jinaai/jina-embeddings-v2-base-en",
+      "Revision": "322d4d7e2f35e84137961a65af894fda0385eb7a"
+    },
+    {
+      "Path": "llama-bpe/special_tokens_map.json",
+      "Url": "https://huggingface.co/NousResearch/Meta-Llama-3-8B/resolve/315b20096dc791d381d514deb5f8bd9c8d6d3061/special_tokens_map.json",
+      "Bytes": 73,
+      "Sha256": "462d91939dbc37178aa5a3eae7068d1990ccc92e09f288cc71f42cdf139d69cc",
+      "Repository": "NousResearch/Meta-Llama-3-8B",
+      "Revision": "315b20096dc791d381d514deb5f8bd9c8d6d3061",
+      "OriginalGitBlobSha1": "d8cd5076496dbe4be2320312abc10adc43097b81",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "llama-bpe/tokenizer_config.json",
+      "Url": "https://huggingface.co/NousResearch/Meta-Llama-3-8B/resolve/315b20096dc791d381d514deb5f8bd9c8d6d3061/tokenizer_config.json",
+      "Bytes": 50566,
+      "Sha256": "690727b4fed286383df1c7ca5e805124cb70c6eb4529f807c7b2e60ff741da7e",
+      "Repository": "NousResearch/Meta-Llama-3-8B",
+      "Revision": "315b20096dc791d381d514deb5f8bd9c8d6d3061",
+      "OriginalGitBlobSha1": "72193e9eb5cb6126087980deffb4930ec27a72a9",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "llama-bpe/tokenizer.json",
+      "Url": "https://huggingface.co/NousResearch/Meta-Llama-3-8B/resolve/315b20096dc791d381d514deb5f8bd9c8d6d3061/tokenizer.json",
+      "Bytes": 9085698,
+      "Sha256": "e134af98b985517b4f068e3755ae90d4e9cd2d45d328325dc503f1c6b2d06cc7",
+      "Repository": "NousResearch/Meta-Llama-3-8B",
+      "Revision": "315b20096dc791d381d514deb5f8bd9c8d6d3061",
+      "OriginalGitBlobSha1": "b197f72effb9d5ed16ee0f5663e11e4cfac2ba62",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "phi-2/added_tokens.json",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/added_tokens.json",
+      "Bytes": 1080,
+      "Sha256": "eca8e90d1be6af3afeb1a37f070f9492645c551a9fb2e1ce2a4a8b21f04ffc8b",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "phi-2/config.json",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/config.json",
+      "Bytes": 735,
+      "Sha256": "fbd955b298fdbd35fb81b3350a0d68d12616da7b7e9d81397ef632038ccc1111",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "phi-2/merges.txt",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/merges.txt",
+      "Bytes": 456318,
+      "Sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "phi-2/special_tokens_map.json",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/special_tokens_map.json",
+      "Bytes": 99,
+      "Sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "phi-2/tokenizer.json",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/tokenizer.json",
+      "Bytes": 2114924,
+      "Sha256": "337da36be7a71a6e88aa9148967a7bc8736f4b47c7de8e19ba92b89e80734cfc",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "phi-2/tokenizer_config.json",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/tokenizer_config.json",
+      "Bytes": 7339,
+      "Sha256": "1906c7514a738bd743a05d7d95c8e9aeddb4d8c9ffdda4fb6ee05653fb6b97c4",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "phi-2/vocab.json",
+      "Url": "https://huggingface.co/microsoft/phi-2/resolve/810d367871c1d460086d9f82db8696f2e0a0fcd0/vocab.json",
+      "Bytes": 798156,
+      "Sha256": "3ba3c3109ff33976c4bd966589c11ee14fcaa1f4c9e5e154c2ed7f99d80709e7",
+      "Repository": "microsoft/phi-2",
+      "Revision": "810d367871c1d460086d9f82db8696f2e0a0fcd0"
+    },
+    {
+      "Path": "deepseek-llm/config.json",
+      "Url": "https://huggingface.co/deepseek-ai/deepseek-llm-7b-base/resolve/7683fea62db869066ddaff6a41d032262c490d4f/config.json",
+      "Bytes": 584,
+      "Sha256": "80cafaa279bc26b96cad0976ec81d9bba7dc1ef55bd9c3428c15c2d56d9b32ac",
+      "Repository": "deepseek-ai/deepseek-llm-7b-base",
+      "Revision": "7683fea62db869066ddaff6a41d032262c490d4f"
+    },
+    {
+      "Path": "deepseek-llm/tokenizer.json",
+      "Url": "https://huggingface.co/deepseek-ai/deepseek-llm-7b-base/resolve/7683fea62db869066ddaff6a41d032262c490d4f/tokenizer.json",
+      "Bytes": 4609778,
+      "Sha256": "a08b02921f08548065a7b2ec13b2ffeed873231add60f9c3c7b08b04f2cc212a",
+      "Repository": "deepseek-ai/deepseek-llm-7b-base",
+      "Revision": "7683fea62db869066ddaff6a41d032262c490d4f"
+    },
+    {
+      "Path": "deepseek-llm/tokenizer_config.json",
+      "Url": "https://huggingface.co/deepseek-ai/deepseek-llm-7b-base/resolve/7683fea62db869066ddaff6a41d032262c490d4f/tokenizer_config.json",
+      "Bytes": 792,
+      "Sha256": "4fd5a605324b47a246bd72153628256581196802396bf8f3e0259fd55b8f37ce",
+      "Repository": "deepseek-ai/deepseek-llm-7b-base",
+      "Revision": "7683fea62db869066ddaff6a41d032262c490d4f"
+    },
+    {
+      "Path": "deepseek-coder/config.json",
+      "Url": "https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-base/resolve/ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912/config.json",
+      "Bytes": 632,
+      "Sha256": "d6e95333839ce9726d6619ae3e055dd2cbf854f003bc45c426e0550860fa6448",
+      "Repository": "deepseek-ai/deepseek-coder-6.7b-base",
+      "Revision": "ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912"
+    },
+    {
+      "Path": "deepseek-coder/tokenizer.json",
+      "Url": "https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-base/resolve/ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912/tokenizer.json",
+      "Bytes": 1367962,
+      "Sha256": "ef48ebdc8546c2d8092349d321f1d162de804a1c8900df2b615c7dc8b02ce141",
+      "Repository": "deepseek-ai/deepseek-coder-6.7b-base",
+      "Revision": "ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912"
+    },
+    {
+      "Path": "deepseek-coder/tokenizer_config.json",
+      "Url": "https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-base/resolve/ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912/tokenizer_config.json",
+      "Bytes": 793,
+      "Sha256": "c185a68412e595b34f9a32a2ffd68b726a1286b0936a2b616e7d1a236197fc48",
+      "Repository": "deepseek-ai/deepseek-coder-6.7b-base",
+      "Revision": "ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912"
+    },
+    {
+      "Path": "falcon/config.json",
+      "Url": "https://huggingface.co/tiiuae/falcon-7b/resolve/ec89142b67d748a1865ea4451372db8313ada0d8/config.json",
+      "Bytes": 1048,
+      "Sha256": "ef0b96fb53bf7627eb115138bdfd36edb5661891816546f41ed91fb80f19ab31",
+      "Repository": "tiiuae/falcon-7b",
+      "Revision": "ec89142b67d748a1865ea4451372db8313ada0d8"
+    },
+    {
+      "Path": "falcon/special_tokens_map.json",
+      "Url": "https://huggingface.co/tiiuae/falcon-7b/resolve/ec89142b67d748a1865ea4451372db8313ada0d8/special_tokens_map.json",
+      "Bytes": 281,
+      "Sha256": "c0bf83db1644ea3fdcd1a8a68172a0a6c8c3956da922e1e75c47b97e8315433a",
+      "Repository": "tiiuae/falcon-7b",
+      "Revision": "ec89142b67d748a1865ea4451372db8313ada0d8"
+    },
+    {
+      "Path": "falcon/tokenizer.json",
+      "Url": "https://huggingface.co/tiiuae/falcon-7b/resolve/ec89142b67d748a1865ea4451372db8313ada0d8/tokenizer.json",
+      "Bytes": 2734130,
+      "Sha256": "d6c5cdac1421ea998722aa88ea1cb630b2a9ec63bf8a85331bb3d9d321507186",
+      "Repository": "tiiuae/falcon-7b",
+      "Revision": "ec89142b67d748a1865ea4451372db8313ada0d8"
+    },
+    {
+      "Path": "falcon/tokenizer_config.json",
+      "Url": "https://huggingface.co/tiiuae/falcon-7b/resolve/ec89142b67d748a1865ea4451372db8313ada0d8/tokenizer_config.json",
+      "Bytes": 287,
+      "Sha256": "956d99c7b9a195e5c3eea5074cb3571b761282f2e621d804817b86dbcf6e2385",
+      "Repository": "tiiuae/falcon-7b",
+      "Revision": "ec89142b67d748a1865ea4451372db8313ada0d8"
+    },
+    {
+      "Path": "mpt/merges.txt",
+      "Url": "https://huggingface.co/EleutherAI/gpt-neox-20b/resolve/c292233c833e336628618a88a648727eb3dff0a7/merges.txt",
+      "Bytes": 456583,
+      "Sha256": "0a1f07b1d32153dcdf48f57189b0c217a69b11e11a3bee8a053861987e1640e4",
+      "Repository": "EleutherAI/gpt-neox-20b",
+      "Revision": "c292233c833e336628618a88a648727eb3dff0a7"
+    },
+    {
+      "Path": "mpt/special_tokens_map.json",
+      "Url": "https://huggingface.co/EleutherAI/gpt-neox-20b/resolve/c292233c833e336628618a88a648727eb3dff0a7/special_tokens_map.json",
+      "Bytes": 90,
+      "Sha256": "c0b3c279b6ecdb71996a86ffb4d4ab94dfdb5df95f00bac9515688faef2ff5dd",
+      "Repository": "EleutherAI/gpt-neox-20b",
+      "Revision": "c292233c833e336628618a88a648727eb3dff0a7"
+    },
+    {
+      "Path": "mpt/tokenizer.json",
+      "Url": "https://huggingface.co/EleutherAI/gpt-neox-20b/resolve/c292233c833e336628618a88a648727eb3dff0a7/tokenizer.json",
+      "Bytes": 2113710,
+      "Sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+      "Repository": "EleutherAI/gpt-neox-20b",
+      "Revision": "c292233c833e336628618a88a648727eb3dff0a7"
+    },
+    {
+      "Path": "mpt/tokenizer_config.json",
+      "Url": "https://huggingface.co/EleutherAI/gpt-neox-20b/resolve/c292233c833e336628618a88a648727eb3dff0a7/tokenizer_config.json",
+      "Bytes": 156,
+      "Sha256": "6c50f7b37042a059c71a347be27bc53cc4fcb0f6c8166b00712f3937c91e6bc7",
+      "Repository": "EleutherAI/gpt-neox-20b",
+      "Revision": "c292233c833e336628618a88a648727eb3dff0a7"
+    },
+    {
+      "Path": "mpt/vocab.json",
+      "Url": "https://huggingface.co/EleutherAI/gpt-neox-20b/resolve/c292233c833e336628618a88a648727eb3dff0a7/vocab.json",
+      "Bytes": 1077392,
+      "Sha256": "4529c7dbac8210536fdda3b82c499bd4fba0a1bf529dd571fef92448ff3f440c",
+      "Repository": "EleutherAI/gpt-neox-20b",
+      "Revision": "c292233c833e336628618a88a648727eb3dff0a7"
+    },
+    {
+      "Path": "starcoder/config.json",
+      "Url": "https://huggingface.co/bigcode/starcoder2-3b/resolve/733247c55e3f73af49ce8e9c7949bf14af205928/config.json",
+      "Bytes": 700,
+      "Sha256": "636a8a48c05d5882e4467aacc1e2cc0dcff83be582f5658e3af172bda5e7d94e",
+      "Repository": "bigcode/starcoder2-3b",
+      "Revision": "733247c55e3f73af49ce8e9c7949bf14af205928"
+    },
+    {
+      "Path": "starcoder/merges.txt",
+      "Url": "https://huggingface.co/bigcode/starcoder2-3b/resolve/733247c55e3f73af49ce8e9c7949bf14af205928/merges.txt",
+      "Bytes": 441705,
+      "Sha256": "ac9dfb2c5bd3b10bd46aa7fdaa8c54e8e1bcfe1618d9288320ebc82c518442fc",
+      "Repository": "bigcode/starcoder2-3b",
+      "Revision": "733247c55e3f73af49ce8e9c7949bf14af205928"
+    },
+    {
+      "Path": "starcoder/special_tokens_map.json",
+      "Url": "https://huggingface.co/bigcode/starcoder2-3b/resolve/733247c55e3f73af49ce8e9c7949bf14af205928/special_tokens_map.json",
+      "Bytes": 958,
+      "Sha256": "1dd716f4648a359f7fca1221fc6a14edb1dd369239a4d7e0e5674c5f11f061d6",
+      "Repository": "bigcode/starcoder2-3b",
+      "Revision": "733247c55e3f73af49ce8e9c7949bf14af205928"
+    },
+    {
+      "Path": "starcoder/tokenizer.json",
+      "Url": "https://huggingface.co/bigcode/starcoder2-3b/resolve/733247c55e3f73af49ce8e9c7949bf14af205928/tokenizer.json",
+      "Bytes": 2060919,
+      "Sha256": "6190a6649d90a7fe35bfed8bff990c3e7aafc3cfa5beea185045f03f0890402b",
+      "Repository": "bigcode/starcoder2-3b",
+      "Revision": "733247c55e3f73af49ce8e9c7949bf14af205928"
+    },
+    {
+      "Path": "starcoder/tokenizer_config.json",
+      "Url": "https://huggingface.co/bigcode/starcoder2-3b/resolve/733247c55e3f73af49ce8e9c7949bf14af205928/tokenizer_config.json",
+      "Bytes": 7877,
+      "Sha256": "8149d8e6b21275ad2cc346885ad92c0e9b5aa3e28a78bb5d39b7febc7e52545d",
+      "Repository": "bigcode/starcoder2-3b",
+      "Revision": "733247c55e3f73af49ce8e9c7949bf14af205928"
+    },
+    {
+      "Path": "starcoder/vocab.json",
+      "Url": "https://huggingface.co/bigcode/starcoder2-3b/resolve/733247c55e3f73af49ce8e9c7949bf14af205928/vocab.json",
+      "Bytes": 777202,
+      "Sha256": "542ee3f8b27b3a825754728b4dc59eff31065fecce843a93f09b98f13dbd7de9",
+      "Repository": "bigcode/starcoder2-3b",
+      "Revision": "733247c55e3f73af49ce8e9c7949bf14af205928"
+    },
+    {
+      "Path": "gpt-2/config.json",
+      "Url": "https://huggingface.co/evilfreelancer/ruGPT3XL/resolve/d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41/config.json",
+      "Bytes": 961,
+      "Sha256": "ca983f70addca4efa9972e892b8b35a95d7d961432a31b4ebc72a711792bc656",
+      "Repository": "evilfreelancer/ruGPT3XL",
+      "Revision": "d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41"
+    },
+    {
+      "Path": "gpt-2/merges.txt",
+      "Url": "https://huggingface.co/evilfreelancer/ruGPT3XL/resolve/d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41/merges.txt",
+      "Bytes": 1230754,
+      "Sha256": "10fe1ddc36f4e5297ae2a997e79c34edaf49ca4732a4bf132b23cecaa3f6996d",
+      "Repository": "evilfreelancer/ruGPT3XL",
+      "Revision": "d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41"
+    },
+    {
+      "Path": "gpt-2/tokenizer.json",
+      "Url": "https://huggingface.co/evilfreelancer/ruGPT3XL/resolve/d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41/tokenizer.json",
+      "Bytes": 5106803,
+      "Sha256": "2b707604072917cd80e6a7b4a809885ae298d24755ee31621439c43df09ecf00",
+      "Repository": "evilfreelancer/ruGPT3XL",
+      "Revision": "d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41"
+    },
+    {
+      "Path": "gpt-2/tokenizer_config.json",
+      "Url": "https://huggingface.co/evilfreelancer/ruGPT3XL/resolve/d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41/tokenizer_config.json",
+      "Bytes": 654,
+      "Sha256": "35fa6f1461c9d2199c8986fd6696a7a9288ffdc975d9b77ef0a5a06c8c81dc41",
+      "Repository": "evilfreelancer/ruGPT3XL",
+      "Revision": "d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41"
+    },
+    {
+      "Path": "gpt-2/vocab.json",
+      "Url": "https://huggingface.co/evilfreelancer/ruGPT3XL/resolve/d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41/vocab.json",
+      "Bytes": 1572428,
+      "Sha256": "e56f937035e48d36fcfdab938d9fa82a66c891c33b2a8b687ee16d3c13525784",
+      "Repository": "evilfreelancer/ruGPT3XL",
+      "Revision": "d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41"
+    },
+    {
+      "Path": "stablelm2/config.json",
+      "Url": "https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b/resolve/2f275b1127d59fc31e4f7c7426d528768ada9ea4/config.json",
+      "Bytes": 608,
+      "Sha256": "e14f378901a37d07b275e5899d2733aeb4363abdb48748bd8b32714f25d9becb",
+      "Repository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "Revision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4"
+    },
+    {
+      "Path": "stablelm2/merges.txt",
+      "Url": "https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b/resolve/2f275b1127d59fc31e4f7c7426d528768ada9ea4/merges.txt",
+      "Bytes": 916645,
+      "Sha256": "ba1ddf59caa031b0ec33b4ec9c47211fde4d4f89951394aac5b8e7938743c47f",
+      "Repository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "Revision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4"
+    },
+    {
+      "Path": "stablelm2/special_tokens_map.json",
+      "Url": "https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b/resolve/2f275b1127d59fc31e4f7c7426d528768ada9ea4/special_tokens_map.json",
+      "Bytes": 784,
+      "Sha256": "e0089d52101270d9b6e23e2c337f7f6793f47240f485cdfcd51f60ac1d9874f6",
+      "Repository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "Revision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4"
+    },
+    {
+      "Path": "stablelm2/tokenizer.json",
+      "Url": "https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b/resolve/2f275b1127d59fc31e4f7c7426d528768ada9ea4/tokenizer.json",
+      "Bytes": 4239399,
+      "Sha256": "4ce5f0768574d7224669ee2192ce9b45394b64df3d6e7ea7e36f8ee2d3a9d6d8",
+      "Repository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "Revision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4"
+    },
+    {
+      "Path": "stablelm2/tokenizer_config.json",
+      "Url": "https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b/resolve/2f275b1127d59fc31e4f7c7426d528768ada9ea4/tokenizer_config.json",
+      "Bytes": 1403,
+      "Sha256": "943dfd301b34cffb5631a5a44a15a2466fba7fcf72ee2993d2ab5ac5e6b6acb8",
+      "Repository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "Revision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4"
+    },
+    {
+      "Path": "stablelm2/vocab.json",
+      "Url": "https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b/resolve/2f275b1127d59fc31e4f7c7426d528768ada9ea4/vocab.json",
+      "Bytes": 2012401,
+      "Sha256": "cd0daf2d7b955bd741d8eeb9486e0ccce6a3e8e442894015255b51edf625eb1f",
+      "Repository": "stabilityai/stablelm-2-zephyr-1_6b",
+      "Revision": "2f275b1127d59fc31e4f7c7426d528768ada9ea4"
+    },
+    {
+      "Path": "refact/config.json",
+      "Url": "https://huggingface.co/smallcloudai/Refact-1_6-base/resolve/1ff9414fb7c9a813a1f069af8e83f66386e3d5b0/config.json",
+      "Bytes": 681,
+      "Sha256": "5638bf448852b87b7c1f5295a40d549c1ad9dc4f5f3cc5aef326bf96de2b25d9",
+      "Repository": "smallcloudai/Refact-1_6-base",
+      "Revision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0"
+    },
+    {
+      "Path": "refact/merges.txt",
+      "Url": "https://huggingface.co/smallcloudai/Refact-1_6-base/resolve/1ff9414fb7c9a813a1f069af8e83f66386e3d5b0/merges.txt",
+      "Bytes": 441848,
+      "Sha256": "74b0a4bc1a97ebc1d227f69231b18574374ba052fb945b0fa0aa91d3c32504a2",
+      "Repository": "smallcloudai/Refact-1_6-base",
+      "Revision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0"
+    },
+    {
+      "Path": "refact/special_tokens_map.json",
+      "Url": "https://huggingface.co/smallcloudai/Refact-1_6-base/resolve/1ff9414fb7c9a813a1f069af8e83f66386e3d5b0/special_tokens_map.json",
+      "Bytes": 532,
+      "Sha256": "0823292e24ea07b89317e9ede9d08da2a1b6c014290c06908a7ad04f1efd6719",
+      "Repository": "smallcloudai/Refact-1_6-base",
+      "Revision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0"
+    },
+    {
+      "Path": "refact/tokenizer.json",
+      "Url": "https://huggingface.co/smallcloudai/Refact-1_6-base/resolve/1ff9414fb7c9a813a1f069af8e83f66386e3d5b0/tokenizer.json",
+      "Bytes": 2057395,
+      "Sha256": "42b5a37ba11199f024f2b8873e1ecba98da33166e16f700bf7cb2304b0a5583f",
+      "Repository": "smallcloudai/Refact-1_6-base",
+      "Revision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0"
+    },
+    {
+      "Path": "refact/tokenizer_config.json",
+      "Url": "https://huggingface.co/smallcloudai/Refact-1_6-base/resolve/1ff9414fb7c9a813a1f069af8e83f66386e3d5b0/tokenizer_config.json",
+      "Bytes": 717,
+      "Sha256": "4d8a576be1b7a37446e07a524202302c08ddc116e68b2e042d9fe4eaef46192e",
+      "Repository": "smallcloudai/Refact-1_6-base",
+      "Revision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0"
+    },
+    {
+      "Path": "refact/vocab.json",
+      "Url": "https://huggingface.co/smallcloudai/Refact-1_6-base/resolve/1ff9414fb7c9a813a1f069af8e83f66386e3d5b0/vocab.json",
+      "Bytes": 776993,
+      "Sha256": "20175afb9f164fad4829aca2279f8df7eeff1e2e3f671378aaa287a740aff09f",
+      "Repository": "smallcloudai/Refact-1_6-base",
+      "Revision": "1ff9414fb7c9a813a1f069af8e83f66386e3d5b0"
+    },
+    {
+      "Path": "qwen2/config.json",
+      "Url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/config.json",
+      "Bytes": 727,
+      "Sha256": "b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9",
+      "Repository": "Qwen/Qwen3-Embedding-0.6B",
+      "Revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    {
+      "Path": "qwen2/merges.txt",
+      "Url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/merges.txt",
+      "Bytes": 1671853,
+      "Sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+      "Repository": "Qwen/Qwen3-Embedding-0.6B",
+      "Revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    {
+      "Path": "qwen2/tokenizer.json",
+      "Url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/tokenizer.json",
+      "Bytes": 11423705,
+      "Sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
+      "Repository": "Qwen/Qwen3-Embedding-0.6B",
+      "Revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    {
+      "Path": "qwen2/tokenizer_config.json",
+      "Url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/tokenizer_config.json",
+      "Bytes": 9706,
+      "Sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0",
+      "Repository": "Qwen/Qwen3-Embedding-0.6B",
+      "Revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    {
+      "Path": "qwen2/vocab.json",
+      "Url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/resolve/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/vocab.json",
+      "Bytes": 2776833,
+      "Sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+      "Repository": "Qwen/Qwen3-Embedding-0.6B",
+      "Revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    {
+      "Path": "olmo/config.json",
+      "Url": "https://huggingface.co/allenai/OLMo-1.7-7B-hf/resolve/e3c82a0871580b424d74e68acee866bb007df7df/config.json",
+      "Bytes": 615,
+      "Sha256": "8625136abb91ea5576cbd61675a36dc6143af3d5fd20c4b55f37edd4ecd336fe",
+      "Repository": "allenai/OLMo-1.7-7B-hf",
+      "Revision": "e3c82a0871580b424d74e68acee866bb007df7df"
+    },
+    {
+      "Path": "olmo/special_tokens_map.json",
+      "Url": "https://huggingface.co/allenai/OLMo-1.7-7B-hf/resolve/e3c82a0871580b424d74e68acee866bb007df7df/special_tokens_map.json",
+      "Bytes": 65,
+      "Sha256": "b77491e270c6fcc5b2ecf22370f7318a6a18d3cabea09ba7bab92e9bf12656c2",
+      "Repository": "allenai/OLMo-1.7-7B-hf",
+      "Revision": "e3c82a0871580b424d74e68acee866bb007df7df"
+    },
+    {
+      "Path": "olmo/tokenizer.json",
+      "Url": "https://huggingface.co/allenai/OLMo-1.7-7B-hf/resolve/e3c82a0871580b424d74e68acee866bb007df7df/tokenizer.json",
+      "Bytes": 2115389,
+      "Sha256": "b327c22ee5e26ee1ac5ae0228b7be4397e08122b95b11acea350d3541e42c0a4",
+      "Repository": "allenai/OLMo-1.7-7B-hf",
+      "Revision": "e3c82a0871580b424d74e68acee866bb007df7df"
+    },
+    {
+      "Path": "olmo/tokenizer_config.json",
+      "Url": "https://huggingface.co/allenai/OLMo-1.7-7B-hf/resolve/e3c82a0871580b424d74e68acee866bb007df7df/tokenizer_config.json",
+      "Bytes": 5372,
+      "Sha256": "78a839c7851f14f9fb30e664c2b46166dc0628f2900679e5ec160656f702edff",
+      "Repository": "allenai/OLMo-1.7-7B-hf",
+      "Revision": "e3c82a0871580b424d74e68acee866bb007df7df"
+    },
+    {
+      "Path": "jina-v2-es/config.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-es/resolve/8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e/config.json",
+      "Bytes": 1503,
+      "Sha256": "1b01dc4ac97fcc8d2fa9ee5d7661a4a70394ac7b8f355f1f0871bbc0f23af009",
+      "Repository": "jinaai/jina-embeddings-v2-base-es",
+      "Revision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
+    },
+    {
+      "Path": "jina-v2-es/merges.txt",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-es/resolve/8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e/merges.txt",
+      "Bytes": 592336,
+      "Sha256": "fa3d726274ba9284f7248c0c17d8e8cdbe11a89ecc1b3a9db89ce131783702af",
+      "Repository": "jinaai/jina-embeddings-v2-base-es",
+      "Revision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
+    },
+    {
+      "Path": "jina-v2-es/special_tokens_map.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-es/resolve/8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e/special_tokens_map.json",
+      "Bytes": 958,
+      "Sha256": "f23c8e6099631c233c16d9bf8dab198f610826cdd1b358f270f6d55c1863e857",
+      "Repository": "jinaai/jina-embeddings-v2-base-es",
+      "Revision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
+    },
+    {
+      "Path": "jina-v2-es/tokenizer.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-es/resolve/8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e/tokenizer.json",
+      "Bytes": 2637974,
+      "Sha256": "5cd8fa360a99a895a4afce83d98131bb74ec2e957ed238f6cdd6107358ca25dc",
+      "Repository": "jinaai/jina-embeddings-v2-base-es",
+      "Revision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
+    },
+    {
+      "Path": "jina-v2-es/tokenizer_config.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-es/resolve/8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e/tokenizer_config.json",
+      "Bytes": 1211,
+      "Sha256": "99c5e1cf31def1533447759dca2f1c22853d499c0c73e13d9667ae2b5ff1fa0b",
+      "Repository": "jinaai/jina-embeddings-v2-base-es",
+      "Revision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
+    },
+    {
+      "Path": "jina-v2-es/vocab.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-es/resolve/8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e/vocab.json",
+      "Bytes": 1009250,
+      "Sha256": "383055ba17b801d2000119157db143ab57dccfa08ea3575179657efa627ce9e8",
+      "Repository": "jinaai/jina-embeddings-v2-base-es",
+      "Revision": "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
+    },
+    {
+      "Path": "jina-v2-de/config.json",
+      "Url": "https://huggingface.co/aari1995/German_Semantic_V3/resolve/38403d438de2aa13d8e553dec44c8e8785dbe9c5/config.json",
+      "Bytes": 1010,
+      "Sha256": "c89b438a3b56a9592e9c7145afb8769781382ff6d95e1b8cf06692afd319491a",
+      "Repository": "aari1995/German_Semantic_V3",
+      "Revision": "38403d438de2aa13d8e553dec44c8e8785dbe9c5"
+    },
+    {
+      "Path": "jina-v2-de/special_tokens_map.json",
+      "Url": "https://huggingface.co/aari1995/German_Semantic_V3/resolve/38403d438de2aa13d8e553dec44c8e8785dbe9c5/special_tokens_map.json",
+      "Bytes": 732,
+      "Sha256": "5aa43c2f985a25296d5a5ce621c2f77376ca8091a47993c492fd5460b895b140",
+      "Repository": "aari1995/German_Semantic_V3",
+      "Revision": "38403d438de2aa13d8e553dec44c8e8785dbe9c5"
+    },
+    {
+      "Path": "jina-v2-de/tokenizer.json",
+      "Url": "https://huggingface.co/aari1995/German_Semantic_V3/resolve/38403d438de2aa13d8e553dec44c8e8785dbe9c5/tokenizer.json",
+      "Bytes": 729315,
+      "Sha256": "5343a791f84c16acc0363e14d497d6fc84222feaa5e9705e74f12198ccd820af",
+      "Repository": "aari1995/German_Semantic_V3",
+      "Revision": "38403d438de2aa13d8e553dec44c8e8785dbe9c5"
+    },
+    {
+      "Path": "jina-v2-de/tokenizer_config.json",
+      "Url": "https://huggingface.co/aari1995/German_Semantic_V3/resolve/38403d438de2aa13d8e553dec44c8e8785dbe9c5/tokenizer_config.json",
+      "Bytes": 1527,
+      "Sha256": "0af2ac40ebb05b99334aa672e544c490a91b1aa30b30e34fcd96bc7f0086f23a",
+      "Repository": "aari1995/German_Semantic_V3",
+      "Revision": "38403d438de2aa13d8e553dec44c8e8785dbe9c5"
+    },
+    {
+      "Path": "jina-v2-de/vocab.txt",
+      "Url": "https://huggingface.co/aari1995/German_Semantic_V3/resolve/38403d438de2aa13d8e553dec44c8e8785dbe9c5/vocab.txt",
+      "Bytes": 239836,
+      "Sha256": "bf186f7fb9cb667d811c08b45ce64d1e8e262277bb053f05d1aef3e9f13039a3",
+      "Repository": "aari1995/German_Semantic_V3",
+      "Revision": "38403d438de2aa13d8e553dec44c8e8785dbe9c5"
+    },
+    {
+      "Path": "smaug-bpe/config.json",
+      "Url": "https://huggingface.co/abacusai/Smaug-Llama-3-70B-Instruct/resolve/8f558d6211b9d8f1712b80df40c5b65bea0b56ea/config.json",
+      "Bytes": 767,
+      "Sha256": "1acae3c2b98c936da8eeaae698dd5703058178ff2041acfd95344b858159e18d",
+      "Repository": "abacusai/Smaug-Llama-3-70B-Instruct",
+      "Revision": "8f558d6211b9d8f1712b80df40c5b65bea0b56ea"
+    },
+    {
+      "Path": "smaug-bpe/special_tokens_map.json",
+      "Url": "https://huggingface.co/abacusai/Smaug-Llama-3-70B-Instruct/resolve/8f558d6211b9d8f1712b80df40c5b65bea0b56ea/special_tokens_map.json",
+      "Bytes": 449,
+      "Sha256": "03d62862d41de30db9e05cb4865de4f36c48ab3032327139fcdfacc5798a4828",
+      "Repository": "abacusai/Smaug-Llama-3-70B-Instruct",
+      "Revision": "8f558d6211b9d8f1712b80df40c5b65bea0b56ea"
+    },
+    {
+      "Path": "smaug-bpe/tokenizer.json",
+      "Url": "https://huggingface.co/abacusai/Smaug-Llama-3-70B-Instruct/resolve/8f558d6211b9d8f1712b80df40c5b65bea0b56ea/tokenizer.json",
+      "Bytes": 9084491,
+      "Sha256": "4f4a59c1e93395a75686bc7555d93b628af8dae7f203235607b61efe9dd21341",
+      "Repository": "abacusai/Smaug-Llama-3-70B-Instruct",
+      "Revision": "8f558d6211b9d8f1712b80df40c5b65bea0b56ea"
+    },
+    {
+      "Path": "smaug-bpe/tokenizer_config.json",
+      "Url": "https://huggingface.co/abacusai/Smaug-Llama-3-70B-Instruct/resolve/8f558d6211b9d8f1712b80df40c5b65bea0b56ea/tokenizer_config.json",
+      "Bytes": 51016,
+      "Sha256": "b9f74bef2cfc60d912140884fa56e00ca7a8e3bfa897e7a6ec2d065df70722d0",
+      "Repository": "abacusai/Smaug-Llama-3-70B-Instruct",
+      "Revision": "8f558d6211b9d8f1712b80df40c5b65bea0b56ea"
+    },
+    {
+      "Path": "poro-chat/config.json",
+      "Url": "https://huggingface.co/LumiOpen/Poro-34B-chat/resolve/ee6c811710fca78f7be364d3ff08565804f27b8a/config.json",
+      "Bytes": 672,
+      "Sha256": "c42110d682de6c1864590fd778441df3ac190617c0abb6e10c1ef45c7746e116",
+      "Repository": "LumiOpen/Poro-34B-chat",
+      "Revision": "ee6c811710fca78f7be364d3ff08565804f27b8a"
+    },
+    {
+      "Path": "poro-chat/special_tokens_map.json",
+      "Url": "https://huggingface.co/LumiOpen/Poro-34B-chat/resolve/ee6c811710fca78f7be364d3ff08565804f27b8a/special_tokens_map.json",
+      "Bytes": 552,
+      "Sha256": "46ba5142a47d5b4db9f409c1cc2a6a81f0d3a49d778413399567db6496d86b02",
+      "Repository": "LumiOpen/Poro-34B-chat",
+      "Revision": "ee6c811710fca78f7be364d3ff08565804f27b8a"
+    },
+    {
+      "Path": "poro-chat/tokenizer.json",
+      "Url": "https://huggingface.co/LumiOpen/Poro-34B-chat/resolve/ee6c811710fca78f7be364d3ff08565804f27b8a/tokenizer.json",
+      "Bytes": 5640174,
+      "Sha256": "7945d4a8760c9bc48f87aa8020465cb00845d2381508c7b71bb18e99b9ca6358",
+      "Repository": "LumiOpen/Poro-34B-chat",
+      "Revision": "ee6c811710fca78f7be364d3ff08565804f27b8a"
+    },
+    {
+      "Path": "poro-chat/tokenizer_config.json",
+      "Url": "https://huggingface.co/LumiOpen/Poro-34B-chat/resolve/ee6c811710fca78f7be364d3ff08565804f27b8a/tokenizer_config.json",
+      "Bytes": 5236,
+      "Sha256": "1a6852b1b258476564d62a3fcf259200610f708680c5a04ac536b9b8ed82003a",
+      "Repository": "LumiOpen/Poro-34B-chat",
+      "Revision": "ee6c811710fca78f7be364d3ff08565804f27b8a"
+    },
+    {
+      "Path": "jina-v2-code/config.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/516f4baf13dec4ddddda8631e019b5737c8bc250/config.json",
+      "Bytes": 1216,
+      "Sha256": "e426aa684c7f9a95c5f020aa855faf93a24f065f5fad0c9e17b124670cabdea6",
+      "Repository": "jinaai/jina-embeddings-v2-base-code",
+      "Revision": "516f4baf13dec4ddddda8631e019b5737c8bc250"
+    },
+    {
+      "Path": "jina-v2-code/special_tokens_map.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/516f4baf13dec4ddddda8631e019b5737c8bc250/special_tokens_map.json",
+      "Bytes": 280,
+      "Sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+      "Repository": "jinaai/jina-embeddings-v2-base-code",
+      "Revision": "516f4baf13dec4ddddda8631e019b5737c8bc250"
+    },
+    {
+      "Path": "jina-v2-code/tokenizer.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/516f4baf13dec4ddddda8631e019b5737c8bc250/tokenizer.json",
+      "Bytes": 2561316,
+      "Sha256": "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
+      "Repository": "jinaai/jina-embeddings-v2-base-code",
+      "Revision": "516f4baf13dec4ddddda8631e019b5737c8bc250"
+    },
+    {
+      "Path": "jina-v2-code/tokenizer_config.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/516f4baf13dec4ddddda8631e019b5737c8bc250/tokenizer_config.json",
+      "Bytes": 493,
+      "Sha256": "f477aeb15ff9f78d3c1ddf2361d2b0b8b20cf55220f839f29a37f3a18efddd89",
+      "Repository": "jinaai/jina-embeddings-v2-base-code",
+      "Revision": "516f4baf13dec4ddddda8631e019b5737c8bc250"
+    },
+    {
+      "Path": "jina-v2-code/vocab.json",
+      "Url": "https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/516f4baf13dec4ddddda8631e019b5737c8bc250/vocab.json",
+      "Bytes": 970639,
+      "Sha256": "799ccbde8e1dfeda7cad79a81e5d6dfd4037f118e169185183885ec28119849c",
+      "Repository": "jinaai/jina-embeddings-v2-base-code",
+      "Revision": "516f4baf13dec4ddddda8631e019b5737c8bc250"
+    },
+    {
+      "Path": "viking/config.json",
+      "Url": "https://huggingface.co/LumiOpen/Viking-7B/resolve/efee9d2387fb39829f792aab1980016514e1291e/config.json",
+      "Bytes": 806,
+      "Sha256": "6b929761ec24875c8c025f6999e887ed52ae8696c0a7a7e334052d76a3eb20ca",
+      "Repository": "LumiOpen/Viking-7B",
+      "Revision": "efee9d2387fb39829f792aab1980016514e1291e"
+    },
+    {
+      "Path": "viking/special_tokens_map.json",
+      "Url": "https://huggingface.co/LumiOpen/Viking-7B/resolve/efee9d2387fb39829f792aab1980016514e1291e/special_tokens_map.json",
+      "Bytes": 1002,
+      "Sha256": "982de25c96fc846e2afdf02be00c3698bff5c71a8b2bc815b7b9ac132b4cc103",
+      "Repository": "LumiOpen/Viking-7B",
+      "Revision": "efee9d2387fb39829f792aab1980016514e1291e"
+    },
+    {
+      "Path": "viking/tokenizer.json",
+      "Url": "https://huggingface.co/LumiOpen/Viking-7B/resolve/efee9d2387fb39829f792aab1980016514e1291e/tokenizer.json",
+      "Bytes": 5839729,
+      "Sha256": "e5520a35cf44aec70454497098c595a81e075409e5ca71e81bf4f7b2a31e4c7e",
+      "Repository": "LumiOpen/Viking-7B",
+      "Revision": "efee9d2387fb39829f792aab1980016514e1291e"
+    },
+    {
+      "Path": "viking/tokenizer_config.json",
+      "Url": "https://huggingface.co/LumiOpen/Viking-7B/resolve/efee9d2387fb39829f792aab1980016514e1291e/tokenizer_config.json",
+      "Bytes": 4940,
+      "Sha256": "e50b9a797fb913e172f2e74bc5855baf61006cb94b88257e69034b00f758c317",
+      "Repository": "LumiOpen/Viking-7B",
+      "Revision": "efee9d2387fb39829f792aab1980016514e1291e"
+    },
+    {
+      "Path": "jais/special_tokens_map.json",
+      "Url": "https://huggingface.co/ElmehdiSMILI/jais-13b/resolve/8ae731bd5c5ab12ef6475f03c37c59ee63247930/special_tokens_map.json",
+      "Bytes": 99,
+      "Sha256": "e3987f4b89cd26781c8b6225066be5d2e47c43cf5550c1e39450539fe03368a6",
+      "Repository": "ElmehdiSMILI/jais-13b",
+      "Revision": "8ae731bd5c5ab12ef6475f03c37c59ee63247930",
+      "OriginalGitBlobSha1": "dc1cc229d12ab2c775e6d9399134d1cc067b8ec3",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "jais/tokenizer.json",
+      "Url": "https://huggingface.co/ElmehdiSMILI/jais-13b/resolve/8ae731bd5c5ab12ef6475f03c37c59ee63247930/tokenizer.json",
+      "Bytes": 4851204,
+      "Sha256": "0cb856e46b8f66f723d634fefba242eadd8d0fb87bbb1a1a00d6653081047ddf",
+      "Repository": "ElmehdiSMILI/jais-13b",
+      "Revision": "8ae731bd5c5ab12ef6475f03c37c59ee63247930",
+      "OriginalGitBlobSha1": "91a3d524c8cec577196adce70997ed17049b897b",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "jais/tokenizer_config.json",
+      "Url": "https://huggingface.co/ElmehdiSMILI/jais-13b/resolve/8ae731bd5c5ab12ef6475f03c37c59ee63247930/tokenizer_config.json",
+      "Bytes": 215,
+      "Sha256": "6beceb21917fd98995cd2f0b90742c45bf99a884a949e251841870f35ff39944",
+      "Repository": "ElmehdiSMILI/jais-13b",
+      "Revision": "8ae731bd5c5ab12ef6475f03c37c59ee63247930",
+      "OriginalGitBlobSha1": "ff4702147332c31cd71af922ffa715fd91ea1172",
+      "ExactOriginal": true
+    },
+    {
+      "Path": "jais/config.json",
+      "Url": "https://huggingface.co/ElmehdiSMILI/jais-13b/resolve/8ae731bd5c5ab12ef6475f03c37c59ee63247930/config.json",
+      "Bytes": 1253,
+      "Sha256": "6930b27712542ca8ee5537ce0ab30d01dbf623e822fb947ccf7f5067c9a0e854",
+      "Repository": "ElmehdiSMILI/jais-13b",
+      "Revision": "8ae731bd5c5ab12ef6475f03c37c59ee63247930",
+      "OriginalGitBlobSha1": "471006b8f9dbc8422334ded7aa51dc8983ea20c0",
+      "ExactOriginal": true
+    }
+  ],
+  "SchemaVersion": 1,
+  "UpstreamRevision": "b87ca7225456b06b0975b8239c66b5aecf07e37c"
+}

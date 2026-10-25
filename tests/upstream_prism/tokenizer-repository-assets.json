@@ -1,0 +1,134 @@
+{
+  "Repository": "ggml-org/vocabs",
+  "Revision": "cee4b7a68518c579bb758fca46bb149cd109348e",
+  "AssetPrefix": "tokenizer-repository/",
+  "Files": [
+    {
+      "Path": "HybridDNA/ggml-vocab-carbon.gguf",
+      "Bytes": 6009062,
+      "Sha256": "6dcc59f0f217eaddd7141c085e96ae2753dae61e2eb42695b15b912517166012",
+      "GitBlobSha1": "06c06bbb499c3b692a5ad383fad91a9f749fc798",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/HybridDNA/ggml-vocab-carbon.gguf"
+    },
+    {
+      "Path": "HybridDNA/ggml-vocab-carbon.gguf.inp",
+      "Bytes": 2766,
+      "Sha256": "7b6e77983cde07d652635a220d55b36a5be6de79d383a967dc99494b0a5852c6",
+      "GitBlobSha1": "c0f92522d816266e891f513bd0e1ac6ff2575b43",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/HybridDNA/ggml-vocab-carbon.gguf.inp"
+    },
+    {
+      "Path": "HybridDNA/ggml-vocab-carbon.gguf.out",
+      "Bytes": 2439,
+      "Sha256": "5d3e492342eb574f31e217d57fc843f85888d806de0fc5c371b0f35f81089b85",
+      "GitBlobSha1": "2770578ce51b71eac63225b7b07c1a0aa106cff4",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/HybridDNA/ggml-vocab-carbon.gguf.out"
+    },
+    {
+      "Path": "PLaMo2/ggml-vocab-plamo2.gguf",
+      "Bytes": 2440910,
+      "Sha256": "6f0df3eac864f04137699d780d7fcdafec713c8c4990948c540a88fae398a0fd",
+      "GitBlobSha1": "017beb152143923797dfdf48c129ade8dc230915",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/PLaMo2/ggml-vocab-plamo2.gguf"
+    },
+    {
+      "Path": "PLaMo2/ggml-vocab-plamo2.gguf.inp",
+      "Bytes": 1943,
+      "Sha256": "be0a11f7071f0c67d3053a2d377d8f35f0dbcb77ff11a60300fb57d36b477cf0",
+      "GitBlobSha1": "86b934e4020fba7061c15b6349d5e4163bb2383e",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/PLaMo2/ggml-vocab-plamo2.gguf.inp"
+    },
+    {
+      "Path": "PLaMo2/ggml-vocab-plamo2.gguf.out",
+      "Bytes": 2023,
+      "Sha256": "dfb20407bf1c71cd2b1f124fdffb0a6c35d544897c95033ecd3791d1d38803e4",
+      "GitBlobSha1": "2bd6d0aca1b966f213486012c0a181a5f6c3d692",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/PLaMo2/ggml-vocab-plamo2.gguf.out"
+    },
+    {
+      "Path": "RWKV/ggml-vocab-rwkv-7-world.gguf",
+      "Bytes": 1365451,
+      "Sha256": "ef1da3b3fa3c026800367dab2c1204fb92964a2199350e7133e67d1af91c2e70",
+      "GitBlobSha1": "61f2059f1085c78e4a5ab57a5798c3fbf6261ec6",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/RWKV/ggml-vocab-rwkv-7-world.gguf"
+    },
+    {
+      "Path": "RWKV/ggml-vocab-rwkv-7-world.gguf.inp",
+      "Bytes": 1943,
+      "Sha256": "be0a11f7071f0c67d3053a2d377d8f35f0dbcb77ff11a60300fb57d36b477cf0",
+      "GitBlobSha1": "86b934e4020fba7061c15b6349d5e4163bb2383e",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/RWKV/ggml-vocab-rwkv-7-world.gguf.inp"
+    },
+    {
+      "Path": "RWKV/ggml-vocab-rwkv-7-world.gguf.out",
+      "Bytes": 1721,
+      "Sha256": "455e7ec92c40f577967b590aef31a558c2b6ee97887aead5f255e6eb12b15d5a",
+      "GitBlobSha1": "5d1f2b0cbd084bb886a64be8969122421a726e82",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/RWKV/ggml-vocab-rwkv-7-world.gguf.out"
+    },
+    {
+      "Path": "SPM/ggml-vocab-gemma-3.gguf",
+      "Bytes": 6512800,
+      "Sha256": "68d854494379ec3133f08de356ae37c7ad2c8a0cdcd23ded05e90eeee2c79924",
+      "GitBlobSha1": "adaf89f70e2de2eb4be492ae386dd41cda4e5e02",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/SPM/ggml-vocab-gemma-3.gguf"
+    },
+    {
+      "Path": "SPM/ggml-vocab-gemma-3.gguf.inp",
+      "Bytes": 1943,
+      "Sha256": "be0a11f7071f0c67d3053a2d377d8f35f0dbcb77ff11a60300fb57d36b477cf0",
+      "GitBlobSha1": "86b934e4020fba7061c15b6349d5e4163bb2383e",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/SPM/ggml-vocab-gemma-3.gguf.inp"
+    },
+    {
+      "Path": "SPM/ggml-vocab-gemma-3.gguf.out",
+      "Bytes": 2230,
+      "Sha256": "628571e75839639c5a410e5905528ec90ebd441b0b3e04a7e8279dcaef37d721",
+      "GitBlobSha1": "69068796605a385fed285dda3be353d216c98412",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/SPM/ggml-vocab-gemma-3.gguf.out"
+    },
+    {
+      "Path": "UGM/ggml-vocab-nomic-bert-moe.gguf",
+      "Bytes": 6821834,
+      "Sha256": "d0ccc742eeb2a0148adc5505aeaf65a8f6ff7d1c4a91bff8abe0b027048fff74",
+      "GitBlobSha1": "4b96ca46d412ea1fe95cacf96fc90cab07345d98",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/UGM/ggml-vocab-nomic-bert-moe.gguf"
+    },
+    {
+      "Path": "UGM/ggml-vocab-nomic-bert-moe.gguf.inp",
+      "Bytes": 1943,
+      "Sha256": "be0a11f7071f0c67d3053a2d377d8f35f0dbcb77ff11a60300fb57d36b477cf0",
+      "GitBlobSha1": "86b934e4020fba7061c15b6349d5e4163bb2383e",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/UGM/ggml-vocab-nomic-bert-moe.gguf.inp"
+    },
+    {
+      "Path": "UGM/ggml-vocab-nomic-bert-moe.gguf.out",
+      "Bytes": 1325,
+      "Sha256": "f16d872b7477a588257ba5da1d5de0086288e05a1f19f2d5f4477c6cfaf23277",
+      "GitBlobSha1": "abbed2061d5428097b14e8dc6ef1f8722961fb0a",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/UGM/ggml-vocab-nomic-bert-moe.gguf.out"
+    },
+    {
+      "Path": "WPM/ggml-vocab-jina-v2-en.gguf",
+      "Bytes": 631075,
+      "Sha256": "d2e94cd2a61a79d50328c4d53f87c21132ce1177b463a6153064334fe1847808",
+      "GitBlobSha1": "45737138edeed534d867ebd146cf93b350ac4c6a",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/WPM/ggml-vocab-jina-v2-en.gguf"
+    },
+    {
+      "Path": "WPM/ggml-vocab-jina-v2-en.gguf.inp",
+      "Bytes": 1943,
+      "Sha256": "be0a11f7071f0c67d3053a2d377d8f35f0dbcb77ff11a60300fb57d36b477cf0",
+      "GitBlobSha1": "86b934e4020fba7061c15b6349d5e4163bb2383e",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/WPM/ggml-vocab-jina-v2-en.gguf.inp"
+    },
+    {
+      "Path": "WPM/ggml-vocab-jina-v2-en.gguf.out",
+      "Bytes": 1636,
+      "Sha256": "8f95b1d4e5680634af06ac5a1b19f15ddeb743d3a6240056625e4345a4b06917",
+      "GitBlobSha1": "b1c49672fadad845bad979532cf6491189d83c08",
+      "Url": "https://huggingface.co/ggml-org/vocabs/resolve/cee4b7a68518c579bb758fca46bb149cd109348e/WPM/ggml-vocab-jina-v2-en.gguf.out"
+    }
+  ],
+  "InputSelection": "The source accepts a caller-supplied repository. Pin its complete 2026-05-22 publisher snapshot, whose six tokenizer families are supported by the pinned Prism fork; later publisher additions require unsupported tokenizer behavior. No vocabulary bytes or expected token IDs are changed."
+}

@@ -1,0 +1,6 @@
+[toolchain]
+# This nightly enables the next trait solver and Polonius Alpha by default.
+# Move to the earliest qualifying beta, then stable, once both are promoted.
+channel = "nightly-2026-10-22"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

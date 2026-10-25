@@ -1,0 +1,8 @@
+language = "C"
+cpp_compat = true
+include_guard = "BONSAI_PRISM_H"
+include_version = true
+usize_is_size_t = true
+
+[export]
+item_types = ["opaque", "functions"]

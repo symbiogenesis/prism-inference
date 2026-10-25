@@ -1,0 +1,2464 @@
+{
+  "SchemaVersion": 1,
+  "Source": "tests/peg-parser/test-basic.cpp",
+  "SourceSha256": "24c5c31c65b2f5fc88919a4b5d06506ae644f8f0460c14c0134cd5439c5a7694",
+  "Operations": [
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[\\n\\t\\\\]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            10
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[\\n\\t\\\\]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            9
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[\\n\\t\\\\]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            92
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[\\n\\t\\\\]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            32
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[a\\-z]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            97
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[a\\-z]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            45
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[a\\-z]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            122
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "[a\\-z]"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            98
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "hello"
+              ]
+            },
+            {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "literal",
+                  "Args": [
+                    " world"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            32,
+            119,
+            111,
+            114,
+            108,
+            100
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "hello"
+              ]
+            },
+            {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "literal",
+                  "Args": [
+                    " world"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "hello"
+              ]
+            },
+            {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "literal",
+                  "Args": [
+                    " world"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            32
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "literal",
+          "Args": [
+            "hello"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "a-z"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            97
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "a-z"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            65
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "a-z-"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            102
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "a-z-"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            45
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "chars",
+          "Args": [
+            "a-z-"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            65
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "<think>"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "</think>"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            60,
+            116,
+            104,
+            105
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "begin"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "end"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            98,
+            101,
+            103,
+            105,
+            110
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "<think>"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "</think>"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            60,
+            116,
+            104,
+            105,
+            110,
+            107,
+            62,
+            60,
+            47
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "hello"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "world"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            119,
+            111,
+            114,
+            108,
+            100
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "<think>"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "</think>"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            60,
+            116,
+            104,
+            105,
+            110,
+            107,
+            62,
+            73,
+            32,
+            97,
+            109,
+            32,
+            99,
+            111,
+            109,
+            109,
+            111,
+            110,
+            95,
+            99,
+            104,
+            97,
+            116,
+            95,
+            99,
+            111,
+            109,
+            98,
+            105,
+            110,
+            97,
+            116,
+            111,
+            114,
+            95,
+            112,
+            97,
+            114,
+            115,
+            101,
+            114
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "or",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "option1"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "option2"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            111,
+            112,
+            116
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "or",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "choice_a"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "choice_b"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            99,
+            104,
+            111,
+            105,
+            99,
+            101
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "or",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "first"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "second"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            102,
+            105,
+            114,
+            115,
+            116
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "or",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "alpha"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "beta"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            98,
+            101,
+            116,
+            97
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "or",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "good"
+              ]
+            },
+            {
+              "Op": "literal",
+              "Args": [
+                "better"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            98,
+            101,
+            115,
+            116
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "zero_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "ab"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            97
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "zero_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "xy"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            120,
+            121,
+            120
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "zero_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "test"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            116,
+            101,
+            115,
+            116
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "one_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "repeat"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            114,
+            101,
+            112
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "one_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "ab"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            97,
+            98,
+            97
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "one_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "single"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            115,
+            105,
+            110,
+            103,
+            108,
+            101
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "one_or_more",
+          "Args": [
+            {
+              "Op": "literal",
+              "Args": [
+                "()"
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            115,
+            117,
+            99,
+            99,
+            101,
+            115,
+            115
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "number",
+                {
+                  "Op": "chars",
+                  "Args": [
+                    "0-9"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "list",
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "literal",
+                          "Args": [
+                            "["
+                          ]
+                        },
+                        {
+                          "Op": "ref",
+                          "Args": [
+                            "value"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "literal",
+                      "Args": [
+                        "]"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "rule",
+          "Args": [
+            "value",
+            {
+              "Op": "or",
+              "Args": [
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "number"
+                  ]
+                },
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "list"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            49
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "number",
+                {
+                  "Op": "chars",
+                  "Args": [
+                    "0-9"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "list",
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "literal",
+                          "Args": [
+                            "["
+                          ]
+                        },
+                        {
+                          "Op": "ref",
+                          "Args": [
+                            "value"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "literal",
+                      "Args": [
+                        "]"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "rule",
+          "Args": [
+            "value",
+            {
+              "Op": "or",
+              "Args": [
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "number"
+                  ]
+                },
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "list"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            49,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "number",
+                {
+                  "Op": "chars",
+                  "Args": [
+                    "0-9"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "list",
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "literal",
+                          "Args": [
+                            "["
+                          ]
+                        },
+                        {
+                          "Op": "ref",
+                          "Args": [
+                            "value"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "literal",
+                      "Args": [
+                        "]"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "rule",
+          "Args": [
+            "value",
+            {
+              "Op": "or",
+              "Args": [
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "number"
+                  ]
+                },
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "list"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            91,
+            50,
+            93,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "number",
+                {
+                  "Op": "chars",
+                  "Args": [
+                    "0-9"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "list",
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "literal",
+                          "Args": [
+                            "["
+                          ]
+                        },
+                        {
+                          "Op": "ref",
+                          "Args": [
+                            "value"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "literal",
+                      "Args": [
+                        "]"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "rule",
+          "Args": [
+            "value",
+            {
+              "Op": "or",
+              "Args": [
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "number"
+                  ]
+                },
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "list"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            91,
+            91,
+            51,
+            93,
+            93,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "number",
+                {
+                  "Op": "chars",
+                  "Args": [
+                    "0-9"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "list",
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "literal",
+                          "Args": [
+                            "["
+                          ]
+                        },
+                        {
+                          "Op": "ref",
+                          "Args": [
+                            "value"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "literal",
+                      "Args": [
+                        "]"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "rule",
+          "Args": [
+            "value",
+            {
+              "Op": "or",
+              "Args": [
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "number"
+                  ]
+                },
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "list"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            91
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "number",
+                {
+                  "Op": "chars",
+                  "Args": [
+                    "0-9"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Expr": {
+              "Op": "rule",
+              "Args": [
+                "list",
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "literal",
+                          "Args": [
+                            "["
+                          ]
+                        },
+                        {
+                          "Op": "ref",
+                          "Args": [
+                            "value"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "literal",
+                      "Args": [
+                        "]"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "rule",
+          "Args": [
+            "value",
+            {
+              "Op": "or",
+              "Args": [
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "number"
+                  ]
+                },
+                {
+                  "Op": "ref",
+                  "Args": [
+                    "list"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            97,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "marker",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            109,
+            97,
+            114,
+            107,
+            101,
+            114,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "marker",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            60,
+            109,
+            97,
+            114,
+            107,
+            101,
+            114,
+            62
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    }
+  ],
+  "Assertions": [
+    {
+      "Name": "chars.escape_sequence_newline.escape_sequence_newline",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 0,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escape_sequence_tab.escape_sequence_tab",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 1,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escape_sequence_backslash.escape_sequence_backslash",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 2,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escape_sequence_space_fail.escape_sequence_space_fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 3,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escaped_dash_a.escaped_dash_a",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 4,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escaped_dash_literal.escaped_dash_literal",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 5,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escaped_dash_z.escaped_dash_z",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 6,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "chars.escaped_dash_b_fail.escaped_dash_b_fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 7,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "optional.optional_present.optional_present",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 8,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "optional.optional_present.optional_present_end",
+      "Left": 11,
+      "Right": {
+        "Op": "result",
+        "Operation": 8,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "optional.optional_absent.optional_absent",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 9,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "optional.optional_absent.optional_absent_end",
+      "Left": 5,
+      "Right": {
+        "Op": "result",
+        "Operation": 9,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "optional.partial_match_need_more.partial_match_need_more",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 10,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.literal_success.literal_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 11,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.char_class_lowercase_success.char_class_lowercase_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 12,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.char_class_uppercase_fail.char_class_uppercase_fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 13,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.char_class_with_dash_lowercase.char_class_with_dash_lowercase",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 14,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.char_class_with_dash_literal_dash.char_class_with_dash_literal_dash",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 15,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.char_class_with_dash_uppercase_fail.char_class_with_dash_uppercase_fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 16,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.sequence_partial_match_1.sequence_partial_match_1",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 17,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.sequence_partial_match_2.sequence_partial_match_2",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 18,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.sequence_partial_match_3.sequence_partial_match_3",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 19,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.sequence_full_match.sequence_full_match",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 20,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.sequence_no_match.sequence_no_match",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 21,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.choices_partial_match_1.choices_partial_match_1",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 22,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.choices_partial_match_2.choices_partial_match_2",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 23,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.choices_full_match_1.choices_full_match_1",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 24,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.choices_full_match_2.choices_full_match_2",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 25,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.choices_no_match.choices_no_match",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 26,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.zero_or_more_partial_match_1.zero_or_more_partial_match_1",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 27,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.zero_or_more_partial_match_2.zero_or_more_partial_match_2",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 28,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.zero_or_more_full_match.zero_or_more_full_match",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 29,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.one_or_more_partial_match_1.one_or_more_partial_match_1",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 30,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.one_or_more_partial_match_2.one_or_more_partial_match_2",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 31,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.one_or_more_full_match.one_or_more_full_match",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 32,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "partial parsing.one_or_more_no_match.one_or_more_no_match",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 33,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.simple_number.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 34,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.simple_list.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 35,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.nested_list.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 36,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.deeply_nested_list.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 37,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.need_more_input_match.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 38,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.no_match.result_is_fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 39,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.marker.result_square_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 40,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "recursive rules.marker.result_sharp_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 41,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    }
+  ],
+  "Benchmarks": []
+}

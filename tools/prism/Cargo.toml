@@ -1,0 +1,31 @@
+[package]
+name = "bonsai-prism"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+license.workspace = true
+description = "Bounded immutable LoRA B-vector sharing policy and Prism native adapter"
+repository.workspace = true
+keywords = ["lora", "deduplication", "ggml"]
+categories = ["caching", "science"]
+
+[build-dependencies]
+cbindgen = { version = "=0.29.4", default-features = false, optional = true }
+
+[lib]
+# Policy and native regressions live in integration targets.
+test = false
+crate-type = ["rlib", "staticlib"]
+
+[features]
+engine-loader = ["dep:cbindgen"]
+native-tests = ["engine-loader"]
+
+[[test]]
+name = "native"
+path = "tests/native.rs"
+required-features = ["native-tests"]
+
+[lints]
+workspace = true

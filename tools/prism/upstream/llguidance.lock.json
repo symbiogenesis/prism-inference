@@ -1,0 +1,14 @@
+{
+  "SchemaVersion": 1,
+  "Repository": "https://github.com/guidance-ai/llguidance",
+  "Commit": "d795912fedc7d393de740177ea9ea761e7905774",
+  "Version": "1.0.1",
+  "PinSource": "The unchanged pinned Prism common/CMakeLists.txt LLAMA_LLGUIDANCE dependency",
+  "ArchiveUrl": "https://codeload.github.com/guidance-ai/llguidance/zip/d795912fedc7d393de740177ea9ea761e7905774",
+  "ArchiveRoot": "llguidance-d795912fedc7d393de740177ea9ea761e7905774",
+  "ArchiveBytes": 1130833,
+  "ArchiveSha256": "01cbaa3ae908d9b164ec054bc3a1e2a3a0da97fa4e09e217e4017cab9b6d00c7",
+  "CargoLockSha256": "3771a06633ce97358b9986bd9e6d54e377c131a6e073fb04e15625ce9b492b0d",
+  "LicenseSha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+  "BuildPolicy": "Verified external source; locked production static-library build; no dependency tests or benchmarks"
+}

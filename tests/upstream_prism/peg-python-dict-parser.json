@@ -1,0 +1,2141 @@
+{
+  "SchemaVersion": 1,
+  "Source": "tests/peg-parser/test-python-dict-parser.cpp",
+  "SourceSha256": "ab6b20f141fed193bc93e810608c1b6800415d14ff832ad3ff84671594d18d4f",
+  "Operations": [
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116,
+            39,
+            44,
+            32,
+            39,
+            118,
+            97,
+            108,
+            117,
+            101,
+            39,
+            58,
+            32,
+            52,
+            50,
+            44,
+            32,
+            39,
+            102,
+            108,
+            97,
+            103,
+            39,
+            58,
+            32,
+            84,
+            114,
+            117,
+            101,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            49,
+            44,
+            32,
+            39,
+            104,
+            101,
+            108,
+            108,
+            111,
+            39,
+            44,
+            32,
+            84,
+            114,
+            117,
+            101,
+            44,
+            32,
+            78,
+            111,
+            110,
+            101,
+            44,
+            32,
+            51,
+            46,
+            49,
+            52,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            117,
+            115,
+            101,
+            114,
+            115,
+            39,
+            58,
+            32,
+            91,
+            123,
+            39,
+            105,
+            100,
+            39,
+            58,
+            32,
+            49,
+            44,
+            32,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            65,
+            108,
+            105,
+            99,
+            101,
+            39,
+            125,
+            44,
+            32,
+            123,
+            39,
+            105,
+            100,
+            39,
+            58,
+            32,
+            50,
+            44,
+            32,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            66,
+            111,
+            98,
+            39,
+            125,
+            93,
+            44,
+            32,
+            39,
+            99,
+            111,
+            117,
+            110,
+            116,
+            39,
+            58,
+            32,
+            50,
+            44,
+            32,
+            39,
+            109,
+            101,
+            116,
+            97,
+            100,
+            97,
+            116,
+            97,
+            39,
+            58,
+            32,
+            123,
+            39,
+            118,
+            101,
+            114,
+            115,
+            105,
+            111,
+            110,
+            39,
+            58,
+            32,
+            39,
+            49,
+            46,
+            48,
+            39,
+            44,
+            32,
+            39,
+            116,
+            97,
+            103,
+            115,
+            39,
+            58,
+            32,
+            91,
+            39,
+            97,
+            100,
+            109,
+            105,
+            110,
+            39,
+            44,
+            32,
+            39,
+            117,
+            115,
+            101,
+            114,
+            39,
+            93,
+            125,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            109,
+            101,
+            115,
+            115,
+            97,
+            103,
+            101,
+            39,
+            58,
+            32,
+            39,
+            73,
+            116,
+            92,
+            39,
+            115,
+            32,
+            119,
+            111,
+            114,
+            107,
+            105,
+            110,
+            103,
+            33,
+            39,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            113,
+            117,
+            111,
+            116,
+            101,
+            39,
+            58,
+            32,
+            39,
+            72,
+            101,
+            32,
+            115,
+            97,
+            105,
+            100,
+            32,
+            34,
+            72,
+            101,
+            108,
+            108,
+            111,
+            34,
+            39,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            32,
+            39,
+            111,
+            98,
+            106,
+            39,
+            32,
+            58,
+            32,
+            123,
+            32,
+            39,
+            115,
+            111,
+            109,
+            101,
+            116,
+            104,
+            105,
+            110,
+            103,
+            39,
+            58,
+            32,
+            49,
+            44,
+            32,
+            39,
+            111,
+            116,
+            104,
+            101,
+            114,
+            32,
+            34,
+            115,
+            111,
+            109,
+            101,
+            116,
+            104,
+            105,
+            110,
+            103,
+            34,
+            39,
+            32,
+            58,
+            32,
+            39,
+            102,
+            111,
+            111,
+            92,
+            39,
+            115,
+            32,
+            98,
+            97,
+            114,
+            39,
+            32,
+            125,
+            32,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116,
+            39,
+            44,
+            32,
+            39,
+            118,
+            97,
+            108,
+            117,
+            101,
+            39,
+            58,
+            32
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            109,
+            101,
+            115,
+            115,
+            97,
+            103,
+            101,
+            39,
+            58,
+            32,
+            39,
+            72,
+            101,
+            108,
+            108,
+            111,
+            44,
+            32,
+            228,
+            184,
+            150,
+            231,
+            149,
+            140,
+            33,
+            39,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            117,
+            110,
+            105,
+            99,
+            111,
+            100,
+            101,
+            39,
+            58,
+            32,
+            39,
+            72,
+            101,
+            108,
+            108,
+            111,
+            92,
+            117,
+            48,
+            48,
+            52,
+            49,
+            39,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            116,
+            101,
+            115,
+            116,
+            34,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116,
+            39,
+            44,
+            32,
+            39,
+            118,
+            97,
+            108,
+            117,
+            101,
+            39,
+            58,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            34,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            84,
+            114,
+            117,
+            101
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            70,
+            97,
+            108,
+            115,
+            101
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            78,
+            111,
+            110,
+            101
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            116,
+            114,
+            117,
+            101
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            102,
+            97,
+            108,
+            115,
+            101
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "python_value",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            110,
+            117,
+            108,
+            108
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "string_content",
+                "Args": [
+                  39
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            39,
+            104,
+            101,
+            108,
+            108,
+            111,
+            39
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "string_content",
+                "Args": [
+                  39
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            39,
+            105,
+            116,
+            92,
+            39,
+            115,
+            39
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "string_content",
+                "Args": [
+                  39
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            39,
+            115,
+            97,
+            121,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            34,
+            39
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "string_content",
+                "Args": [
+                  39
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "'"
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            39,
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116,
+            39,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule-lazy",
+              "Args": [
+                "json-string",
+                {
+                  "Statements": [],
+                  "Root": {
+                    "Op": "choice",
+                    "Args": [
+                      [
+                        {
+                          "Op": "double_quoted_string",
+                          "Args": []
+                        },
+                        {
+                          "Op": "single_quoted_string",
+                          "Args": []
+                        }
+                      ]
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            39,
+            110,
+            97,
+            109,
+            101,
+            39,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116,
+            39,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule-lazy",
+              "Args": [
+                "json-string",
+                {
+                  "Statements": [],
+                  "Root": {
+                    "Op": "choice",
+                    "Args": [
+                      [
+                        {
+                          "Op": "double_quoted_string",
+                          "Args": []
+                        },
+                        {
+                          "Op": "single_quoted_string",
+                          "Args": []
+                        }
+                      ]
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            116,
+            101,
+            115,
+            116,
+            34,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule-lazy",
+              "Args": [
+                "json-string",
+                {
+                  "Statements": [],
+                  "Root": {
+                    "Op": "choice",
+                    "Args": [
+                      [
+                        {
+                          "Op": "double_quoted_string",
+                          "Args": []
+                        },
+                        {
+                          "Op": "single_quoted_string",
+                          "Args": []
+                        }
+                      ]
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            39,
+            116,
+            101,
+            115,
+            116,
+            39,
+            44,
+            32,
+            39,
+            118,
+            97,
+            108,
+            117,
+            101,
+            39,
+            58,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            34,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [
+          {
+            "Expr": {
+              "Op": "rule-lazy",
+              "Args": [
+                "json-string",
+                {
+                  "Statements": [],
+                  "Root": {
+                    "Op": "choice",
+                    "Args": [
+                      [
+                        {
+                          "Op": "double_quoted_string",
+                          "Args": []
+                        },
+                        {
+                          "Op": "single_quoted_string",
+                          "Args": []
+                        }
+                      ]
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            32,
+            39,
+            111,
+            98,
+            106,
+            39,
+            32,
+            58,
+            32,
+            123,
+            32,
+            39,
+            115,
+            111,
+            109,
+            101,
+            116,
+            104,
+            105,
+            110,
+            103,
+            39,
+            58,
+            32,
+            49,
+            44,
+            32,
+            39,
+            111,
+            116,
+            104,
+            101,
+            114,
+            32,
+            34,
+            115,
+            111,
+            109,
+            101,
+            116,
+            104,
+            105,
+            110,
+            103,
+            34,
+            39,
+            32,
+            58,
+            32,
+            39,
+            102,
+            111,
+            111,
+            92,
+            39,
+            115,
+            32,
+            98,
+            97,
+            114,
+            39,
+            32,
+            125,
+            32,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    }
+  ],
+  "Assertions": [
+    {
+      "Name": "simple Python dict object parsing.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 0,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "simple Python dict object parsing.result_end",
+      "Left": 43,
+      "Right": {
+        "Op": "result",
+        "Operation": 0,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python array with mixed types.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 1,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python array with mixed types.result_end",
+      "Left": 30,
+      "Right": {
+        "Op": "result",
+        "Operation": 1,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "nested Python dict with objects and arrays.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 2,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "nested Python dict with objects and arrays.result_end",
+      "Left": 136,
+      "Right": {
+        "Op": "result",
+        "Operation": 2,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python dict with escaped single quotes.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 3,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python dict with escaped single quotes.result_end",
+      "Left": 29,
+      "Right": {
+        "Op": "result",
+        "Operation": 3,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python dict with double quotes inside single quotes.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 4,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python dict with double quotes inside single quotes.result_end",
+      "Left": 28,
+      "Right": {
+        "Op": "result",
+        "Operation": 4,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "complex Python dict example from requirements.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 5,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "complex Python dict example from requirements.result_end",
+      "Left": 66,
+      "Right": {
+        "Op": "result",
+        "Operation": 5,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete object.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 6,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete single-quoted string.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 7,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "unicode in Python dict strings.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 8,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "unicode in Python dict strings.result_end",
+      "Left": 29,
+      "Right": {
+        "Op": "result",
+        "Operation": 8,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python dict with unicode escapes.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 9,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python dict with unicode escapes.result_end",
+      "Left": 26,
+      "Right": {
+        "Op": "result",
+        "Operation": 9,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python parser accepts double-quoted strings.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 10,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python parser accepts double-quoted strings.result_end",
+      "Left": 16,
+      "Right": {
+        "Op": "result",
+        "Operation": 10,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python parser with mixed quote styles.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 11,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python parser with mixed quote styles.result_end",
+      "Left": 34,
+      "Right": {
+        "Op": "result",
+        "Operation": 11,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.True.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 12,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.True.end",
+      "Left": 4,
+      "Right": {
+        "Op": "result",
+        "Operation": 12,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.False.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 13,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.False.end",
+      "Left": 5,
+      "Right": {
+        "Op": "result",
+        "Operation": 13,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.None.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 14,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.None.end",
+      "Left": 4,
+      "Right": {
+        "Op": "result",
+        "Operation": 14,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.rejects JSON-style true/false/null.rejects true",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 15,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.rejects JSON-style true/false/null.rejects false",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 16,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "Python True/False/None.rejects JSON-style true/false/null.rejects null",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 17,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.simple string.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 18,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.simple string.end",
+      "Left": 7,
+      "Right": {
+        "Op": "result",
+        "Operation": 18,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.string with escaped single quote.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 19,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.string with escaped single quote.end",
+      "Left": 7,
+      "Right": {
+        "Op": "result",
+        "Operation": 19,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.string with double quotes.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 20,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.string with double quotes.end",
+      "Left": 13,
+      "Right": {
+        "Op": "result",
+        "Operation": 20,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "single-quoted string content parser.incomplete string.need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 21,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() rejects single quotes by default.fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 22,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() accepts single quotes with pre-registered flexible json-string rule.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 23,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() accepts single quotes with pre-registered flexible json-string rule.end",
+      "Left": 16,
+      "Right": {
+        "Op": "result",
+        "Operation": 23,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() still accepts double quotes with flexible json-string rule.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 24,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() still accepts double quotes with flexible json-string rule.end",
+      "Left": 16,
+      "Right": {
+        "Op": "result",
+        "Operation": 24,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() accepts mixed quote styles with flexible json-string rule.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 25,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.json() accepts mixed quote styles with flexible json-string rule.end",
+      "Left": 34,
+      "Right": {
+        "Op": "result",
+        "Operation": 25,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.complex nested structure with flexible json-string rule.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 26,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "json() parser with flexible json-string rule.complex nested structure with flexible json-string rule.end",
+      "Left": 66,
+      "Right": {
+        "Op": "result",
+        "Operation": 26,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    }
+  ],
+  "Benchmarks": []
+}

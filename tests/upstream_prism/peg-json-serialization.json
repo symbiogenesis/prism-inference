@@ -1,0 +1,174 @@
+{
+  "SchemaVersion": 1,
+  "Source": "tests/peg-parser/test-json-serialization.cpp",
+  "SourceSha256": "276f50faa0f1f50da7d5289b3e13110c26cf9120ff23bbdb4a6a8c12c384a028",
+  "Operations": [
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                "<tool_call>",
+                {
+                  "Op": "json",
+                  "Args": []
+                }
+              ]
+            },
+            "</tool_call>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            116,
+            101,
+            115,
+            116,
+            34,
+            44,
+            32,
+            34,
+            118,
+            97,
+            108,
+            117,
+            101,
+            115,
+            34,
+            58,
+            32,
+            91,
+            49,
+            44,
+            32,
+            50,
+            44,
+            32,
+            51,
+            93,
+            44,
+            32,
+            34,
+            110,
+            101,
+            115,
+            116,
+            101,
+            100,
+            34,
+            58,
+            32,
+            123,
+            34,
+            97,
+            34,
+            58,
+            32,
+            116,
+            114,
+            117,
+            101,
+            125,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": true
+    }
+  ],
+  "Assertions": [
+    {
+      "Name": "compare before/after.both_succeed",
+      "Left": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 0,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 0,
+            "Collection": "RoundTripResults",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "compare before/after.same_end_pos",
+      "Left": {
+        "Op": "result",
+        "Operation": 0,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "Right": {
+        "Op": "result",
+        "Operation": 0,
+        "Collection": "RoundTripResults",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    }
+  ],
+  "Benchmarks": [
+    {
+      "Name": "deserialize",
+      "Iterations": 100,
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                "<tool_call>",
+                {
+                  "Op": "json",
+                  "Args": []
+                }
+              ]
+            },
+            "</tool_call>"
+          ]
+        }
+      },
+      "Operation": "deserialize"
+    }
+  ]
+}

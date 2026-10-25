@@ -1,0 +1,1007 @@
+{
+  "GeneratorSource": "tests/gen-tiny-dspark.py",
+  "GeneratorSHA256": "9e152ac323a32529e60237d637fa7de6046819716ede849f98799fb4334e28e4",
+  "Pin": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "CPython": "3.14.0 ARM64",
+  "NumPy": "2.4.4",
+  "Seed": 1234,
+  "InputsOnly": true,
+  "BlobSHA256": "be829f6051708499ad7ace92e4db5703acf1774d6feea5b8ec9dd0dca7fb00e9",
+  "BlobBytes": 1236480,
+  "Layouts": [
+    {
+      "Name": "conditioned",
+      "Conditioning": true,
+      "Correction": false,
+      "Tensors": [
+        {
+          "Name": "token_embd.weight",
+          "Dimensions": [
+            64,
+            256
+          ],
+          "Offset": 0,
+          "Bytes": 65536,
+          "SHA256": "cd703016c79a936e632827be403f122a0c9be8b15108bbf075ed82a1751fc55f"
+        },
+        {
+          "Name": "output_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 65536,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.fc.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 65792,
+          "Bytes": 32768,
+          "SHA256": "52cc10cc680a43880b6e25e65225f924ebd75577eeb0fc7a02ecfcac2732e57f"
+        },
+        {
+          "Name": "dspark.hidden_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 98560,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.log_snr_fc1.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 98816,
+          "Bytes": 32768,
+          "SHA256": "18bf72e03e0f84ecdfc37dc76049aa36e58d1a88f3986fd149286e54dbceaf78"
+        },
+        {
+          "Name": "dspark.log_snr_fc1.bias",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 131584,
+          "Bytes": 256,
+          "SHA256": "5bfe3fb1f77992a49b38b71bcc50a01418139d41e00e78345f7c4ec1d4eb8ed7"
+        },
+        {
+          "Name": "dspark.log_snr_fc2.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 131840,
+          "Bytes": 16384,
+          "SHA256": "0b96631d40c85dceb472cd884080ff71a1578dad5de17eae3ab04d97ffb0bfd4"
+        },
+        {
+          "Name": "dspark.log_snr_fc2.bias",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 148224,
+          "Bytes": 256,
+          "SHA256": "ad380d807cdf2029b5c796f85e25e86c216f6a11708357337a1839cfeab4d3b8"
+        },
+        {
+          "Name": "blk.0.attn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 148480,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.attn_q.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 148736,
+          "Bytes": 16384,
+          "SHA256": "b10045d6cf9b254e619ece7ca5892fc118fc588ed41c186a42558b5166b4c5d3"
+        },
+        {
+          "Name": "blk.0.attn_k.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 165120,
+          "Bytes": 8192,
+          "SHA256": "fea9d9bc87ae0796792383aafcad58011fba05b2adf9506f594bb3759977bc81"
+        },
+        {
+          "Name": "blk.0.attn_v.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 173312,
+          "Bytes": 8192,
+          "SHA256": "f21a473352be863072cf63b63e863e31414176eaa3de95343a64314230673349"
+        },
+        {
+          "Name": "blk.0.attn_output.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 181504,
+          "Bytes": 16384,
+          "SHA256": "c3188c145b435e500abed87bcd03885a38e094be19b113638de1121fa0653caa"
+        },
+        {
+          "Name": "blk.0.attn_q_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 197888,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.0.attn_k_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 198016,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.0.ffn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 198144,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.ffn_gate.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 198400,
+          "Bytes": 24576,
+          "SHA256": "f647318f30e87c8beba53bb30e308062e3ea30b1fd6bec612082d1449bce2c79"
+        },
+        {
+          "Name": "blk.0.ffn_down.weight",
+          "Dimensions": [
+            96,
+            64
+          ],
+          "Offset": 222976,
+          "Bytes": 24576,
+          "SHA256": "b6dc1777b4a273de28d3aeba1854e072567cb472ea05996b44cc3f779fc08bd6"
+        },
+        {
+          "Name": "blk.0.ffn_up.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 247552,
+          "Bytes": 24576,
+          "SHA256": "b72ec8ce09d1b9aa8be871411f02a1e3d5bcd04c0a38b3abaac57b91feb7194b"
+        },
+        {
+          "Name": "blk.1.attn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 272128,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.1.attn_q.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 272384,
+          "Bytes": 16384,
+          "SHA256": "3856c12165564ac5688a40fbc7768b6ec85cc226812455b372f51dea078cdea7"
+        },
+        {
+          "Name": "blk.1.attn_k.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 288768,
+          "Bytes": 8192,
+          "SHA256": "d84ddd4cf4b0f33519e5673b10fbd082b783875590ac221cf16e16c216ed545d"
+        },
+        {
+          "Name": "blk.1.attn_v.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 296960,
+          "Bytes": 8192,
+          "SHA256": "ed2d5a4302f1e52da44fc2566ae5617497af2eb8c1b344989b864c14ede48276"
+        },
+        {
+          "Name": "blk.1.attn_output.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 305152,
+          "Bytes": 16384,
+          "SHA256": "7f4d6d0dafba35ce0ffe762a472085b62d87feabeb80aadb62f940d4de12e157"
+        },
+        {
+          "Name": "blk.1.attn_q_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 321536,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.1.attn_k_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 321664,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.1.ffn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 321792,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.1.ffn_gate.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 322048,
+          "Bytes": 24576,
+          "SHA256": "2255065238bdfe84c7debcd6270febbd26fb155af7ae6e0dca15d364614d503e"
+        },
+        {
+          "Name": "blk.1.ffn_down.weight",
+          "Dimensions": [
+            96,
+            64
+          ],
+          "Offset": 346624,
+          "Bytes": 24576,
+          "SHA256": "33282a9dd97a40749ea5df8621e3762b9374901318fcb5a4f9509cc2b3b7f156"
+        },
+        {
+          "Name": "blk.1.ffn_up.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 371200,
+          "Bytes": 24576,
+          "SHA256": "8dc6d522015460ed62f6e1fdfd09c0cdcd6c5eef953a91f87bc90b167150c2b3"
+        }
+      ]
+    },
+    {
+      "Name": "unconditioned",
+      "Conditioning": false,
+      "Correction": false,
+      "Tensors": [
+        {
+          "Name": "token_embd.weight",
+          "Dimensions": [
+            64,
+            256
+          ],
+          "Offset": 395776,
+          "Bytes": 65536,
+          "SHA256": "cd703016c79a936e632827be403f122a0c9be8b15108bbf075ed82a1751fc55f"
+        },
+        {
+          "Name": "output_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 461312,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.fc.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 461568,
+          "Bytes": 32768,
+          "SHA256": "52cc10cc680a43880b6e25e65225f924ebd75577eeb0fc7a02ecfcac2732e57f"
+        },
+        {
+          "Name": "dspark.hidden_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 494336,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.attn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 494592,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.attn_q.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 494848,
+          "Bytes": 16384,
+          "SHA256": "1c820e5804dcd1b2dc31f4d895cf20ad2f62baee10f3229b67cfdb274c39ebce"
+        },
+        {
+          "Name": "blk.0.attn_k.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 511232,
+          "Bytes": 8192,
+          "SHA256": "cc97be8efd8821b78ded6b94cf4277ca18a300383f340a1bcdddf388c143ce9a"
+        },
+        {
+          "Name": "blk.0.attn_v.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 519424,
+          "Bytes": 8192,
+          "SHA256": "c09d531764173f80392741f83496dbf37e8f187e75b5531249dc0422d91db618"
+        },
+        {
+          "Name": "blk.0.attn_output.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 527616,
+          "Bytes": 16384,
+          "SHA256": "3bdb35af46a7a046c802260e519ca76c4764d6b1fec9e28d9845c34b945b9b00"
+        },
+        {
+          "Name": "blk.0.attn_q_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 544000,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.0.attn_k_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 544128,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.0.ffn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 544256,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.ffn_gate.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 544512,
+          "Bytes": 24576,
+          "SHA256": "581e9dbd076c81bb66eb6026a2e14d44488262da2a75f540617452697060a079"
+        },
+        {
+          "Name": "blk.0.ffn_down.weight",
+          "Dimensions": [
+            96,
+            64
+          ],
+          "Offset": 569088,
+          "Bytes": 24576,
+          "SHA256": "13b77e49d5238e781b418e688233d908021841c4f7a6b25f005e2e6603ff2019"
+        },
+        {
+          "Name": "blk.0.ffn_up.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 593664,
+          "Bytes": 24576,
+          "SHA256": "a144b965d5cb83deef9abb0b65e140c2e619d874562e0866eb63f21659ae30ca"
+        },
+        {
+          "Name": "blk.1.attn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 618240,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.1.attn_q.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 618496,
+          "Bytes": 16384,
+          "SHA256": "a61acd2209494f6d37eb582d037af554793a81bbb07d0105c622ffb9689a5671"
+        },
+        {
+          "Name": "blk.1.attn_k.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 634880,
+          "Bytes": 8192,
+          "SHA256": "8ebad87386bd0798ba5841e8c2d45132131594a6682f7233e55bcb80528aa49b"
+        },
+        {
+          "Name": "blk.1.attn_v.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 643072,
+          "Bytes": 8192,
+          "SHA256": "d93ecb00191365f3b9cfed38661d7d83988c97425ebef704fb58dccb209755a7"
+        },
+        {
+          "Name": "blk.1.attn_output.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 651264,
+          "Bytes": 16384,
+          "SHA256": "41afdf7b7643f2746e70ea558f949e50194d78f098df2fa53d7b613a21decdf7"
+        },
+        {
+          "Name": "blk.1.attn_q_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 667648,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.1.attn_k_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 667776,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.1.ffn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 667904,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.1.ffn_gate.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 668160,
+          "Bytes": 24576,
+          "SHA256": "a0a368105d8d150ba1c31c92efb286120ba082df296f0079663b25edd27f2a27"
+        },
+        {
+          "Name": "blk.1.ffn_down.weight",
+          "Dimensions": [
+            96,
+            64
+          ],
+          "Offset": 692736,
+          "Bytes": 24576,
+          "SHA256": "d91d94ff8cc3add4c1b0d243bf05e8c38acca029582f7cb259fad88a3bfd95db"
+        },
+        {
+          "Name": "blk.1.ffn_up.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 717312,
+          "Bytes": 24576,
+          "SHA256": "9acf58b411b62d80032eef5d0bb4d55f5cfb6c7350a56d86f45cb6d2fb65606e"
+        }
+      ]
+    },
+    {
+      "Name": "corrected",
+      "Conditioning": true,
+      "Correction": true,
+      "Tensors": [
+        {
+          "Name": "dspark.correction_hidden_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 741888,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.correction_embed_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 742144,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.correction_gate.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 742400,
+          "Bytes": 32768,
+          "SHA256": "f7709a6490fbf9ace5a222c50b2dc3d8bd84e10ce9a03552da920f71252d1c07"
+        },
+        {
+          "Name": "dspark.correction_up.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 775168,
+          "Bytes": 32768,
+          "SHA256": "739c2b5fc23a374bd8fbc08c7c13fcf06224f147eeea39ed5f5bd91d9ea176f8"
+        },
+        {
+          "Name": "dspark.correction_down.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 807936,
+          "Bytes": 16384,
+          "SHA256": "209dd5d8ca206b4153dadf3fd49822923576fc9443ae6be3e3eb9750912d1fc6"
+        },
+        {
+          "Name": "dspark.markov_head_a.weight",
+          "Dimensions": [
+            8,
+            256
+          ],
+          "Offset": 824320,
+          "Bytes": 8192,
+          "SHA256": "f0126768cf46cc967a4329954f877c2d04f7596bb3576531dfe6cc7cfe663b69"
+        },
+        {
+          "Name": "dspark.markov_head_b.weight",
+          "Dimensions": [
+            8,
+            256
+          ],
+          "Offset": 832512,
+          "Bytes": 8192,
+          "SHA256": "00b9acf9052f5f9beae737be5f929f22e83def38b3920189f47245f9eb2402a7"
+        },
+        {
+          "Name": "token_embd.weight",
+          "Dimensions": [
+            64,
+            256
+          ],
+          "Offset": 840704,
+          "Bytes": 65536,
+          "SHA256": "32ca5c95797aaf3c9456a8825a407a72300025772c22996e313f25a723fee238"
+        },
+        {
+          "Name": "output_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 906240,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.fc.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 906496,
+          "Bytes": 32768,
+          "SHA256": "b8e7749d71a44380f53135d71c6201ce1bef7fda84184100e827a4f1c245389a"
+        },
+        {
+          "Name": "dspark.hidden_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 939264,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "dspark.log_snr_fc1.weight",
+          "Dimensions": [
+            128,
+            64
+          ],
+          "Offset": 939520,
+          "Bytes": 32768,
+          "SHA256": "06347e0aa65062c9dca5f46e817a7a1cfaf92610ab531a563b85cefe0a647ba8"
+        },
+        {
+          "Name": "dspark.log_snr_fc1.bias",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 972288,
+          "Bytes": 256,
+          "SHA256": "9be013e0ab9f4114bfc75083b7636c53f3cf7642c611ed1f8298148ceeb7cdcc"
+        },
+        {
+          "Name": "dspark.log_snr_fc2.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 972544,
+          "Bytes": 16384,
+          "SHA256": "1f5cf3d6e16fba5ef5a3bfd089d478fb6febaf64b0b8394ab7d8d804d89d8945"
+        },
+        {
+          "Name": "dspark.log_snr_fc2.bias",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 988928,
+          "Bytes": 256,
+          "SHA256": "87a37321fc4419a9969f8975d8738275f0a2c3d00bd070fe93708a1031c7b121"
+        },
+        {
+          "Name": "blk.0.attn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 989184,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.attn_q.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 989440,
+          "Bytes": 16384,
+          "SHA256": "680de32f8240fd53fe17c89101f93c4d9b22ccafcd2ba65c0c8ff7651267a1b2"
+        },
+        {
+          "Name": "blk.0.attn_k.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 1005824,
+          "Bytes": 8192,
+          "SHA256": "7cf50b1476b898807e1c9c8c754640fa283e91a0398c93ae0446fb5417de254b"
+        },
+        {
+          "Name": "blk.0.attn_v.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 1014016,
+          "Bytes": 8192,
+          "SHA256": "d5494911d41a45fe313e021b857a53af92b88869502b6500cf785c2531c91a1d"
+        },
+        {
+          "Name": "blk.0.attn_output.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 1022208,
+          "Bytes": 16384,
+          "SHA256": "9169317df6433021a3e67126ee70e1fa19f3cbbb79a3762ef2be08976e965441"
+        },
+        {
+          "Name": "blk.0.attn_q_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 1038592,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.0.attn_k_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 1038720,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.0.ffn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 1038848,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.0.ffn_gate.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 1039104,
+          "Bytes": 24576,
+          "SHA256": "2ddf1981cbd6e0d613bdd7a332b67b736eeefbb3472cb10848978b55e707e1e6"
+        },
+        {
+          "Name": "blk.0.ffn_down.weight",
+          "Dimensions": [
+            96,
+            64
+          ],
+          "Offset": 1063680,
+          "Bytes": 24576,
+          "SHA256": "2255065238bdfe84c7debcd6270febbd26fb155af7ae6e0dca15d364614d503e"
+        },
+        {
+          "Name": "blk.0.ffn_up.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 1088256,
+          "Bytes": 24576,
+          "SHA256": "33282a9dd97a40749ea5df8621e3762b9374901318fcb5a4f9509cc2b3b7f156"
+        },
+        {
+          "Name": "blk.1.attn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 1112832,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.1.attn_q.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 1113088,
+          "Bytes": 16384,
+          "SHA256": "49a1fb2f664dba82d2cbe670dbefe8ff14303d23af1e1b6c67983ecc12a8833e"
+        },
+        {
+          "Name": "blk.1.attn_k.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 1129472,
+          "Bytes": 8192,
+          "SHA256": "0281ee37919e8949c0acac38077b6b06365bcd2c11f90f34ab2c263ad180f261"
+        },
+        {
+          "Name": "blk.1.attn_v.weight",
+          "Dimensions": [
+            64,
+            32
+          ],
+          "Offset": 1137664,
+          "Bytes": 8192,
+          "SHA256": "8c48de6b22ea7548aff795d675dd587a5a55057b0a1299f7da85fe9db8e88368"
+        },
+        {
+          "Name": "blk.1.attn_output.weight",
+          "Dimensions": [
+            64,
+            64
+          ],
+          "Offset": 1145856,
+          "Bytes": 16384,
+          "SHA256": "d122e08c0e70a493555558732eb93e9b96c2bd985702ab67c070633b1502f155"
+        },
+        {
+          "Name": "blk.1.attn_q_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 1162240,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.1.attn_k_norm.weight",
+          "Dimensions": [
+            32
+          ],
+          "Offset": 1162368,
+          "Bytes": 128,
+          "SHA256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+        },
+        {
+          "Name": "blk.1.ffn_norm.weight",
+          "Dimensions": [
+            64
+          ],
+          "Offset": 1162496,
+          "Bytes": 256,
+          "SHA256": "2f20cd03c9cd392a406c56232b0ff93a15f6d6d7da79086bfa14f55d4a4031b0"
+        },
+        {
+          "Name": "blk.1.ffn_gate.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 1162752,
+          "Bytes": 24576,
+          "SHA256": "186b990b86c911ec5879742705778d6a16c9eed1756e851b695a9eb45a6b31a8"
+        },
+        {
+          "Name": "blk.1.ffn_down.weight",
+          "Dimensions": [
+            96,
+            64
+          ],
+          "Offset": 1187328,
+          "Bytes": 24576,
+          "SHA256": "8eaefc177226f00ecc867e768683cb35366c4f9311cb0fad8dbc1cb016d17a7d"
+        },
+        {
+          "Name": "blk.1.ffn_up.weight",
+          "Dimensions": [
+            64,
+            96
+          ],
+          "Offset": 1211904,
+          "Bytes": 24576,
+          "SHA256": "964377a8802bfea497243366756f6a46ab576406be858c14ab6796d22fba130d"
+        }
+      ]
+    }
+  ],
+  "NumPyWheel": {
+    "filename": "numpy-2.4.4-cp314-cp314-win_arm64.whl",
+    "url": "https://files.pythonhosted.org/packages/70/2e/14cda6f4d8e396c612d1bf97f22958e92148801d7e4f110cabebdc0eef4b/numpy-2.4.4-cp314-cp314-win_arm64.whl",
+    "size": 10496035,
+    "SHA256": "2c194dd721e54ecad9ad387c1d35e63dce5c4450c6dc7dd5611283dda239aabb"
+  },
+  "CPythonArchive": {
+    "Url": "https://www.python.org/ftp/python/3.14.0/python-3.14.0-embed-arm64.zip",
+    "SHA256": "d9e14c00a4d6fdbed96ece861998eb84b3ac3ca540b077b3cdf9bb0bfcea8e07",
+    "AuthenticodeSigner": "Python Software Foundation",
+    "OfficialMD5": "e207670ef0d54dca3681c9e4137a4774"
+  },
+  "License": "MIT; generator and GGUF writer pinned PrismML-Eng/llama.cpp; see tools/prism/upstream/LICENSE",
+  "OriginalInputFileParity": [
+    {
+      "File": "logsnr-cond-off.gguf",
+      "PythonBytes": 348384,
+      "RustBytes": 348384,
+      "PythonSHA": "293913cb815184bef5ecf56fcd66fb371dd66f465e593167e45d1dead5262985",
+      "RustSHA": "293913cb815184bef5ecf56fcd66fb371dd66f465e593167e45d1dead5262985",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-equal.gguf",
+      "PythonBytes": 398368,
+      "RustBytes": 398368,
+      "PythonSHA": "db124eb9cde7a8a764222001cc086e436efdb233495784028ab535c5649fb6bc",
+      "RustSHA": "db124eb9cde7a8a764222001cc086e436efdb233495784028ab535c5649fb6bc",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-max-inf.gguf",
+      "PythonBytes": 398368,
+      "RustBytes": 398368,
+      "PythonSHA": "f8534c13d58ccd405ae9251b8c06688bfe6cb4aa6a101762d6d9abc9f20296e9",
+      "RustSHA": "f8534c13d58ccd405ae9251b8c06688bfe6cb4aa6a101762d6d9abc9f20296e9",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-min-nan.gguf",
+      "PythonBytes": 398368,
+      "RustBytes": 398368,
+      "PythonSHA": "bf9758cd082d4c7e23297f9b68b05a37f16fc6d7e6ca28445621ece777053c1d",
+      "RustSHA": "bf9758cd082d4c7e23297f9b68b05a37f16fc6d7e6ca28445621ece777053c1d",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-omit-max.gguf",
+      "PythonBytes": 398336,
+      "RustBytes": 398336,
+      "PythonSHA": "9adcda7dcce65c81f30f27f3533471960e6bfe9d3e51f340572cc4ba5c9111c5",
+      "RustSHA": "9adcda7dcce65c81f30f27f3533471960e6bfe9d3e51f340572cc4ba5c9111c5",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-omit-min.gguf",
+      "PythonBytes": 398336,
+      "RustBytes": 398336,
+      "PythonSHA": "f0053f2ee021354871f7e16369e7da2e8e2b57bad48e9eb1b324bfb47e505a22",
+      "RustSHA": "f0053f2ee021354871f7e16369e7da2e8e2b57bad48e9eb1b324bfb47e505a22",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-reversed.gguf",
+      "PythonBytes": 398368,
+      "RustBytes": 398368,
+      "PythonSHA": "019b2380c0c854f6dd0e84fb031a82c2a14eecddff775c163bc8b7863532fd93",
+      "RustSHA": "019b2380c0c854f6dd0e84fb031a82c2a14eecddff775c163bc8b7863532fd93",
+      "Equal": true
+    },
+    {
+      "File": "logsnr-valid.gguf",
+      "PythonBytes": 398368,
+      "RustBytes": 398368,
+      "PythonSHA": "0770c8709d0baf8315cfee6eb2994c112e13c5c04f8b14d7012a7d98335e461d",
+      "RustSHA": "0770c8709d0baf8315cfee6eb2994c112e13c5c04f8b14d7012a7d98335e461d",
+      "Equal": true
+    }
+  ]
+}

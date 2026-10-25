@@ -1,0 +1,929 @@
+{
+  "SchemaVersion": 1,
+  "Source": "tests/peg-parser/test-json-parser.cpp",
+  "SourceSha256": "2731298bf7f28047852e4f420243fc533bdb1408611257f47a5fff2adacb36fc",
+  "Operations": [
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            116,
+            101,
+            115,
+            116,
+            34,
+            44,
+            32,
+            34,
+            118,
+            97,
+            108,
+            117,
+            101,
+            34,
+            58,
+            32,
+            52,
+            50,
+            44,
+            32,
+            34,
+            102,
+            108,
+            97,
+            103,
+            34,
+            58,
+            32,
+            116,
+            114,
+            117,
+            101,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            49,
+            44,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            34,
+            44,
+            32,
+            116,
+            114,
+            117,
+            101,
+            44,
+            32,
+            110,
+            117,
+            108,
+            108,
+            44,
+            32,
+            51,
+            46,
+            49,
+            52,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            117,
+            115,
+            101,
+            114,
+            115,
+            34,
+            58,
+            32,
+            91,
+            123,
+            34,
+            105,
+            100,
+            34,
+            58,
+            32,
+            49,
+            44,
+            32,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            65,
+            108,
+            105,
+            99,
+            101,
+            34,
+            125,
+            44,
+            32,
+            123,
+            34,
+            105,
+            100,
+            34,
+            58,
+            32,
+            50,
+            44,
+            32,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            66,
+            111,
+            98,
+            34,
+            125,
+            93,
+            44,
+            32,
+            34,
+            99,
+            111,
+            117,
+            110,
+            116,
+            34,
+            58,
+            32,
+            50,
+            44,
+            32,
+            34,
+            109,
+            101,
+            116,
+            97,
+            100,
+            97,
+            116,
+            97,
+            34,
+            58,
+            32,
+            123,
+            34,
+            118,
+            101,
+            114,
+            115,
+            105,
+            111,
+            110,
+            34,
+            58,
+            32,
+            34,
+            49,
+            46,
+            48,
+            34,
+            44,
+            32,
+            34,
+            116,
+            97,
+            103,
+            115,
+            34,
+            58,
+            32,
+            91,
+            34,
+            97,
+            100,
+            109,
+            105,
+            110,
+            34,
+            44,
+            32,
+            34,
+            117,
+            115,
+            101,
+            114,
+            34,
+            93,
+            125,
+            125
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            116,
+            101,
+            115,
+            116,
+            34,
+            44,
+            32,
+            34,
+            118,
+            97,
+            108,
+            117,
+            101,
+            34,
+            58,
+            32
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            49,
+            44,
+            32,
+            50,
+            44,
+            32,
+            51,
+            44,
+            32
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            100,
+            97,
+            116,
+            97,
+            34,
+            58,
+            32,
+            123,
+            34,
+            110,
+            101,
+            115,
+            116,
+            101,
+            100,
+            34,
+            58,
+            32
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            116,
+            101,
+            120,
+            116,
+            34,
+            58,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            92
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            116,
+            101,
+            120,
+            116,
+            34,
+            58,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            92,
+            117
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json",
+          "Args": []
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            123,
+            34,
+            116,
+            101,
+            120,
+            116,
+            34,
+            58,
+            32,
+            34,
+            104,
+            101,
+            108,
+            108,
+            111,
+            92,
+            117,
+            48,
+            48
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json_member",
+          "Args": [
+            "name",
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    "\"",
+                    {
+                      "Op": "chars",
+                      "Args": [
+                        "[a-z]"
+                      ]
+                    }
+                  ]
+                },
+                "\""
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            98,
+            111,
+            98,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json_member",
+          "Args": [
+            "name",
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    "\"",
+                    {
+                      "Op": "chars",
+                      "Args": [
+                        "[a-z]"
+                      ]
+                    }
+                  ]
+                },
+                "\""
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            34,
+            110,
+            97,
+            109,
+            101,
+            34,
+            58,
+            32,
+            34,
+            98,
+            111
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "json_member",
+          "Args": [
+            "name",
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    "\"",
+                    {
+                      "Op": "chars",
+                      "Args": [
+                        "[a-z]"
+                      ]
+                    }
+                  ]
+                },
+                "\""
+              ]
+            }
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            91,
+            93
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    }
+  ],
+  "Assertions": [
+    {
+      "Name": "simple JSON object parsing.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 0,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "simple JSON object parsing.result_end",
+      "Left": 43,
+      "Right": {
+        "Op": "result",
+        "Operation": 0,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "JSON array with mixed types.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 1,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "JSON array with mixed types.result_end",
+      "Left": 30,
+      "Right": {
+        "Op": "result",
+        "Operation": 1,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "nested JSON with objects and arrays.result_is_success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 2,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "nested JSON with objects and arrays.result_end",
+      "Left": 136,
+      "Right": {
+        "Op": "result",
+        "Operation": 2,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete object.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 3,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete array.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 4,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete nested structure.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 5,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete escape sequence.{\"text\": \"hello\\.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 6,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete escape sequence.{\"text\": \"hello\\.result_end",
+      "Left": 15,
+      "Right": {
+        "Op": "result",
+        "Operation": 6,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete escape sequence.{\"text\": \"hello\\u.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 7,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete escape sequence.{\"text\": \"hello\\u.result_end",
+      "Left": 15,
+      "Right": {
+        "Op": "result",
+        "Operation": 7,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete escape sequence.{\"text\": \"hello\\u00.result_is_need_more_input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 8,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "need_more_input() parsing - incomplete escape sequence.{\"text\": \"hello\\u00.result_end",
+      "Left": 15,
+      "Right": {
+        "Op": "result",
+        "Operation": 8,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "End"
+      },
+      "When": true
+    },
+    {
+      "Name": "object member.success.success",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 9,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "object member.partial.need more input",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 10,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      },
+      "When": true
+    },
+    {
+      "Name": "object member.failed.fail",
+      "Left": true,
+      "Right": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 11,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          0
+        ]
+      },
+      "When": true
+    }
+  ],
+  "Benchmarks": []
+}

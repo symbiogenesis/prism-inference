@@ -1,0 +1,384 @@
+{
+  "SchemaVersion": 1,
+  "Scope": "retained ordinary hosted failures; source-local passes and new focused fixes do not alter the accepted floor",
+  "RunUrl": "https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40146089128",
+  "ProjectRevision": "eb37e263b9852c4fcccb0d1fa8ee69aea977b4d5",
+  "RustResultsSha256": "cc854c086b9c4a0e4a619b2f32c6a99a53a02e73c2a207343322605faa8b97ba",
+  "OrdinarySources": 69,
+  "Passed": 4,
+  "Failed": 65,
+  "MeasuredDecoderLoaderFailures": 5,
+  "UnavailableProductionApiOrWrapperFailures": 60,
+  "Groups": [
+    {
+      "Capability": "packed-codecs",
+      "Sources": [
+        {
+          "Id": "tests/test-ptq1_0-element-map.cpp",
+          "HostedStatus": "fail",
+          "Reason": "20000 original LCG blocks; 2560000 required positions; compared=72448; mismatches=0; mapping_mismatches=0; rejected_blocks=19434; trial=1: noncanonical PTQ encoding"
+        },
+        {
+          "Id": "tests/test-ptq1_0-cuda-dot.cpp",
+          "HostedStatus": "fail",
+          "Reason": "source=17d72e91495a7ffe4e726e90ebe99bf9d7b9acbe1d451a38c865352c3559092a; host transcription, no GPU execution; 5000 trials:20000 scalar integer,20000 HIP integer,5000 HIP float; exhaustive:8192 HIP integer; original failures=0; production decode/CPU dot checks=14096 failures=12325; worst relative=7.062e-5, worst scaled=2.399e-8; examples=[]/[\"case=0: production PTQ decoder rejected: noncanonical PTQ encoding\", \"case=0: production PTQ CPU dot rejected: Rust production API has no packed-activation dot entry point; float matvec would requantize the original inputs.\", \"case=1: production PTQ decoder rejected: noncanonical PTQ encoding\", \"case=1: production PTQ CPU dot rejected: Rust production API has no packed-activation dot entry point; float matvec would requantize the original inputs.\", \"case=2: production PTQ decoder rejected: noncanonical PTQ encoding\", \"case=2: production PTQ CPU dot rejected: Rust production API has no packed-activation dot entry point; float matvec would requantize the original inputs.\", \"case=3: production PTQ decoder rejected: noncanonical PTQ encoding\", \"case=3: production PTQ CPU dot rejected: Rust production API has no packed-activation dot entry point; float matvec would requantize the original inputs.\", \"case=4: production PTQ decoder rejected: noncanonical PTQ encoding\", \"case=4: production PTQ CPU dot rejected: Rust production API has no packed-activation dot entry point; float matvec would requantize the original inputs.\", \"case=5: production PTQ decoder rejected: noncanonical PTQ encoding\", \"case=5: production PTQ CPU dot rejected: Rust production API has no packed-activation dot entry point; float matvec would requantize the original inputs.\"]"
+        }
+      ]
+    },
+    {
+      "Capability": "runtime-utilities",
+      "Sources": [
+        {
+          "Id": "tests/test-unicode.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: unicode_regex_split; 1 original assertion required"
+        },
+        {
+          "Id": "tests/test-mtp-catchup-batch.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: common_speculative_mtp_first_decode_fits; 6 original assertions required"
+        },
+        {
+          "Id": "tests/test-mtmd-impl.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production APIs: MTMD image tiling and temporal bitmap grouping; 29 original assertions required"
+        },
+        {
+          "Id": "tests/test-reasoning-budget.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: reasoning-budget sampler and UTF-8 boundary helper; all 71 original semantic conditions required"
+        },
+        {
+          "Id": "tests/test-log.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust production concurrent common logger API is unavailable; all eight workers and 8,000 messages remain required."
+        },
+        {
+          "Id": "tests/test-batch-alloc.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported: production batch allocator API is missing"
+        },
+        {
+          "Id": "tests/test-lora-conversion-inference.sh",
+          "HostedStatus": "fail",
+          "Reason": "complete LoRA conversion/inference source contract: target lacks production LoRA merger"
+        },
+        {
+          "Id": "tests/test-mtmd-c-api.c",
+          "HostedStatus": "fail",
+          "Reason": "Rust production MTMD chunk APIs are unavailable; all original factory/traversal/serialization checks remain required."
+        },
+        {
+          "Id": "tests/test-sampling.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: stateful sampler and candidate-buffer operations"
+        },
+        {
+          "Id": "tests/test-gguf.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported: production GGUF APIs are missing"
+        },
+        {
+          "Id": "tests/test-c.c",
+          "HostedStatus": "fail",
+          "Reason": "Rust runtime exposes no C public-header ABI; original source is compile-only with zero behavioral assertions"
+        },
+        {
+          "Id": "tests/test-arg-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production argument/parser/download API unavailable"
+        },
+        {
+          "Id": "tests/test-model-resolution.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production HF resolution/handler/cache API unavailable"
+        }
+      ]
+    },
+    {
+      "Capability": "templates-and-chat",
+      "Sources": [
+        {
+          "Id": "tests/test-jinja.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: Jinja lexer/parser/runtime/hasher/stats/caps/string-parts; all 19 original default groups required"
+        },
+        {
+          "Id": "tests/test-chat-template.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust production built-in/common chat template APIs are unavailable; all 36 legacy cases and 35 Jinja cases remain required."
+        },
+        {
+          "Id": "tests/test-chat-auto-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: chat differential helpers, template analysis and generated parsers"
+        },
+        {
+          "Id": "tests/test-chat-analysis.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production chat template/direct-apply/statistics API unavailable"
+        },
+        {
+          "Id": "tests/test-chat.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: common chat parsing/templates/diffs, server request conversion, delimiters and grammar validation"
+        }
+      ]
+    },
+    {
+      "Capability": "grammars-and-peg",
+      "Sources": [
+        {
+          "Id": "tests/test-grammar-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: llama_grammar_parser; all 23 variants and 274 source assertions required"
+        },
+        {
+          "Id": "tests/test-llama-grammar.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: grammar rules, stack storage and candidate rejection; all original literal contracts required"
+        },
+        {
+          "Id": "tests/test-grammar-llguidance.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Production LLGuidance/model-session API unavailable; full source unsupported"
+        },
+        {
+          "Id": "tests/test-grammar-integration.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: grammar/schema/clone state; all 11 original groups and 504 conditions required"
+        },
+        {
+          "Id": "tests/peg-parser/test-basic.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: PEG builders/parser/grammar/arena serialization; 44 source assertion records required"
+        },
+        {
+          "Id": "tests/peg-parser/test-gbnf-generation.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: PEG builders/parser/grammar/arena serialization; 29 source assertion records required"
+        },
+        {
+          "Id": "tests/peg-parser/test-json-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: PEG builders/parser/grammar/arena serialization; 18 source assertion records required"
+        },
+        {
+          "Id": "tests/peg-parser/test-json-serialization.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: PEG builders/parser/grammar/arena serialization; 2 source assertion records required"
+        },
+        {
+          "Id": "tests/peg-parser/test-python-dict-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: PEG builders/parser/grammar/arena serialization; 47 source assertion records required"
+        },
+        {
+          "Id": "tests/peg-parser/test-unicode.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: PEG builders/parser/grammar/arena serialization; 112 source assertion records required"
+        },
+        {
+          "Id": "tests/test-peg-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "6 original groups in basic/unicode/json/gbnf/serialization/python-dict order; 241 inherited assertions; failed_groups=6; deserialize100 benchmark dispatched separately in CI"
+        },
+        {
+          "Id": "tests/test-chat-peg-parser.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: chat PEG builder, AST mapper and message diffs"
+        },
+        {
+          "Id": "tests/test-gbnf-validator.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production Unicode/grammar APIs unavailable"
+        },
+        {
+          "Id": "tests/test-json-schema-to-grammar.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production API: schema conversion/type inspection and grammar parser"
+        }
+      ]
+    },
+    {
+      "Capability": "tensor-backend-and-optimizer",
+      "Sources": [
+        {
+          "Id": "tests/test-col2im-1d.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production tensor-graph API; 11 original geometries, 22 shape contracts and 33 NMSE thresholds required"
+        },
+        {
+          "Id": "tests/test-dfly-fusion.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production tensor-graph API; all 3 original non-square numerical/layout/separation contracts required"
+        },
+        {
+          "Id": "tests/test-rope.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production tensor-graph API; all 5 original modes, full 256x32x73 tensors and 10 relative-L1 assertions required"
+        },
+        {
+          "Id": "tests/test-moe-weighted-reduce.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust production manually aliased backend graph API is unavailable; all 48 source cases remain required."
+        },
+        {
+          "Id": "tests/test-alloc.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported: production graph allocator API is missing"
+        },
+        {
+          "Id": "tests/test-barrier.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust runtime has no production graph/threadpool API for the original barrier workload"
+        },
+        {
+          "Id": "tests/test-backend-sampler.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production model/context/backend sampling APIs are unavailable"
+        },
+        {
+          "Id": "tests/test-export-graph-ops.cpp",
+          "HostedStatus": "fail",
+          "Reason": "complete export source workload: production graph reservation API unavailable"
+        },
+        {
+          "Id": "tests/test-kv-mean-center.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production generated-model/K-cache API unavailable"
+        },
+        {
+          "Id": "tests/test-opt.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production optimizer/dataset APIs; all164 original CPU subtests required"
+        }
+      ]
+    },
+    {
+      "Capability": "quantization",
+      "Sources": [
+        {
+          "Id": "tests/test-quantize-fns.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported: required production codec/CPU-dot API is missing; no reference fallback"
+        },
+        {
+          "Id": "tests/test-quantize-perf.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust runtime lacks the production trait/buffer/timing APIs for the full performance source"
+        },
+        {
+          "Id": "tests/test-quantize-stats.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust runtime lacks production model tensor-map and codec trait APIs for the complete statistics source"
+        },
+        {
+          "Id": "tests/test-quant-type-selection.cpp",
+          "HostedStatus": "fail",
+          "Reason": "unsupported production metadata-model quantization APIs; all11realmodels and363expectedsections required"
+        }
+      ]
+    },
+    {
+      "Capability": "tokenizers",
+      "Sources": [
+        {
+          "Id": "tests/test-tokenizers-repo.sh",
+          "HostedStatus": "fail",
+          "Reason": "{\"Corpora\":[{\"Completed\":false,\"Error\":\"external vocabulary HybridDNA/ggml-vocab-carbon.gguf failed production load: \\\"vocabulary requires tokenizer.ggml.model=gpt2\\\"\",\"Name\":\"HybridDNA/ggml-vocab-carbon.gguf\",\"Passed\":false,\"SourcePredicates\":0},{\"Completed\":false,\"Error\":\"external vocabulary PLaMo2/ggml-vocab-plamo2.gguf failed production load: \\\"BPE requires a STRING merge array\\\"\",\"Name\":\"PLaMo2/ggml-vocab-plamo2.gguf\",\"Passed\":false,\"SourcePredicates\":0},{\"Completed\":false,\"Error\":\"external vocabulary RWKV/ggml-vocab-rwkv-7-world.gguf failed production load: \\\"BPE requires a STRING merge array\\\"\",\"Name\":\"RWKV/ggml-vocab-rwkv-7-world.gguf\",\"Passed\":false,\"SourcePredicates\":0},{\"Completed\":false,\"Error\":\"external vocabulary SPM/ggml-vocab-gemma-3.gguf failed production load: \\\"BPE requires a STRING merge array\\\"\",\"Name\":\"SPM/ggml-vocab-gemma-3.gguf\",\"Passed\":false,\"SourcePredicates\":0},{\"Completed\":false,\"Error\":\"external vocabulary UGM/ggml-vocab-nomic-bert-moe.gguf failed production load: \\\"BPE requires a STRING merge array\\\"\",\"Name\":\"UGM/ggml-vocab-nomic-bert-moe.gguf\",\"Passed\":false,\"SourcePredicates\":0},{\"Completed\":false,\"Error\":\"external vocabulary WPM/ggml-vocab-jina-v2-en.gguf failed production load: \\\"BPE requires a STRING merge array\\\"\",\"Name\":\"WPM/ggml-vocab-jina-v2-en.gguf\",\"Passed\":false,\"SourcePredicates\":0}],\"CorpusCount\":6,\"IgnoredMissingCorpus\":[],\"InputSelection\":\"The source accepts a caller-supplied repository. Pin its complete 2026-05-22 publisher snapshot, whose six tokenizer families are supported by the pinned Prism fork; later publisher additions require unsupported tokenizer behavior. No vocabulary bytes or expected token IDs are changed.\",\"PlatformExclusions\":[\"s390x endian conversion branch does not apply to Windows ARM64\"],\"Repository\":\"ggml-org/vocabs\",\"Revision\":\"cee4b7a68518c579bb758fca46bb149cd109348e\",\"SourceCorrection\":\"Immutable repository asset provisioning replaces mutable git clone/pull; every triple in the compatible publisher snapshot is retained\",\"SourceTokenPredicates\":0,\"TestExecutable\":\"safe-rust-tokenizer-corpus\"}"
+        },
+        {
+          "Id": "tests/test-tokenizer-0.sh",
+          "HostedStatus": "fail",
+          "Reason": "{\"AttemptedCases\":1,\"Cases\":[{\"Name\":\"llama-spm\",\"Observation\":{\"DifferenceDiagnostics\":[],\"Failure\":\"BPE requires a STRING merge array\",\"Production\":{\"AddSpecial\":false,\"Completed\":false,\"Error\":\"BPE requires a STRING merge array\",\"Mode\":\"original-file-export\",\"ParseSpecial\":false,\"RuntimeResult\":{\"ContextLoaded\":false,\"Error\":\"BPE requires a STRING merge array\",\"ModelLoaded\":true,\"Workers\":[]},\"Source\":\"tests/test-tokenizer-0.cpp\",\"SourceAssertions\":0,\"WindowsTextBytes\":2004},\"Reference\":{\"AddSpecial\":false,\"Completed\":true,\"DiagnosticEncodingNanoseconds\":\"606000\",\"InputBytes\":2004,\"LineCount\":46,\"Output\":\"C:\\\\a\\\\_temp\\\\SwiftBonsai-PrismUpstream-d46cb38075084ab3be6384aaac73e0d7\\\\test-tokenizer-0-shell-rust-bridge\\\\tokenizer-shell-files-7420-1792889399203466400\\\\llama-spm\\\\input.tok\",\"OutputSha256\":\"e0ccc2dcf6a82bab48fd088a94088cec8cad65f7eac9bca86564e57d20b0a073\",\"ReferenceClass\":\"LlamaTokenizer\",\"ReferenceSourceCorrection\":null,\"Source\":\"tests/test-tokenizer-0.py\",\"SourceAssertions\":0,\"TokenCount\":757,\"UniversalNewlineTextBytes\":2004},\"Source\":\"tests/test-tokenizer-0.sh\",\"SourceAssertions\":0,\"SourceExitSuccess\":false,\"StopPolicy\":\"The original set -e stops after a rejected production export, before the diagnostic diff\",\"StrictReferenceMatch\":null,\"WorkloadCompleted\":false}}],\"HarnessInputSelection\":{\"CallerSuppliedInputApiRetained\":true,\"Reason\":\"Original CLI requires an input; acceptance uses its immutableUTF8 source text for all26 declared tokenizer cases\",\"SourcePath\":\"tests/test-tokenizer-0.py\"},\"Inputs\":{\"AssetLockSha256\":\"a1acbb73cd50c1a42ac8652059cdcc07ab36d95199e60ce235dc0dae9c8d6ba2\",\"Cases\":[{\"InputReconstruction\":[],\"Name\":\"llama-spm\",\"OriginalRepository\":\"meta-llama/Llama-2-7b-hf\",\"OriginalRevision\":\"01c7f73d771dfac7d292323805ebc428287df4f9\",\"ReferenceFiles\":[\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer.model\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":723869,\"Path\":\"models/ggml-vocab-llama-spm.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"16c3724582d59aa8bf84711894e833f916ee46a31d80e21312759c48bf8d0e69\"}},{\"InputReconstruction\":[],\"Name\":\"phi-3\",\"OriginalRepository\":\"microsoft/Phi-3-mini-4k-instruct\",\"OriginalRevision\":\"f39ac1d28e925b323eae81227eaba4464caced4e\",\"ReferenceFiles\":[\"added_tokens.json\",\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer.model\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":726019,\"Path\":\"models/ggml-vocab-phi-3.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"967d7190d11c4842eab697079d98d56c2116e10eb617be355a2733bfc132e326\"}},{\"InputReconstruction\":[{\"Input\":\"gemma/tokenizer_config.source.json\",\"InputSha256\":\"cf30d1343d0f49bb205784423ba38cb55caaf1be4776048ca1c3fd625f866f27\",\"Output\":\"gemma/tokenizer_config.json\",\"Target\":{\"Bytes\":33556,\"ExactOriginal\":true,\"GitBlobSha1\":\"f23acead1a712a3017d73e25881ac441c71f45ce\",\"Sha256\":\"d1cc6e515e5900205fcc07b62fd16503bbff92b9c2c22bed56fd64400402fbb5\"},\"Transformation\":{\"Encoding\":\"UTF-8 without BOM; LF line endings; preserve final LF\",\"Kind\":\"exact-byte-reconstruction\",\"Steps\":[{\"Kind\":\"remove-exactly-one-whole-line\",\"LinePrefix\":\"  \\\"chat_template\\\": \",\"RemovedBytes\":617},{\"From\":\"  \\\"model_max_length\\\": 3000,\",\"Kind\":\"replace-exactly-once\",\"To\":\"  \\\"model_max_length\\\": 1000000000000000019884624838656,\"},{\"From\":\"  \\\"pad_token\\\": \\\"<eos>\\\",\",\"Kind\":\"replace-exactly-once\",\"To\":\"  \\\"pad_token\\\": \\\"<pad>\\\",\"}]}}],\"Name\":\"gemma\",\"OriginalRepository\":\"google/gemma-2b\",\"OriginalRevision\":\"9cf48e52b224239de00d483ec8eb84fb8d0f3a3a\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer.model\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"gemma\",\"Fingerprint\":null,\"GeneratedVocabFixture\":true,\"Length\":6028640,\"Name\":\"gemma\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":true,\"Sha256\":\"b5df8f28bbedbb72b397ea8ec3829c1d32a6d0a2b7caabe22ad54726d3987b3d\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":256000,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"gemma-2\",\"OriginalRepository\":\"google/gemma-2-9b\",\"OriginalRevision\":\"33c193028431c2fde6c6e51f29e6f17b60cbfac6\",\"ReferenceFiles\":[\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer.model\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"gemma2\",\"Fingerprint\":null,\"GeneratedVocabFixture\":true,\"Length\":6027648,\"Name\":\"gemma-2\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":true,\"Sha256\":\"55702230ab26cc50029819978bc0a5e6daf2f84700d24a0d0e9aca1ba93480ec\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":256000,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"baichuan\",\"OriginalRepository\":\"baichuan-inc/Baichuan-7B\",\"OriginalRevision\":\"5d86e56a58fe4a5b3292cd9bb7468afef6f93eab\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.model\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":1340998,\"Path\":\"models/ggml-vocab-baichuan.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"4f5b955697f3bd3108070b1d5936c7eb9fc542b81c6932e59abddec75bca1963\"}},{\"InputReconstruction\":[],\"Name\":\"bert-bge\",\"OriginalRepository\":\"BAAI/bge-small-en-v1.5\",\"OriginalRevision\":\"5c38ec7c405ec4b44b94cc5a9bb96e735b38267a\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.txt\"],\"Vocabulary\":{\"Length\":627549,\"Path\":\"models/ggml-vocab-bert-bge.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"fbcbe22278fb302694d5f4a41bfe48c5f90e8e3554eab1c0435387dff654a854\"}},{\"InputReconstruction\":[],\"Name\":\"jina-v2-en\",\"OriginalRepository\":\"jinaai/jina-embeddings-v2-base-en\",\"OriginalRevision\":\"322d4d7e2f35e84137961a65af894fda0385eb7a\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.txt\"],\"Vocabulary\":{\"Architecture\":\"jina-bert-v2\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f\",\"Pre\":\"jina-v2-en\"},\"GeneratedVocabFixture\":true,\"Length\":630656,\"Name\":\"jina-v2-en\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"e6699cb3fedf2d5ea3fc15db0aaa0c502c2c65ab742afdc5441e1e00be47317c\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":30528,\"WordPiece\":true}},{\"InputReconstruction\":[],\"Name\":\"llama-bpe\",\"OriginalRepository\":\"meta-llama/Meta-Llama-3-8B\",\"OriginalRevision\":\"8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920\",\"ReferenceFiles\":[\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":7818140,\"Path\":\"models/ggml-vocab-llama-bpe.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"97272e430d53bc7688f52d5e0ad8ea8f163ede9f1bbd1694feaa504797d5d96e\"}},{\"InputReconstruction\":[],\"Name\":\"phi-2\",\"OriginalRepository\":\"microsoft/phi-2\",\"OriginalRevision\":\"810d367871c1d460086d9f82db8696f2e0a0fcd0\",\"ReferenceFiles\":[\"added_tokens.json\",\"config.json\",\"merges.txt\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Architecture\":\"phi2\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"fcace8b9cac38ce847670c970cd5892031a753a1ef381abd1d9af00f713da085\",\"Pre\":\"phi-2\"},\"GeneratedVocabFixture\":true,\"Length\":1787584,\"Name\":\"phi-2\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"de2e963fe9fbdb38d282d731a56b4a17005f9b0b3f5a3cce617600b57fdbb8cd\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":51200,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"deepseek-llm\",\"OriginalRepository\":\"deepseek-ai/deepseek-llm-7b-base\",\"OriginalRevision\":\"7683fea62db869066ddaff6a41d032262c490d4f\",\"ReferenceFiles\":[\"config.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":3970167,\"Path\":\"models/ggml-vocab-deepseek-llm.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"867f77537b54565f0d81d508c04edc41aa1d4ffc1a92745f225b4c1b02755f76\"}},{\"InputReconstruction\":[],\"Name\":\"deepseek-coder\",\"OriginalRepository\":\"deepseek-ai/deepseek-coder-6.7b-base\",\"OriginalRevision\":\"ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912\",\"ReferenceFiles\":[\"config.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":1156067,\"Path\":\"models/ggml-vocab-deepseek-coder.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"91cb1379f2e33af1c4866b194622b7a0e12e8f0c9dba7ba2f10d55978730bec1\"}},{\"InputReconstruction\":[],\"Name\":\"falcon\",\"OriginalRepository\":\"tiiuae/falcon-7b\",\"OriginalRevision\":\"ec89142b67d748a1865ea4451372db8313ada0d8\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Length\":2287728,\"Path\":\"models/ggml-vocab-falcon.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"9f0bf8b0733680398b72e652e90f260f43782f326e75545fc0e49611a5ba35ad\"}},{\"InputReconstruction\":[],\"Name\":\"mpt\",\"OriginalRepository\":\"mosaicml/mpt-7b\",\"OriginalRevision\":null,\"ReferenceFiles\":[\"merges.txt\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Length\":1771393,\"Path\":\"models/ggml-vocab-mpt.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"59dc382612866d1fc6c11ea531318d327598f3412d9c8f8600607cdf3030898f\"}},{\"InputReconstruction\":[],\"Name\":\"starcoder\",\"OriginalRepository\":\"bigcode/starcoder2-3b\",\"OriginalRevision\":\"733247c55e3f73af49ce8e9c7949bf14af205928\",\"ReferenceFiles\":[\"config.json\",\"merges.txt\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Length\":1719346,\"Path\":\"models/ggml-vocab-starcoder.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"fedb892b4e1bd3c1f2fcdae356440b14fb458f4264d586e5c987ed93df4e174d\"}},{\"InputReconstruction\":[],\"Name\":\"gpt-2\",\"OriginalRepository\":\"evilfreelancer/ruGPT3XL\",\"OriginalRevision\":\"d35fdf92f5cca9dcc9bf57a923f9cf3a9eef9a41\",\"ReferenceFiles\":[\"config.json\",\"merges.txt\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Length\":1766807,\"Path\":\"models/ggml-vocab-gpt-2.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"cedc56ca6e2e89f63e781696d1fd76b4b1d49e6720dee86463e915f6e90016ac\"}},{\"InputReconstruction\":[],\"Name\":\"stablelm2\",\"OriginalRepository\":\"stabilityai/stablelm-2-zephyr-1_6b\",\"OriginalRevision\":\"2f275b1127d59fc31e4f7c7426d528768ada9ea4\",\"ReferenceFiles\":[\"config.json\",\"merges.txt\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Architecture\":\"stablelm\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"32d85c31273f8019248f2559fed492d929ea28b17e51d81d3bb36fff23ca72b3\",\"Pre\":\"stablelm2\"},\"GeneratedVocabFixture\":true,\"Length\":3540000,\"Name\":\"stablelm2\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"c9bbe0a3bac8046196257ad6d69fbbb4e24ca56c77bbb7e1185fe1e34837a869\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":100352,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"refact\",\"OriginalRepository\":\"smallcloudai/Refact-1_6-base\",\"OriginalRevision\":\"1ff9414fb7c9a813a1f069af8e83f66386e3d5b0\",\"ReferenceFiles\":[\"config.json\",\"merges.txt\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Length\":1720710,\"Path\":\"models/ggml-vocab-refact.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"ac3ceda902fed91ccf74312b305d9b86c37e4f8e35fa9cc6ef3ce34fca7d4678\"}},{\"InputReconstruction\":[],\"Name\":\"qwen2\",\"OriginalRepository\":\"Qwen/Qwen3-Embedding-0.6B\",\"OriginalRevision\":\"97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3\",\"ReferenceFiles\":[\"config.json\",\"merges.txt\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Length\":5928681,\"Path\":\"models/ggml-vocab-qwen2.gguf\",\"PinnedSourceArchive\":true,\"Sha256\":\"44c2f46b715f585c6ab513970e8a006bfa5badd6108560054921cf598d154d8c\"}},{\"InputReconstruction\":[],\"Name\":\"olmo\",\"OriginalRepository\":\"allenai/OLMo-1.7-7B-hf\",\"OriginalRevision\":\"e3c82a0871580b424d74e68acee866bb007df7df\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"olmo\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"b6dc8df998e1cfbdc4eac8243701a65afe638679230920b50d6f17d81c098166\",\"Pre\":\"olmo\"},\"GeneratedVocabFixture\":true,\"Length\":1768416,\"Name\":\"olmo\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"eec8dd4eed4fd0c2aa5435c955ba2268b81d346fd56abe0f996d802799ee47f4\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":50304,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"jina-v2-es\",\"OriginalRepository\":\"jinaai/jina-embeddings-v2-base-es\",\"OriginalRevision\":\"8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e\",\"ReferenceFiles\":[\"config.json\",\"merges.txt\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Architecture\":\"jina-bert-v2\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"171aeeedd6fb548d418a7461d053f11b6f1f1fc9b387bd66640d28a4b9f5c643\",\"Pre\":\"jina-v2-es\"},\"GeneratedVocabFixture\":true,\"Length\":2222848,\"Name\":\"jina-v2-es\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"383c197ebbe6793cb0349ba31a7029363acdef1a85f2d1eab130dcf536b69ec9\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":61056,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"jina-v2-de\",\"OriginalRepository\":\"aari1995/German_Semantic_V3\",\"OriginalRevision\":\"38403d438de2aa13d8e553dec44c8e8785dbe9c5\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.txt\"],\"Vocabulary\":{\"Architecture\":\"jina-bert-v2\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"b3d1dd861f1d4c5c0d2569ce36baf3f90fe8a102db3de50dd71ff860d91be3df\",\"Pre\":\"jina-v2-de\"},\"GeneratedVocabFixture\":true,\"Length\":617024,\"Name\":\"jina-v2-de\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"f5c100db29e7edbaee003eca12051f8982442684e6ec243004662343d8bb4112\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":31102,\"WordPiece\":true}},{\"InputReconstruction\":[],\"Name\":\"smaug-bpe\",\"OriginalRepository\":\"abacusai/Smaug-Llama-3-70B-Instruct\",\"OriginalRevision\":\"8f558d6211b9d8f1712b80df40c5b65bea0b56ea\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"llama\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"c136ed14d01c2745d4f60a9596ae66800e2b61fa45643e72436041855ad4089d\",\"Pre\":\"smaug-bpe\"},\"GeneratedVocabFixture\":true,\"Length\":7818240,\"Name\":\"smaug-bpe\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"d167fb91a666a2a494c96f9c16bb0aa3f84254d016657b7e782e9828514f48ed\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":128256,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"poro-chat\",\"OriginalRepository\":\"LumiOpen/Poro-34B-chat\",\"OriginalRevision\":\"ee6c811710fca78f7be364d3ff08565804f27b8a\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"bloom\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"c7ea5862a53e4272c035c8238367063e2b270d51faa48c0f09e9d5b54746c360\",\"Pre\":\"poro-chat\"},\"GeneratedVocabFixture\":true,\"Length\":4713024,\"Name\":\"poro-chat\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"4a364ef9dccb7e49b76d830825bc8281a4e01069a34871ae857d01170985a364\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":128000,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"jina-v2-code\",\"OriginalRepository\":\"jinaai/jina-embeddings-v2-base-code\",\"OriginalRevision\":\"516f4baf13dec4ddddda8631e019b5737c8bc250\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\",\"vocab.json\"],\"Vocabulary\":{\"Architecture\":\"jina-bert-v2\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"7967bfa498ade6b757b064f31e964dddbb80f8f9a4d68d4ba7998fcf281c531a\",\"Pre\":\"jina-v2-code\"},\"GeneratedVocabFixture\":true,\"Length\":2141984,\"Name\":\"jina-v2-code\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"4d5a2be25cf93e41ead6416b30808830eca14d612c93f89a89f2e14b473db0e6\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":61056,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"viking\",\"OriginalRepository\":\"LumiOpen/Viking-7B\",\"OriginalRevision\":\"efee9d2387fb39829f792aab1980016514e1291e\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"llama\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"7fc505bd3104ca1083b150b17d088b59534ede9bde81f0dd2090967d7fe52cee\",\"Pre\":\"viking\"},\"GeneratedVocabFixture\":true,\"Length\":4891936,\"Name\":\"viking\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"b1f9b9d4cf0163ccae12c6b67717973086131b8ce540ec2768c66dd439911357\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":131072,\"WordPiece\":false}},{\"InputReconstruction\":[],\"Name\":\"jais\",\"OriginalRepository\":\"core42/jais-13b\",\"OriginalRevision\":\"0d5eb87f91e6577dac17bc319eee940fb875b899\",\"ReferenceFiles\":[\"config.json\",\"special_tokens_map.json\",\"tokenizer.json\",\"tokenizer_config.json\"],\"Vocabulary\":{\"Architecture\":\"jais\",\"Fingerprint\":{\"CheckTokenIdsSha256\":\"b53802fb28e26d645c3a310b34bfe07da813026ec7c7716883404d5e0f8b1901\",\"Pre\":\"jais\"},\"GeneratedVocabFixture\":true,\"Length\":4266464,\"Name\":\"jais\",\"NoProductionObservations\":true,\"NoWeights\":true,\"SentencePiece\":false,\"Sha256\":\"90cf7ec6e5ef80bcf3d91eeb2731f743d0b3580005742f0e5a7612ac5dc912d9\",\"SourceCorrection\":\"Missing pinned source GGUF is generated in safe Rust from immutable original publisher tokenizer inputs using pinned converter input rules\",\"VocabularySize\":84992,\"WordPiece\":false}}],\"GeneratedVocabFixtures\":13,\"MptCanonicalDependency\":{\"PinnedInputIdentity\":{\"AddedDescriptorsVerified\":25,\"Decoder\":{\"add_prefix_space\":false,\"trim_offsets\":true,\"type\":\"ByteLevel\",\"use_regex\":true},\"ExactInputVocabularyAndMergeMatch\":true,\"InputOnly\":true,\"MergesVerified\":50009,\"Normalizer\":{\"type\":\"NFC\"},\"OriginalGgufSha256\":\"59dc382612866d1fc6c11ea531318d327598f3412d9c8f8600607cdf3030898f\",\"OriginalMetadata\":{\"general.architecture\":\"mpt\",\"general.name\":\"mpt\",\"mpt.attention.head_count\":32,\"mpt.attention.layer_norm_epsilon\":9.999999747378752e-6,\"mpt.attention.max_alibi_bias\":8.0,\"mpt.block_count\":32,\"mpt.context_length\":2048,\"mpt.embedding_length\":4096,\"mpt.feed_forward_length\":16384,\"tokenizer.ggml.bos_token_id\":0,\"tokenizer.ggml.eos_token_id\":0,\"tokenizer.ggml.model\":\"gpt2\",\"tokenizer.ggml.pre\":\"mpt\",\"tokenizer.ggml.unknown_token_id\":0},\"PostProcessor\":{\"add_prefix_space\":false,\"trim_offsets\":true,\"type\":\"ByteLevel\",\"use_regex\":true},\"PreTokenizer\":{\"add_prefix_space\":false,\"trim_offsets\":true,\"type\":\"ByteLevel\",\"use_regex\":true},\"TokenEntriesVerified\":50254,\"TokenizerConfig\":{\"add_prefix_space\":false,\"bos_token\":\"<|endoftext|>\",\"eos_token\":\"<|endoftext|>\",\"tokenizer_class\":\"GPTNeoXTokenizer\",\"unk_token\":\"<|endoftext|>\"}},\"Publisher\":{\"Bytes\":2632,\"OnlyWrapperKwarg\":\"model_max_length=2048\",\"Repository\":\"mosaicml/llm-foundry\",\"Revision\":\"cc8351c4d732f091098f13d13b55232a54913edb\",\"Sha256\":\"3eb010463251b35ec830ca2dae45e9619e23ac38167db47307c9c78cee096ce4\",\"TokenizationOverrides\":{},\"Tokenizer\":\"EleutherAI/gpt-neox-20b\",\"Url\":\"https://raw.githubusercontent.com/mosaicml/llm-foundry/cc8351c4d732f091098f13d13b55232a54913edb/scripts/train/yamls/pretrain/mpt-7b.yaml\"},\"SourceCorrection\":\"Unavailable mosaicml/mpt-7b tokenizer files are obtained from its explicitly declared canonical EleutherAI/gpt-neox-20b dependency, with all input vocabulary/merge/special IDs checked against the original pinned vocabulary\"},\"PinnedSourceVocabularies\":13,\"SourceDocuments\":[{\"Bytes\":2004,\"Path\":\"tests/test-tokenizer-0.py\",\"Sha256\":\"6c225af1d7a2dce88fdc1b885ca4b525de588067508c72b15eef62cf6112c788\"},{\"Bytes\":1146,\"Path\":\"tests/test-tokenizer-0.sh\",\"Sha256\":\"85baee7afaac6928e23f915fd7bfa01b7c34547e90fee67d36205a5ca095f3f4\"},{\"Bytes\":22192,\"Path\":\"tests/test-tokenizer-random.py\",\"Sha256\":\"34e3b5edcb16a019faa2d7f17f88d82419cf821e964f921db8b53484037d7929\"}],\"VerifiedPublisherBytes\":150188454,\"VerifiedPublisherFiles\":122},\"PlannedCases\":26,\"SourceAssertions\":0,\"StrictReferenceMatch\":null,\"WorkloadCompleted\":false}"
+        },
+        {
+          "Id": "tests/test-tokenizer-random.py",
+          "HostedStatus": "fail",
+          "Reason": "production vocabulary/model API is unavailable"
+        },
+        {
+          "Id": "tests/test-tokenizer-0.cpp",
+          "HostedStatus": "fail",
+          "Reason": "15 bundled vocabularies; 50/694 source token-vector predicates; 4 shared-context workers per vocabulary, worker0 comparisons only; loader failures=14; token failures=0; bert-bge: BPE requires a STRING merge array; command-r: vocabulary requires tokenizer.ggml.pre=qwen35; deepseek-coder: vocabulary requires tokenizer.ggml.pre=qwen35; deepseek-llm: vocabulary requires tokenizer.ggml.pre=qwen35; falcon: vocabulary requires tokenizer.ggml.pre=qwen35; gemma-4: vocabulary requires tokenizer.ggml.model=gpt2; gpt-2: vocabulary requires tokenizer.ggml.pre=qwen35; llama-bpe: vocabulary requires tokenizer.ggml.pre=qwen35"
+        },
+        {
+          "Id": "tests/test-tokenizer-1-spm.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust production persistent vocabulary API unavailable; exhaustive source contract unsupported"
+        },
+        {
+          "Id": "tests/test-tokenizer-1-bpe.cpp",
+          "HostedStatus": "fail",
+          "Reason": "Rust production persistent vocabulary API unavailable; exhaustive source contract unsupported"
+        }
+      ]
+    },
+    {
+      "Capability": "dspark",
+      "Sources": [
+        {
+          "Id": "tests/test-dspark-logsnr-meta.cpp",
+          "HostedStatus": "fail",
+          "Reason": "complete DSpark log-SNR source contract: missing production DSpark model-loader API"
+        },
+        {
+          "Id": "tests/test-dspark-forward.cpp",
+          "HostedStatus": "fail",
+          "Reason": "complete Windows CPU DSpark forward source contract: missing production DSpark forward/graph API"
+        },
+        {
+          "Id": "tests/test-dspark-loop.cpp",
+          "HostedStatus": "fail",
+          "Reason": "complete DSpark loop source contract: missing production DSpark model/speculative API"
+        },
+        {
+          "Id": "tests/test-dspark-real-eval.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production DSpark model/context/speculative/sampler APIs unavailable"
+        }
+      ]
+    },
+    {
+      "Capability": "model-lifecycle-and-architectures",
+      "Sources": [
+        {
+          "Id": "tests/test-llama-archs.cpp",
+          "HostedStatus": "fail",
+          "Reason": "full architecture source contract: missing production architecture/model API"
+        },
+        {
+          "Id": "tests/test-recurrent-state-rollback.cpp",
+          "HostedStatus": "fail",
+          "Reason": "complete recurrent-state source contract: missing production architecture/model API"
+        },
+        {
+          "Id": "tests/test-autorelease.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production model/context/state API unavailable"
+        },
+        {
+          "Id": "tests/test-model-load-cancel.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production model/context/state API unavailable"
+        },
+        {
+          "Id": "tests/test-save-load-state.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production model/context/state API unavailable"
+        },
+        {
+          "Id": "tests/test-state-restore-fragmented.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production model/context/state API unavailable"
+        },
+        {
+          "Id": "tests/test-thread-safety.cpp",
+          "HostedStatus": "fail",
+          "Reason": "production model/context/state API unavailable"
+        }
+      ]
+    }
+  ]
+}

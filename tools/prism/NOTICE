@@ -1,0 +1,49 @@
+Swift Bonsai 2
+Copyright 2026 Edward Miller and contributors
+
+Original project code, documentation, and configuration are licensed under
+the Apache License, Version 2.0. See LICENSE.
+
+Third-party material retains its original license and attribution. This
+project includes Prism/ggml-derived codec and loader portions, including in
+tools/ternary, tools/codec-probe, tools/prism (including Apply-Overlay.ps1),
+and src/prism-runtime.
+Their upstream MIT terms are reproduced below and retained separately in
+tools/ternary/PRISM-NOTICE.txt and tools/prism/PRISM-LICENSE.txt.
+
+Upstream: https://github.com/PrismML-Eng/llama.cpp
+Codec reference: 73bfe6cc485554822f80c473a3c0c4f25e80f41b
+Tokenizer scanner/Unicode reference: 73bfe6cc485554822f80c473a3c0c4f25e80f41b
+Loader overlay base: b87ca7225456b06b0975b8239c66b5aecf07e37c
+Imported test reference and shared conformance exporters: b87ca7225456b06b0975b8239c66b5aecf07e37c
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Prism runtime HTTP framing and Q1_0/Q2_0 codec adaptations also reference
+Camelid: https://github.com/timtoole02/Camelid
+Revision: 1829a7e73775eb829efe8fabf46a6680897a975b
+Source: src/fabric/http.rs and src/tensor/mod.rs
+Copyright (c) 2026 Tim Toole
+Licensed under the MIT License, reproduced in
+src/prism-runtime/CAMELID-LICENSE.txt.
+The exact Prism/ggml layouts and arithmetic remain the conformance authority.

@@ -1,0 +1,7 @@
+row-quantizers.json -text
+weighted-q4.json -text
+sampler-rng.json -text
+legacy-row-quantizers.json -text
+weighted-legacy.json -text
+# Keep the immutable embedded-template capture byte-identical on Windows.
+swift-chat-template.jinja -text

@@ -1,0 +1,13 @@
+{
+  "SchemaVersion": 1,
+  "Purpose": "Small production model for the Rust-owned upstream lifecycle contracts; stored only in external test evidence.",
+  "Assets": [
+    {
+      "Path": "tinyllamas/stories15M-q4_0.gguf",
+      "Url": "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf?download=true",
+      "Bytes": 19077344,
+      "Sha256": "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739",
+      "IdentitySource": "https://huggingface.co/ggml-org/models-moved/raw/main/tinyllamas/stories15M-q4_0.gguf"
+    }
+  ]
+}

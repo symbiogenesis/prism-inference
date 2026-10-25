@@ -1,0 +1,13 @@
+{
+  "SchemaVersion": 1,
+  "Repository": "https://github.com/PrismML-Eng/llama.cpp",
+  "Commit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "ArchiveUrl": "https://codeload.github.com/PrismML-Eng/llama.cpp/zip/b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "ArchiveSha256": "333ab1cc57bdb1be0b52f894fe8c6822eb7da667a239d7a587dce79283782e58",
+  "ArchiveBytes": 39429253,
+  "ArchiveRoot": "llama.cpp-b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "AdapterSourceSha256": "e0abe8c4905db55c5ba4e75012798551e95d93bc5b697cba25d8e3cc86175d3b",
+  "OverlaidAdapterSha256": "9a35f8711b7f281ac52bc5314d8f9bff30fd70eb5cb5c9ffa3735b87c7207bb8",
+  "CMakeSourceSha256": "666aaa7f44777b4abc665aae93c65480fbddd4fa34567706c01ddebf071b977d",
+  "OverlaidCMakeSha256": "f226657128e33a03ce36c0fd6a2d99aa6a4016349165cf16a528c5932f729d61"
+}

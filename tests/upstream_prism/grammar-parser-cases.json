@@ -1,0 +1,1209 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "SourceSha256": "4c3f3b8ba3f4aa426b750815c7420c5af88672037c98f324168038dedd913ece",
+  "OriginalAssertionCount": 274,
+  "SuccessfulVariants": 17,
+  "FailureVariants": 6,
+  "Cases": [
+    {
+      "Symbols": [],
+      "Elements": [],
+      "OriginalAssertions": 1,
+      "ExpectParsed": false,
+      "Grammar": "\n        root ::= \"a\"{,}\"\n    "
+    },
+    {
+      "Symbols": [],
+      "Elements": [],
+      "OriginalAssertions": 1,
+      "ExpectParsed": false,
+      "Grammar": "\n        root ::= (((((([^x]*){0,99}){0,99}){0,99}){0,99}){0,99}){0,99}\n    "
+    },
+    {
+      "Symbols": [],
+      "Elements": [],
+      "OriginalAssertions": 1,
+      "ExpectParsed": false,
+      "Grammar": "\n        root ::= \"a\"{,10}\"\n    "
+    },
+    {
+      "Symbols": [],
+      "Elements": [],
+      "OriginalAssertions": 1,
+      "ExpectParsed": false,
+      "Grammar": "\n        root ::= \"a\"{5000}\n    "
+    },
+    {
+      "Symbols": [],
+      "Elements": [],
+      "OriginalAssertions": 1,
+      "ExpectParsed": false,
+      "Grammar": "\n        root ::= \"a\"{5000,}\n    "
+    },
+    {
+      "Symbols": [],
+      "Elements": [],
+      "OriginalAssertions": 1,
+      "ExpectParsed": false,
+      "Grammar": "\n        root ::= \"a\"{5000,6000}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 9,
+      "ExpectParsed": true,
+      "Grammar": "\n        root ::= \"a\"{0,5000}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 12,
+      "ExpectParsed": true,
+      "Grammar": "\n        root ::= \"a\"{3,5000}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 4,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 98
+        },
+        {
+          "Type": 6,
+          "Value": 100
+        },
+        {
+          "Type": 6,
+          "Value": 120
+        },
+        {
+          "Type": 5,
+          "Value": 122
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 4,
+          "Value": 49
+        },
+        {
+          "Type": 5,
+          "Value": 51
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 12,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\" | [bdx-z] | [^1-3]\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "a",
+          "Id": 1
+        },
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_2",
+          "Id": 2
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 13,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= a+\n        a     ::= \"a\"\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 10,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"+\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "a",
+          "Id": 1
+        },
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_2",
+          "Id": 2
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 11,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= a?\n        a     ::= \"a\"\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 8,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"?\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "a",
+          "Id": 1
+        },
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_2",
+          "Id": 2
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 12,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= a*\n        a     ::= \"a\"\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 9,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"*\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 5,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"{2}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 11,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"{2,}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 7,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"{ 4}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        },
+        {
+          "Name": "root_2",
+          "Id": 2
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 15,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= \"a\"{2,4}\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "expr",
+          "Id": 2
+        },
+        {
+          "Name": "expr_5",
+          "Id": 5
+        },
+        {
+          "Name": "expr_6",
+          "Id": 6
+        },
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        },
+        {
+          "Name": "root_4",
+          "Id": 4
+        },
+        {
+          "Name": "term",
+          "Id": 3
+        },
+        {
+          "Name": "term_7",
+          "Id": 7
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 4
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 3,
+          "Value": 61
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 3,
+          "Value": 10
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 2,
+          "Value": 6
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 48
+        },
+        {
+          "Type": 5,
+          "Value": 57
+        },
+        {
+          "Type": 2,
+          "Value": 7
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 4
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 45
+        },
+        {
+          "Type": 6,
+          "Value": 43
+        },
+        {
+          "Type": 6,
+          "Value": 42
+        },
+        {
+          "Type": 6,
+          "Value": 47
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 5
+        },
+        {
+          "Type": 2,
+          "Value": 6
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 48
+        },
+        {
+          "Type": 5,
+          "Value": 57
+        },
+        {
+          "Type": 2,
+          "Value": 7
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 43,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= (expr \"=\" term \"\\n\")+\n        expr  ::= term ([-+*/] term)*\n        term  ::= [0-9]+\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "expr",
+          "Id": 2
+        },
+        {
+          "Name": "expr_6",
+          "Id": 6
+        },
+        {
+          "Name": "expr_7",
+          "Id": 7
+        },
+        {
+          "Name": "ident",
+          "Id": 8
+        },
+        {
+          "Name": "ident_10",
+          "Id": 10
+        },
+        {
+          "Name": "num",
+          "Id": 9
+        },
+        {
+          "Name": "num_11",
+          "Id": 11
+        },
+        {
+          "Name": "root",
+          "Id": 0
+        },
+        {
+          "Name": "root_1",
+          "Id": 1
+        },
+        {
+          "Name": "root_5",
+          "Id": 5
+        },
+        {
+          "Name": "term",
+          "Id": 4
+        },
+        {
+          "Name": "ws",
+          "Id": 3
+        },
+        {
+          "Name": "ws_12",
+          "Id": 12
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 5
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 3,
+          "Value": 61
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 2,
+          "Value": 4
+        },
+        {
+          "Type": 3,
+          "Value": 10
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 4
+        },
+        {
+          "Type": 2,
+          "Value": 7
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 12
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 8
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 9
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 40
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 2,
+          "Value": 2
+        },
+        {
+          "Type": 3,
+          "Value": 41
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 1
+        },
+        {
+          "Type": 2,
+          "Value": 5
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 45
+        },
+        {
+          "Type": 6,
+          "Value": 43
+        },
+        {
+          "Type": 6,
+          "Value": 42
+        },
+        {
+          "Type": 6,
+          "Value": 47
+        },
+        {
+          "Type": 2,
+          "Value": 4
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 2,
+          "Value": 6
+        },
+        {
+          "Type": 2,
+          "Value": 7
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 5,
+          "Value": 122
+        },
+        {
+          "Type": 2,
+          "Value": 10
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 48
+        },
+        {
+          "Type": 5,
+          "Value": 57
+        },
+        {
+          "Type": 2,
+          "Value": 11
+        },
+        {
+          "Type": 2,
+          "Value": 3
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 97
+        },
+        {
+          "Type": 5,
+          "Value": 122
+        },
+        {
+          "Type": 6,
+          "Value": 48
+        },
+        {
+          "Type": 5,
+          "Value": 57
+        },
+        {
+          "Type": 6,
+          "Value": 95
+        },
+        {
+          "Type": 2,
+          "Value": 10
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 48
+        },
+        {
+          "Type": 5,
+          "Value": 57
+        },
+        {
+          "Type": 2,
+          "Value": 11
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        },
+        {
+          "Type": 3,
+          "Value": 32
+        },
+        {
+          "Type": 6,
+          "Value": 9
+        },
+        {
+          "Type": 6,
+          "Value": 10
+        },
+        {
+          "Type": 2,
+          "Value": 12
+        },
+        {
+          "Type": 1,
+          "Value": 0
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 81,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= (expr \"=\" ws term \"\\n\")+\n        expr  ::= term ([-+*/] term)*\n        term  ::= ident | num | \"(\" ws expr \")\" ws\n        ident ::= [a-z] [a-z0-9_]* ws\n        num   ::= [0-9]+ ws\n        ws    ::= [ \\t\\n]*\n    "
+    },
+    {
+      "Symbols": [
+        {
+          "Name": "root",
+          "Id": 0
+        }
+      ],
+      "Elements": [
+        {
+          "Type": 8,
+          "Value": 1000
+        },
+        {
+          "Type": 9,
+          "Value": 1001
+        },
+        {
+          "Type": 8,
+          "Value": 1001
+        },
+        {
+          "Type": 0,
+          "Value": 0
+        }
+      ],
+      "OriginalAssertions": 6,
+      "ExpectParsed": true,
+      "Grammar": "\n        root  ::= <[1000]> !<[1001]> <[1001]>\n    "
+    }
+  ]
+}

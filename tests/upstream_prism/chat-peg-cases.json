@@ -1,0 +1,3800 @@
+{
+  "Source": "tests/test-chat-peg-parser.cpp",
+  "SourceSha256": "c0583c716c65fa7c06fc9b282fc8d24aecde29fa55271536e8c23dfbbc0429e0",
+  "Groups": [
+    "native",
+    "qwen3 coder",
+    "qwen3 non-coder",
+    "comparison",
+    "prefix tool names",
+    "tagged peg parser",
+    "permute"
+  ],
+  "Native": [
+    {
+      "Name": "content with reasoning (no generation_prompt)",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "rest",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "<think>The user said hello, I must say hello back</think>\nHello",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "The user said hello, I must say hello back",
+        "Content": "Hello",
+        "Tools": []
+      }
+    },
+    {
+      "Name": "content without reasoning (no generation_prompt)",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "rest",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "Hello",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "",
+        "Content": "Hello",
+        "Tools": []
+      }
+    },
+    {
+      "Name": "content with reasoning_format = none (tags appear in content)",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "eps",
+                "Args": []
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "rest",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "<think>The user said hello, I must say hello back</think>\nHello",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "",
+        "Content": "<think>The user said hello, I must say hello back</think>\nHello",
+        "Tools": []
+      }
+    },
+    {
+      "Name": "content with reasoning generation_prompt",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "rest",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "<think>The user said hello, I must say hello back</think>\nHello",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "The user said hello, I must say hello back",
+        "Content": "Hello",
+        "Tools": []
+      }
+    },
+    {
+      "Name": "content with reasoning generation_prompt and reasoning_format = none",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "eps",
+                "Args": []
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "rest",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "The user said hello, I must say hello back</think>\nHello",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "",
+        "Content": "The user said hello, I must say hello back</think>\nHello",
+        "Tools": []
+      }
+    },
+    {
+      "Name": "content with closed reasoning generation_prompt (empty reasoning discarded)",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "rest",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "<think></think>Hello",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "",
+        "Content": "Hello",
+        "Tools": []
+      }
+    },
+    {
+      "Name": "tools with reasoning generation_prompt",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Let": "tool_call",
+            "Expr": {
+              "Op": "standard_json_tools",
+              "Args": [
+                "<tool_call>[",
+                "]</tool_call>",
+                {
+                  "Json": "[{\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"description\":\"Get the current weather in a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"get_forecast\",\"description\":\"Get the weather forecast for a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"search_knowledge_base\",\"description\":\"Search the internal technical documentation knowledge base.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false},\"strict\":true}}]"
+                },
+                false,
+                false
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "until",
+                    "Args": [
+                      "<tool_call>"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Op": "optional",
+                "Args": [
+                  {
+                    "Op": "add",
+                    "Args": [
+                      {
+                        "Op": "space",
+                        "Args": []
+                      },
+                      {
+                        "Ref": "tool_call"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [
+        "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}",
+        "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}",
+        "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false}"
+      ],
+      "GrammarModes": [
+        true
+      ],
+      "Input": "<think>I must get the weather in New York</think>\n<tool_call>[{\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\"}}]</tool_call>",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "I must get the weather in New York",
+        "Content": "",
+        "Tools": [
+          {
+            "Name": "get_current_weather",
+            "Arguments": "{\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\"}"
+          }
+        ]
+      }
+    },
+    {
+      "Name": "parallel tools with reasoning generation_prompt",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Let": "tool_call",
+            "Expr": {
+              "Op": "standard_json_tools",
+              "Args": [
+                "<tool_call>[",
+                "]</tool_call>",
+                {
+                  "Json": "[{\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"description\":\"Get the current weather in a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"get_forecast\",\"description\":\"Get the weather forecast for a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"search_knowledge_base\",\"description\":\"Search the internal technical documentation knowledge base.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false},\"strict\":true}}]"
+                },
+                true,
+                false
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "until",
+                    "Args": [
+                      "<tool_call>"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Op": "optional",
+                "Args": [
+                  {
+                    "Op": "add",
+                    "Args": [
+                      {
+                        "Op": "space",
+                        "Args": []
+                      },
+                      {
+                        "Ref": "tool_call"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [
+        "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}",
+        "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}",
+        "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false}"
+      ],
+      "GrammarModes": [
+        true
+      ],
+      "Input": "<think>I must get the weather in New York and San Francisco and a 3 day forecast of each.</think>\nLet me search that for you.<tool_call>[{\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\"}}, {\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"San Francisco, CA\", \"unit\": \"fahrenheit\"}}, {\"name\": \"get_forecast\", \"arguments\": {\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\", \"days\": 3}}, {\"name\": \"get_forecast\", \"arguments\": {\"location\": \"San Francisco, CA\", \"unit\": \"fahrenheit\", \"days\": 3}}]</tool_call>",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "I must get the weather in New York and San Francisco and a 3 day forecast of each.",
+        "Content": "Let me search that for you.",
+        "Tools": [
+          {
+            "Name": "get_current_weather",
+            "Arguments": "{\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\"}"
+          },
+          {
+            "Name": "get_current_weather",
+            "Arguments": "{\"location\": \"San Francisco, CA\", \"unit\": \"fahrenheit\"}"
+          },
+          {
+            "Name": "get_forecast",
+            "Arguments": "{\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\", \"days\": 3}"
+          },
+          {
+            "Name": "get_forecast",
+            "Arguments": "{\"location\": \"San Francisco, CA\", \"unit\": \"fahrenheit\", \"days\": 3}"
+          }
+        ]
+      }
+    },
+    {
+      "Name": "response_format with reasoning generation_prompt",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "reasoning",
+            "Expr": {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "add",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "<think>",
+                            {
+                              "Op": "reasoning",
+                              "Args": [
+                                {
+                                  "Op": "until",
+                                  "Args": [
+                                    "</think>"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "</think>"
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Ref": "reasoning"
+              },
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "schema",
+                    "Args": [
+                      {
+                        "Op": "json",
+                        "Args": []
+                      },
+                      "response-output",
+                      {
+                        "Json": "{\"type\":\"object\",\"properties\":{\"invoice_number\":{\"type\":\"string\"},\"amount\":{\"type\":\"number\"},\"due_date\":{\"type\":\"string\"}},\"required\":[\"invoice_number\",\"amount\",\"due_date\"]}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Op": "space",
+                "Args": []
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "ResolveRefs": [],
+      "GrammarModes": [
+        false
+      ],
+      "Input": "<think>I must produce the invoice in the requested format</think>\n{\"invoice_number\": \"INV-2025-001\", \"amount\": 1250.50, \"due_date\": \"2025-12-31\"}",
+      "Mode": "native",
+      "Expected": {
+        "Reasoning": "I must produce the invoice in the requested format",
+        "Content": "{\"invoice_number\": \"INV-2025-001\", \"amount\": 1250.50, \"due_date\": \"2025-12-31\"}",
+        "Tools": []
+      }
+    }
+  ],
+  "Coder": {
+    "Graph": {
+      "Statements": [
+        {
+          "Let": "content",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "content",
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "until",
+                    "Args": [
+                      "<tool_call>"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_0_0",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "location"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_string_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "until_one_of",
+                              "Args": [
+                                [
+                                  "</parameter>\n<parameter=",
+                                  "</parameter>\n</function>"
+                                ]
+                              ]
+                            },
+                            "tool-get_current_weather-arg-location-schema",
+                            {
+                              "Json": "{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"}"
+                            },
+                            true
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_0_0",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-get_current_weather-arg-location",
+                  {
+                    "Ref": "arg_0_0"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_0_1",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "unit"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_string_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "until_one_of",
+                              "Args": [
+                                [
+                                  "</parameter>\n<parameter=",
+                                  "</parameter>\n</function>"
+                                ]
+                              ]
+                            },
+                            "tool-get_current_weather-arg-unit-schema",
+                            {
+                              "Json": "{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}"
+                            },
+                            true
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_0_1",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-get_current_weather-arg-unit",
+                  {
+                    "Ref": "arg_0_1"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_0",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "tool-get_current_weather",
+              {
+                "Op": "space-add",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      {
+                        "Op": "tool_open",
+                        "Args": [
+                          {
+                            "Op": "add",
+                            "Args": [
+                              {
+                                "Op": "add",
+                                "Args": [
+                                  "<function=",
+                                  {
+                                    "Op": "tool_name",
+                                    "Args": [
+                                      {
+                                        "Op": "literal",
+                                        "Args": [
+                                          "get_current_weather"
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              ">"
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Op": "sequence",
+                        "Args": [
+                          [
+                            {
+                              "Ref": "parser_arg_0_0"
+                            },
+                            {
+                              "Ref": "parser_arg_0_1"
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "Op": "tool_close",
+                    "Args": [
+                      {
+                        "Op": "literal",
+                        "Args": [
+                          "</function>"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_1_0",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "location"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_string_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "until_one_of",
+                              "Args": [
+                                [
+                                  "</parameter>\n<parameter=",
+                                  "</parameter>\n</function>"
+                                ]
+                              ]
+                            },
+                            "tool-get_forecast-arg-location-schema",
+                            {
+                              "Json": "{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"}"
+                            },
+                            true
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_1_0",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-get_forecast-arg-location",
+                  {
+                    "Ref": "arg_1_0"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_1_1",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "unit"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_string_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "until_one_of",
+                              "Args": [
+                                [
+                                  "</parameter>\n<parameter=",
+                                  "</parameter>\n</function>"
+                                ]
+                              ]
+                            },
+                            "tool-get_forecast-arg-unit-schema",
+                            {
+                              "Json": "{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}"
+                            },
+                            true
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_1_1",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-get_forecast-arg-unit",
+                  {
+                    "Ref": "arg_1_1"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_1_2",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "days"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_json_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "json",
+                              "Args": []
+                            },
+                            "tool-get_forecast-arg-days-schema",
+                            {
+                              "Json": "{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_1_2",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-get_forecast-arg-days",
+                  {
+                    "Ref": "arg_1_2"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_1",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "tool-get_forecast",
+              {
+                "Op": "space-add",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      {
+                        "Op": "tool_open",
+                        "Args": [
+                          {
+                            "Op": "add",
+                            "Args": [
+                              {
+                                "Op": "add",
+                                "Args": [
+                                  "<function=",
+                                  {
+                                    "Op": "tool_name",
+                                    "Args": [
+                                      {
+                                        "Op": "literal",
+                                        "Args": [
+                                          "get_forecast"
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              ">"
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Op": "sequence",
+                        "Args": [
+                          [
+                            {
+                              "Ref": "parser_arg_1_0"
+                            },
+                            {
+                              "Ref": "parser_arg_1_1"
+                            },
+                            {
+                              "Ref": "parser_arg_1_2"
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "Op": "tool_close",
+                    "Args": [
+                      {
+                        "Op": "literal",
+                        "Args": [
+                          "</function>"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_2_0",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "query"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_string_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "until_one_of",
+                              "Args": [
+                                [
+                                  "</parameter>\n<parameter=",
+                                  "</parameter>\n</function>"
+                                ]
+                              ]
+                            },
+                            "tool-search_knowledge_base-arg-query-schema",
+                            {
+                              "Json": "{\"type\":\"string\",\"description\":\"The search query string.\"}"
+                            },
+                            true
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_2_0",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-search_knowledge_base-arg-query",
+                  {
+                    "Ref": "arg_2_0"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_2_1",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "max_results"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_json_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "json",
+                              "Args": []
+                            },
+                            "tool-search_knowledge_base-arg-max_results-schema",
+                            {
+                              "Json": "{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5}"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_2_1",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-search_knowledge_base-arg-max_results",
+                  {
+                    "Ref": "arg_2_1"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "arg_2_2",
+          "Expr": {
+            "Op": "tool_arg",
+            "Args": [
+              {
+                "Op": "sequence",
+                "Args": [
+                  [
+                    {
+                      "Op": "tool_arg_open",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            {
+                              "Op": "add",
+                              "Args": [
+                                "<parameter=",
+                                {
+                                  "Op": "tool_arg_name",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "category"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ">"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_string_value",
+                      "Args": [
+                        {
+                          "Op": "schema",
+                          "Args": [
+                            {
+                              "Op": "until_one_of",
+                              "Args": [
+                                [
+                                  "</parameter>\n<parameter=",
+                                  "</parameter>\n</function>"
+                                ]
+                              ]
+                            },
+                            "tool-search_knowledge_base-arg-category-schema",
+                            {
+                              "Json": "{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}"
+                            },
+                            true
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Op": "tool_arg_close",
+                      "Args": [
+                        {
+                          "Op": "add",
+                          "Args": [
+                            "</parameter>\n",
+                            {
+                              "Op": "peek",
+                              "Args": [
+                                {
+                                  "Op": "or",
+                                  "Args": [
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "<parameter="
+                                      ]
+                                    },
+                                    {
+                                      "Op": "literal",
+                                      "Args": [
+                                        "</function>"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "parser_arg_2_2",
+          "Expr": {
+            "Op": "optional",
+            "Args": [
+              {
+                "Op": "rule",
+                "Args": [
+                  "tool-search_knowledge_base-arg-category",
+                  {
+                    "Ref": "arg_2_2"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_2",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "tool-search_knowledge_base",
+              {
+                "Op": "space-add",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      {
+                        "Op": "tool_open",
+                        "Args": [
+                          {
+                            "Op": "add",
+                            "Args": [
+                              {
+                                "Op": "add",
+                                "Args": [
+                                  "<function=",
+                                  {
+                                    "Op": "tool_name",
+                                    "Args": [
+                                      {
+                                        "Op": "literal",
+                                        "Args": [
+                                          "search_knowledge_base"
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              ">"
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Op": "sequence",
+                        "Args": [
+                          [
+                            {
+                              "Ref": "parser_arg_2_0"
+                            },
+                            {
+                              "Ref": "parser_arg_2_1"
+                            },
+                            {
+                              "Ref": "parser_arg_2_2"
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "Op": "tool_close",
+                    "Args": [
+                      {
+                        "Op": "literal",
+                        "Args": [
+                          "</function>"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_call",
+          "Expr": {
+            "Op": "trigger_rule",
+            "Args": [
+              "tool-call",
+              {
+                "Op": "space-add",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      "<tool_call>",
+                      {
+                        "Op": "choice",
+                        "Args": [
+                          [
+                            {
+                              "Ref": "tool_0"
+                            },
+                            {
+                              "Ref": "tool_1"
+                            },
+                            {
+                              "Ref": "tool_2"
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  },
+                  "</tool_call>"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "Root": {
+        "Op": "add",
+        "Args": [
+          {
+            "Op": "add",
+            "Args": [
+              {
+                "Ref": "content"
+              },
+              {
+                "Op": "zero_or_more",
+                "Args": [
+                  {
+                    "Op": "add",
+                    "Args": [
+                      {
+                        "Op": "space",
+                        "Args": []
+                      },
+                      {
+                        "Ref": "tool_call"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "Op": "end",
+            "Args": []
+          }
+        ]
+      }
+    },
+    "ResolveRefs": [
+      "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}",
+      "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}",
+      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false}"
+    ],
+    "GrammarModes": [
+      false
+    ],
+    "Input": "Let me search the knowledge base for cat pictures.<tool_call>\n<function=search_knowledge_base>\n<parameter=query>cat pictures</parameter>\n<parameter=category>general</parameter>\n</function>\n</tool_call>"
+  },
+  "NonCoder": {
+    "Graph": {
+      "Statements": [
+        {
+          "Let": "tool_call",
+          "Expr": {
+            "Op": "standard_json_tools",
+            "Args": [
+              "<tool_call>",
+              "</tool_call>",
+              {
+                "Json": "[{\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"description\":\"Get the current weather in a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"get_forecast\",\"description\":\"Get the weather forecast for a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"search_knowledge_base\",\"description\":\"Search the internal technical documentation knowledge base.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false},\"strict\":true}}]"
+              },
+              true,
+              false
+            ]
+          }
+        }
+      ],
+      "Root": {
+        "Op": "sequence",
+        "Args": [
+          [
+            {
+              "Op": "content",
+              "Args": [
+                {
+                  "Op": "until",
+                  "Args": [
+                    "<tool_call>"
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "optional",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "space",
+                      "Args": []
+                    },
+                    {
+                      "Ref": "tool_call"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        ]
+      }
+    },
+    "ResolveRefs": [
+      "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"}},\"required\":[\"location\",\"unit\"]}",
+      "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"The city and state, e.g. San Francisco, CA\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"description\":\"The temperature unit to use. Infer this from the users location.\"},\"days\":{\"type\":\"integer\",\"description\":\"Number of days to forecast (1-10)\",\"minimum\":1,\"maximum\":10}},\"required\":[\"location\",\"unit\"]}",
+      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"The search query string.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"The maximum number of results to return.\",\"default\":5},\"category\":{\"type\":\"string\",\"enum\":[\"api\",\"troubleshooting\",\"billing\",\"general\"],\"description\":\"Filter search by specific category.\"}},\"required\":[\"query\",\"category\"],\"additionalProperties\":false}"
+    ],
+    "GrammarModes": [
+      false
+    ],
+    "Input": "I need to get the weather.\n<tool_call>{\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\"}}</tool_call>",
+    "Expected": {
+      "Content": "I need to get the weather.\n",
+      "Reasoning": "",
+      "Tools": [
+        {
+          "Name": "get_current_weather",
+          "Arguments": "{\"location\": \"New York City, NY\", \"unit\": \"fahrenheit\"}"
+        }
+      ]
+    }
+  },
+  "Comparison": {
+    "Graph": {
+      "Statements": [
+        {
+          "Let": "thinking",
+          "Expr": {
+            "Op": "reasoning_block",
+            "Args": [
+              {
+                "Op": "space-add",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      "<|START_THINKING|>",
+                      {
+                        "Op": "reasoning",
+                        "Args": [
+                          {
+                            "Op": "until",
+                            "Args": [
+                              "<|END_THINKING|>"
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "<|END_THINKING|>"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "response",
+          "Expr": {
+            "Op": "space-add",
+            "Args": [
+              {
+                "Op": "space-add",
+                "Args": [
+                  "<|START_RESPONSE|>",
+                  {
+                    "Op": "content",
+                    "Args": [
+                      {
+                        "Op": "until",
+                        "Args": [
+                          "<|END_RESPONSE|>"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              "<|END_RESPONSE|>"
+            ]
+          }
+        },
+        {
+          "Let": "tool_call_id",
+          "Expr": {
+            "Op": "atomic",
+            "Args": [
+              {
+                "Op": "space-add",
+                "Args": [
+                  "\"tool_call_id\"",
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      ":",
+                      {
+                        "Op": "add",
+                        "Args": [
+                          {
+                            "Op": "add",
+                            "Args": [
+                              "\"",
+                              {
+                                "Op": "tool_id",
+                                "Args": [
+                                  {
+                                    "Op": "string_content",
+                                    "Args": [
+                                      34
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          "\""
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_call_name",
+          "Expr": {
+            "Op": "atomic",
+            "Args": [
+              {
+                "Op": "space-add",
+                "Args": [
+                  "\"tool_name\"",
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      ":",
+                      {
+                        "Op": "add",
+                        "Args": [
+                          {
+                            "Op": "add",
+                            "Args": [
+                              "\"",
+                              {
+                                "Op": "tool_name",
+                                "Args": [
+                                  {
+                                    "Op": "string_content",
+                                    "Args": [
+                                      34
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          "\""
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_call_args",
+          "Expr": {
+            "Op": "space-add",
+            "Args": [
+              "\"parameters\"",
+              {
+                "Op": "space-add",
+                "Args": [
+                  ":",
+                  {
+                    "Op": "tool_args",
+                    "Args": [
+                      {
+                        "Op": "json",
+                        "Args": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_call_fields",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "tool-call-fields",
+              {
+                "Op": "or",
+                "Args": [
+                  {
+                    "Op": "or",
+                    "Args": [
+                      {
+                        "Ref": "tool_call_id"
+                      },
+                      {
+                        "Ref": "tool_call_name"
+                      }
+                    ]
+                  },
+                  {
+                    "Ref": "tool_call_args"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_call",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "tool-call",
+              {
+                "Op": "tool",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      {
+                        "Op": "space-add",
+                        "Args": [
+                          {
+                            "Op": "space-add",
+                            "Args": [
+                              {
+                                "Op": "tool_open",
+                                "Args": [
+                                  {
+                                    "Op": "literal",
+                                    "Args": [
+                                      "{"
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "Ref": "tool_call_fields"
+                              }
+                            ]
+                          },
+                          {
+                            "Op": "zero_or_more",
+                            "Args": [
+                              {
+                                "Op": "space-add",
+                                "Args": [
+                                  {
+                                    "Op": "literal",
+                                    "Args": [
+                                      ","
+                                    ]
+                                  },
+                                  {
+                                    "Ref": "tool_call_fields"
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Op": "tool_close",
+                        "Args": [
+                          {
+                            "Op": "literal",
+                            "Args": [
+                              "}"
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_calls",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "tool-calls",
+              {
+                "Op": "space-add",
+                "Args": [
+                  {
+                    "Op": "space-add",
+                    "Args": [
+                      "<|START_ACTION|>",
+                      {
+                        "Op": "space-add",
+                        "Args": [
+                          {
+                            "Op": "space-add",
+                            "Args": [
+                              {
+                                "Op": "space-add",
+                                "Args": [
+                                  "[",
+                                  {
+                                    "Ref": "tool_call"
+                                  }
+                                ]
+                              },
+                              {
+                                "Op": "zero_or_more",
+                                "Args": [
+                                  {
+                                    "Op": "space-add",
+                                    "Args": [
+                                      {
+                                        "Op": "literal",
+                                        "Args": [
+                                          ","
+                                        ]
+                                      },
+                                      {
+                                        "Ref": "tool_call"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          "]"
+                        ]
+                      }
+                    ]
+                  },
+                  "<|END_ACTION|>"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "Root": {
+        "Op": "space-add",
+        "Args": [
+          {
+            "Op": "optional",
+            "Args": [
+              {
+                "Ref": "thinking"
+              }
+            ]
+          },
+          {
+            "Op": "add",
+            "Args": [
+              {
+                "Op": "or",
+                "Args": [
+                  {
+                    "Ref": "tool_calls"
+                  },
+                  {
+                    "Ref": "response"
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "Reasoning": "To plan an effective trip to Japan that includes both historical sites and modern attractions within a budget of $4000 for a two-week stay, we need to:\n\n1. Identify key historical sites and modern attractions in Japan.\n2. Find affordable accommodation options that provide a balance between comfort and cost.\n3. Determine the best modes of transportation for getting around Japan.\n4. Create a day-by-day itinerary that ensures the user gets to see a variety of attractions without overspending.\n5. Provide a detailed cost breakdown that includes accommodation, transportation, meals, and entry fees to attractions.",
+    "ToolCallsJson": "[{\"tool_call_id\":\"call_0\",\"tool_name\":\"plan_trip\",\"parameters\":{\"destination\":\"Japan\",\"duration\":14,\"budget\":4000,\"interests\":[\"historical sites\",\"modern attractions\"],\"accommodation_preferences\":\"affordable\",\"transportation_preferences\":\"efficient\",\"meal_preferences\":\"local cuisine\"}}]",
+    "CompleteIterations": 100,
+    "IncrementalIterations": 20
+  },
+  "Prefix": {
+    "Graph": {
+      "Statements": [
+        {
+          "Let": "content",
+          "Expr": {
+            "Op": "rule",
+            "Args": [
+              "content",
+              {
+                "Op": "content",
+                "Args": [
+                  {
+                    "Op": "until",
+                    "Args": [
+                      "<tool_call>"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Let": "tool_call",
+          "Expr": {
+            "Op": "standard_constructed_tools",
+            "Args": [
+              {
+                "Json": "{\"tool_call_start_marker\":\"<tool_call>\",\"tool_call_end_marker\":\"</tool_call>\",\"function_opener\":\"<function=\",\"function_closer\":\"</function>\",\"function_name_suffix\":\">\",\"parameter_key_prefix\":\"<param=\",\"parameter_key_suffix\":\">\",\"parameter_closer\":\"</param>\"}"
+              },
+              {
+                "Json": "[{\"type\":\"function\",\"function\":{\"name\":\"special_function\",\"description\":\"A special function\",\"parameters\":{\"type\":\"object\",\"properties\":{\"arg1\":{\"type\":\"integer\"}},\"required\":[\"arg1\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"special_function_with_opt\",\"description\":\"A special function with optional params\",\"parameters\":{\"type\":\"object\",\"properties\":{\"arg1\":{\"type\":\"integer\"},\"arg2\":{\"type\":\"integer\"}},\"required\":[\"arg1\"]}}}]"
+              },
+              false,
+              false
+            ]
+          }
+        }
+      ],
+      "Root": {
+        "Op": "add",
+        "Args": [
+          {
+            "Op": "add",
+            "Args": [
+              {
+                "Ref": "content"
+              },
+              {
+                "Op": "zero_or_more",
+                "Args": [
+                  {
+                    "Op": "add",
+                    "Args": [
+                      {
+                        "Op": "space",
+                        "Args": []
+                      },
+                      {
+                        "Ref": "tool_call"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "Op": "end",
+            "Args": []
+          }
+        ]
+      }
+    },
+    "Input": "Let me call the function.<tool_call><function=special_function_with_opt><param=arg1>42</param></function></tool_call>",
+    "ShortInput": "Let me call the function.<tool_call><function=special_function><param=arg1>42</param></function></tool_call>",
+    "ExpectedContent": "Let me call the function.",
+    "ExpectedLongName": "special_function_with_opt",
+    "ExpectedShortName": "special_function"
+  },
+  "Tagged": [
+    {
+      "Name": "basic tag extraction",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "tag",
+                      "Args": [
+                        "greeting",
+                        {
+                          "Op": "until",
+                          "Args": [
+                            " "
+                          ]
+                        }
+                      ]
+                    },
+                    " "
+                  ]
+                },
+                {
+                  "Op": "tag",
+                  "Args": [
+                    "name",
+                    {
+                      "Op": "rest",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Input": "Hello World",
+      "Mapper": "tags",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "success",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              1
+            ]
+          }
+        },
+        {
+          "Name": "greeting tag",
+          "Left": "Hello",
+          "Right": {
+            "Path": [
+              "Tags",
+              "greeting"
+            ]
+          }
+        },
+        {
+          "Name": "name tag",
+          "Left": "World",
+          "Right": {
+            "Path": [
+              "Tags",
+              "name"
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "duplicate tags overwrite",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "tag",
+                      "Args": [
+                        "item",
+                        {
+                          "Op": "until",
+                          "Args": [
+                            ","
+                          ]
+                        }
+                      ]
+                    },
+                    ","
+                  ]
+                },
+                {
+                  "Op": "tag",
+                  "Args": [
+                    "item",
+                    {
+                      "Op": "rest",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Input": "first,second",
+      "Mapper": "tags",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "success",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              1
+            ]
+          }
+        },
+        {
+          "Name": "item tag",
+          "Left": "second",
+          "Right": {
+            "Path": [
+              "Tags",
+              "item"
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "no tags extracted",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "rest",
+              "Args": []
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Input": "Hello",
+      "Mapper": "tags",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "success",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              1
+            ]
+          }
+        },
+        {
+          "Name": "empty tags",
+          "Left": 0,
+          "Right": {
+            "Op": "length",
+            "Args": [
+              {
+                "Path": [
+                  "Tags"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "structured extraction",
+      "Graph": {
+        "Statements": [
+          {
+            "Let": "header",
+            "Expr": {
+              "Op": "tag",
+              "Args": [
+                "header",
+                {
+                  "Op": "until",
+                  "Args": [
+                    "\n"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "Let": "body",
+            "Expr": {
+              "Op": "tag",
+              "Args": [
+                "body",
+                {
+                  "Op": "rest",
+                  "Args": []
+                }
+              ]
+            }
+          }
+        ],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Ref": "header"
+                    },
+                    "\n"
+                  ]
+                },
+                {
+                  "Ref": "body"
+                }
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Input": "Title\nBody content here",
+      "Mapper": "tags",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "success",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              1
+            ]
+          }
+        },
+        {
+          "Name": "header",
+          "Left": "Title",
+          "Right": {
+            "Path": [
+              "Tags",
+              "header"
+            ]
+          }
+        },
+        {
+          "Name": "body",
+          "Left": "Body content here",
+          "Right": {
+            "Path": [
+              "Tags",
+              "body"
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "partial parse",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "tag",
+                      "Args": [
+                        "prefix",
+                        {
+                          "Op": "until",
+                          "Args": [
+                            ":"
+                          ]
+                        }
+                      ]
+                    },
+                    ":"
+                  ]
+                },
+                {
+                  "Op": "tag",
+                  "Args": [
+                    "value",
+                    {
+                      "Op": "rest",
+                      "Args": []
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Input": "key:val",
+      "Mapper": "tags",
+      "Flags": 1,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "not fail",
+          "Left": true,
+          "Right": {
+            "Op": "not",
+            "Args": [
+              {
+                "Op": "equal",
+                "Args": [
+                  {
+                    "Path": [
+                      "Result",
+                      "Type"
+                    ]
+                  },
+                  0
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Name": "prefix tag",
+          "Left": "key",
+          "Right": {
+            "Path": [
+              "Tags",
+              "prefix"
+            ]
+          }
+        },
+        {
+          "Name": "value tag",
+          "Left": "val",
+          "Right": {
+            "Path": [
+              "Tags",
+              "value"
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "find in the middle",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "choice",
+                      "Args": [
+                        [
+                          {
+                            "Op": "literal",
+                            "Args": [
+                              "{"
+                            ]
+                          },
+                          {
+                            "Op": "literal",
+                            "Args": [
+                              ":"
+                            ]
+                          }
+                        ]
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                },
+                {
+                  "Op": "literal",
+                  "Args": [
+                    "\""
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "atomic",
+              "Args": [
+                {
+                  "Op": "literal",
+                  "Args": [
+                    "fun_name"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Input": "This is a very long jinja template string. We have tools. We will try to call them now: <tool_call>{ \"fun_name\" : { \"arg\" : 1 }</tool_call>",
+      "Mapper": "tags-anywhere",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "success",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              1
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "fail find in the middle",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "add",
+              "Args": [
+                {
+                  "Op": "add",
+                  "Args": [
+                    {
+                      "Op": "choice",
+                      "Args": [
+                        [
+                          {
+                            "Op": "literal",
+                            "Args": [
+                              "{"
+                            ]
+                          },
+                          {
+                            "Op": "literal",
+                            "Args": [
+                              ":"
+                            ]
+                          }
+                        ]
+                      ]
+                    },
+                    {
+                      "Op": "space",
+                      "Args": []
+                    }
+                  ]
+                },
+                {
+                  "Op": "literal",
+                  "Args": [
+                    "\""
+                  ]
+                }
+              ]
+            },
+            {
+              "Op": "atomic",
+              "Args": [
+                {
+                  "Op": "literal",
+                  "Args": [
+                    "fun_name"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Input": "This is a very long jinja template string. We have tools. We will try to call them now: <tool_call><fun=fun_name><arg name=arg>1</arg></tool_call>",
+      "Mapper": "tags-anywhere",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "failure",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              0
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    },
+    {
+      "Name": "find function tag with name",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "tag",
+          "Args": [
+            "fun_marker",
+            {
+              "Op": "choice",
+              "Args": [
+                [
+                  {
+                    "Op": "add",
+                    "Args": [
+                      {
+                        "Op": "add",
+                        "Args": [
+                          {
+                            "Op": "add",
+                            "Args": [
+                              {
+                                "Op": "tag",
+                                "Args": [
+                                  "fun_pre",
+                                  {
+                                    "Op": "add",
+                                    "Args": [
+                                      {
+                                        "Op": "literal",
+                                        "Args": [
+                                          "<"
+                                        ]
+                                      },
+                                      {
+                                        "Op": "until_one_of",
+                                        "Args": [
+                                          [
+                                            ">",
+                                            "foofoo"
+                                          ]
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "Op": "literal",
+                                "Args": [
+                                  "foofoo"
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "Op": "tag",
+                            "Args": [
+                              "fun_post",
+                              {
+                                "Op": "add",
+                                "Args": [
+                                  {
+                                    "Op": "add",
+                                    "Args": [
+                                      {
+                                        "Op": "negate",
+                                        "Args": [
+                                          {
+                                            "Op": "add",
+                                            "Args": [
+                                              {
+                                                "Op": "space",
+                                                "Args": []
+                                              },
+                                              {
+                                                "Op": "literal",
+                                                "Args": [
+                                                  "<"
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "Op": "until",
+                                        "Args": [
+                                          ">"
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "Op": "literal",
+                                    "Args": [
+                                      ">"
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Op": "space",
+                        "Args": []
+                      }
+                    ]
+                  },
+                  {
+                    "Op": "add",
+                    "Args": [
+                      {
+                        "Op": "add",
+                        "Args": [
+                          {
+                            "Op": "tag",
+                            "Args": [
+                              "fun_pre",
+                              {
+                                "Op": "add",
+                                "Args": [
+                                  {
+                                    "Op": "literal",
+                                    "Args": [
+                                      "["
+                                    ]
+                                  },
+                                  {
+                                    "Op": "until_one_of",
+                                    "Args": [
+                                      [
+                                        "]",
+                                        "foofoo"
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "Op": "literal",
+                            "Args": [
+                              "foofoo"
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Op": "tag",
+                        "Args": [
+                          "fun_post",
+                          {
+                            "Op": "add",
+                            "Args": [
+                              {
+                                "Op": "negate",
+                                "Args": [
+                                  {
+                                    "Op": "add",
+                                    "Args": [
+                                      {
+                                        "Op": "add",
+                                        "Args": [
+                                          {
+                                            "Op": "add",
+                                            "Args": [
+                                              {
+                                                "Op": "space",
+                                                "Args": []
+                                              },
+                                              {
+                                                "Op": "literal",
+                                                "Args": [
+                                                  "["
+                                                ]
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "Op": "until",
+                                            "Args": [
+                                              "]"
+                                            ]
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "Op": "literal",
+                                        "Args": [
+                                          "]"
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "Op": "space",
+                                "Args": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              ]
+            }
+          ]
+        }
+      },
+      "Input": "\n<tool_call>\n<function=foofoo>\n<parameter=first>\nXXXX\n</parameter>\n<parameter=second>\nYYYY\n</parameter>\n</function>\n</tool_call>\n",
+      "Mapper": "tags-anywhere",
+      "Flags": 0,
+      "Mode": "checks",
+      "Checks": [
+        {
+          "Name": "success",
+          "Left": true,
+          "Right": {
+            "Op": "equal",
+            "Args": [
+              {
+                "Path": [
+                  "Result",
+                  "Type"
+                ]
+              },
+              1
+            ]
+          }
+        },
+        {
+          "Name": "fun_pre should be '<function='",
+          "Left": "<function=",
+          "Right": {
+            "Path": [
+              "Tags",
+              "fun_pre"
+            ]
+          }
+        },
+        {
+          "Name": "fun_post should be '>'",
+          "Left": ">",
+          "Right": {
+            "Path": [
+              "Tags",
+              "fun_post"
+            ]
+          }
+        }
+      ],
+      "ResolveRefs": [],
+      "GrammarModes": []
+    }
+  ],
+  "Permute": [
+    {
+      "Name": "accepts every ordering",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "permute",
+              "Args": [
+                "abc",
+                [
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "a"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "b"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "c"
+                    ]
+                  }
+                ]
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Mode": "permute-inputs",
+      "Inputs": [
+        "abc",
+        "acb",
+        "bac",
+        "bca",
+        "cab",
+        "cba"
+      ],
+      "Expected": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "Name": "single element",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "permute",
+              "Args": [
+                "a",
+                [
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "a"
+                    ]
+                  }
+                ]
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Mode": "permute-inputs",
+      "Inputs": [
+        "a",
+        "aa"
+      ],
+      "Expected": [
+        true,
+        false
+      ]
+    },
+    {
+      "Name": "grammar left-factorizes shared tails",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "permute",
+              "Args": [
+                "abc",
+                [
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "a"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "b"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "c"
+                    ]
+                  }
+                ]
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Mode": "permute-grammar",
+      "ExpectedGrammar": "\n            abc-1 ::= \"a\"\n            abc-2 ::= \"b\"\n            abc-3 ::= \"a\" abc-2 | \"b\" abc-1\n            abc-4 ::= \"c\"\n            abc-5 ::= \"a\" abc-4 | \"c\" abc-1\n            abc-6 ::= \"b\" abc-4 | \"c\" abc-2\n            abc-7 ::= \"a\" abc-6 | \"b\" abc-5 | \"c\" abc-3\n            root ::= abc-7\n            space ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\n        "
+    },
+    {
+      "Name": "grammar emits one rule per remaining subset",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "permute",
+              "Args": [
+                "abcd",
+                [
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "a"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "b"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "c"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "d"
+                    ]
+                  }
+                ]
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Mode": "permute-count",
+      "Prefix": "abcd-",
+      "ExpectedCount": 15
+    },
+    {
+      "Name": "grammar emits no rules for a single element",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "permute",
+              "Args": [
+                "a",
+                [
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "a"
+                    ]
+                  }
+                ]
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Mode": "permute-grammar",
+      "ExpectedGrammar": "\n            root ::= \"a\"\n            space ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\n        "
+    },
+    {
+      "Name": "grammar falls back to the given order when too large",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "add",
+          "Args": [
+            {
+              "Op": "permute",
+              "Args": [
+                "big",
+                [
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "a"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "b"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "c"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "d"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "e"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "f"
+                    ]
+                  },
+                  {
+                    "Op": "literal",
+                    "Args": [
+                      "g"
+                    ]
+                  }
+                ]
+              ]
+            },
+            {
+              "Op": "end",
+              "Args": []
+            }
+          ]
+        }
+      },
+      "Mode": "permute-grammar",
+      "ExpectedGrammar": "\n            root ::= \"a\" \"b\" \"c\" \"d\" \"e\" \"f\" \"g\"\n            space ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\n        "
+    }
+  ]
+}

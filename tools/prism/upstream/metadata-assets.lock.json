@@ -1,0 +1,306 @@
+{
+  "SchemaVersion": 1,
+  "Purpose": "Immutable official API bytes and bounded raw GGUF prefixes; independent of expected schemas and engine results.",
+  "Models": [
+    {
+      "Repo": "ggml-org/Qwen3-0.6B-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "13ac06624948e4d8589cb4b6f90100837342fcb8",
+      "Api": {
+        "Path": "metadata/ggml-org_Qwen3-0.6B-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/Qwen3-0.6B-GGUF/revision/13ac06624948e4d8589cb4b6f90100837342fcb8",
+        "Bytes": 5725,
+        "Sha256": "01f04caea36b355ebc43babc15b1037e0bd548536205773522776907a8c09730",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_Qwen3-0.6B-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_Qwen3-0.6B-GGUF--Q8_0/Qwen3-0.6B-Q8_0.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/resolve/13ac06624948e4d8589cb4b6f90100837342fcb8/Qwen3-0.6B-Q8_0.gguf",
+          "Bytes": 8388608,
+          "Sha256": "a50035ed8844d93340462ab9c385971b6d9fdb03e99a20bc631d8995b0ff16ae",
+          "Filename": "Qwen3-0.6B-Q8_0.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/GLM-4.6V-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "7de678a269f576ae4090efbf59b558a993386fff",
+      "Api": {
+        "Path": "metadata/ggml-org_GLM-4.6V-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/GLM-4.6V-GGUF/revision/7de678a269f576ae4090efbf59b558a993386fff",
+        "Bytes": 5850,
+        "Sha256": "cfb77c03bafd2c121c28c2dcbe42b770809b544cf82714ec98efd64f52778766",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_GLM-4.6V-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_GLM-4.6V-GGUF--Q8_0/GLM-4.6V-Q8_0-00001-of-00003.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/GLM-4.6V-GGUF/resolve/7de678a269f576ae4090efbf59b558a993386fff/GLM-4.6V-Q8_0-00001-of-00003.gguf",
+          "Bytes": 16777216,
+          "Sha256": "330819045a421fc0087cc746f2b9d7da48cc44636a812a91d5d94b9dbc24bf01",
+          "Filename": "GLM-4.6V-Q8_0-00001-of-00003.gguf",
+          "Status": 206,
+          "RangeBytes": 16777216
+        },
+        {
+          "Path": "metadata/ggml-org_GLM-4.6V-GGUF--Q8_0/GLM-4.6V-Q8_0-00002-of-00003.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/GLM-4.6V-GGUF/resolve/7de678a269f576ae4090efbf59b558a993386fff/GLM-4.6V-Q8_0-00002-of-00003.gguf",
+          "Bytes": 2097152,
+          "Sha256": "419136b3855da1e0e517c45e45f26d8bc8f198f673c9815e6f800f5fe18865ca",
+          "Filename": "GLM-4.6V-Q8_0-00002-of-00003.gguf",
+          "Status": 206,
+          "RangeBytes": 2097152
+        },
+        {
+          "Path": "metadata/ggml-org_GLM-4.6V-GGUF--Q8_0/GLM-4.6V-Q8_0-00003-of-00003.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/GLM-4.6V-GGUF/resolve/7de678a269f576ae4090efbf59b558a993386fff/GLM-4.6V-Q8_0-00003-of-00003.gguf",
+          "Bytes": 2097152,
+          "Sha256": "ae3b17218cdd60e0433864f2882a3a5c5c899f245ac086f58dc91fbd439dc86d",
+          "Filename": "GLM-4.6V-Q8_0-00003-of-00003.gguf",
+          "Status": 206,
+          "RangeBytes": 2097152
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/Step-3.5-Flash-GGUF",
+      "Quant": "Q4_K",
+      "Revision": "c439ad64d667632f3e1507757cbe225b6a46e6b8",
+      "Api": {
+        "Path": "metadata/ggml-org_Step-3.5-Flash-GGUF--Q4_K/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/Step-3.5-Flash-GGUF/revision/c439ad64d667632f3e1507757cbe225b6a46e6b8",
+        "Bytes": 6088,
+        "Sha256": "742bf29cbfe5b172000c0b77bce02f22357befd7fd8a82f4413a11f0ac5207fe",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_Step-3.5-Flash-GGUF--Q4_K.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_Step-3.5-Flash-GGUF--Q4_K/Step-3.5-Flash-Q4_K.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/Step-3.5-Flash-GGUF/resolve/c439ad64d667632f3e1507757cbe225b6a46e6b8/Step-3.5-Flash-Q4_K.gguf",
+          "Bytes": 8388608,
+          "Sha256": "af81fca5693df328944244502949d91e39a65a967d8f79bedd53661cb5c2874c",
+          "Filename": "Step-3.5-Flash-Q4_K.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/Qwen3-Coder-Next-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "805f6576bda47d164dd0d0dcbf7b165ebedcad4e",
+      "Api": {
+        "Path": "metadata/ggml-org_Qwen3-Coder-Next-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/Qwen3-Coder-Next-GGUF/revision/805f6576bda47d164dd0d0dcbf7b165ebedcad4e",
+        "Bytes": 7186,
+        "Sha256": "7a02d70c84ecf68c05ecaa84562a17694559b191b1ed190c2ca1704056f1fdc1",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_Qwen3-Coder-Next-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_Qwen3-Coder-Next-GGUF--Q8_0/Qwen3-Coder-Next-Q8_0.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/Qwen3-Coder-Next-GGUF/resolve/805f6576bda47d164dd0d0dcbf7b165ebedcad4e/Qwen3-Coder-Next-Q8_0.gguf",
+          "Bytes": 8388608,
+          "Sha256": "e9ad251fa334b85b5057e76c6dd81a785c91aec15b322038b97fdf9bae078167",
+          "Filename": "Qwen3-Coder-Next-Q8_0.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/Qwen3-14B-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "af3732ec4e23a1dfff21a0479cd3545ace763e38",
+      "Api": {
+        "Path": "metadata/ggml-org_Qwen3-14B-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/Qwen3-14B-GGUF/revision/af3732ec4e23a1dfff21a0479cd3545ace763e38",
+        "Bytes": 5248,
+        "Sha256": "19874dd9ca1d68a96deadf428d4d1b2db375c3322a658738a665d3249994448e",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_Qwen3-14B-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_Qwen3-14B-GGUF--Q8_0/Qwen3-14B-Q8_0.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/Qwen3-14B-GGUF/resolve/af3732ec4e23a1dfff21a0479cd3545ace763e38/Qwen3-14B-Q8_0.gguf",
+          "Bytes": 8388608,
+          "Sha256": "193eb3dab4c122abc2742dc4fb2e96b2de4b94ac8b64c50e7edada287abb784a",
+          "Filename": "Qwen3-14B-Q8_0.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/NVIDIA-Nemotron-Nano-3-30B-A3B-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "fe801509a580ff84a5728d4a9104e3f6f7e9b0dd",
+      "Api": {
+        "Path": "metadata/ggml-org_NVIDIA-Nemotron-Nano-3-30B-A3B-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/NVIDIA-Nemotron-3-Nano-30B-A3B-GGUF/revision/fe801509a580ff84a5728d4a9104e3f6f7e9b0dd",
+        "Bytes": 12377,
+        "Sha256": "706bd4b3ef602c5f79b6e1ec42e0b665095639ff70efe0f8299607ba1b7024dd",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_NVIDIA-Nemotron-Nano-3-30B-A3B-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_NVIDIA-Nemotron-Nano-3-30B-A3B-GGUF--Q8_0/NVIDIA-Nemotron-3-Nano-30B-A3B-Q8_0.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/NVIDIA-Nemotron-3-Nano-30B-A3B-GGUF/resolve/fe801509a580ff84a5728d4a9104e3f6f7e9b0dd/NVIDIA-Nemotron-3-Nano-30B-A3B-Q8_0.gguf",
+          "Bytes": 8388608,
+          "Sha256": "cba54f0f77a563b5570718c89cd76907fdeec665242453bf28309c410e6c5c53",
+          "Filename": "NVIDIA-Nemotron-3-Nano-30B-A3B-Q8_0.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ],
+      "ProviderRepo": "ggml-org/NVIDIA-Nemotron-3-Nano-30B-A3B-GGUF",
+      "SourceCorrection": "The pinned source transposes Nano-3; that API returns HTTP 401. Use the publisher's public NVIDIA-Nemotron-3-Nano-30B-A3B repository with immutable bytes; original test identity and expected schema are retained."
+    },
+    {
+      "Repo": "ggml-org/gpt-oss-120b-GGUF",
+      "Quant": "mxfp4",
+      "Revision": "7200b74bea78b0a2964ef9f3897eefa401e890ff",
+      "Api": {
+        "Path": "metadata/ggml-org_gpt-oss-120b-GGUF--mxfp4/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/gpt-oss-120b-GGUF/revision/7200b74bea78b0a2964ef9f3897eefa401e890ff",
+        "Bytes": 18878,
+        "Sha256": "58140754c7fde36c98d1b492f15eea8748859b4ca059873410e2a41ef4bc9f8d",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_gpt-oss-120b-GGUF--mxfp4.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_gpt-oss-120b-GGUF--mxfp4/gpt-oss-120b-MXFP4.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/7200b74bea78b0a2964ef9f3897eefa401e890ff/gpt-oss-120b-MXFP4.gguf",
+          "Bytes": 16777216,
+          "Sha256": "ed5e4aca1d42cb628bb4bba376cf73a5227ee9996241366d4248e394f744a261",
+          "Filename": "gpt-oss-120b-MXFP4.gguf",
+          "Status": 206,
+          "RangeBytes": 16777216
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/gemma-3-4b-it-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "d0976223747697cb51e056d85c532013931fe52e",
+      "Api": {
+        "Path": "metadata/ggml-org_gemma-3-4b-it-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/gemma-3-4b-it-GGUF/revision/d0976223747697cb51e056d85c532013931fe52e",
+        "Bytes": 3476,
+        "Sha256": "cfe093816ba1fdc8b93dc9726474fbe18c8e5a4dd226d77bf5f387aa1b64797a",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_gemma-3-4b-it-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_gemma-3-4b-it-GGUF--Q8_0/gemma-3-4b-it-Q8_0.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF/resolve/d0976223747697cb51e056d85c532013931fe52e/gemma-3-4b-it-Q8_0.gguf",
+          "Bytes": 8388608,
+          "Sha256": "eb6f5c8939d3e86c421fc0c991a85ed4099b365315685af078ef1f1ce5641f91",
+          "Filename": "gemma-3-4b-it-Q8_0.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ]
+    },
+    {
+      "Repo": "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF",
+      "Quant": "Q4_K_M",
+      "Revision": "83fb6e83d0a8aada42d499259bc929d922e9a558",
+      "Api": {
+        "Path": "metadata/bartowski_Meta-Llama-3.1-70B-Instruct-GGUF--Q4_K_M/api.json",
+        "Url": "https://huggingface.co/api/models/bartowski/Meta-Llama-3.1-70B-Instruct-GGUF/revision/83fb6e83d0a8aada42d499259bc929d922e9a558",
+        "Bytes": 21502,
+        "Sha256": "f91b0ec99c1a4a2ff5b32c133a8a179f496b9d44f9eee3322b29f9710f19b3cf",
+        "CorpusPath": "tools/prism/upstream/metadata-api/bartowski_Meta-Llama-3.1-70B-Instruct-GGUF--Q4_K_M.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/bartowski_Meta-Llama-3.1-70B-Instruct-GGUF--Q4_K_M/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf.prefix",
+          "Url": "https://huggingface.co/bartowski/Meta-Llama-3.1-70B-Instruct-GGUF/resolve/83fb6e83d0a8aada42d499259bc929d922e9a558/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf",
+          "Bytes": 8388608,
+          "Sha256": "a8d39f1c16ad850fbd0dc68ad38543e174974b66ada9ca8daedaab199b0e7d66",
+          "Filename": "Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        }
+      ]
+    },
+    {
+      "Repo": "bartowski/deepseek-ai_DeepSeek-V3.1-GGUF",
+      "Quant": "IQ1_M",
+      "Revision": "a7ccff7723b7145b1e64c005100e91210eeb1ff9",
+      "Api": {
+        "Path": "metadata/bartowski_deepseek-ai_DeepSeek-V3.1-GGUF--IQ1_M/api.json",
+        "Url": "https://huggingface.co/api/models/bartowski/deepseek-ai_DeepSeek-V3.1-GGUF/revision/a7ccff7723b7145b1e64c005100e91210eeb1ff9",
+        "Bytes": 25218,
+        "Sha256": "4d05ba6e2ad61d091b14f525ebdb116da6379539fea13119de7dac3cb7d7d6d5",
+        "CorpusPath": "tools/prism/upstream/metadata-api/bartowski_deepseek-ai_DeepSeek-V3.1-GGUF--IQ1_M.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/bartowski_deepseek-ai_DeepSeek-V3.1-GGUF--IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M_deepseek-ai_DeepSeek-V3.1-IQ1_M-00001-of-00004.gguf.prefix",
+          "Url": "https://huggingface.co/bartowski/deepseek-ai_DeepSeek-V3.1-GGUF/resolve/a7ccff7723b7145b1e64c005100e91210eeb1ff9/deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00001-of-00004.gguf",
+          "Bytes": 8388608,
+          "Sha256": "3505d9c8d4fe4528e29e0a1a98b88ce86773b18f5790c01356f0990d1729f352",
+          "Filename": "deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00001-of-00004.gguf",
+          "Status": 206,
+          "RangeBytes": 8388608
+        },
+        {
+          "Path": "metadata/bartowski_deepseek-ai_DeepSeek-V3.1-GGUF--IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M_deepseek-ai_DeepSeek-V3.1-IQ1_M-00002-of-00004.gguf.prefix",
+          "Url": "https://huggingface.co/bartowski/deepseek-ai_DeepSeek-V3.1-GGUF/resolve/a7ccff7723b7145b1e64c005100e91210eeb1ff9/deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00002-of-00004.gguf",
+          "Bytes": 2097152,
+          "Sha256": "4bb10aabf81b9564432b64854162ca261c3497c62bf00dc1551ee4cd90f8d93f",
+          "Filename": "deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00002-of-00004.gguf",
+          "Status": 206,
+          "RangeBytes": 2097152
+        },
+        {
+          "Path": "metadata/bartowski_deepseek-ai_DeepSeek-V3.1-GGUF--IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M_deepseek-ai_DeepSeek-V3.1-IQ1_M-00003-of-00004.gguf.prefix",
+          "Url": "https://huggingface.co/bartowski/deepseek-ai_DeepSeek-V3.1-GGUF/resolve/a7ccff7723b7145b1e64c005100e91210eeb1ff9/deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00003-of-00004.gguf",
+          "Bytes": 2097152,
+          "Sha256": "e2dca1a9ccfde25abe3153e21dcf431790d72a586fca6bee367cf8ac803488c1",
+          "Filename": "deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00003-of-00004.gguf",
+          "Status": 206,
+          "RangeBytes": 2097152
+        },
+        {
+          "Path": "metadata/bartowski_deepseek-ai_DeepSeek-V3.1-GGUF--IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M_deepseek-ai_DeepSeek-V3.1-IQ1_M-00004-of-00004.gguf.prefix",
+          "Url": "https://huggingface.co/bartowski/deepseek-ai_DeepSeek-V3.1-GGUF/resolve/a7ccff7723b7145b1e64c005100e91210eeb1ff9/deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00004-of-00004.gguf",
+          "Bytes": 2097152,
+          "Sha256": "d9868645516d4d26e2c9c406add091db8318d4d811ac9a3b662098b6bf7dfc7c",
+          "Filename": "deepseek-ai_DeepSeek-V3.1-IQ1_M/deepseek-ai_DeepSeek-V3.1-IQ1_M-00004-of-00004.gguf",
+          "Status": 206,
+          "RangeBytes": 2097152
+        }
+      ]
+    },
+    {
+      "Repo": "ggml-org/Qwen3.6-27B-GGUF",
+      "Quant": "Q8_0",
+      "Revision": "1132d03976d88e30a09ab0ddbf1531d5e1b46e7c",
+      "Api": {
+        "Path": "metadata/ggml-org_Qwen3.6-27B-GGUF--Q8_0/api.json",
+        "Url": "https://huggingface.co/api/models/ggml-org/Qwen3.6-27B-GGUF/revision/1132d03976d88e30a09ab0ddbf1531d5e1b46e7c",
+        "Bytes": 9733,
+        "Sha256": "8b9c09def9eef3106e0b81b566c6fe9e22fecaf90414eeea13160b4a51e06112",
+        "CorpusPath": "tools/prism/upstream/metadata-api/ggml-org_Qwen3.6-27B-GGUF--Q8_0.json"
+      },
+      "Files": [
+        {
+          "Path": "metadata/ggml-org_Qwen3.6-27B-GGUF--Q8_0/Qwen3.6-27B-Q8_0.gguf.prefix",
+          "Url": "https://huggingface.co/ggml-org/Qwen3.6-27B-GGUF/resolve/1132d03976d88e30a09ab0ddbf1531d5e1b46e7c/Qwen3.6-27B-Q8_0.gguf",
+          "Bytes": 16777216,
+          "Sha256": "3b27e30a411bb39a56eaeaf09594798cd1522a4ae058373b7438b9f649aa5b6e",
+          "Filename": "Qwen3.6-27B-Q8_0.gguf",
+          "Status": 206,
+          "RangeBytes": 16777216
+        }
+      ]
+    }
+  ]
+}

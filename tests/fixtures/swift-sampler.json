@@ -1,0 +1,1521 @@
+{
+  "SchemaVersion": 1,
+  "RuntimeCommit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "ArchiveSha256": "cc808b33d35c72a3bd5c69a0d609d422426feb9dce23868e77992b6c33b8ddb3",
+  "LibrarySha256": {
+    "llama.dll": "923a518137e50be427ef6c7de9ebdeb3535d6e6f00d709a3e31d0b475d07a9d1",
+    "ggml.dll": "3e0caeb96473fed052832f3c0cd013301de408ed29b706ab2072bfe403f9cb29",
+    "ggml-base.dll": "cef62eabf27b1e6f78e024f293e7f9c34adf13d51a499490304ec4ccc2b2c5d7",
+    "ggml-cpu.dll": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+    "libomp140.aarch64.dll": "f87c3f333de0b09eda4e76096ad642a82f7ef8da350b22b7fc10b7b34ec51a23"
+  },
+  "Host": "Windows-11-10.0.26300-SP0",
+  "Machine": "ARM64",
+  "Vocabulary": 248320,
+  "Scope": "192 seeded correctness draws from verified native Windows ARM64 production samplers; no timing or model execution",
+  "Chain": [
+    "top-k:20",
+    "top-p:0.95/min_keep:1",
+    "min-p:0/min_keep:1",
+    "temperature:1",
+    "distribution:seed"
+  ],
+  "Cases": [
+    {
+      "Kind": "uniform",
+      "Seed": 0,
+      "LogitsSha256": "895365e27ed4255bccdcabe85bebf7c22aaaeebab375264d8e90eae30dc28399",
+      "Selected": [
+        13,
+        0,
+        0,
+        0,
+        13,
+        1,
+        8,
+        10,
+        8,
+        5,
+        9,
+        5
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 18,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 10,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 4,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 12,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 8,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 19,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 1,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 11,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 5,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 15,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 13,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 7,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 17,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 3,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 0,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 2,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 6,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "uniform",
+      "Seed": 1,
+      "LogitsSha256": "895365e27ed4255bccdcabe85bebf7c22aaaeebab375264d8e90eae30dc28399",
+      "Selected": [
+        6,
+        2,
+        4,
+        6,
+        12,
+        1,
+        1,
+        7,
+        2,
+        0,
+        8,
+        5
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 18,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 10,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 4,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 12,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 8,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 19,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 1,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 11,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 5,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 15,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 13,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 7,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 17,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 3,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 0,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 2,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 6,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "uniform",
+      "Seed": 4242,
+      "LogitsSha256": "895365e27ed4255bccdcabe85bebf7c22aaaeebab375264d8e90eae30dc28399",
+      "Selected": [
+        9,
+        12,
+        11,
+        19,
+        4,
+        9,
+        5,
+        7,
+        4,
+        2,
+        10,
+        11
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 18,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 10,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 4,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 12,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 8,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 19,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 1,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 11,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 5,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 15,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 13,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 7,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 17,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 3,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 0,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 2,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 6,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "uniform",
+      "Seed": 4294967294,
+      "LogitsSha256": "895365e27ed4255bccdcabe85bebf7c22aaaeebab375264d8e90eae30dc28399",
+      "Selected": [
+        10,
+        6,
+        9,
+        1,
+        5,
+        12,
+        2,
+        0,
+        13,
+        16,
+        3,
+        3
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 18,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 10,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 4,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 12,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 8,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 19,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 1,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 11,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 5,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 15,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 13,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 7,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 17,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 3,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 0,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 2,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 6,
+          "LogitBits": 0,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "permuted",
+      "Seed": 0,
+      "LogitsSha256": "0fbb70a0038e19a86091ec60041073e5d6d21340e3094ccec8eff61951b33f11",
+      "Selected": [
+        74836,
+        64631,
+        64631,
+        64631,
+        74836,
+        132664,
+        37418,
+        95246,
+        37418,
+        227910,
+        17008,
+        227910
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 47623,
+          "LogitBits": 1122303872,
+          "ProbabilityBits": 1029274267
+        },
+        {
+          "Id": 95246,
+          "LogitBits": 1122303744,
+          "ProbabilityBits": 1029260355
+        },
+        {
+          "Id": 142869,
+          "LogitBits": 1122303616,
+          "ProbabilityBits": 1029246457
+        },
+        {
+          "Id": 190492,
+          "LogitBits": 1122303488,
+          "ProbabilityBits": 1029232572
+        },
+        {
+          "Id": 238115,
+          "LogitBits": 1122303360,
+          "ProbabilityBits": 1029218701
+        },
+        {
+          "Id": 37418,
+          "LogitBits": 1122303232,
+          "ProbabilityBits": 1029204843
+        },
+        {
+          "Id": 85041,
+          "LogitBits": 1122303104,
+          "ProbabilityBits": 1029190999
+        },
+        {
+          "Id": 132664,
+          "LogitBits": 1122302976,
+          "ProbabilityBits": 1029177168
+        },
+        {
+          "Id": 180287,
+          "LogitBits": 1122302848,
+          "ProbabilityBits": 1029163352
+        },
+        {
+          "Id": 227910,
+          "LogitBits": 1122302720,
+          "ProbabilityBits": 1029149548
+        },
+        {
+          "Id": 27213,
+          "LogitBits": 1122302592,
+          "ProbabilityBits": 1029135757
+        },
+        {
+          "Id": 74836,
+          "LogitBits": 1122302464,
+          "ProbabilityBits": 1029121981
+        },
+        {
+          "Id": 122459,
+          "LogitBits": 1122302336,
+          "ProbabilityBits": 1029108218
+        },
+        {
+          "Id": 170082,
+          "LogitBits": 1122302208,
+          "ProbabilityBits": 1029094468
+        },
+        {
+          "Id": 217705,
+          "LogitBits": 1122302080,
+          "ProbabilityBits": 1029080732
+        },
+        {
+          "Id": 17008,
+          "LogitBits": 1122301952,
+          "ProbabilityBits": 1029067009
+        },
+        {
+          "Id": 64631,
+          "LogitBits": 1122301824,
+          "ProbabilityBits": 1029053299
+        },
+        {
+          "Id": 112254,
+          "LogitBits": 1122301696,
+          "ProbabilityBits": 1029039603
+        },
+        {
+          "Id": 159877,
+          "LogitBits": 1122301568,
+          "ProbabilityBits": 1029025920
+        }
+      ]
+    },
+    {
+      "Kind": "permuted",
+      "Seed": 1,
+      "LogitsSha256": "0fbb70a0038e19a86091ec60041073e5d6d21340e3094ccec8eff61951b33f11",
+      "Selected": [
+        159877,
+        112254,
+        142869,
+        159877,
+        238115,
+        132664,
+        132664,
+        122459,
+        112254,
+        64631,
+        37418,
+        227910
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 47623,
+          "LogitBits": 1122303872,
+          "ProbabilityBits": 1029274267
+        },
+        {
+          "Id": 95246,
+          "LogitBits": 1122303744,
+          "ProbabilityBits": 1029260355
+        },
+        {
+          "Id": 142869,
+          "LogitBits": 1122303616,
+          "ProbabilityBits": 1029246457
+        },
+        {
+          "Id": 190492,
+          "LogitBits": 1122303488,
+          "ProbabilityBits": 1029232572
+        },
+        {
+          "Id": 238115,
+          "LogitBits": 1122303360,
+          "ProbabilityBits": 1029218701
+        },
+        {
+          "Id": 37418,
+          "LogitBits": 1122303232,
+          "ProbabilityBits": 1029204843
+        },
+        {
+          "Id": 85041,
+          "LogitBits": 1122303104,
+          "ProbabilityBits": 1029190999
+        },
+        {
+          "Id": 132664,
+          "LogitBits": 1122302976,
+          "ProbabilityBits": 1029177168
+        },
+        {
+          "Id": 180287,
+          "LogitBits": 1122302848,
+          "ProbabilityBits": 1029163352
+        },
+        {
+          "Id": 227910,
+          "LogitBits": 1122302720,
+          "ProbabilityBits": 1029149548
+        },
+        {
+          "Id": 27213,
+          "LogitBits": 1122302592,
+          "ProbabilityBits": 1029135757
+        },
+        {
+          "Id": 74836,
+          "LogitBits": 1122302464,
+          "ProbabilityBits": 1029121981
+        },
+        {
+          "Id": 122459,
+          "LogitBits": 1122302336,
+          "ProbabilityBits": 1029108218
+        },
+        {
+          "Id": 170082,
+          "LogitBits": 1122302208,
+          "ProbabilityBits": 1029094468
+        },
+        {
+          "Id": 217705,
+          "LogitBits": 1122302080,
+          "ProbabilityBits": 1029080732
+        },
+        {
+          "Id": 17008,
+          "LogitBits": 1122301952,
+          "ProbabilityBits": 1029067009
+        },
+        {
+          "Id": 64631,
+          "LogitBits": 1122301824,
+          "ProbabilityBits": 1029053299
+        },
+        {
+          "Id": 112254,
+          "LogitBits": 1122301696,
+          "ProbabilityBits": 1029039603
+        },
+        {
+          "Id": 159877,
+          "LogitBits": 1122301568,
+          "ProbabilityBits": 1029025920
+        }
+      ]
+    },
+    {
+      "Kind": "permuted",
+      "Seed": 4242,
+      "LogitsSha256": "0fbb70a0038e19a86091ec60041073e5d6d21340e3094ccec8eff61951b33f11",
+      "Selected": [
+        17008,
+        238115,
+        180287,
+        85041,
+        142869,
+        17008,
+        227910,
+        122459,
+        142869,
+        112254,
+        95246,
+        180287
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 47623,
+          "LogitBits": 1122303872,
+          "ProbabilityBits": 1029274267
+        },
+        {
+          "Id": 95246,
+          "LogitBits": 1122303744,
+          "ProbabilityBits": 1029260355
+        },
+        {
+          "Id": 142869,
+          "LogitBits": 1122303616,
+          "ProbabilityBits": 1029246457
+        },
+        {
+          "Id": 190492,
+          "LogitBits": 1122303488,
+          "ProbabilityBits": 1029232572
+        },
+        {
+          "Id": 238115,
+          "LogitBits": 1122303360,
+          "ProbabilityBits": 1029218701
+        },
+        {
+          "Id": 37418,
+          "LogitBits": 1122303232,
+          "ProbabilityBits": 1029204843
+        },
+        {
+          "Id": 85041,
+          "LogitBits": 1122303104,
+          "ProbabilityBits": 1029190999
+        },
+        {
+          "Id": 132664,
+          "LogitBits": 1122302976,
+          "ProbabilityBits": 1029177168
+        },
+        {
+          "Id": 180287,
+          "LogitBits": 1122302848,
+          "ProbabilityBits": 1029163352
+        },
+        {
+          "Id": 227910,
+          "LogitBits": 1122302720,
+          "ProbabilityBits": 1029149548
+        },
+        {
+          "Id": 27213,
+          "LogitBits": 1122302592,
+          "ProbabilityBits": 1029135757
+        },
+        {
+          "Id": 74836,
+          "LogitBits": 1122302464,
+          "ProbabilityBits": 1029121981
+        },
+        {
+          "Id": 122459,
+          "LogitBits": 1122302336,
+          "ProbabilityBits": 1029108218
+        },
+        {
+          "Id": 170082,
+          "LogitBits": 1122302208,
+          "ProbabilityBits": 1029094468
+        },
+        {
+          "Id": 217705,
+          "LogitBits": 1122302080,
+          "ProbabilityBits": 1029080732
+        },
+        {
+          "Id": 17008,
+          "LogitBits": 1122301952,
+          "ProbabilityBits": 1029067009
+        },
+        {
+          "Id": 64631,
+          "LogitBits": 1122301824,
+          "ProbabilityBits": 1029053299
+        },
+        {
+          "Id": 112254,
+          "LogitBits": 1122301696,
+          "ProbabilityBits": 1029039603
+        },
+        {
+          "Id": 159877,
+          "LogitBits": 1122301568,
+          "ProbabilityBits": 1029025920
+        }
+      ]
+    },
+    {
+      "Kind": "permuted",
+      "Seed": 4294967294,
+      "LogitsSha256": "0fbb70a0038e19a86091ec60041073e5d6d21340e3094ccec8eff61951b33f11",
+      "Selected": [
+        95246,
+        159877,
+        17008,
+        132664,
+        227910,
+        238115,
+        112254,
+        64631,
+        27213,
+        190492,
+        217705,
+        217705
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 47623,
+          "LogitBits": 1122303872,
+          "ProbabilityBits": 1029274267
+        },
+        {
+          "Id": 95246,
+          "LogitBits": 1122303744,
+          "ProbabilityBits": 1029260355
+        },
+        {
+          "Id": 142869,
+          "LogitBits": 1122303616,
+          "ProbabilityBits": 1029246457
+        },
+        {
+          "Id": 190492,
+          "LogitBits": 1122303488,
+          "ProbabilityBits": 1029232572
+        },
+        {
+          "Id": 238115,
+          "LogitBits": 1122303360,
+          "ProbabilityBits": 1029218701
+        },
+        {
+          "Id": 37418,
+          "LogitBits": 1122303232,
+          "ProbabilityBits": 1029204843
+        },
+        {
+          "Id": 85041,
+          "LogitBits": 1122303104,
+          "ProbabilityBits": 1029190999
+        },
+        {
+          "Id": 132664,
+          "LogitBits": 1122302976,
+          "ProbabilityBits": 1029177168
+        },
+        {
+          "Id": 180287,
+          "LogitBits": 1122302848,
+          "ProbabilityBits": 1029163352
+        },
+        {
+          "Id": 227910,
+          "LogitBits": 1122302720,
+          "ProbabilityBits": 1029149548
+        },
+        {
+          "Id": 27213,
+          "LogitBits": 1122302592,
+          "ProbabilityBits": 1029135757
+        },
+        {
+          "Id": 74836,
+          "LogitBits": 1122302464,
+          "ProbabilityBits": 1029121981
+        },
+        {
+          "Id": 122459,
+          "LogitBits": 1122302336,
+          "ProbabilityBits": 1029108218
+        },
+        {
+          "Id": 170082,
+          "LogitBits": 1122302208,
+          "ProbabilityBits": 1029094468
+        },
+        {
+          "Id": 217705,
+          "LogitBits": 1122302080,
+          "ProbabilityBits": 1029080732
+        },
+        {
+          "Id": 17008,
+          "LogitBits": 1122301952,
+          "ProbabilityBits": 1029067009
+        },
+        {
+          "Id": 64631,
+          "LogitBits": 1122301824,
+          "ProbabilityBits": 1029053299
+        },
+        {
+          "Id": 112254,
+          "LogitBits": 1122301696,
+          "ProbabilityBits": 1029039603
+        },
+        {
+          "Id": 159877,
+          "LogitBits": 1122301568,
+          "ProbabilityBits": 1029025920
+        }
+      ]
+    },
+    {
+      "Kind": "tied-boundary",
+      "Seed": 0,
+      "LogitsSha256": "82f44d1c9f422a087d4a04f288f59eb2349043e467f62f1fe5fe8888add49987",
+      "Selected": [
+        51,
+        135,
+        135,
+        135,
+        51,
+        128,
+        107,
+        65,
+        107,
+        79,
+        93,
+        79
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 44,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 65,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 100,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 23,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 107,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 128,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 72,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 79,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 37,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 51,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 114,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 30,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 121,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 93,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 135,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 86,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 58,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "tied-boundary",
+      "Seed": 1,
+      "LogitsSha256": "82f44d1c9f422a087d4a04f288f59eb2349043e467f62f1fe5fe8888add49987",
+      "Selected": [
+        58,
+        86,
+        100,
+        58,
+        23,
+        128,
+        128,
+        114,
+        86,
+        135,
+        107,
+        79
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 44,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 65,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 100,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 23,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 107,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 128,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 72,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 79,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 37,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 51,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 114,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 30,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 121,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 93,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 135,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 86,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 58,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "tied-boundary",
+      "Seed": 4242,
+      "LogitsSha256": "82f44d1c9f422a087d4a04f288f59eb2349043e467f62f1fe5fe8888add49987",
+      "Selected": [
+        93,
+        23,
+        72,
+        9,
+        100,
+        93,
+        79,
+        114,
+        100,
+        86,
+        65,
+        72
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 44,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 65,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 100,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 23,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 107,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 128,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 72,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 79,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 37,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 51,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 114,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 30,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 121,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 93,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 135,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 86,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 58,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "tied-boundary",
+      "Seed": 4294967294,
+      "LogitsSha256": "82f44d1c9f422a087d4a04f288f59eb2349043e467f62f1fe5fe8888add49987",
+      "Selected": [
+        65,
+        58,
+        93,
+        128,
+        79,
+        23,
+        86,
+        135,
+        51,
+        16,
+        121,
+        121
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 44,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 65,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 100,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 16,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 23,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 107,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 9,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 128,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 72,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 79,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 37,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 51,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 114,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 30,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 121,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 93,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 135,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 86,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        },
+        {
+          "Id": 58,
+          "LogitBits": 1077936128,
+          "ProbabilityBits": 1029149750
+        }
+      ]
+    },
+    {
+      "Kind": "single",
+      "Seed": 0,
+      "LogitsSha256": "cfb10404477a36efcaa29ba1aef7658ad7f9a17d89484f7fba6bddf425fc87c4",
+      "Selected": [
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 248319,
+          "LogitBits": 1148846080,
+          "ProbabilityBits": 1065353216
+        }
+      ]
+    },
+    {
+      "Kind": "single",
+      "Seed": 1,
+      "LogitsSha256": "cfb10404477a36efcaa29ba1aef7658ad7f9a17d89484f7fba6bddf425fc87c4",
+      "Selected": [
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 248319,
+          "LogitBits": 1148846080,
+          "ProbabilityBits": 1065353216
+        }
+      ]
+    },
+    {
+      "Kind": "single",
+      "Seed": 4242,
+      "LogitsSha256": "cfb10404477a36efcaa29ba1aef7658ad7f9a17d89484f7fba6bddf425fc87c4",
+      "Selected": [
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 248319,
+          "LogitBits": 1148846080,
+          "ProbabilityBits": 1065353216
+        }
+      ]
+    },
+    {
+      "Kind": "single",
+      "Seed": 4294967294,
+      "LogitsSha256": "cfb10404477a36efcaa29ba1aef7658ad7f9a17d89484f7fba6bddf425fc87c4",
+      "Selected": [
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319,
+        248319
+      ],
+      "FirstCandidates": [
+        {
+          "Id": 248319,
+          "LogitBits": 1148846080,
+          "ProbabilityBits": 1065353216
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1311 @@
+{
+  "SourceSHA256": "7d542af7b20f6e43d2b174f1dddf9b9480a3130db36c005c3f17c164c032b44d",
+  "KeyMap": {
+    "GENERAL_ARCHITECTURE": "general.architecture",
+    "VOCAB_SIZE": "%s.vocab_size",
+    "CONTEXT_LENGTH": "%s.context_length",
+    "EMBEDDING_LENGTH": "%s.embedding_length",
+    "FEATURES_LENGTH": "%s.features_length",
+    "BLOCK_COUNT": "%s.block_count",
+    "LEADING_DENSE_BLOCK_COUNT": "%s.leading_dense_block_count",
+    "FEED_FORWARD_LENGTH": "%s.feed_forward_length",
+    "USE_PARALLEL_RESIDUAL": "%s.use_parallel_residual",
+    "LOGIT_SCALE": "%s.logit_scale",
+    "TIME_MIX_EXTRA_DIM": "%s.time_mix_extra_dim",
+    "TIME_DECAY_EXTRA_DIM": "%s.time_decay_extra_dim",
+    "FULL_ATTENTION_INTERVAL": "%s.full_attention_interval",
+    "ATTENTION_HEAD_COUNT": "%s.attention.head_count",
+    "ATTENTION_HEAD_COUNT_KV": "%s.attention.head_count_kv",
+    "ATTENTION_MAX_ALIBI_BIAS": "%s.attention.max_alibi_bias",
+    "ATTENTION_KEY_LENGTH": "%s.attention.key_length",
+    "ATTENTION_VALUE_LENGTH": "%s.attention.value_length",
+    "ROPE_DIMENSION_COUNT": "%s.rope.dimension_count",
+    "ATTENTION_KEY_LENGTH_MLA": "%s.attention.key_length_mla",
+    "ATTENTION_VALUE_LENGTH_MLA": "%s.attention.value_length_mla",
+    "ATTENTION_KV_LORA_RANK_SWA": "%s.attention.kv_lora_rank_swa",
+    "ATTENTION_KEY_LENGTH_SWA": "%s.attention.key_length_swa",
+    "ATTENTION_VALUE_LENGTH_SWA": "%s.attention.value_length_swa",
+    "ATTENTION_KEY_LENGTH_MLA_SWA": "%s.attention.key_length_mla_swa",
+    "ATTENTION_VALUE_LENGTH_MLA_SWA": "%s.attention.value_length_mla_swa",
+    "ROPE_FREQ_BASE_SWA": "%s.rope.freq_base_swa",
+    "ATTENTION_INDEXER_TYPES": "%s.attention.indexer.types",
+    "ATTENTION_CLAMP_KQV": "%s.attention.clamp_kqv",
+    "ATTENTION_LAYERNORM_EPS": "%s.attention.layer_norm_epsilon",
+    "ATTENTION_LAYERNORM_RMS_EPS": "%s.attention.layer_norm_rms_epsilon",
+    "ATTENTION_GROUPNORM_EPS": "%s.attention.group_norm_epsilon",
+    "ATTENTION_GROUPNORM_GROUPS": "%s.attention.group_norm_groups",
+    "ATTENTION_Q_LORA_RANK": "%s.attention.q_lora_rank",
+    "ATTENTION_KV_LORA_RANK": "%s.attention.kv_lora_rank",
+    "ATTENTION_RELATIVE_BUCKETS_COUNT": "%s.attention.relative_buckets_count",
+    "ATTENTION_SLIDING_WINDOW": "%s.attention.sliding_window",
+    "EMBEDDING_LENGTH_PER_LAYER": "%s.embedding_length_per_layer_input",
+    "ATTENTION_SHARED_KV_LAYERS": "%s.attention.shared_kv_layers",
+    "ATTENTION_SLIDING_WINDOW_PATTERN": "%s.attention.sliding_window_pattern",
+    "ATTENTION_INDEXER_HEAD_COUNT": "%s.attention.indexer.head_count",
+    "ATTENTION_INDEXER_KEY_LENGTH": "%s.attention.indexer.key_length",
+    "ATTENTION_INDEXER_TOP_K": "%s.attention.indexer.top_k",
+    "ATTENTION_INDEXER_BLOCK_SIZE": "%s.attention.indexer.block_size",
+    "ATTENTION_INDEXER_LOCAL_BLOCKS": "%s.attention.indexer.local_blocks",
+    "ROPE_DIMENSION_SECTIONS": "%s.rope.dimension_sections",
+    "ATTENTION_OUTPUT_GROUP_COUNT": "%s.attention.output_group_count",
+    "ATTENTION_OUTPUT_LORA_RANK": "%s.attention.output_lora_rank",
+    "ATTENTION_COMPRESS_RATIOS": "%s.attention.compress_ratios",
+    "ATTENTION_COMPRESS_ROPE_FREQ_BASE": "%s.attention.compress_rope_freq_base",
+    "HYPER_CONNECTION_COUNT": "%s.hyper_connection.count",
+    "HYPER_CONNECTION_SINKHORN_ITERATIONS": "%s.hyper_connection.sinkhorn_iterations",
+    "HYPER_CONNECTION_EPSILON": "%s.hyper_connection.epsilon",
+    "HASH_LAYER_COUNT": "%s.hash_layer_count",
+    "SWIGLU_CLAMP_EXP": "%s.swiglu_clamp_exp",
+    "EXPERT_WEIGHTS_SCALE": "%s.expert_weights_scale",
+    "EXPERT_WEIGHTS_NORM": "%s.expert_weights_norm",
+    "TOKENIZER_MODEL": "tokenizer.ggml.model",
+    "DENSE_2_FEAT_OUT": "%s.dense_2_feat_out",
+    "DENSE_3_FEAT_IN": "%s.dense_3_feat_in",
+    "EXPERT_FEED_FORWARD_LENGTH": "%s.expert_feed_forward_length",
+    "EXPERT_SHARED_FEED_FORWARD_LENGTH": "%s.expert_shared_feed_forward_length",
+    "EXPERT_LATENT_LENGTH": "%s.expert_latent_length",
+    "INTERLEAVE_MOE_LAYER_STEP": "%s.interleave_moe_layer_step",
+    "EXPERT_COUNT": "%s.expert_count",
+    "EXPERT_USED_COUNT": "%s.expert_used_count",
+    "EXPERT_SHARED_COUNT": "%s.expert_shared_count",
+    "EXPERT_GATING_FUNC": "%s.expert_gating_func",
+    "EXPERT_GROUP_SCALE": "%s.expert_group_scale",
+    "EXPERTS_PER_GROUP": "%s.experts_per_group",
+    "POSNET_EMBEDDING_LENGTH": "%s.posnet.embedding_length",
+    "POSNET_BLOCK_COUNT": "%s.posnet.block_count",
+    "CONVNEXT_EMBEDDING_LENGTH": "%s.convnext.embedding_length",
+    "CONVNEXT_BLOCK_COUNT": "%s.convnext.block_count",
+    "XIELU_ALPHA_N": "xielu.alpha_n",
+    "XIELU_ALPHA_P": "xielu.alpha_p",
+    "XIELU_BETA": "xielu.beta",
+    "XIELU_EPS": "xielu.eps",
+    "SSM_INNER_SIZE": "%s.ssm.inner_size",
+    "SSM_CONV_KERNEL": "%s.ssm.conv_kernel",
+    "SSM_STATE_SIZE": "%s.ssm.state_size",
+    "SSM_TIME_STEP_RANK": "%s.ssm.time_step_rank",
+    "SSM_GROUP_COUNT": "%s.ssm.group_count",
+    "KDA_HEAD_DIM": "%s.kda.head_dim",
+    "KDA_SAFE_GATE": "%s.kda.safe_gate",
+    "KDA_GATE_LOWER_BOUND": "%s.kda.gate_lower_bound",
+    "SWIGLU_CLAMP_SHEXP": "%s.swiglu_clamp_shexp",
+    "WKV_HEAD_SIZE": "%s.wkv.head_size",
+    "SHORTCONV_L_CACHE": "%s.shortconv.l_cache",
+    "RESIDUAL_SCALE": "%s.residual_scale",
+    "ATTN_RES_BLOCK_SIZE": "%s.attn_res.block_size",
+    "ACTIVATION_SITU_BETA": "%s.activation.situ_beta",
+    "ACTIVATION_SITU_LINEAR_BETA": "%s.activation.situ_linear_beta",
+    "DSPARK_BLOCK_SIZE": "%s.dspark.block_size",
+    "DSPARK_MASK_TOKEN_ID": "%s.dspark.mask_token_id",
+    "DSPARK_TARGET_LAYERS": "%s.dspark.target_layers"
+  },
+  "Architectures": [
+    {
+      "Enum": "CLIP",
+      "Name": "clip",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LLAMA",
+      "Name": "llama",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LLAMA4",
+      "Name": "llama4",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DECI",
+      "Name": "deci",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "FALCON",
+      "Name": "falcon",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GROK",
+      "Name": "grok",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GPT2",
+      "Name": "gpt2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GPTJ",
+      "Name": "gptj",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GPTNEOX",
+      "Name": "gptneox",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MPT",
+      "Name": "mpt",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BAICHUAN",
+      "Name": "baichuan",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "STARCODER",
+      "Name": "starcoder",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "REFACT",
+      "Name": "refact",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BERT",
+      "Name": "bert",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MODERN_BERT",
+      "Name": "modern-bert",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NOMIC_BERT",
+      "Name": "nomic-bert",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NOMIC_BERT_MOE",
+      "Name": "nomic-bert-moe",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NEO_BERT",
+      "Name": "neo-bert",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "JINA_BERT_V2",
+      "Name": "jina-bert-v2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "JINA_BERT_V3",
+      "Name": "jina-bert-v3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "EUROBERT",
+      "Name": "eurobert",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BLOOM",
+      "Name": "bloom",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "STABLELM",
+      "Name": "stablelm",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN",
+      "Name": "qwen",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN2",
+      "Name": "qwen2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN2MOE",
+      "Name": "qwen2moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN2VL",
+      "Name": "qwen2vl",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN3",
+      "Name": "qwen3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN3MOE",
+      "Name": "qwen3moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN3NEXT",
+      "Name": "qwen3next",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN3VL",
+      "Name": "qwen3vl",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN3VLMOE",
+      "Name": "qwen3vlmoe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN35",
+      "Name": "qwen35",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN35MOE",
+      "Name": "qwen35moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DSPARK",
+      "Name": "dspark",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PHI2",
+      "Name": "phi2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PHI3",
+      "Name": "phi3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PHIMOE",
+      "Name": "phimoe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PLAMO",
+      "Name": "plamo",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PLAMO2",
+      "Name": "plamo2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PLAMO3",
+      "Name": "plamo3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "CODESHELL",
+      "Name": "codeshell",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "ORION",
+      "Name": "orion",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "INTERNLM2",
+      "Name": "internlm2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MINICPM",
+      "Name": "minicpm",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MINICPM3",
+      "Name": "minicpm3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GEMMA",
+      "Name": "gemma",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GEMMA2",
+      "Name": "gemma2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GEMMA3",
+      "Name": "gemma3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GEMMA3N",
+      "Name": "gemma3n",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GEMMA4",
+      "Name": "gemma4",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": true
+    },
+    {
+      "Enum": "GEMMA4_ASSISTANT",
+      "Name": "gemma4-assistant",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": true
+    },
+    {
+      "Enum": "GEMMA_EMBEDDING",
+      "Name": "gemma-embedding",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "STARCODER2",
+      "Name": "starcoder2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MAMBA",
+      "Name": "mamba",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MAMBA2",
+      "Name": "mamba2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "JAMBA",
+      "Name": "jamba",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "FALCON_H1",
+      "Name": "falcon-h1",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "XVERSE",
+      "Name": "xverse",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "COMMAND_R",
+      "Name": "command-r",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "COHERE2",
+      "Name": "cohere2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "COHERE2MOE",
+      "Name": "cohere2moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DBRX",
+      "Name": "dbrx",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "OLMO",
+      "Name": "olmo",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "OLMO2",
+      "Name": "olmo2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "OLMOE",
+      "Name": "olmoe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MUSE_GLIMMER",
+      "Name": "muse-glimmer",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "OPENELM",
+      "Name": "openelm",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "ARCTIC",
+      "Name": "arctic",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DEEPSEEK",
+      "Name": "deepseek",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DEEPSEEK2",
+      "Name": "deepseek2",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DEEPSEEK2OCR",
+      "Name": "deepseek2-ocr",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DEEPSEEK32",
+      "Name": "deepseek32",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DEEPSEEK4",
+      "Name": "deepseek4",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "CHATGLM",
+      "Name": "chatglm",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GLM4",
+      "Name": "glm4",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GLM4_MOE",
+      "Name": "glm4moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GLM_DSA",
+      "Name": "glm-dsa",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BITNET",
+      "Name": "bitnet",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "T5",
+      "Name": "t5",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "T5ENCODER",
+      "Name": "t5encoder",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "JAIS",
+      "Name": "jais",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "JAIS2",
+      "Name": "jais2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NEMOTRON",
+      "Name": "nemotron",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NEMOTRON_H",
+      "Name": "nemotron_h",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NEMOTRON_H_MOE",
+      "Name": "nemotron_h_moe",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "EXAONE",
+      "Name": "exaone",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "EXAONE4",
+      "Name": "exaone4",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "EXAONE_MOE",
+      "Name": "exaone-moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "RWKV6",
+      "Name": "rwkv6",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "RWKV6QWEN2",
+      "Name": "rwkv6qwen2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "RWKV7",
+      "Name": "rwkv7",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "ARWKV7",
+      "Name": "arwkv7",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GRANITE",
+      "Name": "granite",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GRANITE_MOE",
+      "Name": "granitemoe",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GRANITE_HYBRID",
+      "Name": "granitehybrid",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GRANITE_SWITCH",
+      "Name": "graniteswitch",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GRANITE_SWA",
+      "Name": "granite_swa",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "CHAMELEON",
+      "Name": "chameleon",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "WAVTOKENIZER_DEC",
+      "Name": "wavtokenizer-dec",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PLM",
+      "Name": "plm",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BAILINGMOE",
+      "Name": "bailingmoe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BAILINGMOE2",
+      "Name": "bailingmoe2",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "BAILINGMOE3",
+      "Name": "bailingmoe3",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DOTS1",
+      "Name": "dots1",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DOTS3NOTE",
+      "Name": "dots3note",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "ARCEE",
+      "Name": "arcee",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "AFMOE",
+      "Name": "afmoe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LAGUNA",
+      "Name": "laguna",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "ERNIE4_5",
+      "Name": "ernie4_5",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "ERNIE4_5_MOE",
+      "Name": "ernie4_5-moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "HUNYUAN_MOE",
+      "Name": "hunyuan-moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "HUNYUAN_DENSE",
+      "Name": "hunyuan-dense",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "HUNYUAN_VL",
+      "Name": "hunyuan_vl",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "HY_V3",
+      "Name": "hy_v3",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "SMOLLM3",
+      "Name": "smollm3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "OPENAI_MOE",
+      "Name": "gpt-oss",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LFM2",
+      "Name": "lfm2",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LFM2MOE",
+      "Name": "lfm2moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "DREAM",
+      "Name": "dream",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "SMALLTHINKER",
+      "Name": "smallthinker",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LLADA",
+      "Name": "llada",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LLADA_MOE",
+      "Name": "llada-moe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "SEED_OSS",
+      "Name": "seed_oss",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "GROVEMOE",
+      "Name": "grovemoe",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "APERTUS",
+      "Name": "apertus",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MINIMAX_01",
+      "Name": "minimax-01",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MINIMAX_M2",
+      "Name": "minimax-m2",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MINIMAX_M3",
+      "Name": "minimax-m3",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "COGVLM",
+      "Name": "cogvlm",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "RND1",
+      "Name": "rnd1",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PANGU_EMBED",
+      "Name": "pangu-embedded",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MISTRAL3",
+      "Name": "mistral3",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "EAGLE3",
+      "Name": "eagle3",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": true
+    },
+    {
+      "Enum": "DFLASH",
+      "Name": "dflash",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": true
+    },
+    {
+      "Enum": "MISTRAL4",
+      "Name": "mistral4",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "PADDLEOCR",
+      "Name": "paddleocr",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MIMO2",
+      "Name": "mimo2",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "STEP35",
+      "Name": "step35",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "LLAMA_EMBED",
+      "Name": "llama-embed",
+      "MandatoryMoe": false,
+      "OptionalMoe": true,
+      "Supported": false,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MAINCODER",
+      "Name": "maincoder",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "KIMI_LINEAR",
+      "Name": "kimi-linear",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "KIMI_K3",
+      "Name": "kimi-k3",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "TALKIE",
+      "Name": "talkie",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "MELLUM",
+      "Name": "mellum",
+      "MandatoryMoe": true,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "NANBEIGE",
+      "Name": "nanbeige",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "QWEN3TTS",
+      "Name": "qwen3tts",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "POCKETTTS",
+      "Name": "pockettts",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": true,
+      "LoopExcluded": false
+    },
+    {
+      "Enum": "UNKNOWN",
+      "Name": "(unknown)",
+      "MandatoryMoe": false,
+      "OptionalMoe": false,
+      "Supported": false,
+      "LoopExcluded": true
+    }
+  ],
+  "FixtureRepairs": [
+    {
+      "Architecture": "dspark",
+      "Reason": "Pinned generic architecture fixture omits mandatory architecture metadata",
+      "Keys": {
+        "block_size": 128,
+        "mask_token_id": 127,
+        "target_layers": [
+          1,
+          16
+        ]
+      },
+      "InputDomain": "Original128tokens/alloutputrows/default64microbatch retained",
+      "ProductionSaverAssertions": "Retained; pinned saver advertises DSpark but omits its required metadata"
+    }
+  ]
+}

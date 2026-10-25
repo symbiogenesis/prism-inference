@@ -1,0 +1,45 @@
+--- a/src/llama-model-saver.cpp
++++ b/src/llama-model-saver.cpp
+@@ -347,1 +347,22 @@
+     add_kv(LLM_KV_WKV_HEAD_SIZE,                     hparams.wkv_head_size);
++    if (model->arch == LLM_ARCH_DSPARK) {
++        const std::vector<uint32_t> target_layers(
++                hparams.dspark_target_layers.begin(),
++                hparams.dspark_target_layers.begin() + hparams.n_dspark_target_layers);
++        add_kv(LLM_KV_DSPARK_BLOCK_SIZE,             hparams.dspark_block_size);
++        add_kv(LLM_KV_DSPARK_MASK_TOKEN_ID,          hparams.dspark_mask_token_id);
++        add_kv(LLM_KV_DSPARK_TARGET_LAYERS,          target_layers);
++        add_kv(LLM_KV_DSPARK_MARKOV_RANK,            hparams.dspark_markov_rank);
++        add_kv(LLM_KV_DSPARK_CONFIDENCE_HEAD,        hparams.dspark_confidence_head);
++        add_kv(LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV, hparams.dspark_confidence_head_with_markov);
++        add_kv(LLM_KV_DSPARK_HIDDEN_CORRECTION,      hparams.dspark_hidden_correction);
++        add_kv(LLM_KV_DSPARK_MARKOV_DEPLOY_EXPOSURE, hparams.dspark_markov_deploy_exposure);
++        if (hparams.dspark_hidden_correction) {
++            add_kv(LLM_KV_DSPARK_CORRECTION_SIZE,    hparams.dspark_correction_size);
++        }
++        add_kv(LLM_KV_DSPARK_LOG_SNR_CONDITIONING,   hparams.dspark_log_snr_conditioning);
++        if (hparams.dspark_log_snr_conditioning) {
++            add_kv(LLM_KV_DSPARK_MIN_LOG_SNR,        hparams.dspark_min_log_snr);
++            add_kv(LLM_KV_DSPARK_MAX_LOG_SNR,        hparams.dspark_max_log_snr);
++        }
++    }
+@@ -444,1 +465,19 @@
+     add_tensor(model->hc_head_scale);
++    if (model->arch == LLM_ARCH_DSPARK) {
++        add_tensor(model->dspark_fc);
++        add_tensor(model->dspark_hidden_norm);
++        add_tensor(model->dspark_markov_head_a);
++        add_tensor(model->dspark_markov_head_b);
++        add_tensor(model->dspark_confidence_head);
++        add_tensor(model->dspark_confidence_head_b);
++        add_tensor(model->dspark_corr_hnorm);
++        add_tensor(model->dspark_corr_enorm);
++        add_tensor(model->dspark_corr_gate);
++        add_tensor(model->dspark_corr_up);
++        add_tensor(model->dspark_corr_down);
++        add_tensor(model->dspark_mode_embedding);
++        add_tensor(model->dspark_log_snr_fc1_w);
++        add_tensor(model->dspark_log_snr_fc1_b);
++        add_tensor(model->dspark_log_snr_fc2_w);
++        add_tensor(model->dspark_log_snr_fc2_b);
++    }

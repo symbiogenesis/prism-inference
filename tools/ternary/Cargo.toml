@@ -1,0 +1,17 @@
+[package]
+name = "bonsai-ternary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+license.workspace = true
+description = "Validated PQ2 and PTQ1 codecs and numerical utilities for Bonsai"
+repository.workspace = true
+keywords = ["ternary", "quantization", "scalar"]
+categories = ["encoding", "science"]
+
+[lib]
+test = false
+
+[lints]
+workspace = true

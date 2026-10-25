@@ -1,0 +1,308 @@
+{
+  "SourceSHA256": "d596a6befca98035acfab4e71e72f50a698a11062fcac138735b3fe1aa9af593",
+  "Commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "Layouts": {
+    "flat": [
+      "README.md",
+      "model-BF16.gguf",
+      "model-Q4_K_M.gguf",
+      "model-Q8_0.gguf",
+      "mmproj-model-BF16.gguf",
+      "mmproj-model-Q8_0.gguf",
+      "mtp-model-BF16.gguf",
+      "mtp-model-Q4_0.gguf",
+      "mtp-model-Q8_0.gguf",
+      "dflash-model-BF16.gguf",
+      "dflash-model-Q8_0.gguf"
+    ],
+    "subdir": [
+      "mmproj-model-f16.gguf",
+      "model-mtp-BF16.gguf",
+      "model-mtp-Q8_0.gguf",
+      "Q3_K_M/model-Q3_K_M-00001-of-00003.gguf",
+      "Q3_K_M/model-Q3_K_M-00002-of-00003.gguf",
+      "Q3_K_M/model-Q3_K_M-00003-of-00003.gguf",
+      "Q8_0/model-Q8_0-00001-of-00002.gguf",
+      "Q8_0/model-Q8_0-00002-of-00002.gguf"
+    ],
+    "hole": [
+      "model-BF16.gguf",
+      "model-Q4_K_M.gguf",
+      "model-Q8_0.gguf",
+      "mtp-model-BF16.gguf",
+      "mtp-model-Q4_0.gguf",
+      "mtp-model-Q8_0.gguf",
+      "dflash-model-BF16.gguf",
+      "dflash-model-Q8_0.gguf"
+    ],
+    "unsloth": [
+      "model-UD-Q8_K_XL.gguf",
+      "mmproj-BF16.gguf",
+      "model-MTP-BF16.gguf"
+    ],
+    "vendors": [
+      "TheDrummer_Model-24B-v4.1-Q8_0.gguf",
+      "BlackSheep-24B.Q8_0.gguf"
+    ],
+    "quad": [
+      "model-Q8_0.gguf",
+      "mtp-model-Q8_0.gguf",
+      "dflash-model-Q8_0.gguf",
+      "eagle3-model-Q8_0.gguf",
+      "dspark-model-Q8_0.gguf"
+    ],
+    "dflash_only": [
+      "model-Q8_0.gguf",
+      "dflash-model-Q8_0.gguf"
+    ],
+    "eagle3_only": [
+      "model-Q8_0.gguf",
+      "eagle3-model-Q8_0.gguf"
+    ],
+    "spark": [
+      "README.md",
+      "model-MXFP4.gguf",
+      "dspark-model-BF16.gguf",
+      "dspark-model-MXFP4.gguf"
+    ],
+    "dspark_dflash": [
+      "model-Q8_0.gguf",
+      "dflash-model-Q8_0.gguf",
+      "dspark-model-Q8_0.gguf"
+    ]
+  },
+  "PlanCases": [
+    {
+      "Name": "flat exact tag",
+      "Layout": "flat",
+      "HfRepo": "test/repo:Q8_0",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "model-Q8_0.gguf",
+      "ModelFiles": [
+        "model-Q8_0.gguf"
+      ],
+      "Mmproj": "mmproj-model-Q8_0.gguf",
+      "Mtp": "mtp-model-Q8_0.gguf",
+      "Dflash": "dflash-model-Q8_0.gguf",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "flat default",
+      "Layout": "flat",
+      "HfRepo": "test/repo",
+      "HfFile": "",
+      "Sidecars": false,
+      "OrderDependent": false,
+      "Primary": "model-Q4_K_M.gguf",
+      "ModelFiles": [
+        "model-Q4_K_M.gguf"
+      ],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "unsloth fallback",
+      "Layout": "unsloth",
+      "HfRepo": "test/repo",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": true,
+      "Primary": "model-UD-Q8_K_XL.gguf",
+      "ModelFiles": [
+        "model-UD-Q8_K_XL.gguf"
+      ],
+      "Mmproj": "mmproj-BF16.gguf",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "flat hf_file",
+      "Layout": "flat",
+      "HfRepo": "test/repo",
+      "HfFile": "model-BF16.gguf",
+      "Sidecars": false,
+      "OrderDependent": false,
+      "Primary": "model-BF16.gguf",
+      "ModelFiles": [
+        "model-BF16.gguf"
+      ],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "flat missing hf_file",
+      "Layout": "flat",
+      "HfRepo": "test/repo",
+      "HfFile": "nope.gguf",
+      "Sidecars": false,
+      "OrderDependent": false,
+      "Primary": "",
+      "ModelFiles": [],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "subdir shards",
+      "Layout": "subdir",
+      "HfRepo": "test/repo:Q3_K_M",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "Q3_K_M/model-Q3_K_M-00001-of-00003.gguf",
+      "ModelFiles": [
+        "Q3_K_M/model-Q3_K_M-00001-of-00003.gguf",
+        "Q3_K_M/model-Q3_K_M-00002-of-00003.gguf",
+        "Q3_K_M/model-Q3_K_M-00003-of-00003.gguf"
+      ],
+      "Mmproj": "mmproj-model-f16.gguf",
+      "Mtp": "model-mtp-Q8_0.gguf",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "hole tag sidecar",
+      "Layout": "hole",
+      "HfRepo": "test/repo:Q4_0",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "",
+      "ModelFiles": [],
+      "Mmproj": "",
+      "Mtp": "mtp-model-Q4_0.gguf",
+      "Dflash": "dflash-model-Q8_0.gguf",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "hole tag alone",
+      "Layout": "hole",
+      "HfRepo": "test/repo:Q4_0",
+      "HfFile": "",
+      "Sidecars": false,
+      "OrderDependent": false,
+      "Primary": "",
+      "ModelFiles": [],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "hole default anchor",
+      "Layout": "hole",
+      "HfRepo": "test/repo",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "model-Q4_K_M.gguf",
+      "ModelFiles": [
+        "model-Q4_K_M.gguf"
+      ],
+      "Mmproj": "",
+      "Mtp": "mtp-model-Q4_0.gguf",
+      "Dflash": "dflash-model-Q8_0.gguf",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "unsloth suffix mtp",
+      "Layout": "unsloth",
+      "HfRepo": "test/repo:Q8_K_XL",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "model-UD-Q8_K_XL.gguf",
+      "ModelFiles": [
+        "model-UD-Q8_K_XL.gguf"
+      ],
+      "Mmproj": "mmproj-BF16.gguf",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "vendor prefix",
+      "Layout": "vendors",
+      "HfRepo": "test/repo:Q8_0",
+      "HfFile": "",
+      "Sidecars": false,
+      "OrderDependent": true,
+      "Primary": "TheDrummer_Model-24B-v4.1-Q8_0.gguf",
+      "ModelFiles": [
+        "TheDrummer_Model-24B-v4.1-Q8_0.gguf"
+      ],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": ""
+    },
+    {
+      "Name": "quad exact tag",
+      "Layout": "quad",
+      "HfRepo": "test/repo:Q8_0",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "model-Q8_0.gguf",
+      "ModelFiles": [
+        "model-Q8_0.gguf"
+      ],
+      "Mmproj": "",
+      "Mtp": "mtp-model-Q8_0.gguf",
+      "Dflash": "dflash-model-Q8_0.gguf",
+      "Eagle3": "eagle3-model-Q8_0.gguf",
+      "Dspark": "dspark-model-Q8_0.gguf"
+    },
+    {
+      "Name": "spark default anchor",
+      "Layout": "spark",
+      "HfRepo": "test/repo",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "model-MXFP4.gguf",
+      "ModelFiles": [
+        "model-MXFP4.gguf"
+      ],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": "dspark-model-MXFP4.gguf"
+    },
+    {
+      "Name": "spark tag sidecar",
+      "Layout": "spark",
+      "HfRepo": "test/repo:BF16",
+      "HfFile": "",
+      "Sidecars": true,
+      "OrderDependent": false,
+      "Primary": "",
+      "ModelFiles": [],
+      "Mmproj": "",
+      "Mtp": "",
+      "Dflash": "",
+      "Eagle3": "",
+      "Dspark": "dspark-model-BF16.gguf"
+    }
+  ]
+}

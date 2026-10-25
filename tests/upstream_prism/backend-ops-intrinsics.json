@@ -1,0 +1,4629 @@
+{
+  "SchemaVersion": 1,
+  "SourceSha256": "8bf7a5cf29d3b3e88aa0c30611f5f1679f46a71ec00306908c44a73ec98ac425",
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "Headers": {
+    "ggml/include/ggml.h": "dc753f24e9dcf7b391e03ffa29c890e427b39f150d8f8473c08b7ecdf8f55856",
+    "ggml/include/ggml-alloc.h": "94e4cd069b9313b2ceb35dacec901981e0bb478d8bb31035b7126be091998c23",
+    "ggml/include/ggml-backend.h": "46d84cb998105f871240864fd0f55446939a2fe86c5c281afa63a010fb1f65a2",
+    "ggml/include/ggml-cpu.h": "316279e004cdeb8e6ef78599acb602bf79a8abdf897fed9fd1914808c1518c6e"
+  },
+  "Intrinsics": {
+    "ggml_acc": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "nb1",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb2",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb3",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_add": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_add_id": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ids",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_add_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_arange": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "start",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "stop",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "step",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_are_same_shape": {
+      "Return": "bool",
+      "Parameters": [
+        {
+          "Name": "t0",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "t1",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_argmax": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_argsort": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "order",
+          "Type": "enumggml_sort_order",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_argsort_top_k": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_blck_size": {
+      "Return": "int64_t",
+      "Parameters": [
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_build_backward_expand": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        },
+        {
+          "Name": "grad_accs",
+          "Type": "structggml_tensor**",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_build_forward_expand": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        },
+        {
+          "Name": "tensor",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_ceil": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_clamp": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "min",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "max",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_col2im_1d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "oc",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_concat": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "dim",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_cont": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_conv_2d_direct": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d1",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_conv_2d_dw_direct": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "stride0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "stride1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "pad0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "pad1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "dilation0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "dilation1",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_conv_3d_direct": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_channels",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_batch",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_channels_out",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_conv_transpose_1d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d0",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_conv_transpose_2d_p0": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "stride",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_cos": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_count_equal": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_cpy": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_cross_entropy_loss": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_cross_entropy_loss_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_cumsum": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_diag": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_diag_mask_inf": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_past",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_div": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_div_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_dsv4_hc_comb": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "mixes",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "base",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "n_iter",
+          "Type": "int32_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_dsv4_hc_post": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "x",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "residual",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "post",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "comb",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_dsv4_hc_pre": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "x",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "weights",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_dup": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_element_size": {
+      "Return": "size_t",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_fill": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_flash_attn_ext": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "q",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "mask",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "max_bias",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "logit_softcap",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_flash_attn_ext_add_sinks": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "sinks",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_flash_attn_ext_set_prec": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "prec",
+          "Type": "enumggml_prec",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_floor": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_gated_delta_net": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "q",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "g",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "beta",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "state",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "K",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_gated_delta_net_replay": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "q",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "g",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "beta",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "state",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "rec",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ctrl",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "K",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_gated_delta_net_rows": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "q",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "g",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "beta",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "states",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "rows",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_snap_slots",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_gated_delta_net_set_raw_gates": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "gdn",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "dt_bias",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_gated_linear_attn": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "q",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "g",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "state",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_get_rows": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_get_rows_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_get_tensor": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "name",
+          "Type": "constchar*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_glu": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "op",
+          "Type": "enumggml_glu_op",
+          "Default": null
+        },
+        {
+          "Name": "swapped",
+          "Type": "bool",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_glu_split": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "op",
+          "Type": "enumggml_glu_op",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_add_node": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        },
+        {
+          "Name": "tensor",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_cpy": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "src",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        },
+        {
+          "Name": "dst",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_n_nodes": {
+      "Return": "int",
+      "Parameters": [
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_overhead": {
+      "Return": "size_t",
+      "Parameters": [],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_overhead_custom": {
+      "Return": "size_t",
+      "Parameters": [
+        {
+          "Name": "size",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "grads",
+          "Type": "bool",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_reset": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_graph_size": {
+      "Return": "int",
+      "Parameters": [
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_group_norm": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_groups",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_im2col": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "is_2D",
+          "Type": "bool",
+          "Default": null
+        },
+        {
+          "Name": "dst_type",
+          "Type": "enumggml_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_im2col_3d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "IC",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "d2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "dst_type",
+          "Type": "enumggml_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_interpolate": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne3",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "uint32_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_is_matrix": {
+      "Return": "bool",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_is_quantized": {
+      "Return": "bool",
+      "Parameters": [
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_is_vector": {
+      "Return": "bool",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_l2_norm": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_leaky_relu": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "negative_slope",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "inplace",
+          "Type": "bool",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_lightning_indexer": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "q",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "weights",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "mask",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_log": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_mean": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_mul": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_mul_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_mul_mat": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_mul_mat_id": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "as",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ids",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_mul_mat_set_hint": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "hint",
+          "Type": "enumggml_op_hint",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_nbytes": {
+      "Return": "size_t",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_nelements": {
+      "Return": "int64_t",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_graph": {
+      "Return": "structggml_cgraph*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_graph_custom": {
+      "Return": "structggml_cgraph*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "size",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "grads",
+          "Type": "bool",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_tensor": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "ne",
+          "Type": "constint64_t*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_tensor_1d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_tensor_2d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_tensor_3d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_new_tensor_4d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne3",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_norm": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_nrows": {
+      "Return": "int64_t",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_opt_step_adamw": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "grad",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "m",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "adamw_params",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_opt_step_sgd": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "grad",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "sgd_params",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_out_prod": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pad": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p3",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pad_circular": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p3",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pad_ext": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "lp0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "lp1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "lp2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "lp3",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp3",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pad_ext_circular": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "lp0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "lp1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "lp2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "lp3",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "rp3",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pad_reflect_1d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_permute": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "axis0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "axis1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "axis2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "axis3",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pool_1d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "op",
+          "Type": "enumggml_op_pool",
+          "Default": null
+        },
+        {
+          "Name": "k0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_pool_2d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "op",
+          "Type": "enumggml_op_pool",
+          "Default": null
+        },
+        {
+          "Name": "k0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "k1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "s1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "p0",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "p1",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_relu": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_repeat": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_repeat_4d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne3",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_repeat_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_reshape_2d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_reshape_3d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_reshape_4d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne3",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rms_norm": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rms_norm_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rms_norm_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_roll": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "shift0",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "shift1",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "shift2",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "shift3",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_ext": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_ctx_orig",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "freq_base",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "freq_scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "ext_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "attn_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_fast",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_slow",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_ext_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_ctx_orig",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "freq_base",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "freq_scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "ext_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "attn_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_fast",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_slow",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_ext_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_ctx_orig",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "freq_base",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "freq_scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "ext_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "attn_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_fast",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_slow",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_multi": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "sections",
+          "Type": "int*",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_ctx_orig",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "freq_base",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "freq_scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "ext_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "attn_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_fast",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_slow",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_multi_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "sections",
+          "Type": "int*",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_ctx_orig",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "freq_base",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "freq_scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "ext_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "attn_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_fast",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_slow",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_multi_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_dims",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "sections",
+          "Type": "int*",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "n_ctx_orig",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "freq_base",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "freq_scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "ext_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "attn_factor",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_fast",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta_slow",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rope_set_offset": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "n_offs",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_round": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rwkv_wkv6": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "r",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "tf",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "td",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "state",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_rwkv_wkv7": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "r",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "w",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "v",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "state",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_scale": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_scale_bias": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_scale_bias_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "s",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_set": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "nb1",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb2",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb3",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_set_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "nb1",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb2",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb3",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_set_loss": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_set_name": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "name",
+          "Type": "constchar*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_set_param": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_set_rows": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sigmoid": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_silu": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_silu_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sin": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_soft_max": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_soft_max_add_sinks": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "sinks",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_soft_max_ext": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "mask",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "max_bias",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_soft_max_ext_back": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "max_bias",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_soft_max_ext_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "mask",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "max_bias",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_softplus": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_solve_tri": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "left",
+          "Type": "bool",
+          "Default": null
+        },
+        {
+          "Name": "lower",
+          "Type": "bool",
+          "Default": null
+        },
+        {
+          "Name": "uni",
+          "Type": "bool",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sqr": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sqrt": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_ssm_conv": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "sx",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "c",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_ssm_scan": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "s",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "x",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "dt",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "A",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "B",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "C",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ids",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "K",
+          "Type": "int64_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sub": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sub_inplace": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sum": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_sum_rows": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_swiglu_oai": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "alpha",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "limit",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_swiglu_split": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "b",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_tanh": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_tensor_overhead": {
+      "Return": "size_t",
+      "Parameters": [],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_timestep_embedding": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "timesteps",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "dim",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "max_period",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_top_k": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "k",
+          "Type": "int",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_transpose": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_tri": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "type",
+          "Type": "enumggml_tri_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_trunc": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_type_size": {
+      "Return": "size_t",
+      "Parameters": [
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_unary": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "op",
+          "Type": "enumggml_unary_op",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_upscale": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "scale_factor",
+          "Type": "int",
+          "Default": null
+        },
+        {
+          "Name": "mode",
+          "Type": "enumggml_scale_mode",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_view_1d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_view_2d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "nb1",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_view_3d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "nb1",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb2",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_view_4d": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "ne0",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne1",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne2",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "ne3",
+          "Type": "int64_t",
+          "Default": null
+        },
+        {
+          "Name": "nb1",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb2",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "nb3",
+          "Type": "size_t",
+          "Default": null
+        },
+        {
+          "Name": "offset",
+          "Type": "size_t",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_view_tensor": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "src",
+          "Type": "structggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_xielu": {
+      "Return": "structggml_tensor*",
+      "Parameters": [
+        {
+          "Name": "ctx",
+          "Type": "structggml_context*",
+          "Default": null
+        },
+        {
+          "Name": "a",
+          "Type": "structggml_tensor*",
+          "Default": null
+        },
+        {
+          "Name": "alpha_n",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "alpha_p",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "beta",
+          "Type": "float",
+          "Default": null
+        },
+        {
+          "Name": "eps",
+          "Type": "float",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_backend_buffer_set_usage": {
+      "Return": "void",
+      "Parameters": [
+        {
+          "Name": "buffer",
+          "Type": "ggml_backend_buffer_t",
+          "Default": null
+        },
+        {
+          "Name": "usage",
+          "Type": "enumggml_backend_buffer_usage",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml-backend.h"
+    },
+    "ggml_backend_graph_compute": {
+      "Return": "enumggml_status",
+      "Parameters": [
+        {
+          "Name": "backend",
+          "Type": "ggml_backend_t",
+          "Default": null
+        },
+        {
+          "Name": "cgraph",
+          "Type": "structggml_cgraph*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml-backend.h"
+    },
+    "ggml_get_name": {
+      "Return": "constchar*",
+      "Parameters": [
+        {
+          "Name": "tensor",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_op_desc": {
+      "Return": "constchar*",
+      "Parameters": [
+        {
+          "Name": "t",
+          "Type": "conststructggml_tensor*",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_op_name": {
+      "Return": "constchar*",
+      "Parameters": [
+        {
+          "Name": "op",
+          "Type": "enumggml_op",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_type_name": {
+      "Return": "constchar*",
+      "Parameters": [
+        {
+          "Name": "type",
+          "Type": "enumggml_type",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    },
+    "ggml_unary_op_name": {
+      "Return": "constchar*",
+      "Parameters": [
+        {
+          "Name": "op",
+          "Type": "enumggml_unary_op",
+          "Default": null
+        }
+      ],
+      "Header": "ggml/include/ggml.h"
+    }
+  }
+}

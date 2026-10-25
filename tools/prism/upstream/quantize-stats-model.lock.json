@@ -1,0 +1,24 @@
+{
+  "SchemaVersion": 1,
+  "Purpose": "Independent official F32 model input; safe Rust copies original float weights into GGUF without quantization or expected answers",
+  "Repository": "karpathy/tinyllamas",
+  "Revision": "0bd21da7698eaf29a0d7de3992de8a46ef624add",
+  "File": "stories42M.bin",
+  "AssetPath": "tinyllamas/stories42M.bin",
+  "Url": "https://huggingface.co/karpathy/tinyllamas/resolve/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories42M.bin?download=true",
+  "Bytes": 167020572,
+  "Sha256": "9f65a1000e17d0bc167dd6332e0ce5119a0222a3d920cead5bce413bfab2ee7b",
+  "Vocabulary": {
+    "SourcePath": "models/ggml-vocab-llama-spm.gguf",
+    "Bytes": 723869,
+    "Sha256": "16c3724582d59aa8bf84711894e833f916ee46a31d80e21312759c48bf8d0e69"
+  },
+  "Converted": {
+    "Filename": "official-stories42M-f32.gguf",
+    "Bytes": 233022656,
+    "Sha256": "05429b48a224122f59d25e136758d240fd59fce884c4da3465bae9c64d210269",
+    "Tensors": 75,
+    "Type": "F32",
+    "AllTensorElementsDivisibleBy": 256
+  }
+}

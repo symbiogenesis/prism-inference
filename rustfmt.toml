@@ -1,0 +1,3 @@
+# Keep standalone rustfmt and Cargo formatting on the same Rust 2024 rules.
+edition = "2024"
+style_edition = "2024"

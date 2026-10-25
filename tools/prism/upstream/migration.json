@@ -1,0 +1,882 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "Total": 71,
+  "Purpose": "Source-by-source migration inventory. Entries describe scope and prerequisites, not passing test results.",
+  "Cases": [
+    {
+      "Id": "tests/peg-parser/test-basic.cpp",
+      "SourceSha256": "24c5c31c65b2f5fc88919a4b5d06506ae644f8f0460c14c0134cd5439c5a7694",
+      "Category": "model-free",
+      "Needs": [
+        "PEG builder/parser production API"
+      ],
+      "AssertionsToPort": "All character classes and escapes; optional/choice/sequence/repetition; recursive rules; markers; complete/partial/no-match semantics.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/peg-parser/test-gbnf-generation.cpp",
+      "SourceSha256": "d14973bb98faaa87d1e17af30b76d413e2ac6541ab800c20eb55d48c8fa1952a",
+      "Category": "model-free",
+      "Needs": [
+        "PEG builder and GBNF production API"
+      ],
+      "AssertionsToPort": "All literal expected grammars; operator precedence; delimiter/Unicode overlap; unreachable-rule pruning; triggers; silent/tagged/atomic wrappers.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/peg-parser/test-json-parser.cpp",
+      "SourceSha256": "2731298bf7f28047852e4f420243fc533bdb1408611257f47a5fff2adacb36fc",
+      "Category": "model-free",
+      "Needs": [
+        "PEG JSON parser production API"
+      ],
+      "AssertionsToPort": "All mixed/nested JSON literals; partial object/array/escape need-more states; object-member success/partial/failure.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/peg-parser/test-json-serialization.cpp",
+      "SourceSha256": "276f50faa0f1f50da7d5289b3e13110c26cf9120ff23bbdb4a6a8c12c384a028",
+      "Category": "correctness-and-benchmark",
+      "Needs": [
+        "PEG serialization production API",
+        "CI benchmark lane for deserialize timing"
+      ],
+      "AssertionsToPort": "Compare parser result before/after JSON serialization; preserve separate deserialize benchmark without making its timings correctness expectations.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/peg-parser/test-python-dict-parser.cpp",
+      "SourceSha256": "ab6b20f141fed193bc93e810608c1b6800415d14ff832ad3ff84671594d18d4f",
+      "Category": "model-free",
+      "Needs": [
+        "PEG Python dict parser production API"
+      ],
+      "AssertionsToPort": "All quote/escape/Unicode/nesting/partial literals; Python True/False/None; reject JSON true/false/null; configurable flexible JSON-string rules.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/peg-parser/test-unicode.cpp",
+      "SourceSha256": "5eda6c6457af1ff1a62081dadac597d7706bb656e9941bb828de6421d9c563cf",
+      "Category": "model-free",
+      "Needs": [
+        "PEG Unicode production API"
+      ],
+      "AssertionsToPort": "All Unicode any/class/until/json-string cases including CJK/emoji; valid/incomplete/malformed UTF-8 and escaped strings.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-alloc.cpp",
+      "SourceSha256": "89de1c9549888a37b388474aca89cad3052c1751fbdace09c81e79d5844633db",
+      "Category": "model-free",
+      "Needs": [
+        "ggml graph allocator and test backend abstraction"
+      ],
+      "AssertionsToPort": "13 original case invocations: tensor/arena/chunk maximums; leftover space; views/in-place; reuse/free; merge at32 andSIZE_MAX; prefer allocation; multiple types; zero; reallocation. Keep byte/allocation counts.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-arg-parser.cpp",
+      "SourceSha256": "935b2cd08b63799a26fb804991380c541a45406c76dceb38589d78c8b28befc1",
+      "Category": "network-required",
+      "Needs": [
+        "common argument parser",
+        "isolated child environment",
+        "http://ggml.ai/ and http://ggml.ai/404 behavior or explicit pinned local equivalent"
+      ],
+      "AssertionsToPort": "All argv/env/default/override/quoting/LoRA vectors; valid and invalid remote grammar URL behavior. Do not silently drop HTTP case.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-autorelease.cpp",
+      "SourceSha256": "71d51cea2eefa5810189156e76ac1d87a46e244081cedc16eae384f2d19dc02d",
+      "Category": "model-required",
+      "Needs": [
+        "loadable full model from common_get_model_or_exit",
+        "threaded native context creation"
+      ],
+      "AssertionsToPort": "Load/create/free context and model and backend entirely inside a worker thread then clean process exit; timeout is failure.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-backend-ops.cpp",
+      "SourceSha256": "8bf7a5cf29d3b3e88aa0c30611f5f1679f46a71ec00306908c44a73ec98ac425",
+      "Category": "model-free",
+      "Needs": [
+        "all available ggml backends",
+        "complete operation/shape generator",
+        "separate grad/perf modes"
+      ],
+      "AssertionsToPort": "Port full 535KB operation and geometry matrix with per-op reference/error tolerances; gradient mode; explicit device unsupported reporting; keep perf mode CI-only.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-backend-sampler.cpp",
+      "SourceSha256": "93711ee1d33e6a8a7b30973732c5dc1faee5a4cb742177eb0133bba1800271d8",
+      "Category": "model-required",
+      "Needs": [
+        "loadable full model",
+        "backend sampling capability",
+        "CPU comparison"
+      ],
+      "AssertionsToPort": "All enabled sampling tests: greedy/top-k/temp/temp-ext/min-p/top-p/dist/logit-bias/penalties; mixed CPU/backend; multi-sequence and multi-output transactions/limits; state and selected token/probability parity.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-barrier.cpp",
+      "SourceSha256": "44a60801134d178c8e2c6789c471909ed83c0b8c71055b259478b4d396220cee",
+      "Category": "correctness-and-benchmark",
+      "Needs": [
+        "ggml CPU barrier/active-thread production path",
+        "native concurrency backend",
+        "CI timing lane"
+      ],
+      "AssertionsToPort": "Barrier integrity; active thread graph and multi-graph correctness; original thread/round parameter handling. Separate any timing/performance observations.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-batch-alloc.cpp",
+      "SourceSha256": "341b3c4291cb46e412d6e750c2ab2e19131812d08ee3b236938c587e99341d79",
+      "Category": "model-free",
+      "Needs": [
+        "private llama_batch_allocr API and synthetic vocab/memory objects"
+      ],
+      "AssertionsToPort": "Every init/split/keep-tail/mrope case table and exact batch positions/sequence IDs/output flags; preserve invalid-input outcomes.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-c.c",
+      "SourceSha256": "c973865e5e86263a71a1210003e80cffa6269572de31cfa647cc3d01b4bea99e",
+      "Category": "helper-compile-only",
+      "Needs": [
+        "public llama C header and link surface"
+      ],
+      "AssertionsToPort": "Empty executable is a C public-header/link smoke check; port to explicit ABI/schema availability assertion or record compile-only coverage; no behavioral suite to invent.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-chat-analysis.cpp",
+      "SourceSha256": "d895ae1736845640b8dab486c68189726821abfbbfc0ca96f98cd419633ad1a1",
+      "Category": "manual-diagnostic",
+      "Needs": [
+        "bundled models/templates/*.jinja",
+        "chat differential-analysis API"
+      ],
+      "AssertionsToPort": "Manual analysis tool has no automated correctness assertions; Rust diagnostic equivalent should preserve template selection/render differences and fail missing assets; do not label diagnostic output full engine parity.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-chat-auto-parser.cpp",
+      "SourceSha256": "d69af3154f3ed738e47a74280bcd63d2e90cd60b05dff7f5f1f7a5b26c59478c",
+      "Category": "model-free",
+      "Needs": [
+        "bundled models/templates/*.jinja",
+        "chat auto-parser/Jinja/PEG APIs"
+      ],
+      "AssertionsToPort": "All diff-split/prefix/suffix/segment/marker/quote normalization and template-specific tool/reasoning detection tables; role markers across all templates; debug template mode separate.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-chat-peg-parser.cpp",
+      "SourceSha256": "c0583c716c65fa7c06fc9b282fc8d24aecde29fa55271536e8c23dfbbc0429e0",
+      "Category": "correctness-and-benchmark",
+      "Needs": [
+        "PEG/chat parser production API",
+        "simple tokenizer equivalent",
+        "CI benchmark lane"
+      ],
+      "AssertionsToPort": "All whole and incremental parser/status/message/tool/schema expectations; preserve current_parse complete/incremental benchmarks separately.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-chat-template.cpp",
+      "SourceSha256": "7a790605222858ca5d5a2de94de27115d693e2c293638c392b7726a44ad3451f",
+      "Category": "model-free",
+      "Needs": [
+        "chat template production API",
+        "optional manual .jinja and JSON data"
+      ],
+      "AssertionsToPort": "All default embedded template/message expectations; manual path/directory handling and supplied JSON paths separate; default requires no full model.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-chat.cpp",
+      "SourceSha256": "9920d484dfe35d8ccec4e34f3dd6a23e1788a479a419cab231c361d3cad4e8b4",
+      "Category": "model-free",
+      "Needs": [
+        "bundled models/templates/*.jinja",
+        "server-chat/common-chat production APIs"
+      ],
+      "AssertionsToPort": "All 317KB template/parser/message/tool/Responses conversion expectations; reasoning budgets/effort; malformed UTF-8; reconstruction and generation prompts; default run from upstream root.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-col2im-1d.cpp",
+      "SourceSha256": "8b0b9fec8a5f7177722060fccfa67ddcd4b1073c833e1511bc4106b03f6c8323",
+      "Category": "model-free",
+      "Needs": [
+        "ggml graph calls and F32/F16/BF16 conversion"
+      ],
+      "AssertionsToPort": "11 original geometries with IC7; cropped overlap/gap/single-column outputs; NMSE <=1e-7 F32 and <=5e-4 F16/BF16; exact output shapes.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-dfly-fusion.cpp",
+      "SourceSha256": "504161d9c3ec6f5ca621b12dc952b5a9cc2e631edb4ad225132b219057eb1fdd",
+      "Category": "model-free",
+      "Needs": [
+        "ggml graph softmax/matmul/rms/view/permutation calls"
+      ],
+      "AssertionsToPort": "Non-square embd8 feat5 layer3 tokens4; independent weighted/base/RMS reference; full and layer1 slice abs error <1e-4; per-layer separation >1e-3.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-double-float.cpp",
+      "SourceSha256": "1a967f5a89c959260d1884740ac0b2f25a8db9dcc96f4c6eed05fcdb35c9627b",
+      "Category": "model-free-slow",
+      "Needs": [
+        "Rust float bit conversions",
+        "CPU feature-specific FP16 production conversion path"
+      ],
+      "AssertionsToPort": "Exhaustive all 2^32 f32 bit patterns for finite rounding equality; F16C-only all65536 half SiLU comparisons allowing equal half or adjacent float. CI-only full correctness because exhaustive.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-dspark-forward.cpp",
+      "SourceSha256": "b47fb55a0911ad7b8ac6a6cce370d8cce8d6c23e45a732b82c0ec5a0f35fe94e",
+      "Category": "model-required",
+      "Needs": [
+        "compatible dspark GGUF",
+        "optional ref.bin",
+        "optional target shared-head model",
+        "Metal/CUDA backend for those modes",
+        "DeepSpec reference generator for tier2"
+      ],
+      "AssertionsToPort": "Tier1 synthetic tap shapes/finiteness; SNR/output/runtime/prefix strict A/B logits; corrected/shared-head paths; CPU/Metal tolerance atol1e-3 rtol1e-2; tier2 reference binary. Runtime-bench modes remain CI-only.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-dspark-logsnr-meta.cpp",
+      "SourceSha256": "2fef2521dbc0985a3aed6bbe50de5a54b7a75dc6c3c5933e04fc8ceb4c7e3112",
+      "Category": "generated-model-required",
+      "Needs": [
+        "8 variants generated by tests/gen-tiny-dspark.py or safe Rust equivalent"
+      ],
+      "AssertionsToPort": "Load valid bounds and conditioning-off; reject omitted min/max NaN/Inf equal/reversed bounds before tensors; missing variant directory is blocked not upstream skip-as-pass. Every rejected load must capture log text mentioning log_snr or log-SNR, proving the intended metadata guard rather than unrelated load failure.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-dspark-loop.cpp",
+      "SourceSha256": "8ad2915c406b296439d0d1474cb147ea35e4543f2b4d479120e67b2151f8a80f",
+      "Category": "generated-model-required",
+      "Needs": [
+        "tiny dspark GGUF",
+        "matching ref.json from external reference",
+        "optional Markov CUDA/Metal"
+      ],
+      "AssertionsToPort": "Exact repeated draft/accept schedule; cache/reset/start bookkeeping; metadata dimensions/vocab/mask; supplied draft results versus JSON at every round; backend Markov branches.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-dspark-real-eval.cpp",
+      "SourceSha256": "d420abbcdf9d7c191d0fa1ac2e9859ab9c67e09a3f59e9b79db45875f3dbc7c9",
+      "Category": "model-required",
+      "Needs": [
+        "compatible full target GGUF and dspark drafter GGUF",
+        "optional dataset.jsonl",
+        "GPU for default999 layers or explicit CPU selection"
+      ],
+      "AssertionsToPort": "Target-layer/meta compatibility; generated token/lossless greedy parity; block accept bookkeeping; optional row oracle; shared head/sparse/Markov switches. Keep diagnostic throughput/perf modes CI-only.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-export-graph-ops.cpp",
+      "SourceSha256": "cfc871218eb04130cb0d6aa8241ff9bdb459c607a27a283701a85cc6325075f7",
+      "Category": "manual-diagnostic",
+      "Needs": [
+        "loadable full model OR remote GGUF metadata",
+        "graph reserve/extract production APIs",
+        "output path"
+      ],
+      "AssertionsToPort": "Export prompt-processing and token-generation operation signatures to tests.txt; original is generator not assertion suite; Rust equivalent should assert reserve success and deterministic serialized signatures.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-gbnf-validator.cpp",
+      "SourceSha256": "21eb0bac296c0e0dd497cc438ab8f10ba9cad66488c00288321d939afbdf310f",
+      "Category": "manual-input-required",
+      "Needs": [
+        "GBNF grammar file",
+        "input UTF-8 file",
+        "llama grammar production API"
+      ],
+      "AssertionsToPort": "Parse supplied grammar and evaluate every input codepoint/accept state with correct exit code; invent no single default fixture because original requires two paths.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-gguf-model-data.cpp",
+      "SourceSha256": "7bb9c074b5e0f8140d560a182d66f5150e4c7e2932319c9c6fd61e8b845cf02c",
+      "Category": "network-required",
+      "Needs": [
+        "cpp-httplib with SSL",
+        "remote metadata Qwen3-0.6B Q8_0 GLM-4.6V Q8_0 Step-3.5-Flash Q4_K",
+        "immutable metadata fixtures needed"
+      ],
+      "AssertionsToPort": "Exact architecture/dimensions/tensor counts and known names/shapes; repeat fetch cache semantics; split model and array-valued head counts. Network failure/skip cannot count pass.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-gguf.cpp",
+      "SourceSha256": "38515758a58762f3084db5cd0ce8ddf28d84c78774598a0bbae0fd4c612ea023",
+      "Category": "model-free",
+      "Needs": [
+        "gguf metadata/tensor reader-writer and backend calls",
+        "external working directory"
+      ],
+      "AssertionsToPort": "All handcrafted malformed files; seed12345 metadata and tensor roundtrips; metadata-only/full; file/buffer/callback reads; set_kv copy and double-copy invariants across backends.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-grammar-integration.cpp",
+      "SourceSha256": "6acd7735c8f6db1d3869bd2de5ea7a585accc75e3f8627eb163be11bc123716a",
+      "Category": "model-free",
+      "Needs": [
+        "llama grammar and JSON-schema conversion APIs"
+      ],
+      "AssertionsToPort": "All accepted/rejected strings; simple/complex grammar; clones; chars/quantifiers; missing root/reference/left recursion/root symbol; JSON schemas; preserve literal domain.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-grammar-llguidance.cpp",
+      "SourceSha256": "050d42e1577bdb537bd8c133e3a71354d5b64a9ea5cc8606962531095e28d56f",
+      "Category": "vocab-asset-required",
+      "Needs": [
+        "LLAMA_LLGUIDANCE enabled and external llguidance dependency",
+        "bundled models/ggml-vocab-llama-bpe.gguf"
+      ],
+      "AssertionsToPort": "All grammar/JSON-schema accepted and rejected strings via llguidance token masks/state; backend comparison. Build disabled is blocked not pass.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-grammar-parser.cpp",
+      "SourceSha256": "4c3f3b8ba3f4aa426b750815c7420c5af88672037c98f324168038dedd913ece",
+      "Category": "model-free",
+      "Needs": [
+        "private grammar parser API"
+      ],
+      "AssertionsToPort": "Exact compiled grammar rules/stacks/character classes/ranges and valid-invalid grammar expectations.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-jinja.cpp",
+      "SourceSha256": "ef2da16176a8e914cbd54341e4b77f675a8f3b5b15a8bfd0c9a7a2305c30c8ab",
+      "Category": "model-free-with-optional-python",
+      "Needs": [
+        "Jinja lexer/parser/runtime production APIs",
+        "optional Python Jinja reference and subproc support for -py"
+      ],
+      "AssertionsToPort": "All whitespace/conditionals/loops/expressions/set/filters/literals/comments/macros/namespaces/tests/string-array-object methods/hash/stats/caps/string-parts/fuzzing; same literal expectations; preserve separate Python comparison lane.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-json-schema-to-grammar.cpp",
+      "SourceSha256": "409361847bab0707ee02749c4e6978a63f9cc9f119ffff40de8c69b0c948e99d",
+      "Category": "python-reference-required",
+      "Needs": [
+        "C++ JSON-schema/grammar production APIs",
+        "Python>=3.8",
+        "bundled examples/json_schema_to_grammar.py"
+      ],
+      "AssertionsToPort": "All literal schema->grammar status and output strings; invalid/unsupported regexp degradation; expectation parseability; identical table against Python reference; Python skip remains explicit.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-kv-mean-center.cpp",
+      "SourceSha256": "376c3c7b5b00811e06d30c2dc275f76c6b434cc87464f90ee8eac25de01c01e9",
+      "Category": "model-free",
+      "Needs": [
+        "synthetic GGUF writer",
+        "private model-saver/KV-cache and mean-center APIs"
+      ],
+      "AssertionsToPort": "Regression safety; synthetic Q4_0 layout gating versus unrotated model; softmax invariance with bias; generated temp GGUFs outside checkout.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-llama-archs.cpp",
+      "SourceSha256": "7d542af7b20f6e43d2b174f1dddf9b9480a3130db36c005c3f17c164c032b44d",
+      "Category": "generated-model-required",
+      "Needs": [
+        "full architecture schema/tensor generator",
+        "synthetic random GGUF writer",
+        "available backends"
+      ],
+      "AssertionsToPort": "All supported architecture/model tensor shape cases; CPU/backend execution comparison; deterministic seed; export mode generates qwen35-dense nemotron_h-dense deepseek4-moe assets for rollback.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-llama-grammar.cpp",
+      "SourceSha256": "18405dcd2ff94a2625e8d6e884ac74b704fc60f9c039dbb270ca550f6b2dad76",
+      "Category": "model-free",
+      "Needs": [
+        "private llama grammar parser/runtime APIs"
+      ],
+      "AssertionsToPort": "Every original grammar stack/candidate rejection/accept and copied state expectation; retain unicode/invalid transitions.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-log.cpp",
+      "SourceSha256": "f668c6d6987b0e8888a3823c0425971356c16ca77b44819236fb00c30e4b60c1",
+      "Category": "model-free",
+      "Needs": [
+        "common logger with concurrent methods",
+        "native worker dispatch or reusable per-request contexts"
+      ],
+      "AssertionsToPort": "8 worker threads x1000 mixed severity messages; concurrent timestamps/prefix toggles; join flush and explicit singleton free; hang/crash smoke behavior preserved.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-lora-conversion-inference.sh",
+      "SourceSha256": "69584616380bdaa7f6ee1e53d165408118fb0897e1280f964eb7bc3b932b9c9a",
+      "Category": "model-and-conversion-required",
+      "Needs": [
+        "ggml-org/lora-tests@c26d5fb85b4070a9e9c4e65d132c783b98086890",
+        "Gemma2ForCausalLM LlamaForCausalLM Phi3ForCausalLM hidden_size64 base and LoRA safetensors",
+        "conversion and export APIs",
+        "expected text files"
+      ],
+      "AssertionsToPort": "Convert base and LoRA F32; merge; greedy seed42 50-token base/hot/merged generation; compare whitespace-trimmed expected text prefixes for all3 architectures; retain merged/hot relation. Safe Rust conversion must replace Python logic if all test code must be Rust.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-model-load-cancel.cpp",
+      "SourceSha256": "92b561c68b058db20722873c5f9dbced7c240fba37de5ffbda4f4296b111e2b6",
+      "Category": "model-required",
+      "Needs": [
+        "readable loadable full GGUF",
+        "loader progress callback"
+      ],
+      "AssertionsToPort": "Original callback returns progress>0.50 and load must return null; preserve actual callback predicate and observed progress behavior instead of reinterpreting intended cancellation point.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-model-resolution.cpp",
+      "SourceSha256": "d596a6befca98035acfab4e71e72f50a698a11062fcac138735b3fe1aa9af593",
+      "Category": "loopback-network-model-free",
+      "Needs": [
+        "common argument/download resolution APIs",
+        "Rust loopback HTTP fixture server",
+        "isolated cache/env"
+      ],
+      "AssertionsToPort": "All fake HF repo quant/split/mmproj/MTP/dflash/eagle3/dspark/preset/explicit path precedence expectations; files are fake fixture names; no real model weights or external network needed.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-moe-weighted-reduce.cpp",
+      "SourceSha256": "099680dac156e3289db96ad1143973271205d27b878ea07661097fa9eba699eb",
+      "Category": "model-free",
+      "Needs": [
+        "ggml CPU/backend graph and explicit layout placement APIs"
+      ],
+      "AssertionsToPort": "48 combinations layouts none/W-in-dst/X-in-dst xexperts2/4/8/15 xembd64/66 xtokens1/7; bitwise CPU reference; status and overlap/alias placement.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-mtmd-c-api.c",
+      "SourceSha256": "bdeb47199c1bc878566c7b47dd4905e6b82fb42586ad92aabc6ee27e1647d884",
+      "Category": "model-free",
+      "Needs": [
+        "libmtmd C API",
+        "synthetic chunk creator or Rust-controlled constructor APIs"
+      ],
+      "AssertionsToPort": "Default marker; text/image/audio chunks positive counts and valid token/ID/position metadata; save query exact size; too-small save; truncated load rejected; full roundtrip exact metadata/token/ID equality.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-mtmd-impl.cpp",
+      "SourceSha256": "b6cffd8cbe193c590cb25b98e480f5db6615f8da3ef7e732ca85b19a2345388b",
+      "Category": "model-free",
+      "Needs": [
+        "libmtmd private image preprocessor and temporal merge APIs"
+      ],
+      "AssertionsToPort": "5 LFM2 should_tile geometries including ties-to-even720;12 temporal groups with images/video/audio/text/mismatched sizes and n_merge1; remaining bitmap part count.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-mtp-catchup-batch.cpp",
+      "SourceSha256": "48d136ab03706c888eb393a771a6e1c7ec0c4ac0be1d7581d58a35bb57f1aae0",
+      "Category": "model-free",
+      "Needs": [
+        "common_speculative_mtp_first_decode_fits production function"
+      ],
+      "AssertionsToPort": "Six exact boundary predicates (32/31/1 true;32/32/1 false;32/30/2 true;32/32/2 false;0/0/0 false;32/-1/1 false).",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-opt.cpp",
+      "SourceSha256": "24af6c26293d328ad42820cc817ab891869c93ec744950e6505018cfd33d04bb",
+      "Category": "model-free",
+      "Needs": [
+        "ggml optimization dataset/context/scheduler APIs",
+        "ADAMW and SGD backend support"
+      ],
+      "AssertionsToPort": "All original dataset/loss/gradient/forward/backward/optimizer/train/resume parameter cases for ADAMW and SGD; numerical thresholds; backend unsupported states explicit; upstream disabled under ASAN/no-realloc.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-peg-parser.cpp",
+      "SourceSha256": "52ebb967feae3aec877a1d3cb1c509b2598a9c799e60401a82253a5d4844038b",
+      "Category": "helper-with-benchmark-default",
+      "Needs": [
+        "six nested PEG test modules",
+        "serialization benchmark lane"
+      ],
+      "AssertionsToPort": "This main only registers nested basic/unicode/json/gbnf/serialization/python-dict suites; share Rust cases and prove all registration groups execute without double-counting assertions; serialization includes benchmark.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-pq2-row-shapes.cpp",
+      "SourceSha256": "5f8a346808b1cf6a77defc022d210023bad0d0dbb00f3a5c4f2ac9ec1c70db92",
+      "Category": "model-free",
+      "Needs": [
+        "ggml PQ2 matrix kernel",
+        "portable Rust owned input corpus replacing C++ normal_distribution"
+      ],
+      "AssertionsToPort": "15 original K128/256/384/512/640 M4 N1/4/16 shapes; independent dequantized scalar matmul reference; original relRMS<0.05; retain original frozen corpus as well as new deterministic Rust generation.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-ptq1_0-cuda-dot.cpp",
+      "SourceSha256": "17d72e91495a7ffe4e726e90ebe99bf9d7b9acbe1d451a38c865352c3559092a",
+      "Category": "model-free-host-device-logic",
+      "Needs": [
+        "pinned CUDA/HIP production source operations exposed through bridge or extracted source-contract check",
+        "no nvcc required for old host logic"
+      ],
+      "AssertionsToPort": "5000 original seed99 blocks; scalar CUDA lane and HIP permutation/vector integer accumulators; per-quarter and scaled float reference thresholds; preserve all original checks despite no actual CUDA compilation.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-ptq1_0-element-map.cpp",
+      "SourceSha256": "3147d23eb3177a57dcd4c40ef87351f572c512a3bac4a5c15405ad611750f17d",
+      "Category": "model-free-host-device-logic",
+      "Needs": [
+        "pinned CUDA accessor and CPU codec operations",
+        "Rust LCG with wrapping32"
+      ],
+      "AssertionsToPort": "Original seed12345 all20000 arbitrary-byte blocks x128 positions; exact mapping equality across both traversals; no canonical-byte filtering. Runtime rejection remains red.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-quant-type-selection.cpp",
+      "SourceSha256": "9a4879f21341efb4adb14c0f08c6fa414735f5a8132ed22181de41efecaa9cb4",
+      "Category": "network-required",
+      "Needs": [
+        "SSL metadata fetcher",
+        "11 exact remote metadata schemas",
+        "12 bundled tests/snapshots/*.schema files"
+      ],
+      "AssertionsToPort": "For every model and ftype compare default/per-tensor selected quant type against pinned schema; all overrides; --generate is reference generation not passing test. Need freeze remote metadata revisions/digests.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-quantize-fns.cpp",
+      "SourceSha256": "830e197b34efc57030cef3b83449264f8b2d4db76121796ae962602cdf675d6b",
+      "Category": "model-free",
+      "Needs": [
+        "all ggml quantization type traits CPU kernels and conversion APIs"
+      ],
+      "AssertionsToPort": "All enabled types quantization/reference/dot error thresholds; F32 dot; PQ2/PTQ1 exact packed dots 256 patterns x2 block counts each and power-of-two scales; retain type coverage.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-quantize-perf.cpp",
+      "SourceSha256": "09de1812b11836bd899a63dfa6b06927a2d0a012edc1e702a33fb51c95d63563",
+      "Category": "benchmark-only",
+      "Needs": [
+        "CI benchmark runner",
+        "all quantization type traits",
+        "alignment/size/iteration parameters"
+      ],
+      "AssertionsToPort": "Original source is performance utility; port workload type/op/size/alignment selection and correctness preconditions; record measurements separately with no invented pass floor; never run locally.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-quantize-stats.cpp",
+      "SourceSha256": "1866b300a8966c3797740a5b4543236d92d1c7b8f2ca67829f453ffcd5b9707b",
+      "Category": "model-statistics-diagnostic",
+      "Needs": [
+        "full F32/F16 model (default models/7B/ggml-model-f16.gguf)",
+        "quantization kernels",
+        "CI profiling lane for timings"
+      ],
+      "AssertionsToPort": "Per-layer/type weighted error statistics histograms filters thread configuration; original reports stats and duration rather than a model-quality pass threshold; safe Rust diagnostic equivalent.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-reasoning-budget.cpp",
+      "SourceSha256": "1499e08757ff9e6f52ddd84134a1454346e92cd78a3dc5a9141f8ba775f57979",
+      "Category": "model-free",
+      "Needs": [
+        "reasoning-budget sampler and synthetic vocab production API"
+      ],
+      "AssertionsToPort": "All counting/forcing/end-match/manual-force/boundary tests; clone mid-count and mid-force; exact UTF-8 boundary predicate cases and state transitions.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-recurrent-state-rollback.cpp",
+      "SourceSha256": "51c1ab7b2acfcbad88651ae8f4d4ad055ab5196c4794949255545bcb82abc299",
+      "Category": "generated-model-required",
+      "Needs": [
+        "generated qwen35-dense.gguf nemotron_h-dense.gguf deepseek4-moe.gguf from arch fixture generator"
+      ],
+      "AssertionsToPort": "All non-SWA recurrent checkpoint/rollback/state-copy branches and logits parity after speculative/restore operations across3 architectures; fixed token inputs.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-rope.cpp",
+      "SourceSha256": "cca4b2a3acbce6c410ec808f1cf263b191aea2c7a3b5df6d14b17c6be13871df",
+      "Category": "model-free",
+      "Needs": [
+        "ggml RoPE normal/NeoX/MRoPE/vision/IMRoPE graph APIs"
+      ],
+      "AssertionsToPort": "All5 modes with exact original shape/positions/sections; compose +100 then -67 equals +33; both relative L1 errors<1e-4.",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-rset-release.cpp",
+      "SourceSha256": "29482cb9369f0357c0ea8107c43caacdc22357910ca25872e42d86a9bdad03d5",
+      "Category": "apple-model-memory-required",
+      "Needs": [
+        "macOS Mach VM statistics",
+        "large model occupying>3GB wired",
+        "CI device memory lane"
+      ],
+      "AssertionsToPort": "Require loaded wired delta>2GB then at least75percent release within10seconds after model free; original platform/hardware requirement cannot pass Linux/Windows by skipping.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": false
+    },
+    {
+      "Id": "tests/test-sampling.cpp",
+      "SourceSha256": "817543792852df22e78f705192793ec5797c872708274d572c24c2fb0c95a8ac",
+      "Category": "correctness-and-benchmark",
+      "Needs": [
+        "llama sampler public APIs",
+        "CI benchmark lane"
+      ],
+      "AssertionsToPort": "All temp/temp-ext/topk/topp/minp/XTC/typical/penalties/DRY/top-n-sigma tables plus sampler queue combinations; preserve default test_perf separately.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-save-load-state.cpp",
+      "SourceSha256": "126af9ad38b3540e0cea3052af5987a0fc8d4d05e0680f8faf3380bda50c6cc1",
+      "Category": "model-required",
+      "Needs": [
+        "tinyllamas/stories15M-q4_0.gguf SHA25666967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739",
+        "external state files"
+      ],
+      "AssertionsToPort": "State bytes/file save-load and continuation tokens/logits equivalence; sequence copy/restore branches and original failure paths.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-state-restore-fragmented.cpp",
+      "SourceSha256": "623ac05b4ea99556d741f0c4c8016967e3260e057ce073d1080830237cf5a9bd",
+      "Category": "model-required",
+      "Needs": [
+        "same pinned stories15M-q4_0.gguf",
+        "LLAMA context and KV sequence APIs"
+      ],
+      "AssertionsToPort": "Create fragmented KV cache and restore state with exact logits/token equivalence; preserve noncontiguous sequence setup.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-thread-safety.cpp",
+      "SourceSha256": "7fb63816a7033566ff1dfb76001b7bdf812a475de2cfe16e544ab14550f56039",
+      "Category": "model-required",
+      "Needs": [
+        "same pinned stories15M-q4_0.gguf",
+        "four context/sequence threads",
+        "-n128 -c256 -ub32 -np4 -t2 original params"
+      ],
+      "AssertionsToPort": "Concurrent model/context decode sampling and cleanup with deterministic expected relationship and no crashes; original prompt The meaning of life is.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizer-0.cpp",
+      "SourceSha256": "3ab4be406c0bd04f0ddf951f3dc6a1cc594bb3fe1f56ae7da08ba077bd5f9d18",
+      "Category": "bundled-vocab-required",
+      "Needs": [
+        "15 CMake bundled models/ggml-vocab-{bert-bge command-r deepseek-coder deepseek-llm falcon gemma-4 gpt-2 llama-bpe llama-spm mpt phi-3 qwen2 qwen35 refact starcoder}.gguf plus matching .inp/.out"
+      ],
+      "AssertionsToPort": "Exact token ID fixtures; detokenization/roundtrip and vocab properties; concurrent tokenization; text-file export mode separate; all15 variants preserved.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizer-0.py",
+      "SourceSha256": "6c225af1d7a2dce88fdc1b885ca4b525de588067508c72b15eef62cf6112c788",
+      "Category": "python-reference-helper",
+      "Needs": [
+        "external models/tokenizers/<name> HuggingFace tokenizer files",
+        "transformers AutoTokenizer",
+        "text corpus"
+      ],
+      "AssertionsToPort": "Generate authoritative token IDs to .tok with timing log; Rust port needs pinned tokenizer reference data or safe Rust reference tokenizer; merely relabeling llama tokens as reference is circular.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizer-0.sh",
+      "SourceSha256": "85baee7afaac6928e23f915fd7bfa01b7c34547e90fee67d36205a5ca095f3f4",
+      "Category": "python-reference-orchestrator",
+      "Needs": [
+        "matching bundled GGUF and external HuggingFace tokenizer directory",
+        "input text",
+        "tokenizer reference implementation"
+      ],
+      "AssertionsToPort": "Coordinate Python/native token-file diff and show mismatch; old script only prints mismatch without nonzero exit so Rust migration should make correctness explicit with retained semantics notes.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizer-1-bpe.cpp",
+      "SourceSha256": "2de134d10ff27590c714cfa70a75beb07be4dbeb971f78f2d9969ed0daaee36a",
+      "Category": "bundled-vocab-required-slow",
+      "Needs": [
+        "bundled BPE GGUFs",
+        "optional ignore-merges",
+        "original registrations commented due slowness"
+      ],
+      "AssertionsToPort": "All vocabulary token detokenize/tokenize roundtrips and applicable Unicode codepoints below0x110000 with surrogate/undefined exclusions and U+2581 exception; ignore-merges single token behavior.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizer-1-spm.cpp",
+      "SourceSha256": "87ca4367b6acd9ddf1e3fc694f2ae02b569070eb66faa5f88068f81aaed35bfb",
+      "Category": "bundled-vocab-required-slow",
+      "Needs": [
+        "bundled models/ggml-vocab-llama-spm.gguf",
+        "optional baichuan"
+      ],
+      "AssertionsToPort": "All vocabulary token and Unicode codepoint roundtrips with original exclusions/U+2581 exception; threaded traversal; ensure vocab type SPM.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizer-random.py",
+      "SourceSha256": "34e3b5edcb16a019faa2d7f17f88d82419cf821e964f921db8b53484037d7929",
+      "Category": "python-reference-required",
+      "Needs": [
+        "26 listed GGUFs and matching external HuggingFace tokenizer directories",
+        "transformers and cffi reference",
+        "safe Rust replacement tokenizer/or frozen corpus"
+      ],
+      "AssertionsToPort": "Original deterministic edge generators for whitespace/Unicode/added token strips; match tokenization/detokenization vs independent AutoTokenizer; preserve currently enabled generator set and disabled generators as explicit optional work.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-tokenizers-repo.sh",
+      "SourceSha256": "79ceac92fb148da980aea8da8cbcc879a129239ce1a7c6774f76b079d2a8aac1",
+      "Category": "network-orchestrator",
+      "Needs": [
+        "https://huggingface.co/ggml-org/vocabs repo at new immutable revision",
+        "matching .inp/.out",
+        "non-Windows registration",
+        "big-endian conversion for s390x"
+      ],
+      "AssertionsToPort": "Discover recursive GGUF assets and invoke tokenizer fixture checks; no current upstream commit pin for remote repo; freeze before reproducible Rust migration; unmatched pairs explicit.",
+      "LegacyReferenceRequired": false,
+      "SafeRustPort": true
+    },
+    {
+      "Id": "tests/test-unicode.cpp",
+      "SourceSha256": "3f90e347bc639d914a360b197c75f9754d01b751a9a39a240d84b31f8303373a",
+      "Category": "model-free",
+      "Needs": [
+        "unicode_regex_split production API"
+      ],
+      "AssertionsToPort": "Exact regex [~][A-Za-z]+ or optional-space symbols or whitespace splits input space-tilde-foo into [space-tilde,foo].",
+      "LegacyReferenceRequired": true,
+      "SafeRustPort": true
+    }
+  ],
+  "ExternalPrerequisites": [
+    "No project lock yet pins LoRA mini-model fixture repository archive/content; upstream provides its commit.",
+    "No project lock pins dspark GGUF/ref.bin/ref.json or compatible target/drafter pair. Tiny metadata generator is bundled and can be ported.",
+    "No pinned HuggingFace tokenizer directories for Python comparison; archive has vocab GGUFs but no models/tokenizers directory.",
+    "No immutable remote metadata revisions/digests for gguf-model-data and quant-type-selection; bundled .schema snapshots are expected output only."
+  ],
+  "Target": {
+    "Platform": "Windows ARM64",
+    "Hardware": "Snapdragon X Elite",
+    "ExcludedSources": [
+      {
+        "Id": "tests/test-rset-release.cpp",
+        "Reason": "Apple wired-memory behavior is outside the requested Windows ARM64 target."
+      }
+    ]
+  }
+}

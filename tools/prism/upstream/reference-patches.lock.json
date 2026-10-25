@@ -1,0 +1,25 @@
+{
+  "SchemaVersion": 2,
+  "SourceCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "Variant": "pinned-upstream-with-documented-production-fixes",
+  "Patches": [
+    {
+      "RelativeSource": "src/llama-model-saver.cpp",
+      "PatchPath": "tools/prism/upstream/patches/dspark-saver.patch",
+      "BeforeSha256": "6dec1fc297dca89fb6933b638acf593a2e4c1ca02b69dafe00268651fa9ef96d",
+      "AfterSha256": "8b2deae2693ff2a664e3d53e82cea06f8166b4671eadd0ba4a957c2a5af53dee",
+      "CanonicalPatchSha256": "0569d425f151fe6115b05375c9517464eeffe2d689f211b8b7b73bdd3298b926",
+      "Reason": "The pinned saver advertises DSpark support but drops required/optional metadata and16 global tensors. Restore them without changing any test predicate.",
+      "Authorization": "User delegated the choice after review of the concrete saver fix and focused failing save/load reproduction; correction covers both proven metadata and tensor omissions."
+    },
+    {
+      "RelativeSource": "src/llama-vocab.cpp",
+      "PatchPath": "tools/prism/upstream/patches/llama3-cleanup.patch",
+      "BeforeSha256": "32b8b7ac4a023bc6367eb7832e56e988ab7373a676ddcca4977665f78932ab88",
+      "AfterSha256": "ecb6ffd1b5248384b96360acbb47bd3a6b8f8aebb547dade3b9429d8c00ff6e2",
+      "CanonicalPatchSha256": "b52f1cceb6a36f9f511503c2e550a9b18a718c4b10272dbdf64cbfae8ae5fd01",
+      "Reason": "Canonical Llama 3 decoding preserves token bytes; inherited punctuation cleanup corrupts original token 24268. Disable cleanup only for llama3, llama-v3 and llama-bpe, preserving all original test predicates and the other six aliases sharing this pretokenizer enum.",
+      "Authorization": "Production correction implements the requested passing upstream reference without weakening the original Rust-owned assertions; independent immutable Meta and tiktoken sources establish the decoding contract."
+    }
+  ]
+}

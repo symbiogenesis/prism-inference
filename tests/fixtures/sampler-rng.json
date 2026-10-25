@@ -1,0 +1,44 @@
+{
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "XtcProbabilityBits": 1056964608,
+  "DistributionCounts": [
+    1,
+    2,
+    17,
+    257,
+    257,
+    257,
+    257,
+    257
+  ],
+  "XtcSeed": 12345,
+  "DistributionSelected": [
+    0,
+    0,
+    7,
+    85,
+    40,
+    214,
+    132,
+    170
+  ],
+  "XtcCounts": [
+    5,
+    5,
+    1,
+    1,
+    1,
+    1,
+    1,
+    5,
+    5,
+    5,
+    5,
+    5
+  ],
+  "DistributionSeed": 4242,
+  "Scope": "20 real production seeded correctness observations; Windows x64-emulated; no timing",
+  "XtcThresholdBits": 1036831949,
+  "ProductionBridgeSha256": "7e15c42d19183a96815c5aa271c186815d6ce752cf9b5cb59fdf36fae5bfad73",
+  "SchemaVersion": 1
+}

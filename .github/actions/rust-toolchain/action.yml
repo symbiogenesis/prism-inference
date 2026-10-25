@@ -1,0 +1,111 @@
+name: Cache an exact Rust toolchain
+description: Restore only one pinned toolchain directory and verify its compiler and components.
+inputs:
+  toolchain:
+    description: Fully qualified dated channel or release, including the host triple.
+    required: true
+  components:
+    description: Comma or whitespace separated components; empty selects the minimal profile.
+    default: rustfmt,clippy
+  expected-host:
+    description: Expected compiler host; defaults to the toolchain suffix.
+    default: ''
+outputs:
+  toolchain-path:
+    description: Absolute directory of this toolchain only.
+    value: ${{ steps.paths.outputs.toolchain-path }}
+  image-identity:
+    description: Runner image identity used to isolate the cache.
+    value: ${{ steps.paths.outputs.image-identity }}
+  compiler-identity:
+    description: SHA256 of the verified rustc verbose identity.
+    value: ${{ steps.verify.outputs.compiler-identity }}
+  cache-hit:
+    description: Whether the exact toolchain cache was restored.
+    value: ${{ steps.cache.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - name: Identify the exact toolchain directory and runner image
+      id: paths
+      shell: pwsh
+      working-directory: ${{ runner.temp }}
+      env:
+        PINNED_TOOLCHAIN: ${{ inputs.toolchain }}
+        REQUIRED_COMPONENTS: ${{ inputs.components }}
+        EXPECTED_HOST: ${{ inputs.expected-host }}
+        RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        if ($env:PINNED_TOOLCHAIN -cnotmatch '^(?:(?:stable|beta|nightly)-[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]+\.[0-9]+\.[0-9]+)-(?<host>[a-z0-9_]+(?:-[a-z0-9_]+){2,})$') {
+          throw 'Use an exact Rust version or dated channel with its full host triple.'
+        }
+        $hostTriple = $Matches.host
+        if ($env:EXPECTED_HOST -and $env:EXPECTED_HOST -cne $hostTriple) { throw 'Expected host disagrees with the pinned toolchain.' }
+        $components = @($env:REQUIRED_COMPONENTS -split '[,\s]+' | Where-Object { $_ } | Sort-Object -Unique)
+        foreach ($component in $components) {
+          if ($component -cnotmatch '^[a-z0-9][a-z0-9-]*$') { throw 'Invalid Rust component name.' }
+        }
+        $rustupHome = (rustup show home | Out-String).Trim()
+        if (-not [IO.Path]::IsPathFullyQualified($rustupHome) -or $rustupHome -match '%[^%]+%' -or $rustupHome -match '[\r\n]') { throw 'Expected an expanded absolute rustup home.' }
+        $toolchainPath = Join-Path (Join-Path $rustupHome 'toolchains') $env:PINNED_TOOLCHAIN
+        if ($env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and (-not $env:ImageOS -or -not $env:ImageVersion)) { throw 'Runner image identity is required for toolchain cache isolation.' }
+        $imageIdentity = "$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)"
+        $componentKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($components -join ',')))).ToLowerInvariant()
+        $imageKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($imageIdentity))).ToLowerInvariant()
+        "toolchain-path=$toolchainPath" >> $env:GITHUB_OUTPUT
+        "image-identity=$imageIdentity" >> $env:GITHUB_OUTPUT
+        "component-key=$componentKey" >> $env:GITHUB_OUTPUT
+        "image-key=$imageKey" >> $env:GITHUB_OUTPUT
+        "components=$($components -join ',')" >> $env:GITHUB_OUTPUT
+        "host=$hostTriple" >> $env:GITHUB_OUTPUT
+    - name: Reuse only the exact toolchain directory
+      id: cache
+      # Owner-managed runners retain their installation between jobs already.
+      if: runner.environment == 'github-hosted'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        # Never retain rustup settings, Cargo home, credentials or proxy binaries.
+        path: ${{ steps.paths.outputs.toolchain-path }}
+        key: rust-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.image-key }}-${{ inputs.toolchain }}-${{ steps.paths.outputs.component-key }}
+    - name: Install the pinned compiler on a cache miss
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      working-directory: ${{ runner.temp }}
+      env:
+        PINNED_TOOLCHAIN: ${{ inputs.toolchain }}
+        REQUIRED_COMPONENTS: ${{ steps.paths.outputs.components }}
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        $arguments = @('toolchain', 'install', $env:PINNED_TOOLCHAIN, '--profile', 'minimal', '--no-self-update')
+        if ($env:REQUIRED_COMPONENTS) { $arguments += @('--component', $env:REQUIRED_COMPONENTS) }
+        rustup @arguments
+    - name: Verify the compiler and all required components
+      id: verify
+      shell: pwsh
+      working-directory: ${{ runner.temp }}
+      env:
+        PINNED_TOOLCHAIN: ${{ inputs.toolchain }}
+        REQUIRED_COMPONENTS: ${{ steps.paths.outputs.components }}
+        EXPECTED_HOST: ${{ steps.paths.outputs.host }}
+        TOOLCHAIN_PATH: ${{ steps.paths.outputs.toolchain-path }}
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        # rustup run does not implicitly install a missing toolchain.
+        $identity = @(rustup run $env:PINNED_TOOLCHAIN rustc -vV)
+        if ($identity -cnotcontains "host: $env:EXPECTED_HOST") { throw 'Restored Rust compiler has an unexpected host.' }
+        $sysroot = (rustup run $env:PINNED_TOOLCHAIN rustc --print sysroot | Out-String).Trim()
+        if ([IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($sysroot)) -cne [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($env:TOOLCHAIN_PATH))) { throw 'Rust compiler resolved outside the exact toolchain directory.' }
+        $installed = @(rustup component list --toolchain $env:PINNED_TOOLCHAIN --installed --quiet)
+        foreach ($component in @($env:REQUIRED_COMPONENTS -split ',' | Where-Object { $_ })) {
+          if ($installed -cnotcontains $component -and $installed -cnotcontains "$component-$env:EXPECTED_HOST") { throw "Required Rust component is missing: $component" }
+        }
+        $identity | Write-Output
+        $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($identity -join "`n")))).ToLowerInvariant()
+        "compiler-identity=$digest" >> $env:GITHUB_OUTPUT

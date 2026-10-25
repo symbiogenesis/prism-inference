@@ -1,0 +1,235 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamCommit": "b87ca7225456b06b0975b8239c66b5aecf07e37c",
+  "Source": "tests/test-reasoning-budget.cpp",
+  "SourceSha256": "1499e08757ff9e6f52ddd84134a1454346e92cd78a3dc5a9141f8ba775f57979",
+  "Cases": [
+    {
+      "Name": "natural end before budget exhausted",
+      "Sequence": [
+        100,
+        50,
+        51,
+        101,
+        52
+      ],
+      "StartSequences": [
+        [
+          100
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ]
+      ],
+      "ForcedTokens": [
+        102
+      ],
+      "Budget": 5,
+      "InitialState": 0,
+      "ExpectedForceStart": null,
+      "ExpectedForceEnd": null
+    },
+    {
+      "Name": "budget exhausted forcing",
+      "Sequence": [
+        100,
+        50,
+        51,
+        52,
+        53
+      ],
+      "StartSequences": [
+        [
+          100
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ]
+      ],
+      "ForcedTokens": [
+        102,
+        101
+      ],
+      "Budget": 2,
+      "InitialState": 0,
+      "ExpectedForceStart": 3,
+      "ExpectedForceEnd": 4
+    },
+    {
+      "Name": "activate immediately budget=0",
+      "Sequence": [
+        100,
+        50,
+        51,
+        52
+      ],
+      "StartSequences": [
+        [
+          100
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ]
+      ],
+      "ForcedTokens": [
+        102,
+        101
+      ],
+      "Budget": 0,
+      "InitialState": 1,
+      "ExpectedForceStart": 0,
+      "ExpectedForceEnd": 1
+    },
+    {
+      "Name": "no start/end configured",
+      "Sequence": [
+        50,
+        51,
+        52,
+        53
+      ],
+      "StartSequences": [
+        []
+      ],
+      "EndSequences": [
+        []
+      ],
+      "ForcedTokens": [
+        102
+      ],
+      "Budget": 2,
+      "InitialState": 0,
+      "ExpectedForceStart": null,
+      "ExpectedForceEnd": null
+    },
+    {
+      "Name": "activate immediately with budget",
+      "Sequence": [
+        50,
+        51,
+        52,
+        53
+      ],
+      "StartSequences": [
+        [
+          100
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ]
+      ],
+      "ForcedTokens": [
+        102,
+        101
+      ],
+      "Budget": 2,
+      "InitialState": 1,
+      "ExpectedForceStart": 2,
+      "ExpectedForceEnd": 3
+    },
+    {
+      "Name": "multi-block re-arms budget after DONE",
+      "Sequence": [
+        100,
+        50,
+        101,
+        100,
+        60,
+        61,
+        62,
+        63
+      ],
+      "StartSequences": [
+        [
+          100
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ]
+      ],
+      "ForcedTokens": [
+        102,
+        101
+      ],
+      "Budget": 2,
+      "InitialState": 0,
+      "ExpectedForceStart": 6,
+      "ExpectedForceEnd": 7
+    },
+    {
+      "Name": "multiple start sequences",
+      "Sequence": [
+        110,
+        111,
+        50,
+        51,
+        52,
+        53
+      ],
+      "StartSequences": [
+        [
+          100
+        ],
+        [
+          110,
+          111
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ]
+      ],
+      "ForcedTokens": [
+        102,
+        101
+      ],
+      "Budget": 2,
+      "InitialState": 0,
+      "ExpectedForceStart": 4,
+      "ExpectedForceEnd": 5
+    },
+    {
+      "Name": "multiple end sequences",
+      "Sequence": [
+        100,
+        50,
+        103,
+        104,
+        52
+      ],
+      "StartSequences": [
+        [
+          100
+        ]
+      ],
+      "EndSequences": [
+        [
+          101
+        ],
+        [
+          103,
+          104
+        ]
+      ],
+      "ForcedTokens": [
+        102,
+        101
+      ],
+      "Budget": 5,
+      "InitialState": 0,
+      "ExpectedForceStart": null,
+      "ExpectedForceEnd": null
+    }
+  ]
+}

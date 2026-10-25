@@ -1,0 +1,6876 @@
+{
+  "SchemaVersion": 1,
+  "Source": "tests/peg-parser/test-unicode.cpp",
+  "SourceSha256": "5eda6c6457af1ff1a62081dadac597d7706bb656e9941bb828de6421d9c563cf",
+  "Operations": [
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            67,
+            97,
+            102,
+            195,
+            169
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160,
+            229,
+            165,
+            189
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            154,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            67,
+            97,
+            102,
+            195
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            154
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            255,
+            254
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            128,
+            87,
+            111,
+            114,
+            108,
+            100
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "one_or_more",
+                "Args": [
+                  {
+                    "Op": "any",
+                    "Args": []
+                  }
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            195,
+            40
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            184,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            229,
+            165,
+            189
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            233,
+            191,
+            191
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            97
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            183,
+            191
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            234,
+            128,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            184
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            229,
+            165
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152,
+            129
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            153,
+            143
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            151,
+            191
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            153,
+            144
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            154,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\U0001F600-\\U0001F64F]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            184,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            53
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            97
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            154,
+            128
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            184
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "chars",
+                "Args": [
+                  "[\\u4E00-\\u9FFF\\U0001F600-\\U0001F64F0-9]"
+                ]
+              },
+              {
+                "Op": "end",
+                "Args": []
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160,
+            229,
+            165,
+            189,
+            60,
+            47,
+            116,
+            97,
+            103,
+            62
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152,
+            128,
+            60,
+            47,
+            116,
+            97,
+            103,
+            62
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            32,
+            228,
+            184,
+            150,
+            231,
+            149,
+            140,
+            33,
+            60,
+            47,
+            116,
+            97,
+            103,
+            62
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            99,
+            111,
+            110,
+            116,
+            101,
+            110,
+            116,
+            240,
+            159,
+            152
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            228,
+            184
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160,
+            229,
+            165,
+            189
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            255,
+            254
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            128,
+            87,
+            111,
+            114,
+            108,
+            100
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "until",
+          "Args": [
+            "</tag>"
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            195,
+            40
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            32,
+            87,
+            111,
+            114,
+            108,
+            100,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            67,
+            97,
+            102,
+            195,
+            169,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160,
+            229,
+            165,
+            189,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            240,
+            159,
+            152,
+            128,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            32,
+            228,
+            184,
+            150,
+            231,
+            149,
+            140,
+            33,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            67,
+            97,
+            102,
+            195
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            228,
+            184
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            84,
+            101,
+            120,
+            116,
+            240,
+            159,
+            152
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189
+          ],
+          "Flags": 1
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            255,
+            254
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            128,
+            87,
+            111,
+            114,
+            108,
+            100
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "string_content",
+          "Args": [
+            34
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            195,
+            40
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            72,
+            101,
+            108,
+            108,
+            111,
+            92,
+            117,
+            48,
+            48,
+            52,
+            49,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160,
+            92,
+            110,
+            229,
+            165,
+            189,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    },
+    {
+      "Kind": "peg-evaluate",
+      "Graph": {
+        "Statements": [],
+        "Root": {
+          "Op": "sequence",
+          "Args": [
+            [
+              {
+                "Op": "string_content",
+                "Args": [
+                  34
+                ]
+              },
+              {
+                "Op": "literal",
+                "Args": [
+                  "\""
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "Inputs": [
+        {
+          "Bytes": [
+            228,
+            189,
+            160,
+            92,
+            34,
+            229,
+            165,
+            189,
+            34
+          ],
+          "Flags": 0
+        }
+      ],
+      "GenerateGrammar": [],
+      "RoundTrip": false
+    }
+  ],
+  "Assertions": [
+    {
+      "Name": "any.case 0: Hello",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 0,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 0: Hello.equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 0,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 0,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 0,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 0,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 0,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 1: Caf\\xc3\\xa9",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 1,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 1: Caf\\xc3\\xa9.equal",
+      "Left": {
+        "Bytes": [
+          67,
+          97,
+          102,
+          195,
+          169
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              67,
+              97,
+              102,
+              195,
+              169
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 1,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 1,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 1,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 1,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 1,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 2: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 2,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 2: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160,
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160,
+              229,
+              165,
+              189
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 2,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 2,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 2,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 2,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 2,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 3: \\xf0\\x9f\\x9a\\x80",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 3,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 3: \\xf0\\x9f\\x9a\\x80.equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          154,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              154,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 3,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 3,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 3,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 3,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 3,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 4: Caf\\xc3",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 4,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 4: Caf\\xc3.equal",
+      "Left": {
+        "Bytes": [
+          67,
+          97,
+          102
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              67,
+              97,
+              102,
+              195
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 4,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 4,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 4,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 4,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 4,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 5: \\xe4\\xbd",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 5,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 5: \\xe4\\xbd.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 5,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 5,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 5,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 5,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 5,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 6: \\xf0\\x9f\\x9a",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 6,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 6: \\xf0\\x9f\\x9a.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              154
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 6,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 6,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 6,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 6,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 6,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 7: \\xff\\xfe",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 7,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 7: \\xff\\xfe.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              255,
+              254
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 7,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 7,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 7,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 7,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 7,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 8: Hello\\x80World",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 8,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 8: Hello\\x80World.equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111,
+              128,
+              87,
+              111,
+              114,
+              108,
+              100
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 8,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 8,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 8,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 8,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 8,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "any.case 9: \\xc3(",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 9,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "any.case 9: \\xc3(.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              195,
+              40
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 9,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 9,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 9,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 9,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 9,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 0: \\xe4\\xb8\\x80",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 10,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 0: \\xe4\\xb8\\x80.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          184,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              184,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 10,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 10,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 10,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 10,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 10,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 1: \\xe4\\xbd\\xa0",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 11,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 1: \\xe4\\xbd\\xa0.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 11,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 11,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 11,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 11,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 11,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 2: \\xe5\\xa5\\xbd",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 12,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 2: \\xe5\\xa5\\xbd.equal",
+      "Left": {
+        "Bytes": [
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              229,
+              165,
+              189
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 12,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 12,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 12,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 12,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 12,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 3: \\xe9\\xbf\\xbf",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 13,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 3: \\xe9\\xbf\\xbf.equal",
+      "Left": {
+        "Bytes": [
+          233,
+          191,
+          191
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              233,
+              191,
+              191
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 13,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 13,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 13,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 13,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 13,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 4: a",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 14,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 4: a.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              97
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 14,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 14,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 14,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 14,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 14,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 5: \\xe4\\xb7\\xbf",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 15,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 5: \\xe4\\xb7\\xbf.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              183,
+              191
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 15,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 15,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 15,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 15,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 15,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 6: \\xea\\x80\\x80",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 16,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 6: \\xea\\x80\\x80.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              234,
+              128,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 16,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 16,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 16,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 16,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 16,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 7: \\xe4\\xb8",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 17,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 7: \\xe4\\xb8.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              184
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 17,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 17,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 17,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 17,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 17,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 8: \\xe5\\xa5",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 18,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+4E00-U+9FFF (CJK).case 8: \\xe5\\xa5.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              229,
+              165
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 18,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 18,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 18,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 18,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 18,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 0: \\xf0\\x9f\\x98\\x80",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 19,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 0: \\xf0\\x9f\\x98\\x80.equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          152,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 19,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 19,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 19,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 19,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 19,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 1: \\xf0\\x9f\\x98\\x81",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 20,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 1: \\xf0\\x9f\\x98\\x81.equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          152,
+          129
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152,
+              129
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 20,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 20,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 20,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 20,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 20,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 2: \\xf0\\x9f\\x99\\x8f",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 21,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 2: \\xf0\\x9f\\x99\\x8f.equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          153,
+          143
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              153,
+              143
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 21,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 21,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 21,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 21,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 21,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 3: \\xf0\\x9f\\x97\\xbf",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 22,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 3: \\xf0\\x9f\\x97\\xbf.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              151,
+              191
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 22,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 22,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 22,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 22,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 22,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 4: \\xf0\\x9f\\x99\\x90",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 23,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 4: \\xf0\\x9f\\x99\\x90.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              153,
+              144
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 23,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 23,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 23,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 23,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 23,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 5: \\xf0\\x9f\\x9a\\x80",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 24,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 5: \\xf0\\x9f\\x9a\\x80.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              154,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 24,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 24,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 24,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 24,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 24,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 6: \\xf0\\x9f\\x98",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 25,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 6: \\xf0\\x9f\\x98.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 25,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 25,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 25,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 25,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 25,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 7: \\xf0\\x9f",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 26,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.unicode range U+1F600-U+1F64F (emoticons).case 7: \\xf0\\x9f.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 26,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 26,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 26,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 26,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 26,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 0: \\xe4\\xb8\\x80",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 27,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 0: \\xe4\\xb8\\x80.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          184,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              184,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 27,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 27,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 27,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 27,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 27,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 1: \\xe4\\xbd\\xa0",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 28,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 1: \\xe4\\xbd\\xa0.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 28,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 28,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 28,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 28,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 28,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 2: \\xf0\\x9f\\x98\\x80",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 29,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 2: \\xf0\\x9f\\x98\\x80.equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          152,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 29,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 29,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 29,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 29,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 29,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 3: 5",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 30,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 3: 5.equal",
+      "Left": {
+        "Bytes": [
+          53
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              53
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 30,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 30,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 30,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 30,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 30,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 4: a",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 31,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 4: a.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              97
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 31,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 31,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 31,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 31,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 31,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 5: \\xf0\\x9f\\x9a\\x80",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 32,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 5: \\xf0\\x9f\\x9a\\x80.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              154,
+              128
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 32,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 32,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 32,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 32,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 32,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 6: \\xe4\\xb8",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 33,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 6: \\xe4\\xb8.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              184
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 33,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 33,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 33,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 33,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 33,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 7: \\xf0\\x9f\\x98",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 34,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "char classes.mixed unicode ranges.case 7: \\xf0\\x9f\\x98.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 34,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 34,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 34,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 34,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 34,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "until parser.ASCII delimiter with Unicode content.case 0: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd</tag>",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 35,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.ASCII delimiter with Unicode content.case 0: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd</tag>.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160,
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160,
+              229,
+              165,
+              189,
+              60,
+              47,
+              116,
+              97,
+              103,
+              62
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 35,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 35,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 35,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 35,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "until parser.ASCII delimiter with Unicode content.case 1: \\xf0\\x9f\\x98\\x80</tag>",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 36,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.ASCII delimiter with Unicode content.case 1: \\xf0\\x9f\\x98\\x80</tag>.equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          152,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152,
+              128,
+              60,
+              47,
+              116,
+              97,
+              103,
+              62
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 36,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 36,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 36,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 36,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "until parser.ASCII delimiter with Unicode content.case 2: Hello \\xe4\\xb8\\x96\\xe7\\x95\\x8c!</tag>",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 37,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.ASCII delimiter with Unicode content.case 2: Hello \\xe4\\xb8\\x96\\xe7\\x95\\x8c!</tag>.equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111,
+          32,
+          228,
+          184,
+          150,
+          231,
+          149,
+          140,
+          33
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111,
+              32,
+              228,
+              184,
+              150,
+              231,
+              149,
+              140,
+              33,
+              60,
+              47,
+              116,
+              97,
+              103,
+              62
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 37,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 37,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 37,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 37,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "until parser.incomplete UTF-8 at end.case 0: content\\xf0\\x9f\\x98",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 38,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.incomplete UTF-8 at end.case 0: content\\xf0\\x9f\\x98.equal",
+      "Left": {
+        "Bytes": [
+          99,
+          111,
+          110,
+          116,
+          101,
+          110,
+          116
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              99,
+              111,
+              110,
+              116,
+              101,
+              110,
+              116,
+              240,
+              159,
+              152
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 38,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 38,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 38,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 38,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 38,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "until parser.incomplete UTF-8 at end.case 1: hello\\xe4\\xb8",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 39,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.incomplete UTF-8 at end.case 1: hello\\xe4\\xb8.equal",
+      "Left": {
+        "Bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              104,
+              101,
+              108,
+              108,
+              111,
+              228,
+              184
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 39,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 39,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 39,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 39,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 39,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "until parser.incomplete UTF-8 at end.case 2: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 40,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.incomplete UTF-8 at end.case 2: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd.equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160,
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160,
+              229,
+              165,
+              189
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 40,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 40,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 40,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "or",
+        "Args": [
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 40,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              1
+            ]
+          },
+          {
+            "Op": "equal",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 40,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Type"
+              },
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Name": "until parser.malformed UTF-8.case 0: Hello\\xff\\xfe",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 41,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.malformed UTF-8.case 1: Hello\\x80World",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 42,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "until parser.malformed UTF-8.case 2: \\xc3(",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 43,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 0: Hello World\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 44,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 0: Hello World\".equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111,
+          32,
+          87,
+          111,
+          114,
+          108,
+          100
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111,
+              32,
+              87,
+              111,
+              114,
+              108,
+              100,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 44,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 44,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 44,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 44,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 1: Caf\\xc3\\xa9\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 45,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 1: Caf\\xc3\\xa9\".equal",
+      "Left": {
+        "Bytes": [
+          67,
+          97,
+          102,
+          195,
+          169
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              67,
+              97,
+              102,
+              195,
+              169,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 45,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 45,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 45,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 45,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 2: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 46,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 2: \\xe4\\xbd\\xa0\\xe5\\xa5\\xbd\".equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160,
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160,
+              229,
+              165,
+              189,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 46,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 46,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 46,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 46,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 3: \\xf0\\x9f\\x98\\x80\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 47,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 3: \\xf0\\x9f\\x98\\x80\".equal",
+      "Left": {
+        "Bytes": [
+          240,
+          159,
+          152,
+          128
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              240,
+              159,
+              152,
+              128,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 47,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 47,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 47,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 47,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 4: Hello \\xe4\\xb8\\x96\\xe7\\x95\\x8c!\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 48,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.valid UTF-8 characters.case 4: Hello \\xe4\\xb8\\x96\\xe7\\x95\\x8c!\".equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111,
+          32,
+          228,
+          184,
+          150,
+          231,
+          149,
+          140,
+          33
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111,
+              32,
+              228,
+              184,
+              150,
+              231,
+              149,
+              140,
+              33,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 48,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 48,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 48,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 48,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 0: Caf\\xc3",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 49,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 0: Caf\\xc3.equal",
+      "Left": {
+        "Bytes": [
+          67,
+          97,
+          102
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              67,
+              97,
+              102,
+              195
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 49,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 49,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 49,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 49,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 1: Hello\\xe4\\xb8",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 50,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 1: Hello\\xe4\\xb8.equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111,
+              228,
+              184
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 50,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 50,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 50,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 50,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 2: Text\\xf0\\x9f\\x98",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 51,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 2: Text\\xf0\\x9f\\x98.equal",
+      "Left": {
+        "Bytes": [
+          84,
+          101,
+          120,
+          116
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              84,
+              101,
+              120,
+              116,
+              240,
+              159,
+              152
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 51,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 51,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 51,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 51,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 3: \\xe4\\xbd",
+      "Left": 2,
+      "Right": {
+        "Op": "result",
+        "Operation": 52,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.incomplete UTF-8.case 3: \\xe4\\xbd.equal",
+      "Left": {
+        "Bytes": []
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 52,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "result",
+                "Operation": 52,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "End"
+              },
+              {
+                "Op": "result",
+                "Operation": 52,
+                "Collection": "Results",
+                "Index": 0,
+                "Field": "Start"
+              }
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 52,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          2
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.malformed UTF-8.case 0: Hello\\xff\\xfe",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 53,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.malformed UTF-8.case 1: Hello\\x80World",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 54,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.malformed UTF-8.case 2: \\xc3(",
+      "Left": 0,
+      "Right": {
+        "Op": "result",
+        "Operation": 55,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.escape sequences with UTF-8.case 0: Hello\\u0041\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 56,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.escape sequences with UTF-8.case 0: Hello\\u0041\".equal",
+      "Left": {
+        "Bytes": [
+          72,
+          101,
+          108,
+          108,
+          111,
+          92,
+          117,
+          48,
+          48,
+          52,
+          49
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              72,
+              101,
+              108,
+              108,
+              111,
+              92,
+              117,
+              48,
+              48,
+              52,
+              49,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 56,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 56,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 56,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 56,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.escape sequences with UTF-8.case 1: \\xe4\\xbd\\xa0\\n\\xe5\\xa5\\xbd\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 57,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.escape sequences with UTF-8.case 1: \\xe4\\xbd\\xa0\\n\\xe5\\xa5\\xbd\".equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160,
+          92,
+          110,
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160,
+              92,
+              110,
+              229,
+              165,
+              189,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 57,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 57,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 57,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 57,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    },
+    {
+      "Name": "json_string parser.escape sequences with UTF-8.case 2: \\xe4\\xbd\\xa0\\\"\\xe5\\xa5\\xbd\"",
+      "Left": 1,
+      "Right": {
+        "Op": "result",
+        "Operation": 58,
+        "Collection": "Results",
+        "Index": 0,
+        "Field": "Type"
+      },
+      "When": true
+    },
+    {
+      "Name": "json_string parser.escape sequences with UTF-8.case 2: \\xe4\\xbd\\xa0\\\"\\xe5\\xa5\\xbd\".equal",
+      "Left": {
+        "Bytes": [
+          228,
+          189,
+          160,
+          92,
+          34,
+          229,
+          165,
+          189
+        ]
+      },
+      "Right": {
+        "Op": "slice",
+        "Args": [
+          {
+            "Bytes": [
+              228,
+              189,
+              160,
+              92,
+              34,
+              229,
+              165,
+              189,
+              34
+            ]
+          },
+          {
+            "Op": "result",
+            "Operation": 58,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Start"
+          },
+          {
+            "Op": "subtract",
+            "Args": [
+              {
+                "Op": "subtract",
+                "Args": [
+                  {
+                    "Op": "result",
+                    "Operation": 58,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "End"
+                  },
+                  {
+                    "Op": "result",
+                    "Operation": 58,
+                    "Collection": "Results",
+                    "Index": 0,
+                    "Field": "Start"
+                  }
+                ]
+              },
+              1
+            ]
+          }
+        ]
+      },
+      "When": {
+        "Op": "equal",
+        "Args": [
+          {
+            "Op": "result",
+            "Operation": 58,
+            "Collection": "Results",
+            "Index": 0,
+            "Field": "Type"
+          },
+          1
+        ]
+      }
+    }
+  ],
+  "Benchmarks": []
+}

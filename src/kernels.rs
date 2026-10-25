@@ -369,6 +369,19 @@ fn quantized(value: f32) -> Result<i8> {
 }
 
 fn q8k_into(input: &[f32], output: &mut Vec<Q8KBlock>) -> Result<()> {
+    q8k_with_rounding::<false>(input, output)
+}
+
+fn pinned_q8k_integer(value: f32, inverse_scale: f32) -> Result<i8> {
+    // The pinned binary inlines nearest_int(iscale * value) and fuses the
+    // product with its rounding magic. Rounding the product first can change
+    // a code at a half-integer boundary and then every projection using it.
+    let rounded = finite(inverse_scale.mul_add(value, 12_582_912.0))?;
+    let integer = i32::try_from(rounded.to_bits() & 0x007f_ffff)? - 0x0040_0000;
+    Ok(i8::try_from(integer.min(127))?)
+}
+
+fn q8k_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8KBlock>) -> Result<()> {
     if !input.len().is_multiple_of(256) {
         return Err(invalid(
             "Q8_K activations require a multiple of 256 columns",
@@ -397,8 +410,13 @@ fn q8k_into(input: &[f32], output: &mut Vec<Q8KBlock>) -> Result<()> {
             }
             block.scale = 1.0 / inverse_scale;
             for (target, &value) in block.values.iter_mut().zip(chunk) {
-                // nearest_int in the pinned C reference is ties-to-even.
-                *target = quantized((value * inverse_scale).round_ties_even().min(127.0))?;
+                *target = if PINNED {
+                    pinned_q8k_integer(value, inverse_scale)?
+                } else {
+                    // Preserve the public scalar source contract, including
+                    // binary32 product rounding before ties-to-even rounding.
+                    quantized((value * inverse_scale).round_ties_even().min(127.0))?
+                };
             }
             for (sum, values) in block.sums.iter_mut().zip(block.values.as_chunks::<16>().0) {
                 *sum = values.iter().map(|&value| i16::from(value)).sum();
@@ -1311,6 +1329,9 @@ impl MatvecScratch {
         }
         let contract = ActivationContract::for_tensor(tensor, columns);
         match contract {
+            ActivationContract::Q8K if self.pinned_accumulation => {
+                q8k_with_rounding::<true>(input, &mut self.q8k)?;
+            }
             ActivationContract::Q8K => q8k_into(input, &mut self.q8k)?,
             ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
             _ => collect_into(
@@ -1756,9 +1777,85 @@ pub fn softmax(values: &mut [f32]) -> Result<()> {
 mod tests {
     use std::sync::Arc;
 
+    use sha2::{Digest, Sha256};
+
     use super::{
         MatvecScratch, Tensor, matvec_into, q8_into, q8k_into, rms_norm, rms_norm_pinned_into,
     };
+
+    fn serialized_q8k(block: &super::Q8KBlock) -> Vec<u8> {
+        block
+            .scale
+            .to_le_bytes()
+            .into_iter()
+            .chain(block.values.iter().flat_map(|value| value.to_le_bytes()))
+            .chain(block.sums.iter().flat_map(|value| value.to_le_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn pinned_q8k_preparation_matches_independent_native_half_boundary_capture() -> crate::Result<()>
+    {
+        let fixture = include_bytes!("../tests/fixtures/swift-q8k-parity.bin");
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/swift-q8k-parity.json"))?;
+        let hash: String = Sha256::digest(fixture)
+            .into_iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
+        assert_eq!(fixture.len(), 584);
+        assert_eq!(
+            provenance["runtime_commit"].as_str(),
+            Some("73bfe6cc485554822f80c473a3c0c4f25e80f41b")
+        );
+        assert_eq!(
+            provenance["ggml_cpu_sha256"].as_str(),
+            Some("701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab")
+        );
+        let tensor = Tensor {
+            name: "q8k-boundary".to_owned(),
+            dimensions: vec![256, 1],
+            kind: super::PQ2,
+            data: Arc::from([0_u8; 68]),
+        };
+        for backend in [
+            super::MatvecBackend::Scalar,
+            super::MatvecBackend::Auto,
+            super::MatvecBackend::ExperimentalNeon,
+        ] {
+            let mut pinned = MatvecScratch::with_pinned_backend(backend);
+            let mut source = MatvecScratch::with_backend(backend);
+            for (case, (word, native_code, source_code)) in
+                [(0xbe01_0f7e, 71, 72), (0x3e01_0f7e, -71, -72)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let mut input = [0.0; 256];
+                input[0] = f32::from_bits(0x3e65_3d88);
+                input[1] = f32::from_bits(word);
+                {
+                    let prepared = pinned.prepare(&tensor, &input)?;
+                    let block = &prepared.scratch.q8k[0];
+                    assert_eq!(block.values[1], native_code);
+                    assert_eq!(serialized_q8k(block), fixture[case * 292..(case + 1) * 292]);
+                }
+                {
+                    let prepared = source.prepare(&tensor, &input)?;
+                    assert_eq!(prepared.scratch.q8k[0].values[1], source_code);
+                }
+                let mut scalar_blocks = Vec::new();
+                q8k_into(&input, &mut scalar_blocks)?;
+                assert_eq!(scalar_blocks[0].values[1], source_code);
+                // Failed preparation cannot expose a prepared projection or
+                // prevent the next valid request from refreshing its storage.
+                input[17] = f32::NAN;
+                assert!(pinned.prepare(&tensor, &input).is_err());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn pinned_pq2_accumulation_matches_independent_native_binary_capture() -> crate::Result<()> {

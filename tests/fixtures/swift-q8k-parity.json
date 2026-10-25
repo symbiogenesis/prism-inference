@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "purpose": "Independent pinned Q8_K fused nearest-integer boundary controls",
+  "runtime_commit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "ggml_cpu_sha256": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+  "quantizer_source_url": "https://raw.githubusercontent.com/PrismML-Eng/llama.cpp/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-quants.c",
+  "quantizer_source_sha256": "46dd353f30e7f1c42c7d82d88d91fad64dbe5d6e680b234de25355d9fb482d13",
+  "fixture_bytes": 584,
+  "fixture_sha256": "86d985b8a60fde3241daeeb1712dac45a0cc8e4684ac962dcb488ef17bb1fba5",
+  "capture_sha256": "bfc3ca704fc2db9abf3cbc3f09ee21c36bc78d59b8292e772ce4ce9f9f709f9e",
+  "probe_sha256": "60e0fcf39d08ee6d33b5d2c3f1657947cb7afe17a625ac862bb83ea7f9774cc3",
+  "model_loaded": false,
+  "layout": "Two consecutive 292-byte little-endian Q8_K blocks: F32 scale, 256 i8 codes, 16 i16 block sums",
+  "input_layout": "Each input has 256 binary32 values: the two specified words at positions 0/1, then 254 zero words",
+  "cases": [
+    {
+      "input_bits": [
+        "3e653d88",
+        "be010f7e"
+      ],
+      "inverse_scale_bits": "c40dd32f",
+      "native_code_at_1": 71,
+      "source_code_at_1": 72,
+      "native_block_sha256": "a395b10e68c73f9eef11b473d44edcd75222ca075caba15555ec74f01dfb8c41"
+    },
+    {
+      "input_bits": [
+        "3e653d88",
+        "3e010f7e"
+      ],
+      "inverse_scale_bits": "c40dd32f",
+      "native_code_at_1": -71,
+      "source_code_at_1": -72,
+      "native_block_sha256": "cdce97a0920f1d8e68dc544828e617744ee503927da9dae5fdbd15a4c88043b9"
+    }
+  ],
+  "notes": [
+    "Expected complete blocks were captured from the hash-verified pinned DLL type-15 from_float entry point.",
+    "The binary32 multiplication alone rounds to 71.5, whereas its exact product is 71.49999789570757; fused magic addition preserves the native rounding outcome.",
+    "This isolated operator evidence does not establish full-model parity."
+  ]
+}

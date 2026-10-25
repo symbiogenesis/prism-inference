@@ -279,7 +279,7 @@ if (@($selected | Where-Object { $_ -in $modelSelections }).Count) {
 }
 if (@($selected | Where-Object { $_ -in @('GgufMetadata', 'QuantSelection', 'ExportGraph') }).Count) {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.MetadataAssets = Save-BonsaiPrismMetadataAsset -Repository $repo -Directory $assetDirectory
+    $receipt.MetadataAssets = Save-BonsaiPrismMetadataAsset -Directory $assetDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 $bridgeFamilies = @{
@@ -288,17 +288,17 @@ $bridgeFamilies = @{
 }
 if ($selected -contains 'LoraConversion') {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.LoraAssets = Save-BonsaiPrismLoraAsset -Repository $repo -Directory $assetDirectory
+    $receipt.LoraAssets = Save-BonsaiPrismLoraAsset -Directory $assetDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 if ($selected -contains 'TokenizersRepo') {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.TokenizerRepository = Save-BonsaiPrismTokenizerRepository -Repository $repo -Directory $assetDirectory
+    $receipt.TokenizerRepository = Save-BonsaiPrismTokenizerRepository -Directory $assetDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 if (@($selected | Where-Object { $_ -in @('TokenizerPython','TokenizerShell','TokenizerRandom') }).Count) {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.TokenizerReference = Save-BonsaiPrismTokenizerReference -Repository $repo -Directory $assetDirectory
+    $receipt.TokenizerReference = Save-BonsaiPrismTokenizerReference -Directory $assetDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 if ($selected -contains 'QuantizeStats') {

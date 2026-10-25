@@ -13,8 +13,7 @@ function Save-BonsaiPrismMetadataAsset {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Called only by explicitly requested Prism test execution, writing fresh external evidence.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Repository,
-          [Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory)
     $root = Resolve-ExternalPath $Directory
     [void][IO.Directory]::CreateDirectory($root)
     $runtimeSource = Resolve-PrismSource
@@ -133,8 +132,7 @@ function Save-BonsaiPrismTokenizerRepository {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Explicit Prism setup writes only hash-verified external input artifacts.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Repository,
-          [Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory)
     $runtimeSource = Resolve-PrismSource
     $lockPath = Join-Path $runtimeSource 'tests/upstream_prism/tokenizer-repository-assets.json'
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json -AsHashtable
@@ -166,8 +164,7 @@ function Save-BonsaiPrismTokenizerReference {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Explicit Prism setup writes only hash-verified external publisher inputs.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Repository,
-          [Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory)
     $runtimeSource = Resolve-PrismSource
     $lockPath = Join-Path $runtimeSource 'tests/upstream_prism/tokenizer-reference-assets.json'
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json -AsHashtable
@@ -197,8 +194,7 @@ function Save-BonsaiPrismLoraAsset {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Explicit Prism test setup writes only verified external input artifacts.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Repository,
-          [Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory)
     $runtimeSource = Resolve-PrismSource
     $lockPath = Join-Path $runtimeSource 'tests/upstream_prism/lora-assets.json'
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json -AsHashtable

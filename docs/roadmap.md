@@ -41,8 +41,15 @@ still require their own evidence. Runner's released runtime lock remains
 
 The private server also cancels model work when an in-flight request future is
 dropped. Focused recovery checks cover rollback, reset-required admission and a
-successful request after explicit reset. Complete device lifecycle evidence
-remains pending.
+successful request after explicit reset. The
+[bounded owned HTTP device receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/config/swift-owned-http-mvp.evidence.json)
+also covers supplied-history streaming, seeded reset/replay, context rejection
+and recovery, active abandonment with Job cleanup, and a successful request
+after a fresh owned restart. Exact diagnostic binaries use explicit 13.65 GiB
+startup patches in both owner and server; the 12 GiB Job cap and 4 GiB running
+reserve remain enforced. These results do not change the production 16 GiB
+policy or establish released-runtime packaging, full-context service behavior
+or daily security. Reviewed prebuilt consumption remains a delivery step.
 
 Synthetic checks cover bounded parsing, exact codec arithmetic, graph state,
 checkpoint isolation, rollback, tokenization and service contracts. The

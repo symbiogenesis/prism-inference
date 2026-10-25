@@ -90,6 +90,26 @@ impl Arithmetic {
         }
     }
 
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Preserve separate multiply/add rounding for generic graph convolution."
+    )]
+    fn convolution_row(self, history: &[f32], projected: f32, coefficients: &[f32]) -> Result<f32> {
+        match self {
+            Self::Source => {
+                let mut sum = 0.0;
+                for (&old, &coefficient) in history.iter().zip(coefficients) {
+                    sum += old * coefficient;
+                }
+                sum += projected * coefficients[history.len()];
+                Ok(sum)
+            }
+            Self::PinnedSwift => {
+                crate::kernels::pinned_convolution::row(history, projected, coefficients)
+            }
+        }
+    }
+
     fn attention_dot(self, query: &[f32], key: &[u16]) -> Result<f32> {
         match self {
             Self::Source => Ok(dot_f16(query, key)),
@@ -1501,15 +1521,11 @@ impl Evaluation<'_> {
             let start = channel * (g.convolution - 1);
             let coefficients =
                 &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
-            let mut sum = 0.0;
-            for (old, coefficient) in history[start..start + g.convolution - 1]
-                .iter()
-                .zip(coefficients)
-            {
-                sum += old * coefficient;
-            }
-            sum += projected * coefficients[g.convolution - 1];
-            *mixed_value = sum;
+            *mixed_value = self.arithmetic.convolution_row(
+                &history[start..start + g.convolution - 1],
+                projected,
+                coefficients,
+            )?;
             if g.convolution > 1 {
                 convolution[start..start + g.convolution - 1].rotate_left(1);
                 convolution[start + g.convolution - 2] = projected;

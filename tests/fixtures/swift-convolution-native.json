@@ -1,0 +1,632 @@
+{
+  "purpose": "Compiled native SSM convolution arithmetic with nonzero history",
+  "runtime_commit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "runtime_dll_sha256": {
+    "ggml-base.dll": "cef62eabf27b1e6f78e024f293e7f9c34adf13d51a499490304ec4ccc2b2c5d7",
+    "ggml-cpu.dll": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+    "ggml-rpc.dll": "842f1a814790d30b8fcc1d76de244ed937a68731391cac23dcedf773319ee3f2",
+    "ggml.dll": "3e0caeb96473fed052832f3c0cd013301de408ed29b706ab2072bfe403f9cb29",
+    "libomp140.aarch64.dll": "f87c3f333de0b09eda4e76096ad642a82f7ef8da350b22b7fc10b7b34ec51a23",
+    "llama-batched-bench-impl.dll": "d26cfff95c10e5ac10bd8b2531fad9c12a4a982dd84806005d90bcdb12589653",
+    "llama-bench-impl.dll": "9bca88a258d940c4868ace777fb7923f8e7507f2635a2b4eaca9cace3daf5dd0",
+    "llama-cli-impl.dll": "dae698a1cb7d78683f317dd85012100beb1e19d5351418dde358dc7a19a09947",
+    "llama-common.dll": "a6dd99451074b89b4bda4ed2feeb3d060f3bea86379c08162e18f962a4024c48",
+    "llama-completion-impl.dll": "7acf7a4482607bb93eb53b1d8b1f7ca4e8db9f83fbf100f6f916ae5ff855d320",
+    "llama-fit-params-impl.dll": "8ead412252eaa3394074cf62b33ece12c2cc5bef66d549b2a983935ec5bbf226",
+    "llama-perplexity-impl.dll": "a32385daad357b3000bbb54631f8b2ed1a140eb9c59d3aefa46dd46d3cc24372",
+    "llama-quantize-impl.dll": "d7b8bc14b2ccc018f046dac09cf93df2df5483ff0707adfe0a72585e9bf6d10e",
+    "llama-server-impl.dll": "73bf9ce81a1b0ad91000b0386747288f498221e568e946b377fba1d0a9e40c71",
+    "llama.dll": "923a518137e50be427ef6c7de9ebdeb3535d6e6f00d709a3e31d0b475d07a9d1",
+    "mtmd.dll": "3e392db0e5f9a615dbae815616102507ed04930041e858452c5394a9b1eee0fe"
+  },
+  "setup_probe_sha256": "5f9974c415ddeb3ecdd7fce4e76dfc6663cc9f0415934cfdab3e0f862e16927f",
+  "capture_probe_sha256": "ebcf4b9000a6346ed0b12120a60749289a275428c6d97c2cb50b3ad6dd5a0dcf",
+  "model_loaded": false,
+  "graph_arena_bytes": 16777216,
+  "threads": 1,
+  "layout": "signal[channel][oldest history ... newest history, projected]; weights[channel][tap]",
+  "cases": [
+    {
+      "width": 4,
+      "channels": 64,
+      "live_history": 0,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "two_fma_pairs": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 64,
+      "live_history": 0,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "two_fma_pairs": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 64,
+      "live_history": 2,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 23,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 5,
+            "native_bits": "3dd32299",
+            "formula_bits": "3dd32298",
+            "native": 0.10309333354234695,
+            "formula": 0.10309332609176636
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 26,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 4,
+            "native_bits": "3fadc623",
+            "formula_bits": "3fadc622",
+            "native": 1.3576091527938843,
+            "formula": 1.3576090335845947
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 26,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 1,
+            "native_bits": "bdb4b500",
+            "formula_bits": "bdb4b508",
+            "native": -0.08823585510253906,
+            "formula": -0.08823591470718384
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 64,
+      "live_history": 2,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.00026208209351352707,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b988a7d2",
+            "formula_bits": "35c03e2a",
+            "native": -0.0002606497728265822,
+            "formula": 1.4323206869448768e-06
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.0002606497728265822,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b988a7d2",
+            "formula_bits": "00000000",
+            "native": -0.0002606497728265822,
+            "formula": 0.0
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.0002606497728265822,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b988a7d2",
+            "formula_bits": "00000000",
+            "native": -0.0002606497728265822,
+            "formula": 0.0
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 64,
+      "live_history": 3,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 25,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "3f37d6c9",
+            "formula_bits": "3f37d6ca",
+            "native": 0.7181211113929749,
+            "formula": 0.7181211709976196
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 25,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "3f37d6c9",
+            "formula_bits": "3f37d6ca",
+            "native": 0.7181211113929749,
+            "formula": 0.7181211709976196
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 18,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "3f37d6c9",
+            "formula_bits": "3f37d6ca",
+            "native": 0.7181211113929749,
+            "formula": 0.7181211709976196
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 64,
+      "live_history": 3,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.000476837158203125,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "be99335c",
+            "formula_bits": "be993cb6",
+            "native": -0.2992199659347534,
+            "formula": -0.29929131269454956
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.000476837158203125,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "be99335c",
+            "formula_bits": "be993cb6",
+            "native": -0.2992199659347534,
+            "formula": -0.29929131269454956
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 11,
+          "maximum_absolute_error": 5.960464477539063e-08,
+          "first_difference": {
+            "index": 7,
+            "native_bits": "3d83969e",
+            "formula_bits": "3d83969d",
+            "native": 0.06425212323665619,
+            "formula": 0.06425211578607559
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 65,
+      "live_history": 0,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "two_fma_pairs": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 65,
+      "live_history": 0,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "two_fma_pairs": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 65,
+      "live_history": 2,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 27,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 1,
+            "native_bits": "bf048e6c",
+            "formula_bits": "bf048e6d",
+            "native": -0.5177981853485107,
+            "formula": -0.5177982449531555
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 34,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 1,
+            "native_bits": "bf048e6c",
+            "formula_bits": "bf048e6d",
+            "native": -0.5177981853485107,
+            "formula": -0.5177982449531555
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 30,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 1,
+            "native_bits": "bf048e6c",
+            "formula_bits": "bf048e6d",
+            "native": -0.5177981853485107,
+            "formula": -0.5177982449531555
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 65,
+      "live_history": 2,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 65,
+          "maximum_absolute_error": 0.00043996540306068255,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b51bf473",
+            "formula_bits": "36097ae3",
+            "native": -5.809772005704872e-07,
+            "formula": 2.0486120320128975e-06
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 65,
+          "maximum_absolute_error": 0.00043981109047308564,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b51bf473",
+            "formula_bits": "00000000",
+            "native": -5.809772005704872e-07,
+            "formula": 0.0
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 65,
+          "maximum_absolute_error": 0.00043981109047308564,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b51bf473",
+            "formula_bits": "00000000",
+            "native": -5.809772005704872e-07,
+            "formula": 0.0
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 65,
+      "live_history": 3,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 24,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "3fff4db8",
+            "formula_bits": "3fff4db7",
+            "native": 1.9945592880249023,
+            "formula": 1.9945591688156128
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 35,
+          "maximum_absolute_error": 2.384185791015625e-07,
+          "first_difference": {
+            "index": 3,
+            "native_bits": "bf0a28d3",
+            "formula_bits": "bf0a28d5",
+            "native": -0.5396854281425476,
+            "formula": -0.5396855473518372
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 27,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 2,
+            "native_bits": "3fc40b1f",
+            "formula_bits": "3fc40b1e",
+            "native": 1.531589388847351,
+            "formula": 1.5315892696380615
+          }
+        }
+      }
+    },
+    {
+      "width": 4,
+      "channels": 65,
+      "live_history": 3,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.0002438575029373169,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "beb1c303",
+            "formula_bits": "beb1c977",
+            "native": -0.3471909463405609,
+            "formula": -0.3472401797771454
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.0002438575029373169,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "beb1c303",
+            "formula_bits": "beb1c977",
+            "native": -0.3471909463405609,
+            "formula": -0.3472401797771454
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 19,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 5,
+            "native_bits": "3e2fe669",
+            "formula_bits": "3e2fe668",
+            "native": 0.1717773824930191,
+            "formula": 0.1717773675918579
+          }
+        }
+      }
+    },
+    {
+      "width": 2,
+      "channels": 64,
+      "live_history": 1,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 12,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 7,
+            "native_bits": "bdae79df",
+            "formula_bits": "bdae79e0",
+            "native": -0.08519338816404343,
+            "formula": -0.08519339561462402
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 12,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 7,
+            "native_bits": "bdae79df",
+            "formula_bits": "bdae79e0",
+            "native": -0.08519338816404343,
+            "formula": -0.08519339561462402
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 12,
+          "maximum_absolute_error": 1.1920928955078125e-07,
+          "first_difference": {
+            "index": 7,
+            "native_bits": "bdae79df",
+            "formula_bits": "bdae79e0",
+            "native": -0.08519338816404343,
+            "formula": -0.08519339561462402
+          }
+        }
+      }
+    },
+    {
+      "width": 2,
+      "channels": 64,
+      "live_history": 1,
+      "cancellation": true,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.00022008735686540604,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b83bc1a8",
+            "formula_bits": "00000000",
+            "native": -4.4764630729332566e-05,
+            "formula": 0.0
+          }
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.00022008735686540604,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b83bc1a8",
+            "formula_bits": "00000000",
+            "native": -4.4764630729332566e-05,
+            "formula": 0.0
+          }
+        },
+        "two_fma_pairs": {
+          "different_words": 64,
+          "maximum_absolute_error": 0.00022008735686540604,
+          "first_difference": {
+            "index": 0,
+            "native_bits": "b83bc1a8",
+            "formula_bits": "00000000",
+            "native": -4.4764630729332566e-05,
+            "formula": 0.0
+          }
+        }
+      }
+    },
+    {
+      "width": 1,
+      "channels": 64,
+      "live_history": 0,
+      "cancellation": false,
+      "comparisons": {
+        "separate_f32": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "sequential_fma": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "pairwise_products": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        },
+        "two_fma_pairs": {
+          "different_words": 0,
+          "maximum_absolute_error": 0.0,
+          "first_difference": null
+        }
+      }
+    }
+  ],
+  "fixture_bytes": 31444,
+  "fixture_sha256": "02adf53bc96410e4402e3f77a0e4201a0d3cbb4a4b7aa53784025cc65de2119d"
+}

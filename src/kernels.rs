@@ -25,6 +25,7 @@ mod kquants;
 mod legacy;
 pub(crate) mod pinned_activations;
 pub(crate) mod pinned_attention;
+pub(crate) mod pinned_convolution;
 pub(crate) mod pinned_gdn;
 mod signquants;
 mod tquants;

@@ -90,6 +90,55 @@ impl Arithmetic {
         }
     }
 
+    fn attention_dot(self, query: &[f32], key: &[u16]) -> Result<f32> {
+        match self {
+            Self::Source => Ok(dot_f16(query, key)),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_attention::dot(key.iter().copied().map(half_to_float), query)
+            }
+        }
+    }
+
+    fn attention_current_dot(self, query: &[f32], key: &[f32]) -> Result<f32> {
+        match self {
+            Self::Source => Ok(dot(query, key)),
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot(key.iter().copied(), query),
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "Preserve the generic graph's binary64 accumulation and final binary32 rounding."
+    )]
+    fn attention_values(
+        self,
+        values: &KvCache,
+        current: f32,
+        dimension: usize,
+        probabilities: &[f32],
+    ) -> Result<f32> {
+        match self {
+            Self::Source => {
+                let past_sum = values
+                    .tokens()
+                    .zip(probabilities.iter())
+                    .map(|(past, &probability)| {
+                        f64::from(probability * half_to_float(past[dimension]))
+                    })
+                    .sum::<f64>();
+                Ok((past_sum + f64::from(probabilities[probabilities.len() - 1] * current)) as f32)
+            }
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot(
+                values
+                    .tokens()
+                    .map(|past| half_to_float(past[dimension]))
+                    .chain(std::iter::once(current)),
+                probabilities,
+            ),
+        }
+    }
+
     #[allow(
         clippy::suboptimal_flops,
         reason = "Preserve the generic graph's separate multiply/add rounding."
@@ -1346,9 +1395,17 @@ impl Evaluation<'_> {
             prepare(&mut scratch.scores, self.position + 1)?;
             let scores = &mut scratch.scores;
             for past in keys.tokens() {
-                scores.push(dot_f16(q, &past[offset..offset + g.head]) * scale);
+                scores.push(
+                    self.arithmetic
+                        .attention_dot(q, &past[offset..offset + g.head])?
+                        * scale,
+                );
             }
-            scores.push(dot(q, &key[offset..offset + g.head]) * scale);
+            scores.push(
+                self.arithmetic
+                    .attention_current_dot(q, &key[offset..offset + g.head])?
+                    * scale,
+            );
             softmax(scores)?;
             // Nonflash V(F16) x softmax(F32) also converts its RHS to F16.
             for probability in scores.iter_mut() {
@@ -1356,15 +1413,12 @@ impl Evaluation<'_> {
             }
             let result = &mut scratch.attended[head * g.head..(head + 1) * g.head];
             for (dimension, out) in result.iter_mut().enumerate() {
-                let past_sum = values
-                    .tokens()
-                    .zip(scores.iter())
-                    .map(|(past, &probability)| {
-                        f64::from(probability * half_to_float(past[offset + dimension]))
-                    })
-                    .sum::<f64>();
-                *out = (past_sum + f64::from(scores[self.position] * value[offset + dimension]))
-                    as f32;
+                *out = self.arithmetic.attention_values(
+                    values,
+                    value[offset + dimension],
+                    offset + dimension,
+                    scores,
+                )?;
             }
         }
         for (out, &gate) in scratch.attended.iter_mut().zip(&scratch.gate) {

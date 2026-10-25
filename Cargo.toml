@@ -66,6 +66,12 @@ path = "tests/jinja_capabilities.rs"
 required-features = ["cli"]
 
 [[example]]
+name = "swift_model_check"
+# Include bounded evidence-write guards in ordinary correctness checks.
+test = true
+required-features = ["cli"]
+
+[[example]]
 name = "upstream_prism"
 # Conformance code lives with tests; the explicit example target preserves
 # its command-line runner and embedded unit tests.

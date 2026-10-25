@@ -25,7 +25,7 @@ if (Test-Path -LiteralPath $output) { throw 'Use a new release bundle output dir
 [void][IO.Directory]::CreateDirectory($output)
 $files = Join-Path $output 'files'
 [void][IO.Directory]::CreateDirectory($files)
-$git = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+$git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $identity = Invoke-BonsaiNativeProcess -Executable $git -ArgumentList @('-C',$repo,'rev-parse','HEAD') -WorkingDirectory $output -TimeoutSeconds 30
 if ($identity.ExitCode -or $identity.StandardOutput.Trim() -cne $SourceRevision) { throw 'The checked source revision differs from the release receipt.' }
 $manifest = [IO.File]::ReadAllText((Join-Path $repo 'Cargo.toml'))

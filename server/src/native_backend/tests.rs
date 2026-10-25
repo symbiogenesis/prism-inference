@@ -346,6 +346,95 @@ fn private_disconnect_rolls_back_and_requires_reset_before_subsequent_success() 
         )
         .await?;
         assert_eq!(result, Ok(()));
+        let completed_cancellation = Cancellation::default();
+        let (mut client, server) = duplex(128);
+        let mut response = Vec::new();
+        let (result, read) = together(
+            exchange(
+                server,
+                &mut worker,
+                Input::Generate(canonical(&body).map_err(|e| format!("{e:?}"))?),
+                &completed_cancellation,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            client.read_to_end(&mut response),
+        )
+        .await;
+        read?;
+        assert_eq!(result, Ok(()));
+        assert!(!completed_cancellation.is_cancelled());
+        assert_eq!(observed.state.load(Ordering::Relaxed), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn private_dropped_exchange_cancels_and_recovers_only_after_reset() -> TestResult {
+    run(async {
+        let observed = Observation::default();
+        let mut worker =
+            Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
+        let body = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
+        let cancellation = Cancellation::default();
+        let (mut client, server) = duplex(1);
+        {
+            let serving = exchange(
+                server,
+                &mut worker,
+                Input::Generate(canonical(&body).map_err(|e| format!("{e:?}"))?),
+                &cancellation,
+                Instant::now() + Duration::from_secs(10),
+            );
+            let receive = async {
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 17];
+                while !bytes.windows(5).any(|part| part == b"draft") {
+                    let count = client.read(&mut buffer).await?;
+                    if count == 0 {
+                        return Err(std::io::Error::other("missing provisional output"));
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            let mut serving = pin!(serving);
+            let mut receive = pin!(receive);
+            poll_fn(|cx| {
+                if serving.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "exchange completed before abandonment",
+                    )));
+                }
+                receive.as_mut().poll(cx)
+            })
+            .await?;
+            assert!(!cancellation.is_cancelled());
+            // Drop the pending future without returning an error through its
+            // ordinary path, while retaining its model owner and token.
+        }
+        assert!(cancellation.is_cancelled());
+        worker.settled().await;
+        assert_eq!(observed.state.load(Ordering::Relaxed), 0);
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Err(NativeBackendError::Engine));
+        let (result, _) = perform(&mut worker, request("/reset", &[], true)).await?;
+        assert_eq!(result, Ok(()));
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
         let (result, _) =
             perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
         assert_eq!(result, Ok(()));

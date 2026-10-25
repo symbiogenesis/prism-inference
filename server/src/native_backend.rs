@@ -123,6 +123,19 @@ struct Received {
     pending: Option<PendingChat>,
 }
 
+struct CancelOnDrop<'a> {
+    cancellation: &'a Cancellation,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
 async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     mut client: C,
     policy: &RequestPolicy,
@@ -186,6 +199,12 @@ async fn exchange<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     deadline: Instant,
 ) -> Result<(), NativeBackendError> {
     let events = worker.start(input, cancellation.clone(), deadline.into_std())?;
+    // Dropping a connection future must stop its model work even when the
+    // worker remains owned by the server and no error result is observed.
+    let mut cancel_on_drop = CancelOnDrop {
+        cancellation,
+        armed: true,
+    };
     let (mut input, output) = split(client);
     let mut byte = [0; 1];
     let mut abandoned = pin!(input.read(&mut byte));
@@ -202,8 +221,10 @@ async fn exchange<C: AsyncRead + AsyncWrite + Unpin + 'static>(
         pipeline.as_mut().poll(cx)
     })
     .await;
-    if result.is_err() {
-        cancellation.cancel();
+    // Success includes the worker's terminal write acknowledgement and final
+    // execution check; provisional output alone must not disarm cancellation.
+    if result.is_ok() {
+        cancel_on_drop.armed = false;
     }
     result
 }

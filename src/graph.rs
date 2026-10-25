@@ -113,6 +113,23 @@ impl Arithmetic {
         }
     }
 
+    fn attention_rope(
+        self,
+        input: &mut [f32],
+        geometry: &Geometry,
+        frequencies: &[(f32, f32)],
+    ) -> Result<()> {
+        match self {
+            Self::Source => rope(input, geometry, frequencies),
+            Self::PinnedSwift => crate::kernels::pinned_attention::rope(
+                input,
+                geometry.head,
+                geometry.rope,
+                frequencies,
+            ),
+        }
+    }
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::as_conversions,
@@ -1379,8 +1396,10 @@ impl Evaluation<'_> {
             rope_frequencies(g, self.position, &mut scratch.frequencies)?;
             self.frequencies_ready = true;
         }
-        rope(&mut scratch.query, g, &scratch.frequencies)?;
-        rope(key, g, &scratch.frequencies)?;
+        self.arithmetic
+            .attention_rope(&mut scratch.query, g, &scratch.frequencies)?;
+        self.arithmetic
+            .attention_rope(key, g, &scratch.frequencies)?;
         // F16 K x Q converts the F32 query to F16 even with F32 precision.
         for element in scratch
             .query
@@ -2557,6 +2576,64 @@ mod tests {
         assert_eq!(input[10].to_bits(), 2.0_f32.to_bits());
         assert!((input[0] - 3.0_f32.cos()).abs() < 0.000_001);
         assert!((input[6] - 3.0_f32.sin()).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_attention_rope_matches_native_fused_order_and_keeps_source_path() -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Capture {
+            runtime_commit: String,
+            ggml_cpu_sha256: String,
+            head: usize,
+            rotary_dimensions: usize,
+            sections: [usize; 4],
+            freq_base_bits: u32,
+            input_bits: Vec<u32>,
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            position: usize,
+            native_bits: Vec<u32>,
+        }
+        let capture: Capture =
+            serde_json::from_str(include_str!("../tests/fixtures/swift-attention-rope.json"))?;
+        assert_eq!(
+            capture.runtime_commit,
+            "73bfe6cc485554822f80c473a3c0c4f25e80f41b"
+        );
+        assert_eq!(
+            capture.ggml_cpu_sha256,
+            "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab"
+        );
+        let mut geometry = projection_geometry(capture.head);
+        geometry.rope = capture.rotary_dimensions;
+        geometry.rope_sections = capture.sections;
+        geometry.rope_base = f32::from_bits(capture.freq_base_bits);
+        let input = capture
+            .input_bits
+            .into_iter()
+            .map(f32::from_bits)
+            .collect::<Vec<_>>();
+        for case in capture.cases {
+            let mut frequencies = Vec::new();
+            rope_frequencies(&geometry, case.position, &mut frequencies)?;
+            let mut pinned = input.clone();
+            Arithmetic::PinnedSwift.attention_rope(&mut pinned, &geometry, &frequencies)?;
+            assert_eq!(
+                pinned.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                case.native_bits,
+                "position {}",
+                case.position
+            );
+            let mut source = input.clone();
+            Arithmetic::Source.attention_rope(&mut source, &geometry, &frequencies)?;
+            assert_ne!(
+                source.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                case.native_bits
+            );
+        }
         Ok(())
     }
 

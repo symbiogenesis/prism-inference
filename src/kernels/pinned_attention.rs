@@ -90,6 +90,41 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Rotates the exact Swift heads with the pinned compiled FMA operand order.
+///
+/// # Errors
+/// Rejects geometry or frequency drift before mutation and nonfinite results.
+pub(crate) fn rope(
+    input: &mut [f32],
+    head: usize,
+    rotary: usize,
+    frequencies: &[(f32, f32)],
+) -> Result<()> {
+    if head != 256
+        || rotary != 64
+        || input.is_empty()
+        || !input.len().is_multiple_of(head)
+        || frequencies.len() != rotary / 2
+        || frequencies
+            .iter()
+            .any(|&(cosine, sine)| !cosine.is_finite() || !sine.is_finite())
+    {
+        return Err(invalid("invalid pinned Swift RoPE geometry or frequencies"));
+    }
+    for head in input.chunks_exact_mut(head) {
+        for (index, &(cosine, sine)) in frequencies.iter().enumerate() {
+            let first = head[index];
+            let second = head[index + rotary / 2];
+            head[index] = (-second).mul_add(sine, first * cosine);
+            head[index + rotary / 2] = second.mul_add(cosine, first * sine);
+        }
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(invalid("nonfinite pinned Swift RoPE output"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use bonsai_ternary::half_to_float;

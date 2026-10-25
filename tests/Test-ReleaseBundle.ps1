@@ -9,6 +9,7 @@ param([ValidateSet('Identity','Target','Archive','All')][string]$Case = 'All')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+if ($Case -eq 'All' -and $env:GITHUB_ACTIONS -ne 'true') { throw 'The complete suite runs only in CI. Select one focused case locally.' }
 Import-Module (Join-Path $PSScriptRoot '../scripts/Bonsai.Native.psm1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $scratch = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('Prism-ReleaseBundle-' + [guid]::NewGuid().ToString('N'))))

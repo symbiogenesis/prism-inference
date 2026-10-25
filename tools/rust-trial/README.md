@@ -77,7 +77,7 @@ This trial includes no benchmarks. Exact prototype regression names are:
 - `tests::repeated_outputs_reuse_storage`
 
 The manual main-only [workflow](../../.github/workflows/rust-nightly.yml) checks
-the pinned nightly across Runtime/Broker groups in two parallel lanes. Runtime holds
+the pinned nightly across Runtime groups in two parallel lanes. Runtime holds
 ternary, GGUF, Prism, the CPU reference and this trial; Broker holds Windows
 boundaries, broker and maintenance tools. Compiler/group targets remain separate.
 Independent probes and every lane must pass the final `compatibility` check,

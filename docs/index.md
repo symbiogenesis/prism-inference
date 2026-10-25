@@ -15,6 +15,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Integrate a worker or the private HTTP server | [Swift worker and private server](cli-and-workers.md#swift-worker-and-private-http-server) |
 | Understand budgets and failure recovery | [Runtime contracts](runtime-contracts.md) |
 | Compile, check or package the workspace | [Building and validation](build-and-validation.md) |
+| Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |
 | Check support and remaining qualification | [Roadmap](roadmap.md) |
 
 ## Technical reference

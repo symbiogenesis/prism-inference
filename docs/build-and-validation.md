@@ -78,10 +78,20 @@ adapter execution, broader process/OS ownership qualification, SIMD/Adreno suppo
 correctness/TPS/quality/security acceptance. Full suites and every benchmark
 remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
 
-The [upstream Prism baseline](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/prism-upstream-tests.md) separately
-imports pinned original C++ tests and applies shared assertions to this runtime.
-Its complete source inventory retains unported tests as unsupported, counts them
-against the green fraction and prevents already-green adapters from regressing.
+This repository also owns the [complete upstream conformance guide](prism-upstream-tests.md).
+Its [runtime workflow](../.github/workflows/runtime-conformance.yml) preserves
+four ordinary source partitions,16 planning partitions and32 execution partitions,
+plus native codec parity and a fail-closed aggregate. Measurements and gradients
+remain explicit manual opt-ins. The [focused workflow](../.github/workflows/prism-focused.yml)
+diagnoses one named source without replacing the complete gate.
+
+The [standards workflow](../.github/workflows/standards.yml) owns PowerShell and
+embedded-C# analysis for the migrated orchestration. The manual
+[compiler trial](../.github/workflows/rust-nightly.yml) retains Runtime
+Core/Supporting checks and isolated stable/nightly acceptance probes. Runner
+contains only app/provisioning/released-runtime integration gates; none of these
+runtime suites bootstrap through its maintenance executable or released source.
+All full suites and every benchmark remain hosted-only.
 
 ## Bounded actual-model correctness captures
 

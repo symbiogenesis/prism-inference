@@ -82,4 +82,4 @@ Success writes one JSON object; failure writes stderr and returns nonzero.
 PTQ1 export preserves raw scales, ternary symbols, other tensor payloads and
 metadata, and checks byte-identical PQ2 reconstruction. It does not qualify native
 PTQ1 activation quantization, logits, quality, speed or an inference profile.
-See [validation](../../docs/validation.md) for focused checks and CI coverage.
+See [building and validation](../../docs/build-and-validation.md) for focused checks and CI coverage.

@@ -206,5 +206,5 @@ unsupported in the 71-source denominator.
 Native acceptance targets Windows ARM64 for Snapdragon X Elite. The Apple-only
 wired-memory source remains inventoried as an explicit exclusion. The complete
 71-source migration inventory is tracked in the
-[baseline guide](../../../docs/prism-upstream-tests.md). These derivatives retain
+[baseline guide](https://github.com/symbiogenesis/SwiftBonsai2/blob/main/docs/prism-upstream-tests.md). These derivatives retain
 the upstream MIT attribution in [LICENSE](LICENSE).

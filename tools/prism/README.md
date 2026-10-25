@@ -26,8 +26,8 @@ unqualified.
 The external Prism/llama.cpp engine remains C/C++. The source applicator inserts
 ownership, Rust calls and exception translation into its loader. Generated C
 declarations preserve the interop contract; inference replacement is separate
-[native Rust engine work](../../docs/native-rust-engine.md). The experimental
-[CPU reference](../../src/prism-runtime/README.md) reuses the safe sharing policy
+[native Rust engine work](../../docs/roadmap.md). The experimental
+[CPU reference](../../docs/runtime-contracts.md) reuses the safe sharing policy
 but does not replace this overlay or the publisher profile.
 
 `src/loader.rs` is the audited FFI boundary. It reads the pinned tensor's initial

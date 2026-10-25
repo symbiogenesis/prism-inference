@@ -23,7 +23,7 @@ edges and activation ABI. The [native C++ fixture](tests/fixtures/README.md) add
 
 Independent base-3 expectations check all 5,994 lane words against exact symbol
 positions, so a matching encoder/decoder permutation cannot pass by round trip
-alone. The separate [released native probe](../codec-probe/README.md) compares
+alone. The separate [released native probe](https://github.com/symbiogenesis/SwiftBonsai2/blob/main/tools/codec-probe/README.md) compares
 production Rust packing against the pinned native PQ2/PTQ1 decoders without
 adding unsafe code to this crate.
 
@@ -51,4 +51,4 @@ try {
 ```
 
 Full suites and all benchmarks remain CI-only. Foundation runs formatting,
-strict Clippy, documentation and correctness checks; see [validation](../../docs/validation.md).
+strict Clippy, documentation and correctness checks; see [building and validation](../../docs/build-and-validation.md).

@@ -22,9 +22,8 @@ C/C++ inference library.
 
 The first generation path supports the dense Qwen35 architecture used by
 **Swift/Bonsai**. Broader Prism architectures and general model selection are
-in scope and planned. The project grew out of
-[SwiftBonsai](https://github.com/symbiogenesis/SwiftBonsai2) and is an independent
-implementation, separate from PrismML's upstream runtime.
+in scope and planned. Prism Inference is an independent implementation, separate
+from PrismML's upstream runtime.
 
 > [!IMPORTANT]
 > **Early development.** Full-model numerical parity and device qualification

@@ -1,0 +1,14 @@
+[package]
+name = "bonsai-rust-trial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+description = "Isolated safe borrowed-logits experiment for the Rust compiler trial"
+repository.workspace = true
+keywords = ["rust", "nightly", "borrowing"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true

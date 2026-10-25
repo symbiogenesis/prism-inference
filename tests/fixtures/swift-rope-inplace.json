@@ -1,0 +1,90 @@
+{
+  "purpose": "Compact deterministic native in-place RoPE outputs plus one sealed activation-pair FP16 boundary; no model-weight inputs.",
+  "runtime_commit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "runtime_dll_sha256": {
+    "ggml-base.dll": "cef62eabf27b1e6f78e024f293e7f9c34adf13d51a499490304ec4ccc2b2c5d7",
+    "ggml-cpu.dll": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+    "ggml-rpc.dll": "842f1a814790d30b8fcc1d76de244ed937a68731391cac23dcedf773319ee3f2",
+    "ggml.dll": "3e0caeb96473fed052832f3c0cd013301de408ed29b706ab2072bfe403f9cb29",
+    "libomp140.aarch64.dll": "f87c3f333de0b09eda4e76096ad642a82f7ef8da350b22b7fc10b7b34ec51a23",
+    "llama-batched-bench-impl.dll": "d26cfff95c10e5ac10bd8b2531fad9c12a4a982dd84806005d90bcdb12589653",
+    "llama-bench-impl.dll": "9bca88a258d940c4868ace777fb7923f8e7507f2635a2b4eaca9cace3daf5dd0",
+    "llama-cli-impl.dll": "dae698a1cb7d78683f317dd85012100beb1e19d5351418dde358dc7a19a09947",
+    "llama-common.dll": "a6dd99451074b89b4bda4ed2feeb3d060f3bea86379c08162e18f962a4024c48",
+    "llama-completion-impl.dll": "7acf7a4482607bb93eb53b1d8b1f7ca4e8db9f83fbf100f6f916ae5ff855d320",
+    "llama-fit-params-impl.dll": "8ead412252eaa3394074cf62b33ece12c2cc5bef66d549b2a983935ec5bbf226",
+    "llama-perplexity-impl.dll": "a32385daad357b3000bbb54631f8b2ed1a140eb9c59d3aefa46dd46d3cc24372",
+    "llama-quantize-impl.dll": "d7b8bc14b2ccc018f046dac09cf93df2df5483ff0707adfe0a72585e9bf6d10e",
+    "llama-server-impl.dll": "73bf9ce81a1b0ad91000b0386747288f498221e568e946b377fba1d0a9e40c71",
+    "llama.dll": "923a518137e50be427ef6c7de9ebdeb3535d6e6f00d709a3e31d0b475d07a9d1",
+    "mtmd.dll": "3e392db0e5f9a615dbae815616102507ed04930041e858452c5394a9b1eee0fe"
+  },
+  "probe_sha256": "3baa8c53fc2b3311f1b3aef29fa5cadfba11d35acdc5d2f933798035c5a28dc0",
+  "model_loaded": false,
+  "model_weight_inputs": false,
+  "graph_arena_bytes": 16777216,
+  "threads": 4,
+  "reused_input_sha256": "631decb7eef0d42d78a55f218516f8ae501b9506c2525570c129e989428388ad",
+  "rotary_dimensions": 64,
+  "head": 256,
+  "sections": [
+    11,
+    11,
+    10,
+    0
+  ],
+  "freq_base": 10000000.0,
+  "storage_alias_verified": true,
+  "native_operator": "ggml_rope_multi_inplace",
+  "arithmetic": "first.mul_add(cosine, -(second * sine)); second.mul_add(cosine, first * sine)",
+  "binary_layout": "SWROPIP1, u32 case count, cases of u32 position and 64 F32 output words, then 11 u32 boundary words (position, pair, two inputs, cosine, sine, two in-place outputs, two out-of-place outputs, packed native F16 outputs). All numbers little-endian.",
+  "cases": [
+    {
+      "position": 1,
+      "native_rotated_words": 64,
+      "native_unchanged_tail_verified": true
+    },
+    {
+      "position": 2,
+      "native_rotated_words": 64,
+      "native_unchanged_tail_verified": true
+    },
+    {
+      "position": 17,
+      "native_rotated_words": 64,
+      "native_unchanged_tail_verified": true
+    }
+  ],
+  "boundary_activation_source": {
+    "path": "C:\\Users\\symbi\\AppData\\Local\\Temp\\SwiftMvp-8da0ada7fcf648059cb3cc9282112d3d\\actual-model\\rust-attention42-trace\\block-3-Kcur_normed.f32le",
+    "sha256": "850c89a1846fdc30f383bc3b44d831398a8385173241a4d7b87435b4c96952b1",
+    "retained_words": [
+      787,
+      819
+    ],
+    "sealed_by_root": true,
+    "model_tensor_weights": false
+  },
+  "boundary": {
+    "position": 42,
+    "pair": 19,
+    "input_bits": [
+      3215985559,
+      3212025857
+    ],
+    "native_inplace_bits": [
+      3215962112,
+      3212093417
+    ],
+    "native_out_of_place_bits": [
+      3215962111,
+      3212093417
+    ],
+    "native_half_words": [
+      48510,
+      48037
+    ]
+  },
+  "fixture_bytes": 836,
+  "fixture_sha256": "efda5a7620adad6ac1735357bb20d6ea8663092164d9a3d221afa2822226fbc1"
+}

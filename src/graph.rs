@@ -141,7 +141,7 @@ impl Arithmetic {
     ) -> Result<()> {
         match self {
             Self::Source => rope(input, geometry, frequencies),
-            Self::PinnedSwift => crate::kernels::pinned_attention::rope(
+            Self::PinnedSwift => crate::kernels::pinned_attention::rope_in_place(
                 input,
                 geometry.head,
                 geometry.rope,
@@ -2670,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_attention_rope_matches_native_fused_order_and_keeps_source_path() -> Result<()> {
+    fn pinned_attention_out_of_place_rope_matches_native_and_keeps_source_path() -> Result<()> {
         let (capture, coefficients) = pinned_rope_captures()?;
         let geometry = captured_rope_geometry(&capture);
         let input = capture
@@ -2693,7 +2693,12 @@ mod tests {
                 .map(|(&cosine, &sine)| (f32::from_bits(cosine), f32::from_bits(sine)))
                 .collect::<Vec<_>>();
             let mut pinned = input.clone();
-            Arithmetic::PinnedSwift.attention_rope(&mut pinned, &geometry, &frequencies)?;
+            crate::kernels::pinned_attention::rope(
+                &mut pinned,
+                geometry.head,
+                geometry.rope,
+                &frequencies,
+            )?;
             assert_eq!(
                 pinned.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
                 case.native_bits,
@@ -2752,7 +2757,12 @@ mod tests {
                 case.position
             );
             let mut pinned = input.clone();
-            Arithmetic::PinnedSwift.attention_rope(&mut pinned, &geometry, &frequencies)?;
+            crate::kernels::pinned_attention::rope(
+                &mut pinned,
+                geometry.head,
+                geometry.rope,
+                &frequencies,
+            )?;
             assert_eq!(
                 pinned.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
                 case.native_bits,
@@ -2760,6 +2770,108 @@ mod tests {
                 case.position
             );
         }
+        Ok(())
+    }
+
+    fn pinned_rope_inplace_capture() -> Result<Cursor<&'static [u8]>> {
+        let bytes = include_bytes!("../tests/fixtures/swift-rope-inplace.bin");
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/swift-rope-inplace.json"))?;
+        let hash: String = Sha256::digest(bytes)
+            .into_iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
+        assert_eq!(
+            hash,
+            "efda5a7620adad6ac1735357bb20d6ea8663092164d9a3d221afa2822226fbc1"
+        );
+        assert_eq!(
+            provenance["runtime_commit"].as_str(),
+            Some("73bfe6cc485554822f80c473a3c0c4f25e80f41b")
+        );
+        assert_eq!(
+            provenance["runtime_dll_sha256"]["ggml-cpu.dll"].as_str(),
+            Some("701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab")
+        );
+        let mut input = Cursor::new(bytes.as_slice());
+        let mut magic = [0; 8];
+        input.read_exact(&mut magic)?;
+        assert_eq!(&magic, b"SWROPIP1");
+        assert_eq!(read_gdn_word(&mut input)?, 3);
+        Ok(input)
+    }
+
+    #[test]
+    fn pinned_attention_inplace_rope_matches_native_and_fp16_boundary() -> Result<()> {
+        let (capture, coefficients) = pinned_rope_captures()?;
+        let geometry = captured_rope_geometry(&capture);
+        let original = capture
+            .input_bits
+            .iter()
+            .copied()
+            .map(f32::from_bits)
+            .collect::<Vec<_>>();
+        let mut input = pinned_rope_inplace_capture()?;
+        for coefficient in &coefficients.cases {
+            assert_eq!(
+                usize::try_from(read_gdn_word(&mut input)?)?,
+                coefficient.position
+            );
+            let native = read_gdn_vector(&mut input, 64)?;
+            let frequencies = coefficient
+                .cosine_bits
+                .iter()
+                .zip(&coefficient.sine_bits)
+                .map(|(&cosine, &sine)| (f32::from_bits(cosine), f32::from_bits(sine)))
+                .collect::<Vec<_>>();
+            let mut actual = original.clone();
+            Arithmetic::PinnedSwift.attention_rope(&mut actual, &geometry, &frequencies)?;
+            let mut expected = original.clone();
+            expected[..64].copy_from_slice(&native);
+            assert_eq!(
+                actual.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                expected.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                "in-place position {}",
+                coefficient.position
+            );
+        }
+        assert_eq!(read_gdn_word(&mut input)?, 42);
+        let pair = usize::try_from(read_gdn_word(&mut input)?)?;
+        assert_eq!(pair, 19);
+        let first = f32::from_bits(read_gdn_word(&mut input)?);
+        let second = f32::from_bits(read_gdn_word(&mut input)?);
+        let cosine = f32::from_bits(read_gdn_word(&mut input)?);
+        let sine = f32::from_bits(read_gdn_word(&mut input)?);
+        let native = [read_gdn_word(&mut input)?, read_gdn_word(&mut input)?];
+        let separate = [read_gdn_word(&mut input)?, read_gdn_word(&mut input)?];
+        let native_half = read_gdn_word(&mut input)?;
+        let mut frequencies = vec![(1.0, 0.0); 32];
+        frequencies[pair] = (cosine, sine);
+        let mut actual = vec![0.0; 256];
+        actual[pair] = first;
+        actual[pair + 32] = second;
+        let mut out_of_place = actual.clone();
+        Arithmetic::PinnedSwift.attention_rope(&mut actual, &geometry, &frequencies)?;
+        crate::kernels::pinned_attention::rope(&mut out_of_place, 256, 64, &frequencies)?;
+        assert_eq!(
+            [actual[pair].to_bits(), actual[pair + 32].to_bits()],
+            native
+        );
+        assert_eq!(
+            [
+                out_of_place[pair].to_bits(),
+                out_of_place[pair + 32].to_bits()
+            ],
+            separate
+        );
+        assert_eq!(
+            u32::from(half_bits(actual[pair])) | (u32::from(half_bits(actual[pair + 32])) << 16),
+            native_half
+        );
+        assert_ne!(half_bits(actual[pair]), half_bits(out_of_place[pair]));
+        assert_eq!(input.position(), u64::try_from(input.get_ref().len())?);
         Ok(())
     }
 

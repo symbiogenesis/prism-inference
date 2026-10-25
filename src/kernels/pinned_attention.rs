@@ -90,15 +90,42 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
-/// Rotates the exact Swift heads with the pinned compiled FMA operand order.
+/// Retains the pinned out-of-place operator oracle for focused comparisons.
 ///
 /// # Errors
 /// Rejects geometry or frequency drift before mutation and nonfinite results.
+#[cfg(test)]
 pub(crate) fn rope(
     input: &mut [f32],
     head: usize,
     rotary: usize,
     frequencies: &[(f32, f32)],
+) -> Result<()> {
+    rope_with_aliasing(input, head, rotary, frequencies, false)
+}
+
+/// Rotates Swift heads with the compiled native allocator's in-place ordering.
+///
+/// Native buffer reuse changes the first FMA's operand order. The second
+/// component retains the same ordering as the out-of-place control.
+///
+/// # Errors
+/// Rejects geometry or frequency drift before mutation and nonfinite results.
+pub(crate) fn rope_in_place(
+    input: &mut [f32],
+    head: usize,
+    rotary: usize,
+    frequencies: &[(f32, f32)],
+) -> Result<()> {
+    rope_with_aliasing(input, head, rotary, frequencies, true)
+}
+
+fn rope_with_aliasing(
+    input: &mut [f32],
+    head: usize,
+    rotary: usize,
+    frequencies: &[(f32, f32)],
+    in_place: bool,
 ) -> Result<()> {
     if head != 256
         || rotary != 64
@@ -115,7 +142,11 @@ pub(crate) fn rope(
         for (index, &(cosine, sine)) in frequencies.iter().enumerate() {
             let first = head[index];
             let second = head[index + rotary / 2];
-            head[index] = (-second).mul_add(sine, first * cosine);
+            head[index] = if in_place {
+                first.mul_add(cosine, -(second * sine))
+            } else {
+                (-second).mul_add(sine, first * cosine)
+            };
             head[index + rotary / 2] = second.mul_add(cosine, first * sine);
         }
     }

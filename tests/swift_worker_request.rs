@@ -1,6 +1,6 @@
+//! Direct tests of the production Swift worker's private strict request schema.
 #![forbid(unsafe_code)]
 #![cfg(feature = "cli")]
-//! Direct tests of the production Swift worker's private strict request schema.
 
 #[path = "../src/swift_worker_request.rs"]
 mod request;

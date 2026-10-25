@@ -1,6 +1,6 @@
+//! Focused actual worker writes, bounded UTF-8 chunks and single-terminal delivery.
 #![forbid(unsafe_code)]
 #![cfg(feature = "cli")]
-//! Focused actual worker writes, bounded UTF-8 chunks and single-terminal delivery.
 
 #[path = "../src/swift_worker_output.rs"]
 mod delivery;

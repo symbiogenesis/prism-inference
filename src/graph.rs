@@ -10,8 +10,9 @@ use std::sync::Arc;
 use bonsai_gguf::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
 use bonsai_ternary::half_to_float;
 
+use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place, swiglu_into};
 use crate::kernels::{
-    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, half_bits,
+    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, half_bits, rms_norm_into,
     rms_norm_pinned_into, round_f16, row, row_into, silu, softmax,
 };
 use crate::model::{Model, Tensor};
@@ -23,6 +24,65 @@ use crate::{Decoder, Result, invalid};
 /// and allocator overhead.
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_WIDTH: usize = 1 << 20;
+
+#[derive(Clone, Copy)]
+enum Arithmetic {
+    Source,
+    PinnedSwift,
+}
+
+impl Arithmetic {
+    fn normalize(
+        self,
+        input: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        match self {
+            Self::Source => rms_norm_into(input, weight, epsilon, output),
+            Self::PinnedSwift => rms_norm_pinned_into(input, weight, epsilon, output),
+        }
+    }
+
+    fn silu(self, values: &mut [f32]) {
+        match self {
+            Self::Source => values.iter_mut().for_each(|value| *value = silu(*value)),
+            Self::PinnedSwift => silu_in_place(values),
+        }
+    }
+
+    fn swiglu_in_place(self, gate: &[f32], up: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Source => {
+                for (up, &gate) in up.iter_mut().zip(gate) {
+                    *up *= silu(gate);
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => swiglu_in_place(gate, up),
+        }
+    }
+
+    fn swiglu_into(self, gate: &[f32], up: &[f32], output: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Source => {
+                for ((output, &up), &gate) in output.iter_mut().zip(up).zip(gate) {
+                    *output = up * silu(gate);
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => swiglu_into(gate, up, output),
+        }
+    }
+
+    fn scratch(self, backend: MatvecBackend) -> MatvecScratch {
+        match self {
+            Self::Source => MatvecScratch::with_backend(backend),
+            Self::PinnedSwift => MatvecScratch::with_pinned_backend(backend),
+        }
+    }
+}
 const MAX_LAYERS: usize = 256;
 const KV_PAGE_TOKENS: usize = 64;
 
@@ -272,6 +332,7 @@ struct Workspace {
 
 struct Evaluation<'a> {
     geometry: &'a Geometry,
+    arithmetic: Arithmetic,
     transforms: &'a Transforms,
     position: usize,
     frequencies_ready: bool,
@@ -575,10 +636,14 @@ pub enum StateComponent {
 }
 
 /// Native decoder for the supported Qwen3.5 dense text graph.
+///
+/// The exact pinned Swift artifact uses its compiled Windows ARM64 arithmetic
+/// contract. Other model identities retain the scalar source-order reference.
 pub struct Qwen35 {
     provenance: Arc<()>,
     identity: String,
     geometry: Geometry,
+    arithmetic: Arithmetic,
     embedding: Tensor,
     output: Tensor,
     output_norm: Vec<f32>,
@@ -968,10 +1033,23 @@ impl Qwen35 {
                 },
             });
         }
+        // Verified loaders set identity to the complete file SHA256. Select the
+        // compiled native contract only for the exact MVP artifact, preserving
+        // the generic source-order graph and its independent numerical controls.
+        let arithmetic = if model.identity == crate::model::swift::MODEL_SHA256 {
+            Arithmetic::PinnedSwift
+        } else {
+            Arithmetic::Source
+        };
+        let mut identity = model.identity + ":qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32";
+        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            identity.push_str(":prism-arm64-fused-v1");
+        }
         Ok(Self {
             provenance: Arc::new(()),
-            identity: model.identity + ":qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32",
+            identity,
             geometry,
+            arithmetic,
             embedding,
             output,
             output_norm,
@@ -981,7 +1059,7 @@ impl Qwen35 {
             workspace: Workspace {
                 deltas,
                 projection: ProjectionScratch {
-                    matvec: MatvecScratch::with_pinned_backend(backend),
+                    matvec: arithmetic.scratch(backend),
                     ..ProjectionScratch::default()
                 },
                 ..Workspace::default()
@@ -1044,6 +1122,7 @@ impl Qwen35 {
         } = &mut self.workspace;
         let mut evaluation = Evaluation {
             geometry: &self.geometry,
+            arithmetic: self.arithmetic,
             transforms: &self.transforms,
             position: self.position,
             frequencies_ready: false,
@@ -1055,7 +1134,8 @@ impl Qwen35 {
             self.transforms.sign(hidden);
         }
         for ((layer, state), delta) in self.layers.iter().zip(&self.state).zip(deltas.iter_mut()) {
-            rms_norm_pinned_into(hidden, &layer.norm, self.geometry.epsilon, normalized)?;
+            self.arithmetic
+                .normalize(hidden, &layer.norm, self.geometry.epsilon, normalized)?;
             match (&layer.attention, state) {
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
                     evaluation.full_attention(
@@ -1086,21 +1166,29 @@ impl Qwen35 {
                 _ => return Err(invalid("decoder layer/cache kind mismatch")),
             }
             add(hidden, attention);
-            rms_norm_pinned_into(hidden, &layer.post_norm, self.geometry.epsilon, normalized)?;
+            self.arithmetic.normalize(
+                hidden,
+                &layer.post_norm,
+                self.geometry.epsilon,
+                normalized,
+            )?;
             // Attention no longer reads its projections or gates. Keep the
             // exact FFN operations while reusing their high-water allocations.
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
             evaluation.project_group_into([&layer.up, &layer.gate], normalized, [up, gate])?;
-            for (up, &gate) in up.iter_mut().zip(gate.iter()) {
-                *up *= silu(gate);
-            }
+            self.arithmetic.swiglu_in_place(gate, up)?;
             evaluation.project_into(&layer.down, up, attention)?;
             add(hidden, attention);
             finite(hidden, "decoder layer output")?;
         }
         if let Some(logits) = logits {
-            rms_norm_pinned_into(hidden, &self.output_norm, self.geometry.epsilon, normalized)?;
+            self.arithmetic.normalize(
+                hidden,
+                &self.output_norm,
+                self.geometry.epsilon,
+                normalized,
+            )?;
             evaluation.project_into(&self.output, normalized, logits)?;
             finite(logits, "output logits")?;
         }
@@ -1190,7 +1278,7 @@ impl Evaluation<'_> {
         prepare(&mut scratch.query, g.head * g.heads)?;
         prepare(&mut scratch.gate, g.head * g.heads)?;
         for head in scratch.projected.chunks_exact(2 * g.head) {
-            rms_norm_pinned_into(
+            self.arithmetic.normalize(
                 &head[..g.head],
                 &layer.query_norm,
                 g.epsilon,
@@ -1201,7 +1289,8 @@ impl Evaluation<'_> {
         }
         prepare(key, scratch.key_projection.len())?;
         for head in scratch.key_projection.chunks_exact(g.head) {
-            rms_norm_pinned_into(head, &layer.key_norm, g.epsilon, &mut scratch.normalized)?;
+            self.arithmetic
+                .normalize(head, &layer.key_norm, g.epsilon, &mut scratch.normalized)?;
             key.extend_from_slice(&scratch.normalized);
         }
         // Geometry and position are shared by every full-attention layer in
@@ -1317,12 +1406,13 @@ impl Evaluation<'_> {
                 sum += old * coefficient;
             }
             sum += projected * coefficients[g.convolution - 1];
-            *mixed_value = silu(sum);
+            *mixed_value = sum;
             if g.convolution > 1 {
                 convolution[start..start + g.convolution - 1].rotate_left(1);
                 convolution[start + g.convolution - 2] = projected;
             }
         }
+        self.arithmetic.silu(mixed);
         let key_width = g.key_width();
         for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
             l2_norm(head, g.epsilon);
@@ -1363,14 +1453,15 @@ impl Evaluation<'_> {
                 }
                 *out = dot(state_row, q) * scale;
             }
-            rms_norm_pinned_into(output, &layer.norm, g.epsilon, &mut scratch.normalized)?;
-            for ((out, &normalized), &z) in output
-                .iter_mut()
-                .zip(&scratch.normalized)
-                .zip(&scratch.gate[head * g.ssm_head..(head + 1) * g.ssm_head])
-            {
-                *out = normalized * silu(z);
-            }
+            self.arithmetic
+                .normalize(output, &layer.norm, g.epsilon, &mut scratch.normalized)?;
+            // Pinned qwen35.cpp build_norm_gated explicitly uses
+            // ggml_swiglu_split(gate, normalized), not separate SiLU/MUL nodes.
+            self.arithmetic.swiglu_into(
+                &scratch.gate[head * g.ssm_head..(head + 1) * g.ssm_head],
+                &scratch.normalized,
+                output,
+            )?;
         }
         finite(matrix, "GDN state")?;
         finite(convolution, "convolution state")?;

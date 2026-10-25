@@ -23,6 +23,7 @@ mod iqfit;
 mod iquants;
 mod kquants;
 mod legacy;
+pub(crate) mod pinned_activations;
 mod signquants;
 mod tquants;
 

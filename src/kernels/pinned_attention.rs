@@ -150,9 +150,12 @@ mod tests {
 
     #[derive(Deserialize)]
     struct WeightedValue {
-        value_half_bits: Vec<u16>,
-        probability_half_bits: Vec<u16>,
-        native_bits: u32,
+        #[serde(rename = "value_half_bits")]
+        values: Vec<u16>,
+        #[serde(rename = "probability_half_bits")]
+        probabilities: Vec<u16>,
+        #[serde(rename = "native_bits")]
+        expected: u32,
     }
 
     #[derive(Deserialize)]
@@ -198,17 +201,13 @@ mod tests {
         }
         let value = capture.weighted_value;
         let probabilities = value
-            .probability_half_bits
+            .probabilities
             .into_iter()
             .map(half_to_float)
             .collect::<Vec<_>>();
         assert_eq!(
-            dot(
-                value.value_half_bits.into_iter().map(half_to_float),
-                &probabilities
-            )?
-            .to_bits(),
-            value.native_bits
+            dot(value.values.into_iter().map(half_to_float), &probabilities)?.to_bits(),
+            value.expected
         );
         assert!(dot([1.0].into_iter(), &[]).is_err());
         assert!(dot([].into_iter(), &[1.0]).is_err());

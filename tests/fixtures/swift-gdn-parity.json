@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "purpose": "Independent pinned CPU GDN F32 dot and scaled-update regression",
+  "runtime_commit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "ggml_cpu_sha256": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+  "fixture_bytes": 5168,
+  "fixture_sha256": "aae5f1b9530bf0a9dcf4755ef82249b8ebb80fd6feac673d1227c32c2a321fb3",
+  "source_capture_sha256": "ffb9445a55693425dd2bf71f632d9720178eb3529d398a0c5e7fb23ff67cf944",
+  "source_probe_sha256": "5f9974c415ddeb3ecdd7fce4e76dfc6663cc9f0415934cfdab3e0f862e16927f",
+  "simd_header_url": "https://raw.githubusercontent.com/PrismML-Eng/llama.cpp/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-cpu/simd-mappings.h",
+  "simd_header_sha256": "d1ca849419a643d4304d82d3921d11b02722ccf69d607a86c2c579b864f700b2",
+  "model_loaded": false,
+  "graph_threads": 1,
+  "graph_arena_bytes": 16777216,
+  "gdn": {
+    "dimension": 128,
+    "heads": 1,
+    "tokens": 1,
+    "sequences": 1,
+    "gate": 0,
+    "beta": 1,
+    "raw_gates": false
+  },
+  "layout": "Little-endian: PGDN001 NUL; u32 dot-case count, u32 row-case count; each dot: u32 width, u32 native-result bits, width F32 x, width F32 y; each row: u32 width, F32 v, F32 native-output, width F32 q/k/initial-state/native-updated-state",
+  "dot_cases": [
+    {
+      "seed": 742,
+      "source_case": "cancellation-heavy",
+      "width": 128
+    }
+  ],
+  "row_cases": [
+    {
+      "seed": 741,
+      "state_row": 0,
+      "source_case": "ordinary",
+      "width": 128
+    },
+    {
+      "seed": 742,
+      "state_row": 1,
+      "source_case": "cancellation-heavy",
+      "width": 128
+    }
+  ],
+  "notes": [
+    "Complete captures and script retained externally in the session evidence lane.",
+    "Rows are extracted from independent native one-head, one-token, one-sequence D128 GDN execution with g=0, beta=1 and raw gates disabled.",
+    "A row update/output depends only on that initial state row and the shared q/k plus corresponding v value.",
+    "Expected bits come from native output buffers; no model weights were loaded.",
+    "This operator fixture does not establish full-model numerical parity."
+  ]
+}

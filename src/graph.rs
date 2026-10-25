@@ -82,6 +82,29 @@ impl Arithmetic {
             Self::PinnedSwift => MatvecScratch::with_pinned_backend(backend),
         }
     }
+
+    fn gdn_dot(self, first: &[f32], second: &[f32]) -> Result<f32> {
+        match self {
+            Self::Source => Ok(dot(first, second)),
+            Self::PinnedSwift => crate::kernels::pinned_gdn::dot(first, second),
+        }
+    }
+
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Preserve the generic graph's separate multiply/add rounding."
+    )]
+    fn gdn_add_scaled(self, target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
+        match self {
+            Self::Source => {
+                for (target, &input) in target.iter_mut().zip(input) {
+                    *target += scale * input;
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::add_scaled(target, input, scale),
+        }
+    }
 }
 const MAX_LAYERS: usize = 256;
 const KV_PAGE_TOKENS: usize = 64;
@@ -1447,11 +1470,9 @@ impl Evaluation<'_> {
                 .zip(v)
                 .zip(output.iter_mut())
             {
-                let delta = (value - dot(state_row, k)) * update;
-                for (element, &key) in state_row.iter_mut().zip(k) {
-                    *element += delta * key;
-                }
-                *out = dot(state_row, q) * scale;
+                let delta = (value - self.arithmetic.gdn_dot(state_row, k)?) * update;
+                self.arithmetic.gdn_add_scaled(state_row, k, delta)?;
+                *out = self.arithmetic.gdn_dot(state_row, q)? * scale;
             }
             self.arithmetic
                 .normalize(output, &layer.norm, g.epsilon, &mut scratch.normalized)?;
@@ -2035,14 +2056,112 @@ fn rope(input: &mut [f32], geometry: &Geometry, frequencies: &[(f32, f32)]) -> R
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::{Cursor, Read};
     use std::sync::Arc;
 
+    use sha2::{Digest, Sha256};
+
     use super::{
-        Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES, ProjectionScratch,
-        Transforms, copy_state, dot, dot_f16, half_bits, half_to_float, rope, rope_frequencies,
+        Arithmetic, Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES,
+        ProjectionScratch, Transforms, copy_state, dot, dot_f16, half_bits, half_to_float, rope,
+        rope_frequencies,
     };
     use crate::Result;
     use crate::model::Tensor;
+
+    fn read_gdn_word(input: &mut Cursor<&[u8]>) -> Result<u32> {
+        let mut bytes = [0; 4];
+        input.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_gdn_vector(input: &mut Cursor<&[u8]>, width: usize) -> Result<Vec<f32>> {
+        (0..width)
+            .map(|_| read_gdn_word(input).map(f32::from_bits))
+            .collect()
+    }
+
+    #[test]
+    fn pinned_gdn_arithmetic_matches_independent_native_capture() -> Result<()> {
+        // Expected buffers come from the pinned DLL's one-head D128 GDN graph,
+        // g=0, beta=1, raw gates disabled. Keep the independent native rounding
+        // oracle rather than manufacturing expected values from Rust formulas.
+        let bytes = include_bytes!("../tests/fixtures/swift-gdn-parity.bin");
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/swift-gdn-parity.json"))?;
+        let hash: String = Sha256::digest(bytes)
+            .into_iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
+        assert_eq!(
+            provenance["runtime_commit"].as_str(),
+            Some("73bfe6cc485554822f80c473a3c0c4f25e80f41b")
+        );
+        assert_eq!(
+            provenance["ggml_cpu_sha256"].as_str(),
+            Some("701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab")
+        );
+        let mut input = Cursor::new(bytes.as_slice());
+        let mut header = [0; 8];
+        input.read_exact(&mut header)?;
+        assert_eq!(&header, b"PGDN001\0");
+        let dots = read_gdn_word(&mut input)?;
+        let rows = read_gdn_word(&mut input)?;
+        assert_eq!((dots, rows), (1, 2));
+        for _ in 0..dots {
+            let width = usize::try_from(read_gdn_word(&mut input)?)?;
+            assert_eq!(width, 128);
+            let native = read_gdn_word(&mut input)?;
+            let first = read_gdn_vector(&mut input, width)?;
+            let second = read_gdn_vector(&mut input, width)?;
+            assert_eq!(
+                Arithmetic::PinnedSwift.gdn_dot(&first, &second)?.to_bits(),
+                native
+            );
+            assert_ne!(
+                Arithmetic::Source.gdn_dot(&first, &second)?.to_bits(),
+                native
+            );
+        }
+        for _ in 0..rows {
+            let width = usize::try_from(read_gdn_word(&mut input)?)?;
+            assert_eq!(width, 128);
+            let value = f32::from_bits(read_gdn_word(&mut input)?);
+            let native = read_gdn_word(&mut input)?;
+            let query = read_gdn_vector(&mut input, width)?;
+            let key = read_gdn_vector(&mut input, width)?;
+            let mut state = read_gdn_vector(&mut input, width)?;
+            let expected = read_gdn_vector(&mut input, width)?;
+            let mut source = state.clone();
+            let delta = value - Arithmetic::PinnedSwift.gdn_dot(&state, &key)?;
+            Arithmetic::PinnedSwift.gdn_add_scaled(&mut state, &key, delta)?;
+            let scale = 1.0 / 128.0_f32.sqrt();
+            assert_eq!(
+                (Arithmetic::PinnedSwift.gdn_dot(&state, &query)? * scale).to_bits(),
+                native
+            );
+            assert_eq!(
+                state
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            let delta = value - Arithmetic::Source.gdn_dot(&source, &key)?;
+            Arithmetic::Source.gdn_add_scaled(&mut source, &key, delta)?;
+            assert_ne!(
+                (Arithmetic::Source.gdn_dot(&source, &query)? * scale).to_bits(),
+                native
+            );
+        }
+        assert_eq!(input.position(), u64::try_from(bytes.len())?);
+        Ok(())
+    }
 
     fn projection_geometry(width: usize) -> Geometry {
         Geometry {

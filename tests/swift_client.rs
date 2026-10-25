@@ -1,6 +1,6 @@
+//! Focused pinned readiness, count/completion and abandoned-stream contracts.
 #![forbid(unsafe_code)]
 #![cfg(feature = "cli")]
-//! Focused pinned readiness, count/completion and abandoned-stream contracts.
 
 use bonsai_prism_runtime::{
     Result,

@@ -1,6 +1,6 @@
+//! Opt-in device correctness exercise; never an inference performance benchmark.
 #![cfg(feature = "cli")]
 #![forbid(unsafe_code)]
-//! Opt-in device correctness exercise; never an inference performance benchmark.
 
 use std::{
     path::PathBuf,

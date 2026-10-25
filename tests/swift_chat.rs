@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-#![cfg(feature = "cli")]
 //! Swift-only native prompt-byte and tokenizer captures at pinned Prism 73bfe6c.
 //!
 //! The fixture template was extracted after full pinned artifact verification.
@@ -9,6 +7,8 @@
 //! exact binary prompt input, special parsing enabled and offline mode. The
 //! fixture records source/executable identities; these are correctness captures,
 //! never throughput measurements. Regeneration requires both native controls.
+#![forbid(unsafe_code)]
+#![cfg(feature = "cli")]
 
 use std::path::Path;
 

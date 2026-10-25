@@ -1,6 +1,6 @@
+//! Focused chat capability probes and opt-in pinned production differentials.
 #![forbid(unsafe_code)]
 #![cfg(feature = "cli")]
-//! Focused chat capability probes and opt-in pinned production differentials.
 
 use bonsai_prism_runtime::Result;
 use bonsai_prism_runtime::jinja::{ChatCapabilities, Template};

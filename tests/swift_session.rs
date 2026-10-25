@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    io,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -33,6 +34,9 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
     assert!(prompt.prompt_tokens() > 0);
     assert_eq!(prompt.output_tokens(), 1);
     rejected_requests_leave_session_ready(&mut session, &prompt, &messages);
+    let cancelled_text = interrupted_generation_restores_session(&mut session, &prompt, true)?;
+    let abandoned_text = interrupted_generation_restores_session(&mut session, &prompt, false)?;
+    assert_eq!(cancelled_text, abandoned_text);
 
     let mut first_text = String::new();
     let first = session.complete(
@@ -50,6 +54,7 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
     assert_eq!(first.prompt_tokens, prompt.prompt_tokens());
     assert!(first.generated_tokens <= 1);
     assert!(first.finish == Finish::Stop || first.generated_tokens == 1);
+    assert_eq!(first_text, cancelled_text);
     session.reset()?;
     let mut replay = String::new();
     let second = session.complete(
@@ -104,6 +109,56 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
     assert_eq!(completion.reused_tokens, 0);
     assert!(!session.is_faulted());
     Ok(())
+}
+
+fn interrupted_generation_restores_session(
+    session: &mut SwiftSession,
+    prompt: &PreparedChat,
+    cancel: bool,
+) -> Result<String> {
+    let cancellation = Cancellation::default();
+    let mut provisional = String::new();
+    let mut terminal = false;
+    let result = session.complete(
+        prompt,
+        &cancellation,
+        Instant::now() + Duration::from_secs(600),
+        |event| match event {
+            TextEvent::Delta(text) => {
+                provisional.push_str(text);
+                if cancel {
+                    cancellation.cancel();
+                    Ok(())
+                } else {
+                    Err(
+                        io::Error::new(io::ErrorKind::BrokenPipe, "abandoned provisional output")
+                            .into(),
+                    )
+                }
+            }
+            TextEvent::Complete(_) => {
+                terminal = true;
+                Ok(())
+            }
+        },
+    );
+    let error = result.err().ok_or("interrupted generation completed")?;
+    assert_ne!(provisional, "");
+    assert!(!terminal);
+    assert_eq!(cancellation.is_cancelled(), cancel);
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(if cancel {
+            io::ErrorKind::Interrupted
+        } else {
+            io::ErrorKind::BrokenPipe
+        })
+    );
+    // Neither failure may require resetting the sampler before the next
+    // request. Their provisional text must replay after both failures and a
+    // later explicit seeded reset, checked by the successful calls above.
+    assert!(!session.is_faulted());
+    Ok(provisional)
 }
 
 fn rejected_requests_leave_session_ready(

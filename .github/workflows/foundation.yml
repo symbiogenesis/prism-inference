@@ -11,7 +11,7 @@ permissions:
 env:
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
   CARGO_BUILD_FINGERPRINT: content
-  PRISM_VERSION: '0.1.1'
+  PRISM_VERSION: '0.1.2'
 concurrency:
   group: foundation-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
@@ -75,6 +75,7 @@ jobs:
           [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'workspace.log') | Out-Null
           try {
+            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-ReleaseBundle.ps1') -Case All
             cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
             cargo +nightly-2026-10-22 fmt --manifest-path $manifest --all -- --check
             # bonsai-prism's native-tests feature requires ggml; checked in native-overlay.

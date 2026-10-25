@@ -127,6 +127,14 @@ license/notice files. Each bundle has a receipt identifying its exact source
 revision, target, version, file hashes and archive hash. The aggregate Foundation
 check requires both Windows targets and the Linux native overlay gate.
 
+The checkout prepares version `0.1.2`; the published crates.io installation
+examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
+checkout, a revision mismatch, inconsistent runtime/server versions or a
+toolchain string that differs from the pinned channel and target. The receipt
+records the resulting bytes; its source-to-binary trust still depends on the
+checked Foundation build. The synthetic release-bundle regressions verify
+identity rejection, PE target checks and every archive entry's recorded hash.
+
 The main CLI, token worker and Swift worker come from the `prism-inference`
 package. `prism-inference-server` and `bonsai-gguf` are separate packages in
 the workspace; `cargo install prism-inference` alone installs the first three

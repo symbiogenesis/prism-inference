@@ -21,16 +21,35 @@ Import-Module (Join-Path $PSScriptRoot 'Bonsai.Native.psm1')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $build = Resolve-ExternalPath $BuildDirectory
 $output = Resolve-ExternalPath $OutputDirectory
+if (-not [IO.Directory]::Exists($build)) { throw 'The release build directory does not exist.' }
 if (Test-Path -LiteralPath $output) { throw 'Use a new release bundle output directory.' }
+$git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+$identity = Invoke-BonsaiNativeProcess -Executable $git -ArgumentList @('-C',$repo,'rev-parse','HEAD') -WorkingDirectory $build -TimeoutSeconds 30
+if ($identity.ExitCode -or $identity.StandardOutput.Trim() -cne $SourceRevision) { throw 'The checked source revision differs from the release receipt.' }
+$status = Invoke-BonsaiNativeProcess -Executable $git -ArgumentList @('-C',$repo,'status','--porcelain=v1','--untracked-files=normal') -WorkingDirectory $build -TimeoutSeconds 30
+if ($status.ExitCode -or $status.StandardOutput.Trim()) { throw 'Release bundles require a clean source checkout.' }
+foreach ($manifestPath in @('Cargo.toml','server/Cargo.toml')) {
+    $manifest = [IO.File]::ReadAllText((Join-Path $repo $manifestPath))
+    $package = [regex]::Match($manifest, '(?ms)^\[package\]\r?\n(?<Package>.*?)(?=^\[|\z)')
+    $declared = [regex]::Match($package.Groups['Package'].Value, '(?m)^version = "(?<Version>[0-9]+\.[0-9]+\.[0-9]+)"\r?$')
+    if (-not $package.Success -or -not $declared.Success -or $declared.Groups['Version'].Value -cne $Version) {
+        throw 'The package version differs from the release receipt.'
+    }
+    if ($manifestPath -ceq 'server/Cargo.toml') {
+        $dependency = [regex]::Match($manifest, '(?m)^bonsai-prism-runtime = \{ package = "prism-inference", path = "\.\.", version = "=(?<Version>[0-9]+\.[0-9]+\.[0-9]+)" \}\r?$')
+        if (-not $dependency.Success -or $dependency.Groups['Version'].Value -cne $Version) {
+            throw 'The server must pin the bundled runtime package version.'
+        }
+    }
+}
+$toolchainPin = [IO.File]::ReadAllText((Join-Path $repo 'rust-toolchain.toml'))
+$channel = [regex]::Match($toolchainPin, '(?m)^channel = "(?<Channel>nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})"\r?$')
+if (-not $channel.Success -or $Toolchain -cne "$($channel.Groups['Channel'].Value)-$Target") {
+    throw 'The release toolchain must match the pinned channel and target.'
+}
 [void][IO.Directory]::CreateDirectory($output)
 $files = Join-Path $output 'files'
 [void][IO.Directory]::CreateDirectory($files)
-$git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-$identity = Invoke-BonsaiNativeProcess -Executable $git -ArgumentList @('-C',$repo,'rev-parse','HEAD') -WorkingDirectory $output -TimeoutSeconds 30
-if ($identity.ExitCode -or $identity.StandardOutput.Trim() -cne $SourceRevision) { throw 'The checked source revision differs from the release receipt.' }
-$manifest = [IO.File]::ReadAllText((Join-Path $repo 'Cargo.toml'))
-$declared = [regex]::Match($manifest, '(?m)^version = "(?<Version>[0-9]+\.[0-9]+\.[0-9]+)"\r?$')
-if (-not $declared.Success -or $declared.Groups['Version'].Value -cne $Version) { throw 'The package version differs from the release receipt.' }
 $executables = @('prism-inference.exe','bonsai-token-worker.exe','bonsai-swift-worker.exe','prism-inference-server.exe','bonsai-gguf.exe')
 $machine = if ($Target -ceq 'aarch64-pc-windows-msvc') { 0xaa64 } else { 0x8664 }
 foreach ($name in $executables) {

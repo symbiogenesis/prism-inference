@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>14.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <WarningLevel>9999</WarningLevel>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn></NoWarn>
+    <WarningsNotAsErrors></WarningsNotAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>10.0</AnalysisLevel>
+    <AnalysisMode>All</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <ImplicitUsings>disable</ImplicitUsings>
+
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <GlobalAnalyzerConfigFiles Include="CSharp.Strict.globalconfig" />
+    <EmbeddedCSharp Include="$(EmbeddedSourcesDirectory)/*.cs" Condition="'$(EmbeddedSourcesDirectory)' != ''" />
+    <Compile Include="@(EmbeddedCSharp)" />
+  </ItemGroup>
+  <Target Name="RequireEmbeddedSources" BeforeTargets="CoreCompile">
+    <Error Condition="'$(EmbeddedSourcesDirectory)' == ''" Text="Set EmbeddedSourcesDirectory to the temporary directory containing every extracted Add-Type C# source." />
+    <Error Condition="!Exists('$(EmbeddedSourcesDirectory)')" Text="The extracted embedded C# source directory does not exist." />
+    <Error Condition="'@(EmbeddedCSharp)' == ''" Text="No embedded Add-Type C# source files were extracted." />
+  </Target>
+</Project>

@@ -1,0 +1,50 @@
+name: Script standards
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: script-standards-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+jobs:
+  standards:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare the pinned C# analyzer SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.4xx'
+      - name: Reuse the pinned PowerShell analyzer
+        id: analyzer-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/Prism-Standards-Tools
+          key: psscriptanalyzer-v1-${{ runner.os }}-${{ runner.arch }}-1.25.0
+      - name: Save the pinned PowerShell analyzer on a cache miss
+        if: steps.analyzer-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Save-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Path (Join-Path $env:RUNNER_TEMP 'Prism-Standards-Tools') -Force
+      - name: Enforce PowerShell contracts and embedded C# analyzers
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($PSVersionTable.PSVersion -lt [version]'7.6' -or $PSVersionTable.PSVersion.PreReleaseLabel) {
+            throw 'Script standards require stable PowerShell 7.6 or later.'
+          }
+          $tooling = Join-Path $env:RUNNER_TEMP 'Prism-Standards-Tools'
+          $analyzer = Join-Path $tooling 'PSScriptAnalyzer/1.25.0/PSScriptAnalyzer.psd1'
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Standards.ps1') -AnalyzerModulePath $analyzer

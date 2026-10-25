@@ -11,8 +11,8 @@ use bonsai_gguf::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
 use bonsai_ternary::half_to_float;
 
 use crate::kernels::{
-    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, half_bits, rms_norm_into,
-    round_f16, row, row_into, silu, softmax,
+    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, half_bits,
+    rms_norm_pinned_into, round_f16, row, row_into, silu, softmax,
 };
 use crate::model::{Model, Tensor};
 use crate::{Decoder, Result, invalid};
@@ -1058,7 +1058,7 @@ impl Qwen35 {
             self.transforms.sign(hidden);
         }
         for ((layer, state), delta) in self.layers.iter().zip(&self.state).zip(deltas.iter_mut()) {
-            rms_norm_into(hidden, &layer.norm, self.geometry.epsilon, normalized)?;
+            rms_norm_pinned_into(hidden, &layer.norm, self.geometry.epsilon, normalized)?;
             match (&layer.attention, state) {
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
                     evaluation.full_attention(
@@ -1089,7 +1089,7 @@ impl Qwen35 {
                 _ => return Err(invalid("decoder layer/cache kind mismatch")),
             }
             add(hidden, attention);
-            rms_norm_into(hidden, &layer.post_norm, self.geometry.epsilon, normalized)?;
+            rms_norm_pinned_into(hidden, &layer.post_norm, self.geometry.epsilon, normalized)?;
             evaluation.project_group_into([&layer.up, &layer.gate], normalized, [up, gate])?;
             for (up, &gate) in up.iter_mut().zip(gate.iter()) {
                 *up *= silu(gate);
@@ -1099,7 +1099,7 @@ impl Qwen35 {
             finite(hidden, "decoder layer output")?;
         }
         if let Some(logits) = logits {
-            rms_norm_into(hidden, &self.output_norm, self.geometry.epsilon, normalized)?;
+            rms_norm_pinned_into(hidden, &self.output_norm, self.geometry.epsilon, normalized)?;
             evaluation.project_into(&self.output, normalized, logits)?;
             finite(logits, "output logits")?;
         }
@@ -1189,7 +1189,7 @@ impl Evaluation<'_> {
         prepare(&mut scratch.query, g.head * g.heads)?;
         prepare(&mut scratch.gate, g.head * g.heads)?;
         for head in scratch.joint_query.chunks_exact(2 * g.head) {
-            rms_norm_into(
+            rms_norm_pinned_into(
                 &head[..g.head],
                 &layer.query_norm,
                 g.epsilon,
@@ -1200,7 +1200,7 @@ impl Evaluation<'_> {
         }
         prepare(key, scratch.key_projection.len())?;
         for head in scratch.key_projection.chunks_exact(g.head) {
-            rms_norm_into(head, &layer.key_norm, g.epsilon, &mut scratch.normalized)?;
+            rms_norm_pinned_into(head, &layer.key_norm, g.epsilon, &mut scratch.normalized)?;
             key.extend_from_slice(&scratch.normalized);
         }
         // Geometry and position are shared by every full-attention layer in
@@ -1362,7 +1362,7 @@ impl Evaluation<'_> {
                 }
                 *out = dot(state_row, q) * scale;
             }
-            rms_norm_into(output, &layer.norm, g.epsilon, &mut scratch.normalized)?;
+            rms_norm_pinned_into(output, &layer.norm, g.epsilon, &mut scratch.normalized)?;
             for ((out, &normalized), &z) in output
                 .iter_mut()
                 .zip(&scratch.normalized)

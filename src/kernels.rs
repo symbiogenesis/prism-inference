@@ -1599,7 +1599,37 @@ pub fn rms_norm_into(
     output: &mut Vec<f32>,
 ) -> Result<()> {
     fill_into(output, |output| {
-        rms_norm_impl(input, weight, epsilon, output)
+        let scale = rms_norm_scale(input, weight, epsilon)?;
+        collect_into(
+            input
+                .iter()
+                .zip(weight)
+                .map(|(&value, &w)| finite(value * scale * w)),
+            output,
+        )
+    })
+}
+
+/// Applies the weighted RMS contract of the pinned Windows ARM64 Prism binary.
+///
+/// The compiled fused RMS/MUL loop rounds `input * weight` before multiplying
+/// by the scale, although the upstream scalar source spells the other order.
+/// Keep this separate from the public source-order scalar reference.
+pub(crate) fn rms_norm_pinned_into(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    output: &mut Vec<f32>,
+) -> Result<()> {
+    fill_into(output, |output| {
+        let scale = rms_norm_scale(input, weight, epsilon)?;
+        collect_into(
+            input
+                .iter()
+                .zip(weight)
+                .map(|(&value, &w)| finite((value * w) * scale)),
+            output,
+        )
     })
 }
 
@@ -1608,7 +1638,7 @@ pub fn rms_norm_into(
     clippy::cast_possible_truncation,
     reason = "The scalar normalization contract rounds the binary64 mean to binary32."
 )]
-fn rms_norm_impl(input: &[f32], weight: &[f32], epsilon: f32, output: &mut Vec<f32>) -> Result<()> {
+fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
     if input.is_empty() || input.len() != weight.len() || !epsilon.is_finite() || epsilon < 0.0 {
         return Err(invalid(
             "RMS normalization requires equal nonempty vectors and nonnegative epsilon",
@@ -1626,13 +1656,7 @@ fn rms_norm_impl(input: &[f32], weight: &[f32], epsilon: f32, output: &mut Vec<f
     if !scale.is_finite() || scale <= 0.0 {
         return Err(invalid("RMS normalization produced an invalid scale"));
     }
-    collect_into(
-        input
-            .iter()
-            .zip(weight)
-            .map(|(&value, &w)| finite(value * scale * w)),
-        output,
-    )
+    Ok(scale)
 }
 
 /// Applies a normalized Sylvester Hadamard transform to one contiguous block.
@@ -1701,7 +1725,111 @@ pub fn softmax(values: &mut [f32]) -> Result<()> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{MatvecScratch, Tensor, matvec_into, q8_into, q8k_into};
+    use super::{
+        MatvecScratch, Tensor, matvec_into, q8_into, q8k_into, rms_norm, rms_norm_pinned_into,
+    };
+
+    #[test]
+    fn pinned_fused_rms_matches_independent_native_binary_capture() -> crate::Result<()> {
+        // Captured from the pinned 73bfe6cc Windows ARM64 ggml RMS/MUL graph,
+        // one thread, epsilon=1e-6; all installed DLL hashes were reverified.
+        // ggml-cpu.dll SHA256:
+        // 701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab.
+        // Inputs: Python random.Random(123), 16 binary32-rounded uniform values
+        // in [-10, 10], followed by 16 binary32-rounded weights in [0.5, 1.5].
+        // These expected bits are native outputs, not a Rust formula oracle.
+        let input = [
+            0xc10f_3e60,
+            0xc104_19ab,
+            0xbfed_760a,
+            0xc0fb_1265,
+            0x4100_6236,
+            0xc113_ca74,
+            0x3f39_5abd,
+            0xc056_c975,
+            0x40e1_55df,
+            0xc0d9_d0ea,
+            0xc050_5cd9,
+            0xc054_bd99,
+            0xc0a3_1870,
+            0xc11f_7726,
+            0xbfa3_224c,
+            0xc103_f6b4,
+        ]
+        .map(f32::from_bits);
+        let weight = [
+            0x3f8c_7e24,
+            0x3f11_e375,
+            0x3f50_c1eb,
+            0x3f72_c536,
+            0x3fb3_e41a,
+            0x3f17_bf6b,
+            0x3f24_6596,
+            0x3fa5_2113,
+            0x3f05_6fb9,
+            0x3fb4_a095,
+            0x3f89_6570,
+            0x3f43_ec20,
+            0x3fab_3e44,
+            0x3fa2_67de,
+            0x3f57_ed23,
+            0x3fa6_9771,
+        ]
+        .map(f32::from_bits);
+        let native = [
+            0xbfbf_e77d,
+            0xbf37_c5b7,
+            0xbe6c_5a32,
+            0xbf91_4ecf,
+            0x3fdc_3aa0,
+            0xbf55_db96,
+            0x3d91_490b,
+            0xbf29_1af1,
+            0x3f0f_5c43,
+            0xbfbb_95d0,
+            0xbf08_7efe,
+            0xbec6_ba73,
+            0xbf85_297f,
+            0xbff6_f545,
+            0xbe27_f2bd,
+            0xbfd1_a270,
+        ];
+        let mut output = vec![99.0; 32];
+        let pointer = output.as_ptr();
+        rms_norm_pinned_into(&input, &weight, 1e-6, &mut output)?;
+        assert_eq!(
+            output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            native
+        );
+        assert_eq!(output.as_ptr(), pointer);
+        // The generic scalar API retains its documented source-order rounding.
+        assert_eq!(rms_norm(&input, &weight, 1e-6)?[0].to_bits(), 0xbfbf_e77e);
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_fused_rms_clears_nonfinite_intermediate_and_recovers_storage() -> crate::Result<()> {
+        let mut output = vec![99.0; 32];
+        let pointer = output.as_ptr();
+        // Weight-first multiplication overflows even though the source-order
+        // scalar result is finite. Reject this compiled-contract intermediate.
+        assert!(rms_norm_pinned_into(&[2.0], &[f32::MAX], 0.0, &mut output).is_err());
+        assert_eq!(output, [0.0; 0]);
+        assert_eq!(output.as_ptr(), pointer);
+        assert_eq!(
+            rms_norm(&[2.0], &[f32::MAX], 0.0)?[0].to_bits(),
+            f32::MAX.to_bits()
+        );
+        assert!(rms_norm_pinned_into(&[], &[], 0.0, &mut output).is_err());
+        assert_eq!(output, [0.0; 0]);
+        rms_norm_pinned_into(&[2.0], &[3.0], 0.0, &mut output)?;
+        assert_eq!(output[0].to_bits(), 3.0_f32.to_bits());
+        assert_eq!(output.as_ptr(), pointer);
+        Ok(())
+    }
 
     #[test]
     fn prepared_siblings_quantize_once_and_retry_with_fresh_contents() -> crate::Result<()> {

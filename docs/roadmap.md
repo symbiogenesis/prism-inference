@@ -23,8 +23,9 @@ native reference exceed the declared numerical tolerance.
 
 The pinned Swift chat path has native template-byte/tokenizer-ID captures and
 seeded full-vocabulary MT19937 sampler comparisons. The exact verified Swift
-identity selects the pinned Windows ARM64 binary's weighted RMS, PQ2 fused
-accumulation and SiLU/SwiGLU arithmetic. Independent native captures cover those
+identity selects the pinned Windows ARM64 binary's weighted RMS, fused Q8_K
+preparation and PQ2 accumulation, GDN updates, SiLU/SwiGLU and nonflash attention
+arithmetic. Independent native captures cover those
 operators; other model identities and public scalar APIs preserve their existing
 source-order contracts. Decoder identity records the pinned arithmetic choice.
 These operator repairs do not close the failed full-model numerical comparison.

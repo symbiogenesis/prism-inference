@@ -83,6 +83,26 @@ imports pinned original C++ tests and applies shared assertions to this runtime.
 Its complete source inventory retains unported tests as unsupported, counts them
 against the green fraction and prevents already-green adapters from regressing.
 
+## Bounded actual-model correctness captures
+
+Build the `swift_model_check` example explicitly from the external working lane.
+Its `forward` mode retains the existing 1–16 supplied-token captures. For a
+verified chat prefix, `trajectory` reads an absolute JSON token-ID file and
+reserves all requested 1–16 greedy steps within the 8,192-token context:
+
+```text
+swift_model_check trajectory <absolute-model> <existing-absolute-evidence-dir> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>
+```
+
+The qualifier ingests intermediate prompt tokens without logits, then captures
+logits and complete logical hybrid state for the final prefix and every
+fed-back greedy token. It reports exact prompt/generated IDs and includes
+special tokens in this fixed-step diagnostic. Service stop and sampler
+qualification remain separate. Snapshots never overwrite files; their combined
+payload is capped at 8 GiB. Retain absolute external outputs and the existing
+process-memory/deadline supervision. No timings or throughput are measured.
+The evidence-write guards run in the ordinary hosted correctness suite.
+
 ## Release bundles and compatibility
 
 The Windows jobs build five executables and package them with the four root

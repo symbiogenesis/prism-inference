@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "prism-runtime-capabilities",
+  "runtime": {
+    "name": "prism-inference",
+    "version": "0.1.2",
+    "target": {
+      "architecture": "aarch64",
+      "os": "windows",
+      "environment": "msvc"
+    }
+  },
+  "cpu": {
+    "scalar": true,
+    "neon_build_eligible": true
+  },
+  "backends": {
+    "vulkan": "unavailable",
+    "hexagon": "unavailable"
+  },
+  "supported_contracts": [
+    "qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32",
+    "qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32:prism-arm64-fused-v1"
+  ],
+  "qualification": "unqualified"
+}

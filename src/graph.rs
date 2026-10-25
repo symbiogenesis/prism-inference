@@ -23,6 +23,18 @@ use crate::{Decoder, Result, invalid};
 /// This excludes model storage, scratch, checkpoints, page-table/Arc metadata
 /// and allocator overhead.
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Graph identity suffix for the generic source-order Qwen35 text decoder.
+///
+/// This identifies numerical/state layout, without portable checkpoint support
+/// or model/device qualification. Complete decoder identities also include the
+/// verified model SHA-256.
+pub const QWEN35_GRAPH_CONTRACT: &str = "qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32";
+/// Graph identity suffix selected only for the exact pinned Swift model.
+///
+/// This includes the pinned ARM64 arithmetic ordering. It does not qualify
+/// other model artifacts or promise portable state or target-device parity.
+pub const SWIFT_GRAPH_CONTRACT: &str =
+    "qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32:prism-arm64-fused-v1";
 const MAX_WIDTH: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
@@ -1157,10 +1169,12 @@ impl Qwen35 {
         } else {
             Arithmetic::Source
         };
-        let mut identity = model.identity + ":qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32";
-        if matches!(arithmetic, Arithmetic::PinnedSwift) {
-            identity.push_str(":prism-arm64-fused-v1");
-        }
+        let contract = if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            SWIFT_GRAPH_CONTRACT
+        } else {
+            QWEN35_GRAPH_CONTRACT
+        };
+        let identity = model.identity + ":" + contract;
         Ok(Self {
             provenance: Arc::new(()),
             identity,

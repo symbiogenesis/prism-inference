@@ -2,6 +2,24 @@
 
 [Documentation index](index.md) · [Build and validation](build-and-validation.md) · [Runtime contracts](runtime-contracts.md)
 
+## Inspect compiled support
+
+Run `prism-inference --capabilities` alone to emit one bounded version-one JSON
+record without model I/O or device execution. The `runtime.target` facts describe
+the executable target, including an emulated process. `cpu.neon_build_eligible`
+uses the same production kernel predicate as actual dispatch; it is a build fact,
+not a host ISA probe or a promise that every operation uses NEON. Unsupported
+targets and builds without the `experimental-neon` feature report false.
+
+`supported_contracts` lists the graph identity suffixes used by the generic
+Qwen35 decoder and the exact pinned Swift artifact. Complete decoder identities
+also include the verified model SHA-256. These suffixes identify implementation
+contracts; they do not establish portable checkpoints or qualify a model/device.
+Vulkan and Hexagon are unavailable and `qualification` remains `unqualified`.
+Consumers must reject unsupported schema versions and retain independent artifact,
+evidence and resource admission. This inventory does not select a profile or
+change generation defaults. Additional options alongside `--capabilities` reject.
+
 ## Generate from text or token IDs
 
 Generation (the default `--mode generate`) requires an absolute model path,

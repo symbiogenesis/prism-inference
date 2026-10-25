@@ -29,6 +29,9 @@ use std::{
 };
 
 const USAGE: &str = "Native CPU reference; full-model parity and performance are unqualified.\n\
+Usage: prism-inference --capabilities\n\
+Reports versioned compiled support as one JSON record without loading a model.\n\
+Build eligibility and graph contract IDs do not qualify a hardware profile.\n\
 Usage: prism-inference --model <absolute-gguf-path> --bytes <u64>\n\
   --sha256 <64-hex> --memory-bytes <usize> --context <1..262144>\n\
   [--mode <generate|tokenize>]\n\
@@ -804,6 +807,19 @@ fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() == 1 && args[0] == "--help" {
         return match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
+    if args.len() == 1 && args[0] == "--capabilities" {
+        let mut output = std::io::stdout().lock();
+        return match serde_json::to_writer(
+            &mut output,
+            &bonsai_prism_runtime::capabilities::RuntimeCapabilities::current(),
+        )
+        .map_err(std::io::Error::other)
+        .and_then(|()| output.write_all(b"\n"))
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         };

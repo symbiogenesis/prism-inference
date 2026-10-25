@@ -9,6 +9,8 @@
 pub mod backend;
 pub mod bpe;
 #[cfg(feature = "cli")]
+pub mod capabilities;
+#[cfg(feature = "cli")]
 pub mod chat;
 pub mod codec;
 pub mod grammar;

@@ -245,7 +245,10 @@ struct ProjectionScratch {
 
 #[derive(Default)]
 struct AttentionScratch {
-    joint_query: Vec<f32>,
+    // Attention projections finish before the FFN starts. Reuse these two
+    // vectors for joint Q/gate or recurrent QKV, then FFN up/gate. Recurrent
+    // convolution also replaces each QKV element only after its last raw use.
+    projected: Vec<f32>,
     query: Vec<f32>,
     gate: Vec<f32>,
     key_projection: Vec<f32>,
@@ -253,18 +256,14 @@ struct AttentionScratch {
     attended: Vec<f32>,
     scores: Vec<f32>,
     frequencies: Vec<(f32, f32)>,
-    qkv: Vec<f32>,
     beta: Vec<f32>,
     alpha: Vec<f32>,
-    mixed: Vec<f32>,
 }
 
 #[derive(Default)]
 struct Workspace {
     hidden: Vec<f32>,
     normalized: Vec<f32>,
-    up: Vec<f32>,
-    gate: Vec<f32>,
     attention: Vec<f32>,
     projection: ProjectionScratch,
     attention_scratch: AttentionScratch,
@@ -1038,8 +1037,6 @@ impl Qwen35 {
         let Workspace {
             hidden,
             normalized,
-            up,
-            gate,
             attention,
             projection,
             attention_scratch,
@@ -1090,6 +1087,10 @@ impl Qwen35 {
             }
             add(hidden, attention);
             rms_norm_pinned_into(hidden, &layer.post_norm, self.geometry.epsilon, normalized)?;
+            // Attention no longer reads its projections or gates. Keep the
+            // exact FFN operations while reusing their high-water allocations.
+            let up = &mut attention_scratch.projected;
+            let gate = &mut attention_scratch.gate;
             evaluation.project_group_into([&layer.up, &layer.gate], normalized, [up, gate])?;
             for (up, &gate) in up.iter_mut().zip(gate.iter()) {
                 *up *= silu(gate);
@@ -1184,11 +1185,11 @@ impl Evaluation<'_> {
         self.project_group_into(
             [&layer.query, &layer.key, &layer.value],
             input,
-            [&mut scratch.joint_query, &mut scratch.key_projection, value],
+            [&mut scratch.projected, &mut scratch.key_projection, value],
         )?;
         prepare(&mut scratch.query, g.head * g.heads)?;
         prepare(&mut scratch.gate, g.head * g.heads)?;
-        for head in scratch.joint_query.chunks_exact(2 * g.head) {
+        for head in scratch.projected.chunks_exact(2 * g.head) {
             rms_norm_pinned_into(
                 &head[..g.head],
                 &layer.query_norm,
@@ -1295,16 +1296,16 @@ impl Evaluation<'_> {
             [&layer.qkv, &layer.gate, &layer.beta, &layer.alpha],
             input,
             [
-                &mut scratch.qkv,
+                &mut scratch.projected,
                 &mut scratch.gate,
                 &mut scratch.beta,
                 &mut scratch.alpha,
             ],
         )?;
         copy_into(history, convolution)?;
-        zeros_into(g.convolution_width(), &mut scratch.mixed)?;
-        let mixed = &mut scratch.mixed;
+        let mixed = &mut scratch.projected;
         for (channel, mixed_value) in mixed.iter_mut().enumerate() {
+            let projected = *mixed_value;
             let start = channel * (g.convolution - 1);
             let coefficients =
                 &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
@@ -1315,11 +1316,11 @@ impl Evaluation<'_> {
             {
                 sum += old * coefficient;
             }
-            sum += scratch.qkv[channel] * coefficients[g.convolution - 1];
+            sum += projected * coefficients[g.convolution - 1];
             *mixed_value = silu(sum);
             if g.convolution > 1 {
                 convolution[start..start + g.convolution - 1].rotate_left(1);
-                convolution[start + g.convolution - 2] = scratch.qkv[channel];
+                convolution[start + g.convolution - 2] = projected;
             }
         }
         let key_width = g.key_width();

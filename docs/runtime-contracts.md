@@ -203,6 +203,20 @@ evaluation attempt. Neither retained-model nor checkpoint budgets cover workspac
 Synthetic capacity reuse does not establish full-model allocation, peak-memory or
 speed benefit; [R4.2](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/native-rust-engine.md#ordered-work) remains open.
 
+Attention projections and FFN up activations share one vector; their gates
+share another. Each attention call finishes reading those buffers before the
+FFN overwrites them. Recurrent convolution replaces each projected QKV element
+after its last raw use, saving the raw value for the convolution-history update.
+The arithmetic and reduction order are unchanged. Committed state, transactional
+layer deltas, checkpoints and reusable RoPE frequencies remain separate.
+
+For Swift's widths (FFN 17,408, joint query 12,288, recurrent QKV 10,240 and
+attention gate 6,144), these lifetimes remove four separate vector allocations:
+38,912 F32 slots, or **152 KiB** of nominal high-water payload. Vector capacity
+rounding, allocator overhead and process memory are separate; this is no measured
+peak-memory or speed claim. Fixed phase reuse needs neither a moving allocator
+nor a change to numerical tolerances.
+
 ## SIMD dispatch and diagnostics
 
 The inherited [SIMD S0–S6 plan](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/simd-plan.md) records kernel status and remaining acceptance.

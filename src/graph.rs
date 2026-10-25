@@ -2579,26 +2579,55 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn pinned_attention_rope_matches_native_fused_order_and_keeps_source_path() -> Result<()> {
-        #[derive(serde::Deserialize)]
-        struct Capture {
-            runtime_commit: String,
-            ggml_cpu_sha256: String,
-            head: usize,
-            rotary_dimensions: usize,
-            sections: [usize; 4],
-            freq_base_bits: u32,
-            input_bits: Vec<u32>,
-            cases: Vec<Case>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Case {
-            position: usize,
-            native_bits: Vec<u32>,
-        }
-        let capture: Capture =
+    #[derive(serde::Deserialize)]
+    struct RopeCapture {
+        runtime_commit: String,
+        ggml_cpu_sha256: String,
+        head: usize,
+        rotary_dimensions: usize,
+        sections: [usize; 4],
+        freq_base_bits: u32,
+        input_bits: Vec<u32>,
+        cases: Vec<RopeCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RopeCase {
+        position: usize,
+        native_bits: Vec<u32>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RopeCoefficients {
+        runtime_commit: String,
+        runtime_dll_sha256: BTreeMap<String, String>,
+        cases: Vec<RopeCoefficientCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RopeCoefficientCase {
+        position: usize,
+        cosine_bits: Vec<u32>,
+        sine_bits: Vec<u32>,
+    }
+
+    fn pinned_rope_captures() -> Result<(RopeCapture, RopeCoefficients)> {
+        let capture: RopeCapture =
             serde_json::from_str(include_str!("../tests/fixtures/swift-attention-rope.json"))?;
+        let coefficients = include_str!("../tests/fixtures/swift-rope-basis.json");
+        // Git may check text fixtures out with CRLF. Pin the captured contents
+        // with LF normalization while preserving every numeric oracle word.
+        let normalized = coefficients.replace("\r\n", "\n");
+        let hash: String = Sha256::digest(normalized.as_bytes())
+            .into_iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(
+            hash,
+            "e58b3c96b6ce704361d7a397775817959793e2a6cbaa78598e8a07075548ae93"
+        );
+        let coefficients: RopeCoefficients = serde_json::from_str(coefficients)?;
         assert_eq!(
             capture.runtime_commit,
             "73bfe6cc485554822f80c473a3c0c4f25e80f41b"
@@ -2607,18 +2636,46 @@ mod tests {
             capture.ggml_cpu_sha256,
             "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab"
         );
+        assert_eq!(coefficients.runtime_commit, capture.runtime_commit);
+        assert_eq!(
+            coefficients.runtime_dll_sha256.get("ggml-cpu.dll"),
+            Some(&capture.ggml_cpu_sha256)
+        );
+        assert_eq!(capture.cases.len(), coefficients.cases.len());
+        Ok((capture, coefficients))
+    }
+
+    fn captured_rope_geometry(capture: &RopeCapture) -> Geometry {
         let mut geometry = projection_geometry(capture.head);
         geometry.rope = capture.rotary_dimensions;
         geometry.rope_sections = capture.sections;
         geometry.rope_base = f32::from_bits(capture.freq_base_bits);
+        geometry
+    }
+
+    #[test]
+    fn pinned_attention_rope_matches_native_fused_order_and_keeps_source_path() -> Result<()> {
+        let (capture, coefficients) = pinned_rope_captures()?;
+        let geometry = captured_rope_geometry(&capture);
         let input = capture
             .input_bits
-            .into_iter()
+            .iter()
+            .copied()
             .map(f32::from_bits)
             .collect::<Vec<_>>();
-        for case in capture.cases {
-            let mut frequencies = Vec::new();
-            rope_frequencies(&geometry, case.position, &mut frequencies)?;
+        for (case, coefficient) in capture.cases.iter().zip(&coefficients.cases) {
+            assert_eq!(case.position, coefficient.position);
+            assert_eq!(coefficient.cosine_bits.len(), geometry.rope / 2);
+            assert_eq!(coefficient.sine_bits.len(), geometry.rope / 2);
+            // These are fresh native basis-vector outputs, independent of the
+            // host's powf/sin/cos implementations. The full native output oracle
+            // remains bit-exact on every host that checks the FMA arithmetic.
+            let frequencies = coefficient
+                .cosine_bits
+                .iter()
+                .zip(&coefficient.sine_bits)
+                .map(|(&cosine, &sine)| (f32::from_bits(cosine), f32::from_bits(sine)))
+                .collect::<Vec<_>>();
             let mut pinned = input.clone();
             Arithmetic::PinnedSwift.attention_rope(&mut pinned, &geometry, &frequencies)?;
             assert_eq!(
@@ -2629,9 +2686,62 @@ mod tests {
             );
             let mut source = input.clone();
             Arithmetic::Source.attention_rope(&mut source, &geometry, &frequencies)?;
+            let mut baseline = input.clone();
+            rope(&mut baseline, &geometry, &frequencies)?;
+            assert!(
+                source
+                    .iter()
+                    .zip(&baseline)
+                    .all(|(source, baseline)| source.to_bits() == baseline.to_bits())
+            );
             assert_ne!(
                 source.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
                 case.native_bits
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+    fn pinned_attention_rope_target_frequencies_and_full_rotation_match_native() -> Result<()> {
+        let (capture, coefficients) = pinned_rope_captures()?;
+        let geometry = captured_rope_geometry(&capture);
+        let input = capture
+            .input_bits
+            .iter()
+            .copied()
+            .map(f32::from_bits)
+            .collect::<Vec<_>>();
+        for (case, coefficient) in capture.cases.iter().zip(&coefficients.cases) {
+            assert_eq!(case.position, coefficient.position);
+            let mut frequencies = Vec::new();
+            rope_frequencies(&geometry, case.position, &mut frequencies)?;
+            assert_eq!(
+                frequencies
+                    .iter()
+                    .map(|&(cosine, _)| cosine.to_bits())
+                    .collect::<Vec<_>>(),
+                coefficient.cosine_bits,
+                "native target cosine coefficients at position {}",
+                case.position
+            );
+            assert_eq!(
+                frequencies
+                    .iter()
+                    .map(|&(_, sine)| sine.to_bits())
+                    .collect::<Vec<_>>(),
+                coefficient.sine_bits,
+                "native target sine coefficients at position {}",
+                case.position
+            );
+            let mut pinned = input.clone();
+            Arithmetic::PinnedSwift.attention_rope(&mut pinned, &geometry, &frequencies)?;
+            assert_eq!(
+                pinned.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                case.native_bits,
+                "native target full rotation at position {}",
+                case.position
             );
         }
         Ok(())

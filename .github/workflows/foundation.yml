@@ -1,0 +1,297 @@
+name: Foundation
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+  CARGO_BUILD_FINGERPRINT: content
+  PRISM_VERSION: '0.1.0'
+concurrency:
+  group: foundation-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+jobs:
+  windows:
+    name: windows / ${{ matrix.target }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reuse the exact native Rust compiler
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-${{ matrix.target }}
+      - name: Identify the host and external build lane
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $identity = rustc "+nightly-2026-10-22-$env:EXPECTED_TARGET" -vV
+          if ($identity -notcontains "host: $env:EXPECTED_TARGET") { throw 'Expected the native target compiler.' }
+          $identity
+          "PRISM_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'PrismInference-Target')" >> $env:GITHUB_ENV
+          "PRISM_CHECK_EVIDENCE=$(Join-Path $env:RUNNER_TEMP ('PrismInference-Checks-' + [guid]::NewGuid().ToString('N')))" >> $env:GITHUB_ENV
+      - name: Reuse Cargo sources and target artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ env.CARGO_TARGET_DIR }}
+          key: prism-runtime-v1-${{ matrix.target }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
+          restore-keys: |
+            prism-runtime-v1-${{ matrix.target }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-
+      - name: Check formatting, Release analyzers, documentation and complete correctness
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
+          Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'workspace.log') | Out-Null
+          try {
+            cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
+            cargo +nightly-2026-10-22 fmt --manifest-path $manifest --all -- --check
+            # Native bonsai-prism features require ggml and are checked in native-overlay.
+            cargo +nightly-2026-10-22 clippy --manifest-path $manifest --workspace --all-targets --locked --offline --release -- -D warnings
+            cargo +nightly-2026-10-22 doc --manifest-path $manifest --workspace --no-deps --locked --offline --release
+            cargo +nightly-2026-10-22 test --manifest-path $manifest --workspace --locked --offline --release --no-fail-fast
+            cargo +nightly-2026-10-22 build --manifest-path $manifest --workspace --bins --locked --offline --release
+          } finally { Stop-Transcript | Out-Null }
+      - name: Check feature-disabled compilation and scalar fallback
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'feature-variants.log') | Out-Null
+          try {
+            cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
+            cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
+            cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
+            cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
+            cargo +nightly-2026-10-22 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
+          } finally { Stop-Transcript | Out-Null }
+      - name: Verify immutable reference fixtures and kill the bounded mutation catalog
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $fixtures = Join-Path $env:GITHUB_WORKSPACE 'tools/ternary/tests/fixtures'
+          $provenance = Get-Content -LiteralPath (Join-Path $fixtures 'provenance.json') -Raw | ConvertFrom-Json -DateKind String
+          if ((Get-FileHash -LiteralPath (Join-Path $fixtures 'ptq-reference.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $provenance.fixtureSha256) { throw 'The immutable C++ codec corpus differs from its provenance.' }
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Mutations.ps1') -EvidenceDirectory (Join-Path $env:PRISM_CHECK_EVIDENCE 'mutations')
+      - name: Package the five checked Windows executables
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $build = Join-Path $env:CARGO_TARGET_DIR "$env:RELEASE_TARGET/release"
+          foreach ($name in @('prism-inference','bonsai-token-worker','bonsai-swift-worker','prism-inference-server','bonsai-gguf')) {
+            & (Join-Path $build ($name + '.exe')) --help
+          }
+          $output = Join-Path $env:RUNNER_TEMP ('PrismInference-Bundle-' + [guid]::NewGuid().ToString('N'))
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $env:RELEASE_TARGET -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-10-22-$env:RELEASE_TARGET" | ConvertTo-Json -Depth 8
+          "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
+      - name: Retain the checked release bundle and source receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-inference-${{ env.PRISM_VERSION }}-${{ matrix.target }}
+          path: |
+            ${{ env.PRISM_BUNDLE_DIRECTORY }}/*.zip
+            ${{ env.PRISM_BUNDLE_DIRECTORY }}/*.receipt.json
+          if-no-files-found: error
+      - name: Retain correctness and analyzer logs
+        if: always() && env.PRISM_CHECK_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-checks-${{ matrix.target }}-${{ github.run_id }}
+          path: ${{ env.PRISM_CHECK_EVIDENCE }}
+          if-no-files-found: error
+  native-overlay:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reuse the pinned Linux ARM64 Rust compiler
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-aarch64-unknown-linux-gnu
+      - name: Identify native Rust for the storage policy and regression
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustc +nightly-2026-10-22 -vV
+      - name: Select the ccache installation identity
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          "PRISM_PACKAGE_HOST=$env:ImageOS-$env:ImageVersion" >> $env:GITHUB_ENV
+      - name: Reuse ccache installation packages for this runner image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/SwiftBonsai-CcachePackages/*.deb
+          # Dependencies already installed by the image must match on a hit.
+          # Never restore these system packages across runner image versions.
+          key: prism-ccache-packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_PACKAGE_HOST }}
+      - name: Install ccache and select the native compiler cache identity
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not (Get-Command ccache -CommandType Application -ErrorAction SilentlyContinue)) {
+            $packageDirectory = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-CcachePackages'
+            [void][IO.Directory]::CreateDirectory($packageDirectory)
+            $packages = @(Get-ChildItem -LiteralPath $packageDirectory -Filter '*.deb' -File | ForEach-Object { $_.FullName })
+            if (-not $packages.Count) {
+              sudo apt-get update -qq
+              sudo apt-get --download-only -y --no-install-recommends -o "Dir::Cache::archives=$packageDirectory" install ccache
+              $packages = @(Get-ChildItem -LiteralPath $packageDirectory -Filter '*.deb' -File | ForEach-Object { $_.FullName })
+            }
+            if (-not $packages.Count) { throw 'The ccache installation packages are missing.' }
+            sudo dpkg --install @packages
+          }
+          $compiler = clang++ --version | Out-String
+          $ccache = ccache --version | Out-String
+          $identity = "$env:ImageOS-$env:ImageVersion-$compiler-$ccache"
+          $digest = [Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identity)))
+          "PRISM_CACHE_HOST=$digest" >> $env:GITHUB_ENV
+      # Keep native and Rust caches separate: changing Cargo paths must not
+      # invalidate every C++ object through the Actions cache path version.
+      - name: Reuse pinned source downloads and compiler objects
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/SwiftBonsai-PrismDownloads
+            ${{ runner.temp }}/SwiftBonsai-PrismCcache
+          key: prism-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-${{ hashFiles('tools/prism/**', 'scripts/Build-PrismEngine.ps1') }}
+          restore-keys: |
+            prism-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-
+      - name: Reuse locked Prism Rust downloads and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ runner.temp }}/SwiftBonsai-PrismRustChecks
+            ${{ runner.temp }}/SwiftBonsai-PrismRustBuild
+          key: prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/**', 'scripts/Build-PrismEngine.ps1', 'scripts/Bonsai.Rust.psm1', 'tests/Test-Rust.ps1', 'config/rust-packages.psd1', 'rust-toolchain.toml') }}-content-v1
+          restore-keys: |
+            prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-
+      - name: Check Rust and build the pinned engine with its Rust storage overlay
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        env:
+          CC: clang
+          CXX: clang++
+          CCACHE_DIR: ${{ runner.temp }}/SwiftBonsai-PrismCcache
+          CCACHE_MAXSIZE: 500M
+          CCACHE_COMPILERCHECK: content
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Expected native ARM64 source build.' }
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'tools/prism/Cargo.toml'
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismRustChecks'
+          cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
+          $checks = Join-Path $env:RUNNER_TEMP ('SwiftBonsai-PrismChecks-' + [guid]::NewGuid().ToString('N'))
+          "PRISM_CHECK_EVIDENCE=$checks" >> $env:GITHUB_ENV
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-10-22 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'policy') -FullTests -Offline | ConvertTo-Json -Depth 8
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1') -Force
+          $lock = Get-Content -Raw -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/prism/source.lock.json') | ConvertFrom-Json
+          $lane = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismDownloads'
+          [IO.Directory]::CreateDirectory($lane) | Out-Null
+          $archive = Join-Path $lane ("prism-source-$($lock.ArchiveSha256).zip")
+          $null = Receive-LockedArtifact -Uri $lock.ArchiveUrl -Path $archive -Bytes $lock.ArchiveBytes -Sha256 $lock.ArchiveSha256 -TimeoutSeconds 600
+          $rustBuild = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismRustBuild'
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismOverlay.ps1') -SourceArchive $archive -RustTargetDirectory $rustBuild
+          $launcher = (Get-Command ccache -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          $parallel = [Math]::Min(4, [Environment]::ProcessorCount)
+          ccache --zero-stats
+          $result = & (Join-Path $env:GITHUB_WORKSPACE 'scripts/Build-PrismEngine.ps1') -SourceArchive $archive -BuildMode All -Generator Ninja -Parallel $parallel -CompilerLauncher $launcher -RustTargetDirectory $rustBuild
+          $result | ConvertTo-Json -Depth 10
+          "BONSAI_PRISM_EVIDENCE=$($result.EvidenceDirectory)" >> $env:GITHUB_ENV
+          ctest --test-dir (Join-Path $result.EvidenceDirectory 'build-probe') --output-on-failure --timeout 60
+          if ($LASTEXITCODE) { throw 'Native immutable B-sharing regression failed.' }
+          $nativeLibraries = @(Get-ChildItem -LiteralPath (Join-Path $result.EvidenceDirectory 'build-probe') -Recurse -File | Where-Object { $_.Name -in @('libggml.a','libggml-cpu.a','libggml-base.a') })
+          $env:BONSAI_PRISM_NATIVE_LIB_DIR = @($nativeLibraries.DirectoryName | Sort-Object -Unique) -join [IO.Path]::PathSeparator
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-10-22 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'native') -CheckProfile Native -Phase clippy,doc -Offline | ConvertTo-Json -Depth 8
+          ccache --show-stats
+          'Rust sharing policy and native regression passed; pinned engine compiled and linked to Rust. Model TPS/quality remains unqualified.' >> $env:GITHUB_STEP_SUMMARY
+      - name: Retain source-build receipts and technical logs
+        if: always() && env.BONSAI_PRISM_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-storage-overlay-${{ github.run_id }}
+          path: |
+            ${{ env.BONSAI_PRISM_EVIDENCE }}/build-receipt.json
+            ${{ env.BONSAI_PRISM_EVIDENCE }}/command-*.log
+            ${{ env.BONSAI_PRISM_EVIDENCE }}/build-probe/Testing/Temporary/LastTest.log
+          if-no-files-found: error
+      - name: Retain Prism Rust check evidence
+        if: always() && env.PRISM_CHECK_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-rust-checks-${{ github.run_id }}
+          path: ${{ env.PRISM_CHECK_EVIDENCE }}
+          if-no-files-found: error
+
+  foundation:
+    if: always() && github.ref == 'refs/heads/main'
+    needs: [windows, native-overlay]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 2
+    steps:
+      - name: Require both Windows targets and the native overlay gate
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          if ! jq -e 'all(.[]; .result == "success")' <<< "$JOB_RESULTS"; then
+            echo "$JOB_RESULTS"
+            exit 1
+          fi

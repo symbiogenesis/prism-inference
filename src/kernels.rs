@@ -763,13 +763,18 @@ fn dot_integer(weights: &[i16], activations: &[i8]) -> f32 {
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
-fn dot_pq2(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
+fn dot_pq2<const FUSED: bool>(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
     let mut output = 0.0;
     for (index, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
         let activation = &input[index / 2];
         let start = (index % 2) * 128;
-        output += (scale(block)? * activation.scale)
-            * dot_integer(&pq2_values(block), &activation.values[start..start + 128]);
+        let d = scale(block)? * activation.scale;
+        let sum = dot_integer(&pq2_values(block), &activation.values[start..start + 128]);
+        output = if FUSED {
+            d.mul_add(sum, output)
+        } else {
+            output + d * sum
+        };
     }
     finite(output)
 }
@@ -785,16 +790,21 @@ fn dot_pq2(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
-fn dot_pq2_neon(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
+fn dot_pq2_neon<const FUSED: bool>(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
     let mut output = 0.0;
     for (index, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
         let activation = &input[index / 2];
         let start = (index % 2) * 128;
-        output += (scale(block)? * activation.scale)
-            * integer_float(neon::dot(
-                block[2..].try_into()?,
-                activation.values[start..start + 128].try_into()?,
-            ));
+        let d = scale(block)? * activation.scale;
+        let sum = integer_float(neon::dot(
+            block[2..].try_into()?,
+            activation.values[start..start + 128].try_into()?,
+        ));
+        output = if FUSED {
+            d.mul_add(sum, output)
+        } else {
+            output + d * sum
+        };
     }
     finite(output)
 }
@@ -971,7 +981,7 @@ pub fn packed_dot(kind: u32, count: usize, weights: &[u8], activations: &[u8]) -
                 &mut input,
             )?;
             if kind == PQ2 {
-                dot_pq2(weights, &input)
+                dot_pq2::<false>(weights, &input)
             } else if matches!(kind, 16..=19 | 21..=23 | 29 | 34 | 35) {
                 dot_additional(kind, weights, &[], &input)
             } else {
@@ -1025,6 +1035,7 @@ pub struct MatvecScratch {
     row: Vec<f32>,
     diagnostics: MatvecDiagnostics,
     statistics: MatvecStatistics,
+    pinned_accumulation: bool,
     #[cfg(test)]
     preparations: usize,
 }
@@ -1245,6 +1256,7 @@ impl Default for MatvecScratch {
             row: Vec::new(),
             diagnostics: MatvecDiagnostics::new(MatvecBackend::Auto),
             statistics: MatvecStatistics::default(),
+            pinned_accumulation: false,
             #[cfg(test)]
             preparations: 0,
         }
@@ -1334,6 +1346,14 @@ impl MatvecScratch {
         }
     }
 
+    /// Selects the pinned Windows ARM64 binary's graph arithmetic contract.
+    pub(crate) fn with_pinned_backend(backend: MatvecBackend) -> Self {
+        Self {
+            pinned_accumulation: true,
+            ..Self::with_backend(backend)
+        }
+    }
+
     /// Configured dispatch policy, preserved across preparation and failures.
     ///
     /// Individual operations may select scalar fallback. Use
@@ -1386,9 +1406,17 @@ impl MatvecScratch {
             target_feature = "neon"
         ))]
         if matches!(self.selected_backend(), MatvecBackend::ExperimentalNeon) {
-            return dot_pq2_neon;
+            return if self.pinned_accumulation {
+                dot_pq2_neon::<true>
+            } else {
+                dot_pq2_neon::<false>
+            };
         }
-        dot_pq2
+        if self.pinned_accumulation {
+            dot_pq2::<true>
+        } else {
+            dot_pq2::<false>
+        }
     }
 
     const fn select_q8_groups(&mut self) -> Q8GroupRowKernel {
@@ -1728,6 +1756,44 @@ mod tests {
     use super::{
         MatvecScratch, Tensor, matvec_into, q8_into, q8k_into, rms_norm, rms_norm_pinned_into,
     };
+
+    #[test]
+    fn pinned_pq2_accumulation_matches_independent_native_binary_capture() -> crate::Result<()> {
+        // Pinned 73bfe6cc Windows ARM64 ggml-cpu.dll, SHA256
+        // 701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab.
+        // Invoke its type-142 vec_dot with these exact native packed buffers;
+        // expected bits are the captured native result, not a Rust FMA oracle.
+        let mut weights = [0xaa; 68];
+        weights[..2].copy_from_slice(&0x3c01_u16.to_le_bytes());
+        weights[34..36].copy_from_slice(&0x3787_u16.to_le_bytes());
+        let mut values = [3; 256];
+        values[128..].fill(-13);
+        let mut sums = [48; 16];
+        sums[8..].fill(-208);
+        let activations = [super::Q8KBlock {
+            scale: f32::from_bits(0x3da0_0001),
+            values,
+            sums,
+        }];
+        for backend in [
+            super::MatvecBackend::Scalar,
+            super::MatvecBackend::Auto,
+            super::MatvecBackend::ExperimentalNeon,
+        ] {
+            let mut pinned = MatvecScratch::with_pinned_backend(backend);
+            assert_eq!(
+                pinned.select_pq2()(&weights, &activations)?.to_bits(),
+                0xc1f9_0b01
+            );
+            // Public scalar/native-packed APIs retain the non-fused source order.
+            let mut reference = MatvecScratch::with_backend(backend);
+            assert_eq!(
+                reference.select_pq2()(&weights, &activations)?.to_bits(),
+                0xc1f9_0b02
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn pinned_fused_rms_matches_independent_native_binary_capture() -> crate::Result<()> {

@@ -981,7 +981,7 @@ impl Qwen35 {
             workspace: Workspace {
                 deltas,
                 projection: ProjectionScratch {
-                    matvec: MatvecScratch::with_backend(backend),
+                    matvec: MatvecScratch::with_pinned_backend(backend),
                     ..ProjectionScratch::default()
                 },
                 ..Workspace::default()

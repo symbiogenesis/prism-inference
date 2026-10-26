@@ -185,6 +185,26 @@ Neither a successful PTQ1 load nor changed generated text settles the adapter's
 authoring basis. These correctness captures contain no benchmarks and cannot
 substitute for the separate target-device quality/performance gates.
 
+The bounded 2026-10-26 capture at runtime revision `934fb13` is **not qualified**.
+It used the exact current-weight PTQ1 export, pinned publisher runtime
+`73bfe6cc`, supplied token IDs `[248045, 872, 198]`, an 8K context, FP16 KV,
+F32 recurrent state and the existing `1e-3 + 1e-3 * abs(reference)` tolerance:
+
+| Comparison | Bounded result |
+| --- | --- |
+| Rust scalar PTQ1 against native PTQ1 | 2,691,842 of 118,611,456 logits/state values exceed tolerance across 483 files; maximum absolute error 0.19140625; no file is byte-identical. |
+| Native PTQ1 against compatible prior native PQ2 | 593,835 of 744,960 logits exceed the same bound; maximum absolute error 0.10386914014816284. Prior report controls and each reused logits hash were verified. |
+
+Both comparisons retain the greedy IDs `[198, 198, 220]` for these three supplied
+inputs. This small observation establishes neither output-quality equivalence
+nor successful same-format numerical parity. The PTQ1 scalar/native mismatch
+must be diagnosed without relaxing the frozen tolerance. The comparison between
+representations remains a distinct question because activation arithmetic differs.
+NEON, adapter correctness, longer contexts and quality/performance qualification
+were not run in this quick local check. Successful native loading and the exact
+weight repack remain separate, narrower results. No default, service selection
+or production memory requirement was changed by this diagnostic evidence.
+
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five

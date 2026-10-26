@@ -237,6 +237,32 @@ performance measurement, service enablement, default or memory-policy change
 is claimed. The prepared one-token check can reuse the existing pinned native
 reference when the unchanged admission requirements are available.
 
+### Conditional PTQ1 admission trial
+
+The owner subsequently authorized a provisional reduction of 1,259,520,000 bytes
+from the 16 GiB admission requirement, conditional on successful checks. At
+15,920,349,184 bytes (about 14.827 GiB), the corrected automatic backend completed
+one supplied token `[248045]` with the unchanged 12 GiB Job limit and 4 GiB
+physical reserve. The checker was built from `45fdd85`; later repair commits
+only changed a test assertion and fixture metadata. No further production
+arithmetic changed between that build and `e2d8d6f`.
+
+Against the retained pinned native PTQ1 reference, 430,526 of 39,504,384 complete
+logits/live-state values exceeded `1e-3 + 1e-3 * abs(reference)` across 129 files.
+Maximum absolute error was 0.06584501266479492. The greedy ID was 198 in both
+implementations, and 28 state files were byte-identical. The first nonexact
+stored state belongs to zero-based block 14; the first stored state outside
+tolerance belongs to block 15. This localizes the next investigation boundary,
+not the exact first divergent graph operation.
+
+The resource checks passed, but numerical parity did not. The conditional
+admission reduction was therefore reverted, with production admission retained
+at 16 GiB. The provisional policy patch, snapshots, comparison hashes and failure
+receipt remain outside Git in the admission-trial evidence lane. Runner's
+[repair receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/docs/ptq1-arithmetic-evidence.json)
+records the bounded result. No benchmark, quality/adapter qualification, default
+change or additional model capture followed this failure.
+
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five

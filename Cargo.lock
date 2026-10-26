@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bonsai-windows-credentials",
  "bonsai-windows-process",

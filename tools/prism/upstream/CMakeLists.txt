@@ -21,5 +21,5 @@ add_subdirectory("${PRISM_SOURCE_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
 # This process is an adapter to production ggml only. The safe Rust suite owns
 # case generation, independent references and pass/fail decisions.
-add_executable(prism-upstream-bridge bridge.cpp)
-target_link_libraries(prism-upstream-bridge PRIVATE ggml ggml-cpu)
+include("${CMAKE_CURRENT_LIST_DIR}/RustBridge.cmake")
+add_prism_rust_ggml_bridge()

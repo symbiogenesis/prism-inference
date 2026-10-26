@@ -162,6 +162,7 @@ impl Arithmetic {
         }
     }
 
+    #[cfg(test)]
     #[allow(
         clippy::cast_possible_truncation,
         clippy::as_conversions,
@@ -191,6 +192,47 @@ impl Arithmetic {
                     .map(|past| half_to_float(past[dimension]))
                     .chain(std::iter::once(current)),
                 probabilities,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "Preserve each channel's binary64 sum and final binary32 rounding."
+    )]
+    fn attention_value_tile(
+        self,
+        values: &KvCache,
+        current: &[f32],
+        offset: usize,
+        probabilities: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        match self {
+            Self::Source => {
+                // Match Iterator::sum's initial value, including signed zero.
+                // One 32-channel stack tile costs 256 bytes and retains each
+                // channel's token order while reading adjacent FP16 values.
+                let zero = std::iter::empty::<f64>().sum::<f64>();
+                let mut sums = [zero; crate::kernels::pinned_attention::VALUE_TILE];
+                for (past, &probability) in values.tokens().zip(probabilities) {
+                    for (sum, &value) in sums.iter_mut().zip(&past[offset..offset + output.len()]) {
+                        *sum += f64::from(probability * half_to_float(value));
+                    }
+                }
+                let probability = probabilities[probabilities.len() - 1];
+                for ((out, sum), &value) in output.iter_mut().zip(sums).zip(current) {
+                    *out = (sum + f64::from(probability * value)) as f32;
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile(
+                values.tokens(),
+                current,
+                probabilities,
+                offset,
+                output,
             ),
         }
     }
@@ -1476,12 +1518,17 @@ impl Evaluation<'_> {
                 *probability = round_f16(*probability);
             }
             let result = &mut scratch.attended[head * g.head..(head + 1) * g.head];
-            for (dimension, out) in result.iter_mut().enumerate() {
-                *out = self.arithmetic.attention_values(
+            for (tile, out) in result
+                .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                .enumerate()
+            {
+                let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
+                self.arithmetic.attention_value_tile(
                     values,
-                    value[offset + dimension],
+                    &value[offset + dimension..offset + dimension + out.len()],
                     offset + dimension,
                     scores,
+                    out,
                 )?;
             }
         }
@@ -2890,6 +2937,60 @@ mod tests {
         );
         assert_ne!(half_bits(actual[pair]), half_bits(out_of_place[pair]));
         assert_eq!(input.position(), u64::try_from(input.get_ref().len())?);
+        Ok(())
+    }
+
+    #[test]
+    fn attention_value_tiles_preserve_strided_oracle_bits_across_cache_pages() -> Result<()> {
+        let width = 71;
+        let tile_width = crate::kernels::pinned_attention::VALUE_TILE;
+        let cases = [0_u16, 0x8000, 1, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff];
+        for history in [
+            0, 1, 14, 15, 16, 17, 63, 64, 65, 127, 128, 129, 254, 255, 256, 257, 8191,
+        ] {
+            let mut cache = KvCache::new(width, history + 1)?;
+            for position in 0..history {
+                let values: Vec<f32> = (0..width)
+                    .map(|dimension| half_to_float(cases[(position + dimension) % cases.len()]))
+                    .collect();
+                cache.reserve_append()?;
+                cache.append(&values);
+            }
+            let current: Vec<f32> = (0..width)
+                .map(|dimension| half_to_float(cases[(history + dimension) % cases.len()]))
+                .collect();
+            for weights in [[0.5_f32, -0.25, 0.125, 0.0, -0.0], [-0.0; 5]] {
+                let probabilities: Vec<f32> = (0..=history)
+                    .map(|position| weights[position % weights.len()])
+                    .collect();
+                for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+                    let mut actual = vec![f32::NAN; width];
+                    for (tile, output) in actual.chunks_mut(tile_width).enumerate() {
+                        let offset = tile * tile_width;
+                        arithmetic.attention_value_tile(
+                            &cache,
+                            &current[offset..offset + output.len()],
+                            offset,
+                            &probabilities,
+                            output,
+                        )?;
+                    }
+                    for (dimension, actual) in actual.into_iter().enumerate() {
+                        let expected = arithmetic.attention_values(
+                            &cache,
+                            current[dimension],
+                            dimension,
+                            &probabilities,
+                        )?;
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "history {history}, channel {dimension}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

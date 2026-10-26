@@ -12,6 +12,70 @@
 use crate::{Result, invalid};
 
 const CACHE_PADDING: usize = 256;
+/// A contiguous cache-line-sized segment of binary16 value channels.
+pub(crate) const VALUE_TILE: usize = 32;
+
+/// Reduces adjacent value channels without rereading the paged cache per channel.
+///
+/// Each channel retains [`dot`]'s exact FMA lanes, zero padding and reduction
+/// tree. The fixed stack accumulator occupies 2 KiB; no cache is expanded.
+///
+/// # Errors
+/// Rejects invalid tile/row geometry, unequal token counts and nonfinite results.
+pub(crate) fn value_tile<'a>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[f32],
+    offset: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    if output.is_empty()
+        || output.len() > VALUE_TILE
+        || current.len() != output.len()
+        || weights.is_empty()
+        || weights.len() > crate::model::swift::CONTEXT_TOKENS
+    {
+        return Err(invalid("invalid pinned attention value tile"));
+    }
+    let end = offset
+        .checked_add(output.len())
+        .ok_or_else(|| invalid("pinned attention value offset overflow"))?;
+    let mut sums = [[[0.0_f32; 4]; 4]; VALUE_TILE];
+    let last = weights.len() - 1;
+    for (index, &weight) in weights[..last].iter().enumerate() {
+        let values = past
+            .next()
+            .and_then(|row| row.get(offset..end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        for (sum, &value) in sums.iter_mut().zip(values) {
+            let lane = &mut sum[index % 16 / 4][index % 4];
+            *lane = bonsai_ternary::half_to_float(value).mul_add(weight, *lane);
+        }
+    }
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    for (sum, &value) in sums.iter_mut().zip(current) {
+        let lane = &mut sum[last % 16 / 4][last % 4];
+        *lane = value.mul_add(weights[last], *lane);
+    }
+    // Zero FMAs are observable for signed zero, so retain every masked lane.
+    let physical = weights.len().div_ceil(CACHE_PADDING) * CACHE_PADDING;
+    for index in weights.len()..physical {
+        for sum in &mut sums[..output.len()] {
+            let lane = &mut sum[index % 16 / 4][index % 4];
+            *lane = 0.0_f32.mul_add(0.0, *lane);
+        }
+    }
+    for (out, sum) in output.iter_mut().zip(sums) {
+        let mut lanes = [0.0; 4];
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            *lane = (sum[0][index] + sum[2][index]) + (sum[1][index] + sum[3][index]);
+        }
+        *out = super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+    }
+    Ok(())
+}
 
 /// Reduces decoded F16 operands with the pinned four-register F32 FMA tree.
 ///
@@ -161,7 +225,7 @@ mod tests {
     use bonsai_ternary::half_to_float;
     use serde::Deserialize;
 
-    use super::{dot, softmax};
+    use super::{VALUE_TILE, dot, softmax, value_tile};
 
     #[derive(Deserialize)]
     struct Capture {
@@ -244,6 +308,62 @@ mod tests {
         assert!(dot([].into_iter(), &[1.0]).is_err());
         assert!(dot([1.0, 2.0].into_iter(), &[1.0]).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn pinned_value_tiles_match_native_capture_and_visit_each_cached_row_once() -> crate::Result<()>
+    {
+        let capture: Capture = serde_json::from_str(include_str!(
+            "../../tests/fixtures/swift-attention-dot.json"
+        ))?;
+        let values = capture.weighted_value;
+        let rows: Vec<[u16; VALUE_TILE]> = values.values[..values.values.len() - 1]
+            .iter()
+            .map(|&value| [value; VALUE_TILE])
+            .collect();
+        let current = [half_to_float(values.values[values.values.len() - 1]); VALUE_TILE];
+        let probabilities: Vec<f32> = values
+            .probabilities
+            .into_iter()
+            .map(half_to_float)
+            .collect();
+        let visits = std::cell::Cell::new(0);
+        let past = rows.iter().map(<[u16; VALUE_TILE]>::as_slice).inspect(|_| {
+            visits.set(visits.get() + 1);
+        });
+        let mut output = [f32::NAN; VALUE_TILE];
+        value_tile(past, &current, &probabilities, 0, &mut output)?;
+        assert!(
+            output
+                .iter()
+                .all(|value| value.to_bits() == values.expected)
+        );
+        assert_eq!(visits.get(), rows.len());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_value_tiles_reject_malformed_extents_and_nonfinite_results() {
+        let row = [0x3c00_u16, 0x4000];
+        let mut output = [19.0];
+        assert!(value_tile([row.as_slice()].into_iter(), &[1.0], &[1.0], 0, &mut output).is_err());
+        assert!(value_tile([].into_iter(), &[1.0], &[1.0, 1.0], 0, &mut output).is_err());
+        assert!(
+            value_tile(
+                [row.as_slice()].into_iter(),
+                &[1.0],
+                &[1.0, 1.0],
+                2,
+                &mut output
+            )
+            .is_err()
+        );
+        assert!(value_tile([].into_iter(), &[], &[1.0], 0, &mut output).is_err());
+        assert!(value_tile([].into_iter(), &[1.0], &[], 0, &mut output).is_err());
+        assert!(value_tile([].into_iter(), &[1.0], &[1.0], usize::MAX, &mut output).is_err());
+        assert!(value_tile([].into_iter(), &[f32::MAX], &[2.0], 0, &mut output).is_err());
+        assert!(value_tile([].into_iter(), &[f32::NAN], &[1.0], 0, &mut output).is_err());
+        assert_eq!(output, [19.0]);
     }
 
     #[test]

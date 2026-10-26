@@ -42,7 +42,7 @@ required-features = ["cli"]
 aho-corasick = "=1.1.5"
 bonsai-ternary = { version = "=0.1.0", path = "tools/ternary" }
 bonsai-gguf = { version = "=0.1.0", path = "tools/gguf", default-features = false }
-bonsai-prism = { version = "=0.1.0", path = "tools/prism" }
+bonsai-prism = { version = "=0.1.1", path = "tools/prism" }
 serde_json = { version = "=1.0.154", optional = true }
 serde = { version = "=1.0.229", optional = true, features = ["derive"] }
 regex = "=1.13.1"

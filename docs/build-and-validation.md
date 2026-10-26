@@ -151,6 +151,40 @@ payload is capped at 8 GiB. Retain absolute external outputs and the existing
 process-memory/deadline supervision. No timings or throughput are measured.
 The evidence-write guards run in the ordinary hosted correctness suite.
 
+PQ2 remains the default and the service MVP's only selected representation.
+For the verified lossless export of those same current weights, prefix the
+offline checker command with `--use-repacked-ptq1`:
+
+```text
+swift_model_check --use-repacked-ptq1 forward <absolute-current-repacked-PTQ1-model> <existing-absolute-evidence-dir> <scalar|auto|neon> <id,id,...>
+```
+
+The prefix also applies to `inspect`, `load` and `trajectory`. It admits only
+the current-weight export with SHA-256
+`e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5`,
+5,946,648,928 complete file bytes and the strict 851-tensor PTQ1/F32/BF16
+inventory. The older publisher PTQ1 checkpoint is not admitted. Receipts include
+the selected representation and its actual artifact identity. The existing
+`swift::load`, `swift::inspect` and service paths continue to select PQ2; the
+explicit `load_representation`/`inspect_representation` APIs serve this offline
+correctness lane. This does not enable PTQ1 or adapters in the Rust service.
+
+Compare PTQ1 snapshots against the same verified PTQ1 file executed by the pinned
+publisher Prism CPU implementation, using the existing declared full-model
+numerical tolerances. Scalar/NEON self-comparison alone is insufficient. Keep
+the exact supplied token IDs, context, KV/state types, transforms and per-token
+logical state extents matched. Equal PQ2/PTQ1 decoded weights do not establish
+equal logits: PQ2 uses Q8_K activations on complete rows, while PTQ1 uses Q8_0.
+A comparison between representations therefore has a separate quality decision;
+do not loosen the trusted same-format correctness tolerance to make it pass.
+
+The Rust graph does not implement adapter forward execution. An approved LoRA's
+load-at-zero logits identity, nonzero correction and Swift grouped-SSM input
+ordering must be verified at native residual writers before adapter qualification.
+Neither a successful PTQ1 load nor changed generated text settles the adapter's
+authoring basis. These correctness captures contain no benchmarks and cannot
+substitute for the separate target-device quality/performance gates.
+
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five

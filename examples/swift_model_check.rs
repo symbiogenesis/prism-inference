@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::MatvecBackend;
-use bonsai_prism_runtime::model::swift;
+use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::runtime::greedy;
 use bonsai_prism_runtime::token_input::read_tokens;
 use bonsai_prism_runtime::{Decoder, Result};
@@ -20,6 +20,7 @@ const USAGE: &str = concat!(
     "Usage: swift_model_check <inspect|load> <absolute-model>\n",
     "       swift_model_check forward <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check trajectory <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>\n",
+    "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -50,7 +51,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let representation = select_representation(&mut arguments);
     if arguments.len() == 1 && arguments[0] == "--help" {
         std::io::stdout().lock().write_all(USAGE.as_bytes())?;
         return Ok(());
@@ -71,14 +73,18 @@ fn run() -> Result<()> {
         if arguments.len() != 2 {
             return Err(reject("inspect takes only the model path"));
         }
-        return report("header-verified", swift::inspect(&path, MODEL_BUDGET)?);
+        return report(
+            "header-verified",
+            swift::inspect_representation(&path, MODEL_BUDGET, representation)?,
+            representation,
+        );
     }
     if mode == "load" {
         if arguments.len() != 2 {
             return Err(reject("load takes only the model path"));
         }
-        let (model, receipt) = swift::load(&path, MODEL_BUDGET)?;
-        report("weights-loaded", receipt)?;
+        let (model, receipt) = swift::load_representation(&path, MODEL_BUDGET, representation)?;
+        report("weights-loaded", receipt, representation)?;
         let graph = Qwen35::with_state_budget(
             model,
             swift::CONTEXT_TOKENS,
@@ -90,9 +96,21 @@ fn run() -> Result<()> {
         );
     }
     match mode.as_str() {
-        "forward" => forward(&path, &arguments[2..]),
-        "trajectory" => trajectory(&path, &arguments[2..]),
+        "forward" => forward(&path, &arguments[2..], representation),
+        "trajectory" => trajectory(&path, &arguments[2..], representation),
         _ => Err(reject("unsupported evaluation mode")),
+    }
+}
+
+fn select_representation(arguments: &mut Vec<String>) -> Representation {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--use-repacked-ptq1")
+    {
+        arguments.remove(0);
+        Representation::CurrentRepackedPtq1
+    } else {
+        Representation::Pq2
     }
 }
 
@@ -117,13 +135,17 @@ fn valid_tokens(tokens: &[u32]) -> bool {
             .all(|&token| usize::try_from(token).is_ok_and(|id| id < swift::VOCAB_SIZE))
 }
 
-fn load_graph(path: &Path, backend: MatvecBackend) -> Result<Qwen35> {
-    let (model, receipt) = swift::load(path, MODEL_BUDGET)?;
-    report("weights-loaded", receipt)?;
+fn load_graph(
+    path: &Path,
+    backend: MatvecBackend,
+    representation: Representation,
+) -> Result<Qwen35> {
+    let (model, receipt) = swift::load_representation(path, MODEL_BUDGET, representation)?;
+    report("weights-loaded", receipt, representation)?;
     Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, 1024 * 1024 * 1024, backend)
 }
 
-fn forward(path: &Path, arguments: &[String]) -> Result<()> {
+fn forward(path: &Path, arguments: &[String], representation: Representation) -> Result<()> {
     if arguments.len() != 3 {
         return Err(reject(
             "forward requires output directory, backend and token IDs",
@@ -137,7 +159,7 @@ fn forward(path: &Path, arguments: &[String]) -> Result<()> {
     if !valid_tokens(&tokens) || tokens.len() > 16 {
         return Err(reject("forward requires 1..16 valid token IDs"));
     }
-    let mut graph = load_graph(path, backend)?;
+    let mut graph = load_graph(path, backend, representation)?;
     let mut logits = Vec::new();
     let mut remaining = usize::MAX;
     for (position, token) in tokens.into_iter().enumerate() {
@@ -150,7 +172,7 @@ fn forward(path: &Path, arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn trajectory(path: &Path, arguments: &[String]) -> Result<()> {
+fn trajectory(path: &Path, arguments: &[String], representation: Representation) -> Result<()> {
     if arguments.len() != 4 {
         return Err(reject(
             "trajectory requires output directory, backend, prompt-ID file and greedy steps",
@@ -179,7 +201,7 @@ fn trajectory(path: &Path, arguments: &[String]) -> Result<()> {
     emit(
         &json!({"event":"trajectory-start","prompt_token_ids":prompt,"prompt_tokens":prompt.len(),"greedy_steps":steps,"context_tokens":swift::CONTEXT_TOKENS,"maximum_snapshot_payload_bytes":MAX_TRAJECTORY_EVIDENCE_BYTES,"snapshot_count":steps+1,"stop_policy":"fixed-step raw greedy; special IDs are included"}),
     )?;
-    let mut graph = load_graph(path, backend)?;
+    let mut graph = load_graph(path, backend, representation)?;
     for &token in intermediate {
         graph.ingest(token)?;
     }
@@ -255,15 +277,40 @@ fn dump_state(graph: &Qwen35, states: &Path, remaining: &mut usize) -> Result<()
     })
 }
 
-fn report(event: &str, receipt: swift::LoadReceipt) -> Result<()> {
-    emit(
-        &json!({"event":event,"model_sha256":swift::MODEL_SHA256,"model_bytes":swift::MODEL_BYTES,"header_charge_bytes":receipt.header_charge_bytes,"tensor_payload_bytes":receipt.tensor_payload_bytes,"retained_storage_bytes":receipt.retained_storage_bytes,"largest_tensor_conversion_copy_bytes":receipt.largest_tensor_bytes,"tensor_counts_f32_bf16_pq2":receipt.tensor_counts,"model_storage_budget_bytes":MODEL_BUDGET,"memory_claim":"retained storage accounting; process working set and peak commit are separate"}),
-    )
+fn report(event: &str, receipt: swift::LoadReceipt, representation: Representation) -> Result<()> {
+    let mut record = json!({"event":event,"weight_representation":representation.name(),"model_sha256":representation.model_sha256(),"model_bytes":representation.model_bytes(),"header_charge_bytes":receipt.header_charge_bytes,"tensor_payload_bytes":receipt.tensor_payload_bytes,"retained_storage_bytes":receipt.retained_storage_bytes,"largest_tensor_conversion_copy_bytes":receipt.largest_tensor_bytes,"tensor_counts_f32_bf16_packed":receipt.tensor_counts,"model_storage_budget_bytes":MODEL_BUDGET,"memory_claim":"retained storage accounting; process working set and peak commit are separate"});
+    // Retain the original PQ2 evidence key without falsely naming PTQ1 counts PQ2.
+    if representation == Representation::Pq2 {
+        record["tensor_counts_f32_bf16_pq2"] = json!(receipt.tensor_counts);
+    }
+    emit(&record)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Result, write_values};
+    use super::{Representation, Result, select_representation, write_values};
+
+    #[test]
+    fn ptq1_correctness_capture_requires_explicit_prefix_and_keeps_source_default() {
+        let mut source = vec!["inspect".to_owned(), "model.gguf".to_owned()];
+        assert_eq!(select_representation(&mut source), Representation::Pq2);
+        assert_eq!(source, ["inspect", "model.gguf"]);
+
+        let mut exported = vec![
+            "--use-repacked-ptq1".to_owned(),
+            "forward".to_owned(),
+            "export.gguf".to_owned(),
+        ];
+        assert_eq!(
+            select_representation(&mut exported),
+            Representation::CurrentRepackedPtq1
+        );
+        assert_eq!(exported, ["forward", "export.gguf"]);
+
+        let mut misplaced = vec!["inspect".to_owned(), "--use-repacked-ptq1".to_owned()];
+        assert_eq!(select_representation(&mut misplaced), Representation::Pq2);
+        assert_eq!(misplaced, ["inspect", "--use-repacked-ptq1"]);
+    }
 
     #[test]
     fn snapshot_output_preserves_existing_evidence_and_enforces_payload_budget() -> Result<()> {

@@ -1,7 +1,8 @@
-//! Exact, immutable Swift PQ2 model admission and retained-storage accounting.
+//! Exact Swift model admission and retained-storage accounting.
 //!
-//! This is the one-model MVP boundary. Full-model numerical qualification and
-//! process-memory admission are separate from successful verified loading.
+//! PQ2 remains the service MVP default. The explicit current-weight PTQ1 lane
+//! permits correctness captures; it does not qualify the service or adapters.
+//! Full-model numerical and process-memory qualification remain separate.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,6 +20,11 @@ use crate::{Result, invalid};
 pub const MODEL_BYTES: u64 = 7_206_168_928;
 /// Immutable pinned Swift PQ2 artifact identity.
 pub const MODEL_SHA256: &str = "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5";
+/// Exact verified current-weight PTQ1 export length, not the older publisher model.
+pub const REPACKED_PTQ1_BYTES: u64 = 5_946_648_928;
+/// Immutable current-weight export identity from Runner's PTQ1 export receipt.
+pub const REPACKED_PTQ1_SHA256: &str =
+    "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
 /// Exact embedded UTF-8 template identity in the verified artifact.
 pub const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
@@ -35,6 +41,69 @@ pub const STATE_PAYLOAD_BYTES: usize = 693_764_096;
 
 const SIGN_SHA256: &str = "3d1ea9136a6044cd680cc1e92cde65e9dd7238e1288fe2effabec5d201c48bed";
 
+/// Exact current-weight artifact selected for an offline correctness capture.
+///
+/// Both choices retain the same decoded weights. Their native activation
+/// quantizers differ, so this selection does not promise equal model outputs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Representation {
+    /// Original pinned current-weight PQ2 artifact and service default.
+    #[default]
+    Pq2,
+    /// Verified lossless repack of the current PQ2 weights, not older PTQ weights.
+    CurrentRepackedPtq1,
+}
+
+impl Representation {
+    /// Stable evidence identity distinguishing the source from its exact export.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pq2 => "PQ2_0",
+            Self::CurrentRepackedPtq1 => "current-repacked-PTQ1_0",
+        }
+    }
+
+    /// Complete immutable artifact length, including GGUF metadata and alignment.
+    #[must_use]
+    pub const fn model_bytes(self) -> u64 {
+        match self {
+            Self::Pq2 => MODEL_BYTES,
+            Self::CurrentRepackedPtq1 => REPACKED_PTQ1_BYTES,
+        }
+    }
+
+    /// SHA-256 of the only artifact admitted by this representation.
+    #[must_use]
+    pub const fn model_sha256(self) -> &'static str {
+        match self {
+            Self::Pq2 => MODEL_SHA256,
+            Self::CurrentRepackedPtq1 => REPACKED_PTQ1_SHA256,
+        }
+    }
+
+    const fn tensor_kind(self) -> u32 {
+        match self {
+            Self::Pq2 => 142,
+            Self::CurrentRepackedPtq1 => 143,
+        }
+    }
+
+    const fn file_type(self) -> u64 {
+        match self {
+            Self::Pq2 => 141,
+            Self::CurrentRepackedPtq1 => 143,
+        }
+    }
+
+    const fn tensor_payload_bytes(self) -> usize {
+        match self {
+            Self::Pq2 => TENSOR_PAYLOAD_BYTES,
+            Self::CurrentRepackedPtq1 => 5_935_527_936,
+        }
+    }
+}
+
 /// Conservative loader accounting; this is not a process resident-set verdict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadReceipt {
@@ -46,7 +115,7 @@ pub struct LoadReceipt {
     pub retained_storage_bytes: usize,
     /// Largest tensor; shared-storage conversion can transiently copy this much.
     pub largest_tensor_bytes: usize,
-    /// Counts in F32, BF16 and PQ2 order.
+    /// Counts in F32, BF16 and selected packed-representation order.
     pub tensor_counts: [usize; 3],
 }
 
@@ -62,8 +131,30 @@ pub struct LoadReceipt {
 /// Rejects artifact drift, unsupported/malformed metadata, any extra or missing
 /// tensor, encoding/dimension drift, insufficient storage budgets and I/O errors.
 pub fn load(path: &Path, memory_limit: usize) -> Result<(Model, LoadReceipt)> {
-    let (reader, receipt) = verify(path, memory_limit)?;
-    let model = Model::load_verified(reader, MODEL_SHA256, memory_limit, &mut |_| Ok(true))?;
+    load_representation(path, memory_limit, Representation::Pq2)
+}
+
+/// Loads the exact selected current-weight representation for correctness checks.
+///
+/// This retains the same strict metadata, tensor geometry and storage budget as
+/// [`load`]. PTQ1 selection admits only the verified current-weight export and
+/// does not enable a service profile, adapters or performance qualification.
+///
+/// # Errors
+/// Rejects changed artifacts, mixed representations, inventory/metadata drift,
+/// insufficient retained-storage budgets and invalid executable tensor values.
+pub fn load_representation(
+    path: &Path,
+    memory_limit: usize,
+    representation: Representation,
+) -> Result<(Model, LoadReceipt)> {
+    let (reader, receipt) = verify(path, memory_limit, representation)?;
+    let model = Model::load_verified(
+        reader,
+        representation.model_sha256(),
+        memory_limit,
+        &mut |_| Ok(true),
+    )?;
     Ok((model, receipt))
 }
 
@@ -76,14 +167,39 @@ pub fn load(path: &Path, memory_limit: usize) -> Result<(Model, LoadReceipt)> {
 /// # Errors
 /// Rejects changed identity, declarations, inventory or the model storage budget.
 pub fn inspect(path: &Path, memory_limit: usize) -> Result<LoadReceipt> {
-    Ok(verify(path, memory_limit)?.1)
+    inspect_representation(path, memory_limit, Representation::Pq2)
 }
 
-fn verify(path: &Path, memory_limit: usize) -> Result<(VerifiedModel, LoadReceipt)> {
-    let reader = VerifiedModel::open(path, PRISM_DIALECT, MODEL_BYTES, MODEL_SHA256, memory_limit)?;
-    validate_metadata(reader.metadata())?;
+/// Verifies only the pinned artifact and strict header of an explicit representation.
+///
+/// As with [`inspect`], hashing reads the complete file without retaining weights;
+/// a successful receipt is not a numerical, service or memory-residency verdict.
+///
+/// # Errors
+/// Rejects changed identity, declarations, inventory or the model storage budget.
+pub fn inspect_representation(
+    path: &Path,
+    memory_limit: usize,
+    representation: Representation,
+) -> Result<LoadReceipt> {
+    Ok(verify(path, memory_limit, representation)?.1)
+}
+
+fn verify(
+    path: &Path,
+    memory_limit: usize,
+    representation: Representation,
+) -> Result<(VerifiedModel, LoadReceipt)> {
+    let reader = VerifiedModel::open(
+        path,
+        PRISM_DIALECT,
+        representation.model_bytes(),
+        representation.model_sha256(),
+        memory_limit,
+    )?;
+    validate_metadata_for(reader.metadata(), representation)?;
     let (tensor_counts, tensor_payload_bytes, largest_tensor_bytes) =
-        validate_inventory(reader.tensors())?;
+        validate_inventory(reader.tensors(), representation)?;
     let header_charge_bytes = reader.retained_bytes();
     let retained_storage_bytes = header_charge_bytes
         .checked_add(tensor_payload_bytes)
@@ -112,11 +228,15 @@ fn verify(path: &Path, memory_limit: usize) -> Result<(VerifiedModel, LoadReceip
 ///
 /// # Errors
 /// Rejects missing, extra or changed pinned metadata declarations.
+pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
+    validate_metadata_for(metadata, Representation::Pq2)
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete one-model metadata contract together."
+    reason = "Keep the exact shared metadata contract and representation discriminator together."
 )]
-pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
+fn validate_metadata_for(metadata: &Metadata, representation: Representation) -> Result<()> {
     if metadata.len() != 49 {
         return Err(invalid("Swift metadata inventory mismatch"));
     }
@@ -163,7 +283,7 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
         ("tokenizer.ggml.padding_token_id", 248_044),
         ("tokenizer.ggml.bos_token_id", 248_044),
         ("general.quantization_version", 2),
-        ("general.file_type", 141),
+        ("general.file_type", representation.file_type()),
     ] {
         if metadata.get(key).and_then(MetadataValue::as_u64) != Some(value) {
             return Err(invalid(format!("Swift metadata mismatch: {key}")));
@@ -225,7 +345,7 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
     if hex(sign_hash) != SIGN_SHA256 {
         return Err(invalid("Swift Hadamard sign identity mismatch"));
     }
-    let expected = expected_tensors();
+    let expected = expected_tensors(representation);
     let transformed = metadata
         .get("prism.hadamard.weight_names")
         .and_then(MetadataValue::as_array)
@@ -236,7 +356,9 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
             .as_str()
             .ok_or_else(|| invalid("Swift transform names must be strings"))?;
         if name == "token_embd.weight"
-            || expected.get(name).is_none_or(|spec| spec.0 != 142)
+            || expected
+                .get(name)
+                .is_none_or(|spec| spec.0 != representation.tensor_kind())
             || !names.insert(name)
         {
             return Err(invalid("Swift Hadamard weight inventory mismatch"));
@@ -305,10 +427,11 @@ fn hex(hash: Sha256) -> String {
         .collect()
 }
 
-fn expected_tensors() -> BTreeMap<String, (u32, Vec<u64>)> {
+fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Vec<u64>)> {
     let mut tensors = BTreeMap::new();
+    let packed = representation.tensor_kind();
     for name in ["token_embd.weight", "output.weight"] {
-        tensors.insert(name.to_owned(), (142, vec![5_120, 248_320]));
+        tensors.insert(name.to_owned(), (packed, vec![5_120, 248_320]));
     }
     tensors.insert("output_norm.weight".to_owned(), (0, vec![5_120]));
     for layer in 0..64 {
@@ -319,22 +442,22 @@ fn expected_tensors() -> BTreeMap<String, (u32, Vec<u64>)> {
             add(name, 0, &[5_120]);
         }
         for name in ["ffn_up.weight", "ffn_gate.weight"] {
-            add(name, 142, &[5_120, 17_408]);
+            add(name, packed, &[5_120, 17_408]);
         }
-        add("ffn_down.weight", 142, &[17_408, 5_120]);
+        add("ffn_down.weight", packed, &[17_408, 5_120]);
         if (layer + 1) % 4 == 0 {
-            add("attn_q.weight", 142, &[5_120, 12_288]);
+            add("attn_q.weight", packed, &[5_120, 12_288]);
             for name in ["attn_k.weight", "attn_v.weight"] {
-                add(name, 142, &[5_120, 1_024]);
+                add(name, packed, &[5_120, 1_024]);
             }
-            add("attn_output.weight", 142, &[6_144, 5_120]);
+            add("attn_output.weight", packed, &[6_144, 5_120]);
             for name in ["attn_q_norm.weight", "attn_k_norm.weight"] {
                 add(name, 0, &[256]);
             }
         } else {
-            add("attn_qkv.weight", 142, &[5_120, 10_240]);
-            add("attn_gate.weight", 142, &[5_120, 6_144]);
-            add("ssm_out.weight", 142, &[6_144, 5_120]);
+            add("attn_qkv.weight", packed, &[5_120, 10_240]);
+            add("attn_gate.weight", packed, &[5_120, 6_144]);
+            add("ssm_out.weight", packed, &[6_144, 5_120]);
             for name in ["ssm_alpha.weight", "ssm_beta.weight"] {
                 add(name, 30, &[5_120, 48]);
             }
@@ -348,8 +471,12 @@ fn expected_tensors() -> BTreeMap<String, (u32, Vec<u64>)> {
     tensors
 }
 
-fn validate_inventory(tensors: &[TensorDescriptor]) -> Result<([usize; 3], usize, usize)> {
+fn validate_inventory(
+    tensors: &[TensorDescriptor],
+    representation: Representation,
+) -> Result<([usize; 3], usize, usize)> {
     validate_layouts(
+        representation,
         tensors.len(),
         tensors.iter().map(|tensor| {
             (
@@ -363,10 +490,11 @@ fn validate_inventory(tensors: &[TensorDescriptor]) -> Result<([usize; 3], usize
 }
 
 fn validate_layouts<'a>(
+    representation: Representation,
     count: usize,
     tensors: impl IntoIterator<Item = (&'a str, &'a [u64], u32, u64)>,
 ) -> Result<([usize; 3], usize, usize)> {
-    let expected = expected_tensors();
+    let expected = expected_tensors(representation);
     if count != expected.len() {
         return Err(invalid("Swift tensor inventory count mismatch"));
     }
@@ -385,7 +513,7 @@ fn validate_layouts<'a>(
         let slot = match kind {
             0 => 0,
             30 => 1,
-            142 => 2,
+            kind if kind == representation.tensor_kind() => 2,
             _ => return Err(invalid("Swift tensor encoding mismatch")),
         };
         counts[slot] += 1;
@@ -395,7 +523,7 @@ fn validate_layouts<'a>(
             .ok_or_else(|| invalid("Swift tensor accounting overflow"))?;
         largest = largest.max(length);
     }
-    if counts != [353, 96, 402] || bytes != TENSOR_PAYLOAD_BYTES {
+    if counts != [353, 96, 402] || bytes != representation.tensor_payload_bytes() {
         return Err(invalid("Swift tensor payload inventory mismatch"));
     }
     Ok((counts, bytes, largest))
@@ -405,9 +533,8 @@ fn validate_layouts<'a>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn inventory_covers_every_hybrid_block_and_exact_payload() -> Result<()> {
-        let descriptors = expected_tensors()
+    fn descriptors(representation: Representation) -> Vec<(String, Vec<u64>, u32, u64)> {
+        expected_tensors(representation)
             .into_iter()
             .map(|(name, (type_id, dimensions))| {
                 let elements = dimensions.iter().product::<u64>();
@@ -415,13 +542,20 @@ mod tests {
                     0 => elements * 4,
                     30 => elements * 2,
                     142 => elements / 256 * 68,
+                    143 => elements / 128 * 28,
                     _ => 0,
                 };
                 (name, dimensions, type_id, bytes)
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    #[test]
+    fn inventory_covers_every_hybrid_block_and_exact_payload() -> Result<()> {
+        let descriptors = descriptors(Representation::Pq2);
         assert_eq!(
             validate_layouts(
+                Representation::Pq2,
                 descriptors.len(),
                 descriptors.iter().map(|(name, dimensions, kind, bytes)| (
                     name.as_str(),
@@ -436,6 +570,7 @@ mod tests {
         descriptors[0].1[0] += 1;
         assert!(
             validate_layouts(
+                Representation::Pq2,
                 descriptors.len(),
                 descriptors.iter().map(|(name, dimensions, kind, bytes)| (
                     name.as_str(),
@@ -449,6 +584,7 @@ mod tests {
         descriptors.pop();
         assert!(
             validate_layouts(
+                Representation::Pq2,
                 descriptors.len(),
                 descriptors.iter().map(|(name, dimensions, kind, bytes)| (
                     name.as_str(),
@@ -459,6 +595,56 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn current_weight_ptq1_inventory_is_exact_and_never_substitutes_for_pq2() -> Result<()> {
+        let representation = Representation::CurrentRepackedPtq1;
+        let descriptors = descriptors(representation);
+        let layouts = || {
+            descriptors.iter().map(|(name, dimensions, kind, bytes)| {
+                (name.as_str(), dimensions.as_slice(), *kind, *bytes)
+            })
+        };
+        assert_eq!(
+            validate_layouts(representation, descriptors.len(), layouts())?,
+            ([353, 96, 402], 5_935_527_936, 278_118_400)
+        );
+        assert!(validate_layouts(Representation::Pq2, descriptors.len(), layouts()).is_err());
+        assert!(
+            validate_layouts(
+                representation,
+                descriptors.len(),
+                layouts().map(|(name, dimensions, kind, bytes)| {
+                    (
+                        name,
+                        dimensions,
+                        if kind == 143 { 142 } else { kind },
+                        bytes,
+                    )
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_layouts(
+                representation,
+                descriptors.len(),
+                layouts().map(|(name, dimensions, kind, bytes)| {
+                    (name, dimensions, kind, bytes + u64::from(kind == 143))
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(Representation::default(), Representation::Pq2);
+        assert_eq!(representation.model_bytes(), 5_946_648_928);
+        assert_eq!(
+            representation.model_sha256(),
+            "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5"
+        );
+        assert_eq!(representation.name(), "current-repacked-PTQ1_0");
+        assert_eq!(representation.file_type(), 143);
         Ok(())
     }
 

@@ -89,7 +89,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/SwiftBonsai-PrismUpstreamRust
-          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-content-v1
+          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-${{ hashFiles('src/**', 'tests/upstream_prism/**', 'tests/fixtures/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/prism/src/**', 'tools/prism/build.rs', 'tools/prism/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-content-v2
           restore-keys: |
             prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-
       - name: Reuse exact pinned upstream native builds
@@ -99,7 +99,12 @@ jobs:
           # Orchestration changes can reuse the same native source/compiler tree.
           # Never restore across source pins, adapter code or compiler identities;
           # source verification and CMake still run before every correctness test.
-          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-${{ hashFiles('tools/prism/upstream/**', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1') }}
+          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-${{ hashFiles('tools/prism/upstream/**/CMakeLists.txt', 'tools/prism/upstream/**/*.cmake', 'tools/prism/upstream/**/*.c', 'tools/prism/upstream/**/*.cpp', 'tools/prism/upstream/**/*.h', 'tools/prism/upstream/**/*.hpp', 'tools/prism/upstream/**/*.inc', 'tools/prism/upstream/**/*.rs', 'tools/prism/upstream/patches/**', 'tools/prism/upstream/reference-patches.lock.json', 'tools/prism/upstream/llguidance.lock.json', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1', 'scripts/Bonsai.PrismGrammar.psm1', 'scripts/Bonsai.PrismReferencePatch.psm1') }}
+      - name: Reuse hash-locked tokenizer and LoRA download inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/SwiftBonsai-PrismFixtureDownloads
+          key: prism-fixtures-v1-case-${{ inputs.case }}-${{ hashFiles('tests/upstream_prism/tokenizer-reference-assets.json', 'tests/upstream_prism/tokenizer-repository-assets.json', 'tests/upstream_prism/lora-assets.json') }}
       - name: Run the selected source contract on upstream and Rust
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -163,7 +168,7 @@ jobs:
               $prepared | ConvertTo-Json -Depth 12
               & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismBackend.ps1') -Phase Plan -BundleDirectory $prepared.BackendBundleDirectory -EvidenceDirectory (Join-Path $evidence 'backend-plan') -Index 0 -Benchmarks -Gradients:($env:PRISM_FOCUSED_GRADIENTS -ceq 'true') | ConvertTo-Json -Depth 12
             } else {
-              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case $env:PRISM_FOCUSED_CASE -SourceArchive $archive -EvidenceDirectory $caseEvidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1 | ConvertTo-Json -Depth 12
+              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case $env:PRISM_FOCUSED_CASE -SourceArchive $archive -EvidenceDirectory $caseEvidence -AssetCacheDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismFixtureDownloads') -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1 | ConvertTo-Json -Depth 12
             }
             $provenance.ControllerStatus = 'complete'
           } catch {

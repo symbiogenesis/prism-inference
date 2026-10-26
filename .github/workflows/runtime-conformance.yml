@@ -87,6 +87,11 @@ jobs:
         with:
           name: prism-backend-tools
           path: ${{ runner.temp }}/prism-backend-tools
+      - name: Reuse hash-locked tokenizer and LoRA download inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/SwiftBonsai-PrismFixtureDownloads
+          key: prism-fixtures-v1-source-${{ matrix.partition }}-${{ hashFiles('tests/upstream_prism/tokenizer-reference-assets.json', 'tests/upstream_prism/tokenizer-repository-assets.json', 'tests/upstream_prism/lora-assets.json') }}
       - name: Run safe Rust conformance on upstream and Rust
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -106,7 +111,7 @@ jobs:
           [void][IO.Directory]::CreateDirectory($downloads)
           $archive = Join-Path $downloads ("prism-$($lock.ArchiveSha256).zip")
           $null = Receive-LockedArtifact -Uri $lock.ArchiveUrl -Path $archive -Bytes $lock.ArchiveBytes -Sha256 $lock.ArchiveSha256 -TimeoutSeconds 600
-          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -SourceArchive $archive -EvidenceDirectory $evidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -CommonToolsBundleDirectory (Join-Path $env:RUNNER_TEMP 'prism-backend-tools') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 2 -DeferBackend -SourcePartition ([int]$env:SOURCE_PARTITION) | ConvertTo-Json -Depth 12
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -SourceArchive $archive -EvidenceDirectory $evidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -CommonToolsBundleDirectory (Join-Path $env:RUNNER_TEMP 'prism-backend-tools') -AssetCacheDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismFixtureDownloads') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 4 -DeferBackend -SourcePartition ([int]$env:SOURCE_PARTITION) | ConvertTo-Json -Depth 12
       - name: Publish ordinary source results for the complete gate
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -232,7 +237,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/SwiftBonsai-PrismUpstreamRust
-          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-content-v1
+          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-${{ hashFiles('src/**', 'tests/upstream_prism/**', 'tests/fixtures/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/prism/src/**', 'tools/prism/build.rs', 'tools/prism/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-content-v2
           restore-keys: |
             prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-
       - name: Reuse exact pinned upstream native builds
@@ -242,7 +247,7 @@ jobs:
           # Orchestration changes can reuse the same native source/compiler tree.
           # Never restore across source pins, adapter code or compiler identities;
           # source verification and CMake still run before every correctness test.
-          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-source-${{ matrix.partition }}-${{ hashFiles('tools/prism/upstream/**', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1') }}
+          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-source-${{ matrix.partition }}-${{ hashFiles('tools/prism/upstream/**/CMakeLists.txt', 'tools/prism/upstream/**/*.cmake', 'tools/prism/upstream/**/*.c', 'tools/prism/upstream/**/*.cpp', 'tools/prism/upstream/**/*.h', 'tools/prism/upstream/**/*.hpp', 'tools/prism/upstream/**/*.inc', 'tools/prism/upstream/**/*.rs', 'tools/prism/upstream/patches/**', 'tools/prism/upstream/reference-patches.lock.json', 'tools/prism/upstream/llguidance.lock.json', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1', 'scripts/Bonsai.PrismGrammar.psm1', 'scripts/Bonsai.PrismReferencePatch.psm1') }}
       - name: Run safe Rust conformance on upstream and Rust
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -266,6 +271,7 @@ jobs:
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismEvidence.ps1') -Case Ordinary
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismEvidence.ps1') -Case Backend
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismNativeCache.ps1')
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismFixtureCache.ps1')
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismSourcePartition.ps1')
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismSourceResults.ps1')
           foreach ($case in @('Scheduling', 'Identity', 'ProcessFailure')) {
@@ -377,7 +383,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/SwiftBonsai-PrismUpstreamRust
-          key: prism-backend-tools-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-content-v1
+          key: prism-backend-tools-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-${{ hashFiles('src/**', 'tests/upstream_prism/**', 'tests/fixtures/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/prism/src/**', 'tools/prism/build.rs', 'tools/prism/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-content-v2
           restore-keys: |
             prism-backend-tools-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-
             prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-10-22-
@@ -388,7 +394,7 @@ jobs:
           # Orchestration changes can reuse the same native source/compiler tree.
           # Never restore across source pins, adapter code or compiler identities;
           # source verification and CMake still run before every correctness test.
-          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-backend-tools-${{ hashFiles('tools/prism/upstream/**', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1') }}
+          key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-backend-tools-${{ hashFiles('tools/prism/upstream/**/CMakeLists.txt', 'tools/prism/upstream/**/*.cmake', 'tools/prism/upstream/**/*.c', 'tools/prism/upstream/**/*.cpp', 'tools/prism/upstream/**/*.h', 'tools/prism/upstream/**/*.hpp', 'tools/prism/upstream/**/*.inc', 'tools/prism/upstream/**/*.rs', 'tools/prism/upstream/patches/**', 'tools/prism/upstream/reference-patches.lock.json', 'tools/prism/upstream/llguidance.lock.json', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1', 'scripts/Bonsai.PrismGrammar.psm1', 'scripts/Bonsai.PrismReferencePatch.psm1') }}
       - name: Prepare revision-bound native backend tools without running source workloads
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -541,7 +547,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+        # Longest observed shards start first under the shared runner limit.
+        # Membership, source order, RNG offsets and the 32-shard proof stay exact.
+        # Baseline: Runtime conformance run 40243150077 (Windows ARM64).
+        partition: [18, 17, 20, 30, 15, 11, 19, 16, 9, 10, 8, 28, 12, 23, 25, 4, 27, 21, 14, 22, 3, 13, 26, 0, 24, 7, 29, 31, 5, 6, 1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

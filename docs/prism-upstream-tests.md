@@ -477,6 +477,23 @@ rules and produces no source verdict. Missing tools prevent backend execution;
 a failed ordinary job still fails final Foundation acceptance, and the final
 gate still requires all four ordinary groups and all backend partitions.
 
+The 32 execution shards are queued with the longest observed workloads first
+under the shared hosted-runner limit. This changes scheduling only: shard
+membership, all source geometries, source-order random offsets and the complete
+fan-in proof remain unchanged. The remaining ordinary-source group runs up to
+four isolated adapters concurrently; each adapter's C++ and Rust controls still
+run in order, and explicitly requested measurements remain exclusive.
+
+Compiled Rust caches include runtime and harness contents so changed sources
+refresh the immutable cache instead of rebuilding from the same old entry on
+every run. Native cache identities cover actual CMake, native/Rust bridge,
+patch and grammar inputs, avoiding rebuilds for unrelated catalog or fixture
+edits. Every cached source/adapter byte is still verified before CMake runs.
+Tokenizer and LoRA download caches retain only locked raw inputs. Every hit is
+size/hash checked and copied into fresh evidence before assertions; generated
+fixtures, observations and test results are never reused. Cache misses retain
+the same bounded, hash-verified download path.
+
 ## Growing the baseline
 
 Add an adapter using the original inputs, assertions and tolerances. Keep input

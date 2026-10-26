@@ -96,10 +96,12 @@ function Save-BonsaiPrismFixture {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param([Parameter(Mandatory)][hashtable]$Lock, [Parameter(Mandatory)][string]$Directory,
+          [string]$CacheDirectory,
           [Parameter(Mandatory)][long]$TotalBytes, [Parameter(Mandatory)][long]$MaximumFileBytes,
           [Parameter(Mandatory)][scriptblock]$ValidateEntry, [scriptblock]$ValidatePaths,
           [hashtable]$Receipt = @{})
     $root = Resolve-ExternalPath $Directory
+    $cache = if ($CacheDirectory) { Resolve-ExternalPath $CacheDirectory } else { $null }
     $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     [long]$total = 0
     # Family predicates own the allowed relative paths and immutable source URLs.
@@ -117,7 +119,15 @@ function Save-BonsaiPrismFixture {
     if ($ValidatePaths) { $null = & $ValidatePaths $paths }
     $Receipt.Files = @(foreach ($entry in $Lock.Files) {
         $path = Resolve-ExternalPath (Join-Path $root ($Lock.AssetPrefix + $entry.Path))
-        $null = Receive-LockedArtifact -Uri $entry.Url -Path $path -Bytes $entry.Bytes -Sha256 $entry.Sha256 -TimeoutSeconds 600
+        if ($cache) {
+            $cached = Resolve-ExternalPath (Join-Path $cache ($Lock.AssetPrefix + $entry.Path))
+            $null = Receive-LockedArtifact -Uri $entry.Url -Path $cached -Bytes $entry.Bytes -Sha256 $entry.Sha256 -TimeoutSeconds 600
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+            [IO.File]::Copy($cached, $path, $false)
+            Test-LockedArtifact -Path $path -Bytes $entry.Bytes -Sha256 $entry.Sha256
+        } else {
+            $null = Receive-LockedArtifact -Uri $entry.Url -Path $path -Bytes $entry.Bytes -Sha256 $entry.Sha256 -TimeoutSeconds 600
+        }
         @{ Path=$path; Bytes=$entry.Bytes; Sha256=$entry.Sha256; Url=$entry.Url }
     })
     $Receipt.TotalBytes = $total
@@ -132,7 +142,7 @@ function Save-BonsaiPrismTokenizerRepository {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Explicit Prism setup writes only hash-verified external input artifacts.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory, [string]$CacheDirectory)
     $runtimeSource = Resolve-PrismSource
     $lockPath = Join-Path $runtimeSource 'tests/upstream_prism/tokenizer-repository-assets.json'
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json -AsHashtable
@@ -141,7 +151,7 @@ function Save-BonsaiPrismTokenizerRepository {
         $lock.AssetPrefix -cne 'tokenizer-repository/' -or $lock.Files.Count -ne 18) {
         throw 'The tokenizer corpus repository lock differs from its source identity.'
     }
-    return Save-BonsaiPrismFixture -Lock $lock -Directory $Directory -TotalBytes 23804987 -MaximumFileBytes 20000000 -Receipt @{ Revision=$revision; CorpusCount=6 } -ValidateEntry {
+    return Save-BonsaiPrismFixture -Lock $lock -Directory $Directory -CacheDirectory $CacheDirectory -TotalBytes 23804987 -MaximumFileBytes 20000000 -Receipt @{ Revision=$revision; CorpusCount=6 } -ValidateEntry {
         param($entry)
         $entry.Path -cmatch '^(BPE|SPM|HybridDNA|PLaMo2|PLaMo3|RWKV|UGM|WPM)/ggml-vocab-[a-z0-9-]+\.gguf(?:\.(?:inp|out))?$' -and
         $entry.GitBlobSha1 -cmatch '^[a-f0-9]{40}$' -and
@@ -164,7 +174,7 @@ function Save-BonsaiPrismTokenizerReference {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Explicit Prism setup writes only hash-verified external publisher inputs.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory, [string]$CacheDirectory)
     $runtimeSource = Resolve-PrismSource
     $lockPath = Join-Path $runtimeSource 'tests/upstream_prism/tokenizer-reference-assets.json'
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json -AsHashtable
@@ -176,7 +186,7 @@ function Save-BonsaiPrismTokenizerReference {
     foreach ($case in $lock.Cases) {
         if ($case.Name -cnotmatch '^[a-z0-9-]+$' -or -not $names.Add($case.Name)) { throw 'Invalid tokenizer family identity.' }
     }
-    return Save-BonsaiPrismFixture -Lock $lock -Directory $Directory -TotalBytes 150188454 -MaximumFileBytes 33554432 -Receipt @{ Families=26; GeneratedVocabularyOwner='safe-rust' } -ValidateEntry {
+    return Save-BonsaiPrismFixture -Lock $lock -Directory $Directory -CacheDirectory $CacheDirectory -TotalBytes 150188454 -MaximumFileBytes 33554432 -Receipt @{ Families=26; GeneratedVocabularyOwner='safe-rust' } -ValidateEntry {
         param($entry)
         $entry.Path -cmatch '^[a-z0-9-]+/(?:config\.json|tokenizer\.json|tokenizer_config(?:\.source)?\.json|special_tokens_map\.json|added_tokens\.json|tokenizer\.model|vocab\.(?:json|txt)|merges\.txt)$' -and
         $names.Contains($entry.Path.Split('/')[0]) -and
@@ -194,7 +204,7 @@ function Save-BonsaiPrismLoraAsset {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Explicit Prism test setup writes only verified external input artifacts.')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)][string]$Directory)
+    param([Parameter(Mandatory)][string]$Directory, [string]$CacheDirectory)
     $runtimeSource = Resolve-PrismSource
     $lockPath = Join-Path $runtimeSource 'tests/upstream_prism/lora-assets.json'
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json -AsHashtable
@@ -205,7 +215,7 @@ function Save-BonsaiPrismLoraAsset {
         $lock.AssetPrefix -cne 'lora-tests/' -or $lock.Files.Count -ne 28) {
         throw 'The original LoRA fixture lock differs from its source identity.'
     }
-    return Save-BonsaiPrismFixture -Lock $lock -Directory $Directory -TotalBytes 269404497 -MaximumFileBytes 100000000 -Receipt @{ Revision=$revision; ConvertedInputs=$false } -ValidateEntry {
+    return Save-BonsaiPrismFixture -Lock $lock -Directory $Directory -CacheDirectory $CacheDirectory -TotalBytes 269404497 -MaximumFileBytes 100000000 -Receipt @{ Revision=$revision; ConvertedInputs=$false } -ValidateEntry {
         param($entry)
         $relative = $entry.Path
         -not ([string]::IsNullOrEmpty($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Contains('\') -or

@@ -25,6 +25,7 @@ param(
     [ValidateRange(-1, 3)][int]$SourcePartition = -1,
     [string]$NativeBuildDirectory,
     [string]$CommonToolsBundleDirectory,
+    [string]$AssetCacheDirectory,
     [switch]$DeferBackend,
     [switch]$PrepareBackendToolsOnly
 )
@@ -288,17 +289,17 @@ $bridgeFamilies = @{
 }
 if ($selected -contains 'LoraConversion') {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.LoraAssets = Save-BonsaiPrismLoraAsset -Directory $assetDirectory
+    $receipt.LoraAssets = Save-BonsaiPrismLoraAsset -Directory $assetDirectory -CacheDirectory $AssetCacheDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 if ($selected -contains 'TokenizersRepo') {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.TokenizerRepository = Save-BonsaiPrismTokenizerRepository -Directory $assetDirectory
+    $receipt.TokenizerRepository = Save-BonsaiPrismTokenizerRepository -Directory $assetDirectory -CacheDirectory $AssetCacheDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 if (@($selected | Where-Object { $_ -in @('TokenizerPython','TokenizerShell','TokenizerRandom') }).Count) {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
-    $receipt.TokenizerReference = Save-BonsaiPrismTokenizerReference -Directory $assetDirectory
+    $receipt.TokenizerReference = Save-BonsaiPrismTokenizerReference -Directory $assetDirectory -CacheDirectory $AssetCacheDirectory
     [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
 }
 if ($selected -contains 'QuantizeStats') {

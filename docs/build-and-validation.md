@@ -205,6 +205,38 @@ were not run in this quick local check. Successful native loading and the exact
 weight repack remain separate, narrower results. No default, service selection
 or production memory requirement was changed by this diagnostic evidence.
 
+### PTQ1 arithmetic repair, 2026-10-26
+
+The earlier capture exposed three implementation differences, repaired in the
+code through `e2d8d6f`:
+
+- The graph selected pinned arithmetic only for the PQ2 hash. The exact verified
+  current-weight PTQ1 hash now selects the same pinned graph contract, including
+  normalization, activations, attention and recurrent-state arithmetic.
+- Pinned Q8_0 activation preparation now rounds binary32 products to nearest,
+  ties to even, matching the ARM64 quantizer. Public reference encoding retains
+  ties away from zero. Six independent native Q8_0/Q8_1 captures match completely.
+- Pinned PTQ1 scalar and baseline NEON kernels now preserve the native DOTPROD
+  binary's four partial integer lanes, per-group scale multiplication, fused
+  accumulation across the row and final pairwise reduction. Forty independent
+  native rows matched this order; the prior implementation differed in thirty.
+  The checked-in fixtures distinguish these orders without loading a model.
+
+The native dot captures use `nrc=1`; the type trait's two-row capability does
+not establish 2x2-tile parity. Public source-order kernels and the PQ2 fallback
+keep their prior behavior. Focused graph selection/recovery and native fixture
+regressions accompany the repair; full suites remain hosted.
+
+A single-token actual-model recheck was attempted with the existing supervisor,
+16 GiB admission, 12 GiB committed limit and 4 GiB physical reserve. Admission
+was rejected before the model process started: minimum available physical memory
+was 14,668,292,096 bytes. The guard was preserved. Therefore these operator and
+dispatch repairs do **not** establish new full-model parity or supersede the
+retained failed capture. No new model snapshot, adapter/quality qualification,
+performance measurement, service enablement, default or memory-policy change
+is claimed. The prepared one-token check can reuse the existing pinned native
+reference when the unchanged admission requirements are available.
+
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five

@@ -14,8 +14,10 @@ env:
   CARGO_BUILD_FINGERPRINT: content
   PRISM_VERSION: '0.1.2'
 concurrency:
-  group: foundation-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: false
+  # The successful-ancestor planner carries every cancelled push forward.
+  # Explicit manual runs retain an independent complete validation request.
+  group: foundation-${{ github.ref }}-${{ github.event_name == 'push' && 'push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 jobs:
   changes:
     if: github.ref == 'refs/heads/main'

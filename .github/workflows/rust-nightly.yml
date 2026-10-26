@@ -15,8 +15,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: rust-nightly-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: rust-nightly-${{ github.ref }}-${{ github.event_name == 'push' && 'push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 jobs:
   probe:
     name: Compiler acceptance probes

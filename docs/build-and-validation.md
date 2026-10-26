@@ -124,7 +124,11 @@ codec lane builds its probe and checks parity; Foundation owns its Rust analyzer
 Each workflow compares with its most recent successful push revision on the
 current ancestry, so changes from failed or cancelled pushes remain covered.
 If that baseline cannot be established, selection falls back to full validation.
-Each revision retains its own run. Aggregate gates require successful planning
+Automatic Foundation, standards and compiler-probe runs supersede older pushes
+on the same branch, releasing runners for the newest revision. Successful-ancestor
+selection carries changes from cancelled and failed pushes into Foundation's
+next plan. Manual dispatches retain independent complete validation requests.
+Aggregate gates require successful planning
 and successful selected jobs; they permit skips only for unselected groups.
 
 ## Bounded actual-model correctness captures

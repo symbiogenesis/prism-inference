@@ -15,8 +15,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: script-standards-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: script-standards-${{ github.ref }}-${{ github.event_name == 'push' && 'push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 jobs:
   standards:
     if: github.ref == 'refs/heads/main'

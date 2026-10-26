@@ -169,7 +169,14 @@ optional decoded-vocabulary/output storage and allocator overhead. Text mode adm
 at most 1,000,000 vocabulary entries, 64 MiB of decoded piece bytes and 1 MiB per
 piece; the entry table and output buffers are additional bounded storage.
 Reference sampling admits at most 1,048,576 finite logits and allocates bounded
-candidate scratch per draw. BPE admits at most 1,000,000 merge rules and 64 MiB
+candidate scratch retained across draws. Swift sampling retains at most 248,320
+12-byte candidates (2,979,840 payload bytes) after its first sample. Sampler
+clones copy options and RNG state without copying candidate scratch; the next
+sample rebuilds candidates in token-ID order. Reset preserves reusable capacity.
+Request rollback may replace warmed scratch with an empty checkpoint sampler.
+Scratch is outside model/state/checkpoint payload budgets, and allocation reuse
+does not establish lower process peak memory or measured throughput.
+BPE admits at most 1,000,000 merge rules and 64 MiB
 serialized merge bytes, 64 KiB per pretokenized piece, and 1 MiB/65,536 pieces
 per multi-piece request. Vocabulary validation, lookup tables and heap/node/output
 scratch add storage outside model/state/checkpoint budgets.
@@ -216,6 +223,15 @@ attention gate 6,144), these lifetimes remove four separate vector allocations:
 rounding, allocator overhead and process memory are separate; this is no measured
 peak-memory or speed claim. Fixed phase reuse needs neither a moving allocator
 nor a change to numerical tolerances.
+
+Attention-value reads use tiles of at most 32 adjacent dimensions, with at most
+2 KiB of stack accumulator payload. Each tile traverses the paged FP16 cache
+once, preserving each dimension's token order. Source arithmetic retains rounded
+F32 products accumulated in F64 and the separate current-token addition. Pinned
+Swift retains its four-register F32 FMA tree, zero padding through 256-token
+boundaries and final pairwise reduction. The cache representation, FP16
+probability rounding and transactional state are unchanged. Fewer page traversals
+do not establish a whole-model TPS gain.
 
 ## SIMD dispatch and diagnostics
 

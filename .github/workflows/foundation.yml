@@ -44,7 +44,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/ci/impact.py --before "$BEFORE" --after "$GITHUB_SHA" --workflow foundation.yml
   windows:
-    name: windows / ${{ matrix.target }}
+    name: windows / ${{ matrix.target }} / ${{ matrix.lane }}
     needs: changes
     if: github.ref == 'refs/heads/main' && needs.changes.outputs.windows == 'true'
     runs-on: ${{ matrix.runner }}
@@ -52,6 +52,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Start expensive test compilation first. Unit/doc/default binaries and
+        # release receipts belong to correctness-0; every integration test is
+        # assigned exactly once by Cargo metadata, independently of file names.
+        lane: [correctness-0, correctness-1, correctness-2, correctness-3, checks, variants]
+        runner: [windows-11-arm, windows-2025]
         include:
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
@@ -61,6 +66,7 @@ jobs:
       CARGO_BUILD_TARGET: ${{ matrix.target }}
       PRISM_PACKAGES: ${{ needs.changes.outputs.packages }}
       PRISM_RELEASE: ${{ needs.changes.outputs.release }}
+      PRISM_LANE: ${{ matrix.lane }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -84,17 +90,45 @@ jobs:
           "PRISM_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
           "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'PrismInference-Target')" >> $env:GITHUB_ENV
           "PRISM_CHECK_EVIDENCE=$(Join-Path $env:RUNNER_TEMP ('PrismInference-Checks-' + [guid]::NewGuid().ToString('N')))" >> $env:GITHUB_ENV
-      - name: Reuse Cargo sources and target artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Reuse locked Cargo downloads
+        id: downloads
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
-            ${{ env.CARGO_TARGET_DIR }}
-          key: prism-runtime-v1-${{ matrix.target }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
+          key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Reuse this lane's compiler artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Never seed every shard with the old full-workspace target: retaining
+          # only its own outputs keeps restore time and cache quota bounded.
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: prism-runtime-v2-${{ matrix.target }}-${{ matrix.lane }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', '.github/ci/foundation_shards.py', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
-            prism-runtime-v1-${{ matrix.target }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-
-      - name: Check affected crates and build their executables
+            prism-runtime-v2-${{ matrix.target }}-${{ matrix.lane }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-10-22-
+      - name: Fetch the locked workspace and prepare evidence
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
+          if (-not $packages.Count) { throw 'A selected Windows lane requires affected packages.' }
+          [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
+          cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
+      - name: Save locked downloads once per architecture
+        if: matrix.lane == 'correctness-0' && steps.downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: ${{ steps.downloads.outputs.cache-primary-key }}
+      - name: Check affected Rust formatting, Clippy and documentation
+        if: matrix.lane == 'checks'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -104,17 +138,38 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
           $selection = @($packages | ForEach-Object { '--package'; $_ })
-          [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'workspace.log') | Out-Null
           try {
-            cargo +nightly-2026-10-22 fetch --manifest-path $manifest --locked
-            if ($packages.Count) {
-              cargo +nightly-2026-10-22 fmt --manifest-path $manifest @selection -- --check
-              # Native linking is covered separately by the selected overlay gate.
-              cargo +nightly-2026-10-22 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
-              cargo +nightly-2026-10-22 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
-              cargo +nightly-2026-10-22 test --manifest-path $manifest @selection --locked --offline --release --no-fail-fast
-            }
+            cargo +nightly-2026-10-22 fmt --manifest-path $manifest @selection -- --check
+            # Native linking is covered separately by the selected overlay gate.
+            cargo +nightly-2026-10-22 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
+            cargo +nightly-2026-10-22 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
+          } finally { Stop-Transcript | Out-Null }
+      - name: Run this shard's complete Cargo correctness targets
+        if: startsWith(matrix.lane, 'correctness-')
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $index = [int]($env:PRISM_LANE -replace '^correctness-', '')
+          Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'correctness.log') | Out-Null
+          try {
+            python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/foundation_shards.py') --index $index --count 4 --manifest (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --evidence $env:PRISM_CHECK_EVIDENCE
+          } finally { Stop-Transcript | Out-Null }
+      - name: Build selected default-feature executables
+        if: matrix.lane == 'correctness-0'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
+          Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'build.log') | Out-Null
+          try {
             $binaryPackages = @('prism-inference','prism-inference-server','bonsai-gguf','prism-conformance-policy','bonsai-codec-probe')
             $buildPackages = @($binaryPackages | Where-Object { $_ -cin $packages })
             if ($env:PRISM_RELEASE -ceq 'true') {
@@ -127,6 +182,7 @@ jobs:
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Check feature variants, scalar fallback and loader ABI
+        if: matrix.lane == 'variants'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -153,7 +209,7 @@ jobs:
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Verify immutable reference fixtures and kill the bounded mutation catalog
-        if: matrix.target == 'aarch64-pc-windows-msvc' && needs.changes.outputs.mutations == 'true'
+        if: matrix.lane == 'correctness-0' && matrix.target == 'aarch64-pc-windows-msvc' && needs.changes.outputs.mutations == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -165,7 +221,7 @@ jobs:
           if ((Get-FileHash -LiteralPath (Join-Path $fixtures 'ptq-reference.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $provenance.fixtureSha256) { throw 'The immutable C++ codec corpus differs from its provenance.' }
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Mutations.ps1') -EvidenceDirectory (Join-Path $env:PRISM_CHECK_EVIDENCE 'mutations')
       - name: Package the five checked Windows executables
-        if: needs.changes.outputs.release == 'true'
+        if: matrix.lane == 'correctness-0' && needs.changes.outputs.release == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         env:
@@ -182,7 +238,7 @@ jobs:
           & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $env:RELEASE_TARGET -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-10-22-$env:RELEASE_TARGET" | ConvertTo-Json -Depth 8
           "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
       - name: Retain the checked release bundle and source receipt
-        if: needs.changes.outputs.release == 'true'
+        if: matrix.lane == 'correctness-0' && needs.changes.outputs.release == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: prism-inference-${{ env.PRISM_VERSION }}-${{ matrix.target }}
@@ -194,7 +250,7 @@ jobs:
         if: always() && env.PRISM_CHECK_EVIDENCE != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: prism-checks-${{ matrix.target }}-${{ github.run_id }}
+          name: prism-checks-${{ matrix.target }}-${{ matrix.lane }}-${{ github.run_id }}
           path: ${{ env.PRISM_CHECK_EVIDENCE }}
           if-no-files-found: error
   native-overlay:

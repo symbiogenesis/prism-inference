@@ -59,6 +59,18 @@ try {
 The current [Foundation workflow](../.github/workflows/foundation.yml) runs
 formatting, Release Clippy/rustdoc and complete correctness tests for affected
 workspace crates and their transitive consumers on Windows ARM64 and x64.
+Each Windows target runs analyzers, feature variants and four correctness shards
+concurrently. Cargo metadata assigns every enabled integration-test target to
+exactly one shard; same-named targets share a shard, while unit tests, doctests,
+test-enabled examples and default binary/release packaging run on shard zero.
+Every shard retains its full target inventory and executed command list. The
+`windows` matrix remains required by the fail-closed Foundation aggregate.
+Every Cargo test command keeps the complete selected package set to preserve
+dependency feature unification. The unit-test invocation also selects the three
+empty `test = false` library roots; dormant feature-gated native targets remain
+disabled. Unsupported dependency activation of a gated target fails selection.
+Compiler caches are isolated by architecture and lane; locked registry downloads
+have their own shared cache, avoiding a complete workspace cache in every shard.
 Feature variants, loader-ABI checks and mutation guards run only when their
 packages or inputs are selected. Its Linux ARM64 gate builds the pinned Prism
 engine with the Rust storage overlay only when that overlay's inputs change.

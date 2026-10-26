@@ -435,6 +435,10 @@ struct Q8Block {
 }
 
 fn q8_into(input: &[f32], output: &mut Vec<Q8Block>) -> Result<()> {
+    q8_with_rounding::<false>(input, output)
+}
+
+fn q8_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8Block>) -> Result<()> {
     if !input.len().is_multiple_of(32) {
         return Err(invalid("Q8_0 activations require a multiple of 32 columns"));
     }
@@ -453,7 +457,15 @@ fn q8_into(input: &[f32], output: &mut Vec<Q8Block>) -> Result<()> {
             };
             finite(block.scale)?;
             for (target, &value) in block.values.iter_mut().zip(chunk) {
-                *target = quantized((value * inverse_scale).round())?;
+                let product = value * inverse_scale;
+                // The pinned ARM64 Q8_0/Q8_1 quantizers use vcvtnq_s32_f32,
+                // which rounds the binary32 product to nearest, ties to even.
+                // The public source quantizer keeps roundf's ties away from zero.
+                *target = quantized(if PINNED {
+                    product.round_ties_even()
+                } else {
+                    product.round()
+                })?;
             }
             let sum = block.values.iter().map(|&value| i32::from(value)).sum();
             block.sum = round_f16(integer_float(sum) * d);
@@ -1334,6 +1346,9 @@ impl MatvecScratch {
                 q8k_with_rounding::<true>(input, &mut self.q8k)?;
             }
             ActivationContract::Q8K => q8k_into(input, &mut self.q8k)?,
+            ActivationContract::Q8 if self.pinned_accumulation => {
+                q8_with_rounding::<true>(input, &mut self.q8)?;
+            }
             ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
             _ => collect_into(
                 input.iter().map(|&value| {
@@ -1792,6 +1807,85 @@ mod tests {
             .chain(block.values.iter().flat_map(|value| value.to_le_bytes()))
             .chain(block.sums.iter().flat_map(|value| value.to_le_bytes()))
             .collect()
+    }
+
+    #[test]
+    fn pinned_q8_preparation_matches_independent_native_rounding_capture() -> crate::Result<()> {
+        let fixture = include_bytes!("../tests/fixtures/swift-q8-parity.bin");
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/swift-q8-parity.json"))?;
+        let hash: String = Sha256::digest(fixture)
+            .into_iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
+        assert_eq!(fixture.len(), 420);
+        assert_eq!(
+            provenance["runtime_commit"].as_str(),
+            Some("73bfe6cc485554822f80c473a3c0c4f25e80f41b")
+        );
+        assert_eq!(
+            provenance["ggml_cpu_sha256"].as_str(),
+            Some("701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab")
+        );
+        let cases = provenance["cases"]
+            .as_array()
+            .ok_or_else(|| super::invalid("native Q8 fixture cases missing"))?;
+        assert_eq!(cases.len(), 6);
+        for backend in [
+            super::MatvecBackend::Scalar,
+            super::MatvecBackend::Auto,
+            super::MatvecBackend::ExperimentalNeon,
+        ] {
+            // PTQ1 uses Q8_0; Q4_1 uses Q8_1's additional scaled sum.
+            for (kind, columns, bytes) in [(super::PTQ1, 128, 28), (super::Q4_1, 32, 20)] {
+                let tensor = Tensor {
+                    name: "q8-rounding".to_owned(),
+                    dimensions: vec![columns, 1],
+                    kind,
+                    data: Arc::from(vec![0_u8; bytes]),
+                };
+                let mut pinned = MatvecScratch::with_pinned_backend(backend);
+                let mut source = MatvecScratch::with_backend(backend);
+                for (index, case) in cases.iter().enumerate() {
+                    let words = case["input_bits"]
+                        .as_array()
+                        .ok_or_else(|| super::invalid("native Q8 fixture input missing"))?;
+                    let mut input = Vec::new();
+                    for word in words {
+                        let word = word
+                            .as_str()
+                            .ok_or_else(|| super::invalid("native Q8 fixture word missing"))?;
+                        input.push(f32::from_bits(u32::from_str_radix(word, 16)?));
+                    }
+                    assert_eq!(input.len(), 32);
+                    input = input.repeat(columns / 32);
+                    let prepared = pinned.prepare(&tensor, &input)?;
+                    for block in &prepared.scratch.q8 {
+                        let mut q8 = super::half_bits(block.scale).to_le_bytes().to_vec();
+                        q8.extend(block.values.iter().flat_map(|value| value.to_le_bytes()));
+                        assert_eq!(q8, fixture[index * 70..index * 70 + 34]);
+                        let mut q8_1 = super::half_bits(block.scale).to_le_bytes().to_vec();
+                        q8_1.extend(super::half_bits(block.sum).to_le_bytes());
+                        q8_1.extend(block.values.iter().flat_map(|value| value.to_le_bytes()));
+                        assert_eq!(q8_1, fixture[index * 70 + 34..(index + 1) * 70]);
+                    }
+                    if index == 1 {
+                        // The public source API retains roundf's ties away
+                        // from zero even when graph arithmetic follows ARM64.
+                        let prepared = source.prepare(&tensor, &input)?;
+                        assert_eq!(&prepared.scratch.q8[0].values[2..8], &[1, -1, 2, -2, 3, -3]);
+                        let mut direct = Vec::new();
+                        q8_into(&input, &mut direct)?;
+                        assert_eq!(&direct[0].values[2..8], &[1, -1, 2, -2, 3, -3]);
+                    }
+                    input[17] = f32::NAN;
+                    assert!(pinned.prepare(&tensor, &input).is_err());
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

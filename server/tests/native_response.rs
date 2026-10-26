@@ -123,6 +123,65 @@ fn body(
 }
 
 #[test]
+fn native_thinking_off_stream_and_json_keep_all_generated_text_visible() -> TestResult {
+    run(async {
+        let text = "答え 🌱</think>literal suffix";
+        for streaming in [false, true] {
+            let (client, state) = writer();
+            let mut output = NativeResponse::with_thinking(
+                client,
+                streaming,
+                100,
+                Instant::now() + Duration::from_secs(60),
+                false,
+            );
+            for character in text.chars() {
+                output
+                    .delta(character.encode_utf8(&mut [0; 4]))
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+            output
+                .complete(completion(Finish::Stop))
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            let state = state.borrow();
+            let payload = body(&state.bytes, streaming)?;
+            let mut content = String::new();
+            if streaming {
+                for frame in std::str::from_utf8(&payload)?
+                    .split("\n\n")
+                    .filter(|s| !s.is_empty() && *s != "data: [DONE]")
+                {
+                    let event: Value =
+                        serde_json::from_str(frame.strip_prefix("data: ").ok_or("bad frame")?)?;
+                    assert!(
+                        event["choices"][0]["delta"]
+                            .get("reasoning_content")
+                            .is_none()
+                    );
+                    content.push_str(
+                        event["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .unwrap_or(""),
+                    );
+                }
+            } else {
+                let value: Value = serde_json::from_slice(&payload)?;
+                assert_eq!(value["choices"][0]["message"]["reasoning_content"], "");
+                content.push_str(
+                    value["choices"][0]["message"]["content"]
+                        .as_str()
+                        .ok_or("missing answer")?,
+                );
+            }
+            assert_eq!(content, text);
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn native_stream_and_json_preserve_reasoning_at_every_delimiter_boundary() -> TestResult {
     run(async {
         let text = "思考</thinX> 🌱</think>\n答え</think>";

@@ -83,6 +83,7 @@ async fn together<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::O
 
 struct FakePrepared {
     admitted: crate::AdmittedChat,
+    thinking: bool,
 }
 #[derive(Default, Clone)]
 struct Observation {
@@ -104,16 +105,23 @@ impl worker::Engine for FakeEngine {
     type Prepared = FakePrepared;
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
         self.0.preparations.fetch_add(1, Ordering::Relaxed);
+        let value: Value =
+            serde_json::from_slice(&pending.body).map_err(|_| NativeBackendError::Schema)?;
+        let thinking = value["chat_template_kwargs"]["enable_thinking"]
+            .as_bool()
+            .ok_or(NativeBackendError::Schema)?;
         Ok(FakePrepared {
+            thinking,
             admitted: pending
                 .admit(|_| Ok(100))
                 .map_err(NativeBackendError::Admission)?,
         })
     }
-    fn properties(value: &Self::Prepared) -> (usize, bool, &[u8]) {
+    fn properties(value: &Self::Prepared) -> (usize, bool, bool, &[u8]) {
         (
             100,
             value.admitted.streams_response(),
+            value.thinking,
             value.admitted.backend_body(),
         )
     }
@@ -199,7 +207,9 @@ fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> T
         );
     }
     for (name, value) in [
-        ("enable_thinking", json!(false)),
+        ("enable_thinking", json!(null)),
+        ("enable_thinking", json!("false")),
+        ("enable_thinking", json!(0)),
         ("reasoning_effort", json!("low")),
         ("preserve_thinking", json!(false)),
         ("other", json!(true)),
@@ -236,6 +246,60 @@ fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> T
         assert!(canonical(changed.as_bytes()).is_err());
     }
     Ok(())
+}
+
+#[test]
+fn private_thinking_mode_controls_visible_output_and_is_bound_to_exact_count() -> TestResult {
+    run(async {
+        for streaming in [false, true] {
+            let observed = Observation::default();
+            let mut worker =
+                Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
+            let original = pending(streaming, 128).map_err(|e| format!("{e:?}"))?.body;
+            let mut value: Value = serde_json::from_slice(&original)?;
+            value["chat_template_kwargs"]["enable_thinking"] = json!(false);
+            let body = canonical(&serde_json::to_vec(&value)?)
+                .map_err(|e| format!("{e:?}"))?
+                .body;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body)?["chat_template_kwargs"]["enable_thinking"],
+                false
+            );
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions", &original, true),
+            )
+            .await?;
+            assert_eq!(result, Err(NativeBackendError::CountMismatch));
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let (result, reply) =
+                perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
+            assert_eq!(result, Ok(()));
+            let text = std::str::from_utf8(&reply)?;
+            if streaming {
+                assert!(!text.contains("reasoning_content"));
+            } else {
+                assert!(text.contains("\"reasoning_content\":\"\""));
+            }
+            assert!(text.contains("\"content\":\"draft"));
+            assert!(text.contains("</think>answer"));
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 1);
+        }
+        Ok(())
+    })
 }
 
 #[test]

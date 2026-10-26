@@ -230,12 +230,28 @@ impl SwiftChatSession {
     /// Rejects unsupported/bounded message shapes, zero or more than 4096 output
     /// tokens, template failure and prompt plus output beyond 8192 tokens.
     pub fn prepare(&self, messages: &Value, reserved_output_tokens: usize) -> Result<SwiftPrompt> {
+        self.prepare_with_thinking(messages, reserved_output_tokens, true)
+    }
+
+    /// Render with the selected thinking mode and reserve the entire output.
+    ///
+    /// Disabling thinking closes the reasoning block in the prompt itself.
+    /// Supplied assistant reasoning remains preserved in either mode.
+    ///
+    /// # Errors
+    /// Returns the same message, template and token-budget errors as [`Self::prepare`].
+    pub fn prepare_with_thinking(
+        &self,
+        messages: &Value,
+        reserved_output_tokens: usize,
+        enable_thinking: bool,
+    ) -> Result<SwiftPrompt> {
         let budget = output_budget(reserved_output_tokens)?;
         validate_messages(messages)?;
         let rendered = self.template.render_json(
             messages.clone(),
             true,
-            &json!({"enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true}),
+            &json!({"enable_thinking": enable_thinking, "reasoning_effort": "xhigh", "preserve_thinking": true}),
         )?;
         let tokenization = self.tokenization.encode(
             &rendered,

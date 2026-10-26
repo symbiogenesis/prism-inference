@@ -31,11 +31,17 @@ impl NativeChat {
     pub const fn prompt_tokens(&self) -> usize {
         self.prompt.prompt_tokens()
     }
+
+    /// Thinking mode used to render the exact counted prompt.
+    #[must_use]
+    pub const fn thinking_enabled(&self) -> bool {
+        self.prompt.thinking_enabled()
+    }
 }
 
 /// Render, tokenize and admit an already authenticated strict broker request.
 ///
-/// The existing broker canonicalization fixes sampling and thinking settings.
+/// The existing broker canonicalization fixes sampling and selects thinking.
 /// Counting and execution share the prepared token allocation, and preserve the
 /// existing conservative template margin in addition to exact accounting.
 ///
@@ -47,13 +53,16 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
         let messages = value.get("messages").ok_or(Rejection::ChatSchema)?;
+        let enable_thinking = value["chat_template_kwargs"]["enable_thinking"]
+            .as_bool()
+            .ok_or(Rejection::ChatSchema)?;
         let output = value
             .get("max_completion_tokens")
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(Rejection::CompletionLimit)?;
         let prompt = session
-            .prepare(messages, output)
+            .prepare_with_thinking(messages, output, enable_thinking)
             .map_err(|_| Rejection::TokenCountUnavailable)?;
         let count = prompt.prompt_tokens();
         prepared = Some(prompt);

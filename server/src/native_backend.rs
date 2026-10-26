@@ -259,12 +259,17 @@ async fn deliver<W: AsyncWrite + Unpin>(
                 .await?;
                 delivered.store(true, Ordering::Release);
             }
-            Output::Started { prompt, streaming } => {
-                response = Some(NativeResponse::new(
+            Output::Started {
+                prompt,
+                streaming,
+                thinking,
+            } => {
+                response = Some(NativeResponse::with_thinking(
                     writer.take().ok_or(NativeBackendError::Engine)?,
                     streaming,
                     prompt,
                     deadline,
+                    thinking,
                 ));
             }
             Output::Delta(text) => response
@@ -452,7 +457,6 @@ fn canonical(bytes: &[u8]) -> Result<PendingChat, NativeBackendError> {
         || body.n_cache_reuse != 0
         || body.ignore_eos
         || body.top_k != 20
-        || !body.chat_template_kwargs.0.enable_thinking
         || body.chat_template_kwargs.0.reasoning_effort != "xhigh"
         || !body.chat_template_kwargs.0.preserve_thinking
         || [
@@ -484,7 +488,7 @@ fn canonical(bytes: &[u8]) -> Result<PendingChat, NativeBackendError> {
         frequency_penalty: 0.0,
         repeat_penalty: 1.0,
         chat_template_kwargs: ChatTemplateKwargs {
-            enable_thinking: true,
+            enable_thinking: body.chat_template_kwargs.0.enable_thinking,
             reasoning_effort: "xhigh",
             preserve_thinking: true,
         },

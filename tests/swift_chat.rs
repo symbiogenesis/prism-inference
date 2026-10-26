@@ -58,6 +58,28 @@ fn swift_pinned_template_matches_native_bytes_with_reasoning_history() -> Result
 }
 
 #[test]
+fn swift_pinned_template_disables_reasoning_without_losing_supplied_history() -> Result<()> {
+    let fixture = capture()?;
+    let template = ChatTemplate::new(TEMPLATE, "<|endoftext|>", "<|im_end|>")?;
+    for case in fixture["cases"].as_array().ok_or("missing native cases")? {
+        let rendered = template.render_json(
+            case["messages"].clone(),
+            true,
+            &json!({"enable_thinking":false,"reasoning_effort":"xhigh","preserve_thinking":true}),
+        )?;
+        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(!rendered.contains("Reasoning effort is set to xhigh."));
+        if case["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() > 1)
+        {
+            assert!(rendered.contains("Consider a small tree.\nKeep this supplied thought."));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn swift_chat_rejects_foreign_model_and_unverified_template_before_tokenizer_build() -> Result<()> {
     let fixture = capture()?;
     let mut metadata = ModelMetadata {
@@ -118,6 +140,22 @@ fn swift_actual_artifact_matches_native_prompt_bytes_ids_and_budget() -> Result<
             serde_json::to_value(prompt.tokenization.prompt_token_count())?,
             case["prompt_token_count"]
         );
+        let disabled = session.prepare_with_thinking(&case["messages"], 4096, false)?;
+        assert!(
+            disabled
+                .rendered
+                .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        );
+        assert!(
+            !disabled
+                .rendered
+                .contains("Reasoning effort is set to xhigh.")
+        );
+        assert_ne!(
+            disabled.tokenization.token_ids,
+            prompt.tokenization.token_ids
+        );
+        assert_eq!(disabled.tokenization.reserved_output_tokens, 4096);
     }
     assert!(
         session

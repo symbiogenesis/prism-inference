@@ -33,6 +33,7 @@ pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub struct PreparedChat {
     tokens: Vec<u32>,
     output_tokens: usize,
+    enable_thinking: bool,
 }
 
 impl PreparedChat {
@@ -46,6 +47,12 @@ impl PreparedChat {
     #[must_use]
     pub const fn output_tokens(&self) -> usize {
         self.output_tokens
+    }
+
+    /// Whether the exact prepared prompt starts an open reasoning block.
+    #[must_use]
+    pub const fn thinking_enabled(&self) -> bool {
+        self.enable_thinking
     }
 }
 
@@ -138,13 +145,31 @@ impl SwiftSession {
     /// # Errors
     /// Rejects malformed history, output/context overflow and closed admission.
     pub fn prepare(&self, messages: &Value, output_tokens: usize) -> Result<PreparedChat> {
+        self.prepare_with_thinking(messages, output_tokens, true)
+    }
+
+    /// Render and encode once with the selected thinking mode.
+    ///
+    /// The prepared prompt retains its mode for matching response parsing.
+    ///
+    /// # Errors
+    /// Returns the same admission and prompt errors as [`Self::prepare`].
+    pub fn prepare_with_thinking(
+        &self,
+        messages: &Value,
+        output_tokens: usize,
+        enable_thinking: bool,
+    ) -> Result<PreparedChat> {
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
-        let prompt = self.chat.prepare(messages, output_tokens)?;
+        let prompt = self
+            .chat
+            .prepare_with_thinking(messages, output_tokens, enable_thinking)?;
         Ok(PreparedChat {
             tokens: prompt.tokenization.token_ids,
             output_tokens,
+            enable_thinking,
         })
     }
 

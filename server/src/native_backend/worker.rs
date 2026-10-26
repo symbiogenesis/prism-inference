@@ -19,7 +19,7 @@ use tokio::sync::{Notify, mpsc as channel};
 pub(super) trait Engine: Send + 'static {
     type Prepared: Send;
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError>;
-    fn properties(prepared: &Self::Prepared) -> (usize, bool, &[u8]);
+    fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]);
     fn complete(
         &mut self,
         prepared: &Self::Prepared,
@@ -35,10 +35,11 @@ impl Engine for SwiftSession {
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
         crate::native_swift::prepare(self, pending).map_err(NativeBackendError::Admission)
     }
-    fn properties(prepared: &Self::Prepared) -> (usize, bool, &[u8]) {
+    fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]) {
         (
             prepared.prompt_tokens(),
             prepared.admitted().streams_response(),
+            prepared.thinking_enabled(),
             prepared.admitted().backend_body(),
         )
     }
@@ -64,7 +65,11 @@ pub(super) enum Input {
 
 pub(super) enum Output {
     Count(usize),
-    Started { prompt: usize, streaming: bool },
+    Started {
+        prompt: usize,
+        streaming: bool,
+        thinking: bool,
+    },
     Delta(String),
     Complete(Completion),
     Reset,
@@ -250,14 +255,21 @@ impl<E: Engine> State<E> {
             .counted
             .take()
             .ok_or(NativeBackendError::CountMismatch)?;
-        let (prompt, streaming, body) = E::properties(&prepared);
+        let (prompt, streaming, thinking, body) = E::properties(&prepared);
         if body != pending.body {
             return Err(NativeBackendError::CountMismatch);
         }
         // Every failure after this point closes admission until an explicit
         // successful reset, including missing write/terminal acknowledgements.
         self.faulted = true;
-        acknowledge(command, Output::Started { prompt, streaming })?;
+        acknowledge(
+            command,
+            Output::Started {
+                prompt,
+                streaming,
+                thinking,
+            },
+        )?;
         self.engine
             .complete(&prepared, &command.cancel, command.deadline, |event| {
                 let output = match event {

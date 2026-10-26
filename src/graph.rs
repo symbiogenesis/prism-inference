@@ -29,7 +29,7 @@ pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// or model/device qualification. Complete decoder identities also include the
 /// verified model SHA-256.
 pub const QWEN35_GRAPH_CONTRACT: &str = "qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32";
-/// Graph identity suffix selected only for the exact pinned Swift model.
+/// Graph identity suffix selected only for the exact pinned Swift representations.
 ///
 /// This includes the pinned ARM64 arithmetic ordering. It does not qualify
 /// other model artifacts or promise portable state or target-device parity.
@@ -1162,9 +1162,13 @@ impl Qwen35 {
             });
         }
         // Verified loaders set identity to the complete file SHA256. Select the
-        // compiled native contract only for the exact MVP artifact, preserving
-        // the generic source-order graph and its independent numerical controls.
-        let arithmetic = if model.identity == crate::model::swift::MODEL_SHA256 {
+        // compiled native contract only for the exact current-weight PQ2 and
+        // lossless PTQ1 artifacts. Packing does not change the graph's native
+        // arithmetic; generic artifacts retain source-order controls.
+        let arithmetic = if matches!(
+            model.identity.as_str(),
+            crate::model::swift::MODEL_SHA256 | crate::model::swift::REPACKED_PTQ1_SHA256
+        ) {
             Arithmetic::PinnedSwift
         } else {
             Arithmetic::Source

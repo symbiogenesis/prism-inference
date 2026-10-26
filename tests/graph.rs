@@ -746,38 +746,43 @@ fn pinned_arithmetic_requires_exact_swift_identity_and_survives_recovery() -> Re
     // Synthetic labels exercise selection and recovery, not actual-model
     // qualification. The separate verified-loader tests bind production
     // identities to complete file hashes, and native captures own arithmetic.
-    let mut model = preparation_fixture(true, true);
-    model.identity = bonsai_prism_runtime::model::swift::MODEL_SHA256.to_owned();
-    let mut pinned = Qwen35::new(model, 16)?;
-    let mut near = preparation_fixture(true, true);
-    near.identity = format!("{}0", bonsai_prism_runtime::model::swift::MODEL_SHA256);
-    let mut near = Qwen35::new(near, 16)?;
-    let mut source = Qwen35::new(preparation_fixture(true, true), 16)?;
-    assert!(pinned.identity().ends_with(":prism-arm64-fused-v1"));
-    assert!(!near.identity().ends_with(":prism-arm64-fused-v1"));
-    let mut pinned_bits = Vec::new();
-    let mut source_bits = Vec::new();
-    for token in [0, 1, 1, 0] {
-        let checkpoint = pinned.checkpoint()?;
-        let expected = pinned.evaluate(token)?;
-        pinned.restore(&checkpoint)?;
-        assert!(pinned.evaluate(2).is_err());
-        assert_eq!(pinned.evaluate(token)?, expected);
-        pinned_bits.push(expected.into_iter().map(f32::to_bits).collect::<Vec<_>>());
-        let expected = source.evaluate(token)?;
-        assert_eq!(near.evaluate(token)?, expected);
-        source_bits.push(expected.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+    for identity in [
+        bonsai_prism_runtime::model::swift::MODEL_SHA256,
+        bonsai_prism_runtime::model::swift::REPACKED_PTQ1_SHA256,
+    ] {
+        let mut model = preparation_fixture(true, true);
+        model.identity = identity.to_owned();
+        let mut pinned = Qwen35::new(model, 16)?;
+        let mut near = preparation_fixture(true, true);
+        near.identity = format!("{identity}0");
+        let mut near = Qwen35::new(near, 16)?;
+        let mut source = Qwen35::new(preparation_fixture(true, true), 16)?;
+        assert!(pinned.identity().ends_with(":prism-arm64-fused-v1"));
+        assert!(!near.identity().ends_with(":prism-arm64-fused-v1"));
+        let mut pinned_bits = Vec::new();
+        let mut source_bits = Vec::new();
+        for token in [0, 1, 1, 0] {
+            let checkpoint = pinned.checkpoint()?;
+            let expected = pinned.evaluate(token)?;
+            pinned.restore(&checkpoint)?;
+            assert!(pinned.evaluate(2).is_err());
+            assert_eq!(pinned.evaluate(token)?, expected);
+            pinned_bits.push(expected.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+            let expected = source.evaluate(token)?;
+            assert_eq!(near.evaluate(token)?, expected);
+            source_bits.push(expected.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+        }
+        assert_ne!(pinned_bits, source_bits);
+        pinned.reset()?;
+        assert_eq!(
+            pinned
+                .evaluate(0)?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            pinned_bits[0]
+        );
     }
-    assert_ne!(pinned_bits, source_bits);
-    pinned.reset()?;
-    assert_eq!(
-        pinned
-            .evaluate(0)?
-            .into_iter()
-            .map(f32::to_bits)
-            .collect::<Vec<_>>(),
-        pinned_bits[0]
-    );
     Ok(())
 }
 

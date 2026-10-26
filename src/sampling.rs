@@ -56,7 +56,7 @@ impl Default for Sampling {
     }
 }
 
-/// Seeded experimental reference sampling with a bounded candidate allocation.
+/// Seeded experimental reference sampling with a reusable bounded candidate allocation.
 ///
 /// Each call first validates all 1 through 1,048,576 logits, ranks them by
 /// descending value and ascending token ID, applies temperature and top-k,
@@ -70,15 +70,35 @@ impl Default for Sampling {
 /// `0x94d049bb133111eb`. The upper 32 output bits divided by `2^32` form a
 /// uniform draw in `[0, 1)`. Invalid inputs and allocation errors do not consume
 /// a draw; even a single-candidate successful sample consumes exactly one.
-/// Clones retain the exact options and generator state.
+/// Clones retain the exact options and generator state without copying scratch.
 ///
 /// This contract is independent of Prism/C++ RNG parity. Floating-point
 /// exponentiation may differ between platforms; cross-platform token identity
 /// near probability boundaries is not qualified.
-#[derive(Clone, Debug)]
 pub struct ReferenceSampler {
     options: Sampling,
     state: u64,
+    candidates: Vec<Candidate>,
+}
+
+impl Clone for ReferenceSampler {
+    fn clone(&self) -> Self {
+        Self {
+            options: self.options,
+            state: self.state,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReferenceSampler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceSampler")
+            .field("options", &self.options)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReferenceSampler {
@@ -100,6 +120,7 @@ impl ReferenceSampler {
         Ok(Self {
             options,
             state: seed,
+            candidates: Vec::new(),
         })
     }
 
@@ -131,7 +152,10 @@ impl Sampler for ReferenceSampler {
                 "reference sampling requires bounded nonempty finite logits",
             ));
         }
-        let mut candidates = Vec::new();
+        // Computing a prospective draw does not advance state on any failure.
+        let (next_state, draw) = self.next_draw();
+        let candidates = &mut self.candidates;
+        candidates.clear();
         candidates.try_reserve_exact(logits.len())?;
         for (index, &logit) in logits.iter().enumerate() {
             candidates.push(Candidate {
@@ -159,7 +183,7 @@ impl Sampler for ReferenceSampler {
         candidates.sort_unstable_by(rank);
         let maximum = f64::from(candidates[0].logit);
         let mut total = 0.0;
-        for candidate in &mut candidates {
+        for candidate in &mut *candidates {
             // Subtract in f64 before dividing so every finite f32 temperature
             // and logit stays representable, even at their extreme values.
             candidate.weight = ((f64::from(candidate.logit) - maximum)
@@ -170,14 +194,13 @@ impl Sampler for ReferenceSampler {
         let threshold = total * f64::from(self.options.top_p);
         let mut retained = 0;
         let mut retained_total = 0.0;
-        for candidate in &candidates {
+        for candidate in &*candidates {
             retained += 1;
             retained_total += candidate.weight;
             if retained_total >= threshold {
                 break;
             }
         }
-        let (next_state, draw) = self.next_draw();
         let target = draw * retained_total;
         let mut cumulative = 0.0;
         let mut selected = candidates[0].token;
@@ -192,5 +215,36 @@ impl Sampler for ReferenceSampler {
         }
         self.state = next_state;
         Ok(selected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReferenceSampler, Sampler, Sampling};
+
+    #[test]
+    fn candidate_storage_reuses_capacity_and_clones_only_semantic_state() -> crate::Result<()> {
+        let mut sampler = ReferenceSampler::new(Sampling::default(), 0)?;
+        sampler.sample(&[0.0; 257])?;
+        let allocation = sampler.candidates.as_ptr();
+        let capacity = sampler.candidates.capacity();
+        let mut control = sampler.clone();
+        assert_eq!(control.candidates.capacity(), 0);
+
+        for width in [257, 31, 1, 256] {
+            let mut logits = vec![-1000.0; width];
+            logits[width - 1] = 1000.0;
+            let expected = u32::try_from(width - 1)?;
+            assert_eq!(sampler.sample(&logits)?, expected);
+            assert_eq!(control.sample(&logits)?, expected);
+            assert_eq!(sampler.candidates.as_ptr(), allocation);
+            assert_eq!(sampler.candidates.capacity(), capacity);
+        }
+        assert_ne!(control.candidates.as_ptr(), allocation);
+        assert!(sampler.sample(&[f32::NAN; 257]).is_err());
+        assert!(sampler.sample(&[]).is_err());
+        assert_eq!(sampler.candidates.as_ptr(), allocation);
+        assert_eq!(sampler.sample(&[0.0; 257])?, control.sample(&[0.0; 257])?);
+        Ok(())
     }
 }

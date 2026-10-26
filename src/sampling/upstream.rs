@@ -97,6 +97,12 @@ impl Candidates {
         self.backing.len()
     }
 
+    // Recover the complete allocation, including entries outside a filtered
+    // view. A subsequent sample must rebuild every entry and its view metadata.
+    pub(super) fn into_backing(self) -> Vec<Candidate> {
+        self.backing
+    }
+
     fn sort(&mut self) {
         self.data_mut()
             .sort_unstable_by(|left, right| descending(left.logit, right.logit));

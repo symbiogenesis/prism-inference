@@ -63,6 +63,9 @@ fn swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries() -> Re
     for cancel in [false, true] {
         let mut runtime = runtime(None)?;
         let mut sampler = SwiftSampler::new(4242)?;
+        // Exercise rollback after scratch is already retained: the request
+        // checkpoint must preserve RNG state without duplicating that storage.
+        sampler.sample(&vec![0.0; SwiftSampler::VOCABULARY])?;
         let mut control = sampler.clone();
         let options = Generation {
             max_tokens: 3,

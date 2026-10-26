@@ -8,6 +8,8 @@ on:
         default: Chat
         options:
           - Chat
+          - Pq2RowShapes
+          - Ptq1ElementMap
           - DsparkForward
           - DsparkRealEval
           - TokenizerBpe

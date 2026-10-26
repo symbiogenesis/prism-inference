@@ -1,5 +1,13 @@
 # Runtime conformance
 
+The PQ2/PTQ1 GGML process adapter is now Rust (`tools/prism/upstream/bridge/`),
+linked to the unchanged pinned production ggml library. The reference target
+remains `cpp` because it observes production Prism. Its binary protocol, numerical
+calls, resource limits and executable name are preserved. The separate common API
+bridge remains native. Focused protocol checks run before GGML tools are used or
+published; `tests/Test-PrismGgmlBridge.ps1 -ReferenceBridge <old-executable>` also
+compares old/new response bytes and rejection behavior.
+
 This repository owns the complete upstream source/backend catalog, codec parity
 and their CI orchestration. SwiftBonsai Runner keeps app and released-runtime
 integration checks. The [Swift MVP checklist](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/docs/prism-upstream-todo.md)

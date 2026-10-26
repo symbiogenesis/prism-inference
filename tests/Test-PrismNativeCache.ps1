@@ -68,12 +68,25 @@ $adapter = Join-Path $scratch 'checkout-adapter'
 [void][IO.Directory]::CreateDirectory((Join-Path $adapter 'common'))
 [IO.File]::WriteAllText((Join-Path $adapter 'CMakeLists.txt'), 'adapter build configuration')
 [IO.File]::WriteAllText((Join-Path $adapter 'common/bridge.cpp'), 'adapter production calls')
+[IO.File]::WriteAllText((Join-Path $adapter 'bridge.rs'), 'Rust ggml production calls')
 [IO.File]::WriteAllText((Join-Path $adapter 'common/operations.hpp'), 'adapter production operations')
 [IO.File]::WriteAllText((Join-Path $adapter 'catalog.json'), 'non-native evidence policy')
 Assert ($null -eq (Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory $preview -WhatIf)) 'Adapter WhatIf returned an uncreated cache.'
 Assert (-not (Test-Path -LiteralPath $preview)) 'Adapter WhatIf created a cache.'
 $cachedAdapter = Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory $cache
 Assert (-not [IO.File]::Exists((Join-Path $cachedAdapter 'catalog.json'))) 'Native caches must not bind unrelated evidence policy files.'
+$rustBridge = Join-Path $cachedAdapter 'bridge.rs'
+Assert ([IO.File]::ReadAllText($rustBridge) -ceq 'Rust ggml production calls') 'The Rust ggml adapter was not cached.'
+$rustTimestamp = [IO.File]::GetLastWriteTimeUtc($rustBridge)
+[IO.File]::SetLastWriteTimeUtc((Join-Path $adapter 'bridge.rs'), $rustTimestamp.AddHours(1))
+[void](Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory $cache)
+Assert ([IO.File]::GetLastWriteTimeUtc($rustBridge) -eq $rustTimestamp) 'Fresh checkout timestamps invalidated the Rust bridge.'
+[IO.File]::WriteAllText($rustBridge, 'modified Rust ggml production calls')
+Assert-Failure { Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory $cache } 'A modified cached Rust adapter was accepted.'
+[IO.File]::Copy((Join-Path $adapter 'bridge.rs'), $rustBridge, $true)
+[IO.File]::Delete($rustBridge)
+Assert-Failure { Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory $cache } 'A missing cached Rust adapter was accepted.'
+[IO.File]::Copy((Join-Path $adapter 'bridge.rs'), $rustBridge, $false)
 $bridge = Join-Path $cachedAdapter 'common/bridge.cpp'
 $bridgeTimestamp = [IO.File]::GetLastWriteTimeUtc($bridge)
 [IO.File]::SetLastWriteTimeUtc((Join-Path $adapter 'common/bridge.cpp'), $bridgeTimestamp.AddHours(1))

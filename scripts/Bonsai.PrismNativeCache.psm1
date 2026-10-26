@@ -97,7 +97,7 @@ function Initialize-BonsaiPrismNativeAdapter {
     Keeps verified adapter build inputs at stable paths and timestamps.
     .DESCRIPTION
     Fresh checkouts must not invalidate a cached native bridge's translation
-    unit and headers. Copy only CMake/native inputs; then compare the complete
+    unit and headers. Copy only CMake/native/Rust inputs; then compare the complete
     cached inventory and every file's bytes with the current checkout. Modified,
     missing or injected cached files fail closed and require a fresh cache.
     #>
@@ -131,7 +131,7 @@ function Initialize-BonsaiPrismNativeAdapter {
         throw 'Prism adapter source trees cannot contain reparse points.'
     }
     $originals = @($sourceEntries | Where-Object {
-        -not $_.PSIsContainer -and ($_.Name -ceq 'CMakeLists.txt' -or $_.Extension -cin @('.c', '.cpp', '.h', '.hpp', '.inc', '.cmake'))
+        -not $_.PSIsContainer -and ($_.Name -ceq 'CMakeLists.txt' -or $_.Extension -cin @('.c', '.cpp', '.h', '.hpp', '.inc', '.cmake', '.rs'))
     })
     if (-not [IO.File]::Exists((Join-Path $source 'CMakeLists.txt')) -or $originals.Count -eq 0) {
         throw 'The Prism adapter has no native CMake inputs.'

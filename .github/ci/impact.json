@@ -32,7 +32,7 @@
         "tools/prism/upstream/**", "tools/prism/source.lock.json",
         "scripts/Bonsai.Prism*.psm1", "scripts/Compress-PrismEvidence.ps1",
         "tests/Test-PrismBackend*.ps1", "tests/Test-PrismBaseline.ps1",
-        "tests/Test-PrismEvidence.ps1", "tests/Test-PrismNativeCache.ps1",
+        "tests/Test-PrismEvidence.ps1", "tests/Test-PrismNativeCache.ps1", "tests/Test-PrismGgmlBridge.ps1",
         "tests/Test-PrismRunner.ps1", "tests/Test-PrismTaskRunner.ps1",
         "tests/Test-PrismSource*.ps1", "tests/Test-PrismUpstream.ps1",
         ".github/actions/conformance-policy/**", ".github/workflows/prism-focused.yml"

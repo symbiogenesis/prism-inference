@@ -146,7 +146,7 @@ The current ports preserve all seventy Windows-applicable source contracts from
 Unicode, MTP, Jinja, MTMD and grammar use a [common bridge](common/PROTOCOL.md).
 The Rust runtime has no equivalent production APIs; their Rust results fail.
 
-The native bridge contains only serialization, input validation and production
+The Rust GGML bridge and separate common native bridge contain only serialization, input validation and production
 Prism calls. It does not include upstream test sources or contain generators,
 references, expected values, assertions or tolerances. The C++ fixture exporters
 and original source files are no longer compiled as tests. The original importer
@@ -173,6 +173,22 @@ range, size and SHA-256 checks. Raw API listings are an input-only corpus becaus
 their activity fields change even at revision URLs. No header input is derived
 from expected schemas. The lock explicitly records the upstream Nemotron
 repository-name correction. Assets are materialized only in external evidence.
+
+The PQ2/PTQ1 process adapter is implemented in Rust under `bridge/`; its former
+`bridge.cpp` has been removed. `RustBridge.cmake` compiles it with the pinned
+`nightly-2026-10-22` toolchain and links the same production ggml libraries through
+a small reviewed C ABI. The broader `common/` production API bridge is separate.
+Both CMake entry points retain the `prism-upstream-bridge` target and executable
+name. Set `PRISM_RUST_TOOLCHAIN` to select an explicitly installed toolchain;
+Windows builds select the Rust ARM64 or x64 target to match the CMake platform.
+No dependency download is part of this adapter build.
+
+`tests/Test-PrismGgmlBridge.ps1` checks valid mixed batches, the 64-request bound,
+malformed requests, resource bounds, paths and validation before output truncation.
+An optional `-ReferenceBridge <previous-executable>` compares response bytes and
+rejection behavior before and after a change. The ordinary conformance runner
+requires these protocol checks whenever it builds or consumes the GGML adapter.
+All evidence is external; these focused checks measure no timings.
 
 From a verified, unmodified source extraction, configure this directory with
 CMake and `-DPRISM_SOURCE_DIR=<absolute upstream path>`, then build the

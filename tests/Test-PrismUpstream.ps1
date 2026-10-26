@@ -352,7 +352,7 @@ foreach ($family in $families) {
     $null = Resolve-ExternalPath $build
     $buildSource = $bridgeFamilies[$buildFamily].Source
     $configureArguments = @('-S', $buildSource, '-B', $build, "-DPRISM_SOURCE_DIR=$nativeSource", '-DCMAKE_BUILD_TYPE=Release',
-        '-DLLAMA_BUILD_NUMBER=0', "-DLLAMA_BUILD_COMMIT=$($lock.Commit)") + $generatorArguments
+        '-DLLAMA_BUILD_NUMBER=0', "-DLLAMA_BUILD_COMMIT=$($lock.Commit)", "-DPRISM_RUST_TOOLCHAIN=$Toolchain", "-DPRISM_RUSTUP_EXECUTABLE=$((Get-Command rustup -CommandType Application -ErrorAction Stop).Source)") + $generatorArguments
     if ($buildFamily -eq 'common' -and $referencePatch) {
         foreach ($patch in $referencePatch.Patches) {
             $setting = switch -CaseSensitive ($patch.RelativeSource) {
@@ -413,6 +413,12 @@ foreach ($family in $families) {
         ExecutableSha256 = (Get-FileHash -LiteralPath $bridges[$family] -Algorithm SHA256).Hash.ToLowerInvariant()
         VerifiedPeMachine = if ($IsWindows -and $NativePlatform -eq 'ARM64') { '0xAA64' } else { $null }
     })
+}
+if ($bridges.ContainsKey('ggml')) {
+    # Validate the Rust process boundary before publishing or consuming shared tools.
+    $bridgeEvidence = Join-Path $evidence 'ggml-protocol-bridge'
+    & (Join-Path $repo 'tests/Test-PrismGgmlBridge.ps1') -Bridge $bridges['ggml'] -EvidenceDirectory $bridgeEvidence | Out-Null
+    $receipt.GgmlBridgeProtocol = Join-Path $bridgeEvidence 'receipt.json'
 }
 $receipt.NativeBuilds = $nativeBuilds.ToArray()
 [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 10))

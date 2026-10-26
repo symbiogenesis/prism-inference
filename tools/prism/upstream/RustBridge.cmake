@@ -43,6 +43,12 @@ function(add_prism_rust_ggml_bridge)
   set(source_directory "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/bridge")
   add_custom_command(OUTPUT "${output}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${output_directory}"
+    COMMAND "${PRISM_RUSTUP_EXECUTABLE}" run "${PRISM_RUST_TOOLCHAIN}" rustfmt
+      --edition 2024 --check "${source_directory}/main.rs"
+    COMMAND "${PRISM_RUSTUP_EXECUTABLE}" run "${PRISM_RUST_TOOLCHAIN}" clippy-driver
+      --edition 2024 --crate-name prism_upstream_bridge --target "${rust_target}"
+      --emit metadata -D warnings -W clippy::all -W clippy::pedantic -W clippy::nursery
+      "${source_directory}/main.rs" -o "${output_directory}/bridge.rmeta"
     COMMAND "${PRISM_RUSTUP_EXECUTABLE}" run "${PRISM_RUST_TOOLCHAIN}" rustc
       "${source_directory}/main.rs" --crate-name prism_upstream_bridge
       --edition 2024 --crate-type bin --target "${rust_target}"
@@ -53,7 +59,7 @@ function(add_prism_rust_ggml_bridge)
       -l static=ggml -l static=ggml-cpu -l static=ggml-base
       ${native_runtime_args} -o "${output}"
     DEPENDS "${source_directory}/main.rs" "${source_directory}/protocol.rs"
-      "${source_directory}/native.rs" ggml ggml-cpu ggml-base
+      "${source_directory}/native.rs" "${CMAKE_CURRENT_FUNCTION_LIST_FILE}" ggml ggml-cpu ggml-base
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     COMMENT "Building the Rust production ggml process adapter (${rust_target})"
     VERBATIM COMMAND_EXPAND_LISTS)

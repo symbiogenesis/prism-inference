@@ -1,7 +1,8 @@
 # Upstream process adapter
 
 `prism-upstream-bridge --input ABSOLUTE_PATH --output ABSOLUTE_PATH` calls the
-production ggml library from the verified pinned Prism source. It does not compile
+production ggml library from the verified pinned Prism source. The process
+adapter is written in Rust; production ggml remains the native reference. It does not compile
 or include upstream test sources. The safe Rust caller supplies all inputs,
 independent references, tolerances and pass/fail decisions. Exit zero means the
 operations completed and the response was written; errors use a nonzero exit and

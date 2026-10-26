@@ -64,8 +64,8 @@ target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd pri
 # The same-revision CI tool bundle also supplies the small ggml-only wrapper.
 # Reuse this tree's production ggml libraries instead of compiling them again in
 # a second CMake project. Ordinary common-only builds never request this target.
-add_executable(prism-upstream-bridge ../bridge.cpp)
-target_link_libraries(prism-upstream-bridge PRIVATE ggml ggml-cpu)
+include("${CMAKE_CURRENT_LIST_DIR}/../RustBridge.cmake")
+add_prism_rust_ggml_bridge()
 # The pinned public C ABI intentionally throws for source-tested invalid inputs.
 # Preserve those C++ exception observations instead of assuming extern C is no-throw.
 if(MSVC)

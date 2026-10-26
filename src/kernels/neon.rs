@@ -83,6 +83,32 @@ fn dot32(neon: Neon, low: i8x16<Neon>, high: i8x16<Neon>, values: &[i8; 32]) -> 
     .reduce_sum()
 }
 
+#[inline]
+fn dot16_native_lanes(weights: i8x16<Neon>, values: i8x16<Neon>) -> [i32; 4] {
+    let (weight_low, weight_high) = weights.widen();
+    let (value_low, value_high) = values.widen();
+    let (a, b) = (weight_low * value_low).widen();
+    let (c, d) = (weight_high * value_high).widen();
+    [
+        a.reduce_sum(),
+        b.reduce_sum(),
+        c.reduce_sum(),
+        d.reduce_sum(),
+    ]
+}
+
+#[inline]
+fn dot32_native_lanes(
+    neon: Neon,
+    low: i8x16<Neon>,
+    high: i8x16<Neon>,
+    values: &[i8; 32],
+) -> [i32; 4] {
+    let low = dot16_native_lanes(low, i8x16::from_slice(neon, &values[..16]));
+    let high = dot16_native_lanes(high, i8x16::from_slice(neon, &values[16..]));
+    std::array::from_fn(|lane| low[lane] + high[lane])
+}
+
 /// Retains four independent `Q8_0` integer sums, each bounded by 8,192.
 #[inline]
 pub(super) fn dot_groups(packed: &[u8; 32], activations: [&[i8; 32]; 4]) -> [i32; 4] {
@@ -130,6 +156,59 @@ fn join_low8(low: i8x16<Neon>, high: i8x16<Neon>) -> i8x16<Neon> {
         .bitcast()
 }
 
+#[inline]
+fn decode_ptq1(neon: Neon, packed: &[u8; 28]) -> [i8x16<Neon>; 8] {
+    let first = trits(u8x16::from_slice(neon, &packed[..16]));
+    // Overlap only bytes 10..26; no load reaches the scale or exceeds the block.
+    let rest = u8x16::from_slice(neon, &packed[10..26]);
+    let middle = trits(rest.swizzle_dyn([6, 7, 8, 9, 10, 11, 12, 13, 6, 7, 8, 9, 10, 11, 12, 13]));
+    let last = trits(rest.swizzle_dyn([
+        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+    ]));
+    let tail_low: u32x4<Neon> = last[0]
+        .bitcast::<u16x8<Neon>>()
+        .zip_low(last[1].bitcast::<u16x8<Neon>>())
+        .bitcast();
+    let tail_high: u32x4<Neon> = last[2]
+        .bitcast::<u16x8<Neon>>()
+        .zip_low(last[3].bitcast::<u16x8<Neon>>())
+        .bitcast();
+    let tail = tail_low.zip_low(tail_high).bitcast();
+    [
+        first[0],
+        first[1],
+        first[2],
+        first[3],
+        first[4],
+        join_low8(middle[0], middle[1]),
+        join_low8(middle[2], middle[3]),
+        join_low8(middle[4], tail),
+    ]
+}
+
+/// Keeps each native PTQ1 DOTPROD lane separate until floating accumulation.
+#[inline]
+pub(super) fn dot_ptq1_native_lanes(
+    packed: &[u8; 28],
+    activations: [&[i8; 32]; 4],
+) -> Result<[[i32; 4]; 4]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        let weights = super::ptq1_values(packed)?;
+        return Ok(std::array::from_fn(|group| {
+            super::q8_native_lanes(&weights[group * 32..group * 32 + 32], activations[group])
+        }));
+    };
+    let decoded = decode_ptq1(neon, packed);
+    Ok(std::array::from_fn(|group| {
+        dot32_native_lanes(
+            neon,
+            decoded[group * 2],
+            decoded[group * 2 + 1],
+            activations[group],
+        )
+    }))
+}
+
 /// Decodes all native PTQ1 bytes directly, without a temporary PQ2 block.
 ///
 /// Bytes 0..16 contain five stride-16 digits, 16..24 five stride-8 digits,
@@ -148,39 +227,15 @@ pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) ->
                 .sum()
         }));
     };
-    let first = trits(u8x16::from_slice(neon, &packed[..16]));
-    // The overlapping load includes precisely bytes 10..26, never scale bytes
-    // or storage beyond the block. Shuffles duplicate only the needed lanes.
-    let rest = u8x16::from_slice(neon, &packed[10..26]);
-    let middle = trits(rest.swizzle_dyn([6, 7, 8, 9, 10, 11, 12, 13, 6, 7, 8, 9, 10, 11, 12, 13]));
-    let last = trits(rest.swizzle_dyn([
-        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
-    ]));
-    let tail_low: u32x4<Neon> = last[0]
-        .bitcast::<u16x8<Neon>>()
-        .zip_low(last[1].bitcast::<u16x8<Neon>>())
-        .bitcast();
-    let tail_high: u32x4<Neon> = last[2]
-        .bitcast::<u16x8<Neon>>()
-        .zip_low(last[3].bitcast::<u16x8<Neon>>())
-        .bitcast();
-    let tail = tail_low.zip_low(tail_high).bitcast();
-    Ok([
-        dot32(neon, first[0], first[1], activations[0]),
-        dot32(neon, first[2], first[3], activations[1]),
+    let decoded = decode_ptq1(neon, packed);
+    Ok(std::array::from_fn(|group| {
         dot32(
             neon,
-            first[4],
-            join_low8(middle[0], middle[1]),
-            activations[2],
-        ),
-        dot32(
-            neon,
-            join_low8(middle[2], middle[3]),
-            join_low8(middle[4], tail),
-            activations[3],
-        ),
-    ])
+            decoded[group * 2],
+            decoded[group * 2 + 1],
+            activations[group],
+        )
+    }))
 }
 
 #[cfg(test)]

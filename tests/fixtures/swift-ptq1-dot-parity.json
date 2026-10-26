@@ -1,0 +1,39 @@
+{
+  "runtime_commit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "ggml_cpu_sha256": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+  "fixture_sha256": "781fa202c4d23e2a78cf362e3d84e008dd647c31606ba92b7869f5c2168d439c",
+  "fixture_bytes": 508,
+  "seed": 318,
+  "native_rows": 2,
+  "record_count": 40,
+  "dotprod_mismatches": 0,
+  "source_mismatches": 30,
+  "fallback_mismatches": 33,
+  "fixtures": [
+    {
+      "width": 128,
+      "native_bits": 3242401762,
+      "dotprod_bits": 3242401762,
+      "fallback_bits": 3242401763,
+      "source_bits": 3242401763,
+      "weights_hex": "e6fc985e5437926ca700c7414b105d462cf4ce05b9f19a83ae05ff2d",
+      "activations_hex": "972c7a3a6a246fcbe95659cc1513895ebe72a7ad165b5622e26207fa5ccef7fe7b3c982c57a793eaeacf1c80c8dcc82a029e6ce12edd73472fff99bf47649a049b1640871832ccff23e34a834dded029495d5f20535b8ec3b0aec06db1994d601d2b0b8f083fd82c10ef6af6487554a7b4e1ab8cde83d636971b60602a9f41644b011553e7af7198"
+    },
+    {
+      "width": 256,
+      "native_bits": 1100085970,
+      "dotprod_bits": 1100085970,
+      "fallback_bits": 1100085972,
+      "source_bits": 1100085972,
+      "weights_hex": "4f1cf6d5ace6c582fb116effaa47672bc615baffa0564f10fa2b1a356aa77108399c667689032134998062f3129f64daeeb467316b985436",
+      "activations_hex": "fc2d3071b1c18bfb0c6a3911959b884171f93fb2aacfcde7390ee60b24c2a92ed8f062296785c91537e20ee77fb4b1e133ad7736a2f6026b2fe02d899c2e157b073b0f63591539e61b4f42042c876a1cdbe445466488dee60204eb5b30c0fe5cf0ec07f193cf842a43d84ac6f413b7f2a3aeeb974d66cdd3db6788a1fe7b41a8ecdd5be089327f54451eab9b247b164fef89fbe0936b81b10792cf29618e711779ddda7c8d72a85197d19a2f575468edaa16d5ec2a2f45264ae52a7d8f8efa43526822003f137c1836967e20b730c576653d7a59fb2d85263a3bddbc87340a340ad253ca13594cf3ba9124fdb7aefc2bfba1b1751089a5141fef8e4e9250b471ec5f2b64349d155552932c1673441698"
+    }
+  ],
+  "schema_version": 1,
+  "model_loaded": false,
+  "purpose": "Independent pinned PTQ1 ARM64 DOTPROD lane/FMA accumulation controls",
+  "source_url": "https://raw.githubusercontent.com/PrismML-Eng/llama.cpp/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-cpu/arch/arm/quants.c",
+  "source_sha256": "c41f66f75c81845ea73b0fbf9a7b4502cc4752e1958b5c5668a580d3d4efda37",
+  "probe_sha256": "07903a52410a51418ea6dfaff8ff23b08ff53b5e123a0f1b688fc017e9e5484b",
+  "layout": "Two records: u32 width, u32 native result bits, width/128 native PTQ1 blocks (28 bytes each), width/32 Q8_0 blocks (34 bytes each); little endian"
+}

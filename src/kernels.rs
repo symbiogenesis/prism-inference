@@ -870,6 +870,79 @@ fn dot_q8_groups(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32> {
     finite(output)
 }
 
+fn q8_native_lanes(weights: &[i16], activations: &[i8; 32]) -> [i32; 4] {
+    // The pinned DOTPROD binary keeps four adjacent-product groups from each
+    // 16-wide half, rather than reducing the complete Q8_0 group to one integer.
+    std::array::from_fn(|lane| {
+        [lane * 4, lane * 4 + 16]
+            .into_iter()
+            .flat_map(|start| start..start + 4)
+            .map(|index| i32::from(weights[index]) * i32::from(activations[index]))
+            .sum()
+    })
+}
+
+fn q8_group_native_lanes<const NEON: bool>(
+    block: &[u8],
+    activations: &[Q8Block; 4],
+) -> Result<[[i32; 4]; 4]> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if NEON {
+        let values = activations.each_ref().map(|activation| &activation.values);
+        return neon::dot_ptq1_native_lanes(block.try_into()?, values);
+    }
+    let weights = ptq1_values(block)?;
+    Ok(std::array::from_fn(|group| {
+        q8_native_lanes(
+            &weights[group * 32..group * 32 + 32],
+            &activations[group].values,
+        )
+    }))
+}
+
+fn dot_q8_groups_pinned<const NEON: bool>(
+    kind: u32,
+    bytes: &[u8],
+    input: &[Q8Block],
+) -> Result<f32> {
+    // Only PTQ1 has independent pinned-binary captures for this Q8_0 contract.
+    // Preserve the existing PQ2 odd-128 fallback pending separate validation.
+    if kind != PTQ1 {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if NEON {
+            return dot_q8_groups_neon(kind, bytes, input);
+        }
+        return dot_q8_groups(kind, bytes, input);
+    }
+    let (_, block_bytes) = layout(kind)?;
+    let mut lanes = [0.0_f32; 4];
+    for (index, block) in bytes.chunks_exact(block_bytes).enumerate() {
+        let activations = <&[Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let groups = q8_group_native_lanes::<NEON>(block, activations)?;
+        let weight_scale = scale(&block[26..])?;
+        for (integers, activation) in groups.into_iter().zip(activations) {
+            let d = weight_scale * activation.scale;
+            for (lane, integer) in lanes.iter_mut().zip(integers) {
+                *lane = integer_float(integer).mul_add(d, *lane);
+            }
+        }
+    }
+    // ARM64 FADDP reduces adjacent lanes in pairs after the entire row.
+    finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+}
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -1469,9 +1542,17 @@ impl MatvecScratch {
             target_feature = "neon"
         ))]
         if matches!(self.selected_backend(), MatvecBackend::ExperimentalNeon) {
-            return dot_q8_groups_neon;
+            return if self.pinned_accumulation {
+                dot_q8_groups_pinned::<true>
+            } else {
+                dot_q8_groups_neon
+            };
         }
-        dot_q8_groups
+        if self.pinned_accumulation {
+            dot_q8_groups_pinned::<false>
+        } else {
+            dot_q8_groups
+        }
     }
 }
 
@@ -1987,6 +2068,71 @@ mod tests {
                 0xc1f9_0b02
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_ptq1_accumulation_matches_independent_native_binary_capture() -> crate::Result<()> {
+        let fixture = include_bytes!("../tests/fixtures/swift-ptq1-dot-parity.bin");
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/swift-ptq1-dot-parity.json"))?;
+        let hash: String = Sha256::digest(fixture)
+            .into_iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
+        assert_eq!(fixture.len(), 508);
+        assert_eq!(
+            provenance["runtime_commit"].as_str(),
+            Some("73bfe6cc485554822f80c473a3c0c4f25e80f41b")
+        );
+        assert_eq!(
+            provenance["ggml_cpu_sha256"].as_str(),
+            Some("701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab")
+        );
+        let mut remaining = fixture.as_slice();
+        for case in 0..2 {
+            let width = usize::try_from(u32::from_le_bytes(remaining[..4].try_into()?))?;
+            let expected = u32::from_le_bytes(remaining[4..8].try_into()?);
+            let weight_bytes = width / 128 * 28;
+            let (weights, next) = remaining[8..].split_at(weight_bytes);
+            let (activations, next) = next.split_at(width / 32 * 34);
+            remaining = next;
+            let input = activations
+                .as_chunks::<34>()
+                .0
+                .iter()
+                .map(|block| {
+                    Ok(super::Q8Block {
+                        scale: super::scale(block)?,
+                        sum: 0.0,
+                        values: std::array::from_fn(|index| i8::from_ne_bytes([block[index + 2]])),
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            for backend in [
+                super::MatvecBackend::Scalar,
+                super::MatvecBackend::Auto,
+                super::MatvecBackend::ExperimentalNeon,
+            ] {
+                let mut pinned = MatvecScratch::with_pinned_backend(backend);
+                assert_eq!(
+                    pinned.select_q8_groups()(super::PTQ1, weights, &input)?.to_bits(),
+                    expected
+                );
+                // Public source/reference APIs keep their unfused group reduction.
+                let mut source = MatvecScratch::with_backend(backend);
+                let source_bits =
+                    source.select_q8_groups()(super::PTQ1, weights, &input)?.to_bits();
+                assert_ne!(source_bits, expected);
+                assert_eq!(
+                    Some(u64::from(source_bits)),
+                    provenance["fixtures"][case]["source_bits"].as_u64()
+                );
+            }
+        }
+        assert!(remaining.is_empty());
         Ok(())
     }
 

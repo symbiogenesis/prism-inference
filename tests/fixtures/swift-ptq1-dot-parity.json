@@ -4,7 +4,6 @@
   "fixture_sha256": "781fa202c4d23e2a78cf362e3d84e008dd647c31606ba92b7869f5c2168d439c",
   "fixture_bytes": 508,
   "seed": 318,
-  "native_rows": 2,
   "record_count": 40,
   "dotprod_mismatches": 0,
   "source_mismatches": 30,
@@ -35,5 +34,8 @@
   "source_url": "https://raw.githubusercontent.com/PrismML-Eng/llama.cpp/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-cpu/arch/arm/quants.c",
   "source_sha256": "c41f66f75c81845ea73b0fbf9a7b4502cc4752e1958b5c5668a580d3d4efda37",
   "probe_sha256": "07903a52410a51418ea6dfaff8ff23b08ff53b5e123a0f1b688fc017e9e5484b",
-  "layout": "Two records: u32 width, u32 native result bits, width/128 native PTQ1 blocks (28 bytes each), width/32 Q8_0 blocks (34 bytes each); little endian"
+  "layout": "Two records: u32 width, u32 native result bits, width/128 native PTQ1 blocks (28 bytes each), width/32 Q8_0 blocks (34 bytes each); little endian",
+  "capture_nrc": 1,
+  "native_trait_nrows": 2,
+  "scope": "Independent single-row nrc=1 packed-dot correctness only; trait nrows=2 describes available dispatch, not captured execution. No nrc=2 2x2 tile, model, adapter, quality, or performance qualification."
 }

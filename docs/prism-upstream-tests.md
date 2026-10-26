@@ -484,6 +484,12 @@ fan-in proof remain unchanged. The remaining ordinary-source group runs up to
 four isolated adapters concurrently; each adapter's C++ and Rust controls still
 run in order, and explicitly requested measurements remain exclusive.
 
+A newer automatic push cancels obsolete conformance work for the same branch,
+freeing hosted runner capacity. Impact selection still compares against the
+last successful ancestor, so unvalidated changes from cancelled revisions stay
+in the next run's scope. Every manual dispatch has an independent concurrency
+group and retains its requested diagnostics or measurements.
+
 Compiled Rust caches include runtime and harness contents so changed sources
 refresh the immutable cache instead of rebuilding from the same old entry on
 every run. Native cache identities cover actual CMake, native/Rust bridge,

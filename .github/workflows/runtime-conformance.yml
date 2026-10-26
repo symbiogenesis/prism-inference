@@ -35,8 +35,11 @@ env:
   # proof. Keep this in sync with the prism-backend-run matrix below.
   PRISM_BACKEND_EXECUTION_COUNT: '32'
 concurrency:
-  group: runtime-conformance-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: false
+  # Pushes select cumulatively from the last successful ancestor, so a newer
+  # revision safely replaces obsolete work instead of occupying all ARM64 slots.
+  # Explicit diagnostic/measurement dispatches keep their own independent run.
+  group: runtime-conformance-${{ github.event_name }}-${{ github.ref }}-${{ github.event_name == 'push' && 'latest' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 jobs:
   changes:
     if: github.ref == 'refs/heads/main'

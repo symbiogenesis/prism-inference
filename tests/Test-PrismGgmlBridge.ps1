@@ -33,7 +33,7 @@ foreach ($entry in $executables.GetEnumerator()) {
 [void][IO.Directory]::CreateDirectory($evidence)
 $observations = [Collections.Generic.List[object]]::new()
 
-function New-GgmlHeader {
+function Get-GgmlHeader {
     <# .SYNOPSIS
     Writes an explicitly supplied request header in the protocol's byte order.
     #>
@@ -44,11 +44,11 @@ function New-GgmlHeader {
     $writer = [IO.BinaryWriter]::new($stream)
     try {
         foreach ($value in @($Operation, $K, $M, $N, $PackedCount, $ActivationCount)) { $writer.Write([uint32]$value) }
-        return ,$stream.ToArray()
+        $PSCmdlet.WriteObject($stream.ToArray(), $false)
     } finally { $writer.Dispose(); $stream.Dispose() }
 }
 
-function New-GgmlPacket {
+function Get-GgmlPacket {
     <# .SYNOPSIS
     Frames supplied request bytes without deriving expected production results.
     #>
@@ -61,11 +61,11 @@ function New-GgmlPacket {
         $writer.Write([Text.Encoding]::ASCII.GetBytes("BSPREQ1`n"))
         $writer.Write($Count)
         $writer.Write($Payload)
-        return ,$stream.ToArray()
+        $PSCmdlet.WriteObject($stream.ToArray(), $false)
     } finally { $writer.Dispose(); $stream.Dispose() }
 }
 
-function New-GgmlRequest {
+function Get-GgmlRequest {
     <# .SYNOPSIS
     Supplies deterministic finite-scale packed weights and activation bit patterns.
     #>
@@ -94,7 +94,7 @@ function New-GgmlRequest {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write((New-GgmlHeader $Operation $K $M $N $packed.Length $activationCount))
+        $writer.Write((Get-GgmlHeader -Operation $Operation -K $K -M $M -N $N -PackedCount $packed.Length -ActivationCount $activationCount))
         $writer.Write($packed)
         for ($index = 0; $index -lt $activationCount; $index++) { $writer.Write([single]($random.Next(-4096, 4097) / 1024.0)) }
         $outputCount = if ($Operation -eq 1) { $M * $N } else { $K * $M }
@@ -188,50 +188,50 @@ function Invoke-GgmlCase {
 # A focused numeric sample spans both formats, multiple rows/columns and mixed
 # request order. Both executables receive exactly the same immutable input file.
 $requests = @(
-    (New-GgmlRequest 1 128 1 1 11),
-    (New-GgmlRequest 2 128 257 0 12),
-    (New-GgmlRequest 1 384 4 4 13),
-    (New-GgmlRequest 1 640 4 16 14),
-    (New-GgmlRequest 2 128 1 0 15),
-    (New-GgmlRequest 1 8192 1 1 16)
+    (Get-GgmlRequest -Operation 1 -K 128 -M 1 -N 1 -Seed 11),
+    (Get-GgmlRequest -Operation 2 -K 128 -M 257 -N 0 -Seed 12),
+    (Get-GgmlRequest -Operation 1 -K 384 -M 4 -N 4 -Seed 13),
+    (Get-GgmlRequest -Operation 1 -K 640 -M 4 -N 16 -Seed 14),
+    (Get-GgmlRequest -Operation 2 -K 128 -M 1 -N 0 -Seed 15),
+    (Get-GgmlRequest -Operation 1 -K 8192 -M 1 -N 1 -Seed 16)
 )
 $payload = [Collections.Generic.List[byte]]::new()
 foreach ($request in $requests) { $payload.AddRange([byte[]]$request.Bytes) }
-Invoke-GgmlCase -Name 'mixed-numerics' -Packet (New-GgmlPacket $requests.Length $payload.ToArray()) -OutputCounts @($requests | ForEach-Object { [uint32]$_.OutputCount })
-$tiny = New-GgmlRequest 2 128 1 0 123
+Invoke-GgmlCase -Name 'mixed-numerics' -Packet (Get-GgmlPacket -Count $requests.Length -Payload $payload.ToArray()) -OutputCounts @($requests | ForEach-Object { [uint32]$_.OutputCount })
+$tiny = Get-GgmlRequest -Operation 2 -K 128 -M 1 -N 0 -Seed 123
 $payload.Clear()
 for ($index = 0; $index -lt 64; $index++) { $payload.AddRange([byte[]]$tiny.Bytes) }
-Invoke-GgmlCase -Name 'maximum-request-count' -Packet (New-GgmlPacket 64 $payload.ToArray()) -OutputCounts ([uint32[]]::new(64) | ForEach-Object { [uint32]128 })
-$valid = New-GgmlPacket 1 $tiny.Bytes
+Invoke-GgmlCase -Name 'maximum-request-count' -Packet (Get-GgmlPacket -Count 64 -Payload $payload.ToArray()) -OutputCounts ([uint32[]]::new(64) | ForEach-Object { [uint32]128 })
+$valid = Get-GgmlPacket -Count 1 -Payload $tiny.Bytes
 
 $invalid = @(
     @{ Name = 'empty'; Packet = [byte[]]::new(0); Error = 'invalid request magic' },
     @{ Name = 'bad-magic'; Packet = [Text.Encoding]::ASCII.GetBytes('BADREQ1!'); Error = 'invalid request magic' },
     @{ Name = 'truncated-count'; Packet = [Text.Encoding]::ASCII.GetBytes("BSPREQ1`n"); Error = 'truncated request' },
-    @{ Name = 'zero-count'; Packet = (New-GgmlPacket 0); Error = 'request count outside 1..64' },
-    @{ Name = 'too-many-requests'; Packet = (New-GgmlPacket 65); Error = 'request count outside 1..64' },
-    @{ Name = 'truncated-header'; Packet = (New-GgmlPacket 1); Error = 'truncated request' },
-    @{ Name = 'unknown-operation'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 3 128 1 0 0 0)); Error = 'unknown operation' },
-    @{ Name = 'packed-limit'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 1 0 (16MB + 1) 0)); Error = 'request payload exceeds size limit' },
-    @{ Name = 'activation-limit'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 1 1 34 (4MB + 1))); Error = 'request payload exceeds size limit' },
-    @{ Name = 'pq2-zero-k'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 0 1 1 0 0)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-unblocked-k'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 129 1 1 34 129)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-large-k'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 8320 1 1 0 0)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-zero-m'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 0 1 0 128)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-large-m'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 4097 1 0 128)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-zero-n'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 1 0 34 0)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-large-n'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 1 257 34 0)); Error = 'invalid PQ2 matrix shape' },
-    @{ Name = 'pq2-weight-elements'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 8192 1025 1 0 0)); Error = 'PQ2 weights exceed element limit' },
-    @{ Name = 'pq2-packed-length'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 1 1 33 128)); Error = 'PQ2 payload does not match shape' },
-    @{ Name = 'pq2-activation-length'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 1 128 1 1 34 127)); Error = 'PQ2 payload does not match shape' },
-    @{ Name = 'ptq1-wrong-k'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 256 1 0 28 0)); Error = 'invalid PTQ1 batch shape' },
-    @{ Name = 'ptq1-zero-blocks'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 0 0 0 0)); Error = 'invalid PTQ1 batch shape' },
-    @{ Name = 'ptq1-large-batch'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 20001 0 0 0)); Error = 'invalid PTQ1 batch shape' },
-    @{ Name = 'ptq1-wrong-n'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 1 1 28 0)); Error = 'invalid PTQ1 batch shape' },
-    @{ Name = 'ptq1-packed-length'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 1 0 27 0)); Error = 'PTQ1 payload does not match shape' },
-    @{ Name = 'ptq1-activation-length'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 1 0 28 1)); Error = 'PTQ1 payload does not match shape' },
-    @{ Name = 'truncated-packed'; Packet = (New-GgmlPacket 1 (New-GgmlHeader 2 128 1 0 28 0)); Error = 'truncated packed payload' },
-    @{ Name = 'truncated-activation'; Packet = (New-GgmlPacket 1 ((New-GgmlHeader 1 128 1 1 34 128) + [byte[]]::new(34))); Error = 'truncated request' },
+    @{ Name = 'zero-count'; Packet = (Get-GgmlPacket -Count 0); Error = 'request count outside 1..64' },
+    @{ Name = 'too-many-requests'; Packet = (Get-GgmlPacket -Count 65); Error = 'request count outside 1..64' },
+    @{ Name = 'truncated-header'; Packet = (Get-GgmlPacket -Count 1); Error = 'truncated request' },
+    @{ Name = 'unknown-operation'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 3 -K 128 -M 1 -N 0 -PackedCount 0 -ActivationCount 0)); Error = 'unknown operation' },
+    @{ Name = 'packed-limit'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 1 -N 0 -PackedCount (16MB + 1) -ActivationCount 0)); Error = 'request payload exceeds size limit' },
+    @{ Name = 'activation-limit'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 1 -N 1 -PackedCount 34 -ActivationCount (4MB + 1))); Error = 'request payload exceeds size limit' },
+    @{ Name = 'pq2-zero-k'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 0 -M 1 -N 1 -PackedCount 0 -ActivationCount 0)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-unblocked-k'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 129 -M 1 -N 1 -PackedCount 34 -ActivationCount 129)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-large-k'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 8320 -M 1 -N 1 -PackedCount 0 -ActivationCount 0)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-zero-m'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 0 -N 1 -PackedCount 0 -ActivationCount 128)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-large-m'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 4097 -N 1 -PackedCount 0 -ActivationCount 128)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-zero-n'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 1 -N 0 -PackedCount 34 -ActivationCount 0)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-large-n'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 1 -N 257 -PackedCount 34 -ActivationCount 0)); Error = 'invalid PQ2 matrix shape' },
+    @{ Name = 'pq2-weight-elements'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 8192 -M 1025 -N 1 -PackedCount 0 -ActivationCount 0)); Error = 'PQ2 weights exceed element limit' },
+    @{ Name = 'pq2-packed-length'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 1 -N 1 -PackedCount 33 -ActivationCount 128)); Error = 'PQ2 payload does not match shape' },
+    @{ Name = 'pq2-activation-length'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 1 -K 128 -M 1 -N 1 -PackedCount 34 -ActivationCount 127)); Error = 'PQ2 payload does not match shape' },
+    @{ Name = 'ptq1-wrong-k'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 256 -M 1 -N 0 -PackedCount 28 -ActivationCount 0)); Error = 'invalid PTQ1 batch shape' },
+    @{ Name = 'ptq1-zero-blocks'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 0 -N 0 -PackedCount 0 -ActivationCount 0)); Error = 'invalid PTQ1 batch shape' },
+    @{ Name = 'ptq1-large-batch'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 20001 -N 0 -PackedCount 0 -ActivationCount 0)); Error = 'invalid PTQ1 batch shape' },
+    @{ Name = 'ptq1-wrong-n'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 1 -N 1 -PackedCount 28 -ActivationCount 0)); Error = 'invalid PTQ1 batch shape' },
+    @{ Name = 'ptq1-packed-length'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 1 -N 0 -PackedCount 27 -ActivationCount 0)); Error = 'PTQ1 payload does not match shape' },
+    @{ Name = 'ptq1-activation-length'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 1 -N 0 -PackedCount 28 -ActivationCount 1)); Error = 'PTQ1 payload does not match shape' },
+    @{ Name = 'truncated-packed'; Packet = (Get-GgmlPacket -Count 1 -Payload (Get-GgmlHeader -Operation 2 -K 128 -M 1 -N 0 -PackedCount 28 -ActivationCount 0)); Error = 'truncated packed payload' },
+    @{ Name = 'truncated-activation'; Packet = (Get-GgmlPacket -Count 1 -Payload ((Get-GgmlHeader -Operation 1 -K 128 -M 1 -N 1 -PackedCount 34 -ActivationCount 128) + [byte[]]::new(34))); Error = 'truncated request' },
     @{ Name = 'trailing-data'; Packet = [byte[]]($valid + [byte]0); Error = 'trailing request data' }
 )
 foreach ($case in $invalid) { Invoke-GgmlCase -Name $case.Name -Packet $case.Packet -ExpectedError $case.Error }
@@ -239,10 +239,10 @@ foreach ($case in $invalid) { Invoke-GgmlCase -Name $case.Name -Packet $case.Pac
 # Six maximum-sized PTQ1 responses fit the total; the seventh header must reject
 # before reading its packed payload or opening an output. This is not executed.
 $payload.Clear()
-$largeRequest = [byte[]]((New-GgmlHeader 2 128 20000 0 560000 0) + [byte[]]::new(560000))
+$largeRequest = [byte[]]((Get-GgmlHeader -Operation 2 -K 128 -M 20000 -N 0 -PackedCount 560000 -ActivationCount 0) + [byte[]]::new(560000))
 for ($index = 0; $index -lt 6; $index++) { $payload.AddRange($largeRequest) }
-$payload.AddRange((New-GgmlHeader 2 128 20000 0 560000 0))
-Invoke-GgmlCase -Name 'total-output-limit' -Packet (New-GgmlPacket 7 $payload.ToArray()) -ExpectedError 'responses exceed total element limit'
+$payload.AddRange((Get-GgmlHeader -Operation 2 -K 128 -M 20000 -N 0 -PackedCount 560000 -ActivationCount 0))
+Invoke-GgmlCase -Name 'total-output-limit' -Packet (Get-GgmlPacket -Count 7 -Payload $payload.ToArray()) -ExpectedError 'responses exceed total element limit'
 foreach ($case in @(
     @{ Mode = 'usage'; Error = 'usage: prism-upstream-bridge' },
     @{ Mode = 'relative-input'; Error = 'protocol paths must be absolute' },

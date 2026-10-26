@@ -2132,7 +2132,7 @@ mod tests {
                 );
             }
         }
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, b"");
         Ok(())
     }
 

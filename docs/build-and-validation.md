@@ -289,6 +289,30 @@ current Runner development budget: 11,230,294,016 available physical bytes versu
 unchanged. The earlier failed full-model comparison therefore remains the latest
 numerical verdict. No PTQ1 default, service selection or admission reduction is
 qualified by these operator fixtures.
+### PTQ1 activation preparation repair
+
+A later one-token Rust recheck completed under a separate diagnostic envelope:
+12 GiB available admission, 8 GiB Job commit and the same 4 GiB physical reserve.
+Peak Job commit was 6,275,588,096 bytes; minimum available physical RAM was
+7,574,892,544 bytes. All 129 outputs matched the earlier Rust capture, including
+its numerical failure. This is bounded resource evidence, not a service profile.
+
+A native-backed intermediate trace localized the first difference to block 13's
+FFN down-projection. Its input and Hadamard transform matched exactly; one Q8_0
+activation code differed. The pinned DLL uses amax multiplied by rounded
+binary32 1/127 for scale and direct 127/amax division for inverse scale. The
+previous division-then-reciprocal sequence rounded a halfway value differently.
+The pinned PTQ1 path now reproduces the native sequence and has a distinct
+activation-sharing contract. Generic/PQ2 behavior remains unchanged. Four small
+synthetic native controls and the entire isolated 17,408-by-5,120 projection
+match exactly. A new full-model comparison after this repair remains pending;
+production defaults, service selection and admission are unqualified.
+
+The unchanged DSpark real-eval case passed in isolated main CI run 40446869313
+but exhausted its native session lifetime in concurrent ordinary partition 3.
+That partition now runs adapters serially; the other ordinary partitions retain
+their prior concurrency. Source coverage, inputs, assertions and deadlines stay
+unchanged. CI on the final combined revision is handed to the owner for monitoring.
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five
@@ -299,7 +323,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.5`; the published crates.io installation
+The checkout prepares version `0.1.6`; the published crates.io installation
 examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt

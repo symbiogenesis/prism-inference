@@ -100,6 +100,9 @@ jobs:
         working-directory: ${{ runner.temp }}
         env:
           SOURCE_PARTITION: ${{ matrix.partition }}
+          # DSpark's unchanged native session passes in isolation; avoid
+          # overlapping it with the other heavy partition-three adapters.
+          PRISM_CASE_PARALLEL: ${{ matrix.partition == 3 && '1' || '4' }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
@@ -114,7 +117,7 @@ jobs:
           [void][IO.Directory]::CreateDirectory($downloads)
           $archive = Join-Path $downloads ("prism-$($lock.ArchiveSha256).zip")
           $null = Receive-LockedArtifact -Uri $lock.ArchiveUrl -Path $archive -Bytes $lock.ArchiveBytes -Sha256 $lock.ArchiveSha256 -TimeoutSeconds 600
-          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -SourceArchive $archive -EvidenceDirectory $evidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -CommonToolsBundleDirectory (Join-Path $env:RUNNER_TEMP 'prism-backend-tools') -AssetCacheDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismFixtureDownloads') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 4 -DeferBackend -SourcePartition ([int]$env:SOURCE_PARTITION) | ConvertTo-Json -Depth 12
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -SourceArchive $archive -EvidenceDirectory $evidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -CommonToolsBundleDirectory (Join-Path $env:RUNNER_TEMP 'prism-backend-tools') -AssetCacheDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismFixtureDownloads') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-10-22-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel ([int]$env:PRISM_CASE_PARALLEL) -DeferBackend -SourcePartition ([int]$env:SOURCE_PARTITION) | ConvertTo-Json -Depth 12
       - name: Publish ordinary source results for the complete gate
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

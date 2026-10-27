@@ -131,6 +131,16 @@ next plan. Manual dispatches retain independent complete validation requests.
 Aggregate gates require successful planning
 and successful selected jobs; they permit skips only for unselected groups.
 
+## Checkpoint restore storage
+
+Checkpoint restoration stages every fallible KV page-table and mutable-tail copy
+before changing live state. Convolution and recurrent matrices then restore their
+exact binary32 bits into existing live allocations. Independently owned snapshots
+and sealed KV-page sharing retain their previous contracts. For Swift, this avoids
+another 156,893,184 bytes (149.625 MiB) of transient recurrent/convolution payload
+during restore. It is a storage-lifetime bound, not a measured decrease in process
+peak RAM or admission requirements. Focused ownership, staging-failure and frozen
+hybrid-state recovery regressions cover the change.
 ## Bounded actual-model correctness captures
 
 Build the `swift_model_check` example explicitly from the external working lane.
@@ -273,7 +283,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.4`; the published crates.io installation
+The checkout prepares version `0.1.5`; the published crates.io installation
 examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt

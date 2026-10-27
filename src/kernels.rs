@@ -30,6 +30,9 @@ pub(crate) mod pinned_gdn;
 mod signquants;
 mod tquants;
 
+#[cfg(test)]
+mod pinned_float_tests;
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -1670,7 +1673,21 @@ impl PreparedMatvec<'_> {
                 scratch.diagnostics = scratch.diagnostics.select(false);
                 for (index, _) in tensor.data.chunks_exact(row_bytes).enumerate() {
                     row_into(tensor, index, &mut scratch.row)?;
-                    output.push(finite(float_dot(&scratch.row, &scratch.activations))?);
+                    // Native F32/F16 projections use four FMA registers on
+                    // complete 16-element blocks. Restrict this qualified
+                    // contract to aligned rows: compiled scalar tails have
+                    // different rounding and retain their prior behavior.
+                    // BF16's pinned ARM64 dot still uses the binary64 sum.
+                    output.push(
+                        if scratch.pinned_accumulation
+                            && matches!(tensor.kind, F32 | F16)
+                            && columns.is_multiple_of(16)
+                        {
+                            pinned_gdn::dot(&scratch.row, &scratch.activations)?
+                        } else {
+                            finite(float_dot(&scratch.row, &scratch.activations))?
+                        },
+                    );
                 }
             }
         }

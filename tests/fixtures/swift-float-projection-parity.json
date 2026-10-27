@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "runtime_commit": "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+  "ggml_cpu_sha256": "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab",
+  "source_url": "https://raw.githubusercontent.com/PrismML-Eng/llama.cpp/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-cpu/vec.cpp",
+  "source_sha256": "cda0babb53f9c8ff1faa7459b2c49019d15e5970dfe0c613d58e2659e919f524",
+  "probe_sha256": "6332cc2edb0f62a91a06e3982d5566136f61ea1868ebf722f1d72236beef6506",
+  "seed": 2026102602,
+  "capture_nrc": 1,
+  "model_loaded": false,
+  "fixture_bytes": 84880,
+  "fixture_sha256": "5a00f4c15e67ba7dd49a4e38c833e07648e7f617e0c2fd6d57078f3e55e9c263",
+  "layout": "Twelve little-endian records: u32 kind, u32 width, u32 native result bits, one weight row then one activation row in the native scalar format. F32=0 (four bytes); F16=1 and BF16=30 (two bytes).",
+  "scope": "Aligned scalar floating projection operator evidence; no full-model, tail, adapter, quality or performance qualification. Generic and BF16 arithmetic are controls.",
+  "records": [
+    {
+      "kind": 0,
+      "count": 16,
+      "native_bits": 3235552059,
+      "generic_bits": 3235552059
+    },
+    {
+      "kind": 0,
+      "count": 32,
+      "native_bits": 1093978223,
+      "generic_bits": 1093978226
+    },
+    {
+      "kind": 0,
+      "count": 128,
+      "native_bits": 1125913574,
+      "generic_bits": 1125913574
+    },
+    {
+      "kind": 0,
+      "count": 5120,
+      "native_bits": 1135630859,
+      "generic_bits": 1135630859
+    },
+    {
+      "kind": 1,
+      "count": 16,
+      "native_bits": 1098318002,
+      "generic_bits": 1098318002
+    },
+    {
+      "kind": 1,
+      "count": 32,
+      "native_bits": 1114226534,
+      "generic_bits": 1114226534
+    },
+    {
+      "kind": 1,
+      "count": 128,
+      "native_bits": 3255284359,
+      "generic_bits": 3255284360
+    },
+    {
+      "kind": 1,
+      "count": 5120,
+      "native_bits": 1140938014,
+      "generic_bits": 1140938012
+    },
+    {
+      "kind": 30,
+      "count": 16,
+      "native_bits": 1106821240,
+      "generic_bits": 1106821240
+    },
+    {
+      "kind": 30,
+      "count": 32,
+      "native_bits": 3241731844,
+      "generic_bits": 3241731844
+    },
+    {
+      "kind": 30,
+      "count": 128,
+      "native_bits": 3260398173,
+      "generic_bits": 3260398173
+    },
+    {
+      "kind": 30,
+      "count": 5120,
+      "native_bits": 1120890605,
+      "generic_bits": 1120890605
+    }
+  ]
+}

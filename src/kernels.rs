@@ -33,6 +33,9 @@ mod tquants;
 #[cfg(test)]
 mod pinned_float_tests;
 
+#[cfg(test)]
+mod pinned_q8_tests;
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -442,6 +445,13 @@ fn q8_into(input: &[f32], output: &mut Vec<Q8Block>) -> Result<()> {
 }
 
 fn q8_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8Block>) -> Result<()> {
+    q8_with_contract::<PINNED, false>(input, output)
+}
+
+fn q8_with_contract<const PINNED: bool, const NATIVE_SCALE: bool>(
+    input: &[f32],
+    output: &mut Vec<Q8Block>,
+) -> Result<()> {
     if !input.len().is_multiple_of(32) {
         return Err(invalid("Q8_0 activations require a multiple of 32 columns"));
     }
@@ -451,8 +461,22 @@ fn q8_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8Block>
             for &value in chunk {
                 maximum = maximum.max(finite(value)?.abs());
             }
-            let d = maximum / 127.0;
-            let inverse_scale = if d == 0.0 { 0.0 } else { 1.0 / d };
+            // The pinned ARM64 Q8_0 binary multiplies by this rounded
+            // reciprocal for the stored scale, but divides 127 by the
+            // unscaled maximum for integer preparation. Recovering the
+            // inverse from d changes halfway cases by one quantization code.
+            let d = if NATIVE_SCALE {
+                maximum * f32::from_bits(0x3c01_0204)
+            } else {
+                maximum / 127.0
+            };
+            let inverse_scale = if d == 0.0 {
+                0.0
+            } else if NATIVE_SCALE {
+                127.0 / maximum
+            } else {
+                1.0 / d
+            };
             let mut block = Q8Block {
                 scale: round_f16(d),
                 sum: 0.0,
@@ -1154,14 +1178,16 @@ pub struct MatvecScratch {
 enum ActivationContract {
     Q8K,
     Q8,
+    PinnedPtq1Q8,
     F32,
     F16,
     BF16,
 }
 
 impl ActivationContract {
-    const fn for_tensor(tensor: &Tensor, columns: usize) -> Self {
+    const fn for_tensor(tensor: &Tensor, columns: usize, pinned: bool) -> Self {
         match tensor.kind {
+            PTQ1 if pinned => Self::PinnedPtq1Q8,
             10..=14 | 16..=19 | 21..=23 | 29 | 34 | 35 => Self::Q8K,
             PQ2 if columns.is_multiple_of(256) => Self::Q8K,
             PQ2 | PTQ1 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | 20 | 39..=42 => Self::Q8,
@@ -1416,8 +1442,11 @@ impl MatvecScratch {
                 "matvec requires a matching finite activation vector",
             ));
         }
-        let contract = ActivationContract::for_tensor(tensor, columns);
+        let contract = ActivationContract::for_tensor(tensor, columns, self.pinned_accumulation);
         match contract {
+            ActivationContract::PinnedPtq1Q8 => {
+                q8_with_contract::<true, true>(input, &mut self.q8)?;
+            }
             ActivationContract::Q8K if self.pinned_accumulation => {
                 q8k_with_rounding::<true>(input, &mut self.q8k)?;
             }
@@ -1604,7 +1633,8 @@ impl PreparedMatvec<'_> {
     pub fn is_compatible(&self, tensor: &Tensor) -> Result<bool> {
         let (columns, _, _) = dimensions(tensor)?;
         Ok(columns == self.input.len()
-            && ActivationContract::for_tensor(tensor, columns) == self.contract)
+            && ActivationContract::for_tensor(tensor, columns, self.scratch.pinned_accumulation)
+                == self.contract)
     }
 
     /// Multiplies compatible packed rows using the already prepared activation.
@@ -1627,7 +1657,8 @@ impl PreparedMatvec<'_> {
     fn multiply(&mut self, tensor: &Tensor, output: &mut Vec<f32>) -> Result<()> {
         let (columns, rows, row_bytes) = dimensions(tensor)?;
         if columns != self.input.len()
-            || ActivationContract::for_tensor(tensor, columns) != self.contract
+            || ActivationContract::for_tensor(tensor, columns, self.scratch.pinned_accumulation)
+                != self.contract
         {
             return Err(invalid("incompatible prepared matvec activation contract"));
         }

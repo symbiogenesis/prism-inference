@@ -1733,7 +1733,7 @@ impl Decoder for Qwen35 {
                 "checkpoint belongs to a different model or context",
             ));
         }
-        self.state = copy_state(&checkpoint.layers)?;
+        restore_state(&mut self.state, &checkpoint.layers, KvCache::copy)?;
         self.position = checkpoint.position;
         Ok(())
     }
@@ -2106,6 +2106,98 @@ fn copy_state(states: &[LayerState]) -> Result<Vec<LayerState>> {
     Ok(result)
 }
 
+/// Stage only the fallible KV copies before writing any live state. Recurrent
+/// payloads have fixed geometry and restore into their existing allocations;
+/// copying a complete replacement would transiently retain another full set of
+/// convolution and GDN buffers while live state and checkpoints coexist.
+fn restore_state(
+    states: &mut [LayerState],
+    checkpoint: &[LayerState],
+    mut copy_cache: impl FnMut(&KvCache) -> Result<KvCache>,
+) -> Result<()> {
+    enum Restore<'a> {
+        Full {
+            keys: &'a mut KvCache,
+            values: &'a mut KvCache,
+            saved_keys: KvCache,
+            saved_values: KvCache,
+        },
+        Recurrent {
+            convolution: &'a mut [f32],
+            matrix: &'a mut [f32],
+            saved_convolution: &'a [f32],
+            saved_matrix: &'a [f32],
+        },
+    }
+
+    if states.len() != checkpoint.len() {
+        return Err(invalid("checkpoint has incompatible layer state"));
+    }
+    let mut restores = capacity(states.len())?;
+    for (state, saved) in states.iter_mut().zip(checkpoint) {
+        restores.push(match (state, saved) {
+            (
+                LayerState::Full { keys, values },
+                LayerState::Full {
+                    keys: saved_keys,
+                    values: saved_values,
+                },
+            ) => Restore::Full {
+                keys,
+                values,
+                saved_keys: copy_cache(saved_keys)?,
+                saved_values: copy_cache(saved_values)?,
+            },
+            (
+                LayerState::Recurrent {
+                    convolution,
+                    matrix,
+                },
+                LayerState::Recurrent {
+                    convolution: saved_convolution,
+                    matrix: saved_matrix,
+                },
+            ) if convolution.len() == saved_convolution.len()
+                && matrix.len() == saved_matrix.len() =>
+            {
+                Restore::Recurrent {
+                    convolution,
+                    matrix,
+                    saved_convolution,
+                    saved_matrix,
+                }
+            }
+            _ => return Err(invalid("checkpoint has incompatible layer state")),
+        });
+    }
+    // All allocation, shape checks and fallible work completed above. Applying
+    // the prepared writes cannot fail, so a staging error leaves live state
+    // unchanged, including recurrent buffers preceding the failed KV copy.
+    for restore in restores {
+        match restore {
+            Restore::Full {
+                keys,
+                values,
+                saved_keys,
+                saved_values,
+            } => {
+                *keys = saved_keys;
+                *values = saved_values;
+            }
+            Restore::Recurrent {
+                convolution,
+                matrix,
+                saved_convolution,
+                saved_matrix,
+            } => {
+                convolution.copy_from_slice(saved_convolution);
+                matrix.copy_from_slice(saved_matrix);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn small_float(value: usize) -> Result<f32> {
     Ok(f32::from(u16::try_from(value)?))
 }
@@ -2224,8 +2316,8 @@ mod tests {
 
     use super::{
         Arithmetic, Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES,
-        ProjectionScratch, Transforms, copy_state, dot, dot_f16, half_bits, half_to_float, rope,
-        rope_frequencies,
+        ProjectionScratch, Transforms, copy_state, dot, dot_f16, half_bits, half_to_float,
+        restore_state, rope, rope_frequencies,
     };
     use crate::Result;
     use crate::model::Tensor;
@@ -2625,6 +2717,134 @@ mod tests {
             matrix[0] = 0.0;
         }
         assert_state_bits_eq(&expected, &checkpoint);
+        Ok(())
+    }
+
+    fn restore_fixture() -> Result<Vec<LayerState>> {
+        let mut cache = KvCache::new(2, 3 * KV_PAGE_TOKENS)?;
+        for _ in 0..=KV_PAGE_TOKENS {
+            cache.reserve_append()?;
+            cache.append(&[-0.0, half_to_float(1)]);
+        }
+        Ok(vec![
+            LayerState::Recurrent {
+                convolution: vec![-0.0, f32::from_bits(1)],
+                matrix: vec![f32::MIN_POSITIVE, f32::MAX],
+            },
+            LayerState::Full {
+                keys: cache.copy()?,
+                values: cache,
+            },
+        ])
+    }
+
+    #[test]
+    fn checkpoint_restore_reuses_recurrent_storage_and_preserves_independent_bits() -> Result<()> {
+        let mut states = restore_fixture()?;
+        let checkpoint = copy_state(&states)?;
+        let expected = copy_state(&states)?;
+        let mut storage = Vec::new();
+        for state in &mut states {
+            match state {
+                LayerState::Recurrent {
+                    convolution,
+                    matrix,
+                } => {
+                    storage.push((convolution.as_ptr(), convolution.capacity()));
+                    storage.push((matrix.as_ptr(), matrix.capacity()));
+                    convolution.fill(1.0);
+                    matrix.fill(2.0);
+                }
+                LayerState::Full { keys, values } => {
+                    keys.clear();
+                    values.clear();
+                }
+            }
+        }
+        restore_state(&mut states, &checkpoint, KvCache::copy)?;
+        assert_state_bits_eq(&expected, &states);
+        assert_state_bits_eq(&expected, &checkpoint);
+        if let LayerState::Recurrent {
+            convolution,
+            matrix,
+        } = &mut states[0]
+        {
+            assert_eq!(storage[0], (convolution.as_ptr(), convolution.capacity()));
+            assert_eq!(storage[1], (matrix.as_ptr(), matrix.capacity()));
+            convolution[0] = 3.0;
+            matrix[0] = 4.0;
+        }
+        if let (
+            LayerState::Full { keys, values },
+            LayerState::Full {
+                keys: saved_keys,
+                values: saved_values,
+            },
+        ) = (&mut states[1], &checkpoint[1])
+        {
+            assert!(Arc::ptr_eq(&keys.pages[0], &saved_keys.pages[0]));
+            assert!(Arc::ptr_eq(&values.pages[0], &saved_values.pages[0]));
+            assert_ne!(keys.tail.as_ptr(), saved_keys.tail.as_ptr());
+            assert_ne!(values.tail.as_ptr(), saved_values.tail.as_ptr());
+            keys.tail[0] = 0;
+            values.tail[0] = 0;
+        }
+        assert_state_bits_eq(&expected, &checkpoint);
+        restore_state(&mut states, &checkpoint, KvCache::copy)?;
+        assert_state_bits_eq(&expected, &states);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_restore_staging_failure_leaves_all_live_payloads_unchanged() -> Result<()> {
+        let mut states = restore_fixture()?;
+        let mut checkpoint = copy_state(&states)?;
+        if let LayerState::Recurrent {
+            convolution,
+            matrix,
+        } = &mut checkpoint[0]
+        {
+            convolution.fill(1.0);
+            matrix.fill(2.0);
+        }
+        let expected = copy_state(&states)?;
+        let mut copies = 0;
+        let result = restore_state(&mut states, &checkpoint, |cache| {
+            copies += 1;
+            if copies == 2 {
+                return Err(std::io::Error::other("injected KV staging allocation failure").into());
+            }
+            cache.copy()
+        });
+        assert!(result.is_err());
+        assert_eq!(copies, 2);
+        assert_state_bits_eq(&expected, &states);
+
+        // A malformed later layer likewise cannot partially restore the earlier
+        // recurrent payload, even though that payload needs no allocation.
+        checkpoint[1] = LayerState::Recurrent {
+            convolution: vec![0.0],
+            matrix: vec![0.0],
+        };
+        assert!(restore_state(&mut states, &checkpoint, KvCache::copy).is_err());
+        assert_state_bits_eq(&expected, &states);
+        assert!(restore_state(&mut states, &checkpoint[..1], KvCache::copy).is_err());
+        assert_state_bits_eq(&expected, &states);
+
+        // Complete KV staging before discovering a later recurrent size
+        // mismatch; neither the earlier cache nor any recurrent bits change.
+        states.swap(0, 1);
+        let expected = copy_state(&states)?;
+        let mut checkpoint = copy_state(&states)?;
+        if let LayerState::Full { keys, values } = &mut checkpoint[0] {
+            keys.tail[0] = 0x3c00;
+            values.tail[0] = 0x3c00;
+        }
+        if let LayerState::Recurrent { convolution, .. } = &mut checkpoint[1] {
+            convolution.push(0.0);
+        }
+        assert!(restore_state(&mut states, &checkpoint, KvCache::copy).is_err());
+        assert_state_bits_eq(&expected, &states);
         Ok(())
     }
 

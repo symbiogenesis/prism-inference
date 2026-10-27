@@ -12,7 +12,7 @@ permissions:
 env:
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
   CARGO_BUILD_FINGERPRINT: content
-  PRISM_VERSION: '0.1.4'
+  PRISM_VERSION: '0.1.5'
 concurrency:
   # The successful-ancestor planner carries every cancelled push forward.
   # Explicit manual runs retain an independent complete validation request.

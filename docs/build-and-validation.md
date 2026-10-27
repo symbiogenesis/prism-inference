@@ -273,6 +273,22 @@ receipt remain outside Git in the admission-trial evidence lane. Runner's
 records the bounded result. No benchmark, quality/adapter qualification, default
 change or additional model capture followed this failure.
 
+### Bounded floating-projection follow-up
+
+Native operator captures identified a separate pinned F32/F16 projection
+accumulation gap. Rows divisible by sixteen now use the native four-register
+binary32 FMA reduction. Twelve checked native rows cover F32, F16 and BF16 at
+widths 16, 32, 128 and 5120. Three controls distinguish the repair from the
+previous generic binary64 sum. Generic arithmetic, BF16 and unqualified tail
+widths retain their previous behavior. The fixture records the pinned native
+runtime/DLL and source identities; it does not establish full-model PTQ1 parity.
+
+A new one-token intermediate capture was rejected before model launch by the
+current Runner development budget: 11,230,294,016 available physical bytes versus
+15.5 GiB required. The 11.5 GiB Job ceiling and 4 GiB physical reserve remained
+unchanged. The earlier failed full-model comparison therefore remains the latest
+numerical verdict. No PTQ1 default, service selection or admission reduction is
+qualified by these operator fixtures.
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five

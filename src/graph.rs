@@ -920,7 +920,8 @@ impl Qwen35 {
     ///
     /// # Errors
     /// Rejects a different base identity, unsupported/non-live targets, scales
-    /// outside finite 0..2, and ordinary graph/storage validation failures.
+    /// outside finite 0..2, an embedding adapter on a tied output head, and
+    /// ordinary graph/storage validation failures.
     pub fn with_rank_one_adapter(
         model: Model,
         context_limit: usize,
@@ -935,6 +936,11 @@ impl Qwen35 {
         }
         let mut graph = Self::with_state_budget(model, context_limit, state_budget_bytes, backend)?;
         for target in adapter.targets() {
+            if target == graph.embedding.name && graph.output.name == graph.embedding.name {
+                return Err(invalid(
+                    "rank-one embedding adapter requires a separate output head",
+                ));
+            }
             if target != graph.embedding.name
                 && !graph.layers.iter().any(|layer| {
                     target == layer.down.name

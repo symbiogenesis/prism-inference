@@ -289,6 +289,32 @@ fn rank_one_embedding_correction_follows_inverse_transform() -> Result<()> {
 }
 
 #[test]
+fn rank_one_embedding_admission_rejects_tied_output_head_at_every_scale() -> Result<()> {
+    for scale in [0.0, 1.3] {
+        let mut tied = fixture(false);
+        tied.tensors.remove("output.weight");
+        let factors = rank_one_factors(&tied, &["token_embd.weight"], 0.125);
+        let Err(error) = rank_one_graph(tied, factors, scale) else {
+            return Err("tied-output embedding adapter was admitted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "rank-one embedding adapter requires a separate output head"
+        );
+
+        let separate = fixture(false);
+        let factors = rank_one_factors(&separate, &["token_embd.weight"], 0.125);
+        rank_one_graph(separate, factors, scale)?.evaluate(0)?;
+
+        let mut tied = fixture(false);
+        tied.tensors.remove("output.weight");
+        let factors = rank_one_factors(&tied, &["blk.0.ffn_down.weight"], 0.125);
+        rank_one_graph(tied, factors, scale)?.evaluate(0)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn rank_one_admission_rejects_factor_schema_and_base_drift() -> Result<()> {
     for invalid in 0..9 {
         let base = fixture(false);

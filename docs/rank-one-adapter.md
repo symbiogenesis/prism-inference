@@ -21,6 +21,12 @@ bits into the graph identity. Scale is fixed for that graph and must be finite
 within 0..2; a different scale requires a fresh graph, preventing reuse of state
 computed under another correction.
 
+An embedding adapter requires a separate `output.weight`. Graphs whose output
+head reuses `token_embd.weight` reject embedding adapters at every scale,
+including zero: the embedding lookup factors do not implement a tied output
+projection. Such graphs can still admit supported residual-writer adapters.
+The pinned Swift PQ2 model has a separate output head.
+
 The [pinned native graph](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-graph.cpp)
 defines the operation stages: base projection, independent A/B products on the
 original activation, scale, then add. Folded base Hadamard and grouped SSM

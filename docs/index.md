@@ -16,6 +16,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Understand budgets and failure recovery | [Runtime contracts](runtime-contracts.md) |
 | Compile, check or package the workspace | [Building and validation](build-and-validation.md) |
 | Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |
+| Capture explicit rank-one adapter correctness evidence | [Adapter correctness path](rank-one-adapter.md) |
 | Check support and remaining qualification | [Roadmap](roadmap.md) |
 
 ## Technical reference

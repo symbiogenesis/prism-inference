@@ -5,6 +5,7 @@
 //! remain binary32. This correctness path does not establish device parity.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use bonsai_gguf::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
@@ -15,6 +16,7 @@ use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, half_bits, rms_norm_into,
     rms_norm_pinned_into, round_f16, row, row_into, silu, softmax,
 };
+use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
 use crate::{Decoder, Result, invalid};
 
@@ -496,6 +498,7 @@ struct Workspace {
     normalized: Vec<f32>,
     attention: Vec<f32>,
     projection: ProjectionScratch,
+    adapter: AdapterScratch,
     attention_scratch: AttentionScratch,
     deltas: Vec<LayerDelta>,
 }
@@ -507,6 +510,9 @@ struct Evaluation<'a> {
     position: usize,
     frequencies_ready: bool,
     projection: &'a mut ProjectionScratch,
+    adapter: Option<&'a RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &'a mut AdapterScratch,
 }
 
 #[derive(Default)]
@@ -667,6 +673,7 @@ impl Transforms {
         })
     }
 
+    #[cfg(test)]
     fn project_into(
         &self,
         weight: &Tensor,
@@ -818,6 +825,8 @@ pub struct Qwen35 {
     output: Tensor,
     output_norm: Vec<f32>,
     transforms: Transforms,
+    adapter: Option<RankOneAdapter>,
+    adapter_scale: f32,
     layers: Vec<Layer>,
     state: Vec<LayerState>,
     workspace: Workspace,
@@ -898,6 +907,56 @@ impl Qwen35 {
         backend: MatvecBackend,
     ) -> Result<Self> {
         Self::with_state_budget(model, context_limit, MAX_STATE_BYTES, backend)
+    }
+
+    /// Creates an explicit rank-one adapter graph for numerical qualification.
+    ///
+    /// Base projections retain their existing transforms; corrections receive
+    /// the original activations. Embedding corrections are added after inverse
+    /// transformation. Scale zero bypasses all correction arithmetic exactly.
+    /// Adapter identity and scale bits are sealed into the graph identity and
+    /// cannot change while conversation checkpoints exist. The private Swift
+    /// HTTP service continues to reject adapters until separate qualification.
+    ///
+    /// # Errors
+    /// Rejects a different base identity, unsupported/non-live targets, scales
+    /// outside finite 0..2, and ordinary graph/storage validation failures.
+    pub fn with_rank_one_adapter(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        adapter: RankOneAdapter,
+        scale: f32,
+    ) -> Result<Self> {
+        RankOneAdapter::validate_scale(scale)?;
+        if adapter.base_identity() != model.identity {
+            return Err(invalid("rank-one adapter belongs to another base model"));
+        }
+        let mut graph = Self::with_state_budget(model, context_limit, state_budget_bytes, backend)?;
+        for target in adapter.targets() {
+            if target != graph.embedding.name
+                && !graph.layers.iter().any(|layer| {
+                    target == layer.down.name
+                        || target
+                            == match &layer.attention {
+                                Attention::Full(weights) => &weights.output.name,
+                                Attention::Recurrent(weights) => &weights.output.name,
+                            }
+                })
+            {
+                return Err(invalid("rank-one adapter target is outside the live graph"));
+            }
+        }
+        write!(
+            graph.identity,
+            ":rank-one-lora-v1:{}:{:08x}",
+            adapter.identity(),
+            scale.to_bits()
+        )?;
+        graph.adapter = Some(adapter);
+        graph.adapter_scale = scale;
+        Ok(graph)
     }
 
     /// Creates a decoder within an explicit maximum live-state payload budget.
@@ -1230,10 +1289,16 @@ impl Qwen35 {
             output,
             output_norm,
             transforms,
+            adapter: None,
+            adapter_scale: 0.0,
             layers,
             state,
             workspace: Workspace {
                 deltas,
+                adapter: AdapterScratch::new(
+                    backend,
+                    matches!(arithmetic, Arithmetic::PinnedSwift),
+                ),
                 projection: ProjectionScratch {
                     matvec: arithmetic.scratch(backend),
                     ..ProjectionScratch::default()
@@ -1293,6 +1358,7 @@ impl Qwen35 {
             normalized,
             attention,
             projection,
+            adapter: adapter_scratch,
             attention_scratch,
             deltas,
         } = &mut self.workspace;
@@ -1303,11 +1369,22 @@ impl Qwen35 {
             position: self.position,
             frequencies_ready: false,
             projection,
+            adapter: self.adapter.as_ref(),
+            adapter_scale: self.adapter_scale,
+            adapter_scratch,
         };
         row_into(&self.embedding, token, hidden)?;
         if self.transforms.inverse_embedding {
             self.transforms.rotate(hidden)?;
             self.transforms.sign(hidden);
+        }
+        if let Some(adapter) = &self.adapter {
+            adapter.embedding(
+                token,
+                self.adapter_scale,
+                hidden,
+                evaluation.adapter_scratch,
+            )?;
         }
         for ((layer, state), delta) in self.layers.iter().zip(&self.state).zip(deltas.iter_mut()) {
             self.arithmetic
@@ -1409,10 +1486,35 @@ impl Evaluation<'_> {
         &mut self,
         tensors: [&Tensor; N],
         input: &[f32],
-        outputs: [&mut Vec<f32>; N],
+        mut outputs: [&mut Vec<f32>; N],
     ) -> Result<()> {
-        self.transforms
-            .project_group_into(tensors, input, self.geometry, outputs, self.projection)
+        let result = (|| {
+            self.transforms.project_group_into(
+                tensors,
+                input,
+                self.geometry,
+                outputs.each_mut().map(|output| &mut **output),
+                self.projection,
+            )?;
+            if let Some(adapter) = self.adapter {
+                for (tensor, output) in tensors.into_iter().zip(&mut outputs) {
+                    adapter.linear(
+                        &tensor.name,
+                        input,
+                        self.adapter_scale,
+                        output,
+                        self.adapter_scratch,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            for output in outputs {
+                output.clear();
+            }
+        }
+        result
     }
 
     fn project_into(
@@ -1421,8 +1523,7 @@ impl Evaluation<'_> {
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        self.transforms
-            .project_into(tensor, input, self.geometry, output, self.projection)
+        self.project_group_into([tensor], input, [output])
     }
 
     #[allow(

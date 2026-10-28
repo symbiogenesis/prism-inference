@@ -88,7 +88,7 @@ cargo +nightly-2026-10-22-aarch64-pc-windows-msvc test --locked --offline --rele
 
 The [R0–R7 roadmap](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/native-rust-engine.md) still requires profiling,
 full-model logits/states/tokens, complete tokenizer/template and Prism sampler/RNG parity,
-adapter execution, broader process/OS ownership qualification, SIMD/Adreno support and device
+adapter numerical/service qualification, broader process/OS ownership qualification, SIMD/Adreno support and device
 correctness/TPS/quality/security acceptance. Full suites and every benchmark
 remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
 
@@ -188,7 +188,8 @@ equal logits: PQ2 uses Q8_K activations on complete rows, while PTQ1 uses Q8_0.
 A comparison between representations therefore has a separate quality decision;
 do not loosen the trusted same-format correctness tolerance to make it pass.
 
-The Rust graph does not implement adapter forward execution. An approved LoRA's
+The source graph implements an explicit [rank-one adapter correctness path](rank-one-adapter.md);
+the service and workers still reject adapters. An approved LoRA's
 load-at-zero logits identity, nonzero correction and Swift grouped-SSM input
 ordering must be verified at native residual writers before adapter qualification.
 Neither a successful PTQ1 load nor changed generated text settles the adapter's

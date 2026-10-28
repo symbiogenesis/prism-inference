@@ -9,6 +9,7 @@ use bonsai_gguf::MetadataValueRef;
 use bonsai_gguf::{MetadataArray, MetadataValue};
 use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::{MatvecBackend, MatvecFallbackReason, round_f16};
+use bonsai_prism_runtime::model::lora::RankOneAdapter;
 use bonsai_prism_runtime::model::{Model, Tensor};
 use bonsai_prism_runtime::runtime::{Cancellation, Generation, Limits, Prefill, Runtime};
 use bonsai_prism_runtime::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result};
@@ -105,6 +106,342 @@ fn fixture(recurrent: bool) -> Model {
         tensors,
         identity: "graph-fixture".to_owned(),
     }
+}
+
+fn rank_one_factors(base: &Model, targets: &[&str], value: f32) -> Model {
+    let mut tensors = BTreeMap::new();
+    for &target in targets {
+        let dimensions = &base.tensors[target].dimensions;
+        let input = dimensions[0];
+        let output = dimensions[1];
+        let a_shape = if target == "token_embd.weight" {
+            [1, output]
+        } else {
+            [input, 1]
+        };
+        let b_shape = [
+            1,
+            if target == "token_embd.weight" {
+                input
+            } else {
+                output
+            },
+        ];
+        for (suffix, shape) in [("lora_a", a_shape), ("lora_b", b_shape)] {
+            let name = format!("{target}.{suffix}");
+            tensors.insert(
+                name.clone(),
+                weight(&name, &shape, &vec![value; shape.iter().product()]),
+            );
+        }
+    }
+    Model {
+        metadata: metadata!({"general.architecture":"qwen35", "general.type":"adapter", "adapter.type":"lora", "adapter.lora_alpha":1.0_f32}),
+        tensors,
+        identity: "rank-one-fixture".to_owned(),
+    }
+}
+
+fn rank_one_graph(base: Model, factors: Model, scale: f32) -> Result<Qwen35> {
+    let adapter = RankOneAdapter::from_model(factors, &base)?;
+    Qwen35::with_rank_one_adapter(base, 16, 1024 * 1024, MatvecBackend::Scalar, adapter, scale)
+}
+
+fn graph_bits(graph: &Qwen35) -> Result<Vec<u32>> {
+    let mut bits = Vec::new();
+    graph.visit_state(&mut |_, _, values| {
+        bits.extend(values.iter().map(|value| value.to_bits()));
+        Ok(())
+    })?;
+    Ok(bits)
+}
+
+#[test]
+fn rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits() -> Result<()> {
+    for recurrent in [false, true] {
+        for scale in [0.0, -0.0] {
+            let target = if recurrent {
+                "blk.0.ssm_out.weight"
+            } else {
+                "blk.0.attn_output.weight"
+            };
+            let base = fixture(recurrent);
+            // These finite factors overflow if either correction product runs.
+            let factors = rank_one_factors(
+                &base,
+                &["token_embd.weight", "blk.0.ffn_down.weight", target],
+                f32::MAX,
+            );
+            let mut actual = rank_one_graph(base, factors, scale)?;
+            let mut expected = Qwen35::new(fixture(recurrent), 16)?;
+            for token in [0, 1, 1, 0] {
+                assert_eq!(
+                    actual
+                        .evaluate(token)?
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .evaluate(token)?
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn writer_transform(base: &mut Model, target: &str, inverse_embedding: bool) {
+    for (key, value) in [
+        ("prism.hadamard.version", metadata!(1)),
+        ("prism.hadamard.block_size", metadata!(2)),
+        (
+            "prism.hadamard.transform",
+            metadata!("normalized-sylvester-walsh-hadamard"),
+        ),
+        ("prism.hadamard.axis", metadata!("input-last-dimension")),
+        ("prism.hadamard.sign_mode", metadata!("explicit")),
+        ("prism.hadamard.sign_widths", metadata!([2])),
+        ("prism.hadamard.sign_values", metadata!([-1, 1])),
+        ("prism.hadamard.weight_names", metadata!([target])),
+    ] {
+        base.metadata.insert(key.to_owned(), value);
+    }
+    if inverse_embedding {
+        base.metadata.insert(
+            "prism.hadamard.inverse_weight_names".into(),
+            metadata!(["token_embd.weight"]),
+        );
+    }
+}
+
+#[test]
+fn rank_one_residual_writer_uses_unrotated_activations() -> Result<()> {
+    for recurrent in [false, true] {
+        let target = if recurrent {
+            "blk.0.ssm_out.weight"
+        } else {
+            "blk.0.attn_output.weight"
+        };
+        let mut base = fixture(recurrent);
+        base.tensors
+            .insert(target.to_owned(), weight(target, &[2, 2], &[0.0; 4]));
+        writer_transform(&mut base, target, false);
+        let mut factors = rank_one_factors(&base, &[target], 0.0);
+        let a_name = format!("{target}.lora_a");
+        let b_name = format!("{target}.lora_b");
+        factors
+            .tensors
+            .insert(a_name.clone(), weight(&a_name, &[2, 1], &[1.0, 0.0]));
+        factors
+            .tensors
+            .insert(b_name.clone(), weight(&b_name, &[1, 2], &[0.0, 1.0]));
+        let mut actual = rank_one_graph(base, factors, 1.0)?;
+        let mut control = fixture(recurrent);
+        control.tensors.insert(
+            target.to_owned(),
+            weight(target, &[2, 2], &[0.0, 0.0, 1.0, 0.0]),
+        );
+        let mut expected = Qwen35::new(control, 16)?;
+        for token in [0, 1, 0] {
+            assert_eq!(actual.evaluate(token)?, expected.evaluate(token)?);
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rank_one_embedding_correction_follows_inverse_transform() -> Result<()> {
+    let mut base = fixture(false);
+    writer_transform(&mut base, "output.weight", true);
+    let mut factors = rank_one_factors(&base, &["token_embd.weight"], 0.0);
+    factors.tensors.insert(
+        "token_embd.weight.lora_a".into(),
+        weight("token_embd.weight.lora_a", &[1, 2], &[0.5, -0.25]),
+    );
+    factors.tensors.insert(
+        "token_embd.weight.lora_b".into(),
+        weight("token_embd.weight.lora_b", &[1, 2], &[0.25, 1.0]),
+    );
+    // Put the independently corrected primal rows into a plain embedding;
+    // output.weight's transform remains identical in both graphs.
+    let mut control = fixture(false);
+    writer_transform(&mut control, "output.weight", false);
+    let half = 1.0_f32 / 2.0_f32.sqrt();
+    control.tensors.insert(
+        "token_embd.weight".into(),
+        weight(
+            "token_embd.weight",
+            &[2, 2],
+            &[-half + 0.125, half + 0.5, -half - 0.0625, -half - 0.25],
+        ),
+    );
+    let mut actual = rank_one_graph(base, factors, 1.0)?;
+    let mut expected = Qwen35::new(control, 16)?;
+    for token in [0, 1, 1, 0] {
+        assert_eq!(actual.evaluate(token)?, expected.evaluate(token)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn rank_one_admission_rejects_factor_schema_and_base_drift() -> Result<()> {
+    for invalid in 0..9 {
+        let base = fixture(false);
+        let mut factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+        let name = "blk.0.ffn_down.weight.lora_a";
+        match invalid {
+            0 => {
+                factors
+                    .metadata
+                    .insert("adapter.type".into(), metadata!("other"));
+            }
+            1 => {
+                factors
+                    .metadata
+                    .insert("adapter.lora_alpha".into(), metadata!(f32::NAN));
+            }
+            2 => {
+                factors
+                    .metadata
+                    .insert("adapter.lora_alpha".into(), metadata!(0.0_f32));
+            }
+            3 => {
+                factors.tensors.remove("blk.0.ffn_down.weight.lora_b");
+            }
+            4 => {
+                factors.tensors.get_mut(name).ok_or("missing factor")?.kind = 1;
+            }
+            5 => {
+                factors
+                    .tensors
+                    .get_mut(name)
+                    .ok_or("missing factor")?
+                    .dimensions = vec![2, 2];
+            }
+            6 => {
+                factors.tensors.get_mut(name).ok_or("missing factor")?.data =
+                    Arc::from(f32::INFINITY.to_le_bytes());
+            }
+            7 => {
+                factors.tensors.get_mut(name).ok_or("missing factor")?.name = "alias".into();
+            }
+            _ => {
+                factors.identity.clear();
+            }
+        }
+        assert!(RankOneAdapter::from_model(factors, &base).is_err());
+    }
+    for scale in [f32::NAN, f32::INFINITY, -0.1, 2.1] {
+        let base = fixture(false);
+        let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+        assert!(rank_one_graph(base, factors, scale).is_err());
+    }
+    let base = fixture(false);
+    let adapter = RankOneAdapter::from_model(
+        rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25),
+        &base,
+    )?;
+    let mut other = fixture(false);
+    other.identity = "other".into();
+    assert!(
+        Qwen35::with_rank_one_adapter(other, 16, 1024 * 1024, MatvecBackend::Scalar, adapter, 1.0)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn rank_one_checkpoint_and_failed_generation_preserve_complete_state() -> Result<()> {
+    let base = fixture(true);
+    let factors = rank_one_factors(
+        &base,
+        &[
+            "token_embd.weight",
+            "blk.0.ssm_out.weight",
+            "blk.0.ffn_down.weight",
+        ],
+        0.125,
+    );
+    let mut graph = rank_one_graph(base, factors, 1.3)?;
+    assert!(
+        graph
+            .identity()
+            .contains(":rank-one-lora-v1:rank-one-fixture:3fa66666")
+    );
+    graph.evaluate(0)?;
+    let checkpoint = graph.checkpoint()?;
+    let expected = graph.evaluate(1)?;
+    let state = graph_bits(&graph)?;
+    graph.restore(&checkpoint)?;
+    assert_eq!(graph.evaluate(1)?, expected);
+    assert_eq!(graph_bits(&graph)?, state);
+    graph.reset()?;
+    let mut runtime = Runtime::new(
+        graph,
+        Limits {
+            context_tokens: 16,
+            checkpoints: 0,
+            checkpoint_bytes: 1024 * 1024,
+        },
+    )?;
+    let before = graph_bits(runtime.decoder())?;
+    let result = runtime.generate_until(
+        &[0],
+        &Generation {
+            max_tokens: 1,
+            stop_tokens: vec![],
+        },
+        &Cancellation::default(),
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        |_| Err("delivery failed".into()),
+    );
+    assert!(result.is_err());
+    assert_eq!(graph_bits(runtime.decoder())?, before);
+    Ok(())
+}
+
+#[test]
+fn rank_one_writer_overflow_restores_previous_committed_request() -> Result<()> {
+    let base = fixture(false);
+    let target = "blk.0.attn_output.weight";
+    let mut factors = rank_one_factors(&base, &[target], f32::MAX);
+    let a_name = format!("{target}.lora_a");
+    factors
+        .tensors
+        .insert(a_name.clone(), weight(&a_name, &[2, 1], &[0.0, f32::MAX]));
+    let graph = rank_one_graph(base, factors, 1.3)?;
+    let mut runtime = Runtime::new(
+        graph,
+        Limits {
+            context_tokens: 16,
+            checkpoints: 0,
+            checkpoint_bytes: 1024 * 1024,
+        },
+    )?;
+    let options = Generation {
+        max_tokens: 1,
+        stop_tokens: vec![],
+    };
+    let cancellation = Cancellation::default();
+    runtime.generate(&[0], &options, &cancellation, |_| Ok(()))?;
+    let state = graph_bits(runtime.decoder())?;
+    let tokens = runtime.tokens().to_vec();
+    assert!(
+        runtime
+            .generate(&[0, 1], &options, &cancellation, |_| Ok(()))
+            .is_err()
+    );
+    assert_eq!(runtime.tokens(), tokens);
+    assert_eq!(graph_bits(runtime.decoder())?, state);
+    assert!(!runtime.is_faulted());
+    runtime.generate(&[0], &options, &cancellation, |_| Ok(()))?;
+    assert_eq!(graph_bits(runtime.decoder())?, state);
+    Ok(())
 }
 
 fn hybrid_fixture() -> Model {
@@ -1620,8 +1957,7 @@ fn tied_latent_embedding_with_explicit_signs_restores_primal_basis() -> Result<(
     Ok(())
 }
 
-#[test]
-fn grouped_gdn_value_rotation_matches_unfolded_output_weights() -> Result<()> {
+fn grouped_gdn_models() -> (Model, Model) {
     let mut model = fixture(true);
     model
         .metadata
@@ -1710,6 +2046,12 @@ fn grouped_gdn_value_rotation_matches_unfolded_output_weights() -> Result<()> {
     ] {
         latent.metadata.insert(key.to_owned(), value);
     }
+    (model, latent)
+}
+
+#[test]
+fn grouped_gdn_value_rotation_matches_unfolded_output_weights() -> Result<()> {
+    let (model, latent) = grouped_gdn_models();
     let mut plain = Qwen35::new(model, 16)?;
     let mut transformed = Qwen35::new(latent, 16)?;
     for token in [0, 1, 0, 1] {
@@ -1718,6 +2060,39 @@ fn grouped_gdn_value_rotation_matches_unfolded_output_weights() -> Result<()> {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 0.000_002);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn rank_one_grouped_ssm_branch_retains_original_untiled_input_order() -> Result<()> {
+    let (mut control, mut base) = grouped_gdn_models();
+    let target = "blk.0.ssm_out.weight";
+    base.tensors
+        .insert(target.into(), weight(target, &[8, 2], &[0.0; 16]));
+    let a = [1.0, 0.0, 0.0, -0.25, 0.0, 0.5, 0.0, 0.0];
+    let b = [0.5, -0.25];
+    let mut factors = rank_one_factors(&base, &[target], 0.0);
+    let a_name = format!("{target}.lora_a");
+    let b_name = format!("{target}.lora_b");
+    factors
+        .tensors
+        .insert(a_name.clone(), weight(&a_name, &[8, 1], &a));
+    factors
+        .tensors
+        .insert(b_name.clone(), weight(&b_name, &[1, 2], &b));
+    let matrix: Vec<_> = b
+        .iter()
+        .flat_map(|b| a.iter().map(move |a| a * b))
+        .collect();
+    control
+        .tensors
+        .insert(target.into(), weight(target, &[8, 2], &matrix));
+    let mut actual = rank_one_graph(base, factors, 1.0)?;
+    let mut expected = Qwen35::new(control, 16)?;
+    for token in [0, 1, 0, 1] {
+        assert_eq!(actual.evaluate(token)?, expected.evaluate(token)?);
+        assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
     }
     Ok(())
 }

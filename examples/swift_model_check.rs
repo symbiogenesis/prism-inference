@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::MatvecBackend;
+use bonsai_prism_runtime::model::lora::RankOneAdapter;
 use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::runtime::greedy;
 use bonsai_prism_runtime::token_input::read_tokens;
@@ -21,6 +22,7 @@ const USAGE: &str = concat!(
     "       swift_model_check forward <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check trajectory <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>\n",
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
+    "For original PQ2 load/forward/trajectory only, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> for explicit unqualified LoRA correctness evidence.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -53,6 +55,12 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let representation = select_representation(&mut arguments);
+    let adapter = select_adapter(&mut arguments)?;
+    if adapter.is_some() && representation != Representation::Pq2 {
+        return Err(reject(
+            "rank-one adapter capture requires the original PQ2 model",
+        ));
+    }
     if arguments.len() == 1 && arguments[0] == "--help" {
         std::io::stdout().lock().write_all(USAGE.as_bytes())?;
         return Ok(());
@@ -70,7 +78,7 @@ fn run() -> Result<()> {
         ));
     }
     if mode == "inspect" {
-        if arguments.len() != 2 {
+        if arguments.len() != 2 || adapter.is_some() {
             return Err(reject("inspect takes only the model path"));
         }
         return report(
@@ -83,23 +91,54 @@ fn run() -> Result<()> {
         if arguments.len() != 2 {
             return Err(reject("load takes only the model path"));
         }
-        let (model, receipt) = swift::load_representation(&path, MODEL_BUDGET, representation)?;
-        report("weights-loaded", receipt, representation)?;
-        let graph = Qwen35::with_state_budget(
-            model,
-            swift::CONTEXT_TOKENS,
-            1024 * 1024 * 1024,
-            MatvecBackend::Auto,
-        )?;
+        let graph = load_graph(&path, MatvecBackend::Auto, representation, adapter.as_ref())?;
         return emit(
             &json!({"event":"graph-ready","identity":graph.identity(),"vocabulary":graph.vocab_size(),"initial_checkpoint_bytes":graph.checkpoint_bytes(),"maximum_live_state_payload_bytes":swift::STATE_PAYLOAD_BYTES,"full_attention_blocks":16,"recurrent_blocks":48}),
         );
     }
     match mode.as_str() {
-        "forward" => forward(&path, &arguments[2..], representation),
-        "trajectory" => trajectory(&path, &arguments[2..], representation),
+        "forward" => forward(&path, &arguments[2..], representation, adapter.as_ref()),
+        "trajectory" => trajectory(&path, &arguments[2..], representation, adapter.as_ref()),
         _ => Err(reject("unsupported evaluation mode")),
     }
+}
+
+struct AdapterSelection {
+    path: PathBuf,
+    scale: f32,
+}
+
+fn select_adapter(arguments: &mut Vec<String>) -> Result<Option<AdapterSelection>> {
+    if arguments
+        .first()
+        .is_none_or(|argument| argument != "--rank-one-adapter")
+    {
+        return Ok(None);
+    }
+    if arguments.len() < 3 {
+        return Err(reject(
+            "adapter capture requires an absolute path and scale",
+        ));
+    }
+    let path = PathBuf::from(&arguments[1]);
+    let scale = arguments[2].parse::<f32>()?;
+    if !path.is_absolute()
+        || arguments[1].contains(['%', '\0'])
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || !scale.is_finite()
+        || !(0.0..=2.0).contains(&scale)
+    {
+        return Err(reject(
+            "adapter capture requires an expanded absolute path and finite scale in 0..2",
+        ));
+    }
+    arguments.drain(..3);
+    Ok(Some(AdapterSelection { path, scale }))
 }
 
 fn select_representation(arguments: &mut Vec<String>) -> Representation {
@@ -139,13 +178,34 @@ fn load_graph(
     path: &Path,
     backend: MatvecBackend,
     representation: Representation,
+    selection: Option<&AdapterSelection>,
 ) -> Result<Qwen35> {
     let (model, receipt) = swift::load_representation(path, MODEL_BUDGET, representation)?;
     report("weights-loaded", receipt, representation)?;
-    Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, 1024 * 1024 * 1024, backend)
+    if let Some(selection) = selection {
+        let adapter = RankOneAdapter::load_swift(&selection.path, &model)?;
+        emit(
+            &json!({"event":"rank-one-adapter-loaded", "adapter_sha256":adapter.identity(), "target_pairs":adapter.target_count(), "scale":selection.scale, "scale_bits":format!("{:08x}", selection.scale.to_bits()), "qualification":"unqualified-basis-logits-quality-resources-and-service; original activation basis; no adapter permutation"}),
+        )?;
+        Qwen35::with_rank_one_adapter(
+            model,
+            swift::CONTEXT_TOKENS,
+            1024 * 1024 * 1024,
+            backend,
+            adapter,
+            selection.scale,
+        )
+    } else {
+        Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, 1024 * 1024 * 1024, backend)
+    }
 }
 
-fn forward(path: &Path, arguments: &[String], representation: Representation) -> Result<()> {
+fn forward(
+    path: &Path,
+    arguments: &[String],
+    representation: Representation,
+    adapter: Option<&AdapterSelection>,
+) -> Result<()> {
     if arguments.len() != 3 {
         return Err(reject(
             "forward requires output directory, backend and token IDs",
@@ -159,7 +219,7 @@ fn forward(path: &Path, arguments: &[String], representation: Representation) ->
     if !valid_tokens(&tokens) || tokens.len() > 16 {
         return Err(reject("forward requires 1..16 valid token IDs"));
     }
-    let mut graph = load_graph(path, backend, representation)?;
+    let mut graph = load_graph(path, backend, representation, adapter)?;
     let mut logits = Vec::new();
     let mut remaining = usize::MAX;
     for (position, token) in tokens.into_iter().enumerate() {
@@ -172,7 +232,12 @@ fn forward(path: &Path, arguments: &[String], representation: Representation) ->
     Ok(())
 }
 
-fn trajectory(path: &Path, arguments: &[String], representation: Representation) -> Result<()> {
+fn trajectory(
+    path: &Path,
+    arguments: &[String],
+    representation: Representation,
+    adapter: Option<&AdapterSelection>,
+) -> Result<()> {
     if arguments.len() != 4 {
         return Err(reject(
             "trajectory requires output directory, backend, prompt-ID file and greedy steps",
@@ -201,7 +266,7 @@ fn trajectory(path: &Path, arguments: &[String], representation: Representation)
     emit(
         &json!({"event":"trajectory-start","prompt_token_ids":prompt,"prompt_tokens":prompt.len(),"greedy_steps":steps,"context_tokens":swift::CONTEXT_TOKENS,"maximum_snapshot_payload_bytes":MAX_TRAJECTORY_EVIDENCE_BYTES,"snapshot_count":steps+1,"stop_policy":"fixed-step raw greedy; special IDs are included"}),
     )?;
-    let mut graph = load_graph(path, backend, representation)?;
+    let mut graph = load_graph(path, backend, representation, adapter)?;
     for &token in intermediate {
         graph.ingest(token)?;
     }
@@ -288,7 +353,42 @@ fn report(event: &str, receipt: swift::LoadReceipt, representation: Representati
 
 #[cfg(test)]
 mod tests {
-    use super::{Representation, Result, select_representation, write_values};
+    use super::{Representation, Result, select_adapter, select_representation, write_values};
+
+    #[test]
+    fn rank_one_capture_requires_explicit_bounded_selection() -> Result<()> {
+        let absolute = std::env::temp_dir()
+            .join("approved-lora.gguf")
+            .to_string_lossy()
+            .into_owned();
+        let mut args = vec![
+            "--rank-one-adapter".to_owned(),
+            absolute.clone(),
+            "1.3".to_owned(),
+            "load".to_owned(),
+        ];
+        let adapter = select_adapter(&mut args)?.ok_or("missing explicit adapter")?;
+        assert_eq!(adapter.path, std::path::Path::new(&absolute));
+        assert_eq!(adapter.scale.to_bits(), 1.3_f32.to_bits());
+        assert_eq!(args, ["load"]);
+        for (path, scale) in [
+            ("relative.gguf", "1.3"),
+            (absolute.as_str(), "NaN"),
+            (absolute.as_str(), "2.1"),
+            (absolute.as_str(), "-0.1"),
+            ("%TEMP%/adapter.gguf", "1"),
+        ] {
+            let mut args = vec![
+                "--rank-one-adapter".to_owned(),
+                path.to_owned(),
+                scale.to_owned(),
+            ];
+            assert!(select_adapter(&mut args).is_err());
+        }
+        let mut args = vec!["load".to_owned(), "--rank-one-adapter".to_owned()];
+        assert!(select_adapter(&mut args)?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn ptq1_correctness_capture_requires_explicit_prefix_and_keeps_source_default() {

@@ -61,8 +61,15 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(Rejection::CompletionLimit)?;
+        let adapter_scale = value
+            .get("lora")
+            .map(|lora| {
+                serde_json::from_value::<f32>(lora[0]["scale"].clone())
+                    .map_err(|_| Rejection::ChatSchema)
+            })
+            .transpose()?;
         let prompt = session
-            .prepare_with_thinking(messages, output, enable_thinking)
+            .prepare_with_settings(messages, output, enable_thinking, adapter_scale)
             .map_err(|_| Rejection::TokenCountUnavailable)?;
         let count = prompt.prompt_tokens();
         prepared = Some(prompt);

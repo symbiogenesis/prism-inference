@@ -183,7 +183,10 @@ async fn perform(
 #[test]
 fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> TestResult {
     let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
-    assert!(canonical(&original).is_ok());
+    assert_eq!(
+        canonical(&original).map_err(|e| format!("{e:?}"))?.body,
+        original
+    );
     for (name, value) in [
         ("temperature", json!(0.5)),
         ("top_p", json!(0.5)),
@@ -246,6 +249,172 @@ fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> T
         assert!(canonical(changed.as_bytes()).is_err());
     }
     Ok(())
+}
+
+#[test]
+fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> TestResult {
+    run(async {
+        let profile = ModelProfile {
+            representation: bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1,
+            adapter: true,
+        };
+        let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+        let mut value: Value = serde_json::from_slice(&original)?;
+        assert!(canonical_for_profile(&original, profile).is_err());
+        for invalid in [
+            Value::Null,
+            json!([]),
+            json!([{"id":1,"scale":1.3}]),
+            json!([{"id":0,"scale":"1.3"}]),
+            json!([{"id":0,"scale":null}]),
+            json!([{"id":0,"scale":-0.01}]),
+            json!([{"id":0,"scale":2.000_000_01}]),
+            json!([{"id":0,"scale":1.3,"path":"other.gguf"}]),
+            json!([{"id":0,"scale":1.3},{"id":0,"scale":1.3}]),
+        ] {
+            value["lora"] = invalid;
+            assert!(canonical_for_profile(&serde_json::to_vec(&value)?, profile).is_err());
+        }
+        for scale in [0.0_f64, -0.0, 1.3, 2.0] {
+            value["lora"] = json!([{"id":0,"scale":scale}]);
+            let bytes = serde_json::to_vec(&value)?;
+            assert!(canonical(&bytes).is_err());
+            let prepared = canonical_for_profile(&bytes, profile).map_err(|e| format!("{e:?}"))?;
+            let canonical: Value = serde_json::from_slice(&prepared.body)?;
+            assert_eq!(
+                serde_json::from_value::<f64>(canonical["lora"][0]["scale"].clone())?.to_bits(),
+                scale.to_bits()
+            );
+        }
+        value["lora"] = json!([{"id":0,"scale":1.3}]);
+        value["abliteration_scale"] = json!(1.3);
+        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, profile).is_err());
+        value
+            .as_object_mut()
+            .ok_or("Missing request object.")?
+            .remove("abliteration_scale");
+        let body = canonical_for_profile(&serde_json::to_vec(&value)?, profile)
+            .map_err(|e| format!("{e:?}"))?
+            .body;
+        let duplicate =
+            std::str::from_utf8(&body)?.replacen("\"scale\":", "\"scale\":1.3,\"scale\":", 1);
+        assert!(canonical_for_profile(duplicate.as_bytes(), profile).is_err());
+        let observed = Observation::default();
+        let mut worker =
+            Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
+        worker.profile = profile;
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
+        value["lora"] = json!([{"id":0,"scale":0.0}]);
+        let changed = canonical_for_profile(&serde_json::to_vec(&value)?, profile)
+            .map_err(|e| format!("{e:?}"))?
+            .body;
+        let (result, _) =
+            perform(&mut worker, request("/v1/chat/completions", &changed, true)).await?;
+        assert_eq!(result, Err(NativeBackendError::CountMismatch));
+        assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &changed, true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
+        let (result, _) = perform(&mut worker, request("/reset", &[], true)).await?;
+        assert_eq!(result, Ok(()));
+        let (result, _) =
+            perform(&mut worker, request("/v1/chat/completions", &changed, true)).await?;
+        assert_eq!(result, Err(NativeBackendError::CountMismatch));
+        for bytes in [&body, &changed] {
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", bytes, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let (result, _) =
+                perform(&mut worker, request("/v1/chat/completions", bytes, true)).await?;
+            assert_eq!(result, Ok(()));
+        }
+        assert_eq!(observed.executions.load(Ordering::Relaxed), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scale() {
+    use bonsai_prism_runtime::model::{
+        lora::SWIFT_ADAPTER_SHA256,
+        swift::{self, Representation},
+    };
+    let legacy = ModelProfile::default().readiness(42);
+    assert_eq!(
+        legacy,
+        json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0", "object":"model",
+        "model_sha256":swift::MODEL_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
+        "runtime":"prism-inference", "context_tokens":8192, "seed":42}]})
+    );
+    for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
+        for adapter in [false, true] {
+            let reply = ModelProfile {
+                representation,
+                adapter,
+            }
+            .readiness(17);
+            let selected = &reply["data"][0];
+            assert_eq!(selected["model_sha256"], representation.model_sha256());
+            if adapter || representation != Representation::Pq2 {
+                assert_eq!(selected["weight_representation"], representation.name());
+                assert_eq!(
+                    selected["adapter_sha256"],
+                    json!(adapter.then_some(SWIFT_ADAPTER_SHA256))
+                );
+                assert_eq!(selected["supports_abliteration_scale"], adapter);
+                assert_eq!(
+                    selected.get("abliteration_scale_range"),
+                    adapter.then_some(&json!([0, 2]))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn private_adapter_signed_zero_changes_require_recounting() -> TestResult {
+    run(async {
+        let observed = Observation::default();
+        let mut worker =
+            Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
+        worker.profile.adapter = true;
+        let mut value: Value =
+            serde_json::from_slice(&pending(true, 128).map_err(|e| format!("{e:?}"))?.body)?;
+        let mut bodies = Vec::new();
+        for scale in [0.0_f64, -0.0] {
+            value["lora"] = json!([{"id":0,"scale":scale}]);
+            bodies.push(
+                canonical_for_profile(&serde_json::to_vec(&value)?, worker.profile)
+                    .map_err(|e| format!("{e:?}"))?
+                    .body,
+            );
+        }
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &bodies[0], true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions", &bodies[1], true),
+        )
+        .await?;
+        assert_eq!(result, Err(NativeBackendError::CountMismatch));
+        assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+        Ok(())
+    })
 }
 
 #[test]
@@ -588,62 +757,81 @@ fn private_head_reuses_strict_host_auth_origin_and_framing_policy() -> TestResul
     Ok(())
 }
 
+async fn fail_acknowledgement(worker: &mut Worker, body: &[u8], terminal: bool) -> TestResult {
+    let allowance = if terminal {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(1)
+    };
+    let mut events = worker
+        .start(
+            Input::Generate(
+                canonical_for_profile(body, worker.profile).map_err(|e| format!("{e:?}"))?,
+            ),
+            Cancellation::default(),
+            std::time::Instant::now() + allowance,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+    let held = loop {
+        let Event { output, ack } = events.recv().await.ok_or("missing worker event")?;
+        let target = if terminal {
+            matches!(output, Output::Complete(_))
+        } else {
+            matches!(output, Output::Delta(_))
+        };
+        if target {
+            break ack;
+        }
+        assert!(!matches!(output, Output::Done(_)));
+        ack.ok_or("missing write acknowledgement")?
+            .send(())
+            .map_err(|_| "worker rejected acknowledgement")?;
+    };
+    let held = if terminal {
+        drop(held);
+        None
+    } else {
+        held
+    };
+    let event = events.recv().await.ok_or("missing failed completion")?;
+    assert!(matches!(
+        event.output,
+        Output::Done(Err(NativeBackendError::Engine))
+    ));
+    drop(held);
+    drop(events);
+    worker.settled().await;
+    Ok(())
+}
+
 #[test]
 fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admission() -> TestResult
 {
     run(async {
-        for terminal in [false, true] {
+        for (terminal, adapter) in [(false, false), (true, false), (false, true), (true, true)] {
             let observed = Observation::default();
             let mut worker =
                 Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
-            let body = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+            let mut value: Value =
+                serde_json::from_slice(&pending(true, 128).map_err(|e| format!("{e:?}"))?.body)?;
+            if adapter {
+                worker.profile = ModelProfile {
+                    representation:
+                        bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1,
+                    adapter: true,
+                };
+                value["lora"] = json!([{"id":0,"scale":1.3}]);
+            }
+            let body = canonical_for_profile(&serde_json::to_vec(&value)?, worker.profile)
+                .map_err(|e| format!("{e:?}"))?
+                .body;
             let (counted, _) = perform(
                 &mut worker,
                 request("/v1/chat/completions/input_tokens", &body, true),
             )
             .await?;
             assert_eq!(counted, Ok(()));
-            let allowance = if terminal {
-                Duration::from_secs(10)
-            } else {
-                Duration::from_secs(1)
-            };
-            let mut events = worker
-                .start(
-                    Input::Generate(canonical(&body).map_err(|e| format!("{e:?}"))?),
-                    Cancellation::default(),
-                    std::time::Instant::now() + allowance,
-                )
-                .map_err(|e| format!("{e:?}"))?;
-            let held = loop {
-                let Event { output, ack } = events.recv().await.ok_or("missing worker event")?;
-                let target = if terminal {
-                    matches!(output, Output::Complete(_))
-                } else {
-                    matches!(output, Output::Delta(_))
-                };
-                if target {
-                    break ack;
-                }
-                assert!(!matches!(output, Output::Done(_)));
-                ack.ok_or("missing write acknowledgement")?
-                    .send(())
-                    .map_err(|_| "worker rejected acknowledgement")?;
-            };
-            let held = if terminal {
-                drop(held);
-                None
-            } else {
-                held
-            };
-            let event = events.recv().await.ok_or("missing failed completion")?;
-            assert!(matches!(
-                event.output,
-                Output::Done(Err(NativeBackendError::Engine))
-            ));
-            drop(held);
-            drop(events);
-            worker.settled().await;
+            fail_acknowledgement(&mut worker, &body, terminal).await?;
             assert_eq!(observed.state.load(Ordering::Relaxed), 0);
             let (result, _) = perform(
                 &mut worker,
@@ -651,6 +839,23 @@ fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admis
             )
             .await?;
             assert_eq!(result, Err(NativeBackendError::Engine));
+            let (result, _) = perform(&mut worker, request("/reset", &[], true)).await?;
+            assert_eq!(result, Ok(()));
+            if adapter {
+                value["lora"] = json!([{"id":0,"scale":0.0}]);
+            }
+            let next = canonical_for_profile(&serde_json::to_vec(&value)?, worker.profile)
+                .map_err(|e| format!("{e:?}"))?
+                .body;
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &next, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let (result, _) =
+                perform(&mut worker, request("/v1/chat/completions", &next, true)).await?;
+            assert_eq!(result, Ok(()));
         }
         Ok(())
     })

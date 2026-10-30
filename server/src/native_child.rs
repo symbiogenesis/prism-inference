@@ -4,6 +4,7 @@ use std::{ffi::OsString, io, path::PathBuf};
 
 use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
+    model::swift::Representation,
     swift_session::SwiftSession,
 };
 use bonsai_windows_credentials::validate_external_path;
@@ -16,6 +17,8 @@ struct Config {
     port: u16,
     seed: u32,
     row_workers: usize,
+    representation: Representation,
+    adapter: Option<PathBuf>,
 }
 
 fn invalid() -> io::Error {
@@ -30,15 +33,22 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut child = false;
     let (mut model, mut key, mut port, mut seed) = (None, None, None, None);
     let mut row_workers = None;
+    let mut repacked_ptq1 = false;
+    let mut adapter = None;
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
             child = true;
+            continue;
+        }
+        if argument == "--use-repacked-ptq1" && !repacked_ptq1 {
+            repacked_ptq1 = true;
             continue;
         }
         let value = arguments.next().ok_or_else(invalid)?;
         match argument.to_str() {
             Some("--model") if model.is_none() => model = Some(PathBuf::from(value)),
             Some("--key-file") if key.is_none() => key = Some(PathBuf::from(value)),
+            Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
             Some("--port") if port.is_none() => {
                 port = Some(
                     value
@@ -75,6 +85,12 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         port: port.filter(|&n| n >= 1024).ok_or_else(invalid)?,
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
         row_workers: row_workers.unwrap_or(1),
+        representation: if repacked_ptq1 {
+            Representation::CurrentRepackedPtq1
+        } else {
+            Representation::Pq2
+        },
+        adapter,
     };
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -84,7 +100,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     if !child {
         return Err(invalid());
     }
-    for path in [&config.model, &config.key] {
+    for path in [&config.model, &config.key]
+        .into_iter()
+        .chain(config.adapter.as_ref())
+    {
         validate_external_path(path).map_err(|_| invalid())?;
     }
     Ok(config)
@@ -112,8 +131,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     }
     let (_key_guard, key) = crate::configuration::read_key(&config.key).map_err(|_| invalid())?;
     let parallelism = RowParallelism::new(config.row_workers).map_err(|_| invalid())?;
-    let session = SwiftSession::load_with_row_parallelism(
+    let session = SwiftSession::load_profile_with_row_parallelism(
         &config.model,
+        config.representation,
+        config.adapter.as_deref(),
         MatvecBackend::Auto,
         config.seed,
         parallelism,
@@ -185,6 +206,63 @@ mod tests {
         let mut args = good;
         args[8] = OsString::from(u32::MAX.to_string());
         assert!(parse(args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_selects_ptq1_and_approved_adapter_only_with_explicit_options() -> io::Result<()>
+    {
+        let model = std::env::temp_dir()
+            .join("native-model.gguf")
+            .into_os_string();
+        let key = std::env::temp_dir()
+            .join("native-backend.key")
+            .into_os_string();
+        let adapter = std::env::temp_dir()
+            .join("approved-adapter.gguf")
+            .into_os_string();
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        let default = parse(base.clone())?;
+        assert_eq!(default.representation, Representation::Pq2);
+        assert!(default.adapter.is_none());
+        for repacked in [false, true] {
+            let mut selected = base.clone();
+            if repacked {
+                selected.push("--use-repacked-ptq1".into());
+            }
+            selected.extend([OsString::from("--abliterate-lora"), adapter.clone()]);
+            let config = parse(selected.clone())?;
+            assert_eq!(
+                config.representation,
+                if repacked {
+                    Representation::CurrentRepackedPtq1
+                } else {
+                    Representation::Pq2
+                }
+            );
+            assert_eq!(config.adapter, Some(PathBuf::from(&adapter)));
+            selected.extend([OsString::from("--abliterate-lora"), adapter.clone()]);
+            assert!(parse(selected).is_err());
+        }
+        for extra in [
+            vec!["--use-repacked-ptq1", "--use-repacked-ptq1"],
+            vec!["--abliterate-lora", "relative.gguf"],
+            vec!["--abliteration-scale", "1.3"],
+        ] {
+            let mut invalid = base.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(invalid).is_err());
+        }
         Ok(())
     }
 }

@@ -4,6 +4,20 @@ The independently built prism-inference-server executable supplies the same stri
 
 The server loads the selected exact Swift artifact before binding numeric IPv4 loopback. PQ2 without an adapter remains the default. Explicit `--use-repacked-ptq1` selects only the verified current-weight export; `--abliterate-lora <absolute-path>` loads only the approved rank-one adapter. These options preserve the existing process admission and do not qualify full-model parity, creative quality, device performance or lower memory limits.
 
+Read-only model, adapter and key validation uses the credential helper pinned to
+Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`. Inside an actual Windows
+AppContainer, that helper preserves local-drive, non-root ancestry, reparse and
+regular-file checks while avoiding denied volume-root metadata queries. The
+trusted owner still validates and retains complete ancestry before granting only
+the selected files. The key remains held by a write/delete-denying reader. No
+filesystem grant is expanded.
+
+The server temporarily has `publish = false`: its reviewed Git-only helper
+dependency must remain exact. Delivery uses checked GitHub binary prereleases or
+the exact source checkout, not crates.io server installation. Publishing a shared
+helper release and qualifying a registry-backed server remain pending; the root
+runtime library's separate publication contract is unchanged.
+
 Extended `/v1/models` and `/props` readiness names the exact model ID/hash and
 `weight_representation`, the approved `adapter_sha256` or null, and
 `supports_abliteration_scale`. Adapter profiles also report

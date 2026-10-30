@@ -7,7 +7,7 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     swift_session::SwiftSession,
 };
-use bonsai_windows_credentials::validate_external_path;
+use bonsai_windows_credentials::validate_read_path;
 
 use crate::service::bound_loopback_socket;
 
@@ -104,7 +104,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         .into_iter()
         .chain(config.adapter.as_ref())
     {
-        validate_external_path(path).map_err(|_| invalid())?;
+        validate_read_path(path)?;
     }
     Ok(config)
 }
@@ -155,6 +155,17 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn files() -> io::Result<(bonsai_windows_credentials::PrivateDirectory, [OsString; 3])> {
+        let directory =
+            bonsai_windows_credentials::PrivateDirectory::create(&std::env::temp_dir())?;
+        let paths =
+            ["model.gguf", "backend.key", "adapter.gguf"].map(|name| directory.path().join(name));
+        for path in &paths {
+            std::fs::write(path, [])?;
+        }
+        Ok((directory, paths.map(PathBuf::into_os_string)))
+    }
+
     #[test]
     fn native_child_rejects_unknown_duplicate_relative_and_unbounded_options() -> io::Result<()> {
         let good = [
@@ -169,13 +180,10 @@ mod tests {
             "42",
         ]
         .map(OsString::from);
+        let (_directory, [model, key, _adapter]) = files()?;
         let mut good = good;
-        good[2] = std::env::temp_dir()
-            .join("native-model.gguf")
-            .into_os_string();
-        good[6] = std::env::temp_dir()
-            .join("native-backend.key")
-            .into_os_string();
+        good[2] = model;
+        good[6] = key;
         assert!(parse(good.clone()).is_ok());
         assert_eq!(parse(good.clone())?.row_workers, 1);
         for value in ["0", "17", "invalid"] {
@@ -212,15 +220,7 @@ mod tests {
     #[test]
     fn native_child_selects_ptq1_and_approved_adapter_only_with_explicit_options() -> io::Result<()>
     {
-        let model = std::env::temp_dir()
-            .join("native-model.gguf")
-            .into_os_string();
-        let key = std::env::temp_dir()
-            .join("native-backend.key")
-            .into_os_string();
-        let adapter = std::env::temp_dir()
-            .join("approved-adapter.gguf")
-            .into_os_string();
+        let (directory, [model, key, adapter]) = files()?;
         let base = vec![
             OsString::from("--native-engine-child"),
             "--model".into(),
@@ -235,6 +235,12 @@ mod tests {
         let default = parse(base.clone())?;
         assert_eq!(default.representation, Representation::Pq2);
         assert!(default.adapter.is_none());
+        let mut missing = base.clone();
+        missing[2] = directory.path().join("missing.gguf").into_os_string();
+        assert!(parse(missing).is_err());
+        let mut nonregular = base.clone();
+        nonregular[2] = directory.path().as_os_str().to_owned();
+        assert!(parse(nonregular).is_err());
         for repacked in [false, true] {
             let mut selected = base.clone();
             if repacked {

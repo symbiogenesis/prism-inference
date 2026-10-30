@@ -98,8 +98,7 @@ version = "0.1.0"
 [[package]]
 name = "bonsai-windows-credentials"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88174b697a3d980cbe2a4fcaa644f0e9d79779a8f312e90c15ea0426af51fa6c"
+source = "git+https://github.com/symbiogenesis/SwiftBonsai2Runner?rev=abe04b4a8eff18388af96f0e75c8a8d180b81989#abe04b4a8eff18388af96f0e75c8a8d180b81989"
 dependencies = [
  "windows-sys",
 ]

@@ -13,6 +13,7 @@ mod reception;
 pub mod response;
 #[cfg(windows)]
 mod service;
+pub mod startup;
 mod supervisor;
 mod wire;
 

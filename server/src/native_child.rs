@@ -9,7 +9,10 @@ use bonsai_prism_runtime::{
 };
 use bonsai_windows_credentials::validate_read_path;
 
-use crate::service::bound_loopback_socket;
+use crate::{
+    service::bound_loopback_socket,
+    startup::{self, Stage},
+};
 
 struct Config {
     model: PathBuf,
@@ -119,18 +122,22 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
 /// Rejects arguments, environment overrides, low startup memory, key access,
 /// verified model loading, listener setup and backend lifecycle failures.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
-    let config = parse(arguments)?;
+    let config = parse(arguments).map_err(|error| startup::at(Stage::Arguments, &error))?;
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
-        .map_err(|_| invalid())?;
-    if bonsai_windows_process::available_memory_bytes()?
+        .map_err(|error| startup::at(Stage::Environment, &error))?;
+    if bonsai_windows_process::available_memory_bytes()
+        .map_err(|error| startup::at(Stage::Memory, &error))?
         < crate::configuration::REQUIRED_AVAILABLE_BYTES
     {
-        return Err(io::Error::other(
-            "native Swift startup memory admission rejected",
+        return Err(startup::at(
+            Stage::Memory,
+            &io::Error::other("native Swift startup memory admission rejected"),
         ));
     }
-    let (_key_guard, key) = crate::configuration::read_key(&config.key).map_err(|_| invalid())?;
-    let parallelism = RowParallelism::new(config.row_workers).map_err(|_| invalid())?;
+    let (_key_guard, key) = crate::configuration::read_key(&config.key)
+        .map_err(|error| startup::at(Stage::Key, &error))?;
+    let parallelism = RowParallelism::new(config.row_workers)
+        .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
     let session = SwiftSession::load_profile_with_row_parallelism(
         &config.model,
         config.representation,
@@ -139,15 +146,23 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         config.seed,
         parallelism,
     )
-    .map_err(|_| io::Error::other("verified native Swift loading failed"))?;
+    .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(|error| startup::at(Stage::Runtime, &error))?;
     runtime.block_on(async {
-        let listener = bound_loopback_socket(config.port)?.listen(1)?;
+        let listener = bound_loopback_socket(config.port)
+            .and_then(|socket| socket.listen(1))
+            .map_err(|error| startup::at(Stage::Listener, &error))?;
         crate::native_backend::serve(listener, session, key)
             .await
-            .map_err(|_| io::Error::other("native Swift backend admission closed"))
+            .map_err(|_| {
+                startup::at(
+                    Stage::Backend,
+                    &io::Error::other("native Swift backend admission closed"),
+                )
+            })
     })
 }
 
@@ -164,6 +179,36 @@ mod tests {
             std::fs::write(path, [])?;
         }
         Ok((directory, paths.map(PathBuf::into_os_string)))
+    }
+
+    #[test]
+    fn native_startup_rejects_missing_paths_without_loading_or_leaking_values() -> io::Result<()> {
+        let (directory, [_model, key, _adapter]) = files()?;
+        let arguments = [
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            directory
+                .path()
+                .join("PRIVATE_MISSING_MODEL.gguf")
+                .into_os_string(),
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        let error = run(arguments)
+            .err()
+            .ok_or_else(|| io::Error::other("missing file was accepted"))?;
+        let mut output = Vec::new();
+        startup::write_failure(&mut output, &error)?;
+        let output = String::from_utf8(output).map_err(io::Error::other)?;
+        assert!(output.starts_with(
+            "private-inference-startup-failed stage=arguments errorKind=NotFound osCode="
+        ));
+        assert!(!output.contains("PRIVATE_MISSING_MODEL"));
+        Ok(())
     }
 
     #[test]

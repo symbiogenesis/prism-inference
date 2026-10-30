@@ -18,6 +18,14 @@ the exact source checkout, not crates.io server installation. Publishing a share
 helper release and qualifying a registry-backed server remain pending; the root
 runtime library's separate publication contract is unchanged.
 
+Failed startup emits one value-free stderr line, for example
+`private-inference-startup-failed stage=arguments errorKind=PermissionDenied osCode=5`.
+The fixed stages are `arguments`, `environment`, `memory`, `key`, `model`,
+`runtime`, `listener` and `backend`; an unclassified error uses `unknown`.
+`osCode=none` means no numeric OS code was available. No original error message,
+source chain, path, argument, credential or model value enters this diagnostic.
+The owning launcher must retain it before deleting temporary CI storage.
+
 Extended `/v1/models` and `/props` readiness names the exact model ID/hash and
 `weight_representation`, the approved `adapter_sha256` or null, and
 `supports_abliteration_scale`. Adapter profiles also report

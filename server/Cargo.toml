@@ -1,6 +1,6 @@
 [package]
 name = "prism-inference-server"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.101"
 # Exact Git dependency below is retained for GitHub binaries/source checkouts.
@@ -16,7 +16,7 @@ parallel-rows = ["bonsai-prism-runtime/parallel-rows"]
 
 
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.7" }
+bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.8" }
 http = "=1.5.0"
 httparse = "=1.10.1"
 serde = { version = "=1.0.229", features = ["derive"] }

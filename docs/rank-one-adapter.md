@@ -1,8 +1,9 @@
 # Rank-one adapter correctness path
 
 The source graph implements an explicit rank-one F32 adapter path for numerical
-qualification. The private HTTP server, Swift JSONL worker and ordinary token
-driver continue to reject adapters. This source support is not a qualified
+qualification. The private HTTP server now admits the exact approved adapter
+only through an explicit selection; the Swift JSONL worker and ordinary token
+driver retain their adapter-free subset. This source support is not a qualified
 Runner default, a released-runtime claim or evidence of adapter effectiveness.
 
 `model::lora::RankOneAdapter::load_swift` verifies the approved Orca file's exact
@@ -21,9 +22,11 @@ shapes; callers of that constructor own artifact authenticity.
 Only `token_embd.weight`, `blk.N.attn_output.weight`, `blk.N.ssm_out.weight` and
 `blk.N.ffn_down.weight` are admitted. `Qwen35::with_rank_one_adapter` checks that
 every target is in the live graph. It seals the exact adapter identity and scale
-bits into the graph identity. Scale is fixed for that graph and must be finite
-within 0..2; a different scale requires a fresh graph, preventing reuse of state
-computed under another correction.
+bits into the graph identity. Scale must be finite within 0..2. The narrow
+`reset_with_adapter_scale` operation clears complete state and renews checkpoint
+provenance before changing scale, while retaining immutable weights and factors.
+No state computed under another correction can be reused. The
+[session contract](swift-session-profiles.md) defines request ownership and recovery.
 
 An embedding adapter requires a separate `output.weight`. Graphs whose output
 head reuses `token_embd.weight` reject embedding adapters at every scale,
@@ -69,7 +72,7 @@ create-new logits, complete logical KV/recurrent/convolution snapshots, raw
 greedy IDs and evidence-byte bounds. It produces no timing or benchmark verdict.
 No full-model adapter capture was performed as part of the implementation.
 
-Before service integration, compare the same approved artifacts against pinned
+Before adapter qualification, compare the same approved artifacts against pinned
 native execution at loaded scale zero and intended nonzero scales. Establish
 residual-writer inputs/corrections, especially grouped SSM authoring order;
 complete logits and live state must retain the existing
@@ -77,10 +80,10 @@ complete logits and live state must retain the existing
 uses original input order; they cannot establish the publisher's authoring basis.
 Final logits/state captures alone do not replace native writer-level evidence.
 
-After those numerical checks, add a separately reviewed immutable release and
-explicit private-service adapter readiness/request identities; qualify scale
-changes with fresh state, exact count/generation policy, cancellation, reset,
-streaming and rollback. Then run full-context/long-output, resource, same-engine
+The explicit [private service](../server/README.md) binds adapter and representation
+readiness and preserves exact count/generation scale policy. Review its immutable
+release independently and qualify scale changes, cancellation, reset, streaming and
+rollback on the actual target. Then run full-context/long-output, resource, same-engine
 TPS and independent human quality gates on the actual target before promoting
 Runner's adapter-enabled default. All benchmarks and complete suites remain
 main-only CI work; focused synthetic tests and builds may run locally.

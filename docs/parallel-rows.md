@@ -54,6 +54,8 @@ using the pool, including provisional or failed operations. It is distinct
 from scalar/NEON ISA selection and does not count committed tokens.
 
 Build `prism-inference` or `prism-inference-server` with `--features parallel-rows`.
+The prepared `0.1.9` GitHub release-bundle build includes this feature while
+retaining the one-worker default. Earlier immutable bundles are unchanged.
 The Swift JSONL worker and private `--native-engine-child` HTTP server accept
 `--row-workers 1..16`, default 1. Values above one reject if built without the
 feature. This is a trusted launch option, never a client-controlled HTTP field;

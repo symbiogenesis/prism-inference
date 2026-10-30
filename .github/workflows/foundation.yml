@@ -206,6 +206,7 @@ jobs:
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
               cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
             }

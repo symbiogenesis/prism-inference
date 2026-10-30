@@ -62,6 +62,30 @@ feature. This is a trusted launch option, never a client-controlled HTTP field;
 all existing authentication, model identity, process containment and memory
 admission requirements still apply. Public request/readiness schemas are unchanged.
 
+The source-only `swift_model_check` example accepts the same explicit budget for
+`load`, `forward` and `trajectory`; `inspect` rejects worker settings. Prefix
+order is representation, row workers, then adapter. For example, a hosted build
+with `--features parallel-rows --example swift_model_check` can capture separate
+serial and two-worker controls for the original PQ2 artifact:
+
+```text
+swift_model_check --row-workers 1 --rank-one-adapter <approved-adapter> 1.3 forward <original-PQ2> <new-serial-evidence> auto 248045
+swift_model_check --row-workers 2 --rank-one-adapter <approved-adapter> 1.3 forward <original-PQ2> <new-parallel-evidence> auto 248045
+```
+
+All artifact/evidence paths must be absolute; evidence directories must already
+exist and differ. These are capture interfaces, not instructions to run a long
+matrix on the owner device. Preserve its five-minute total budget and leave
+unrun gates pending. The checker keeps exact model/adapter identities, create-new
+logits and complete logical KV/recurrent/convolution dumps and existing byte
+bounds. Forward/trajectory step records also report the configured `row_workers`,
+cumulative actual `parallel_row_operations` and `evaluation_milliseconds`.
+Evaluation time covers only `Qwen35::evaluate_into`, including its state checks
+and updates, and excludes model loading, evidence I/O, greedy selection and output.
+It is a raw observation, not complete-request latency, service TPS or proof of a
+speedup. The example uses the existing graph policy API directly so it can retain
+complete state dumps; it does not expose the private Swift session's decoder.
+
 ## Validation
 
 Focused controls cover explicit budgets, actual Swift column widths, awkward

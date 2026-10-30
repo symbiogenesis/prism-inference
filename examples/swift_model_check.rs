@@ -4,9 +4,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
-use bonsai_prism_runtime::kernels::MatvecBackend;
+use bonsai_prism_runtime::kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism};
 use bonsai_prism_runtime::model::lora::RankOneAdapter;
 use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::runtime::greedy;
@@ -22,12 +23,13 @@ const USAGE: &str = concat!(
     "       swift_model_check forward <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check trajectory <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>\n",
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
-    "For selected current-weight load/forward/trajectory, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation prefix for explicit unqualified LoRA correctness evidence.\n",
+    "For load/forward/trajectory, --row-workers <1..16> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
+    "For selected current-weight load/forward/trajectory, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
     "Evidence directories must already exist. Files are create-new; trajectory snapshot payload is capped at 8 GiB.\n",
-    "This is correctness evidence, without timing, sampling or service qualification.\n",
+    "Evaluation milliseconds exclude model loading, snapshots, greedy selection and output; they do not establish benchmark or service qualification.\n",
 );
 
 fn reject(message: &str) -> bonsai_prism_runtime::Error {
@@ -55,6 +57,7 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let representation = select_representation(&mut arguments);
+    let row_workers = select_row_workers(&mut arguments)?;
     let adapter = select_adapter(&mut arguments)?;
     if arguments.len() == 1 && arguments[0] == "--help" {
         std::io::stdout().lock().write_all(USAGE.as_bytes())?;
@@ -73,7 +76,7 @@ fn run() -> Result<()> {
         ));
     }
     if mode == "inspect" {
-        if arguments.len() != 2 || adapter.is_some() {
+        if arguments.len() != 2 || adapter.is_some() || row_workers.is_some() {
             return Err(reject("inspect takes only the model path"));
         }
         return report(
@@ -86,16 +89,61 @@ fn run() -> Result<()> {
         if arguments.len() != 2 {
             return Err(reject("load takes only the model path"));
         }
-        let graph = load_graph(&path, MatvecBackend::Auto, representation, adapter.as_ref())?;
+        let graph = load_graph(
+            &path,
+            MatvecBackend::Auto,
+            representation,
+            adapter.as_ref(),
+            row_workers.unwrap_or(1),
+        )?;
         return emit(
-            &json!({"event":"graph-ready","identity":graph.identity(),"vocabulary":graph.vocab_size(),"initial_checkpoint_bytes":graph.checkpoint_bytes(),"maximum_live_state_payload_bytes":swift::STATE_PAYLOAD_BYTES,"full_attention_blocks":16,"recurrent_blocks":48}),
+            &json!({"event":"graph-ready","identity":graph.identity(),"vocabulary":graph.vocab_size(),"initial_checkpoint_bytes":graph.checkpoint_bytes(),"maximum_live_state_payload_bytes":swift::STATE_PAYLOAD_BYTES,"full_attention_blocks":16,"recurrent_blocks":48,"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations}),
         );
     }
     match mode.as_str() {
-        "forward" => forward(&path, &arguments[2..], representation, adapter.as_ref()),
-        "trajectory" => trajectory(&path, &arguments[2..], representation, adapter.as_ref()),
+        "forward" => forward(
+            &path,
+            &arguments[2..],
+            representation,
+            adapter.as_ref(),
+            row_workers.unwrap_or(1),
+        ),
+        "trajectory" => trajectory(
+            &path,
+            &arguments[2..],
+            representation,
+            adapter.as_ref(),
+            row_workers.unwrap_or(1),
+        ),
         _ => Err(reject("unsupported evaluation mode")),
     }
+}
+
+fn select_row_workers(arguments: &mut Vec<String>) -> Result<Option<usize>> {
+    if arguments
+        .first()
+        .is_none_or(|argument| argument != "--row-workers")
+    {
+        return Ok(None);
+    }
+    let value = arguments
+        .get(1)
+        .ok_or_else(|| reject("row workers require one bounded integer"))?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(reject("row workers require one bounded integer"));
+    }
+    let workers = value.parse::<usize>()?;
+    if !(1..=MAX_ROW_WORKERS).contains(&workers) {
+        return Err(reject("row workers must be from 1 through 16"));
+    }
+    arguments.drain(..2);
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--row-workers")
+    {
+        return Err(reject("duplicate row worker selection"));
+    }
+    Ok(Some(workers))
 }
 
 struct AdapterSelection {
@@ -174,10 +222,13 @@ fn load_graph(
     backend: MatvecBackend,
     representation: Representation,
     selection: Option<&AdapterSelection>,
+    row_workers: usize,
 ) -> Result<Qwen35> {
+    // Reject unavailable worker counts before opening/hashing model artifacts.
+    let parallelism = RowParallelism::new(row_workers)?;
     let (model, receipt) = swift::load_representation(path, MODEL_BUDGET, representation)?;
     report("weights-loaded", receipt, representation)?;
-    if let Some(selection) = selection {
+    let mut graph = if let Some(selection) = selection {
         let adapter =
             RankOneAdapter::load_swift_representation(&selection.path, &model, representation)?;
         emit(
@@ -190,10 +241,12 @@ fn load_graph(
             backend,
             adapter,
             selection.scale,
-        )
+        )?
     } else {
-        Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, 1024 * 1024 * 1024, backend)
-    }
+        Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, 1024 * 1024 * 1024, backend)?
+    };
+    graph.set_row_parallelism(parallelism);
+    Ok(graph)
 }
 
 fn forward(
@@ -201,6 +254,7 @@ fn forward(
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    row_workers: usize,
 ) -> Result<()> {
     if arguments.len() != 3 {
         return Err(reject(
@@ -215,14 +269,16 @@ fn forward(
     if !valid_tokens(&tokens) || tokens.len() > 16 {
         return Err(reject("forward requires 1..16 valid token IDs"));
     }
-    let mut graph = load_graph(path, backend, representation, adapter)?;
+    let mut graph = load_graph(path, backend, representation, adapter, row_workers)?;
     let mut logits = Vec::new();
     let mut remaining = usize::MAX;
     for (position, token) in tokens.into_iter().enumerate() {
+        let started = Instant::now();
         graph.evaluate_into(token, &mut logits)?;
+        let evaluation_milliseconds = started.elapsed().as_secs_f64() * 1000.0;
         let output = snapshot(&graph, &logits, evidence, position, &mut remaining)?;
         emit(
-            &json!({"event":"forward-step","position":position,"input_token":token,"greedy_token":greedy(&logits)?,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1]}),
+            &json!({"event":"forward-step","position":position,"input_token":token,"greedy_token":greedy(&logits)?,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1],"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations,"evaluation_milliseconds":evaluation_milliseconds}),
         )?;
     }
     Ok(())
@@ -233,6 +289,7 @@ fn trajectory(
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    row_workers: usize,
 ) -> Result<()> {
     if arguments.len() != 4 {
         return Err(reject(
@@ -262,7 +319,7 @@ fn trajectory(
     emit(
         &json!({"event":"trajectory-start","prompt_token_ids":prompt,"prompt_tokens":prompt.len(),"greedy_steps":steps,"context_tokens":swift::CONTEXT_TOKENS,"maximum_snapshot_payload_bytes":MAX_TRAJECTORY_EVIDENCE_BYTES,"snapshot_count":steps+1,"stop_policy":"fixed-step raw greedy; special IDs are included"}),
     )?;
-    let mut graph = load_graph(path, backend, representation, adapter)?;
+    let mut graph = load_graph(path, backend, representation, adapter, row_workers)?;
     for &token in intermediate {
         graph.ingest(token)?;
     }
@@ -271,12 +328,14 @@ fn trajectory(
     let mut generated = Vec::with_capacity(steps);
     let mut token = last;
     for step in 0..=steps {
+        let started = Instant::now();
         graph.evaluate_into(token, &mut logits)?;
+        let evaluation_milliseconds = started.elapsed().as_secs_f64() * 1000.0;
         let position = prompt.len() - 1 + step;
         let output = snapshot(&graph, &logits, evidence, position, &mut remaining)?;
         let next = greedy(&logits)?;
         emit(
-            &json!({"event":"trajectory-step","step":step,"position":position,"kind":if step==0 {"prefix"} else {"generated"},"input_token":token,"greedy_token":next,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1],"snapshot_payload_bytes_written":MAX_TRAJECTORY_EVIDENCE_BYTES-remaining}),
+            &json!({"event":"trajectory-step","step":step,"position":position,"kind":if step==0 {"prefix"} else {"generated"},"input_token":token,"greedy_token":next,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1],"snapshot_payload_bytes_written":MAX_TRAJECTORY_EVIDENCE_BYTES-remaining,"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations,"evaluation_milliseconds":evaluation_milliseconds}),
         )?;
         if step < steps {
             generated.push(next);
@@ -349,7 +408,76 @@ fn report(event: &str, receipt: swift::LoadReceipt, representation: Representati
 
 #[cfg(test)]
 mod tests {
-    use super::{Representation, Result, select_adapter, select_representation, write_values};
+    use super::{
+        Representation, Result, select_adapter, select_representation, select_row_workers,
+        write_values,
+    };
+
+    #[test]
+    fn row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection() -> Result<()> {
+        let mut default = vec!["forward".into(), "model.gguf".into()];
+        assert_eq!(select_row_workers(&mut default)?, None);
+        assert_eq!(default, ["forward", "model.gguf"]);
+        let path = std::env::temp_dir().join("approved-adapter.gguf");
+        for repacked in [false, true] {
+            for workers in [1_usize, 2, 16] {
+                let mut arguments = Vec::new();
+                if repacked {
+                    arguments.push("--use-repacked-ptq1".into());
+                }
+                arguments.extend([
+                    "--row-workers".into(),
+                    workers.to_string(),
+                    "--rank-one-adapter".into(),
+                    path.to_string_lossy().into_owned(),
+                    "1.3".into(),
+                    "forward".into(),
+                ]);
+                assert_eq!(
+                    select_representation(&mut arguments),
+                    if repacked {
+                        Representation::CurrentRepackedPtq1
+                    } else {
+                        Representation::Pq2
+                    }
+                );
+                assert_eq!(select_row_workers(&mut arguments)?, Some(workers));
+                let adapter = select_adapter(&mut arguments)?.ok_or("missing explicit adapter")?;
+                assert_eq!(adapter.path, path);
+                assert_eq!(adapter.scale.to_bits(), 1.3_f32.to_bits());
+                assert_eq!(arguments, ["forward"]);
+            }
+        }
+        for value in ["", "0", "17", "+2", "-1", "2.0", "184467440737095516160"] {
+            let mut arguments = vec!["--row-workers".into(), value.into(), "forward".into()];
+            assert!(select_row_workers(&mut arguments).is_err());
+        }
+        let mut missing = vec!["--row-workers".into()];
+        assert!(select_row_workers(&mut missing).is_err());
+        let mut duplicate = vec![
+            "--row-workers".into(),
+            "2".into(),
+            "--row-workers".into(),
+            "1".into(),
+        ];
+        assert!(select_row_workers(&mut duplicate).is_err());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "parallel-rows"))]
+    #[test]
+    fn row_worker_feature_rejection_precedes_model_file_access() {
+        let rejected = super::load_graph(
+            std::path::Path::new("missing-relative-model.gguf"),
+            super::MatvecBackend::Auto,
+            Representation::Pq2,
+            None,
+            2,
+        );
+        assert!(
+            matches!(rejected, Err(error) if error.to_string() == "multiple row workers require parallel-rows")
+        );
+    }
 
     #[test]
     fn rank_one_capture_requires_explicit_bounded_selection() -> Result<()> {

@@ -10,7 +10,10 @@ use std::{
 };
 
 use bonsai_prism_runtime::{
-    Result, kernels::MatvecBackend, model::swift, runtime::Cancellation,
+    Result,
+    kernels::{MatvecBackend, RowParallelism},
+    model::swift,
+    runtime::Cancellation,
     swift_session::SwiftSession,
 };
 use serde_json::json;
@@ -21,7 +24,7 @@ use request::{MAX_FRAME_BYTES, Request};
 #[path = "../swift_worker_output.rs"]
 mod delivery;
 use delivery::{Delivery, write_record};
-const USAGE: &[u8] = b"Usage: bonsai-swift-worker --model <absolute-pinned-swift-gguf> --seed <u32> [--backend <auto|scalar>]\nJSONL: {\"op\":\"count\",\"id\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16}\nUse op=complete with timeout_seconds (1..600), or {\"op\":\"reset\",\"id\":2}.\nInput frames require LF and are bounded to 1 MiB. Output is flushed JSONL.\nDeltas are provisional until complete. Close the worker for transport cancellation;\nlibrary owners can also cancel cooperatively through the session Cancellation.\nExisting process admission and ownership policies must wrap this worker.\nFull-model correctness and device qualification require retained comparison evidence.\n";
+const USAGE: &[u8] = b"Usage: bonsai-swift-worker --model <absolute-pinned-swift-gguf> --seed <u32> [--backend <auto|scalar>] [--row-workers <1..16>]\nJSONL: {\"op\":\"count\",\"id\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16}\nUse op=complete with timeout_seconds (1..600), or {\"op\":\"reset\",\"id\":2}.\nInput frames require LF and are bounded to 1 MiB. Output is flushed JSONL.\nDeltas are provisional until complete. Close the worker for transport cancellation;\nlibrary owners can also cancel cooperatively through the session Cancellation.\nExisting process admission and ownership policies must wrap this worker.\nFull-model correctness and device qualification require retained comparison evidence.\n";
 
 fn bad() -> bonsai_prism_runtime::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid Swift worker options").into()
@@ -32,6 +35,7 @@ fn load() -> Result<SwiftSession> {
     let mut model = None;
     let mut seed = None;
     let mut backend = None;
+    let mut row_workers = None;
     while let Some(key) = args.next() {
         let value = args.next().ok_or_else(bad)?;
         match key.to_str() {
@@ -46,14 +50,19 @@ fn load() -> Result<SwiftSession> {
                     _ => return Err(bad()),
                 });
             }
+            Some("--row-workers") if row_workers.is_none() => {
+                row_workers = Some(value.to_str().ok_or_else(bad)?.parse::<usize>()?);
+            }
             _ => return Err(bad()),
         }
     }
     let model = model.filter(|path| path.is_absolute()).ok_or_else(bad)?;
-    SwiftSession::load(
+    let parallelism = RowParallelism::new(row_workers.unwrap_or(1))?;
+    SwiftSession::load_with_row_parallelism(
         &model,
         backend.unwrap_or(MatvecBackend::Auto),
         seed.ok_or_else(bad)?,
+        parallelism,
     )
 }
 

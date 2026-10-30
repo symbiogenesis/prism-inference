@@ -11,7 +11,7 @@ use crate::{
     Result,
     graph::Qwen35,
     invalid,
-    kernels::MatvecBackend,
+    kernels::{MatvecBackend, RowParallelism},
     model::swift::{self, LoadReceipt},
     runtime::{Cancellation, Completion, Limits, Prefill, Runtime},
     sampling::SwiftSampler,
@@ -91,12 +91,29 @@ impl SwiftSession {
     /// # Errors
     /// Rejects artifact/metadata/inventory drift, graph errors or allocation bounds.
     pub fn load(path: &Path, backend: MatvecBackend, seed: u32) -> Result<Self> {
+        Self::load_with_row_parallelism(path, backend, seed, RowParallelism::default())
+    }
+
+    /// Loads the pinned session with an explicitly constructed row-worker pool.
+    ///
+    /// Default loading remains serial. The pool is shared by packed projections
+    /// and survives reset; existing transaction/cancellation behavior is retained.
+    ///
+    /// # Errors
+    /// Returns the same loading, identity and state errors as [`Self::load`].
+    pub fn load_with_row_parallelism(
+        path: &Path,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+    ) -> Result<Self> {
         let sampler = SwiftSampler::new(seed)?;
         let (model, receipt) = swift::load(path, MODEL_MEMORY_BYTES)?;
         let chat = SwiftChatSession::from_model(&model)?;
         let vocabulary = Vocabulary::from_metadata(&model.metadata, swift::VOCAB_SIZE)?;
-        let decoder =
+        let mut decoder =
             Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, STATE_MEMORY_BYTES, backend)?;
+        decoder.set_row_parallelism(parallelism);
         let runtime = Runtime::new(
             decoder,
             Limits {

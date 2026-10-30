@@ -2,7 +2,10 @@
 
 use std::{ffi::OsString, io, path::PathBuf};
 
-use bonsai_prism_runtime::{kernels::MatvecBackend, swift_session::SwiftSession};
+use bonsai_prism_runtime::{
+    kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
+    swift_session::SwiftSession,
+};
 use bonsai_windows_credentials::validate_external_path;
 
 use crate::service::bound_loopback_socket;
@@ -12,6 +15,7 @@ struct Config {
     key: PathBuf,
     port: u16,
     seed: u32,
+    row_workers: usize,
 }
 
 fn invalid() -> io::Error {
@@ -25,6 +29,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut arguments = arguments.into_iter();
     let mut child = false;
     let (mut model, mut key, mut port, mut seed) = (None, None, None, None);
+    let mut row_workers = None;
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
             child = true;
@@ -52,6 +57,15 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                         .map_err(|_| invalid())?,
                 );
             }
+            Some("--row-workers") if row_workers.is_none() => {
+                row_workers = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(invalid)?
+                        .parse::<usize>()
+                        .map_err(|_| invalid())?,
+                );
+            }
             _ => return Err(invalid()),
         }
     }
@@ -60,7 +74,13 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         key: key.ok_or_else(invalid)?,
         port: port.filter(|&n| n >= 1024).ok_or_else(invalid)?,
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
+        row_workers: row_workers.unwrap_or(1),
     };
+    if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
+        || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
+    {
+        return Err(invalid());
+    }
     if !child {
         return Err(invalid());
     }
@@ -91,8 +111,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         ));
     }
     let (_key_guard, key) = crate::configuration::read_key(&config.key).map_err(|_| invalid())?;
-    let session = SwiftSession::load(&config.model, MatvecBackend::Auto, config.seed)
-        .map_err(|_| io::Error::other("verified native Swift loading failed"))?;
+    let parallelism = RowParallelism::new(config.row_workers).map_err(|_| invalid())?;
+    let session = SwiftSession::load_with_row_parallelism(
+        &config.model,
+        MatvecBackend::Auto,
+        config.seed,
+        parallelism,
+    )
+    .map_err(|_| io::Error::other("verified native Swift loading failed"))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -109,7 +135,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_child_rejects_unknown_duplicate_relative_and_unbounded_options() {
+    fn native_child_rejects_unknown_duplicate_relative_and_unbounded_options() -> io::Result<()> {
         let good = [
             "--native-engine-child",
             "--model",
@@ -130,12 +156,21 @@ mod tests {
             .join("native-backend.key")
             .into_os_string();
         assert!(parse(good.clone()).is_ok());
+        assert_eq!(parse(good.clone())?.row_workers, 1);
+        for value in ["0", "17", "invalid"] {
+            let mut args = good.to_vec();
+            args.extend(["--row-workers", value].map(OsString::from));
+            assert!(parse(args).is_err());
+        }
+        let mut parallel = good.to_vec();
+        parallel.extend(["--row-workers", "2"].map(OsString::from));
+        assert_eq!(parse(parallel).is_ok(), cfg!(feature = "parallel-rows"));
         for extra in [
             vec!["--seed", "1"],
             vec!["--profile", "swift-pq2-assessment"],
             vec!["--native-engine-child"],
         ] {
-            let mut args = good.clone().to_vec();
+            let mut args = good.to_vec();
             args.extend(extra.into_iter().map(OsString::from));
             assert!(parse(args).is_err());
         }
@@ -150,5 +185,6 @@ mod tests {
         let mut args = good;
         args[8] = OsString::from(u32::MAX.to_string());
         assert!(parse(args).is_err());
+        Ok(())
     }
 }

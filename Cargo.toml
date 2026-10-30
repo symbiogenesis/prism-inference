@@ -19,6 +19,7 @@ name = "bonsai_prism_runtime"
 default = ["cli", "experimental-neon"]
 cli = ["dep:serde", "dep:serde_json"]
 experimental-neon = ["dep:fearless_simd"]
+parallel-rows = ["dep:rayon"]
 
 [[bin]]
 name = "prism-inference"
@@ -40,6 +41,7 @@ required-features = ["cli"]
 
 [dependencies]
 aho-corasick = "=1.1.5"
+rayon = { version = "=1.12.0", optional = true }
 bonsai-ternary = { version = "=0.1.0", path = "tools/ternary" }
 bonsai-gguf = { version = "=0.1.0", path = "tools/gguf", default-features = false }
 bonsai-prism = { version = "=0.1.1", path = "tools/prism" }

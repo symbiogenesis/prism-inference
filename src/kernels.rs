@@ -23,6 +23,8 @@ mod iqfit;
 mod iquants;
 mod kquants;
 mod legacy;
+mod parallel_rows;
+pub use parallel_rows::{MAX_ROW_WORKERS, RowParallelism};
 pub(crate) mod pinned_activations;
 pub(crate) mod pinned_attention;
 pub(crate) mod pinned_convolution;
@@ -1170,6 +1172,8 @@ pub struct MatvecScratch {
     diagnostics: MatvecDiagnostics,
     statistics: MatvecStatistics,
     pinned_accumulation: bool,
+    row_parallelism: RowParallelism,
+    row_errors: Vec<Option<crate::Error>>,
     #[cfg(test)]
     preparations: usize,
 }
@@ -1320,6 +1324,8 @@ impl MatvecDiagnostics {
 /// or performance. Counters saturate at [`u64::MAX`] and retain no input data.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MatvecStatistics {
+    /// Packed matrix attempts using the explicit persistent row-worker pool.
+    pub parallel_row_operations: u64,
     /// Activation preparations attempted, including unused prepared guards.
     pub preparations: u64,
     /// Preparations rejected before a matrix could be attempted.
@@ -1393,6 +1399,8 @@ impl Default for MatvecScratch {
             diagnostics: MatvecDiagnostics::new(MatvecBackend::Auto),
             statistics: MatvecStatistics::default(),
             pinned_accumulation: false,
+            row_parallelism: RowParallelism::default(),
+            row_errors: Vec::new(),
             #[cfg(test)]
             preparations: 0,
         }
@@ -1400,6 +1408,19 @@ impl Default for MatvecScratch {
 }
 
 impl MatvecScratch {
+    /// Changes only row scheduling, preserving prepared arithmetic and storage.
+    /// Existing callers remain serial until explicitly configured.
+    pub fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+        self.row_errors.clear();
+        self.row_parallelism = parallelism;
+    }
+
+    /// Explicit persistent row-worker budget; small/floating operations stay serial.
+    #[must_use]
+    pub const fn row_workers(&self) -> usize {
+        self.row_parallelism.workers()
+    }
+
     /// Prepares one exact activation vector for compatible sibling projections.
     ///
     /// Quantization or floating activation rounding occurs once. Compatibility
@@ -1684,15 +1705,31 @@ impl PreparedMatvec<'_> {
             }
             PQ2 if columns.is_multiple_of(256) => {
                 let dot = scratch.select_pq2();
-                for bytes in tensor.data.chunks_exact(row_bytes) {
-                    output.push(dot(bytes, &scratch.q8k)?);
+                if scratch.row_parallelism.uses_pool(rows) {
+                    scratch.statistics.parallel_row_operations =
+                        scratch.statistics.parallel_row_operations.saturating_add(1);
                 }
+                scratch.row_parallelism.fill(
+                    &tensor.data,
+                    row_bytes,
+                    output,
+                    &mut scratch.row_errors,
+                    |bytes| dot(bytes, &scratch.q8k),
+                )?;
             }
             PQ2 | PTQ1 => {
                 let dot = scratch.select_q8_groups();
-                for bytes in tensor.data.chunks_exact(row_bytes) {
-                    output.push(dot(tensor.kind, bytes, &scratch.q8)?);
+                if scratch.row_parallelism.uses_pool(rows) {
+                    scratch.statistics.parallel_row_operations =
+                        scratch.statistics.parallel_row_operations.saturating_add(1);
                 }
+                scratch.row_parallelism.fill(
+                    &tensor.data,
+                    row_bytes,
+                    output,
+                    &mut scratch.row_errors,
+                    |bytes| dot(tensor.kind, bytes, &scratch.q8),
+                )?;
             }
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);

@@ -26,9 +26,13 @@ Default features are `cli` (JSON token driver) and `experimental-neon`.
 | Cargo feature selection | Result |
 | --- | --- |
 | Defaults | Token driver/library with eligible NEON selection |
+| `--features parallel-rows` | Opt-in persistent packed-row pool; trusted worker count still defaults to one |
 | `--no-default-features --features experimental-neon --lib` | NEON-enabled library without JSON driver |
 | `--no-default-features --lib` | Scalar-only library |
 | `--no-default-features --features cli` | Scalar-only token driver |
+
+See [explicit row workers](parallel-rows.md) for worker budgets, unchanged row
+arithmetic, CLI/service configuration and qualification limits.
 
 ## Build a checkout
 

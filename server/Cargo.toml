@@ -10,6 +10,9 @@ description = "Bounded private HTTP server for Prism CPU inference"
 keywords = ["inference", "prism", "gguf"]
 categories = ["science"]
 
+[features]
+parallel-rows = ["bonsai-prism-runtime/parallel-rows"]
+
 
 [dependencies]
 bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.6" }

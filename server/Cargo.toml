@@ -1,9 +1,10 @@
 [package]
 name = "prism-inference-server"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.101"
-publish = ["crates-io"]
+# Exact Git dependency below is retained for GitHub binaries/source checkouts.
+publish = false
 license = "Apache-2.0"
 repository = "https://github.com/symbiogenesis/prism-inference"
 description = "Bounded private HTTP server for Prism CPU inference"
@@ -15,7 +16,7 @@ parallel-rows = ["bonsai-prism-runtime/parallel-rows"]
 
 
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.7" }
+bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.8" }
 http = "=1.5.0"
 httparse = "=1.10.1"
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -25,7 +26,7 @@ tokio = { version = "=1.54.1", features = ["io-util", "net", "rt", "sync", "time
 
 [target.'cfg(windows)'.dependencies]
 bonsai-windows-process = "=0.1.0"
-bonsai-windows-credentials = "=0.1.0"
+bonsai-windows-credentials = { git = "https://github.com/symbiogenesis/SwiftBonsai2Runner", rev = "abe04b4a8eff18388af96f0e75c8a8d180b81989" }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["test-util"] }

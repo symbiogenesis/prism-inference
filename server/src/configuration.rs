@@ -6,11 +6,7 @@
 #[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(windows)]
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read},
-    path::Path,
-};
+use std::{io, path::Path};
 
 /// Available physical memory required for the fixed 12 GiB Swift process limit
 /// plus the separate 4 GiB host reserve. The launcher enforces the Job limit.
@@ -48,33 +44,35 @@ fn invalid() -> io::Error {
 }
 
 #[cfg(windows)]
-pub(super) fn read_key(path: &Path) -> io::Result<(File, String)> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)?;
-        if metadata.file_type().is_symlink()
-            || metadata.file_attributes() & 0x400 != 0
-            || (ancestor == path && !metadata.is_file())
-            || (ancestor != path && !metadata.is_dir())
-        {
-            return Err(invalid());
-        }
+pub(super) fn read_key(
+    path: &Path,
+) -> io::Result<(bonsai_windows_credentials::RetainedCredential, String)> {
+    let credential = bonsai_windows_credentials::RetainedCredential::open(path)?;
+    let key = credential.as_hex().to_owned();
+    Ok((credential, key))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_key_retains_the_verified_private_reader_and_rejects_invalid_files() -> io::Result<()> {
+        let credentials =
+            bonsai_windows_credentials::PrivateCredentials::create(&std::env::temp_dir())?;
+        let (_reader, key) = read_key(credentials.backend_path())?;
+        // Equality failures must not print either credential.
+        assert!(key.bytes().eq(credentials.backend_key().bytes()));
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(credentials.backend_path())
+                .is_err()
+        );
+        let invalid = credentials.directory().join("empty.key");
+        std::fs::write(&invalid, [])?;
+        assert!(read_key(&invalid).is_err());
+        assert!(read_key(credentials.directory()).is_err());
+        Ok(())
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .share_mode(1)
-        .custom_flags(0x0020_0000)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 || metadata.len() != 64 {
-        return Err(invalid());
-    }
-    let mut bytes = [0; 64];
-    file.read_exact(&mut bytes)?;
-    let mut surplus = [0];
-    if file.read(&mut surplus)? != 0 || !valid_key(&bytes) {
-        return Err(invalid());
-    }
-    let key = String::from_utf8(bytes.to_vec()).map_err(|_| invalid())?;
-    Ok((file, key))
 }

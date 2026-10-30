@@ -7,9 +7,12 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     swift_session::SwiftSession,
 };
-use bonsai_windows_credentials::validate_external_path;
+use bonsai_windows_credentials::validate_read_path;
 
-use crate::service::bound_loopback_socket;
+use crate::{
+    service::bound_loopback_socket,
+    startup::{self, Stage},
+};
 
 struct Config {
     model: PathBuf,
@@ -104,7 +107,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         .into_iter()
         .chain(config.adapter.as_ref())
     {
-        validate_external_path(path).map_err(|_| invalid())?;
+        validate_read_path(path)?;
     }
     Ok(config)
 }
@@ -119,18 +122,22 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
 /// Rejects arguments, environment overrides, low startup memory, key access,
 /// verified model loading, listener setup and backend lifecycle failures.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
-    let config = parse(arguments)?;
+    let config = parse(arguments).map_err(|error| startup::at(Stage::Arguments, &error))?;
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
-        .map_err(|_| invalid())?;
-    if bonsai_windows_process::available_memory_bytes()?
+        .map_err(|error| startup::at(Stage::Environment, &error))?;
+    if bonsai_windows_process::available_memory_bytes()
+        .map_err(|error| startup::at(Stage::Memory, &error))?
         < crate::configuration::REQUIRED_AVAILABLE_BYTES
     {
-        return Err(io::Error::other(
-            "native Swift startup memory admission rejected",
+        return Err(startup::at(
+            Stage::Memory,
+            &io::Error::other("native Swift startup memory admission rejected"),
         ));
     }
-    let (_key_guard, key) = crate::configuration::read_key(&config.key).map_err(|_| invalid())?;
-    let parallelism = RowParallelism::new(config.row_workers).map_err(|_| invalid())?;
+    let (_key_guard, key) = crate::configuration::read_key(&config.key)
+        .map_err(|error| startup::at(Stage::Key, &error))?;
+    let parallelism = RowParallelism::new(config.row_workers)
+        .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
     let session = SwiftSession::load_profile_with_row_parallelism(
         &config.model,
         config.representation,
@@ -139,21 +146,70 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         config.seed,
         parallelism,
     )
-    .map_err(|_| io::Error::other("verified native Swift loading failed"))?;
+    .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(|error| startup::at(Stage::Runtime, &error))?;
     runtime.block_on(async {
-        let listener = bound_loopback_socket(config.port)?.listen(1)?;
+        let listener = bound_loopback_socket(config.port)
+            .and_then(|socket| socket.listen(1))
+            .map_err(|error| startup::at(Stage::Listener, &error))?;
         crate::native_backend::serve(listener, session, key)
             .await
-            .map_err(|_| io::Error::other("native Swift backend admission closed"))
+            .map_err(|_| {
+                startup::at(
+                    Stage::Backend,
+                    &io::Error::other("native Swift backend admission closed"),
+                )
+            })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn files() -> io::Result<(bonsai_windows_credentials::PrivateDirectory, [OsString; 3])> {
+        let directory =
+            bonsai_windows_credentials::PrivateDirectory::create(&std::env::temp_dir())?;
+        let paths =
+            ["model.gguf", "backend.key", "adapter.gguf"].map(|name| directory.path().join(name));
+        for path in &paths {
+            std::fs::write(path, [])?;
+        }
+        Ok((directory, paths.map(PathBuf::into_os_string)))
+    }
+
+    #[test]
+    fn native_startup_rejects_missing_paths_without_loading_or_leaking_values() -> io::Result<()> {
+        let (directory, [_model, key, _adapter]) = files()?;
+        let arguments = [
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            directory
+                .path()
+                .join("PRIVATE_MISSING_MODEL.gguf")
+                .into_os_string(),
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        let error = run(arguments)
+            .err()
+            .ok_or_else(|| io::Error::other("missing file was accepted"))?;
+        let mut output = Vec::new();
+        startup::write_failure(&mut output, &error)?;
+        let output = String::from_utf8(output).map_err(io::Error::other)?;
+        assert!(output.starts_with(
+            "private-inference-startup-failed stage=arguments errorKind=NotFound osCode="
+        ));
+        assert!(!output.contains("PRIVATE_MISSING_MODEL"));
+        Ok(())
+    }
 
     #[test]
     fn native_child_rejects_unknown_duplicate_relative_and_unbounded_options() -> io::Result<()> {
@@ -169,13 +225,10 @@ mod tests {
             "42",
         ]
         .map(OsString::from);
+        let (_directory, [model, key, _adapter]) = files()?;
         let mut good = good;
-        good[2] = std::env::temp_dir()
-            .join("native-model.gguf")
-            .into_os_string();
-        good[6] = std::env::temp_dir()
-            .join("native-backend.key")
-            .into_os_string();
+        good[2] = model;
+        good[6] = key;
         assert!(parse(good.clone()).is_ok());
         assert_eq!(parse(good.clone())?.row_workers, 1);
         for value in ["0", "17", "invalid"] {
@@ -212,15 +265,7 @@ mod tests {
     #[test]
     fn native_child_selects_ptq1_and_approved_adapter_only_with_explicit_options() -> io::Result<()>
     {
-        let model = std::env::temp_dir()
-            .join("native-model.gguf")
-            .into_os_string();
-        let key = std::env::temp_dir()
-            .join("native-backend.key")
-            .into_os_string();
-        let adapter = std::env::temp_dir()
-            .join("approved-adapter.gguf")
-            .into_os_string();
+        let (directory, [model, key, adapter]) = files()?;
         let base = vec![
             OsString::from("--native-engine-child"),
             "--model".into(),
@@ -235,6 +280,12 @@ mod tests {
         let default = parse(base.clone())?;
         assert_eq!(default.representation, Representation::Pq2);
         assert!(default.adapter.is_none());
+        let mut missing = base.clone();
+        missing[2] = directory.path().join("missing.gguf").into_os_string();
+        assert!(parse(missing).is_err());
+        let mut nonregular = base.clone();
+        nonregular[2] = directory.path().as_os_str().to_owned();
+        assert!(parse(nonregular).is_err());
         for repacked in [false, true] {
             let mut selected = base.clone();
             if repacked {

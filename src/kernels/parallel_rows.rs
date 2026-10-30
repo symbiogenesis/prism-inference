@@ -38,42 +38,45 @@ mod tests {
 
     #[test]
     fn pinned_parallel_rows_preserve_both_activation_contracts() -> Result<()> {
-        let policy = RowParallelism::new(2)?;
-        for (kind, columns) in [(142, 5120), (142, 384), (143, 6144)] {
-            let mut block = [0x66_u8; 34];
-            block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
-            let encoded = if kind == 143 {
-                pack_ptq(&block)?.to_vec()
-            } else {
-                block.to_vec()
-            };
-            let tensor = Tensor {
-                name: "pinned-row-control".into(),
-                dimensions: vec![columns, 7],
-                kind,
-                data: Arc::from(encoded.repeat(columns / 128 * 7)),
-            };
-            let input: Vec<_> = (0..columns)
-                .map(|index| [1.5, -127.0, 0.0, -0.0, 63.5][index % 5])
-                .collect();
-            for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
-                let mut serial = MatvecScratch::with_pinned_backend(backend);
-                let mut parallel = MatvecScratch::with_pinned_backend(backend);
-                parallel.set_row_parallelism(policy.clone());
-                let (mut expected, mut actual) = (Vec::new(), Vec::new());
-                matvec_into(&tensor, &input, &mut expected, &mut serial)?;
-                matvec_into(&tensor, &input, &mut actual, &mut parallel)?;
-                assert_eq!(
-                    actual
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    expected
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>()
-                );
-                assert_eq!(parallel.statistics().parallel_row_operations, 1);
+        for workers in [2, 4] {
+            let policy = RowParallelism::new(workers)?;
+            for (kind, columns) in [(142, 5120), (142, 384), (143, 6144)] {
+                let mut block = [0x66_u8; 34];
+                block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                let encoded = if kind == 143 {
+                    pack_ptq(&block)?.to_vec()
+                } else {
+                    block.to_vec()
+                };
+                let tensor = Tensor {
+                    name: "pinned-row-control".into(),
+                    dimensions: vec![columns, 7],
+                    kind,
+                    data: Arc::from(encoded.repeat(columns / 128 * 7)),
+                };
+                let input: Vec<_> = (0..columns)
+                    .map(|index| [1.5, -127.0, 0.0, -0.0, 63.5][index % 5])
+                    .collect();
+                for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                    let mut serial = MatvecScratch::with_pinned_backend(backend);
+                    let mut parallel = MatvecScratch::with_pinned_backend(backend);
+                    parallel.set_row_parallelism(policy.clone());
+                    let (mut expected, mut actual) = (Vec::new(), Vec::new());
+                    matvec_into(&tensor, &input, &mut expected, &mut serial)?;
+                    matvec_into(&tensor, &input, &mut actual, &mut parallel)?;
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(parallel.statistics().parallel_row_operations, 1);
+                    assert_eq!(parallel.row_workers(), workers);
+                }
             }
         }
         Ok(())

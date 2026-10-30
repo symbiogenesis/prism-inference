@@ -805,34 +805,47 @@ fn assert_backend_state_parity(
     let row_workers = selected.row_workers();
     assert_eq!(scalar.requested_backend(), MatvecBackend::Scalar);
     assert_eq!(selected.requested_backend(), request);
+    assert_eq!(selected.identity(), scalar.identity());
     for token in [0, 1, 0] {
         assert_eq!(
             bits(selected.evaluate(token)?),
             bits(scalar.evaluate(token)?)
         );
+        assert_eq!(graph_bits(&selected)?, graph_bits(&scalar)?);
     }
     let scalar_checkpoint = scalar.checkpoint()?;
     let selected_checkpoint = selected.checkpoint()?;
     assert_eq!(selected.checkpoint_bytes(), scalar.checkpoint_bytes());
     let expected = bits(scalar.evaluate(1)?);
+    let expected_state = graph_bits(&scalar)?;
     assert_eq!(bits(selected.evaluate(1)?), expected);
+    assert_eq!(graph_bits(&selected)?, expected_state);
     selected.ingest(0)?;
     scalar.ingest(0)?;
+    assert_eq!(graph_bits(&selected)?, graph_bits(&scalar)?);
     selected.restore(&selected_checkpoint)?;
     scalar.restore(&scalar_checkpoint)?;
+    assert_eq!(graph_bits(&selected)?, graph_bits(&scalar)?);
     assert_eq!(bits(selected.evaluate(1)?), expected);
     assert_eq!(bits(scalar.evaluate(1)?), expected);
+    assert_eq!(graph_bits(&selected)?, expected_state);
+    assert_eq!(graph_bits(&scalar)?, expected_state);
     let mut rejected = vec![f32::NAN];
     assert!(selected.evaluate_into(2, &mut rejected).is_err());
     assert_eq!(rejected, Vec::<f32>::new());
+    assert_eq!(graph_bits(&selected)?, expected_state);
     assert_eq!(bits(selected.evaluate(0)?), bits(scalar.evaluate(0)?));
+    assert_eq!(graph_bits(&selected)?, graph_bits(&scalar)?);
     selected.reset()?;
     scalar.reset()?;
+    assert_eq!(graph_bits(&selected)?, graph_bits(&scalar)?);
     assert_eq!(selected.requested_backend(), request);
     assert_eq!(bits(selected.evaluate(1)?), bits(scalar.evaluate(1)?));
+    assert_eq!(graph_bits(&selected)?, graph_bits(&scalar)?);
     // Reset and scratch reuse must not mutate either decoder's owned prefix.
     selected.restore(&selected_checkpoint)?;
     assert_eq!(bits(selected.evaluate(1)?), expected);
+    assert_eq!(graph_bits(&selected)?, expected_state);
     assert_eq!(selected.requested_backend(), request);
     assert_eq!(selected.row_workers(), row_workers);
     Ok(())
@@ -875,26 +888,28 @@ fn graph_backend_selection_matches_scalar_logits_checkpoints_and_recovery() -> R
 fn graph_parallel_rows_preserve_logits_checkpoints_and_recovery() -> Result<()> {
     use bonsai_prism_runtime::kernels::RowParallelism;
 
-    let policy = RowParallelism::new(2)?;
-    for recurrent in [false, true] {
-        for (kind, width) in [(142, 128), (142, 256), (143, 128)] {
-            let serial = Qwen35::with_backend(
-                backend_fixture(recurrent, kind, width)?,
-                16,
-                MatvecBackend::Scalar,
-            )?;
-            let mut parallel = Qwen35::with_backend(
-                backend_fixture(recurrent, kind, width)?,
-                16,
-                MatvecBackend::Auto,
-            )?;
-            parallel.set_row_parallelism(policy.clone());
-            assert_eq!(parallel.row_workers(), 2);
-            parallel.ingest(0)?;
-            assert!(parallel.backend_statistics().parallel_row_operations > 0);
-            parallel.reset()?;
-            assert_eq!(parallel.row_workers(), 2);
-            assert_backend_state_parity(serial, parallel, MatvecBackend::Auto)?;
+    for workers in [2, 4] {
+        let policy = RowParallelism::new(workers)?;
+        for recurrent in [false, true] {
+            for (kind, width) in [(142, 128), (142, 256), (143, 128)] {
+                let serial = Qwen35::with_backend(
+                    backend_fixture(recurrent, kind, width)?,
+                    16,
+                    MatvecBackend::Scalar,
+                )?;
+                let mut parallel = Qwen35::with_backend(
+                    backend_fixture(recurrent, kind, width)?,
+                    16,
+                    MatvecBackend::Auto,
+                )?;
+                parallel.set_row_parallelism(policy.clone());
+                assert_eq!(parallel.row_workers(), workers);
+                parallel.ingest(0)?;
+                assert!(parallel.backend_statistics().parallel_row_operations > 0);
+                parallel.reset()?;
+                assert_eq!(parallel.row_workers(), workers);
+                assert_backend_state_parity(serial, parallel, MatvecBackend::Auto)?;
+            }
         }
     }
     Ok(())

@@ -2817,3 +2817,141 @@ fn native_driver_rejects_text_vocabulary_mismatch_before_emitting() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn rank_one_scale_reset_clears_live_state_and_invalidates_same_scale_and_change_back_checkpoints()
+-> Result<()> {
+    for recurrent in [false, true] {
+        let target = if recurrent {
+            "blk.0.ssm_out.weight"
+        } else {
+            "blk.0.attn_output.weight"
+        };
+        let base = fixture(recurrent);
+        let factors = rank_one_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
+        let mut graph = rank_one_graph(base, factors, 1.3)?;
+        graph.evaluate(0)?;
+        let first = graph.checkpoint()?;
+        for scale in [1.3, 0.0, -0.0, 2.0, 1.3] {
+            let previous = graph.checkpoint()?;
+            graph.reset_with_adapter_scale(scale)?;
+            assert_eq!(
+                graph.adapter_scale().map(f32::to_bits),
+                Some(scale.to_bits())
+            );
+            assert!(graph.restore(&previous).is_err());
+            assert!(graph.restore(&first).is_err());
+            assert!(graph_bits(&graph)?.iter().all(|bits| *bits == 0));
+            let base = fixture(recurrent);
+            let factors = rank_one_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
+            let mut fresh = rank_one_graph(base, factors, scale)?;
+            assert_eq!(graph.identity(), fresh.identity());
+            assert_eq!(graph.evaluate(1)?, fresh.evaluate(1)?);
+            assert_eq!(graph_bits(&graph)?, graph_bits(&fresh)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rank_one_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_rollback()
+-> Result<()> {
+    let base = fixture(true);
+    let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+    let mut runtime = Runtime::new(
+        rank_one_graph(base, factors, 1.3)?,
+        Limits {
+            context_tokens: 16,
+            checkpoints: 2,
+            checkpoint_bytes: 1024 * 1024,
+        },
+    )?;
+    let options = Generation {
+        max_tokens: 1,
+        stop_tokens: vec![],
+    };
+    runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
+    assert_ne!(runtime.tokens(), []);
+    assert_eq!(runtime.checkpoint_count(), 1);
+    runtime.reset_with_adapter_scale(0.0)?;
+    assert_eq!(runtime.tokens(), []);
+    assert_eq!(runtime.checkpoint_count(), 0);
+    let empty = graph_bits(runtime.decoder())?;
+    let cancelled = Cancellation::default();
+    cancelled.cancel();
+    assert!(
+        runtime
+            .generate(&[1], &options, &cancelled, |_| Err("must not emit".into()))
+            .is_err()
+    );
+    assert_eq!(graph_bits(runtime.decoder())?, empty);
+    assert!(
+        runtime
+            .generate(&[1], &options, &Cancellation::default(), |_| Err(
+                "failed delivery".into()
+            ))
+            .is_err()
+    );
+    assert_eq!(graph_bits(runtime.decoder())?, empty);
+    assert_eq!(runtime.tokens(), []);
+    assert!(!runtime.is_faulted());
+    let completion = runtime.generate(&[1], &options, &Cancellation::default(), |_| Ok(()))?;
+    assert_eq!(completion.reused_tokens, 0);
+    assert_eq!(runtime.decoder().adapter_scale(), Some(0.0));
+    Ok(())
+}
+
+#[test]
+fn rank_one_invalid_scale_or_absent_adapter_rejects_before_mutation() -> Result<()> {
+    let base = fixture(true);
+    let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+    let mut graph = rank_one_graph(base, factors, 1.3)?;
+    graph.evaluate(0)?;
+    let before = graph_bits(&graph)?;
+    let identity = graph.identity().to_owned();
+    let checkpoint = graph.checkpoint()?;
+    for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 2.01] {
+        assert!(graph.reset_with_adapter_scale(scale).is_err());
+        assert_eq!(graph.identity(), identity);
+        assert_eq!(graph_bits(&graph)?, before);
+        graph.restore(&checkpoint)?;
+    }
+    for adapter in [false, true] {
+        let base = fixture(true);
+        let graph = if adapter {
+            let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+            rank_one_graph(base, factors, 1.3)?
+        } else {
+            Qwen35::new(base, 16)?
+        };
+        let mut runtime = Runtime::new(
+            graph,
+            Limits {
+                context_tokens: 16,
+                checkpoints: 1,
+                checkpoint_bytes: 1024 * 1024,
+            },
+        )?;
+        runtime.generate(
+            &[0],
+            &Generation {
+                max_tokens: 1,
+                stop_tokens: vec![],
+            },
+            &Cancellation::default(),
+            |_| Ok(()),
+        )?;
+        let tokens = runtime.tokens().to_vec();
+        let bits = graph_bits(runtime.decoder())?;
+        assert!(
+            runtime
+                .reset_with_adapter_scale(if adapter { f32::NAN } else { 0.0 })
+                .is_err()
+        );
+        assert_eq!(runtime.tokens(), tokens);
+        assert_eq!(graph_bits(runtime.decoder())?, bits);
+        assert_eq!(runtime.checkpoint_count(), 1);
+        assert!(!runtime.is_faulted());
+    }
+    Ok(())
+}

@@ -914,9 +914,10 @@ impl Qwen35 {
     /// Base projections retain their existing transforms; corrections receive
     /// the original activations. Embedding corrections are added after inverse
     /// transformation. Scale zero bypasses all correction arithmetic exactly.
-    /// Adapter identity and scale bits are sealed into the graph identity and
-    /// cannot change while conversation checkpoints exist. The private Swift
-    /// HTTP service continues to reject adapters until separate qualification.
+    /// Adapter identity and scale bits are sealed into the graph identity.
+    /// [`Self::reset_with_adapter_scale`] changes scale only after clearing state
+    /// and invalidates every previously created checkpoint. Service/default
+    /// qualification remains independent of this explicit graph support.
     ///
     /// # Errors
     /// Rejects a different base identity, unsupported/non-live targets, scales
@@ -963,6 +964,52 @@ impl Qwen35 {
         graph.adapter = Some(adapter);
         graph.adapter_scale = scale;
         Ok(graph)
+    }
+
+    /// Current rank-one correction scale, or `None` when no adapter is loaded.
+    #[must_use]
+    pub const fn adapter_scale(&self) -> Option<f32> {
+        if self.adapter.is_some() {
+            Some(self.adapter_scale)
+        } else {
+            None
+        }
+    }
+
+    /// Clear all live state and establish a fresh rank-one scale identity.
+    ///
+    /// Immutable weights and factors remain shared. Every successful call renews
+    /// checkpoint provenance, including the same scale and changes back to a
+    /// previous scale, so old checkpoints can never restore across this boundary.
+    /// Invalid scale or allocation failure leaves the previous graph unchanged.
+    ///
+    /// # Errors
+    /// Rejects a graph without an adapter, scales outside finite 0..2, malformed
+    /// graph identity and allocation failure while preparing the new identity.
+    pub fn reset_with_adapter_scale(&mut self, scale: f32) -> Result<()> {
+        RankOneAdapter::validate_scale(scale)?;
+        let adapter = self
+            .adapter
+            .as_ref()
+            .ok_or_else(|| invalid("adapter scale requires a loaded rank-one adapter"))?;
+        let (base_identity, _) = self
+            .identity
+            .rsplit_once(":rank-one-lora-v1:")
+            .ok_or_else(|| invalid("rank-one graph identity is missing its adapter contract"))?;
+        let mut identity = String::new();
+        identity.try_reserve_exact(base_identity.len() + adapter.identity().len() + 32)?;
+        write!(
+            identity,
+            "{base_identity}:rank-one-lora-v1:{}:{:08x}",
+            adapter.identity(),
+            scale.to_bits()
+        )?;
+        let provenance = Arc::new(());
+        self.reset()?;
+        self.identity = identity;
+        self.adapter_scale = scale;
+        self.provenance = provenance;
+        Ok(())
     }
 
     /// Creates a decoder within an explicit maximum live-state payload budget.

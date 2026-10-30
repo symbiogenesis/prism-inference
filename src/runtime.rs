@@ -124,6 +124,32 @@ pub struct Runtime<D: Decoder> {
     faulted: bool,
 }
 
+impl Runtime<crate::graph::Qwen35> {
+    /// Clear complete conversation state before changing a loaded adapter scale.
+    ///
+    /// This narrow operation exposes no mutable decoder access. All committed
+    /// tokens, logits and saved prefixes are discarded only after the decoder
+    /// renews its empty-state identity and checkpoint provenance. Sampler state
+    /// remains caller-owned and is not changed by this operation.
+    ///
+    /// # Errors
+    /// Invalid/nonfinite scales and graphs without an adapter reject before any
+    /// mutation. Later failure closes admission until successful explicit reset.
+    pub fn reset_with_adapter_scale(&mut self, scale: f32) -> Result<()> {
+        crate::model::lora::RankOneAdapter::validate_scale(scale)?;
+        if self.decoder.adapter_scale().is_none() {
+            return Err(invalid("adapter scale requires a loaded rank-one adapter"));
+        }
+        self.faulted = true;
+        self.decoder.reset_with_adapter_scale(scale)?;
+        self.checkpoints.clear();
+        self.tokens.clear();
+        self.logits.clear();
+        self.faulted = false;
+        Ok(())
+    }
+}
+
 impl<D: Decoder> Runtime<D> {
     /// Establish an empty conversation and validate all fixed ownership bounds.
     ///

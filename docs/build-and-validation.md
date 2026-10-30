@@ -193,7 +193,11 @@ A comparison between representations therefore has a separate quality decision;
 do not loosen the trusted same-format correctness tolerance to make it pass.
 
 The source graph implements an explicit [rank-one adapter correctness path](rank-one-adapter.md);
-the service and workers still reject adapters. An approved LoRA's
+the offline checker accepts `--rank-one-adapter <absolute-approved-adapter> <scale>`
+after the optional `--use-repacked-ptq1` prefix for `load`, `forward` and
+`trajectory`. Both base selection and approved adapter verification remain exact;
+the existing PQ2 constructor defaults do not admit the export implicitly.
+The service and workers still reject adapters. An approved LoRA's
 load-at-zero logits identity, nonzero correction and Swift grouped-SSM input
 ordering must be verified at native residual writers before adapter qualification.
 Neither a successful PTQ1 load nor changed generated text settles the adapter's

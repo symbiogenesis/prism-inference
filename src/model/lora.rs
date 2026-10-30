@@ -73,9 +73,27 @@ impl RankOneAdapter {
     /// Rejects identity/metadata/shape drift, nonfinite payloads, missing/extra
     /// factors, allocation failures and non-PQ2 base identity.
     pub fn load_swift(path: &Path, base: &Model) -> Result<Self> {
-        if base.identity != super::swift::MODEL_SHA256 {
+        Self::load_swift_representation(path, base, super::swift::Representation::Pq2)
+    }
+
+    /// Loads the approved adapter for one explicitly selected current Swift artifact.
+    ///
+    /// PQ2 and its exact current-weight PTQ1 export use the same factor inventory
+    /// and original activation basis. This checks the selected base identity;
+    /// callers must obtain its executable weights through the strict Swift loader.
+    /// The older published PTQ1 checkpoint is never substituted for this export.
+    ///
+    /// # Errors
+    /// Rejects a base identity outside the selected representation and the same
+    /// artifact, inventory, shape and resource errors as [`Self::load_swift`].
+    pub fn load_swift_representation(
+        path: &Path,
+        base: &Model,
+        representation: super::swift::Representation,
+    ) -> Result<Self> {
+        if base.identity != representation.model_sha256() {
             return Err(invalid(
-                "approved Swift adapter requires the exact PQ2 base",
+                "approved Swift adapter requires the exact selected current-weight base",
             ));
         }
         let mut model = Model::load(
@@ -330,6 +348,7 @@ mod tests {
 
     use super::{Model, RankOneAdapter, Result, Scratch, Tensor};
     use crate::kernels::MatvecBackend;
+    use crate::model::swift::Representation;
 
     fn tensor(name: &str, values: &[f32]) -> Tensor {
         Tensor {
@@ -375,6 +394,52 @@ mod tests {
             ]),
         };
         RankOneAdapter::from_model(factors, &base)
+    }
+
+    #[test]
+    fn rank_one_selected_current_weight_base_keeps_default_and_adapter_verification_strict()
+    -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "PrismAdapterIdentity-{}-{nonce}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"unapproved adapter bytes")?;
+        let mut base = Model {
+            identity: String::new(),
+            metadata: BTreeMap::new(),
+            tensors: BTreeMap::new(),
+        };
+        for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
+            base.identity = representation.model_sha256().into();
+            let error = RankOneAdapter::load_swift_representation(&path, &base, representation)
+                .err()
+                .ok_or("unapproved adapter was admitted")?;
+            assert!(error.to_string().contains("artifact size mismatch"));
+            let other = if representation == Representation::Pq2 {
+                Representation::CurrentRepackedPtq1
+            } else {
+                Representation::Pq2
+            };
+            let error = RankOneAdapter::load_swift_representation(&path, &base, other)
+                .err()
+                .ok_or("mismatched base representation was admitted")?;
+            assert!(error.to_string().contains("selected current-weight base"));
+        }
+        assert!(RankOneAdapter::load_swift(&path, &base).is_err());
+        base.identity = "older-published-PTQ1-checkpoint".into();
+        assert!(
+            RankOneAdapter::load_swift_representation(
+                &path,
+                &base,
+                Representation::CurrentRepackedPtq1
+            )
+            .is_err()
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]

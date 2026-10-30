@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::chat::ChatTemplate;
+use crate::model::swift::Representation;
 use crate::model::{Model, ModelMetadata};
 use crate::special_input::SpecialInputPolicy;
 use crate::special_tokens::SpecialTokens;
@@ -20,8 +21,6 @@ use crate::tokenization::{
 };
 use crate::{Result, invalid};
 
-const MODEL_BYTES: u64 = 7_206_168_928;
-const MODEL_SHA256: &str = "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5";
 const TEMPLATE_SHA256: &str = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 const VOCAB_SIZE: usize = 248_320;
 // Pinned Prism 73bfe6c llama_vocab_is_eog, including vocabulary-inferred stops.
@@ -67,8 +66,29 @@ impl SwiftChatSession {
     /// Rejects identity, template, tokenizer, special declarations, resource
     /// bounds, malformed input, allocation failures and file I/O errors.
     pub fn load(path: &Path, memory_limit: usize) -> Result<Self> {
-        let model = ModelMetadata::load(path, MODEL_BYTES, MODEL_SHA256, memory_limit)?;
-        Self::from_metadata(&model)
+        Self::load_representation(path, memory_limit, Representation::Pq2)
+    }
+
+    /// Verify the explicitly selected current-weight artifact and prepare chat.
+    ///
+    /// This uses its exact complete-file length and SHA-256, retaining the same
+    /// tokenizer, template and resource checks as the PQ2 default. It admits no
+    /// older PTQ1 checkpoint and does not establish inference qualification.
+    ///
+    /// # Errors
+    /// Returns the same verification and metadata errors as [`Self::load`].
+    pub fn load_representation(
+        path: &Path,
+        memory_limit: usize,
+        representation: Representation,
+    ) -> Result<Self> {
+        let model = ModelMetadata::load(
+            path,
+            representation.model_bytes(),
+            representation.model_sha256(),
+            memory_limit,
+        )?;
+        Self::from_metadata_representation(&model, representation)
     }
 
     /// Prepare from metadata already obtained through verified artifact loading.
@@ -81,7 +101,27 @@ impl SwiftChatSession {
     /// Rejects a foreign identity, malformed metadata, unsupported tokenizer or
     /// template, incorrect special declarations and resource/allocation errors.
     pub fn from_metadata(model: &ModelMetadata) -> Result<Self> {
-        Self::from_parts(&model.metadata, model.vocab_size, &model.identity)
+        Self::from_metadata_representation(model, Representation::Pq2)
+    }
+
+    /// Prepare chat from already verified metadata for an explicit representation.
+    ///
+    /// The public metadata container does not attest its own provenance. The
+    /// caller owns artifact verification; selected identity, vocabulary and exact
+    /// template checks remain mandatory before tokenizer construction.
+    ///
+    /// # Errors
+    /// Returns the same metadata and resource errors as [`Self::from_metadata`].
+    pub fn from_metadata_representation(
+        model: &ModelMetadata,
+        representation: Representation,
+    ) -> Result<Self> {
+        Self::from_parts(
+            &model.metadata,
+            model.vocab_size,
+            &model.identity,
+            representation,
+        )
     }
 
     /// Reuse the same verified metadata and identity as executable Swift weights.
@@ -92,6 +132,21 @@ impl SwiftChatSession {
     /// Rejects foreign identity, embedding/vocabulary mismatch and the same
     /// template/tokenizer metadata errors as [`Self::from_metadata`].
     pub fn from_model(model: &Model) -> Result<Self> {
+        Self::from_model_representation(model, Representation::Pq2)
+    }
+
+    /// Reuse verified executable metadata for an explicitly selected representation.
+    ///
+    /// This preserves original tokenizer/template bytes and binds the session's
+    /// identity to the selected artifact without reopening or copying weights.
+    /// The caller retains the verification responsibility of [`Self::from_model`].
+    ///
+    /// # Errors
+    /// Returns the same identity, embedding and metadata errors as [`Self::from_model`].
+    pub fn from_model_representation(
+        model: &Model,
+        representation: Representation,
+    ) -> Result<Self> {
         let embedding = model
             .tensors
             .get("token_embd.weight")
@@ -102,11 +157,16 @@ impl SwiftChatSession {
             .copied()
             .filter(|_| embedding.dimensions.len() == 2)
             .ok_or_else(|| invalid("Swift chat requires a rank-two token embedding"))?;
-        Self::from_parts(&model.metadata, vocab_size, &model.identity)
+        Self::from_parts(&model.metadata, vocab_size, &model.identity, representation)
     }
 
-    fn from_parts(metadata: &Metadata, vocab_size: usize, identity: &str) -> Result<Self> {
-        if identity != MODEL_SHA256 || vocab_size != VOCAB_SIZE {
+    fn from_parts(
+        metadata: &Metadata,
+        vocab_size: usize,
+        identity: &str,
+        representation: Representation,
+    ) -> Result<Self> {
+        if identity != representation.model_sha256() || vocab_size != VOCAB_SIZE {
             return Err(invalid(
                 "Swift chat requires the pinned model identity/vocabulary",
             ));

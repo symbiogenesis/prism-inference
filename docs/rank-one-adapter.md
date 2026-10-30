@@ -9,7 +9,11 @@ Runner default, a released-runtime claim or evidence of adapter effectiveness.
 9,682,464-byte length and SHA-256
 `f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42`.
 It requires the original pinned Swift PQ2 base and all 129 rank-one pairs with
-alpha one. PTQ1 remains outside this adapter capture path. The general
+alpha one. `load_swift_representation` admits the exact current-weight PTQ1
+export only when explicitly selected; its base SHA-256 must match the selected
+representation. Both APIs verify the same approved adapter bytes and preserve
+the same factor and basis checks. The older publisher PTQ1 checkpoint rejects.
+The general
 `RankOneAdapter::from_model` constructor admits a bounded explicit subset after
 checking metadata, complete F32 factor pairs, finite payloads and matching base
 shapes; callers of that constructor own artifact authenticity.
@@ -25,7 +29,7 @@ An embedding adapter requires a separate `output.weight`. Graphs whose output
 head reuses `token_embd.weight` reject embedding adapters at every scale,
 including zero: the embedding lookup factors do not implement a tied output
 projection. Such graphs can still admit supported residual-writer adapters.
-The pinned Swift PQ2 model has a separate output head.
+Both pinned current-weight Swift representations have a separate output head.
 
 The [pinned native graph](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-graph.cpp)
 defines the operation stages: base projection, independent A/B products on the
@@ -51,14 +55,16 @@ From a new external native working directory, use the absolute executable path:
 & $qualifier --rank-one-adapter $approvedAdapter 0 forward $originalPq2 $zeroEvidence scalar '248045'
 & $qualifier --rank-one-adapter $approvedAdapter 1.3 forward $originalPq2 $nonzeroEvidence scalar '248045'
 & $qualifier --rank-one-adapter $approvedAdapter 1.3 trajectory $originalPq2 $trajectoryEvidence auto $promptIds 16
+& $qualifier --use-repacked-ptq1 --rank-one-adapter $approvedAdapter 0 forward $currentPtq1 $ptq1ZeroEvidence scalar '248045'
+& $qualifier --use-repacked-ptq1 --rank-one-adapter $approvedAdapter 1.3 forward $currentPtq1 $ptq1NonzeroEvidence neon '248045'
 ```
 
 Every path variable must contain an expanded absolute path; evidence directories must
 already exist and be distinct. The adapter must be the exact approved file.
-`load` also accepts the prefix; `inspect`, PTQ1, relative adapter paths, unresolved
+`load` also accepts the prefix; `inspect`, relative adapter paths, unresolved
 environment tokens and invalid scales reject. The example remains a source
 correctness tool and is not added to release bundles or ordinary service launch.
-It reports adapter hash, target count and scale bits and retains existing
+It reports the selected representation/base hash, adapter hash, target count and scale bits and retains existing
 create-new logits, complete logical KV/recurrent/convolution snapshots, raw
 greedy IDs and evidence-byte bounds. It produces no timing or benchmark verdict.
 No full-model adapter capture was performed as part of the implementation.

@@ -2871,10 +2871,10 @@ fn rank_one_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_ro
         stop_tokens: vec![],
     };
     runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
-    assert_ne!(runtime.tokens(), []);
+    assert_ne!(runtime.tokens(), &[0_u32; 0]);
     assert_eq!(runtime.checkpoint_count(), 1);
     runtime.reset_with_adapter_scale(0.0)?;
-    assert_eq!(runtime.tokens(), []);
+    assert_eq!(runtime.tokens(), &[0_u32; 0]);
     assert_eq!(runtime.checkpoint_count(), 0);
     let empty = graph_bits(runtime.decoder())?;
     let cancelled = Cancellation::default();
@@ -2893,7 +2893,7 @@ fn rank_one_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_ro
             .is_err()
     );
     assert_eq!(graph_bits(runtime.decoder())?, empty);
-    assert_eq!(runtime.tokens(), []);
+    assert_eq!(runtime.tokens(), &[0_u32; 0]);
     assert!(!runtime.is_faulted());
     let completion = runtime.generate(&[1], &options, &Cancellation::default(), |_| Ok(()))?;
     assert_eq!(completion.reused_tokens, 0);

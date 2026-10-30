@@ -802,6 +802,7 @@ fn assert_backend_state_parity(
     request: MatvecBackend,
 ) -> Result<()> {
     let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let row_workers = selected.row_workers();
     assert_eq!(scalar.requested_backend(), MatvecBackend::Scalar);
     assert_eq!(selected.requested_backend(), request);
     for token in [0, 1, 0] {
@@ -833,6 +834,7 @@ fn assert_backend_state_parity(
     selected.restore(&selected_checkpoint)?;
     assert_eq!(bits(selected.evaluate(1)?), expected);
     assert_eq!(selected.requested_backend(), request);
+    assert_eq!(selected.row_workers(), row_workers);
     Ok(())
 }
 
@@ -863,6 +865,36 @@ fn graph_backend_selection_matches_scalar_logits_checkpoints_and_recovery() -> R
                 Qwen35::new(backend_fixture(recurrent, kind, width)?, 16)?,
                 MatvecBackend::Auto,
             )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn graph_parallel_rows_preserve_logits_checkpoints_and_recovery() -> Result<()> {
+    use bonsai_prism_runtime::kernels::RowParallelism;
+
+    let policy = RowParallelism::new(2)?;
+    for recurrent in [false, true] {
+        for (kind, width) in [(142, 128), (142, 256), (143, 128)] {
+            let serial = Qwen35::with_backend(
+                backend_fixture(recurrent, kind, width)?,
+                16,
+                MatvecBackend::Scalar,
+            )?;
+            let mut parallel = Qwen35::with_backend(
+                backend_fixture(recurrent, kind, width)?,
+                16,
+                MatvecBackend::Auto,
+            )?;
+            parallel.set_row_parallelism(policy.clone());
+            assert_eq!(parallel.row_workers(), 2);
+            parallel.ingest(0)?;
+            assert!(parallel.backend_statistics().parallel_row_operations > 0);
+            parallel.reset()?;
+            assert_eq!(parallel.row_workers(), 2);
+            assert_backend_state_parity(serial, parallel, MatvecBackend::Auto)?;
         }
     }
     Ok(())

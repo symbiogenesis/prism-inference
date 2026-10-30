@@ -200,6 +200,14 @@ jobs:
               cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
               cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
+              cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
+            }
+            if ('prism-inference-server' -cin $packages) {
+              cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --all-targets -- -D warnings
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_child::tests::
             }
             if ('bonsai-gguf' -cin $packages) {
               cargo +nightly-2026-10-22 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib

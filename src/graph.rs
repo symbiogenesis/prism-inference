@@ -13,8 +13,8 @@ use bonsai_ternary::half_to_float;
 
 use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place, swiglu_into};
 use crate::kernels::{
-    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, half_bits, rms_norm_into,
-    rms_norm_pinned_into, round_f16, row, row_into, silu, softmax,
+    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism, half_bits,
+    rms_norm_into, rms_norm_pinned_into, round_f16, row, row_into, silu, softmax,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -1325,6 +1325,26 @@ impl Qwen35 {
     #[must_use]
     pub const fn requested_backend(&self) -> MatvecBackend {
         self.workspace.projection.matvec.requested_backend()
+    }
+
+    /// Sets explicit packed-base-projection row scheduling for subsequent tokens.
+    ///
+    /// Weights and prepared Q8 activations remain borrowed and immutable; rows
+    /// keep their exact kernel arithmetic. Other graph work remains serial.
+    /// Reset and checkpoint restoration preserve this resource policy. It does
+    /// not change numerical/state identity or preempt in-flight projections;
+    /// cancellation is still checked between synchronous decoder operations.
+    pub fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+        self.workspace
+            .projection
+            .matvec
+            .set_row_parallelism(parallelism);
+    }
+
+    /// Configured packed-projection row-worker budget, serial by default.
+    #[must_use]
+    pub const fn row_workers(&self) -> usize {
+        self.workspace.projection.matvec.row_workers()
     }
 
     /// Diagnostics for the latest matrix attempt, including provisional work.

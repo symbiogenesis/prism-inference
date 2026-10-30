@@ -584,6 +584,7 @@ dependencies = [
  "bonsai-ternary",
  "fancy-regex",
  "fearless_simd",
+ "rayon",
  "regex",
  "sentencepiece-rs",
  "serde",

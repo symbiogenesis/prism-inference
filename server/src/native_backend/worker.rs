@@ -1,6 +1,6 @@
 //! A single joined model owner and acknowledged one-event output lane.
 
-use super::{NativeBackendError, PendingChat};
+use super::{NativeBackendError, PendingChat, profile::ModelProfile};
 use bonsai_prism_runtime::{
     runtime::{Cancellation, Completion},
     swift_session::{SwiftSession, TextEvent},
@@ -18,6 +18,9 @@ use tokio::sync::{Notify, mpsc as channel};
 
 pub(super) trait Engine: Send + 'static {
     type Prepared: Send;
+    fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
+        Ok(ModelProfile::default())
+    }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError>;
     fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]);
     fn complete(
@@ -32,6 +35,17 @@ pub(super) trait Engine: Send + 'static {
 
 impl Engine for SwiftSession {
     type Prepared = crate::native_swift::NativeChat;
+    fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
+        if self.adapter_identity().is_some_and(|identity| {
+            identity != bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256
+        }) {
+            return Err(NativeBackendError::Configuration);
+        }
+        Ok(ModelProfile {
+            representation: self.representation(),
+            adapter: self.adapter_identity().is_some(),
+        })
+    }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
         crate::native_swift::prepare(self, pending).map_err(NativeBackendError::Admission)
     }
@@ -90,6 +104,7 @@ struct Command {
 
 pub(super) struct Worker {
     pub(super) seed: u32,
+    pub(super) profile: ModelProfile,
     commands: Option<mpsc::SyncSender<Command>>,
     thread: Option<JoinHandle<()>>,
     busy: Arc<AtomicBool>,
@@ -111,6 +126,7 @@ impl Drop for Settlement<'_> {
 
 impl Worker {
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
+        let profile = engine.profile()?;
         let (commands, receive) = mpsc::sync_channel::<Command>(1);
         let busy = Arc::new(AtomicBool::new(false));
         let idle = Arc::new(Notify::new());
@@ -139,6 +155,7 @@ impl Worker {
             .map_err(|_| NativeBackendError::Engine)?;
         Ok(Self {
             seed,
+            profile,
             commands: Some(commands),
             thread: Some(thread),
             busy,

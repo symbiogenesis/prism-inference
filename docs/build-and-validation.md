@@ -165,7 +165,7 @@ payload is capped at 8 GiB. Retain absolute external outputs and the existing
 process-memory/deadline supervision. No timings or throughput are measured.
 The evidence-write guards run in the ordinary hosted correctness suite.
 
-PQ2 remains the default and the service MVP's only selected representation.
+PQ2 without an adapter remains the default service profile.
 For the verified lossless export of those same current weights, prefix the
 offline checker command with `--use-repacked-ptq1`:
 
@@ -179,9 +179,11 @@ the current-weight export with SHA-256
 5,946,648,928 complete file bytes and the strict 851-tensor PTQ1/F32/BF16
 inventory. The older publisher PTQ1 checkpoint is not admitted. Receipts include
 the selected representation and its actual artifact identity. The existing
-`swift::load`, `swift::inspect` and service paths continue to select PQ2; the
-explicit `load_representation`/`inspect_representation` APIs serve this offline
-correctness lane. This does not enable PTQ1 or adapters in the Rust service.
+`swift::load` and `swift::inspect` continue to select PQ2; the explicit
+`load_representation`/`inspect_representation` APIs serve this correctness lane.
+The private service separately admits explicit PTQ1/approved-adapter selections
+through the [verified session profile](swift-session-profiles.md); selection is
+not full-model or device qualification.
 
 Compare PTQ1 snapshots against the same verified PTQ1 file executed by the pinned
 publisher Prism CPU implementation, using the existing declared full-model
@@ -193,7 +195,12 @@ A comparison between representations therefore has a separate quality decision;
 do not loosen the trusted same-format correctness tolerance to make it pass.
 
 The source graph implements an explicit [rank-one adapter correctness path](rank-one-adapter.md);
-the service and workers still reject adapters. An approved LoRA's
+the offline checker accepts `--rank-one-adapter <absolute-approved-adapter> <scale>`
+after the optional `--use-repacked-ptq1` prefix for `load`, `forward` and
+`trajectory`. Both base selection and approved adapter verification remain exact;
+the existing PQ2 constructor defaults do not admit the export implicitly.
+The JSONL workers remain adapter-free. The explicit private service requires the
+exact approved adapter and pinned-slot request scale. An approved LoRA's
 load-at-zero logits identity, nonzero correction and Swift grouped-SSM input
 ordering must be verified at native residual writers before adapter qualification.
 Neither a successful PTQ1 load nor changed generated text settles the adapter's
@@ -328,7 +335,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.6`; the published crates.io installation
+The checkout prepares version `0.1.7`; the published crates.io installation
 examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt

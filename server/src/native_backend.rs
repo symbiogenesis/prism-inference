@@ -7,6 +7,7 @@
 //! time. Output has one event slot and requires a write acknowledgement before
 //! the next decoder step. Failed generation closes model admission until reset.
 
+mod profile;
 mod worker;
 
 use crate::{
@@ -21,7 +22,8 @@ use crate::{
 };
 use bonsai_prism_runtime::{runtime::Cancellation, swift_session::SwiftSession};
 use http::{HeaderValue, Method, Request as HttpRequest, Version};
-use serde::Deserialize;
+use profile::ModelProfile;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::{
     future::poll_fn,
@@ -142,7 +144,7 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     worker: &mut Worker,
     deadline: Instant,
 ) -> Result<(), NativeBackendError> {
-    let received = match receive(&mut client, policy, deadline).await {
+    let received = match receive(&mut client, policy, worker.profile, deadline).await {
         Ok(value) => value,
         Err(error) => {
             let status = if error == NativeBackendError::Unauthorized {
@@ -168,7 +170,7 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
             return write_json(
                 &mut client,
                 200,
-                &json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0","object":"model","model_sha256":bonsai_prism_runtime::model::swift::MODEL_SHA256,"template_sha256":bonsai_prism_runtime::model::swift::TEMPLATE_SHA256,"runtime":"prism-inference","context_tokens":8192,"seed":worker.seed}]}),
+                &worker.profile.readiness(worker.seed),
                 deadline,
             )
             .await;
@@ -319,6 +321,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
 async fn receive<C: AsyncRead + Unpin>(
     client: &mut C,
     policy: &RequestPolicy,
+    profile: ModelProfile,
     deadline: Instant,
 ) -> Result<Received, NativeBackendError> {
     let start = Instant::now();
@@ -353,7 +356,7 @@ async fn receive<C: AsyncRead + Unpin>(
         filled += read_before(client, &mut body[filled..], intake_deadline).await?;
     }
     let pending = if matches!(route, Route::Count | Route::Generate) {
-        Some(canonical(&body)?)
+        Some(canonical_for_profile(&body, profile)?)
     } else {
         None
     };
@@ -434,6 +437,8 @@ struct FixedBody<'a> {
     frequency_penalty: f32,
     repeat_penalty: f32,
     chat_template_kwargs: Object<FixedTemplate>,
+    #[serde(default, deserialize_with = "optional_lora")]
+    lora: Option<[Object<PinnedLora>; 1]>,
 }
 
 #[derive(Deserialize)]
@@ -444,12 +449,52 @@ struct FixedTemplate {
     preserve_thinking: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PinnedLora {
+    id: u8,
+    scale: f64,
+}
+
+fn optional_lora<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[Object<PinnedLora>; 1]>, D::Error> {
+    <[Object<PinnedLora>; 1]>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Serialize)]
+struct PrivateBody<'a, 'b> {
+    #[serde(flatten)]
+    body: BackendChat<'a, 'b>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lora: Option<[PinnedLora; 1]>,
+}
+
+#[cfg(test)]
 fn canonical(bytes: &[u8]) -> Result<PendingChat, NativeBackendError> {
+    canonical_for_profile(bytes, ModelProfile::default())
+}
+
+fn canonical_for_profile(
+    bytes: &[u8],
+    profile: ModelProfile,
+) -> Result<PendingChat, NativeBackendError> {
     if bytes.len() > MAX_BODY_BYTES {
         return Err(NativeBackendError::Schema);
     }
     let Object(body): Object<FixedBody<'_>> =
         serde_json::from_slice(bytes).map_err(|_| NativeBackendError::Schema)?;
+    if match body.lora.as_ref() {
+        Some([Object(lora)]) => {
+            !profile.adapter
+                || lora.id != 0
+                || !lora.scale.is_finite()
+                || !(0.0..=2.0).contains(&lora.scale)
+        }
+        None => profile.adapter,
+    } {
+        return Err(NativeBackendError::Schema);
+    }
     if !crate::valid_history(&body.messages)
         || !(1..=MAX_COMPLETION_TOKENS).contains(&body.max_completion_tokens)
         || body.n != 1
@@ -472,26 +517,29 @@ fn canonical(bytes: &[u8]) -> Result<PendingChat, NativeBackendError> {
     {
         return Err(NativeBackendError::Schema);
     }
-    let canonical = serde_json::to_vec(&BackendChat {
-        messages: &body.messages,
-        max_completion_tokens: body.max_completion_tokens,
-        stream: body.stream,
-        n: 1,
-        cache_prompt: false,
-        n_cache_reuse: 0,
-        ignore_eos: false,
-        temperature: 1.0,
-        top_p: 0.95,
-        top_k: 20,
-        min_p: 0.0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        repeat_penalty: 1.0,
-        chat_template_kwargs: ChatTemplateKwargs {
-            enable_thinking: body.chat_template_kwargs.0.enable_thinking,
-            reasoning_effort: "xhigh",
-            preserve_thinking: true,
+    let canonical = serde_json::to_vec(&PrivateBody {
+        body: BackendChat {
+            messages: &body.messages,
+            max_completion_tokens: body.max_completion_tokens,
+            stream: body.stream,
+            n: 1,
+            cache_prompt: false,
+            n_cache_reuse: 0,
+            ignore_eos: false,
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_penalty: 1.0,
+            chat_template_kwargs: ChatTemplateKwargs {
+                enable_thinking: body.chat_template_kwargs.0.enable_thinking,
+                reasoning_effort: "xhigh",
+                preserve_thinking: true,
+            },
         },
+        lora: body.lora.map(|[Object(lora)]| [lora]),
     })
     .map_err(|_| NativeBackendError::Schema)?;
     Ok(PendingChat {

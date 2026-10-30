@@ -22,7 +22,7 @@ const USAGE: &str = concat!(
     "       swift_model_check forward <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check trajectory <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>\n",
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
-    "For original PQ2 load/forward/trajectory only, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> for explicit unqualified LoRA correctness evidence.\n",
+    "For selected current-weight load/forward/trajectory, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation prefix for explicit unqualified LoRA correctness evidence.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -56,11 +56,6 @@ fn run() -> Result<()> {
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let representation = select_representation(&mut arguments);
     let adapter = select_adapter(&mut arguments)?;
-    if adapter.is_some() && representation != Representation::Pq2 {
-        return Err(reject(
-            "rank-one adapter capture requires the original PQ2 model",
-        ));
-    }
     if arguments.len() == 1 && arguments[0] == "--help" {
         std::io::stdout().lock().write_all(USAGE.as_bytes())?;
         return Ok(());
@@ -183,9 +178,10 @@ fn load_graph(
     let (model, receipt) = swift::load_representation(path, MODEL_BUDGET, representation)?;
     report("weights-loaded", receipt, representation)?;
     if let Some(selection) = selection {
-        let adapter = RankOneAdapter::load_swift(&selection.path, &model)?;
+        let adapter =
+            RankOneAdapter::load_swift_representation(&selection.path, &model, representation)?;
         emit(
-            &json!({"event":"rank-one-adapter-loaded", "adapter_sha256":adapter.identity(), "target_pairs":adapter.target_count(), "scale":selection.scale, "scale_bits":format!("{:08x}", selection.scale.to_bits()), "qualification":"unqualified-basis-logits-quality-resources-and-service; original activation basis; no adapter permutation"}),
+            &json!({"event":"rank-one-adapter-loaded", "weight_representation":representation.name(), "model_sha256":representation.model_sha256(), "adapter_sha256":adapter.identity(), "target_pairs":adapter.target_count(), "scale":selection.scale, "scale_bits":format!("{:08x}", selection.scale.to_bits()), "qualification":"unqualified-basis-logits-quality-resources-and-service; original activation basis; no adapter permutation"}),
         )?;
         Qwen35::with_rank_one_adapter(
             model,
@@ -410,6 +406,29 @@ mod tests {
         let mut misplaced = vec!["inspect".to_owned(), "--use-repacked-ptq1".to_owned()];
         assert_eq!(select_representation(&mut misplaced), Representation::Pq2);
         assert_eq!(misplaced, ["inspect", "--use-repacked-ptq1"]);
+    }
+
+    #[test]
+    fn ptq1_rank_one_capture_composes_explicit_identity_and_signed_zero_selection() -> Result<()> {
+        let path = std::env::temp_dir().join("approved-adapter.gguf");
+        for scale in ["0", "-0", "1.3"] {
+            let mut args = vec![
+                "--use-repacked-ptq1".into(),
+                "--rank-one-adapter".into(),
+                path.to_string_lossy().into_owned(),
+                scale.into(),
+                "forward".into(),
+            ];
+            assert_eq!(
+                select_representation(&mut args),
+                Representation::CurrentRepackedPtq1
+            );
+            let adapter = select_adapter(&mut args)?.ok_or("missing explicit adapter")?;
+            assert_eq!(adapter.path, path);
+            assert_eq!(adapter.scale.to_bits(), scale.parse::<f32>()?.to_bits());
+            assert_eq!(args, ["forward"]);
+        }
+        Ok(())
     }
 
     #[test]

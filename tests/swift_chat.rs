@@ -15,6 +15,7 @@ use std::path::Path;
 use bonsai_prism_runtime::Result;
 use bonsai_prism_runtime::chat::ChatTemplate;
 use bonsai_prism_runtime::model::ModelMetadata;
+use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::swift_chat::SwiftChatSession;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -104,6 +105,129 @@ fn swift_chat_rejects_foreign_model_and_unverified_template_before_tokenizer_bui
         .err()
         .ok_or("changed template accepted")?;
     assert!(error.to_string().contains("template identity mismatch"));
+    Ok(())
+}
+
+fn synthetic_swift_metadata() -> Result<ModelMetadata> {
+    use bonsai_gguf::{Metadata, MetadataArray, MetadataValue};
+
+    // A bounded tokenizer-only fixture: 256 normal byte pieces, pinned control
+    // spellings and unused entries retain the exact declared vocabulary size.
+    let mut tokens = vec![String::new(); swift::VOCAB_SIZE];
+    let mut types = vec![5; swift::VOCAB_SIZE];
+    let mut next = 256_u32;
+    for byte in u8::MIN..=u8::MAX {
+        let scalar = if (b'!'..=b'~').contains(&byte)
+            || (0xa1..=0xac).contains(&byte)
+            || (0xae..=0xff).contains(&byte)
+        {
+            u32::from(byte)
+        } else {
+            let scalar = next;
+            next += 1;
+            scalar
+        };
+        tokens[usize::from(byte)] = char::from_u32(scalar)
+            .ok_or("invalid fixture byte alphabet")?
+            .to_string();
+        types[usize::from(byte)] = 1;
+    }
+    for (id, spelling) in [
+        (248_044, "<|endoftext|>"),
+        (248_045, "<|im_start|>"),
+        (248_046, "<|im_end|>"),
+        (248_063, "<|fim_pad|>"),
+        (248_064, "<|repo_name|>"),
+        (248_065, "<|file_sep|>"),
+    ] {
+        tokens[id] = spelling.into();
+        types[id] = 3;
+    }
+    Ok(ModelMetadata {
+        identity: swift::MODEL_SHA256.into(),
+        vocab_size: swift::VOCAB_SIZE,
+        metadata: Metadata::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("tokenizer.ggml.model".into(), MetadataValue::from("gpt2")),
+            ("tokenizer.ggml.pre".into(), MetadataValue::from("qwen35")),
+            (
+                "tokenizer.chat_template".into(),
+                MetadataValue::from(TEMPLATE),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                MetadataValue::Array(MetadataArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type".into(),
+                MetadataValue::Array(MetadataArray::I32(types)),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                MetadataValue::Array(MetadataArray::String(Vec::new())),
+            ),
+            (
+                "tokenizer.ggml.bos_token_id".into(),
+                MetadataValue::U32(248_044),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                MetadataValue::U32(248_046),
+            ),
+            (
+                "tokenizer.ggml.padding_token_id".into(),
+                MetadataValue::U32(248_044),
+            ),
+            (
+                "tokenizer.ggml.add_bos_token".into(),
+                MetadataValue::Bool(false),
+            ),
+        ]),
+    })
+}
+
+#[test]
+fn swift_chat_current_weight_selection_preserves_exact_template_tokens_and_default_identity()
+-> Result<()> {
+    use bonsai_gguf::MetadataValue;
+
+    let mut model = synthetic_swift_metadata()?;
+    let pq2 = SwiftChatSession::from_metadata(&model)?;
+    assert!(
+        SwiftChatSession::from_metadata_representation(&model, Representation::CurrentRepackedPtq1)
+            .is_err()
+    );
+    model.identity = swift::REPACKED_PTQ1_SHA256.into();
+    assert!(SwiftChatSession::from_metadata(&model).is_err());
+    let ptq1 = SwiftChatSession::from_metadata_representation(
+        &model,
+        Representation::CurrentRepackedPtq1,
+    )?;
+    assert_ne!(pq2.identity(), ptq1.identity());
+    assert_eq!(ptq1.identity(), swift::REPACKED_PTQ1_SHA256);
+    assert_eq!(pq2.template_sha256(), ptq1.template_sha256());
+    assert_eq!(pq2.stop_tokens(), ptq1.stop_tokens());
+    for thinking in [false, true] {
+        let messages = json!([{"role":"user", "content":"Name a tree."}]);
+        assert_eq!(
+            pq2.prepare_with_thinking(&messages, 4096, thinking)?,
+            ptq1.prepare_with_thinking(&messages, 4096, thinking)?
+        );
+    }
+    model.identity = "older-published-PTQ1-checkpoint".into();
+    assert!(
+        SwiftChatSession::from_metadata_representation(&model, Representation::CurrentRepackedPtq1)
+            .is_err()
+    );
+    model.identity = swift::REPACKED_PTQ1_SHA256.into();
+    model.metadata.insert(
+        "tokenizer.chat_template".into(),
+        MetadataValue::from(format!("{TEMPLATE}\n")),
+    );
+    assert!(
+        SwiftChatSession::from_metadata_representation(&model, Representation::CurrentRepackedPtq1)
+            .is_err()
+    );
     Ok(())
 }
 

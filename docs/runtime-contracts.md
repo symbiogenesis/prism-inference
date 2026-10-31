@@ -224,6 +224,15 @@ rounding, allocator overhead and process memory are separate; this is no measure
 peak-memory or speed claim. Fixed phase reuse needs neither a moving allocator
 nor a change to numerical tolerances.
 
+Recurrent heads copy committed F32 state directly into transactional scratch
+while applying that head's decay. This removes the preceding full matrix copy;
+each multiplication, dot, update and reduction retains its previous order.
+For Swift's 48 recurrent layers, 48 value heads and 128-by-128 matrices, the
+removed copy covers **144 MiB of payload per token**. Scratch remains separate
+from committed state and checkpoints, with the complete destination reserved
+before head processing. This work reduction does not establish measured TPS or
+process-memory benefit; actual-model numerical and performance gates remain open.
+
 Attention-value reads use tiles of at most 32 adjacent dimensions, with at most
 2 KiB of stack accumulator payload. Each tile traverses the paged FP16 cache
 once, preserving each dimension's token order. Source arithmetic retains rounded

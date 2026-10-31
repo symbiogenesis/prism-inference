@@ -1775,7 +1775,10 @@ impl Evaluation<'_> {
         for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
             l2_norm(head, g.epsilon);
         }
-        copy_into(previous, matrix)?;
+        // Reserve the entire transactional destination before touching any head.
+        // Each head is copied with its decay instead of copying the full matrix
+        // first and then reading/writing that copy again to scale it.
+        prepare(matrix, previous.len())?;
         zeros_into(g.value_width(), &mut scratch.attended)?;
         let scale = 1.0 / small_float(g.ssm_head)?.sqrt();
         for head in 0..g.ssm_values {
@@ -1794,11 +1797,12 @@ impl Evaluation<'_> {
             };
             let decay = (softplus * layer.decay[head]).exp();
             let update = sigmoid(scratch.beta[head]);
-            let state =
-                &mut matrix[head * g.ssm_head * g.ssm_head..(head + 1) * g.ssm_head * g.ssm_head];
-            for element in state.iter_mut() {
-                *element *= decay;
-            }
+            let start = head * g.ssm_head * g.ssm_head;
+            let state = append_decayed_head(
+                &previous[start..start + g.ssm_head * g.ssm_head],
+                decay,
+                matrix,
+            );
             let output = &mut scratch.attended[head * g.ssm_head..(head + 1) * g.ssm_head];
             for ((state_row, &value), out) in state
                 .chunks_exact_mut(g.ssm_head)
@@ -2235,6 +2239,18 @@ fn copy_into(input: &[f32], output: &mut Vec<f32>) -> Result<()> {
     Ok(())
 }
 
+// The complete matrix has already been reserved fallibly by the caller. Append
+// directly to transactional scratch; no immutable committed value is overwritten.
+fn append_decayed_head<'a>(
+    previous: &[f32],
+    decay: f32,
+    output: &'a mut Vec<f32>,
+) -> &'a mut [f32] {
+    let start = output.len();
+    output.extend(previous.iter().map(|&element| element * decay));
+    &mut output[start..]
+}
+
 fn capacity<T>(count: usize) -> Result<Vec<T>> {
     if count
         .checked_mul(size_of::<T>())
@@ -2490,8 +2506,8 @@ mod tests {
 
     use super::{
         Arithmetic, Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES,
-        ProjectionScratch, Transforms, copy_state, dot, dot_f16, half_bits, half_to_float,
-        restore_state, rope, rope_frequencies,
+        ProjectionScratch, Transforms, append_decayed_head, copy_state, dot, dot_f16, half_bits,
+        half_to_float, restore_state, rope, rope_frequencies,
     };
     use crate::Result;
     use crate::model::Tensor;
@@ -2559,7 +2575,9 @@ mod tests {
             let native = read_gdn_word(&mut input)?;
             let query = read_gdn_vector(&mut input, width)?;
             let key = read_gdn_vector(&mut input, width)?;
-            let mut state = read_gdn_vector(&mut input, width)?;
+            let previous = read_gdn_vector(&mut input, width)?;
+            let mut state = Vec::with_capacity(width);
+            append_decayed_head(&previous, 1.0, &mut state);
             let expected = read_gdn_vector(&mut input, width)?;
             let mut source = state.clone();
             let delta = value - Arithmetic::PinnedSwift.gdn_dot(&state, &key)?;
@@ -2587,6 +2605,84 @@ mod tests {
             );
         }
         assert_eq!(input.position(), u64::try_from(bytes.len())?);
+        Ok(())
+    }
+
+    #[test]
+    fn decayed_heads_preserve_bits_and_independent_state_across_scratch_reuse() -> Result<()> {
+        let values = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::from_bits(3),
+            -f32::from_bits(3),
+            f32::MAX,
+            -f32::MAX,
+            f32::from_bits(0x3f80_0001),
+            -f32::from_bits(0x3f80_0001),
+        ];
+        let previous = values.repeat(3);
+        let original: Vec<_> = previous.iter().map(|value| value.to_bits()).collect();
+        let mut scratch = vec![f32::NAN; previous.len() + 7];
+        let allocation = scratch.as_ptr();
+        for decays in [[1.0, 0.5, 0.0], [0.0, 1.0, 0.5]] {
+            // Keep the prior copy-then-scale algorithm as a bitwise reference,
+            // with different decays per head and a partly filled old workspace.
+            let mut reference = previous.clone();
+            for (head, decay) in reference.chunks_exact_mut(values.len()).zip(decays) {
+                for element in head {
+                    *element *= decay;
+                }
+            }
+            super::prepare(&mut scratch, previous.len())?;
+            for (head, decay) in previous.chunks_exact(values.len()).zip(decays) {
+                let staged = append_decayed_head(head, decay, &mut scratch);
+                assert_eq!(staged.len(), values.len());
+            }
+            assert_eq!(scratch.as_ptr(), allocation);
+            assert_eq!(
+                scratch
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                reference
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                previous
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                original
+            );
+        }
+        // A later state-validation error may leave provisional scratch dirty;
+        // the immutable committed matrix and a subsequent retry remain exact.
+        super::prepare(&mut scratch, previous.len())?;
+        append_decayed_head(&previous, f32::MAX, &mut scratch);
+        assert!(super::finite(&scratch, "provisional GDN state").is_err());
+        assert_eq!(
+            previous
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            original
+        );
+        super::prepare(&mut scratch, previous.len())?;
+        append_decayed_head(&previous, 1.0, &mut scratch);
+        assert_eq!(
+            scratch
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            original
+        );
+        assert_eq!(scratch.as_ptr(), allocation);
         Ok(())
     }
 

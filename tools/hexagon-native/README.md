@@ -61,7 +61,7 @@ The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
 All seven native library source files match Runner revision
-[`3b4e8c9c00d7d899aa0cd8cd8a9dd42d49f69513`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/3b4e8c9c00d7d899aa0cd8cd8a9dd42d49f69513/tools/hexagon/native_rpc).
+[`7373c020c928a6d188db628bef465f94b612ab9f`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/7373c020c928a6d188db628bef465f94b612ab9f/tools/hexagon/native_rpc).
 Fixed module names use typed `CStr` literals. The vendor request length still
 excludes the terminating NUL, while its independently writable backing buffer
 includes that NUL and is checked after return. URI, ABI, request ordering and

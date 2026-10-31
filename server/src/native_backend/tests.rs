@@ -363,7 +363,7 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
         ..ModelProfile::default()
     }
     .readiness(42);
-    let mut expected_reused = legacy.clone();
+    let mut expected_reused = legacy;
     expected_reused["data"][0]["prompt_reuse"] = json!("latest");
     assert_eq!(reused, expected_reused);
     for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {

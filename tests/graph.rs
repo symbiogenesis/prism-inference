@@ -3092,7 +3092,7 @@ fn profile_reuse_matches_fresh_state_and_sampled_failure_replay() -> Result<()> 
                 assert_eq!(graph_bits(runtime.decoder())?, bits);
             }
             runtime.prepare_profile_request(scale, PromptReuse::Disabled)?;
-            assert!(runtime.tokens().is_empty());
+            assert_eq!(runtime.tokens(), []);
         }
     }
     Ok(())
@@ -3153,7 +3153,7 @@ fn profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary() -
                 assert_eq!(runtime.tokens(), tokens);
                 assert_eq!(graph_bits(runtime.decoder())?, bits);
             } else {
-                assert!(runtime.tokens().is_empty());
+                assert_eq!(runtime.tokens(), []);
                 assert!(graph_bits(runtime.decoder())?.iter().all(|&bits| bits == 0));
             }
             assert_eq!(
@@ -3182,7 +3182,7 @@ fn profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary() -
             }
         }
         runtime.prepare_profile_request(Some(1.3), PromptReuse::Disabled)?;
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens(), []);
         runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
         runtime.reset()?;
         runtime.prepare_profile_request(Some(1.3), PromptReuse::Latest)?;

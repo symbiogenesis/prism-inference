@@ -41,6 +41,14 @@ that process. Host allocation/registration proves neither DSP DMA nor compute;
 implicit-session teardown remains unqualified. Direct native Rust inference still needs safe asynchronous
 buffer/queue ownership and separately signed PQ2/PTQ1 device kernels, followed
 by numerical, complete-state, lifecycle, resource and measured benefit gates.
+
+The terminal STATIC flag-0 control differs from the signed-reference ggml host's
+FD flag-2 or delayed-FD flag-3 flows inside an established HTP session. A STATIC
+refusal supplies no verdict on those modes, DMA64/VTCM or NPU execution. There
+is no automatic alternate-flag retry. In the referenced public Qualcomm host
+[`AEEStdErr.h`](https://github.com/qualcomm/fastrpc/blob/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/inc/AEEStdErr.h#L92),
+512 matches generic `AEE_ERPC`; the native return remains authoritative and its
+underlying cause remains unknown.
 It preserves the main runtime crate's `forbid(unsafe_code)` boundary: only this
 crate's isolated Windows module permits documented unsafe native operations.
 

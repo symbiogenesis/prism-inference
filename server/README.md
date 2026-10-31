@@ -52,3 +52,61 @@ content. Supplied assistant reasoning history remains preserved. Effort stays
 `xhigh` when thinking is enabled, and other template and sampler overrides remain
 rejected. Existing public Rust `prepare` methods and the JSONL worker retain their
 thinking-enabled behavior; `prepare_with_thinking` selects the mode explicitly.
+
+## Released-service correctness capture
+
+The main-only [preparation workflow](../.github/workflows/private-service-acceptance.yml)
+builds `private-service-check.exe` and runs its model-free framing and cancellation
+observation controls on hosted Windows ARM64. Its artifact is named
+`private-service-check-<main-revision>-<run-id>-<attempt>`. The packaged receipt binds
+the checker bytes to its exact owning main source, workflow and run. Preparation
+does not execute a model or qualify a released service.
+
+An existing trusted launcher must start the independently verified released
+`prism-inference-server.exe` with the original PQ2 model, approved adapter, seed,
+explicit row-worker count and omitted prompt reuse. It retains the executable,
+model, adapter and private credential guards, AppContainer/Job, exclusive listener
+PID, memory/watchdog policy and teardown. The checker starts no process and accepts
+only a numeric loopback port. It uses the same protected private backend key as the
+owner; do not pass key bytes on the command line or save them in evidence.
+
+```powershell
+# Run outside every checkout while the existing trusted owner retains the server.
+# The new evidence file must be absolute and must not already exist.
+& $checker $privatePort $privateKeyPath $newEvidencePath $remainingCheckSeconds
+```
+
+The owner supplies a positive allowance of at most 240 seconds, shortened to the
+actual time remaining after setup, artifact verification and model loading, with
+time reserved for owned cleanup. All owner-device diagnostics and captures share
+one five-minute aggregate budget; this command does not grant another allowance.
+Socket operations check one absolute checker deadline. No automatic retry or model
+download occurs. Never use the checker against an independently running daily
+service: it explicitly resets state and abandons a generated response.
+
+The fixed workload checks exact PQ2/template/adapter readiness, canonical counts
+and terminal generation usage at scales 1.3 and zero, invalid-scale rejection,
+stale canonical generation after a replacement count and reset, then disconnects
+after receiving a nonempty provisional streamed delta. A subsequent count must
+be rejected until explicit reset; reset must reproduce the initial seeded short
+response. Every completed observation is flushed to the held evidence file before
+the next step. Natural completion, missing provisional output, a deadline or any
+failed required observation leaves a failed receipt with the completed steps.
+Responses and credentials are never written to that receipt.
+
+Receiving provisional output and observing closed admission establishes externally
+visible interruption and recovery. It does not establish graph execution at the
+instant of disconnect, a cancellation acknowledgement, logits or complete-state
+rollback. Those fields remain explicitly unqualified in the receipt. The checker
+also establishes no sandbox/process ownership, performance, long-context/output,
+creative quality or default-promotion evidence. Runner lifecycle receipts remain
+separate from this Prism-owned capture.
+
+Archive the checker package and receipt alongside the actual-model result and
+the trusted owner's process/cleanup and artifact-verification reports. Bind the
+tested released source, version, archive/server/worker SHA-256 identities separately
+from the later owning main checker source/workflow/run and retained package artifact.
+An internal model thread is exercised through the released HTTP service; the
+separate JSONL `bonsai-swift-worker` binary is not executed by this checker. Exact
+source Foundation/conformance and independent review remain required, and a passed
+checker receipt alone cannot close the released-service promotion gate.

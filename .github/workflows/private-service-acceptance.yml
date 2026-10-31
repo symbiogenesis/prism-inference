@@ -1,0 +1,70 @@
+name: Prepare released private-service acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: private-service-check-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+      - name: Check the bounded source harness without loading a model
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Private-Service-Check-Build'
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          cargo +nightly-2026-10-22 fmt --manifest-path $manifest -p prism-inference-server -- --check
+          cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check -- -D warnings
+          cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
+          cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
+      - name: Bind the checker to owning main source and run
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $package = Join-Path $env:RUNNER_TEMP 'Private-Service-Check-Package'
+          [void][IO.Directory]::CreateDirectory($package)
+          $checker = Join-Path $package 'private-service-check.exe'
+          Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release/examples/private_service_check.exe') -Destination $checker
+          [ordered]@{
+            schemaVersion = 1
+            repository = $env:GITHUB_REPOSITORY
+            revision = $env:GITHUB_SHA
+            gitRef = $env:GITHUB_REF
+            workflowPath = '.github/workflows/private-service-acceptance.yml'
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = [int]$env:GITHUB_RUN_ATTEMPT
+            architecture = 'ARM64'
+            modelExecuted = $false
+            scope = 'harness-preparation-only'
+            compilerIdentity = (& rustc +nightly-2026-10-22 -vV) -join "`n"
+            files = @([ordered]@{
+              name = 'private-service-check.exe'
+              bytes = (Get-Item -LiteralPath $checker).Length
+              sha256 = (Get-FileHash -LiteralPath $checker -Algorithm SHA256).Hash.ToLowerInvariant()
+            })
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $package 'receipt.json') -Encoding utf8NoBOM
+          "PRIVATE_SERVICE_CHECK_PACKAGE=$package" >> $env:GITHUB_ENV
+      - name: Retain the exact checker and credential-free source receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: private-service-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PRIVATE_SERVICE_CHECK_PACKAGE }}
+          if-no-files-found: error
+          retention-days: 90

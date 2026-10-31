@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "purpose": "native-rust-fastrpc-capabilities-and-terminal-scratch-registration",
+  "purpose": "native-rust-fastrpc-capabilities-and-terminal-signed-session-fd-mapping",
   "ggml": {
     "repository": "https://github.com/ggml-org/llama.cpp",
     "commit": "94256114c229674ef96e76eb2dea596e65b43818",
@@ -66,7 +66,10 @@
       "structureAlignment": 8,
       "domainName": "cdsp",
       "sessionId": 0,
-      "supportedBundledArchitectures": [73, 81],
+      "supportedBundledArchitectures": [
+        73,
+        81
+      ],
       "uriBytes": 256,
       "nativeRefusalFallback": false,
       "remoteModuleOpen": false,
@@ -75,7 +78,7 @@
       "fdMappingFlag": 2,
       "delayedFdMappingFlag": 3,
       "extendedFlagAtPublicHeader": "absent-not-invented",
-      "deviceObservation": "pending"
+      "deviceObservation": "X2-metadata-prepared; see docs/evidence/hexagon-x2-session-metadata.json; remote-module-and-mapping-pending"
     },
     "terminalScratchProbe": {
       "bytes": 4096,
@@ -97,6 +100,43 @@
         "fastrpc_mmap",
         "fastrpc_munmap"
       ]
+    },
+    "terminalSignedSessionFdProbe": {
+      "bytes": 4096,
+      "heapId": 25,
+      "allocationFlags": 1,
+      "offset": 0,
+      "mapFlag": 2,
+      "mapFlagName": "FASTRPC_MAP_FD",
+      "sessionId": 0,
+      "domain": "validated-effective-domain-returned-for-cdsp-session0",
+      "module": "fixed-v73-or-v81-bundled-name-from-validated-returned-URI",
+      "moduleSearch": "ADSP_LIBRARY_PATH-exactly-one-checked-absolute-package-directory",
+      "exactLoadedDspBytes": "pending-independent-binding; selected-package-and-URI-alone-do-not-prove-loaded-file",
+      "supervisorPrerequisites": [
+        "all-pinned-package-digests",
+        "current-catalog-membership-and-chain",
+        "guarded-source-bound-executable",
+        "guarded-service-derived-signed-driver",
+        "owned-process-deadline-and-confirmed-Job-cleanup"
+      ],
+      "moduleAndCatalogFilesRetained": true,
+      "allModuleOpenAttemptsPinDriverOwnerUntilProcessDeath": true,
+      "mappingOrUnmappingFailurePinsAllocationAndHandle": true,
+      "noCloseAfterUncertainMapping": true,
+      "computeSubmission": false,
+      "unsignedProcessControl": false,
+      "sessionTeardownQualified": false,
+      "exports": [
+        "remote_handle64_open",
+        "remote_handle64_close",
+        "rpcmem_alloc",
+        "rpcmem_free",
+        "rpcmem_to_fd",
+        "fastrpc_mmap",
+        "fastrpc_munmap"
+      ],
+      "authoritativeCloseHandle": "vendor remote.h remote_handle64 = uint64; reference wrapper close-pointer typedef remote_handle differs and is not copied"
     }
   },
   "windowsAbi": [

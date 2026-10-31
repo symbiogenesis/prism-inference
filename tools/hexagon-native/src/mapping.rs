@@ -31,6 +31,16 @@ pub(super) fn terminal() -> bool {
     USED.load(Ordering::Acquire)
 }
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "All terminal native probes share the same process-wide admission"
+)]
+pub(super) fn admit_terminal() -> Result<(), Error> {
+    USED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| Error::Contract)
+}
+
 fn symbol(driver: &Driver, name: &CStr) -> Result<*mut c_void, Error> {
     // SAFETY: the live retained driver owns its loader handle and the fixed
     // CStr export names are NUL terminated. No function pointer escapes here.
@@ -73,12 +83,7 @@ fn memory_functions(driver: &Driver) -> Result<MemoryFunctions, Error> {
     reason = "Private native mapping owner must not become public API"
 )]
 pub(super) fn probe(driver: Driver) -> Result<MappingProbeReport, Error> {
-    if USED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err(Error::Contract);
-    }
+    admit_terminal()?;
     let MemoryFunctions {
         alloc,
         free,

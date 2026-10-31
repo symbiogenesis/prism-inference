@@ -14,9 +14,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 mod session;
+mod session_mapping;
 pub use session::{
     GET_EFFECTIVE_DOMAIN_ID, GET_URI, MAP_FD, MAP_FD_DELAYED, SessionPreparationReport,
 };
+pub use session_mapping::SessionMappingReport;
 
 #[cfg(all(windows, target_arch = "aarch64"))]
 #[allow(
@@ -348,6 +350,37 @@ impl Driver {
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {
             let _ = self;
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Consume this driver in one fixed signed-module/session FD mapping diagnostic.
+    ///
+    /// The trusted supervisor must independently verify and retain the exact
+    /// pinned package/catalog membership and driver identity before calling.
+    /// `ADSP_LIBRARY_PATH` must equal `package_directory` exactly; no other vendor
+    /// override is supported. Only the fixed v73/v81 module, session zero and FD=2
+    /// mapping are used. No unsigned-process control or computation is requested.
+    /// Progress snapshots distinguish entered from completed native operations.
+    /// After a module-open attempt all driver/module/catalog owners stay pinned
+    /// until supervised process exit, including after explicit handle close.
+    ///
+    /// # Errors
+    /// Rejects malformed paths, missing exports, inherited overrides and metadata
+    /// failures before opening a module. Native refusals remain exact report codes.
+    /// This terminal diagnostic requires external deadlines and verified teardown.
+    pub fn session_mapping_probe(
+        self,
+        package_directory: &Path,
+        progress: impl FnMut(&SessionMappingReport),
+    ) -> Result<SessionMappingReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::session_mapping_probe(self.inner, package_directory, progress)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, progress);
             Err(Error::UnsupportedPlatform)
         }
     }

@@ -43,6 +43,17 @@ const _: () = assert!(std::mem::offset_of!(GetUri, uri_len) == 40);
     reason = "The native helper remains private to its safe parent API"
 )]
 pub(super) fn prepare(driver: &mut Driver) -> Result<SessionPreparationReport, Error> {
+    prepare_with_uri(driver, &mut [0xa5; 256])
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "The validated returned URI is private input to the fixed native open"
+)]
+pub(super) fn prepare_with_uri(
+    driver: &mut Driver,
+    uri: &mut [u8; 256],
+) -> Result<SessionPreparationReport, Error> {
     let raw = driver.capability(Capability::Architecture)?;
     let report = SessionPreparationReport::new(raw);
     if report.architecture.is_none() {
@@ -56,12 +67,13 @@ pub(super) fn prepare(driver: &mut Driver) -> Result<SessionPreparationReport, E
     }
     // SAFETY: the pinned vendor header specifies this exact C function signature.
     let control = unsafe { std::mem::transmute::<*mut c_void, SessionControl>(symbol) };
-    prepare_fixed_metadata(raw, control)
+    prepare_fixed_metadata(raw, control, uri)
 }
 
 fn prepare_fixed_metadata(
     raw: u32,
     control: SessionControl,
+    uri: &mut [u8; 256],
 ) -> Result<SessionPreparationReport, Error> {
     let mut report = SessionPreparationReport::new(raw);
     let Some(architecture) = report.architecture else {
@@ -110,7 +122,7 @@ fn prepare_fixed_metadata(
     // write into a Rust string literal. The input is checked again after return.
     let mut module_bytes = module.to_vec();
     let module_ptr = module_bytes.as_mut_ptr().cast::<c_char>();
-    let mut uri = [0xa5_u8; 256];
+    uri.fill(0xa5);
     let uri_ptr = uri.as_mut_ptr().cast::<c_char>();
     let mut request = GetUri {
         domain_name: domain_ptr,
@@ -148,7 +160,7 @@ fn prepare_fixed_metadata(
         report.stage = "session-uri-contract-changed";
         return Ok(report);
     }
-    report.uri_verified = session::checked_uri(architecture, &uri);
+    report.uri_verified = session::checked_uri(architecture, uri);
     report.stage = if report.uri_verified {
         "session-metadata-prepared"
     } else {
@@ -213,25 +225,25 @@ mod tests {
 
     #[test]
     fn session_metadata_retains_both_codes_without_failure_fallback() -> Result<(), Error> {
-        let success = prepare_fixed_metadata(0x81, accepted)?;
+        let success = prepare_fixed_metadata(0x81, accepted, &mut [0xa5; 256])?;
         assert!(success.metadata_prepared());
         assert_eq!(success.effective_domain, Some(3));
-        let refused = prepare_fixed_metadata(0x81, domain_refused)?;
+        let refused = prepare_fixed_metadata(0x81, domain_refused, &mut [0xa5; 256])?;
         assert_eq!(refused.domain_result, Some(512));
         assert_eq!(refused.uri_result, None);
         assert!(!refused.metadata_prepared());
-        let refused = prepare_fixed_metadata(0x81, uri_refused)?;
+        let refused = prepare_fixed_metadata(0x81, uri_refused, &mut [0xa5; 256])?;
         assert_eq!(refused.domain_result, Some(0));
         assert_eq!(refused.uri_result, Some(512));
         assert!(!refused.metadata_prepared());
-        let unsupported = prepare_fixed_metadata(0x82, domain_refused)?;
+        let unsupported = prepare_fixed_metadata(0x82, domain_refused, &mut [0xa5; 256])?;
         assert_eq!(unsupported.domain_result, None);
         Ok(())
     }
 
     #[test]
     fn changed_native_pointer_is_rejected_without_dereferencing_it() -> Result<(), Error> {
-        let report = prepare_fixed_metadata(0x73, input_changed)?;
+        let report = prepare_fixed_metadata(0x73, input_changed, &mut [0xa5; 256])?;
         assert_eq!(report.stage, "session-uri-contract-changed");
         assert!(!report.metadata_prepared());
         Ok(())

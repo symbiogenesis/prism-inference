@@ -7,8 +7,9 @@ the main runtime does not depend on or re-export it. A reviewed registry release
 of this boundary must precede any main-library dependency so existing runtime
 publication is preserved. The runtime continues to report Hexagon unavailable.
 
-The safe API restricts ordinary native calls to the fixed CDSP capability and
-default-session metadata control requests.
+The safe API restricts ordinary native calls to fixed CDSP capability and
+default-session metadata controls. A consuming terminal diagnostic also opens
+the fixed bundled module and attempts one established-session FD mapping cycle.
 SCM discovery selects `qcnspmcdm` and its `libcdsprpc.dll` inside the Windows
 DriverStore; callers cannot supply a DLL, RPC request or unsigned-process flag.
 Path traversal, device/UNC paths and reparse ancestors reject. A retained
@@ -68,17 +69,24 @@ return codes and completed stages without retry or a fabricated domain/URI.
 The method issues no remote-handle open, mapping or unsigned-process request;
 its report is descriptive and supplies no admission or mapping authority.
 
-Actual signed module opening remains pending independent verification of the
-installed ELF bytes, catalog membership, supported Windows deployment/search
-route and retained file lifetime through open/teardown. A basename URI does not
-bind an installed module to the caller's checked package. An absolute URI has
-not been established as a supported Windows deployment route. The referenced
-ggml initializer requests unsigned-process control before opening its interface;
-this crate omits that request and does not infer a usable signed-session policy
-from source or a bundled catalog. No catalog installation, certificate changes
-or search-path overrides are supplied here.
+`Driver::session_mapping_probe` now consumes the owner, validates the fixed
+v73/v81 URI returned unchanged by the driver, and opens that module through one
+explicit checked `ADSP_LIBRARY_PATH` directory. The trusted supervisor must first
+verify the exact package hashes, catalog membership/chain and service-derived
+driver identity. Native code also retains module/catalog/INF deny-write/delete
+file guards. A basename URI and guarded directory do not independently prove the
+actual DSP-selected file; signed deployment identity remains pending.
 
-The public FD=2 and delayed-FD=3 modes are recorded without executing them.
+The probe uses public FD=2 only after a successful module open, and retains exact
+open/map/unmap/close results. Any uncertain map/unmap retains the allocation and
+handle without free/close. Every open attempt pins the driver, package guards and
+process lease until supervised process death. Even successful explicit handle
+close does not qualify complete vendor session teardown. Fixed callback progress
+records entered operations only. No compute or unsigned-process control exists.
+The authoritative public `remote.h` declares a u64 close handle; the reference
+host wrapper's inconsistent 32-bit function-pointer typedef is not reused.
+
+The terminal probe implements FD=2; delayed-FD=3 remains descriptive only.
 Delayed registration does not prove DSP-side `HAP_mmap`, cache ownership or DMA.
 The extended delayed mode's matching SDK enum/ABI is absent from the pinned
 public header and remains pending. Asynchronous submission/completion ownership,
@@ -93,3 +101,8 @@ Hosted CI owns the complete tests and package checks. A focused named local ABI
 check is allowed under the shared owner-device aggregate budget, including
 setup, compilation, loading/querying when requested and cleanup. This library's
 model-free `self_check()` opens no services, files or libraries.
+
+The branch-only hosted `hexagon-native.yml` workflow runs formatting, all native
+contract tests and strict release Clippy on Windows ARM64 without a device.
+Actual device execution belongs to Runner's separate source-bound supervisor;
+this unpublished crate does not change production runtime dependencies or pins.

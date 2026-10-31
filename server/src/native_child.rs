@@ -5,6 +5,7 @@ use std::{ffi::OsString, io, path::PathBuf};
 use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
     model::swift::Representation,
+    runtime::PromptReuse,
     swift_session::SwiftSession,
 };
 use bonsai_windows_credentials::validate_read_path;
@@ -22,6 +23,7 @@ struct Config {
     row_workers: usize,
     representation: Representation,
     adapter: Option<PathBuf>,
+    prompt_reuse: PromptReuse,
 }
 
 fn invalid() -> io::Error {
@@ -38,6 +40,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut row_workers = None;
     let mut repacked_ptq1 = false;
     let mut adapter = None;
+    let mut prompt_reuse = None;
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
             child = true;
@@ -79,6 +82,13 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                         .map_err(|_| invalid())?,
                 );
             }
+            Some("--prompt-reuse") if prompt_reuse.is_none() => {
+                prompt_reuse = Some(match value.to_str() {
+                    Some("disabled") => PromptReuse::Disabled,
+                    Some("latest") => PromptReuse::Latest,
+                    _ => return Err(invalid()),
+                });
+            }
             _ => return Err(invalid()),
         }
     }
@@ -94,6 +104,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Representation::Pq2
         },
         adapter,
+        prompt_reuse: prompt_reuse.unwrap_or_default(),
     };
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -138,7 +149,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         .map_err(|error| startup::at(Stage::Key, &error))?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let session = SwiftSession::load_profile_with_row_parallelism(
+    let mut session = SwiftSession::load_profile_with_row_parallelism(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
@@ -147,6 +158,9 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         parallelism,
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+    session
+        .set_prompt_reuse(config.prompt_reuse)
+        .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -231,6 +245,22 @@ mod tests {
         good[6] = key;
         assert!(parse(good.clone()).is_ok());
         assert_eq!(parse(good.clone())?.row_workers, 1);
+        assert_eq!(parse(good.clone())?.prompt_reuse, PromptReuse::Disabled);
+        for (value, expected) in [
+            ("disabled", PromptReuse::Disabled),
+            ("latest", PromptReuse::Latest),
+        ] {
+            let mut selected = good.to_vec();
+            selected.extend(["--prompt-reuse", value].map(OsString::from));
+            assert_eq!(parse(selected.clone())?.prompt_reuse, expected);
+            selected.extend(["--prompt-reuse", value].map(OsString::from));
+            assert!(parse(selected).is_err());
+        }
+        for value in ["", "true", "Latest", "snapshot", "approximate"] {
+            let mut selected = good.to_vec();
+            selected.extend(["--prompt-reuse", value].map(OsString::from));
+            assert!(parse(selected).is_err());
+        }
         for value in ["0", "17", "invalid"] {
             let mut args = good.to_vec();
             args.extend(["--row-workers", value].map(OsString::from));

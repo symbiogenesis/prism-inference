@@ -16,7 +16,7 @@ use crate::{
         lora::RankOneAdapter,
         swift::{self, LoadReceipt, Representation},
     },
-    runtime::{Cancellation, Completion, Limits, Prefill, Runtime},
+    runtime::{Cancellation, Completion, Limits, Prefill, PromptReuse, Runtime},
     sampling::SwiftSampler,
     swift_chat::SwiftChatSession,
     text_output::Utf8Output,
@@ -78,8 +78,9 @@ pub enum TextEvent<'a> {
 
 /// Single-owner verified Swift runtime, tokenizer, output vocabulary and sampler.
 ///
-/// Mutable access serializes generation and reset. Every request starts model
-/// state from empty, disabling prompt reuse. Sampler draws persist until reset;
+/// Mutable access serializes generation and reset. Requests start model state
+/// from empty by default; exact latest-state reuse requires explicit selection.
+/// Sampler draws persist until reset;
 /// cancelled or failed generation restores the pre-request sampler. A failed
 /// terminal delivery closes admission until an explicit successful reset.
 pub struct SwiftSession {
@@ -92,6 +93,7 @@ pub struct SwiftSession {
     sampler: SwiftSampler,
     seed: u32,
     delivery_fault: bool,
+    prompt_reuse: PromptReuse,
     receipt: LoadReceipt,
 }
 
@@ -189,6 +191,7 @@ impl SwiftSession {
             sampler,
             seed,
             delivery_fault: false,
+            prompt_reuse: PromptReuse::Disabled,
             receipt,
         })
     }
@@ -221,6 +224,31 @@ impl SwiftSession {
     #[must_use]
     pub const fn requested_backend(&self) -> MatvecBackend {
         self.runtime.decoder().requested_backend()
+    }
+
+    /// Explicit request-boundary policy; fresh recomputation remains the default.
+    #[must_use]
+    pub const fn prompt_reuse(&self) -> PromptReuse {
+        self.prompt_reuse
+    }
+
+    /// Select exact latest-state reuse, clearing live state when policy changes.
+    ///
+    /// No extra prefix snapshots are retained. This experimental policy requires
+    /// independent full-model, lifecycle and device qualification. Changing it
+    /// preserves sampler progression and the per-session prepared-prompt seal.
+    ///
+    /// # Errors
+    /// Closed admission requires explicit reset; reset failure keeps it closed.
+    pub fn set_prompt_reuse(&mut self, reuse: PromptReuse) -> Result<()> {
+        if self.is_faulted() {
+            return Err(invalid("Swift session requires reset"));
+        }
+        if self.prompt_reuse != reuse {
+            self.runtime.reset()?;
+            self.prompt_reuse = reuse;
+        }
+        Ok(())
     }
 
     /// Whether reset is required before another completion can start.
@@ -323,14 +351,10 @@ impl SwiftSession {
         validate_prompt_owner(&self.owner, prompt)?;
         validate_adapter_scale(self.adapter_identity.is_some(), prompt.adapter_scale)?;
         check_request(cancellation, deadline)?;
-        // Every request starts with empty model state. The adapter path also
-        // renews graph identity/provenance, so no scale's checkpoints survive.
-        // Sampler draws retain the existing session behavior until explicit reset.
-        if let Some(scale) = prompt.adapter_scale {
-            self.runtime.reset_with_adapter_scale(scale)?;
-        } else {
-            self.runtime.reset()?;
-        }
+        // Exact reuse is opt-in and never crosses a bitwise scale change.
+        // The runtime recomputes unmatched histories under whole-request rollback.
+        self.runtime
+            .prepare_profile_request(prompt.adapter_scale, self.prompt_reuse)?;
         let options = self.chat.generation(prompt.output_tokens)?;
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;

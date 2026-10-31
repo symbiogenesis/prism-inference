@@ -44,6 +44,7 @@ impl Engine for SwiftSession {
         Ok(ModelProfile {
             representation: self.representation(),
             adapter: self.adapter_identity().is_some(),
+            prompt_reuse: self.prompt_reuse(),
         })
     }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {

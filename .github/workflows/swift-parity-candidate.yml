@@ -1,0 +1,70 @@
+name: Swift Rust parity candidate
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'server/**'
+      - 'tools/gguf/**'
+      - 'tools/native-hash/**'
+      - 'tests/swift*'
+      - '.github/workflows/swift-parity-candidate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: swift-parity-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  model-free:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+      CARGO_BUILD_FINGERPRINT: content
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-${{ matrix.target }}
+      - name: Check native hashing, transactional serving and worker protocol
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Swift-Parity-Target'
+          $evidence = Join-Path $env:RUNNER_TEMP 'Swift-Parity-Evidence'
+          [void][IO.Directory]::CreateDirectory($evidence)
+          "SWIFT_PARITY_EVIDENCE=$evidence" >> $env:GITHUB_ENV
+          Start-Transcript -LiteralPath (Join-Path $evidence 'checks.log') | Out-Null
+          try {
+            $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+            cargo +nightly-2026-10-22 fmt --manifest-path $manifest --all -- --check
+            cargo +nightly-2026-10-22 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
+            cargo +nightly-2026-10-22 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf
+            cargo +nightly-2026-10-22 test --manifest-path $manifest --locked --release -p prism-inference --features parallel-rows --test graph --test swift_session --test swift_worker_request --test swift_worker_output --test swift_sampling --test swift_client
+            cargo +nightly-2026-10-22 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows
+            cargo +nightly-2026-10-22 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --no-deps
+          } finally { Stop-Transcript | Out-Null }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && env.SWIFT_PARITY_EVIDENCE != ''
+        with:
+          name: swift-parity-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.SWIFT_PARITY_EVIDENCE }}
+          if-no-files-found: error

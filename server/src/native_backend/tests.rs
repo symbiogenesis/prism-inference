@@ -257,6 +257,7 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
         let profile = ModelProfile {
             representation: bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1,
             adapter: true,
+            ..ModelProfile::default()
         };
         let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
         let mut value: Value = serde_json::from_slice(&original)?;
@@ -357,11 +358,20 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
         "model_sha256":swift::MODEL_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
         "runtime":"prism-inference", "context_tokens":8192, "seed":42}]})
     );
+    let reused = ModelProfile {
+        prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse::Latest,
+        ..ModelProfile::default()
+    }
+    .readiness(42);
+    let mut expected_reused = legacy;
+    expected_reused["data"][0]["prompt_reuse"] = json!("latest");
+    assert_eq!(reused, expected_reused);
     for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
         for adapter in [false, true] {
             let reply = ModelProfile {
                 representation,
                 adapter,
+                ..ModelProfile::default()
             }
             .readiness(17);
             let selected = &reply["data"][0];
@@ -819,6 +829,7 @@ fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admis
                     representation:
                         bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1,
                     adapter: true,
+                    ..ModelProfile::default()
                 };
                 value["lora"] = json!([{"id":0,"scale":1.3}]);
             }

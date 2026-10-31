@@ -100,6 +100,18 @@ pub struct Completion {
     pub finish: Finish,
 }
 
+/// Explicit request-boundary policy for reusing the latest committed live state.
+///
+/// This does not add retained snapshots or admit approximate prefix matches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PromptReuse {
+    /// Start every request from empty model state.
+    #[default]
+    Disabled,
+    /// Permit exact live-prefix reuse at an unchanged profile and scale bits.
+    Latest,
+}
+
 struct Snapshot<S> {
     state: S,
     tokens: Vec<u32>,
@@ -125,6 +137,44 @@ pub struct Runtime<D: Decoder> {
 }
 
 impl Runtime<crate::graph::Qwen35> {
+    /// Prepare one sealed profile request under an explicit prompt-reuse policy.
+    ///
+    /// Only bit-identical scales preserve the live sequence. Every scale change,
+    /// including signed zero and change-back, clears state and renews checkpoint
+    /// provenance. Unmatched prompts are still recomputed transactionally by
+    /// generation. This operation never changes caller-owned sampler draws.
+    ///
+    /// # Errors
+    /// Rejects mismatched/invalid scales and faulted admission before mutation;
+    /// reset failures keep admission closed until successful explicit reset.
+    pub fn prepare_profile_request(
+        &mut self,
+        scale: Option<f32>,
+        reuse: PromptReuse,
+    ) -> Result<()> {
+        let current = self.decoder.adapter_scale();
+        match (current, scale) {
+            (None, None) => {}
+            (Some(_), Some(scale)) => {
+                crate::model::lora::RankOneAdapter::validate_scale(scale)?;
+            }
+            _ => return Err(invalid("request scale does not match the loaded adapter")),
+        }
+        if self.faulted {
+            return Err(invalid(
+                "native runtime requires reset after failed restoration",
+            ));
+        }
+        if reuse == PromptReuse::Latest && current.map(f32::to_bits) == scale.map(f32::to_bits) {
+            return Ok(());
+        }
+        if let Some(scale) = scale {
+            self.reset_with_adapter_scale(scale)
+        } else {
+            self.reset()
+        }
+    }
+
     /// Clear complete conversation state before changing a loaded adapter scale.
     ///
     /// This narrow operation exposes no mutable decoder access. All committed

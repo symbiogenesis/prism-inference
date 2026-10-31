@@ -11,7 +11,9 @@ use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::{MatvecBackend, MatvecFallbackReason, round_f16};
 use bonsai_prism_runtime::model::lora::RankOneAdapter;
 use bonsai_prism_runtime::model::{Model, Tensor};
-use bonsai_prism_runtime::runtime::{Cancellation, Generation, Limits, Prefill, Runtime};
+use bonsai_prism_runtime::runtime::{
+    Cancellation, Generation, Limits, Prefill, PromptReuse, Runtime,
+};
 use bonsai_prism_runtime::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result};
 #[cfg(feature = "cli")]
 use serde_json::Value;
@@ -2967,6 +2969,229 @@ fn rank_one_invalid_scale_or_absent_adapter_rejects_before_mutation() -> Result<
         assert_eq!(graph_bits(runtime.decoder())?, bits);
         assert_eq!(runtime.checkpoint_count(), 1);
         assert!(!runtime.is_faulted());
+    }
+    Ok(())
+}
+
+fn profile_runtime(recurrent: bool, scale: Option<f32>) -> Result<Runtime<Qwen35>> {
+    let base = fixture(recurrent);
+    let decoder = if let Some(scale) = scale {
+        let target = if recurrent {
+            "blk.0.ssm_out.weight"
+        } else {
+            "blk.0.attn_output.weight"
+        };
+        let factors = rank_one_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
+        rank_one_graph(base, factors, scale)?
+    } else {
+        Qwen35::new(base, 16)?
+    };
+    Runtime::new(
+        decoder,
+        Limits {
+            context_tokens: 16,
+            checkpoints: 0,
+            checkpoint_bytes: 1024 * 1024,
+        },
+    )
+}
+
+#[derive(Clone)]
+struct ProfileSampler {
+    inner: bonsai_prism_runtime::sampling::ReferenceSampler,
+    logits: Vec<Vec<u32>>,
+}
+
+impl bonsai_prism_runtime::sampling::Sampler for ProfileSampler {
+    fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+        self.logits
+            .push(logits.iter().map(|value| value.to_bits()).collect());
+        bonsai_prism_runtime::sampling::Sampler::sample(&mut self.inner, logits)
+    }
+}
+
+#[test]
+fn profile_reuse_matches_fresh_state_and_sampled_failure_replay() -> Result<()> {
+    use bonsai_prism_runtime::sampling::{ReferenceSampler, Sampling};
+
+    for recurrent in [false, true] {
+        for scale in [None, Some(1.3)] {
+            let mut runtime = profile_runtime(recurrent, scale)?;
+            let mut sampler = ProfileSampler {
+                inner: ReferenceSampler::new(Sampling::default(), 42)?,
+                logits: Vec::new(),
+            };
+            let options = Generation {
+                max_tokens: 2,
+                stop_tokens: vec![],
+            };
+            let prefill = Prefill { block_tokens: 4 };
+            for case in 0..5 {
+                let previous_tokens = runtime.tokens().to_vec();
+                let prompt = match case {
+                    0 => vec![0],
+                    1 => [previous_tokens.clone(), vec![1]].concat(),
+                    2 => vec![1], // Edited history must recompute, never truncate recurrence.
+                    3 => vec![0, 1], // Switched history has no retained snapshot.
+                    _ => previous_tokens.clone(),
+                };
+                runtime.prepare_profile_request(scale, PromptReuse::Latest)?;
+                let mut reference_sampler = sampler.clone();
+                profile_request_failures(&mut runtime, &prompt, &options, &mut sampler)?;
+                let mut reference = profile_runtime(recurrent, scale)?;
+                let mut expected = Vec::new();
+                reference.generate_sampled(
+                    &prompt,
+                    &options,
+                    prefill,
+                    &Cancellation::default(),
+                    &mut reference_sampler,
+                    |token| {
+                        expected.push(token);
+                        Ok(())
+                    },
+                )?;
+                let mut actual = Vec::new();
+                let completion = runtime.generate_sampled(
+                    &prompt,
+                    &options,
+                    prefill,
+                    &Cancellation::default(),
+                    &mut sampler,
+                    |token| {
+                        actual.push(token);
+                        Ok(())
+                    },
+                )?;
+                assert_eq!(actual, expected);
+                assert_eq!(sampler.logits, reference_sampler.logits);
+                assert_eq!(runtime.tokens(), reference.tokens());
+                assert_eq!(
+                    graph_bits(runtime.decoder())?,
+                    graph_bits(reference.decoder())?
+                );
+                assert_eq!(
+                    completion.reused_tokens,
+                    if prompt.starts_with(&previous_tokens) {
+                        previous_tokens.len()
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(runtime.checkpoint_count(), 0);
+            }
+            if scale.is_none() {
+                let tokens = runtime.tokens().to_vec();
+                let bits = graph_bits(runtime.decoder())?;
+                assert!(
+                    runtime
+                        .prepare_profile_request(Some(0.0), PromptReuse::Latest)
+                        .is_err()
+                );
+                assert_eq!(runtime.tokens(), tokens);
+                assert_eq!(graph_bits(runtime.decoder())?, bits);
+            }
+            runtime.prepare_profile_request(scale, PromptReuse::Disabled)?;
+            assert_eq!(runtime.tokens(), [0_u32; 0]);
+        }
+    }
+    Ok(())
+}
+
+fn profile_request_failures(
+    runtime: &mut Runtime<Qwen35>,
+    prompt: &[u32],
+    options: &Generation,
+    sampler: &mut ProfileSampler,
+) -> Result<()> {
+    let tokens = runtime.tokens().to_vec();
+    let bits = graph_bits(runtime.decoder())?;
+    let logits = sampler.logits.clone();
+    for cancel in [false, true] {
+        let cancellation = Cancellation::default();
+        assert!(
+            runtime
+                .generate_sampled(
+                    prompt,
+                    options,
+                    Prefill { block_tokens: 4 },
+                    &cancellation,
+                    sampler,
+                    |_| {
+                        if cancel {
+                            cancellation.cancel();
+                            Ok(())
+                        } else {
+                            Err("abandoned provisional output".into())
+                        }
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.tokens(), tokens);
+        assert_eq!(graph_bits(runtime.decoder())?, bits);
+        assert_eq!(sampler.logits, logits);
+        assert!(!runtime.is_faulted());
+    }
+    Ok(())
+}
+
+#[test]
+fn profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary() -> Result<()> {
+    let options = Generation {
+        max_tokens: 1,
+        stop_tokens: vec![],
+    };
+    for recurrent in [false, true] {
+        let mut runtime = profile_runtime(recurrent, Some(1.3))?;
+        for scale in [1.3_f32, 1.3, 0.0, -0.0, 2.0, 1.3] {
+            let old_scale = runtime.decoder().adapter_scale();
+            let tokens = runtime.tokens().to_vec();
+            let bits = graph_bits(runtime.decoder())?;
+            runtime.prepare_profile_request(Some(scale), PromptReuse::Latest)?;
+            if old_scale.map(f32::to_bits) == Some(scale.to_bits()) {
+                assert_eq!(runtime.tokens(), tokens);
+                assert_eq!(graph_bits(runtime.decoder())?, bits);
+            } else {
+                assert_eq!(runtime.tokens(), [0_u32; 0]);
+                assert!(graph_bits(runtime.decoder())?.iter().all(|&bits| bits == 0));
+            }
+            assert_eq!(
+                runtime.decoder().adapter_scale().map(f32::to_bits),
+                Some(scale.to_bits())
+            );
+            runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
+            let mut reference = profile_runtime(recurrent, Some(scale))?;
+            reference.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
+            assert_eq!(runtime.tokens(), reference.tokens());
+            assert_eq!(
+                graph_bits(runtime.decoder())?,
+                graph_bits(reference.decoder())?
+            );
+            let tokens = runtime.tokens().to_vec();
+            let bits = graph_bits(runtime.decoder())?;
+            for invalid in [None, Some(f32::NAN), Some(-1.0)] {
+                assert!(
+                    runtime
+                        .prepare_profile_request(invalid, PromptReuse::Latest)
+                        .is_err()
+                );
+                assert_eq!(runtime.tokens(), tokens);
+                assert_eq!(graph_bits(runtime.decoder())?, bits);
+                assert!(!runtime.is_faulted());
+            }
+        }
+        runtime.prepare_profile_request(Some(1.3), PromptReuse::Disabled)?;
+        assert_eq!(runtime.tokens(), [0_u32; 0]);
+        runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
+        runtime.reset()?;
+        runtime.prepare_profile_request(Some(1.3), PromptReuse::Latest)?;
+        assert_eq!(
+            runtime
+                .generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?
+                .reused_tokens,
+            0
+        );
     }
     Ok(())
 }

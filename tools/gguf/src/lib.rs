@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "report")]
 use serde_json::Value;
+#[cfg(feature = "report")]
 use sha2::{Digest, Sha256};
 
 pub use inspect::TensorDescriptor;
@@ -56,26 +57,30 @@ fn open_read(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(feature = "report")]
 pub(crate) fn digest_hex(hash: Sha256) -> String {
-    hash.finalize()
+    bytes_hex(hash.finalize().into())
+}
+
+fn bytes_hex(digest: [u8; 32]) -> String {
+    digest
         .into_iter()
         .flat_map(|byte| [byte >> 4, byte & 0x0f])
         .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
         .collect()
 }
-pub(crate) fn hash_range(file: &mut File, start: u64, mut length: u64) -> Result<String> {
+pub(crate) fn hash_range(file: &mut File, start: u64, length: u64) -> Result<String> {
     let restore = file.stream_position()?;
     let result = (|| {
         file.seek(SeekFrom::Start(start))?;
-        let mut hash = Sha256::new();
         let mut buffer = vec![0_u8; 65_536];
-        while length != 0 {
-            let count = usize::try_from(length.min(65_536))?;
-            file.read_exact(&mut buffer[..count])?;
-            hash.update(&buffer[..count]);
-            length -= u64::try_from(count)?;
-        }
-        Ok(digest_hex(hash))
+        let digest = bonsai_native_hash::hash_reader(
+            &mut Read::by_ref(file).take(length),
+            length,
+            &mut buffer,
+            &mut || Ok(()),
+        )?;
+        Ok(bytes_hex(digest))
     })();
     file.seek(SeekFrom::Start(restore))?;
     result

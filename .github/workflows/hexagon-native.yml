@@ -1,0 +1,35 @@
+name: Experimental native Hexagon boundary
+on:
+  push:
+    branches: ['codex/hexagon-**']
+    paths:
+      - tools/hexagon-native/**
+      - .github/workflows/hexagon-native.yml
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-contracts:
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+      - name: Check the isolated unpublished crate without opening a device
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $target = Join-Path $env:RUNNER_TEMP 'Prism-Hexagon-Native-Target'
+          cargo +nightly-2026-10-22-aarch64-pc-windows-msvc fmt --manifest-path $manifest -p bonsai-hexagon-native -- --check
+          cargo +nightly-2026-10-22-aarch64-pc-windows-msvc test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets
+          cargo +nightly-2026-10-22-aarch64-pc-windows-msvc clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings

@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
-//! Bounded, explicit actual-model load and forward correctness evidence.
+//! Bounded, explicit actual-model load, forward and rollback correctness evidence.
+
+#[path = "swift_model_check/rollback.rs"]
+mod rollback;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,13 +25,16 @@ const USAGE: &str = concat!(
     "Usage: swift_model_check <inspect|load> <absolute-model>\n",
     "       swift_model_check forward <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check trajectory <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>\n",
+    "       swift_model_check rollback <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
-    "For load/forward/trajectory, --row-workers <1..16> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
-    "For selected current-weight load/forward/trajectory, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
+    "For load/forward/trajectory/rollback, --row-workers <1..16> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
+    "For selected current-weight load/forward/trajectory/rollback, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
     "Evidence directories must already exist. Files are create-new; trajectory snapshot payload is capped at 8 GiB.\n",
+    "rollback permits 1..16 supplied IDs, cancels after one evaluated provisional token and compares full state/tokens/logits before reset plus fresh-recompute continuation; at most 2 GiB of snapshots.\n",
+    "Its explicit capture-stop token 0 and raw greedy tokens do not qualify model stops, production sampling or private HTTP cancellation.\n",
     "Evaluation milliseconds exclude model loading, snapshots, greedy selection and output; they do not establish benchmark or service qualification.\n",
 );
 
@@ -69,7 +75,10 @@ fn run() -> Result<()> {
     let mode = &arguments[0];
     let path = PathBuf::from(&arguments[1]);
     if !path.is_absolute()
-        || !matches!(mode.as_str(), "inspect" | "load" | "forward" | "trajectory")
+        || !matches!(
+            mode.as_str(),
+            "inspect" | "load" | "forward" | "trajectory" | "rollback"
+        )
     {
         return Err(reject(
             "an explicit mode and absolute model path are required",
@@ -109,6 +118,13 @@ fn run() -> Result<()> {
             row_workers.unwrap_or(1),
         ),
         "trajectory" => trajectory(
+            &path,
+            &arguments[2..],
+            representation,
+            adapter.as_ref(),
+            row_workers.unwrap_or(1),
+        ),
+        "rollback" => rollback::run(
             &path,
             &arguments[2..],
             representation,

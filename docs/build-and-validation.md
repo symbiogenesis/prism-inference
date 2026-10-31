@@ -174,6 +174,38 @@ payload is capped at 8 GiB. Retain absolute external outputs and the existing
 process-memory/deadline supervision. No timings or throughput are measured.
 The evidence-write guards run in the ordinary hosted correctness suite.
 
+The `rollback` mode supplies the missing complete-state observation before any
+reset. With 1–16 exact public input IDs, it commits the prefix, captures all
+logical KV/convolution/recurrent state and logits, appends the final supplied ID
+and cancels after the first evaluated provisional greedy token. Successful
+recovery must return `Interrupted`, restore the exact committed token IDs and
+match every captured binary32 bit. It then compares a one-token continuation
+with fresh recomputation, including full logits and state:
+
+```text
+swift_model_check --row-workers 4 --rank-one-adapter <absolute-approved-adapter> 1.3 rollback <absolute-original-PQ2> <new-existing-absolute-evidence-dir> auto 248045
+```
+
+Use one worker explicitly when qualifying that independent profile; four workers
+require the existing `parallel-rows` build. The representation, worker and adapter
+prefixes compose as in `forward`. `rollback.json` records completed steps and
+failure without overwriting prior evidence. Its four capture directories retain
+exact token IDs, complete state/logit files, lengths and SHA-256 digests, with one
+aggregate 2 GiB snapshot-payload cap. Missing or differing components fail.
+
+The capture sampler returns the explicitly declared stop token `0` only to inspect
+the existing logits without advancing the graph. After cancellation these probes
+must be exact live-prefix hits. Ordinary greedy continuation includes special IDs;
+neither mechanism qualifies production sampling or model-stop behavior. Cancellation
+is cooperative after a completed model step, not interruption inside a graph kernel.
+This source checker does not qualify released private HTTP cancellation, the
+reset-every-request serving policy, numerical parity with an independent engine,
+quality, resources or performance. Actual-model evidence is pending until a
+source-bound hosted build and an audited owning device capture pass. All device
+setup, loading, capture, comparison and cleanup must fit the one five-minute
+owner allowance under external process/Job/deadline supervision; do not execute a
+second model trial to complete a larger matrix.
+
 PQ2 without an adapter remains the default service profile.
 For the verified lossless export of those same current weights, prefix the
 offline checker command with `--use-repacked-ptq1`:
@@ -182,7 +214,7 @@ offline checker command with `--use-repacked-ptq1`:
 swift_model_check --use-repacked-ptq1 forward <absolute-current-repacked-PTQ1-model> <existing-absolute-evidence-dir> <scalar|auto|neon> <id,id,...>
 ```
 
-The prefix also applies to `inspect`, `load` and `trajectory`. It admits only
+The prefix also applies to `inspect`, `load`, `trajectory` and `rollback`. It admits only
 the current-weight export with SHA-256
 `e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5`,
 5,946,648,928 complete file bytes and the strict 851-tensor PTQ1/F32/BF16
@@ -205,8 +237,8 @@ do not loosen the trusted same-format correctness tolerance to make it pass.
 
 The source graph implements an explicit [rank-one adapter correctness path](rank-one-adapter.md);
 the offline checker accepts `--rank-one-adapter <absolute-approved-adapter> <scale>`
-after the optional `--use-repacked-ptq1` prefix for `load`, `forward` and
-`trajectory`. Both base selection and approved adapter verification remain exact;
+after the optional `--use-repacked-ptq1` prefix for `load`, `forward`, `trajectory`
+and `rollback`. Both base selection and approved adapter verification remain exact;
 the existing PQ2 constructor defaults do not admit the export implicitly.
 The JSONL workers remain adapter-free. The explicit private service requires the
 exact approved adapter and pinned-slot request scale. An approved LoRA's

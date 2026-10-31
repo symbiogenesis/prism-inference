@@ -318,6 +318,7 @@ mod tests {
             // SAFETY: exercise supplies one live writable u64 output slot.
             unsafe { handle.write(42) };
         }
+        drop(state);
         0
     }
 
@@ -337,7 +338,9 @@ mod tests {
             return std::ptr::null_mut();
         }
         let page = state.page.insert(Box::new(Page([0; 4096])));
-        page.0.as_mut_ptr().cast()
+        let pointer = page.0.as_mut_ptr().cast();
+        drop(state);
+        pointer
     }
 
     unsafe extern "C" fn free(_: *mut c_void) {
@@ -407,7 +410,7 @@ mod tests {
             };
             let mut stages = Vec::new();
             let report = exercise(metadata, &uri, &calls, &mut |snapshot| {
-                stages.push(snapshot.stage)
+                stages.push(snapshot.stage);
             });
             assert_eq!(report.completed_cycle(), fail.is_empty());
             assert_eq!(stages.first(), Some(&"module-open-entered"));
@@ -442,6 +445,7 @@ mod tests {
         };
         metadata.uri_verified = false;
         assert!(!exercise(metadata, &uri, &calls, &mut |_| {}).remote_module_opened);
-        assert!(state().calls.is_empty());
+        let no_calls: [&str; 0] = [];
+        assert_eq!(state().calls, no_calls);
     }
 }

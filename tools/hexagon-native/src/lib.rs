@@ -385,6 +385,38 @@ impl Driver {
         }
     }
 
+    /// Run the fixed signed-package reference process initialization and FD probe.
+    ///
+    /// This separately selected diagnostic additionally issues the reference's
+    /// `DSPRPC_CONTROL_UNSIGNED_MODULE` request with enable=1 for the validated
+    /// effective default-CDSP domain before `GET_URI` and module open. This selects an
+    /// unsigned DSP process class; it is not a signed-PD-only control and cannot
+    /// authorize arbitrary DSP bytes. The supervisor must still independently
+    /// verify and retain the pinned signed package/catalog and driver identities.
+    /// It changes no OS certificate store, test-signing or boot policy. Exact
+    /// closed Windows-driver implementation semantics remain vendor-dependent.
+    /// There is no fallback or retry from `session_mapping_probe`; choosing this
+    /// method is explicit. All owners stay pinned after the initialization attempt.
+    ///
+    /// # Errors
+    /// Uses the same path/environment, process deadline, guarded package and
+    /// verified cleanup prerequisites as `session_mapping_probe`. Native refusal
+    /// remains an exact code in the terminal receipt; no weaker path follows it.
+    pub fn reference_session_mapping_probe(
+        self,
+        package_directory: &Path,
+        progress: impl FnMut(&SessionMappingReport),
+    ) -> Result<SessionMappingReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_session_mapping_probe(self.inner, package_directory, progress)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, progress);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
     /// Consume this driver in one fixed 4KiB allocation/registration/unmap probe.
     ///
     /// The documented registration call may implicitly open a domain session;

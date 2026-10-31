@@ -17,6 +17,10 @@
       {
         "path": "ggml/src/ggml-hexagon/htp/htp_iface.idl",
         "sha256": "bd5da5c2aa14c45a8585213d704f47ce0a51cbbcab419b44f969191bdaddf063"
+      },
+      {
+        "path": "ggml/src/ggml-hexagon/ggml-hexagon.cpp",
+        "sha256": "3e0c3f27de2c9851ac40a7b6f8cdb5cef16282fda5ff76ffe0999061a0eb38a9"
       }
     ]
   },
@@ -32,6 +36,11 @@
       {
         "path": "inc/rpcmem.h",
         "sha256": "363718de80ebcd7c1180477df0b3d5c005cb63fbec7cf6ff0863c3e7c46323b2"
+      },
+      {
+        "path": "src/fastrpc_apps_user.c",
+        "sha256": "daee04f074418978e7e6f4ca450a66e0e32b395bc927e2165dc9940f58a75f71",
+        "purpose": "public-Linux-reference-process-class-semantics-not-closed-Windows-driver-implementation"
       }
     ]
   },
@@ -137,6 +146,37 @@
         "fastrpc_munmap"
       ],
       "authoritativeCloseHandle": "vendor remote.h remote_handle64 = uint64; reference wrapper close-pointer typedef remote_handle differs and is not copied"
+    },
+    "referenceProcessInitialization": {
+      "explicitCliMode": "--reference-session-mapping-probe",
+      "request": 2,
+      "structureBytes": 8,
+      "structureAlignment": 4,
+      "domain": "validated-default-CDSP-effective-domain-only",
+      "enable": 1,
+      "order": [
+        "capability",
+        "effective-domain",
+        "pin-all-owners-and-terminal-admission",
+        "fixed-reference-process-initialization",
+        "GET_URI",
+        "fixed-module-open",
+        "FD-map-unmap-free-close"
+      ],
+      "meaning": "request-unsigned-DSP-process-class; does-not-prove-DSP-signed-PD",
+      "publicLinuxScope": "process-local-domain-attribute-before-session-open; default-zero/signed; opened-class-change-rejects",
+      "closedWindowsScope": "exact-implementation-not-public; runtime-result-and-vendor-session-teardown-need-independent-qualification",
+      "osTrustChanged": false,
+      "bootPolicyChanged": false,
+      "certificatesChanged": false,
+      "arbitraryModuleAuthorization": false,
+      "nativeRefusalFallback": false,
+      "retainsPriorDefaultSessionObservation": true,
+      "ownersPinnedBeforeInitialization": true,
+      "allPinningTerminal": true,
+      "progress": "hexagon-session:stage=reference-process-init-entered",
+      "selectedSignedPackageStillRequired": true,
+      "exactLoadedDspBytes": "pending-independent-binding"
     }
   },
   "windowsAbi": [

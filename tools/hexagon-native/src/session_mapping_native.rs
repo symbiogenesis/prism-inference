@@ -1,7 +1,7 @@
 //! Fixed signed-module open followed by one established-session FD-map cycle.
 
 use super::{Driver, GetProcAddress, last_error, mapping, no_reparse, session_native};
-use crate::{Error, MAP_FD, SessionMappingReport, SessionPreparationReport};
+use crate::{Capability, Error, MAP_FD, SessionMappingReport, SessionPreparationReport};
 use std::ffi::{CStr, c_char, c_void};
 use std::fs::{File, OpenOptions};
 use std::mem::ManuallyDrop;
@@ -137,9 +137,117 @@ pub(super) fn probe(
     // the driver or release the checked package files. Process supervision owns
     // the remaining lifetime; process death is not a qualified vendor teardown.
     let _owner = ManuallyDrop::new((driver, guards));
-    Ok(exercise(metadata, &uri, &calls, &mut progress))
+    Ok(exercise(
+        SessionMappingReport::new(metadata),
+        &uri,
+        &calls,
+        &mut progress,
+    ))
 }
 
+// Public remote.h session_control_req_id starts at zero: this is its third
+// fixed entry; the matching two-int C structure is remote_rpc_control_unsigned_module.
+const REFERENCE_PROCESS_REQUEST: u32 = 2;
+
+#[repr(C)]
+struct ReferenceProcessRequest {
+    domain: i32,
+    enable: i32,
+}
+
+const _: () = assert!(size_of::<ReferenceProcessRequest>() == 8);
+const _: () = assert!(align_of::<ReferenceProcessRequest>() == 4);
+const _: () = assert!(std::mem::offset_of!(ReferenceProcessRequest, enable) == 4);
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "The safe API exposes a separately named fixed reference initialization only"
+)]
+pub(super) fn reference_probe(
+    mut driver: Driver,
+    package: &Path,
+    mut progress: impl FnMut(&SessionMappingReport),
+) -> Result<SessionMappingReport, Error> {
+    let raw = driver.capability(Capability::Architecture)?;
+    let initial = SessionPreparationReport::new(raw);
+    let Some(architecture) = initial.architecture else {
+        let mut report = SessionMappingReport::new(initial);
+        report.reference_process_initialization_selected = true;
+        return Ok(report);
+    };
+    let guards = package_guards(package, architecture)?;
+    let calls = functions(&driver)?;
+    let control = session_native::session_control(&driver)?;
+    let metadata = session_native::prepare_effective_domain(raw, control);
+    let mut report = SessionMappingReport::new(metadata);
+    report.reference_process_initialization_selected = true;
+    if metadata.effective_domain.is_none() || metadata.domain_result != Some(0) {
+        return Ok(report);
+    }
+    mapping::admit_terminal()?;
+    // Reference process-class selection is a native session-affecting operation.
+    // Pin all owners before attempting it, even when no module is later opened.
+    let _owner = ManuallyDrop::new((driver, guards));
+    Ok(reference_after_domain(
+        report,
+        control,
+        &calls,
+        &mut progress,
+    ))
+}
+
+fn reference_after_domain(
+    mut report: SessionMappingReport,
+    control: session_native::SessionControl,
+    calls: &Functions,
+    progress: &mut impl FnMut(&SessionMappingReport),
+) -> SessionMappingReport {
+    let Some(domain) = report.metadata.effective_domain else {
+        return report;
+    };
+    if !report.reference_process_initialization_selected
+        || report.metadata.architecture.is_none()
+        || report.metadata.domain_result != Some(0)
+        || domain < 0
+        || report.metadata.uri_result.is_some()
+    {
+        return report;
+    }
+    report.owner_pinned_until_exit = true;
+    entered(&mut report, "reference-process-init-entered", progress);
+    let mut request = ReferenceProcessRequest { domain, enable: 1 };
+    report.unsigned_process_requested = true;
+    // SAFETY: the pinned eight-byte/two-int ABI selects the returned effective
+    // default-CDSP domain, enable=1, before any module open. This is the exact
+    // reference initializer, not an OS trust/certificate/boot-policy operation.
+    let result = unsafe {
+        control(
+            REFERENCE_PROCESS_REQUEST,
+            std::ptr::from_mut(&mut request).cast(),
+            8,
+        )
+    };
+    report.process_initialization_result = Some(result);
+    if result != 0 {
+        report.stage = "reference-process-init-refused-pinned";
+        return report;
+    }
+    if request.domain != domain || request.enable != 1 {
+        report.stage = "reference-process-init-contract-changed-pinned";
+        return report;
+    }
+    let mut uri = [0xa5; 256];
+    let Ok(metadata) = session_native::prepare_fixed_uri(report.metadata, control, &mut uri) else {
+        report.stage = "session-metadata-incomplete";
+        return report;
+    };
+    report.metadata = metadata;
+    if !report.metadata.metadata_prepared() {
+        report.stage = "session-metadata-incomplete";
+        return report;
+    }
+    exercise(report, &uri, calls, progress)
+}
 fn entered(
     report: &mut SessionMappingReport,
     stage: &'static str,
@@ -164,12 +272,12 @@ fn close_module(
 }
 
 fn exercise(
-    metadata: SessionPreparationReport,
+    mut report: SessionMappingReport,
     uri: &[u8; 256],
     calls: &Functions,
     progress: &mut impl FnMut(&SessionMappingReport),
 ) -> SessionMappingReport {
-    let mut report = SessionMappingReport::new(metadata);
+    let metadata = report.metadata;
     let Some(domain) = metadata.effective_domain else {
         return report;
     };
@@ -409,9 +517,14 @@ mod tests {
                 page: None,
             };
             let mut stages = Vec::new();
-            let report = exercise(metadata, &uri, &calls, &mut |snapshot| {
-                stages.push(snapshot.stage);
-            });
+            let report = exercise(
+                SessionMappingReport::new(metadata),
+                &uri,
+                &calls,
+                &mut |snapshot| {
+                    stages.push(snapshot.stage);
+                },
+            );
             assert_eq!(report.completed_cycle(), fail.is_empty());
             assert_eq!(stages.first(), Some(&"module-open-entered"));
             assert!(report.owner_pinned_until_exit);
@@ -444,7 +557,165 @@ mod tests {
             page: None,
         };
         metadata.uri_verified = false;
-        assert!(!exercise(metadata, &uri, &calls, &mut |_| {}).remote_module_opened);
+        assert!(
+            !exercise(
+                SessionMappingReport::new(metadata),
+                &uri,
+                &calls,
+                &mut |_| {}
+            )
+            .remote_module_opened
+        );
+        let no_calls: [&str; 0] = [];
+        assert_eq!(state().calls, no_calls);
+    }
+    #[repr(C)]
+    struct TestUri {
+        domain: *mut c_char,
+        domain_len: u32,
+        session: u32,
+        module: *mut c_char,
+        module_len: u32,
+        uri: *mut c_char,
+        uri_len: u32,
+    }
+
+    unsafe extern "C" fn reference_control(request: u32, data: *mut c_void, bytes: u32) -> i32 {
+        let mut state = state();
+        if request == 2 && bytes == 8 {
+            state.calls.push("init");
+            let fail = state.fail;
+            drop(state);
+            // SAFETY: reference_after_domain passes this exact live two-int layout.
+            let request = unsafe { &mut *data.cast::<ReferenceProcessRequest>() };
+            if (request.domain, request.enable) != (3, 1) {
+                return 14;
+            }
+            if fail == "init" {
+                return 512;
+            }
+            if fail == "init-contract" {
+                request.enable = 0;
+            }
+            0
+        } else if request == 15 && bytes == 48 {
+            state.calls.push("uri");
+            let fail = state.fail;
+            drop(state);
+            if fail == "uri" {
+                return 512;
+            }
+            // SAFETY: prepare_fixed_uri passes the exact tested 48-byte C request.
+            let request = unsafe { &mut *data.cast::<TestUri>() };
+            if request.domain_len != 4 || request.session != 0 {
+                return 14;
+            }
+            // SAFETY: the fixed caller owns these exact terminated input arrays.
+            let domain = unsafe { CStr::from_ptr(request.domain) };
+            // SAFETY: the fixed caller owns its full terminated module URI array.
+            let module = unsafe { CStr::from_ptr(request.module) };
+            if domain.to_bytes() != b"cdsp"
+                || module.to_bytes()
+                    != b"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0"
+                || usize::try_from(request.module_len).unwrap_or_default()
+                    != module.to_bytes().len()
+            {
+                return 14;
+            }
+            let uri = b"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0\0";
+            if request.uri_len != 256 {
+                return 14;
+            }
+            // SAFETY: the fixed caller owns its 256-byte writable output array.
+            unsafe {
+                std::ptr::copy_nonoverlapping(uri.as_ptr(), request.uri.cast::<u8>(), uri.len());
+            };
+            0
+        } else {
+            14
+        }
+    }
+
+    #[test]
+    fn reference_initialization_precedes_uri_and_open_and_never_retries() {
+        let _lease = TEST_LEASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = Functions {
+            open,
+            close,
+            alloc,
+            free,
+            to_fd,
+            map,
+            unmap,
+        };
+        let mut metadata = SessionPreparationReport::new(0x81);
+        metadata.domain_result = Some(0);
+        metadata.effective_domain = Some(3);
+        metadata.stage = "effective-domain-prepared";
+        for fail in ["", "init", "init-contract", "uri", "open", "map"] {
+            *state() = State {
+                fail,
+                calls: Vec::new(),
+                page: None,
+            };
+            let mut initial = SessionMappingReport::new(metadata);
+            initial.reference_process_initialization_selected = true;
+            let mut stages = Vec::new();
+            let report =
+                reference_after_domain(initial, reference_control, &calls, &mut |snapshot| {
+                    stages.push(snapshot.stage);
+                });
+            assert!(report.reference_process_initialization_selected);
+            assert!(report.unsigned_process_requested);
+            assert!(report.owner_pinned_until_exit);
+            assert_eq!(report.completed_cycle(), fail.is_empty());
+            assert_eq!(stages.first(), Some(&"reference-process-init-entered"));
+            let state = state();
+            match fail {
+                "init" => {
+                    assert_eq!(state.calls, ["init"]);
+                    assert_eq!(report.process_initialization_result, Some(512));
+                    assert_eq!(report.stage, "reference-process-init-refused-pinned");
+                }
+                "init-contract" => {
+                    assert_eq!(state.calls, ["init"]);
+                    assert_eq!(report.process_initialization_result, Some(0));
+                    assert_eq!(
+                        report.stage,
+                        "reference-process-init-contract-changed-pinned"
+                    );
+                }
+                "uri" => {
+                    assert_eq!(state.calls, ["init", "uri"]);
+                    assert_eq!(report.metadata.uri_result, Some(512));
+                    assert_eq!(report.module_open_result, None);
+                }
+                "open" => assert_eq!(state.calls, ["init", "uri", "open"]),
+                "map" => {
+                    assert_eq!(state.calls, ["init", "uri", "open", "alloc", "fd", "map"]);
+                    assert!(state.page.is_some());
+                }
+                _ => assert_eq!(
+                    state.calls,
+                    [
+                        "init", "uri", "open", "alloc", "fd", "map", "unmap", "free", "close"
+                    ]
+                ),
+            }
+        }
+        *state() = State {
+            fail: "",
+            calls: Vec::new(),
+            page: None,
+        };
+        let mut invalid = SessionMappingReport::new(metadata);
+        invalid.reference_process_initialization_selected = true;
+        invalid.metadata.domain_result = Some(512);
+        let refused = reference_after_domain(invalid, reference_control, &calls, &mut |_| {});
+        assert_eq!(refused.process_initialization_result, None);
+        assert!(!refused.unsigned_process_requested);
         let no_calls: [&str; 0] = [];
         assert_eq!(state().calls, no_calls);
     }

@@ -413,6 +413,17 @@ pub(super) fn session_mapping_probe(
     session_mapping_native::probe(driver, package, progress)
 }
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe parent may select the separate fixed reference initializer"
+)]
+pub(super) fn reference_session_mapping_probe(
+    driver: Driver,
+    package: &Path,
+    progress: impl FnMut(&crate::SessionMappingReport),
+) -> Result<crate::SessionMappingReport, Error> {
+    session_mapping_native::reference_probe(driver, package, progress)
+}
 impl Drop for Driver {
     fn drop(&mut self) {
         // SAFETY: this owner completed only fixed queries or pre-mapping cleanup.

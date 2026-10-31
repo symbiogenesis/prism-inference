@@ -16,6 +16,12 @@ use crate::{MappingProbeReport, SessionPreparationReport};
 pub struct SessionMappingReport {
     /// Fixed completed or entered stage, suitable for bounded progress capture.
     pub stage: &'static str,
+    /// The separately named reference-process initializer was explicitly selected.
+    pub reference_process_initialization_selected: bool,
+    /// Exact fixed process-initialization return; absent means not attempted.
+    pub process_initialization_result: Option<i32>,
+    /// The per-process unsigned-PD request was actually invoked, not inferred.
+    pub unsigned_process_requested: bool,
     /// Exact architecture/domain/URI metadata requests and results.
     pub metadata: SessionPreparationReport,
     /// Native module-open return, absent when not attempted.
@@ -38,6 +44,9 @@ impl SessionMappingReport {
     pub(crate) const fn new(metadata: SessionPreparationReport) -> Self {
         Self {
             stage: "session-metadata-incomplete",
+            reference_process_initialization_selected: false,
+            process_initialization_result: None,
+            unsigned_process_requested: false,
             metadata,
             module_open_result: None,
             handle_observed: false,
@@ -55,7 +64,11 @@ impl SessionMappingReport {
     /// nor complete vendor session teardown. The supervisor verifies those separately.
     #[must_use]
     pub const fn completed_cycle(self) -> bool {
-        self.metadata.metadata_prepared()
+        (if self.reference_process_initialization_selected {
+            self.unsigned_process_requested && matches!(self.process_initialization_result, Some(0))
+        } else {
+            !self.unsigned_process_requested && self.process_initialization_result.is_none()
+        }) && self.metadata.metadata_prepared()
             && matches!(self.module_open_result, Some(0))
             && self.handle_observed
             && self.remote_module_opened
@@ -92,6 +105,11 @@ mod tests {
         report.module_close_result = Some(0);
         report.module_close_completed = true;
         report.owner_pinned_until_exit = true;
+        assert!(report.completed_cycle());
+        report.reference_process_initialization_selected = true;
+        assert!(!report.completed_cycle());
+        report.process_initialization_result = Some(0);
+        report.unsigned_process_requested = true;
         assert!(report.completed_cycle());
         report.mapping.poisoned = true;
         assert!(!report.completed_cycle());

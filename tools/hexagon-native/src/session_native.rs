@@ -4,7 +4,11 @@ use super::{Driver, GetProcAddress, last_error};
 use crate::{Capability, Error, SessionPreparationReport, session};
 use std::ffi::{c_char, c_void};
 
-type SessionControl = unsafe extern "C" fn(u32, *mut c_void, u32) -> i32;
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only sibling fixed-session paths share this private ABI alias"
+)]
+pub(super) type SessionControl = unsafe extern "C" fn(u32, *mut c_void, u32) -> i32;
 
 #[repr(C)]
 #[allow(
@@ -59,6 +63,14 @@ pub(super) fn prepare_with_uri(
     if report.architecture.is_none() {
         return Ok(report);
     }
+    prepare_fixed_metadata(raw, session_control(driver)?, uri)
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the private fixed session paths use this pinned export"
+)]
+pub(super) fn session_control(driver: &Driver) -> Result<SessionControl, Error> {
     // SAFETY: the retained driver owns the DLL and the fixed export is NUL terminated.
     let symbol =
         unsafe { GetProcAddress(driver.library.as_ptr(), c"remote_session_control".as_ptr()) };
@@ -66,8 +78,7 @@ pub(super) fn prepare_with_uri(
         return Err(last_error("session-metadata-export"));
     }
     // SAFETY: the pinned vendor header specifies this exact C function signature.
-    let control = unsafe { std::mem::transmute::<*mut c_void, SessionControl>(symbol) };
-    prepare_fixed_metadata(raw, control, uri)
+    Ok(unsafe { std::mem::transmute::<*mut c_void, SessionControl>(symbol) })
 }
 
 fn prepare_fixed_metadata(
@@ -75,12 +86,21 @@ fn prepare_fixed_metadata(
     control: SessionControl,
     uri: &mut [u8; 256],
 ) -> Result<SessionPreparationReport, Error> {
+    prepare_fixed_uri(prepare_effective_domain(raw, control), control, uri)
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "The reference initializer must occur after domain metadata and before URI formatting"
+)]
+pub(super) fn prepare_effective_domain(
+    raw: u32,
+    control: SessionControl,
+) -> SessionPreparationReport {
     let mut report = SessionPreparationReport::new(raw);
-    let Some(architecture) = report.architecture else {
-        return Ok(report);
-    };
-    let module = session::module_uri(architecture).ok_or(Error::Contract)?;
-    let module_len = u32::try_from(module.len() - 1).map_err(|_| Error::Contract)?;
+    if report.architecture.is_none() {
+        return report;
+    }
 
     let mut domain = *b"cdsp\0";
     let domain_ptr = domain.as_mut_ptr().cast::<c_char>();
@@ -102,7 +122,7 @@ fn prepare_fixed_metadata(
     report.domain_result = Some(result);
     if result != 0 {
         report.stage = "effective-domain-refused";
-        return Ok(report);
+        return report;
     }
     if request.domain_name != domain_ptr
         || request.domain_name_len != 4
@@ -110,14 +130,37 @@ fn prepare_fixed_metadata(
         || domain != *b"cdsp\0"
     {
         report.stage = "effective-domain-contract-changed";
-        return Ok(report);
+        return report;
     }
     let Ok(effective_domain) = i32::try_from(request.effective_domain_id) else {
         report.stage = "effective-domain-out-of-range";
-        return Ok(report);
+        return report;
     };
     report.effective_domain = Some(effective_domain);
 
+    report.stage = "effective-domain-prepared";
+    report
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the two private fixed session paths may format this module URI"
+)]
+pub(super) fn prepare_fixed_uri(
+    mut report: SessionPreparationReport,
+    control: SessionControl,
+    uri: &mut [u8; 256],
+) -> Result<SessionPreparationReport, Error> {
+    if report.effective_domain.is_none() || report.domain_result != Some(0) {
+        return Ok(report);
+    }
+    let Some(architecture) = report.architecture else {
+        return Ok(report);
+    };
+    let module = session::module_uri(architecture).ok_or(Error::Contract)?;
+    let module_len = u32::try_from(module.len() - 1).map_err(|_| Error::Contract)?;
+    let mut domain = *b"cdsp\0";
+    let domain_ptr = domain.as_mut_ptr().cast::<c_char>();
     // Mutable owned storage satisfies the C ABI without allowing a provider to
     // write into a Rust string literal. The input is checked again after return.
     let mut module_bytes = module.to_vec();

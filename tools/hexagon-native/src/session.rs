@@ -4,6 +4,8 @@
     reason = "Private URI and receipt helpers must not become public native-boundary API"
 )]
 
+use std::ffi::CStr;
+
 /// Default-session effective-domain query in the pinned public vendor header.
 pub const GET_EFFECTIVE_DOMAIN_ID: u32 = 14;
 /// Default-session module-URI query in the pinned public vendor header.
@@ -67,10 +69,10 @@ impl SessionPreparationReport {
     }
 }
 
-pub(crate) const fn module_uri(architecture: u32) -> Option<&'static [u8]> {
+pub(crate) const fn module_uri(architecture: u32) -> Option<&'static CStr> {
     match architecture {
-        73 => Some(b"file:///libggml-htp-v73.so?htp_iface_skel_handle_invoke&_modver=1.0\0"),
-        81 => Some(b"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0\0"),
+        73 => Some(c"file:///libggml-htp-v73.so?htp_iface_skel_handle_invoke&_modver=1.0"),
+        81 => Some(c"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0"),
         _ => None,
     }
 }
@@ -82,7 +84,7 @@ pub(crate) fn checked_uri(architecture: u32, bytes: &[u8]) -> bool {
     let Some(terminator) = bytes.iter().position(|byte| *byte == 0) else {
         return false;
     };
-    let mut expected = module[..module.len() - 1].to_vec();
+    let mut expected = module.to_bytes().to_vec();
     expected.extend_from_slice(b"&_dom=cdsp&_session=0");
     bytes[..terminator] == expected
 }
@@ -91,7 +93,7 @@ pub(crate) fn self_check() -> bool {
     let Some(module) = module_uri(81) else {
         return false;
     };
-    let mut uri = module[..module.len() - 1].to_vec();
+    let mut uri = module.to_bytes().to_vec();
     uri.extend_from_slice(b"&_dom=cdsp&_session=0\0");
     checked_uri(81, &uri)
         && !checked_uri(73, &uri)
@@ -107,8 +109,10 @@ mod tests {
     #[test]
     fn uri_is_bound_to_exact_architecture_domain_and_default_session() {
         assert!(self_check());
-        let mut uri = module_uri(81).unwrap_or_default().to_vec();
-        uri.pop();
+        let mut uri = module_uri(81)
+            .map(CStr::to_bytes)
+            .unwrap_or_default()
+            .to_vec();
         uri.extend_from_slice(b"&_dom=cdsp&_session=0\0");
         assert!(checked_uri(81, &uri));
         assert!(!checked_uri(82, &uri));

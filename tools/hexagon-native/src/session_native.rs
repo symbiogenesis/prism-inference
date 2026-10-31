@@ -158,12 +158,14 @@ pub(super) fn prepare_fixed_uri(
         return Ok(report);
     };
     let module = session::module_uri(architecture).ok_or(Error::Contract)?;
-    let module_len = u32::try_from(module.len() - 1).map_err(|_| Error::Contract)?;
+    // The vendor ABI excludes the terminator from the declared input length,
+    // while the independently writable backing allocation retains that NUL.
+    let module_len = u32::try_from(module.to_bytes().len()).map_err(|_| Error::Contract)?;
     let mut domain = *b"cdsp\0";
     let domain_ptr = domain.as_mut_ptr().cast::<c_char>();
     // Mutable owned storage satisfies the C ABI without allowing a provider to
     // write into a Rust string literal. The input is checked again after return.
-    let mut module_bytes = module.to_vec();
+    let mut module_bytes = module.to_bytes_with_nul().to_vec();
     let module_ptr = module_bytes.as_mut_ptr().cast::<c_char>();
     uri.fill(0xa5);
     let uri_ptr = uri.as_mut_ptr().cast::<c_char>();
@@ -198,7 +200,7 @@ pub(super) fn prepare_fixed_uri(
         || request.uri != uri_ptr
         || request.uri_len != 256
         || domain != *b"cdsp\0"
-        || module_bytes != module
+        || module_bytes != module.to_bytes_with_nul()
     {
         report.stage = "session-uri-contract-changed";
         return Ok(report);
@@ -268,9 +270,11 @@ mod tests {
 
     #[test]
     fn session_metadata_retains_both_codes_without_failure_fallback() -> Result<(), Error> {
-        let success = prepare_fixed_metadata(0x81, accepted, &mut [0xa5; 256])?;
-        assert!(success.metadata_prepared());
-        assert_eq!(success.effective_domain, Some(3));
+        for architecture in [0x73, 0x81] {
+            let success = prepare_fixed_metadata(architecture, accepted, &mut [0xa5; 256])?;
+            assert!(success.metadata_prepared());
+            assert_eq!(success.effective_domain, Some(3));
+        }
         let refused = prepare_fixed_metadata(0x81, domain_refused, &mut [0xa5; 256])?;
         assert_eq!(refused.domain_result, Some(512));
         assert_eq!(refused.uri_result, None);

@@ -59,6 +59,15 @@ signed-reference ggml host-driver convention. No implementation is vendored.
 The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
+All seven native library source files match Runner revision
+[`8e27b2a8ef671784c896079a7398aadea4ade8b2`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/8e27b2a8ef671784c896079a7398aadea4ade8b2/tools/hexagon/native_rpc).
+Fixed module names use typed `CStr` literals. The vendor request length still
+excludes the terminating NUL, while its independently writable backing buffer
+includes that NUL and is checked after return. URI, ABI, request ordering and
+terminal ownership contracts are unchanged. Prior device observations remain
+bound to their original source/build receipts; this synchronization supplies no
+new device or inference qualification.
+
 `Driver::prepare_session_metadata` now prepares the default `cdsp` session's
 effective domain and exact bundled v73/v81 module URI through pinned public
 `remote_session_control` request IDs 14 and 15. Native ARM64 ABI sizes, alignment

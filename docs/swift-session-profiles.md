@@ -82,6 +82,13 @@ are model-free controls; they do not qualify Swift token re-encoding across turn
 boundaries, complete-model arithmetic, production sampling, resource or latency
 benefit. Reuse remains opt-in pending actual-model private-service qualification.
 
+The mixed full-attention/recurrent regression also repeats and extends exact live
+prefixes across 64-token KV page seals, then shortens the history. It compares
+every sampled logit and complete logical state with fresh computation, verifies
+that stop tokens are neither delivered nor committed, and checks the next
+ordinary draw against an independently progressed reference sampler. This is
+synthetic page/stop coverage, separate from full-model or device qualification.
+
 Focused synthetic graph checks cover same-scale/change-back checkpoint rejection,
 complete state clearing, invalid-setting atomicity, prefix eviction, cancellation
 and failed delivery at a new scale. These checks do not load the full Swift model.

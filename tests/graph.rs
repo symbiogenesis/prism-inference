@@ -3195,3 +3195,103 @@ fn profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary() -
     }
     Ok(())
 }
+
+#[test]
+fn profile_reuse_preserves_mixed_state_and_stop_draws_across_kv_page_seals() -> Result<()> {
+    use bonsai_prism_runtime::sampling::{ReferenceSampler, Sampling};
+
+    let limits = Limits {
+        context_tokens: 192,
+        checkpoints: 0,
+        checkpoint_bytes: 1024 * 1024,
+    };
+    let mut runtime = Runtime::new(Qwen35::new(paged_hybrid_fixture(), 192)?, limits)?;
+    let mut sampler = ProfileSampler {
+        inner: ReferenceSampler::new(Sampling::default(), 42)?,
+        logits: Vec::new(),
+    };
+    let mut reference_sampler = sampler.clone();
+    let options = Generation {
+        max_tokens: 1,
+        stop_tokens: vec![0, 1],
+    };
+    // Repeating an exact prefix must reuse its final logits after an uncommitted
+    // stop draw. Extending across a seal keeps both KV and recurrent state;
+    // shortening requires a fresh computation of the whole mixed graph.
+    for length in [63, 63, 64, 64, 65, 65, 129, 129, 64] {
+        let prompt: Vec<u32> = [0, 1].into_iter().cycle().take(length).collect();
+        let previous = runtime.tokens().to_vec();
+        runtime.prepare_profile_request(None, PromptReuse::Latest)?;
+        let completion = runtime.generate_sampled(
+            &prompt,
+            &options,
+            Prefill { block_tokens: 4 },
+            &Cancellation::default(),
+            &mut sampler,
+            |_| Err("stop token must not be delivered".into()),
+        )?;
+        let mut fresh = Runtime::new(Qwen35::new(paged_hybrid_fixture(), 192)?, limits)?;
+        let expected = fresh.generate_sampled(
+            &prompt,
+            &options,
+            Prefill { block_tokens: 4 },
+            &Cancellation::default(),
+            &mut reference_sampler,
+            |_| Err("reference stop token must not be delivered".into()),
+        )?;
+        assert_eq!(
+            completion.finish,
+            bonsai_prism_runtime::runtime::Finish::Stop
+        );
+        assert_eq!(completion.generated_tokens, 0);
+        assert_eq!(completion.prompt_tokens, expected.prompt_tokens);
+        assert_eq!(
+            completion.reused_tokens,
+            if prompt.starts_with(&previous) {
+                previous.len()
+            } else {
+                0
+            }
+        );
+        assert_eq!(runtime.tokens(), prompt);
+        assert_eq!(graph_bits(runtime.decoder())?, graph_bits(fresh.decoder())?);
+        assert_eq!(sampler.logits, reference_sampler.logits);
+        assert_eq!(runtime.checkpoint_count(), 0);
+    }
+    // The final ordinary draw observes the RNG advancement of every stop above.
+    let prompt = runtime.tokens().to_vec();
+    let ordinary = Generation {
+        max_tokens: 1,
+        stop_tokens: vec![],
+    };
+    let mut fresh = Runtime::new(Qwen35::new(paged_hybrid_fixture(), 192)?, limits)?;
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    runtime.generate_sampled(
+        &prompt,
+        &ordinary,
+        Prefill::default(),
+        &Cancellation::default(),
+        &mut sampler,
+        |token| {
+            actual.push(token);
+            Ok(())
+        },
+    )?;
+    fresh.generate_sampled(
+        &prompt,
+        &ordinary,
+        Prefill::default(),
+        &Cancellation::default(),
+        &mut reference_sampler,
+        |token| {
+            expected.push(token);
+            Ok(())
+        },
+    )?;
+    assert_eq!(actual, expected);
+    assert_eq!(sampler.logits, reference_sampler.logits);
+    assert_eq!(runtime.tokens(), fresh.tokens());
+    assert_eq!(graph_bits(runtime.decoder())?, graph_bits(fresh.decoder())?);
+    Ok(())
+}

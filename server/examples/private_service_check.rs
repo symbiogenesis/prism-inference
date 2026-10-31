@@ -469,11 +469,11 @@ mod tests {
             "prism-service-check-{}-{unique}.json",
             std::process::id()
         ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         let result = (|| {
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
             let mut evidence = Evidence {
                 file,
                 steps: Vec::new(),

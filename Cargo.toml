@@ -140,7 +140,7 @@ allow_attributes_without_reason = "deny"
 
 [workspace]
 resolver = "3"
-members = ["tools/ternary", "tools/gguf", "tools/prism", "server", "tools/conformance-policy", "tools/codec-probe", "tools/rust-trial"]
+members = ["tools/ternary", "tools/gguf", "tools/prism", "server", "tools/conformance-policy", "tools/codec-probe", "tools/rust-trial", "tools/hexagon-native"]
 
 [workspace.package]
 version = "0.1.0"

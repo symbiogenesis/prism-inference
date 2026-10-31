@@ -86,6 +86,22 @@ process limits. Only `host.json`, `hosted-build.json`, `owner.json` and
 `service.json` may be uploaded; protected child directories contain credentials.
 Successful owner receipts require an empty owned Job and released listeners.
 
+The capture's `finally` path first stages available public receipts under
+`%LOCALAPPDATA%\SwiftBonsai2\qualification\prism-private-service-<harness-sha>-<run-id>-<attempt>-<unique-id>`.
+The durable owner-managed directory is outside the checkout and `RUNNER_TEMP`;
+runner temp cleanup and a later Actions upload failure cannot remove its copies.
+An always-run staging step also preserves partial evidence when capture exits
+before its own staging. Only the four fixed JSON filenames are considered, with
+a 64 KiB per-file bound, public schema/source/run checks, read-only held source
+files, non-reparse external ancestry and create-new destinations. Extra/private
+files and child directories are never copied. Missing files stay missing;
+malformed, redirected or unexpected-field receipts are excluded and fail staging.
+Validated failed/pending receipts remain archived without converting their status.
+Each staging call creates a separate immutable selection; it never overwrites
+prior evidence. The workflow uploads only explicit public paths in this durable
+selection. This is bounded local retention, not independent promotion review or
+the complete qualification archive/retrieval policy.
+
 An existing trusted launcher must start the independently verified released
 `prism-inference-server.exe` with the original PQ2 model, approved adapter, seed,
 explicit row-worker count and omitted prompt reuse. It retains the executable,

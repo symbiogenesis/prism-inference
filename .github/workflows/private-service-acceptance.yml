@@ -47,6 +47,7 @@ jobs:
           }
           ./tools/private-service-acceptance/Test-Budget.ps1
           ./tools/private-service-acceptance/Test-Intake.ps1
+          ./tools/private-service-acceptance/Test-Archive.ps1
       - name: Check the bounded source harness without loading a model
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -167,17 +168,22 @@ jobs:
             'The released HTTP service exercises its internal model worker. The separate JSONL worker binary is verified as release data but is not executed.',
             'Owner registration, checkout, tool intake, verification, model loading, checks, cleanup and retention share one five-minute total allowance. No retries or workload matrix.',
             'Provisional disconnect/reset replay does not qualify active graph cancellation, complete-state rollback, numerical parity, performance, quality or default promotion.') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
-      - name: Retain only the credential-free service, owner and source receipts
-        if: always() && env.PRISM_SERVICE_EVIDENCE != ''
+      - name: Preserve public partial receipts if capture did not finish its own staging
+        if: always() && env.PRISM_SERVICE_EVIDENCE != '' && env.PRISM_SERVICE_PUBLIC_EVIDENCE == ''
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: '& (Join-Path $env:GITHUB_WORKSPACE ''tools/private-service-acceptance/Stage-Receipts.ps1'')'
+      - name: Upload the already durable credential-free service, owner and source receipts
+        if: always() && env.PRISM_SERVICE_PUBLIC_EVIDENCE != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: private-service-acceptance-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          # The evidence directory also contains protected child keys. Never
-          # publish recursively or include backend stdout/stderr here.
+          # Upload only schema-checked copies from external durable storage.
+          # The original transient directory also contains protected child keys.
           path: |
-            ${{ env.PRISM_SERVICE_EVIDENCE }}/host.json
-            ${{ env.PRISM_SERVICE_EVIDENCE }}/hosted-build.json
-            ${{ env.PRISM_SERVICE_EVIDENCE }}/owner.json
-            ${{ env.PRISM_SERVICE_EVIDENCE }}/service.json
+            ${{ env.PRISM_SERVICE_PUBLIC_EVIDENCE }}/host.json
+            ${{ env.PRISM_SERVICE_PUBLIC_EVIDENCE }}/hosted-build.json
+            ${{ env.PRISM_SERVICE_PUBLIC_EVIDENCE }}/owner.json
+            ${{ env.PRISM_SERVICE_PUBLIC_EVIDENCE }}/service.json
           if-no-files-found: error
           retention-days: 90

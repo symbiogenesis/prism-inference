@@ -89,5 +89,8 @@ try {
         foreach ($guard in $guards) { $guard.Dispose() }
         if ($hostReport.status -cne 'passed') { $hostReport.status = 'failed' }
         $hostReport | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:PRISM_SERVICE_EVIDENCE 'host.json') -Encoding utf8NoBOM
+        # Preserve evidence before this step exits. The runner clears RUNNER_TEMP
+        # after the job even if the independent artifact upload fails.
+        & (Join-Path $PSScriptRoot 'Stage-Receipts.ps1')
     }
 }

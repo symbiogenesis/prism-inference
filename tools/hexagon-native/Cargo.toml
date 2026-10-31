@@ -1,0 +1,17 @@
+[package]
+name = "bonsai-hexagon-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+description = "Experimental native Rust FastRPC capabilities and terminal signed-session FD diagnostics"
+keywords = ["hexagon", "fastrpc", "qualcomm", "capabilities"]
+categories = ["hardware-support"]
+
+[lib]
+name = "hexagon_native_rpc"
+
+[lints]
+workspace = true

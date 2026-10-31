@@ -1,7 +1,7 @@
 [package]
 name = "prism-inference"
 default-run = "prism-inference"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.101"
 license = "Apache-2.0"
@@ -140,7 +140,7 @@ allow_attributes_without_reason = "deny"
 
 [workspace]
 resolver = "3"
-members = ["tools/ternary", "tools/gguf", "tools/prism", "server", "tools/conformance-policy", "tools/codec-probe", "tools/rust-trial"]
+members = ["tools/ternary", "tools/gguf", "tools/prism", "server", "tools/conformance-policy", "tools/codec-probe", "tools/rust-trial", "tools/hexagon-native"]
 
 [workspace.package]
 version = "0.1.0"

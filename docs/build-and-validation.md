@@ -335,7 +335,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.8`; the published crates.io installation
+The checkout prepares version `0.1.9`; the published crates.io installation
 examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
@@ -349,8 +349,8 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-The `0.1.8` server is prepared for a GitHub binary prerelease, preserving the
-immutable `0.1.7` artifacts. Its Windows credential helper is pinned to Runner
+The `0.1.9` server is prepared for a GitHub binary prerelease, preserving the
+immutable `0.1.7` and `0.1.8` artifacts. Its Windows credential helper is pinned to Runner
 revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
 the lockfile. The server temporarily sets `publish = false`, because a crates.io
 package cannot preserve that Git-only dependency and substituting registry
@@ -359,6 +359,14 @@ checkouts are the supported delivery paths for this server candidate. A reviewed
 helper registry release and server publication remain separate pending work;
 the root runtime library's publication contract is unchanged. Source preparation
 and passing CI alone do not publish the candidate or qualify model serving.
+
+The candidate release-bundle build explicitly enables
+`prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the
+retained Foundation build command. The receipt's exact source revision, binary
+hashes and archive hash bind that build; its schema is unchanged. Library and
+server constructors, including the private HTTP server, still default to one
+row worker. Feature availability does not enable multiple workers in Runner or
+establish model parity, speed, resource suitability or default-runtime promotion.
 
 The worker executable names, Swift readiness identity `bonsai-prism-runtime`
 and library import `bonsai_prism_runtime` preserve the existing SwiftBonsai

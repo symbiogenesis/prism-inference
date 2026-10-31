@@ -12,7 +12,7 @@ permissions:
 env:
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
   CARGO_BUILD_FINGERPRINT: content
-  PRISM_VERSION: '0.1.8'
+  PRISM_VERSION: '0.1.9'
 concurrency:
   # The successful-ancestor planner carries every cancelled push forward.
   # Explicit manual runs retain an independent complete validation request.
@@ -174,13 +174,17 @@ jobs:
           try {
             $binaryPackages = @('prism-inference','prism-inference-server','bonsai-gguf','prism-conformance-policy','bonsai-codec-probe')
             $buildPackages = @($binaryPackages | Where-Object { $_ -cin $packages })
+            $buildFeatures = @()
             if ($env:PRISM_RELEASE -ceq 'true') {
               & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-ReleaseBundle.ps1') -Case All
               $buildPackages = @($buildPackages + @('prism-inference','prism-inference-server','bonsai-gguf') | Sort-Object -Unique)
+              # Availability is part of these checked source-bound binary bytes.
+              # Every runtime entry point still defaults to one row worker.
+              $buildFeatures = @('--features', 'prism-inference/parallel-rows,prism-inference-server/parallel-rows')
             }
             if ($buildPackages.Count) {
               $buildSelection = @($buildPackages | ForEach-Object { '--package'; $_ })
-              cargo +nightly-2026-10-22 build --manifest-path $manifest @buildSelection --bins --locked --offline --release
+              cargo +nightly-2026-10-22 build --manifest-path $manifest @buildSelection @buildFeatures --bins --locked --offline --release
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Check feature variants, scalar fallback and loader ABI
@@ -202,6 +206,7 @@ jobs:
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
               cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
+              cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
               cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
             }

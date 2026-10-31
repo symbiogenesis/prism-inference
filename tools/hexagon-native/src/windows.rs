@@ -14,6 +14,8 @@ use std::sync::{Mutex, MutexGuard};
 
 #[path = "mapping.rs"]
 mod mapping;
+#[path = "session_native.rs"]
+mod session_native;
 
 type Handle = *mut c_void;
 type Control = unsafe extern "C" fn(u32, *mut c_void, u32) -> i32;
@@ -318,7 +320,9 @@ pub(super) struct Driver {
 impl Driver {
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
         let lease = DRIVER_LEASE.try_lock().map_err(|_| Error::Contract)?;
-        if mapping::terminal() { return Err(Error::Contract); }
+        if mapping::terminal() {
+            return Err(Error::Contract);
+        }
         no_reparse(path)?;
         let file = OpenOptions::new()
             .read(true)
@@ -356,7 +360,9 @@ impl Driver {
     }
 
     pub(super) fn capability(&mut self, capability: Capability) -> Result<u32, Error> {
-        if mapping::terminal() { return Err(Error::Contract); }
+        if mapping::terminal() {
+            return Err(Error::Contract);
+        }
         let mut query = CapabilityRequest {
             domain: CDSP_DOMAIN,
             attribute_id: capability.id(),
@@ -374,9 +380,21 @@ impl Driver {
         }
         Ok(query.capability)
     }
+
+    pub(super) fn prepare_session_metadata(
+        &mut self,
+    ) -> Result<crate::SessionPreparationReport, Error> {
+        if mapping::terminal() {
+            return Err(Error::Contract);
+        }
+        session_native::prepare(self)
+    }
 }
 
-#[allow(clippy::redundant_pub_crate, reason = "Only the safe parent may consume the private native owner")]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe parent may consume the private native owner"
+)]
 pub(super) fn mapping_probe(driver: Driver) -> Result<crate::MappingProbeReport, Error> {
     mapping::probe(driver)
 }

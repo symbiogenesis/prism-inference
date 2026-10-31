@@ -7,7 +7,8 @@ the main runtime does not depend on or re-export it. A reviewed registry release
 of this boundary must precede any main-library dependency so existing runtime
 publication is preserved. The runtime continues to report Hexagon unavailable.
 
-The safe API restricts native calls to the fixed CDSP capability control request.
+The safe API restricts ordinary native calls to the fixed CDSP capability and
+default-session metadata control requests.
 SCM discovery selects `qcnspmcdm` and its `libcdsprpc.dll` inside the Windows
 DriverStore; callers cannot supply a DLL, RPC request or unsigned-process flag.
 Path traversal, device/UNC paths and reparse ancestors reject. A retained
@@ -56,6 +57,37 @@ crate's isolated Windows module permits documented unsafe native operations.
 signed-reference ggml host-driver convention. No implementation is vendored.
 The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
+
+`Driver::prepare_session_metadata` now prepares the default `cdsp` session's
+effective domain and exact bundled v73/v81 module URI through pinned public
+`remote_session_control` request IDs 14 and 15. Native ARM64 ABI sizes, alignment
+and field offsets are checked. Each input pointer, length and byte array is
+checked after return; output must be terminated and match the fixed module,
+version, domain and session zero. Failed or unexpected results retain exact
+return codes and completed stages without retry or a fabricated domain/URI.
+The method issues no remote-handle open, mapping or unsigned-process request;
+its report is descriptive and supplies no admission or mapping authority.
+
+Actual signed module opening remains pending independent verification of the
+installed ELF bytes, catalog membership, supported Windows deployment/search
+route and retained file lifetime through open/teardown. A basename URI does not
+bind an installed module to the caller's checked package. An absolute URI has
+not been established as a supported Windows deployment route. The referenced
+ggml initializer requests unsigned-process control before opening its interface;
+this crate omits that request and does not infer a usable signed-session policy
+from source or a bundled catalog. No catalog installation, certificate changes
+or search-path overrides are supplied here.
+
+The public FD=2 and delayed-FD=3 modes are recorded without executing them.
+Delayed registration does not prove DSP-side `HAP_mmap`, cache ownership or DMA.
+The extended delayed mode's matching SDK enum/ABI is absent from the pinned
+public header and remains pending. Asynchronous submission/completion ownership,
+cancellation and in-use buffer retention require the verified signed kernel and
+queue ABI. Metadata preparation neither replaces the retained scoped STATIC
+failure nor establishes those execution/lifecycle gates.
+
+Library regressions include exact URI/family boundaries, partial metadata and
+mocked native refusals and mutated pointer responses. They never load a driver.
 
 Hosted CI owns the complete tests and package checks. A focused named local ABI
 check is allowed under the shared owner-device aggregate budget, including

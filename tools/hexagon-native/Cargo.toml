@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 license.workspace = true
 repository.workspace = true
-description = "Bounded native Rust Qualcomm FastRPC capability and scratch-mapping diagnostics"
+description = "Experimental native Rust FastRPC capabilities, session metadata and terminal scratch diagnostics"
 keywords = ["hexagon", "fastrpc", "qualcomm", "capabilities"]
 categories = ["hardware-support"]
 

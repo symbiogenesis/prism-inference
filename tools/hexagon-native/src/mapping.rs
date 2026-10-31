@@ -14,9 +14,18 @@ type Unmap = unsafe extern "C" fn(i32, i32, *mut c_void, usize) -> i32;
 
 static USED: AtomicBool = AtomicBool::new(false);
 
-struct MemoryFunctions { alloc: Alloc, free: Free, to_fd: ToFd, map: Map, unmap: Unmap }
+struct MemoryFunctions {
+    alloc: Alloc,
+    free: Free,
+    to_fd: ToFd,
+    map: Map,
+    unmap: Unmap,
+}
 
-#[allow(clippy::redundant_pub_crate, reason = "Private native helpers remain accessible only to their safe parent")]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Private native helpers remain accessible only to their safe parent"
+)]
 #[must_use]
 pub(super) fn terminal() -> bool {
     USED.load(Ordering::Acquire)
@@ -26,7 +35,11 @@ fn symbol(driver: &Driver, name: &CStr) -> Result<*mut c_void, Error> {
     // SAFETY: the live retained driver owns its loader handle and the fixed
     // CStr export names are NUL terminated. No function pointer escapes here.
     let pointer = unsafe { GetProcAddress(driver.library.as_ptr(), name.as_ptr()) };
-    if pointer.is_null() { Err(last_error("mapping-export")) } else { Ok(pointer) }
+    if pointer.is_null() {
+        Err(last_error("mapping-export"))
+    } else {
+        Ok(pointer)
+    }
 }
 
 fn memory_functions(driver: &Driver) -> Result<MemoryFunctions, Error> {
@@ -46,15 +59,33 @@ fn memory_functions(driver: &Driver) -> Result<MemoryFunctions, Error> {
     let map = unsafe { std::mem::transmute::<*mut c_void, Map>(map) };
     // SAFETY: fastrpc_munmap uses the exact domain/fd/address/length tuple.
     let unmap = unsafe { std::mem::transmute::<*mut c_void, Unmap>(unmap) };
-    Ok(MemoryFunctions { alloc, free, to_fd, map, unmap })
+    Ok(MemoryFunctions {
+        alloc,
+        free,
+        to_fd,
+        map,
+        unmap,
+    })
 }
 
-#[allow(clippy::redundant_pub_crate, reason = "Private native mapping owner must not become public API")]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Private native mapping owner must not become public API"
+)]
 pub(super) fn probe(driver: Driver) -> Result<MappingProbeReport, Error> {
-    if USED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if USED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return Err(Error::Contract);
     }
-    let MemoryFunctions { alloc, free, to_fd, map, unmap } = memory_functions(&driver)?;
+    let MemoryFunctions {
+        alloc,
+        free,
+        to_fd,
+        map,
+        unmap,
+    } = memory_functions(&driver)?;
 
     // Once native allocation begins, only an explicitly known-safe cleanup
     // releases the owner. A map/unmap failure leaves its DLL/file handles and
@@ -75,21 +106,31 @@ pub(super) fn probe(driver: Driver) -> Result<MappingProbeReport, Error> {
     report.descriptor_error = (fd < 0).then_some(fd);
     if fd < 0 || buffer.addr() % 4096 != 0 {
         // SAFETY: no mapping or submission was attempted; this is our allocation.
-        unsafe { free(buffer); }
+        unsafe {
+            free(buffer);
+        }
         report.free_completed = true;
         drop(ManuallyDrop::into_inner(owner));
-        report.stage = if fd < 0 { "descriptor-refused" } else { "allocation-not-page-aligned" };
+        report.stage = if fd < 0 {
+            "descriptor-refused"
+        } else {
+            "allocation-not-page-aligned"
+        };
         return Ok(report);
     }
     // SAFETY: rpcmem_alloc returned a CPU-accessible exclusive 4096-byte extent;
     // no registration, kernel or device operation has yet seen this pointer.
-    unsafe { buffer.cast::<u8>().write_bytes(0xa5, 4096); }
+    unsafe {
+        buffer.cast::<u8>().write_bytes(0xa5, 4096);
+    }
     // SAFETY: the same valid allocation remains owned, unregistered and live.
     let view = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), 4096) };
     report.cpu_roundtrip_verified = view.iter().all(|byte| *byte == 0xa5);
     if !report.cpu_roundtrip_verified {
         // SAFETY: no mapping or submission occurred and no borrowed view is used again.
-        unsafe { free(buffer); }
+        unsafe {
+            free(buffer);
+        }
         report.free_completed = true;
         drop(ManuallyDrop::into_inner(owner));
         report.stage = "cpu-roundtrip-failed";
@@ -117,7 +158,9 @@ pub(super) fn probe(driver: Driver) -> Result<MappingProbeReport, Error> {
     }
     // SAFETY: explicit unmap completed and the scratch has no remaining native
     // consumer. The implicit domain-session DLL/file owner remains pinned.
-    unsafe { free(buffer); }
+    unsafe {
+        free(buffer);
+    }
     report.free_completed = true;
     report.stage = "mapped-unmapped-freed";
     Ok(report)

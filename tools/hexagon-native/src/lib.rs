@@ -1,9 +1,12 @@
 //! Minimal native Rust `FastRPC` capability boundary, without an inference library.
 //!
-//! This candidate performs only the fixed, read-only CDSP capability control
-//! request. It cannot load DSP kernels, create sessions, change power/trust,
-//! allocate shared buffers or submit inference. Native calls need an external
-//! process deadline; a synchronous driver call has no safe in-process timeout.
+//! The ordinary API performs fixed read-only CDSP capability queries. A separate
+//! consuming terminal probe can allocate/register/unregister exactly 4KiB; that
+//! registration may implicitly open a domain session. Neither path loads custom
+//! DSP kernels, changes power/trust or submits inference. Native calls need an
+//! external process deadline; synchronous driver calls have no in-process timeout.
+//! The trusted caller also owns the child environment and must exclude vendor
+//! search-path, unsigned-process, power and runtime overrides before loading.
 #![deny(unsafe_code)]
 #![deny(warnings)]
 
@@ -39,6 +42,8 @@ pub enum Error {
     File(std::io::Error),
     /// Model-free ABI or decoding checks failed.
     Contract,
+    /// The diagnostic child inherited an unsupported vendor/runtime override.
+    InheritedOverride,
 }
 
 impl fmt::Display for Error {
@@ -49,6 +54,7 @@ impl fmt::Display for Error {
             Self::Native(stage, code) => write!(f, "{stage}:{code}"),
             Self::File(_) => f.write_str("system-driver-file-access-failed"),
             Self::Contract => f.write_str("native-rpc-contract-failed"),
+            Self::InheritedOverride => f.write_str("inherited-native-runtime-override"),
         }
     }
 }
@@ -133,6 +139,59 @@ pub struct CapabilityRequest {
     pub capability: u32,
 }
 
+/// Results of exactly one terminal 4KiB registration probe.
+///
+/// This observes allocation/host access/mapping APIs only, never DSP compute or
+/// DMA. A poisoned result pins uncertain resources until supervised process death.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools, reason = "The diagnostic receipt must retain each independent completed or failed native step")]
+pub struct MappingProbeReport {
+    /// Fixed terminal stage; no provider text or memory address is included.
+    pub stage: &'static str,
+    /// Requested host scratch extent, always 4096 bytes.
+    pub bytes: u32,
+    /// The native allocator returned a nonnull pointer.
+    pub allocation_succeeded: bool,
+    /// A nonnegative descriptor was obtained from that allocation.
+    pub descriptor_observed: bool,
+    /// Exact negative descriptor result when descriptor lookup failed.
+    pub descriptor_error: Option<i32>,
+    /// CPU bytes were written/read before any registration attempt.
+    pub cpu_roundtrip_verified: bool,
+    /// Whether the explicit registration API was invoked.
+    pub mapping_attempted: bool,
+    /// Exact mapping return code; absent means the call was not attempted.
+    pub mapping_result: Option<i32>,
+    /// Exact unmapping return code; absent means the call was not attempted.
+    pub unmapping_result: Option<i32>,
+    /// The normal native free call returned after no mapping or a successful unmap.
+    pub free_completed: bool,
+    /// Uncertain native buffer, library and file lifetimes remain pinned.
+    pub poisoned: bool,
+    /// The driver DLL and file guard remain pinned after any mapping attempt.
+    pub owner_pinned_until_exit: bool,
+}
+
+impl MappingProbeReport {
+    const fn new() -> Self {
+        Self { stage: "not-started", bytes: 4096, allocation_succeeded: false,
+            descriptor_observed: false, descriptor_error: None,
+            cpu_roundtrip_verified: false, mapping_attempted: false,
+            mapping_result: None, unmapping_result: None,
+            free_completed: false, poisoned: false, owner_pinned_until_exit: false }
+    }
+
+    /// Whether allocation, host check, mapping, unmapping and normal free completed.
+    #[must_use]
+    pub const fn completed_mapping_cycle(self) -> bool {
+        self.allocation_succeeded && self.descriptor_observed
+            && self.cpu_roundtrip_verified && self.mapping_attempted
+            && matches!(self.mapping_result, Some(0))
+            && matches!(self.unmapping_result, Some(0))
+            && self.free_completed && !self.poisoned
+    }
+}
+
 /// Decode the architecture's packed decimal low byte as in the pinned host.
 ///
 /// Invalid decimal nibbles and zero remain unknown. The raw driver value must
@@ -163,6 +222,7 @@ pub fn self_check() -> Result<(), Error> {
         || decode_architecture(0x73) != Some(73)
         || decode_architecture(0).is_some()
         || decode_architecture(0x8a).is_some()
+        || MappingProbeReport::new().completed_mapping_cycle()
     {
         return Err(Error::Contract);
     }
@@ -244,9 +304,29 @@ impl Driver {
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {
-            let _ = capability;
+            let _ = (self, capability);
             Err(Error::UnsupportedPlatform)
         }
+    }
+
+    /// Consume this driver in one fixed 4KiB allocation/registration/unmap probe.
+    ///
+    /// The documented registration call may implicitly open a domain session;
+    /// this opens no custom DSP module and invokes no compute. Every subsequent
+    /// driver open/query in this process rejects. Any mapping/unmapping error
+    /// pins the uncertain allocation until supervised process death. Every mapping
+    /// attempt retains the DLL/file owner until process death because implicit
+    /// domain-session teardown has not been qualified, even after a successful unmap.
+    /// Do not run this terminal diagnostic inside a serving process.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms, repeated probes and missing native exports
+    /// before allocation. Per-step native refusals are retained in the report.
+    pub fn scratch_mapping_probe(self) -> Result<MappingProbeReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        { windows::mapping_probe(self.inner) }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        { let _ = self; Err(Error::UnsupportedPlatform) }
     }
 }
 
@@ -265,5 +345,25 @@ mod tests {
         assert_eq!(decode_architecture(0x8f), None);
         assert_eq!(decode_architecture(0xff), None);
         assert_eq!(decode_architecture(0x02), None);
+    }
+
+    #[test]
+    fn partial_mapping_receipts_never_claim_a_complete_cycle() {
+        let mut report = MappingProbeReport::new();
+        report.allocation_succeeded = true;
+        report.descriptor_observed = true;
+        report.cpu_roundtrip_verified = true;
+        report.mapping_attempted = true;
+        report.mapping_result = Some(0);
+        report.unmapping_result = Some(0);
+        report.free_completed = true;
+        assert!(report.completed_mapping_cycle());
+        report.poisoned = true;
+        assert!(!report.completed_mapping_cycle());
+        report.poisoned = false;
+        report.unmapping_result = Some(-1);
+        assert!(!report.completed_mapping_cycle());
+        report.unmapping_result = None;
+        assert!(!report.completed_mapping_cycle());
     }
 }

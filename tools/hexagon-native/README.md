@@ -14,6 +14,9 @@ Path traversal, device/UNC paths and reparse ancestors reject. A retained
 deny-write/delete file handle covers cache-only, no-UI Authenticode validation,
 restricted loading, the synchronous query calls and unload. The driver object
 is deliberately neither Send nor Sync and exports no raw symbol pointer.
+A process-wide nonblocking mutex lease restricts all threads and independent
+objects to one native owner. Contention or lock poisoning rejects immediately;
+the lease covers unload/file close and is pinned with any terminal mapping owner.
 
 The supervisor must separately bind the resolved DLL SHA-256 and publisher to
 reviewed driver evidence and enforce an aggregate process deadline. Cached
@@ -23,8 +26,19 @@ cancellation guarantee. Capability values are observations, not throughput or
 allocation guarantees. Raw architecture remains distinct from packed-decimal
 decoding and unknown/failure results must stay unknown.
 
-This crate opens no DSP module, creates no queue/session, maps no buffers and
-submits no kernels. Direct native Rust inference still needs safe asynchronous
+Trusted callers must also exclude vendor/runtime search-path, unsigned-process,
+power and backend overrides in their child environment before loading the driver.
+Runner's standalone query/mapping CLI rejects the fixed vendor/runtime prefixes
+without logging values or mutating the parent environment.
+
+The ordinary API opens no DSP module, creates no queue/session, maps no buffers
+and submits no kernels. An explicit consuming terminal scratch probe can allocate,
+CPU-check, map and unmap exactly 4096 bytes using fixed public vendor flags. The
+mapping API may implicitly open a domain session. Every mapping attempt pins the
+DLL/file owner until supervised process death; any mapping/unmapping failure pins
+the uncertain buffer as well. No later driver admission or retry is allowed in
+that process. Host allocation/registration proves neither DSP DMA nor compute;
+implicit-session teardown remains unqualified. Direct native Rust inference still needs safe asynchronous
 buffer/queue ownership and separately signed PQ2/PTQ1 device kernels, followed
 by numerical, complete-state, lifecycle, resource and measured benefit gates.
 It preserves the main runtime crate's `forbid(unsafe_code)` boundary: only this

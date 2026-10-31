@@ -1,14 +1,23 @@
 {
   "schemaVersion": 1,
-  "purpose": "native-rust-read-only-fastrpc-capability-boundary",
+  "purpose": "native-rust-fastrpc-capabilities-and-terminal-scratch-registration",
   "ggml": {
     "repository": "https://github.com/ggml-org/llama.cpp",
     "commit": "94256114c229674ef96e76eb2dea596e65b43818",
     "license": "MIT",
     "files": [
-      {"path": "ggml/src/ggml-hexagon/htp-drv.cpp", "sha256": "8b93060b8f5a0aceb77c708d1772c56699810e901a52ab0ae1a4826f9f3e6854"},
-      {"path": "ggml/src/ggml-hexagon/htp-drv.h", "sha256": "c89560619f6c52de53417d5da794ae319668fff1a3f11230da13e3ae6944ae79"},
-      {"path": "ggml/src/ggml-hexagon/htp/htp_iface.idl", "sha256": "bd5da5c2aa14c45a8585213d704f47ce0a51cbbcab419b44f969191bdaddf063"}
+      {
+        "path": "ggml/src/ggml-hexagon/htp-drv.cpp",
+        "sha256": "8b93060b8f5a0aceb77c708d1772c56699810e901a52ab0ae1a4826f9f3e6854"
+      },
+      {
+        "path": "ggml/src/ggml-hexagon/htp-drv.h",
+        "sha256": "c89560619f6c52de53417d5da794ae319668fff1a3f11230da13e3ae6944ae79"
+      },
+      {
+        "path": "ggml/src/ggml-hexagon/htp/htp_iface.idl",
+        "sha256": "bd5da5c2aa14c45a8585213d704f47ce0a51cbbcab419b44f969191bdaddf063"
+      }
     ]
   },
   "vendor": {
@@ -16,8 +25,14 @@
     "commit": "a56e9d4de3614a8d8f4b0e15ff561350c4b686e3",
     "license": "BSD-3-Clause",
     "files": [
-      {"path": "inc/remote.h", "sha256": "f9d0690cfd8953697d6fc3163c2be448a7b5b801148808c9b1b360857aeabc44"},
-      {"path": "inc/rpcmem.h", "sha256": "363718de80ebcd7c1180477df0b3d5c005cb63fbec7cf6ff0863c3e7c46323b2"}
+      {
+        "path": "inc/remote.h",
+        "sha256": "f9d0690cfd8953697d6fc3163c2be448a7b5b801148808c9b1b360857aeabc44"
+      },
+      {
+        "path": "inc/rpcmem.h",
+        "sha256": "363718de80ebcd7c1180477df0b3d5c005cb63fbec7cf6ff0863c3e7c46323b2"
+      }
     ]
   },
   "contract": {
@@ -29,10 +44,40 @@
     "domain": 3,
     "structureBytes": 12,
     "structureAlignment": 4,
-    "attributeIds": [0, 2, 3, 4, 5, 6, 7, 8],
+    "attributeIds": [
+      0,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
     "architectureAttributeId": 6,
     "kernelSubmission": false,
-    "profileEligible": false
+    "profileEligible": false,
+    "terminalScratchProbe": {
+      "bytes": 4096,
+      "heapId": 25,
+      "allocationFlags": 1,
+      "offset": 0,
+      "mapFlag": 0,
+      "mapFlagName": "FASTRPC_MAP_STATIC",
+      "implicitDomainSessionMayOpen": true,
+      "explicitRemoteModuleOpen": false,
+      "computeSubmission": false,
+      "oneProbePerProcess": true,
+      "allMappingAttemptsPinDriverOwnerUntilProcessDeath": true,
+      "mappingOrUnmappingFailurePinsAllocationUntilProcessDeath": true,
+      "exports": [
+        "rpcmem_alloc",
+        "rpcmem_free",
+        "rpcmem_to_fd",
+        "fastrpc_mmap",
+        "fastrpc_munmap"
+      ]
+    }
   },
   "windowsAbi": [
     "https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryserviceconfigw",

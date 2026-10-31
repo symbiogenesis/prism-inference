@@ -10,9 +10,15 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{NonNull, null, null_mut};
 use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard};
+
+#[path = "mapping.rs"]
+mod mapping;
 
 type Handle = *mut c_void;
 type Control = unsafe extern "C" fn(u32, *mut c_void, u32) -> i32;
+
+static DRIVER_LEASE: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
 struct ServiceConfig {
@@ -304,10 +310,15 @@ pub(super) struct Driver {
     _file: File,
     // The vendor control API has no established concurrent-call contract here.
     _single_thread: PhantomData<Rc<()>>,
+    // One native owner across all threads/instances; held through unload/file
+    // close, or permanently pinned by a terminal mapping owner's ManuallyDrop.
+    _lease: MutexGuard<'static, ()>,
 }
 
 impl Driver {
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
+        let lease = DRIVER_LEASE.try_lock().map_err(|_| Error::Contract)?;
+        if mapping::terminal() { return Err(Error::Contract); }
         no_reparse(path)?;
         let file = OpenOptions::new()
             .read(true)
@@ -340,10 +351,12 @@ impl Driver {
             control,
             _file: file,
             _single_thread: PhantomData,
+            _lease: lease,
         })
     }
 
     pub(super) fn capability(&mut self, capability: Capability) -> Result<u32, Error> {
+        if mapping::terminal() { return Err(Error::Contract); }
         let mut query = CapabilityRequest {
             domain: CDSP_DOMAIN,
             attribute_id: capability.id(),
@@ -363,10 +376,16 @@ impl Driver {
     }
 }
 
+#[allow(clippy::redundant_pub_crate, reason = "Only the safe parent may consume the private native owner")]
+pub(super) fn mapping_probe(driver: Driver) -> Result<crate::MappingProbeReport, Error> {
+    mapping::probe(driver)
+}
+
 impl Drop for Driver {
     fn drop(&mut self) {
-        // SAFETY: no session/queue/allocation exists; all fixed queries completed.
-        // DLL unload precedes automatic release of its deny-mutation file guard.
+        // SAFETY: this owner completed only fixed queries or pre-mapping cleanup.
+        // Terminal mapping owners never reach Drop after a mapping attempt;
+        // their DLL/file lease remains pinned until supervised process death.
         unsafe {
             FreeLibrary(self.library.as_ptr());
         }
@@ -376,3 +395,18 @@ impl Drop for Driver {
 const _: () = assert!(size_of::<TrustFile>() == 32);
 const _: () = assert!(size_of::<TrustData>() == 88);
 const _: () = assert!(size_of::<ServiceConfig>() == 64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_lease_rejects_another_owner_without_waiting() -> Result<(), Error> {
+        let first = DRIVER_LEASE.try_lock().map_err(|_| Error::Contract)?;
+        assert!(DRIVER_LEASE.try_lock().is_err());
+        drop(first);
+        let second = DRIVER_LEASE.try_lock().map_err(|_| Error::Contract)?;
+        drop(second);
+        Ok(())
+    }
+}

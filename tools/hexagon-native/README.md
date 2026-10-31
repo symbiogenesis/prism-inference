@@ -106,3 +106,47 @@ The branch-only hosted `hexagon-native.yml` workflow runs formatting, all native
 contract tests and strict release Clippy on Windows ARM64 without a device.
 Actual device execution belongs to Runner's separate source-bound supervisor;
 this unpublished crate does not change production runtime dependencies or pins.
+
+## Explicit reference process initialization
+
+The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and
+`Driver::reference_session_mapping_probe` select one fixed additional native step.
+The original `--session-mapping-probe` still requests no unsigned process and its
+retained observation remains independent. There is no automatic retry between them.
+The reference mode requests an **unsigned DSP process class**, even though only
+the exact Windows catalog-signed package is eligible for this diagnostic. It must
+not be described as signed-PD-only access or authorization for arbitrary DSP code.
+
+The [pinned public header](https://github.com/qualcomm/fastrpc/blob/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/inc/remote.h#L603-L622)
+defines `DSPRPC_CONTROL_UNSIGNED_MODULE=2`; its two-int structure at lines389-392
+has `domain` and `enable`. The fixed control uses enable1 and the checked effective
+default-CDSP domain. It occurs after the effective-domain request, before GET_URI
+and module open, matching the [bundled reference initializer](https://github.com/ggml-org/llama.cpp/blob/94256114c229674ef96e76eb2dea596e65b43818/ggml/src/ggml-hexagon/ggml-hexagon.cpp#L3875-L3912).
+That source unconditionally selects the unsigned PD, including Windows builds.
+This difference does not establish why an earlier module open was refused.
+
+The public [Linux implementation](https://github.com/qualcomm/fastrpc/blob/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/src/fastrpc_apps_user.c#L2434-L2454)
+changes a process-local per-domain attribute before opening a session; zero selects
+signed and nonzero unsigned. Once open, changing its class rejects. The array is
+zero-initialized at line4116. Lines2596-2616 dispatch this request; lines3238-3244
+use its flag when constructing process attributes and lines3688/3735 use those
+attributes for shell/session initialization. This public Linux behavior does not
+prove the exact closed Windows driver implementation or complete remote teardown.
+The source manifest records its exact digest and that limitation.
+
+Windows package catalog signing is a separate requirement. The
+[pinned GenieX run guide](https://github.com/qualcomm/GenieX/blob/a5c8e7fb4a364ddcccefbf187afd1bac52d88de5/notes/run.md#L303-L342)
+requires no extra setup for its Microsoft-signed SDK, while its self-signed fallback
+requires certificate trust and test-signing changes. The reference diagnostic makes
+none of those OS, certificate or boot-policy changes and continues to require
+independent exact package/catalog checks. It still explicitly records
+`unsignedProcessRequested=true` only after its fixed runtime request is invoked.
+
+Driver, package guards and process lease become terminally pinned **before** that
+initialization attempt. Its exact return and unchanged domain/enable inputs must
+pass before GET_URI/module open. Refusal, changed input or later incomplete URI
+returns a separate stage with no weaker retry. The flushed
+`hexagon-session:stage=reference-process-init-entered` marker establishes entry only.
+The receipt records explicit mode selection, actual request/result and fixed request2,
+size8/enable1 independently. Tests cover ordering, refusal, changed inputs and retained
+ownership; hosted builds and independent device observations remain required.

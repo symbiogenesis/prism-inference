@@ -1,6 +1,11 @@
-name: Prepare released private-service acceptance
+name: Released private-service acceptance
 on:
   workflow_dispatch:
+    inputs:
+      run_device:
+        description: Run one bounded owner-device capture after hosted preparation (trusted run-specific owner required)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -11,6 +16,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: windows-11-arm
     timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.package.outputs.artifact-id }}
+      artifact-digest: ${{ steps.package.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -18,6 +26,27 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+      - name: Check out the exact reviewed process owner without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: symbiogenesis/SwiftBonsai2Runner
+          ref: 1914330f8a31769bfe8368ca9728fe7a418ed84e
+          path: owner-source
+          persist-credentials: false
+      - name: Check the mandatory owner deadline without models
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          foreach ($file in (Get-ChildItem -LiteralPath tools/private-service-acceptance -File | Where-Object Extension -In @('.ps1', '.psm1'))) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count) { throw 'The device scripts must parse before model-free controls and packaging.' }
+          }
+          ./tools/private-service-acceptance/Test-Budget.ps1
+          ./tools/private-service-acceptance/Test-Intake.ps1
       - name: Check the bounded source harness without loading a model
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -32,6 +61,24 @@ jobs:
           cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check -- -D warnings
           cargo +nightly-2026-10-22 test --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
           cargo +nightly-2026-10-22 build --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
+      - name: Build and check the Prism-owned capture against the exact Runner owner
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $source = Join-Path $env:GITHUB_WORKSPACE 'owner-source'
+          if ((& git -C $source rev-parse HEAD) -cne '1914330f8a31769bfe8368ca9728fe7a418ed84e') { throw 'The exact reviewed owner source is required.' }
+          $examples = Join-Path $source 'src/broker/examples'
+          [void][IO.Directory]::CreateDirectory($examples)
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/private-service-acceptance/owner.rs') -Destination (Join-Path $examples 'prism_private_service_owner.rs')
+          $env:PRISM_HARNESS_REVISION = $env:GITHUB_SHA
+          $manifest = Join-Path $source 'Cargo.toml'
+          cargo +nightly-2026-10-22 fmt --manifest-path $manifest -p bonsai-broker -- --check
+          cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner -- -D warnings
+          cargo +nightly-2026-10-22 test --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner
+          cargo +nightly-2026-10-22 build --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner
       - name: Bind the checker to owning main source and run
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -43,8 +90,10 @@ jobs:
           [void][IO.Directory]::CreateDirectory($package)
           $checker = Join-Path $package 'private-service-check.exe'
           Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release/examples/private_service_check.exe') -Destination $checker
+          $owner = Join-Path $package 'private-service-owner.exe'
+          Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release/examples/prism_private_service_owner.exe') -Destination $owner
           [ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             repository = $env:GITHUB_REPOSITORY
             revision = $env:GITHUB_SHA
             gitRef = $env:GITHUB_REF
@@ -54,18 +103,81 @@ jobs:
             architecture = 'ARM64'
             modelExecuted = $false
             scope = 'harness-preparation-only'
+            runnerOwnerRevision = '1914330f8a31769bfe8368ca9728fe7a418ed84e'
+            ownerSourceSha256 = (Get-FileHash -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/private-service-acceptance/owner.rs') -Algorithm SHA256).Hash.ToLowerInvariant()
             compilerIdentity = (& rustc +nightly-2026-10-22 -vV) -join "`n"
             files = @([ordered]@{
               name = 'private-service-check.exe'
               bytes = (Get-Item -LiteralPath $checker).Length
               sha256 = (Get-FileHash -LiteralPath $checker -Algorithm SHA256).Hash.ToLowerInvariant()
+            }, [ordered]@{
+              name = 'private-service-owner.exe'
+              bytes = (Get-Item -LiteralPath $owner).Length
+              sha256 = (Get-FileHash -LiteralPath $owner -Algorithm SHA256).Hash.ToLowerInvariant()
             })
           } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $package 'receipt.json') -Encoding utf8NoBOM
           "PRIVATE_SERVICE_CHECK_PACKAGE=$package" >> $env:GITHUB_ENV
       - name: Retain the exact checker and credential-free source receipt
+        id: package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: private-service-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.PRIVATE_SERVICE_CHECK_PACKAGE }}
+          if-no-files-found: error
+          retention-days: 90
+
+  acceptance:
+    needs: prepare
+    if: github.ref == 'refs/heads/main' && inputs.run_device
+    # The external trusted owner registers one ephemeral runner for this run,
+    # starts its original monotonic clock before registration, and retains the
+    # independent 210-second work/240-second process deadline, followed by at
+    # most sixty seconds of receipt intake within the five-minute total.
+    runs-on: ${{ format('private-service-acceptance-{0}', github.run_id) }}
+    timeout-minutes: 5
+    steps:
+      - name: Start the device job budget before checkout and same-run intake
+        shell: pwsh
+        run: |
+          "PRISM_SERVICE_JOB_STARTED_UTC=$([DateTime]::UtcNow.ToString('o'))" >> $env:GITHUB_ENV
+          "PRISM_SERVICE_JOB_STARTED_TICK=$([Diagnostics.Stopwatch]::GetTimestamp())" >> $env:GITHUB_ENV
+          $root = Join-Path $env:RUNNER_TEMP ('Private-Service-Acceptance-' + [guid]::NewGuid().ToString('N'))
+          foreach ($name in @('work', 'evidence')) { [void][IO.Directory]::CreateDirectory((Join-Path $root $name)) }
+          "PRISM_SERVICE_WORK=$(Join-Path $root 'work')" >> $env:GITHUB_ENV
+          "PRISM_SERVICE_EVIDENCE=$(Join-Path $root 'evidence')" >> $env:GITHUB_ENV
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Intake only this owning workflow run's hosted source-bound package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.1
+        with:
+          name: private-service-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/Private-Service-Check-Package
+      - name: Capture the released private service under the trusted owner and one aggregate deadline
+        shell: pwsh
+        working-directory: ${{ env.PRISM_SERVICE_WORK }}
+        env:
+          PRISM_SERVICE_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact-id }}
+          PRISM_SERVICE_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact-digest }}
+        run: |
+          & (Join-Path $env:GITHUB_WORKSPACE 'tools/private-service-acceptance/Invoke-Device.ps1')
+          @('Original PQ2, approved adapter, explicit four row workers and reset-every-request serving.',
+            'The exact reviewed Runner launcher retains the verified artifacts, private credentials, required native sandbox, Job, memory policy and exclusive listener ownership.',
+            'Hosted checker/owner bytes bind this same owning main source, workflow, run and retained artifact; the tested 0.1.10 source/archive/server/worker identities remain separate.',
+            'The released HTTP service exercises its internal model worker. The separate JSONL worker binary is verified as release data but is not executed.',
+            'Owner registration, checkout, tool intake, verification, model loading, checks, cleanup and retention share one five-minute total allowance. No retries or workload matrix.',
+            'Provisional disconnect/reset replay does not qualify active graph cancellation, complete-state rollback, numerical parity, performance, quality or default promotion.') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+      - name: Retain only the credential-free service, owner and source receipts
+        if: always() && env.PRISM_SERVICE_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: private-service-acceptance-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # The evidence directory also contains protected child keys. Never
+          # publish recursively or include backend stdout/stderr here.
+          path: |
+            ${{ env.PRISM_SERVICE_EVIDENCE }}/host.json
+            ${{ env.PRISM_SERVICE_EVIDENCE }}/hosted-build.json
+            ${{ env.PRISM_SERVICE_EVIDENCE }}/owner.json
+            ${{ env.PRISM_SERVICE_EVIDENCE }}/service.json
           if-no-files-found: error
           retention-days: 90

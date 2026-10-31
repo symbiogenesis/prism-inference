@@ -55,12 +55,36 @@ thinking-enabled behavior; `prepare_with_thinking` selects the mode explicitly.
 
 ## Released-service correctness capture
 
-The main-only [preparation workflow](../.github/workflows/private-service-acceptance.yml)
+The main-only [acceptance workflow](../.github/workflows/private-service-acceptance.yml)
 builds `private-service-check.exe` and runs its model-free framing and cancellation
 observation controls on hosted Windows ARM64. Its artifact is named
 `private-service-check-<main-revision>-<run-id>-<attempt>`. The packaged receipt binds
-the checker bytes to its exact owning main source, workflow and run. Preparation
-does not execute a model or qualify a released service.
+the checker bytes to its exact owning main source, workflow and run. Its version-2
+package also contains `private-service-owner.exe`, built from Prism's Rust owner
+example against exact Runner revision `1914330f8a31769bfe8368ca9728fe7a418ed84e`,
+and the owner source digest. Hosted preparation checks the owner, package intake
+and mandatory deadline controls without models. Preparation remains the default;
+it does not qualify a released service.
+
+Explicit `run_device: true` adds one Prism-owned `acceptance` job. An external
+trusted owner must register an ephemeral runner with only the run-specific
+`private-service-acceptance-<run-id>` label and supply the complete
+`BONSAI_NATIVE_OWNER_*` run/revision/start-tick/start-UTC/fixed-210-second deadline
+binding. Missing, partial, stale or exhausted bindings fail closed. The external
+owner has a 240-second process lifetime, including thirty seconds after the work
+cutoff, and at most sixty further seconds for evidence intake: five minutes total.
+No retry or matrix extends that allowance.
+
+The job starts its own monotonic clock before checkout and same-run package
+intake. It verifies the exact member inventory, source/run receipt, native ARM64
+PE identities and held-file digests. The Rust owner additionally retains every
+installed release member and the released archive, then uses the exact reviewed
+Runner launcher for model/adapter verification, native sandbox, Job, memory,
+authenticated readiness and exclusive listener monitoring. All setup reduces the
+remaining model/checker allowance, with independent checker, cleanup and outer
+process limits. Only `host.json`, `hosted-build.json`, `owner.json` and
+`service.json` may be uploaded; protected child directories contain credentials.
+Successful owner receipts require an empty owned Job and released listeners.
 
 An existing trusted launcher must start the independently verified released
 `prism-inference-server.exe` with the original PQ2 model, approved adapter, seed,

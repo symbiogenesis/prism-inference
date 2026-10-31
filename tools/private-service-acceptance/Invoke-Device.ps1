@@ -76,15 +76,18 @@ try {
     $hostReport.status = 'passed'
     $hostReport.stage = 'complete'
 } finally {
-    if ($null -ne $process) {
-        try {
-            if (-not $process.HasExited) {
-                $process.Kill($true)
-                if (-not $process.WaitForExit(10000)) { throw 'The bounded owner did not exit during forced cleanup.' }
-            }
-        } finally { $process.Dispose() }
+    try {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill($true)
+                    if (-not $process.WaitForExit(10000)) { throw 'The bounded owner did not exit during forced cleanup.' }
+                }
+            } finally { $process.Dispose() }
+        }
+    } finally {
+        foreach ($guard in $guards) { $guard.Dispose() }
+        if ($hostReport.status -cne 'passed') { $hostReport.status = 'failed' }
+        $hostReport | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:PRISM_SERVICE_EVIDENCE 'host.json') -Encoding utf8NoBOM
     }
-    foreach ($guard in $guards) { $guard.Dispose() }
-    if ($hostReport.status -cne 'passed') { $hostReport.status = 'failed' }
-    $hostReport | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:PRISM_SERVICE_EVIDENCE 'host.json') -Encoding utf8NoBOM
 }

@@ -1,0 +1,23 @@
+[package]
+name = "bonsai-native-hash"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+license.workspace = true
+repository.workspace = true
+description = "Bounded SHA-256 streams with Windows CNG dispatch and portable Rust hashing"
+keywords = ["sha256", "hash", "windows"]
+categories = ["cryptography"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography"] }
+
+[target.'cfg(not(windows))'.dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

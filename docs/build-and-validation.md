@@ -34,6 +34,15 @@ Default features are `cli` (JSON token driver) and `experimental-neon`.
 See [explicit row workers](parallel-rows.md) for worker budgets, unchanged row
 arithmetic, CLI/service configuration and qualification limits.
 
+GGUF artifact verification uses the safe streaming API from
+[`bonsai-native-hash`](../tools/native-hash/README.md). Windows delegates SHA-256
+CPU dispatch to its CNG provider through a private owned-handle boundary; other
+targets retain the portable Rust baseline. Every model byte is still checked
+through the retained handle before metadata parsing. The GGUF crate remains
+unsafe-free, and full-file reads, load progress and cancellation contracts are
+unchanged. This implementation alone establishes no startup timing improvement.
+Publish the new hash dependency before a registry GGUF release that requires it.
+
 ## Build a checkout
 
 Use the pinned Rust nightly-2026-10-22 and an absolute manifest/target path from

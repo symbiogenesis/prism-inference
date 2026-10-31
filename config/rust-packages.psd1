@@ -1,5 +1,6 @@
 @{
     Packages = @(
+        @{ Name = 'bonsai-native-hash'; Manifest = 'tools/native-hash/Cargo.toml'; Group = 'Runtime'; Features = @('*') }
         @{ Name = 'bonsai-rust-trial'; Manifest = 'tools/rust-trial/Cargo.toml'; Group = 'Runtime'; Features = @('*') }
         @{ Name = 'bonsai-hexagon-native'; Manifest = 'tools/hexagon-native/Cargo.toml'; Group = 'Runtime'; Features = @('*') }
         @{ Name = 'bonsai-ternary'; Manifest = 'tools/ternary/Cargo.toml'; Group = 'Runtime'; Features = @('*') }

@@ -26,6 +26,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Private-Service-Check-Build'
+          "CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR" >> $env:GITHUB_ENV
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           cargo +nightly-2026-10-22 fmt --manifest-path $manifest -p prism-inference-server -- --check
           cargo +nightly-2026-10-22 clippy --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check -- -D warnings

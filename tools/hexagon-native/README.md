@@ -143,10 +143,19 @@ independent exact package/catalog checks. It still explicitly records
 `unsignedProcessRequested=true` only after its fixed runtime request is invoked.
 
 Driver, package guards and process lease become terminally pinned **before** that
-initialization attempt. Its exact return and unchanged domain/enable inputs must
-pass before GET_URI/module open. Refusal, changed input or later incomplete URI
-returns a separate stage with no weaker retry. The flushed
+initialization attempt. Its exact return must pass before GET_URI/module open.
+The ABI accepts a writable payload and the reference caller does not inspect its
+post-call fields. The receipt retains raw `processInitializationDomainAfter` and
+`processInitializationEnableAfter` values after every returned call, including a
+refusal. They remain null when no call was attempted. These bytes never configure
+URI preparation or mapping and never prove an effective DSP process class. All
+subsequent operations use the original independently validated metadata/domain.
+The earlier source's unchanged-input rejection remains a separate observation;
+it was not a vendor refusal or evidence that the returned bytes were configuration.
+Refusal or later incomplete URI returns a separate stage with no weaker retry. The flushed
 `hexagon-session:stage=reference-process-init-entered` marker establishes entry only.
 The receipt records explicit mode selection, actual request/result and fixed request2,
-size8/enable1 independently. Tests cover ordering, refusal, changed inputs and retained
+size8/enable1 independently. Tests mutate both returned fields, retain their raw
+values and prove that subsequent URI/mapping still uses the original domain3.
+Tests also cover ordering, refusal and retained
 ownership; hosted builds and independent device observations remain required.

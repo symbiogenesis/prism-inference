@@ -176,7 +176,10 @@
       "allPinningTerminal": true,
       "progress": "hexagon-session:stage=reference-process-init-entered",
       "selectedSignedPackageStillRequired": true,
-      "exactLoadedDspBytes": "pending-independent-binding"
+      "exactLoadedDspBytes": "pending-independent-binding",
+      "postCallPayload": "record-both-raw-i32-fields-after-every-return; never-consume-as-configuration-or-effective-PD-proof; original-validated-metadata-domain-remains-authoritative",
+      "unchangedPayloadRequired": false,
+      "priorUnchangedPayloadRejection": "preserved-as-distinct-old-source-observation; not-a-vendor-refusal"
     }
   },
   "windowsAbi": [

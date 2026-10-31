@@ -389,7 +389,7 @@ impl Driver {
     ///
     /// This separately selected diagnostic additionally issues the reference's
     /// `DSPRPC_CONTROL_UNSIGNED_MODULE` request with enable=1 for the validated
-    /// effective default-CDSP domain before `GET_URI` and module open. This selects an
+    /// effective default-CDSP domain before `GET_URI` and module open. This requests an
     /// unsigned DSP process class; it is not a signed-PD-only control and cannot
     /// authorize arbitrary DSP bytes. The supervisor must still independently
     /// verify and retain the pinned signed package/catalog and driver identities.

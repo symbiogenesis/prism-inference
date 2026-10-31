@@ -20,6 +20,10 @@ pub struct SessionMappingReport {
     pub reference_process_initialization_selected: bool,
     /// Exact fixed process-initialization return; absent means not attempted.
     pub process_initialization_result: Option<i32>,
+    /// Raw domain payload after the returned call; never used as configuration.
+    pub process_initialization_domain_after: Option<i32>,
+    /// Raw enable payload after the returned call; never an effective-process claim.
+    pub process_initialization_enable_after: Option<i32>,
     /// The per-process unsigned-PD request was actually invoked, not inferred.
     pub unsigned_process_requested: bool,
     /// Exact architecture/domain/URI metadata requests and results.
@@ -46,6 +50,8 @@ impl SessionMappingReport {
             stage: "session-metadata-incomplete",
             reference_process_initialization_selected: false,
             process_initialization_result: None,
+            process_initialization_domain_after: None,
+            process_initialization_enable_after: None,
             unsigned_process_requested: false,
             metadata,
             module_open_result: None,
@@ -65,9 +71,15 @@ impl SessionMappingReport {
     #[must_use]
     pub const fn completed_cycle(self) -> bool {
         (if self.reference_process_initialization_selected {
-            self.unsigned_process_requested && matches!(self.process_initialization_result, Some(0))
+            self.unsigned_process_requested
+                && matches!(self.process_initialization_result, Some(0))
+                && self.process_initialization_domain_after.is_some()
+                && self.process_initialization_enable_after.is_some()
         } else {
-            !self.unsigned_process_requested && self.process_initialization_result.is_none()
+            !self.unsigned_process_requested
+                && self.process_initialization_result.is_none()
+                && self.process_initialization_domain_after.is_none()
+                && self.process_initialization_enable_after.is_none()
         }) && self.metadata.metadata_prepared()
             && matches!(self.module_open_result, Some(0))
             && self.handle_observed
@@ -110,6 +122,9 @@ mod tests {
         assert!(!report.completed_cycle());
         report.process_initialization_result = Some(0);
         report.unsigned_process_requested = true;
+        assert!(!report.completed_cycle());
+        report.process_initialization_domain_after = Some(-33);
+        report.process_initialization_enable_after = Some(17);
         assert!(report.completed_cycle());
         report.mapping.poisoned = true;
         assert!(!report.completed_cycle());

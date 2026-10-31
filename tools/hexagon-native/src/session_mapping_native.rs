@@ -228,14 +228,15 @@ fn reference_after_domain(
         )
     };
     report.process_initialization_result = Some(result);
+    report.process_initialization_domain_after = Some(request.domain);
+    report.process_initialization_enable_after = Some(request.enable);
     if result != 0 {
         report.stage = "reference-process-init-refused-pinned";
         return report;
     }
-    if request.domain != domain || request.enable != 1 {
-        report.stage = "reference-process-init-contract-changed-pinned";
-        return report;
-    }
+    // The public ABI permits a writable payload and the reference caller does
+    // not require input preservation. Record its raw returned bytes only; all
+    // subsequent URI/mapping configuration uses original validated metadata.
     let mut uri = [0xa5; 256];
     let Ok(metadata) = session_native::prepare_fixed_uri(report.metadata, control, &mut uri) else {
         report.stage = "session-metadata-incomplete";
@@ -595,7 +596,8 @@ mod tests {
                 return 512;
             }
             if fail == "init-contract" {
-                request.enable = 0;
+                request.domain = -33;
+                request.enable = 17;
             }
             0
         } else if request == 15 && bytes == 48 {
@@ -670,8 +672,15 @@ mod tests {
             assert!(report.reference_process_initialization_selected);
             assert!(report.unsigned_process_requested);
             assert!(report.owner_pinned_until_exit);
-            assert_eq!(report.completed_cycle(), fail.is_empty());
+            assert_eq!(
+                report.completed_cycle(),
+                fail.is_empty() || fail == "init-contract"
+            );
             assert_eq!(stages.first(), Some(&"reference-process-init-entered"));
+            if fail != "init-contract" {
+                assert_eq!(report.process_initialization_domain_after, Some(3));
+                assert_eq!(report.process_initialization_enable_after, Some(1));
+            }
             let state = state();
             match fail {
                 "init" => {
@@ -680,12 +689,17 @@ mod tests {
                     assert_eq!(report.stage, "reference-process-init-refused-pinned");
                 }
                 "init-contract" => {
-                    assert_eq!(state.calls, ["init"]);
-                    assert_eq!(report.process_initialization_result, Some(0));
                     assert_eq!(
-                        report.stage,
-                        "reference-process-init-contract-changed-pinned"
+                        state.calls,
+                        [
+                            "init", "uri", "open", "alloc", "fd", "map", "unmap", "free", "close"
+                        ]
                     );
+                    assert_eq!(report.process_initialization_result, Some(0));
+                    assert_eq!(report.process_initialization_domain_after, Some(-33));
+                    assert_eq!(report.process_initialization_enable_after, Some(17));
+                    assert_eq!(report.metadata.effective_domain, Some(3));
+                    assert_eq!(report.stage, "session-fd-cycle-completed-owner-pinned");
                 }
                 "uri" => {
                     assert_eq!(state.calls, ["init", "uri"]);

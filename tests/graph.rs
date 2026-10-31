@@ -2996,6 +2996,20 @@ fn profile_runtime(recurrent: bool, scale: Option<f32>) -> Result<Runtime<Qwen35
     )
 }
 
+#[derive(Clone)]
+struct ProfileSampler {
+    inner: bonsai_prism_runtime::sampling::ReferenceSampler,
+    logits: Vec<Vec<u32>>,
+}
+
+impl bonsai_prism_runtime::sampling::Sampler for ProfileSampler {
+    fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+        self.logits
+            .push(logits.iter().map(|value| value.to_bits()).collect());
+        bonsai_prism_runtime::sampling::Sampler::sample(&mut self.inner, logits)
+    }
+}
+
 #[test]
 fn profile_reuse_matches_fresh_state_and_sampled_failure_replay() -> Result<()> {
     use bonsai_prism_runtime::sampling::{ReferenceSampler, Sampling};
@@ -3003,7 +3017,10 @@ fn profile_reuse_matches_fresh_state_and_sampled_failure_replay() -> Result<()> 
     for recurrent in [false, true] {
         for scale in [None, Some(1.3)] {
             let mut runtime = profile_runtime(recurrent, scale)?;
-            let mut sampler = ReferenceSampler::new(Sampling::default(), 42)?;
+            let mut sampler = ProfileSampler {
+                inner: ReferenceSampler::new(Sampling::default(), 42)?,
+                logits: Vec::new(),
+            };
             let options = Generation {
                 max_tokens: 2,
                 stop_tokens: vec![],
@@ -3047,6 +3064,7 @@ fn profile_reuse_matches_fresh_state_and_sampled_failure_replay() -> Result<()> 
                     },
                 )?;
                 assert_eq!(actual, expected);
+                assert_eq!(sampler.logits, reference_sampler.logits);
                 assert_eq!(runtime.tokens(), reference.tokens());
                 assert_eq!(
                     graph_bits(runtime.decoder())?,
@@ -3084,10 +3102,11 @@ fn profile_request_failures(
     runtime: &mut Runtime<Qwen35>,
     prompt: &[u32],
     options: &Generation,
-    sampler: &mut bonsai_prism_runtime::sampling::ReferenceSampler,
+    sampler: &mut ProfileSampler,
 ) -> Result<()> {
     let tokens = runtime.tokens().to_vec();
     let bits = graph_bits(runtime.decoder())?;
+    let logits = sampler.logits.clone();
     for cancel in [false, true] {
         let cancellation = Cancellation::default();
         assert!(
@@ -3111,6 +3130,7 @@ fn profile_request_failures(
         );
         assert_eq!(runtime.tokens(), tokens);
         assert_eq!(graph_bits(runtime.decoder())?, bits);
+        assert_eq!(sampler.logits, logits);
         assert!(!runtime.is_faulted());
     }
     Ok(())

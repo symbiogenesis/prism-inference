@@ -262,6 +262,13 @@ impl DriverLocation {
     /// # Errors
     /// Rejects nonnative platforms, missing SCM access, malformed paths and
     /// reparse ancestors. No environment variable or caller path chooses a DLL.
+    #[cfg_attr(
+        not(all(windows, target_arch = "aarch64")),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "Only the unsupported-target stub is constant; the shared native API performs runtime driver operations"
+        )
+    )]
     pub fn inspect_system() -> Result<Self, Error> {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
@@ -297,6 +304,13 @@ impl Driver {
     /// # Errors
     /// Rejects native/path/file/signature/loader/export failures. Caller-owned
     /// process deadlines must cover signature validation and every native call.
+    #[cfg_attr(
+        not(all(windows, target_arch = "aarch64")),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "Only the unsupported-target stub is constant; the shared native API performs runtime driver operations"
+        )
+    )]
     pub fn open_system() -> Result<Self, Error> {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
@@ -320,6 +334,13 @@ impl Driver {
     ///
     /// # Errors
     /// Preserves native failure codes; output bytes are not used on failure.
+    #[cfg_attr(
+        not(all(windows, target_arch = "aarch64")),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "Only the unsupported-target stub is constant; the shared native API performs runtime driver operations"
+        )
+    )]
     pub fn capability(&mut self, capability: Capability) -> Result<u32, Error> {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
@@ -342,6 +363,13 @@ impl Driver {
     /// # Errors
     /// Rejects unsupported platforms and capability/export failures. Other native
     /// refusals remain separate stages and exact codes in the returned report.
+    #[cfg_attr(
+        not(all(windows, target_arch = "aarch64")),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "Only the unsupported-target stub is constant; the shared native API performs runtime driver operations"
+        )
+    )]
     pub fn prepare_session_metadata(&mut self) -> Result<SessionPreparationReport, Error> {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {

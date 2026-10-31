@@ -113,7 +113,12 @@ setup, compilation, loading/querying when requested and cleanup. This library's
 model-free `self_check()` opens no services, files or libraries.
 
 The branch-only hosted `hexagon-native.yml` workflow runs formatting, all native
-contract tests and strict release Clippy on Windows ARM64 without a device.
+contract tests, strict release Clippy, doctests and documentation compilation on
+Windows ARM64 and x86_64 without a device. Unsupported-target stubs retain the
+same runtime API and reject explicitly; only their constant-stub Clippy suggestion
+is conditionally suppressed. ARM64 native lint checks remain unchanged. The
+private mapping-receipt constructor is compiled only for native ARM64 or tests,
+so ordinary unsupported-target libraries and documentation omit unused code.
 Actual device execution belongs to Runner's separate source-bound supervisor;
 this unpublished crate does not change production runtime dependencies or pins.
 

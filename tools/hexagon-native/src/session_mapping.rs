@@ -45,6 +45,7 @@ pub struct SessionMappingReport {
 }
 
 impl SessionMappingReport {
+    #[cfg(any(test, all(windows, target_arch = "aarch64")))]
     pub(crate) const fn new(metadata: SessionPreparationReport) -> Self {
         Self {
             stage: "session-metadata-incomplete",

@@ -41,7 +41,8 @@ DLL/file owner until supervised process death; any mapping/unmapping failure pin
 the uncertain buffer as well. No later driver admission or retry is allowed in
 that process. Host allocation/registration proves neither DSP DMA nor compute;
 implicit-session teardown remains unqualified. Direct native Rust inference still needs safe asynchronous
-buffer/queue ownership and separately signed PQ2/PTQ1 device kernels, followed
+buffer/queue ownership and qualified packed computation through a reviewed signed
+generic-kernel composition or supported custom-kernel distribution, followed
 by numerical, complete-state, lifecycle, resource and measured benefit gates.
 
 The terminal STATIC flag-0 control differs from the signed-reference ggml host's
@@ -60,7 +61,7 @@ The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
 All seven native library source files match Runner revision
-[`8e27b2a8ef671784c896079a7398aadea4ade8b2`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/8e27b2a8ef671784c896079a7398aadea4ade8b2/tools/hexagon/native_rpc).
+[`3b4e8c9c00d7d899aa0cd8cd8a9dd42d49f69513`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/3b4e8c9c00d7d899aa0cd8cd8a9dd42d49f69513/tools/hexagon/native_rpc).
 Fixed module names use typed `CStr` literals. The vendor request length still
 excludes the terminating NUL, while its independently writable backing buffer
 includes that NUL and is checked after return. URI, ABI, request ordering and

@@ -31,9 +31,9 @@ when both sessions selected identical files and settings. A prepared prompt can
 be replayed after an explicit reset of its original session, preserving the
 existing seeded replay API. It never carries mutable graph state.
 
-## Fresh state and failure behavior
+## Fresh state and experimental exact reuse
 
-Every completion starts from empty model state. Adapter requests additionally use
+By default every completion starts from empty model state. Adapter requests use
 `Runtime<Qwen35>::reset_with_adapter_scale`, which clears committed tokens,
 logits and saved prefixes only after renewing the decoder's empty-state identity.
 `Qwen35::reset_with_adapter_scale` reuses immutable weights and factors, clears
@@ -52,6 +52,35 @@ Sampler draws retain the established session behavior across successful requests
 and scale changes. Scale reset does not silently reseed the sampler. Explicit
 `SwiftSession::reset` clears model state and restores the initial seeded sampler.
 The per-session prepared-prompt seal remains valid across that reset.
+
+`set_prompt_reuse(PromptReuse::Latest)` explicitly enables the latest committed
+live sequence as an exact prefix candidate. The private server accepts
+`--native-engine-child ... --prompt-reuse latest`; omission and explicit
+`--prompt-reuse disabled` retain fresh recomputation. Unknown values and duplicate
+options reject before loading. The JSONL Swift worker retains fresh recomputation.
+Only selected native HTTP readiness adds `"prompt_reuse":"latest"`, allowing an
+owner to verify the explicit policy without changing the default response shape.
+
+The live candidate is eligible only within its original immutable model/adapter
+profile and at bit-identical scale. A scale change, including positive/negative
+zero or change-back, clears state and renews checkpoint provenance before execution.
+An edited or switched token sequence without the complete live prefix recomputes
+from empty under the runtime transaction; recurrent state is never truncated.
+Cancellation or provisional delivery failure at an unchanged scale restores the
+previous committed state and sampler. At a changed scale, rollback retains the
+new scale's empty state, matching the existing fresh-request contract. Failed
+terminal delivery closes admission until explicit reset. Changing reuse policy
+clears the live sequence while preserving sampler progression; an explicit reset
+clears it and reseeds. No retained snapshot cache is added, and snapshot budget
+admission remains unchanged.
+
+Focused synthetic full-attention and recurrent graph tests compare exact live
+reuse, edited/switched histories and provisional failure/cancellation replay with
+fresh logits/state and a cloned reference sampler. Scale tests cover signed zero,
+change-back, invalid-setting atomicity, disabled mode and explicit reset. These
+are model-free controls; they do not qualify Swift token re-encoding across turn
+boundaries, complete-model arithmetic, production sampling, resource or latency
+benefit. Reuse remains opt-in pending actual-model private-service qualification.
 
 Focused synthetic graph checks cover same-scale/change-back checkpoint rejection,
 complete state clearing, invalid-setting atomicity, prefix eviction, cancellation

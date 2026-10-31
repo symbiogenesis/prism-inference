@@ -1,8 +1,11 @@
 //! Exact immutable identities for the explicitly selected private service profile.
 
-use bonsai_prism_runtime::model::{
-    lora::SWIFT_ADAPTER_SHA256,
-    swift::{self, Representation},
+use bonsai_prism_runtime::{
+    model::{
+        lora::SWIFT_ADAPTER_SHA256,
+        swift::{self, Representation},
+    },
+    runtime::PromptReuse,
 };
 use serde_json::{Value, json};
 
@@ -10,6 +13,7 @@ use serde_json::{Value, json};
 pub(super) struct ModelProfile {
     pub representation: Representation,
     pub adapter: bool,
+    pub prompt_reuse: PromptReuse,
 }
 
 impl ModelProfile {
@@ -30,6 +34,9 @@ impl ModelProfile {
             if self.adapter {
                 model["abliteration_scale_range"] = json!([0, 2]);
             }
+        }
+        if self.prompt_reuse == PromptReuse::Latest {
+            model["prompt_reuse"] = json!("latest");
         }
         json!({"data": [model]})
     }

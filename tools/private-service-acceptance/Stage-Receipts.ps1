@@ -11,7 +11,7 @@ if ($env:GITHUB_REPOSITORY -cne 'symbiogenesis/prism-inference' -or $env:GITHUB_
     throw 'Durable service receipts require the exact owning main execution.'
 }
 $archive = Join-Path $env:LOCALAPPDATA 'SwiftBonsai2/qualification'
-$result = Save-PrivateServiceReceipts -SourceDirectory $env:PRISM_SERVICE_EVIDENCE -ArchiveRoot $archive `
+$result = Save-PrivateServiceReceipt -SourceDirectory $env:PRISM_SERVICE_EVIDENCE -ArchiveRoot $archive `
     -TransientRoot $env:RUNNER_TEMP -Revision $env:GITHUB_SHA -RunId $env:GITHUB_RUN_ID -RunAttempt $env:GITHUB_RUN_ATTEMPT
 # Publish only the explicit validated names below, including when another receipt
 # was rejected. The durable directory survives the runner's automatic temp cleanup.

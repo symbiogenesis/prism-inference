@@ -34,7 +34,7 @@ function Assert-ArchiveRejected {
     $options = $arguments.Clone()
     foreach ($key in $Changes.Keys) { $options[$key] = $Changes[$key] }
     $refused = $false
-    try { $null = Save-PrivateServiceReceipts @options } catch { $refused = $true }
+    try { $null = Save-PrivateServiceReceipt @options } catch { $refused = $true }
     if (-not $refused) { throw 'An unsafe archive path or identity was admitted.' }
 }
 
@@ -49,7 +49,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $source 'frontend.key'), 'DO-NOT-ARCHIVE')
     [void][IO.Directory]::CreateDirectory((Join-Path $source 'protected'))
     [IO.File]::WriteAllText((Join-Path $source 'protected/backend.key'), 'DO-NOT-ARCHIVE')
-    $complete = Save-PrivateServiceReceipts @arguments
+    $complete = Save-PrivateServiceReceipt @arguments
     if ($complete.Files.Count -ne 4 -or $complete.Rejected.Count -or $complete.Missing.Count -or
         @(Get-ChildItem -LiteralPath $complete.Directory -Force).Count -ne 4 -or
         [IO.Path]::GetFileName($complete.Directory) -cnotmatch ('^prism-private-service-' + $revision + '-123-1-[a-f0-9]{32}$')) {
@@ -64,7 +64,7 @@ try {
     $failedHost = $hostValue.Clone(); $failedHost.status='failed'
     Write-TestReceipt -Name 'host.json' -Value $failedHost
     Remove-Item -LiteralPath (Join-Path $source 'hosted-build.json')
-    $partial = Save-PrivateServiceReceipts @arguments
+    $partial = Save-PrivateServiceReceipt @arguments
     if ($partial.Files.Count -ne 3 -or $partial.Missing.Count -ne 1 -or $partial.Rejected.Count -or $partial.Directory -ceq $complete.Directory -or
         (Get-FileHash -LiteralPath (Join-Path $complete.Directory 'host.json')).Hash -cne $originalHash -or
         (Get-Content -LiteralPath (Join-Path $partial.Directory 'owner.json') -Raw | ConvertFrom-Json).status -cne 'failed') {
@@ -72,20 +72,20 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $source 'owner.json'), (' ' * (64KB + 1)))
     [IO.File]::WriteAllText((Join-Path $source 'service.json'), '{broken')
-    $bad = Save-PrivateServiceReceipts @arguments
+    $bad = Save-PrivateServiceReceipt @arguments
     if ($bad.Files.Count -ne 1 -or $bad.Files[0] -cne 'host.json' -or $bad.Rejected.Count -ne 2 -or
         @(Get-ChildItem -LiteralPath $bad.Directory -Force).Count -ne 1) { throw 'Invalid or oversized receipts were copied or valid partial evidence was lost.' }
     Write-TestReceipt -Name 'owner.json' -Value $ownerValue
     $secret = $serviceValue.Clone(); $secret.readiness=@{ apiKey='DO-NOT-ARCHIVE' }
     Write-TestReceipt -Name 'service.json' -Value $secret
-    $bad = Save-PrivateServiceReceipts @arguments
+    $bad = Save-PrivateServiceReceipt @arguments
     if ($bad.Rejected -cnotcontains 'service.json' -or (Test-Path -LiteralPath (Join-Path $bad.Directory 'service.json'))) { throw 'A nested credential field entered public archival.' }
     $secret=$hostValue.Clone(); $secret.apiKey='DO-NOT-ARCHIVE'
     Write-TestReceipt -Name 'host.json' -Value $secret
-    $bad = Save-PrivateServiceReceipts @arguments
+    $bad = Save-PrivateServiceReceipt @arguments
     if ($bad.Rejected -cnotcontains 'host.json') { throw 'An extra credential field entered public archival.' }
     Write-TestReceipt -Name 'host.json' -Value $hostValue
-    $bad = Save-PrivateServiceReceipts @arguments -Revision ('b' * 40)
+    $bad = Save-PrivateServiceReceipt @arguments -Revision ('b' * 40)
     if ($bad.Files.Count -or $bad.Rejected.Count -ne 3) { throw 'Stale-source receipts were admitted.' }
     Assert-ArchiveRejected -Changes @{ ArchiveRoot=$transient }
     Assert-ArchiveRejected -Changes @{ ArchiveRoot=$source }

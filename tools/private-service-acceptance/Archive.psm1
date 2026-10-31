@@ -28,7 +28,7 @@ function Assert-ReceiptDirectory {
     return $full
 }
 
-function Assert-ReceiptFields {
+function Assert-ReceiptField {
     [CmdletBinding()]
     [OutputType([void])]
     param([Parameter(Mandatory)][Collections.IDictionary]$Value, [Parameter(Mandatory)][string[]]$Fields)
@@ -46,7 +46,7 @@ function Assert-PublicReceipt {
         [Parameter(Mandatory)][string]$RunAttempt
     )
     if ($Name -ceq 'hosted-build.json') {
-        Assert-ReceiptFields -Value $Value -Fields @('schemaVersion', 'repository', 'revision', 'gitRef', 'workflowPath', 'runId', 'runAttempt',
+        Assert-ReceiptField -Value $Value -Fields @('schemaVersion', 'repository', 'revision', 'gitRef', 'workflowPath', 'runId', 'runAttempt',
             'architecture', 'modelExecuted', 'scope', 'runnerOwnerRevision', 'ownerSourceSha256', 'compilerIdentity', 'files')
         if ($Value.schemaVersion -ne 2 -or $Value.repository -cne 'symbiogenesis/prism-inference' -or
             $Value.revision -cne $Revision -or $Value.gitRef -cne 'refs/heads/main' -or
@@ -55,7 +55,7 @@ function Assert-PublicReceipt {
             throw 'The hosted receipt does not bind this execution.'
         }
         foreach ($file in $Value.files) {
-            Assert-ReceiptFields -Value $file -Fields @('name', 'bytes', 'sha256')
+            Assert-ReceiptField -Value $file -Fields @('name', 'bytes', 'sha256')
             if ($file.name -cnotin @('private-service-check.exe', 'private-service-owner.exe')) { throw 'Unexpected hosted file.' }
         }
         return
@@ -66,7 +66,7 @@ function Assert-PublicReceipt {
     }
     switch -CaseSensitive ($Name) {
         'host.json' {
-            Assert-ReceiptFields -Value $Value -Fields @('schemaVersion', 'status', 'stage', 'repository', 'harnessRevision', 'gitRef', 'runId', 'runAttempt',
+            Assert-ReceiptField -Value $Value -Fields @('schemaVersion', 'status', 'stage', 'repository', 'harnessRevision', 'gitRef', 'runId', 'runAttempt',
                 'workflowPath', 'artifactId', 'artifactName', 'artifactDigest', 'runnerOwnerRevision', 'jobStartedUtc', 'wholeOwnerMaximumSeconds',
                 'ownerWorkSeconds', 'ownerProcessTotalSeconds', 'postWorkProcessReserveSeconds', 'retainedIntakeReserveSeconds', 'cpu', 'architecture',
                 'os', 'ownerElapsedSeconds', 'jobElapsedSeconds', 'ownerSoftSeconds', 'ownerHardSeconds', 'ownerExitCode', 'defaultPromotionQualified')
@@ -76,20 +76,20 @@ function Assert-PublicReceipt {
             }
         }
         'owner.json' {
-            Assert-ReceiptFields -Value $Value -Fields @('schemaVersion', 'status', 'harnessRevision', 'runnerOwnerRevision', 'aggregateOwnerAllowanceSeconds',
+            Assert-ReceiptField -Value $Value -Fields @('schemaVersion', 'status', 'harnessRevision', 'runnerOwnerRevision', 'aggregateOwnerAllowanceSeconds',
                 'elapsedMilliseconds', 'profile', 'rowWorkersRequested', 'releasedFilesAndArchiveVerified', 'authenticatedOwnedReadiness', 'ownedJobEmpty',
                 'listenersReleased', 'checkerSucceeded', 'separateJsonlWorkerExecuted', 'activeGraphCancellationQualified', 'completeStateRollbackQualified',
                 'defaultPromotionQualified', 'testedRuntime')
             if ($Value.harnessRevision -cne $Revision) { throw 'The owner receipt does not bind this source.' }
             if ($Value.Contains('testedRuntime')) {
-                Assert-ReceiptFields -Value $Value.testedRuntime -Fields @('revision', 'version', 'archiveSha256', 'serverSha256', 'workerSha256')
+                Assert-ReceiptField -Value $Value.testedRuntime -Fields @('revision', 'version', 'archiveSha256', 'serverSha256', 'workerSha256')
             }
         }
         'service.json' {
-            Assert-ReceiptFields -Value $Value -Fields @('schemaVersion', 'status', 'completedSteps', 'readiness', 'scope', 'fullStateNumericalParityQualified',
+            Assert-ReceiptField -Value $Value -Fields @('schemaVersion', 'status', 'completedSteps', 'readiness', 'scope', 'fullStateNumericalParityQualified',
                 'performanceQualified', 'activeGraphCancellationQualified', 'completeStateRollbackQualified', 'processOwnershipQualified', 'defaultPromotionQualified')
             if ($null -ne $Value.readiness) {
-                Assert-ReceiptFields -Value $Value.readiness -Fields @('modelSha256', 'templateSha256', 'adapterSha256', 'seed', 'contextTokens',
+                Assert-ReceiptField -Value $Value.readiness -Fields @('modelSha256', 'templateSha256', 'adapterSha256', 'seed', 'contextTokens',
                     'weightRepresentation', 'servingStatePolicy')
             }
         }
@@ -97,7 +97,7 @@ function Assert-PublicReceipt {
     }
 }
 
-function Save-PrivateServiceReceipts {
+function Save-PrivateServiceReceipt {
     <# .SYNOPSIS
     Stage only bounded, schema-checked public receipts outside ephemeral runner storage.
     .DESCRIPTION
@@ -166,4 +166,4 @@ function Save-PrivateServiceReceipts {
     [pscustomobject]@{ Directory=$destination; Files=$copied.ToArray(); Missing=$missing.ToArray(); Rejected=$rejected.ToArray() }
 }
 
-Export-ModuleMember -Function Save-PrivateServiceReceipts
+Export-ModuleMember -Function Save-PrivateServiceReceipt

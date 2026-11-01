@@ -608,9 +608,12 @@ mod tests {
     static TIMED_CALLS: AtomicU32 = AtomicU32::new(0);
     static NONBLOCKING_CALLS: AtomicU32 = AtomicU32::new(0);
 
+    type CleanupFailure = Option<(&'static str, i32)>;
+    type CleanupCase = (CleanupFailure, &'static [&'static str]);
+
     struct CleanupState {
         steps: Vec<&'static str>,
-        failure: Option<(&'static str, i32)>,
+        failure: CleanupFailure,
     }
 
     static CLEANUP_STATE: Mutex<CleanupState> = Mutex::new(CleanupState {
@@ -624,7 +627,7 @@ mod tests {
         };
         state.steps.push(name);
         match state.failure {
-            Some((stage, code)) if stage == name => code,
+            Some((failure_point, code)) if failure_point == name => code,
             _ => 0,
         }
     }
@@ -702,7 +705,7 @@ mod tests {
             close: cleanup_module_close,
             free: cleanup_free,
         };
-        let cases: [(Option<(&str, i32)>, &[&str]); 5] = [
+        let cases: [CleanupCase; 5] = [
             (
                 None,
                 &["stop", "queue-close", "unmap", "module-close", "free"],

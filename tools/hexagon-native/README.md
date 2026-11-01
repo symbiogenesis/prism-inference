@@ -160,8 +160,12 @@ controls remain outside the Rust production runtime.
 Every native-affecting attempt pins the driver, package guards and process lease.
 No failed, cancelled, expired or malformed submission releases its allocation,
 queue or module. A complete validated numeric response followed by successful
-DSP stop, host queue close, authoritative u64 module close and same-tuple host
-unmap permits normal allocation free. The DLL and package owners remain pinned
+DSP stop, host queue close, same-tuple host unmap and authoritative u64 module
+close permits normal allocation free. The module/session stays open through
+host unmap, and the allocation stays retained through module close. A refused
+unmap skips module close and free; a refused module close skips free. Hosted
+mocks call the actual cleanup function and verify the exact release order and
+each stop/queue/unmap/module failure boundary. The DLL and package owners remain pinned
 through process exit even then. Explicit cleanup does not establish complete
 vendor-session teardown. Selected DSP bytes, actual-model numerics/state,
 resource behavior, sustained benefit and automatic selection remain unqualified;

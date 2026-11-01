@@ -108,6 +108,26 @@ struct Calls {
     queue_read: QueueRead,
 }
 
+struct CleanupCalls {
+    invoke: Invoke,
+    queue_close: QueueClose,
+    unmap: Unmap,
+    close: Close,
+    free: Free,
+}
+
+impl Calls {
+    const fn cleanup_calls(&self) -> CleanupCalls {
+        CleanupCalls {
+            invoke: self.invoke,
+            queue_close: self.queue_close,
+            unmap: self.unmap,
+            close: self.close,
+            free: self.free,
+        }
+    }
+}
+
 fn symbol(driver: &Driver, name: &CStr) -> Result<*mut c_void, Error> {
     // SAFETY: the driver retains its live module and the fixed export is terminated.
     let pointer = unsafe { GetProcAddress(driver.library.as_ptr(), name.as_ptr()) };
@@ -417,7 +437,16 @@ fn exercise(
     if !report.record_numeric_reply(compute::output_valid_for(report.fixture, output)) {
         return report;
     }
-    cleanup(report, calls, handle, queue, domain, fd, memory, progress)
+    cleanup(
+        report,
+        &calls.cleanup_calls(),
+        handle,
+        queue,
+        domain,
+        fd,
+        memory,
+        progress,
+    )
 }
 
 fn write_packet(
@@ -511,7 +540,7 @@ fn read_reply(
 )]
 fn cleanup(
     mut report: QueueComputeReport,
-    calls: &Calls,
+    calls: &CleanupCalls,
     handle: u64,
     queue: *mut c_void,
     domain: i32,
@@ -537,22 +566,25 @@ fn cleanup(
         report.stage = "compute-queue-close-refused-pinned";
         return report;
     }
-    entered(&mut report, "compute-module-close-entered", progress);
-    // SAFETY: no queue, in-flight operation or callback remains; close the exact
-    // original u64 handle before unmapping/freeing its former matrix buffers.
-    let result = unsafe { (calls.close)(handle) };
-    report.module_close_result = Some(result);
-    if result != 0 {
-        report.stage = "compute-module-close-refused-pinned";
-        return report;
-    }
     entered(&mut report, "compute-fd-unmap-entered", progress);
     // SAFETY: original same-domain FD/address/extent tuple; the operation and
-    // imported queue were drained/stopped and the remote module closed first.
+    // imported queue were drained/stopped and the host queue closed. Keep the
+    // remote module/session open through this release, as in the earlier FD
+    // mapping control. The allocation remains retained through module close.
     let result = unsafe { (calls.unmap)(domain, fd, memory, 16_384) };
     report.unmapping_result = Some(result);
     if result != 0 {
         report.stage = "compute-fd-unmap-refused-pinned";
+        return report;
+    }
+    entered(&mut report, "compute-module-close-entered", progress);
+    // SAFETY: after successful stop, host queue close and explicit host FD unmap,
+    // close the exact original u64 handle. No queue or operation remains active;
+    // the allocation is still retained if this final handle release is refused.
+    let result = unsafe { (calls.close)(handle) };
+    report.module_close_result = Some(result);
+    if result != 0 {
+        report.stage = "compute-module-close-refused-pinned";
         return report;
     }
     entered(&mut report, "compute-free-entered", progress);
@@ -570,10 +602,156 @@ fn cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TIMED_CALLS: AtomicU32 = AtomicU32::new(0);
     static NONBLOCKING_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    struct CleanupState {
+        steps: Vec<&'static str>,
+        failure: Option<(&'static str, i32)>,
+    }
+
+    static CLEANUP_STATE: Mutex<CleanupState> = Mutex::new(CleanupState {
+        steps: Vec::new(),
+        failure: None,
+    });
+
+    fn cleanup_step(name: &'static str) -> i32 {
+        let Ok(mut state) = CLEANUP_STATE.lock() else {
+            return -77;
+        };
+        state.steps.push(name);
+        match state.failure {
+            Some((stage, code)) if stage == name => code,
+            _ => 0,
+        }
+    }
+
+    extern "C" fn cleanup_stop(handle: u64, scalars: u32, arguments: *mut RemoteBuffer) -> i32 {
+        if handle != 42 || scalars != compute::STOP_SCALARS || !arguments.is_null() {
+            return -77;
+        }
+        cleanup_step("stop")
+    }
+
+    extern "C" fn cleanup_queue_close(queue: *mut c_void) -> i32 {
+        if queue.addr() != 0x1000 {
+            return -77;
+        }
+        cleanup_step("queue-close")
+    }
+
+    extern "C" fn cleanup_unmap(domain: i32, fd: i32, memory: *mut c_void, bytes: usize) -> i32 {
+        if domain != 3 || fd != 7 || memory.addr() != 0x2000 || bytes != 16_384 {
+            return -77;
+        }
+        cleanup_step("unmap")
+    }
+
+    extern "C" fn cleanup_module_close(handle: u64) -> i32 {
+        if handle != 42 {
+            return -77;
+        }
+        cleanup_step("module-close")
+    }
+
+    extern "C" fn cleanup_free(memory: *mut c_void) {
+        let _ = cleanup_step(if memory.addr() == 0x2000 {
+            "free"
+        } else {
+            "invalid-free"
+        });
+    }
+
+    const fn numeric_report() -> QueueComputeReport {
+        let mut metadata = SessionPreparationReport::new(0x81);
+        metadata.domain_result = Some(0);
+        metadata.effective_domain = Some(3);
+        metadata.uri_result = Some(0);
+        metadata.uri_verified = true;
+        let mut report = QueueComputeReport::new(metadata);
+        report.process_initialization_result = Some(0);
+        report.process_initialization_domain_after = Some(3);
+        report.process_initialization_enable_after = Some(1);
+        report.unsigned_process_requested = true;
+        report.module_open_result = Some(0);
+        report.handle_observed = true;
+        report.allocation_succeeded = true;
+        report.mapping_result = Some(0);
+        report.queue_create_result = Some(0);
+        report.queue_export_result = Some(0);
+        report.queue_start_result = Some(0);
+        report.queue_write_result = Some(0);
+        report.queue_read_result = Some(0);
+        report.compute_submitted = true;
+        report.response_validated = true;
+        report.numeric_validated = true;
+        report.owner_pinned_until_exit = true;
+        report.poisoned = true;
+        report
+    }
+
+    #[test]
+    fn actual_cleanup_unmaps_before_module_close_and_retains_on_any_failure() -> Result<(), Error> {
+        let calls = CleanupCalls {
+            invoke: cleanup_stop,
+            queue_close: cleanup_queue_close,
+            unmap: cleanup_unmap,
+            close: cleanup_module_close,
+            free: cleanup_free,
+        };
+        let cases: [(Option<(&str, i32)>, &[&str]); 5] = [
+            (
+                None,
+                &["stop", "queue-close", "unmap", "module-close", "free"],
+            ),
+            (Some(("stop", 14)), &["stop"]),
+            (Some(("queue-close", 14)), &["stop", "queue-close"]),
+            (Some(("unmap", 512)), &["stop", "queue-close", "unmap"]),
+            (
+                Some(("module-close", 14)),
+                &["stop", "queue-close", "unmap", "module-close"],
+            ),
+        ];
+        for (failure, expected) in cases {
+            {
+                let mut state = CLEANUP_STATE.lock().map_err(|_| Error::Contract)?;
+                state.steps.clear();
+                state.failure = failure;
+            }
+            // Opaque markers are compared/passed back by mocks, never dereferenced.
+            let report = cleanup(
+                numeric_report(),
+                &calls,
+                42,
+                std::ptr::without_provenance_mut(0x1000),
+                3,
+                7,
+                std::ptr::without_provenance_mut(0x2000),
+                &mut |_| {},
+            );
+            let state = CLEANUP_STATE.lock().map_err(|_| Error::Contract)?;
+            assert_eq!(state.steps.as_slice(), expected);
+            assert!(report.compute_executed());
+            assert_eq!(report.free_completed, failure.is_none());
+            assert_eq!(report.poisoned, failure.is_some());
+            assert_eq!(report.completed_cycle(), failure.is_none());
+            assert!(report.owner_pinned_until_exit);
+            if failure == Some(("unmap", 512)) {
+                assert_eq!(report.unmapping_result, Some(512));
+                assert_eq!(report.module_close_result, None);
+                assert!(!report.free_completed);
+            }
+            if failure == Some(("module-close", 14)) {
+                assert_eq!(report.unmapping_result, Some(0));
+                assert_eq!(report.module_close_result, Some(14));
+                assert!(!report.free_completed);
+            }
+        }
+        Ok(())
+    }
 
     extern "C" fn timed_refusal(
         queue: *mut c_void,

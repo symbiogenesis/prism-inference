@@ -1775,10 +1775,7 @@ impl Evaluation<'_> {
         for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
             l2_norm(head, g.epsilon);
         }
-        // Reserve the entire transactional destination before touching any head.
-        // Each head is copied with its decay instead of copying the full matrix
-        // first and then reading/writing that copy again to scale it.
-        prepare(matrix, previous.len())?;
+        copy_into(previous, matrix)?;
         zeros_into(g.value_width(), &mut scratch.attended)?;
         let scale = 1.0 / small_float(g.ssm_head)?.sqrt();
         for head in 0..g.ssm_values {
@@ -1797,12 +1794,11 @@ impl Evaluation<'_> {
             };
             let decay = (softplus * layer.decay[head]).exp();
             let update = sigmoid(scratch.beta[head]);
-            let start = head * g.ssm_head * g.ssm_head;
-            let state = append_decayed_head(
-                &previous[start..start + g.ssm_head * g.ssm_head],
-                decay,
-                matrix,
-            );
+            let state =
+                &mut matrix[head * g.ssm_head * g.ssm_head..(head + 1) * g.ssm_head * g.ssm_head];
+            for element in state.iter_mut() {
+                *element *= decay;
+            }
             let output = &mut scratch.attended[head * g.ssm_head..(head + 1) * g.ssm_head];
             for ((state_row, &value), out) in state
                 .chunks_exact_mut(g.ssm_head)
@@ -2239,8 +2235,10 @@ fn copy_into(input: &[f32], output: &mut Vec<f32>) -> Result<()> {
     Ok(())
 }
 
-// The complete matrix has already been reserved fallibly by the caller. Append
-// directly to transactional scratch; no immutable committed value is overwritten.
+// Retain the unqualified copy/decay candidate in model-free controls only.
+// The complete matrix must be reserved fallibly by its test caller. Production
+// retains the previously released copy-then-scale path pending device evidence.
+#[cfg(test)]
 fn append_decayed_head<'a>(
     previous: &[f32],
     decay: f32,

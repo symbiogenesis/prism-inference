@@ -224,14 +224,18 @@ rounding, allocator overhead and process memory are separate; this is no measure
 peak-memory or speed claim. Fixed phase reuse needs neither a moving allocator
 nor a change to numerical tolerances.
 
-Recurrent heads copy committed F32 state directly into transactional scratch
-while applying that head's decay. This removes the preceding full matrix copy;
-each multiplication, dot, update and reduction retains its previous order.
-For Swift's 48 recurrent layers, 48 value heads and 128-by-128 matrices, the
-removed copy covers **144 MiB of payload per token**. Scratch remains separate
-from committed state and checkpoints, with the complete destination reserved
-before head processing. This work reduction does not establish measured TPS or
-process-memory benefit; actual-model numerical and performance gates remain open.
+Production recurrent heads retain the released copy-then-scale sequence from
+`749a5f5`: copy committed F32 state into transactional scratch, then apply each
+head's decay in place before its dot products and updates. Scratch remains
+separate from committed state and checkpoints.
+
+The fused copy/decay candidate from `244df2e`, with independent fixture correction
+`f1b49cd`, remains in Git history and model-free regression controls. It could
+remove **144 MiB of copied payload per token** for Swift's 48 recurrent layers,
+48 value heads and 128-by-128 matrices. It is excluded from production until
+source-bound actual-model logits/live-state, throughput and resource qualification
+pass. Synthetic bitwise controls and fewer copied bytes alone do not authorize
+release or repinning of that execution change.
 
 Attention-value reads use tiles of at most 32 adjacent dimensions, with at most
 2 KiB of stack accumulator payload. Each tile traverses the paged FP16 cache

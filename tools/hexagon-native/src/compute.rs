@@ -3,6 +3,10 @@
 //! All packet fields are encoded explicitly from ggml's pinned `htp-ops.h` at
 //! `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. This is an access diagnostic,
 //! never a Swift arithmetic, performance, deployment or admission qualification.
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "Private packet helpers remain accessible only to their safe parent and native sibling"
+)]
 
 use crate::SessionPreparationReport;
 
@@ -212,6 +216,8 @@ fn tensor(bytes: &mut [u8], offset: usize, data: u64, size: u32, ti: u16, rows: 
 
 /// Construct the only supported packet image before the device can see it.
 pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES] {
+    const OP: usize = 192;
+    const KP: usize = OP + 72;
     let mut bytes = [0; COMPUTE_ALLOCATION_BYTES];
     // One htp_buf_desc (24), three htp_tensor (56), one htp_op_desc
     // (232), one reserved htp_prof_desc (48), total minimum command 472.
@@ -221,9 +227,7 @@ pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES
     tensor(&mut bytes, 24, 1024, 4096, 0, 32, 1);
     tensor(&mut bytes, 80, 5120, 256, 1, 2, 0);
     tensor(&mut bytes, 136, 5504, 256, 2, 2, 0);
-    const OP: usize = 192;
     put_u32(&mut bytes, OP, 4); // HTP_OP_MUL_MAT, no stub or fusion flags.
-    const KP: usize = OP + 72;
     bytes[KP] = 4; // HTP_MM_KERNEL_HVX_F32_F32_VTCM.
     bytes[KP + 4] = 1; // one compute thread.
     bytes[KP + 6] = 16; // prefetch rows; source-derived F32 solver choice.

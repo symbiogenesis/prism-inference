@@ -1,0 +1,76 @@
+name: Source package
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/**'
+      - 'examples/**'
+      - 'tests/**'
+      - 'tools/gguf/**'
+      - 'tools/native-hash/**'
+      - 'tools/prism/**'
+      - 'tools/ternary/**'
+      - '.github/actions/rust-toolchain/**'
+      - '.github/ci/source_package.py'
+      - '.github/workflows/source-package.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: source-package-${{ github.ref }}-${{ github.event_name == 'push' && 'push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+jobs:
+  package:
+    name: package / ${{ matrix.target }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/Prism-SourcePackage-Build
+      PRISM_PACKAGE_EVIDENCE: ${{ runner.temp }}/Prism-SourcePackage-Evidence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-${{ matrix.target }}
+          components: ''
+      - name: Reuse locked Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Verify normalized packages and an external library consumer
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python (Join-Path $env:GITHUB_WORKSPACE '.github/ci/source_package.py')
+      - name: Retain source archives and consumer evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: source-package-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}/package/*.crate
+            ${{ env.PRISM_PACKAGE_EVIDENCE }}/receipt.json
+            ${{ env.PRISM_PACKAGE_EVIDENCE }}/commands.json
+            ${{ env.PRISM_PACKAGE_EVIDENCE }}/consumer/Cargo.lock
+          if-no-files-found: error

@@ -2575,9 +2575,7 @@ mod tests {
             let native = read_gdn_word(&mut input)?;
             let query = read_gdn_vector(&mut input, width)?;
             let key = read_gdn_vector(&mut input, width)?;
-            let previous = read_gdn_vector(&mut input, width)?;
-            let mut state = Vec::with_capacity(width);
-            append_decayed_head(&previous, 1.0, &mut state);
+            let mut state = read_gdn_vector(&mut input, width)?;
             let expected = read_gdn_vector(&mut input, width)?;
             let mut source = state.clone();
             let delta = value - Arithmetic::PinnedSwift.gdn_dot(&state, &key)?;

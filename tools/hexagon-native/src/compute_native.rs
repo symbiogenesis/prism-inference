@@ -260,6 +260,10 @@ pub(super) fn probe_fixture(
     Ok(exercise(report, handle, domain, &calls, &mut progress))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep one fixed operation's registration, submission and completion sequence linear for ownership review"
+)]
 fn exercise(
     mut report: QueueComputeReport,
     handle: u64,
@@ -392,7 +396,9 @@ fn exercise(
     // during asynchronous device use. Only the fixed output subsection is read.
     let output = unsafe {
         std::slice::from_raw_parts(
-            memory.cast::<u8>().add(report.fixture.output_offset()),
+            memory
+                .cast::<u8>()
+                .wrapping_add(report.fixture.output_offset()),
             compute::OUTPUT_BYTES,
         )
     };

@@ -220,7 +220,7 @@ impl QueueComputeReport {
     // inference/admission decision. Write errors preserve every uncertain owner
     // even after an independently validated numeric result has been observed.
     #[cfg(any(test, all(windows, target_arch = "aarch64")))]
-    pub(crate) fn record_numeric_reply(&mut self, numeric_valid: bool) -> bool {
+    pub(crate) const fn record_numeric_reply(&mut self, numeric_valid: bool) -> bool {
         self.numeric_validated =
             numeric_valid && self.response_validated && matches!(self.queue_read_result, Some(0));
         if !matches!(self.queue_write_result, Some(0)) {
@@ -562,7 +562,7 @@ pub(crate) fn self_check() -> bool {
 mod tests {
     use super::*;
 
-    fn submitted_report(fixture: ComputeFixture, write_result: i32) -> QueueComputeReport {
+    const fn submitted_report(fixture: ComputeFixture, write_result: i32) -> QueueComputeReport {
         let mut metadata = SessionPreparationReport::new(0x81);
         metadata.domain_result = Some(0);
         metadata.effective_domain = Some(3);

@@ -61,7 +61,7 @@ The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
 All nine native library source files and `sources.json` match Runner revision
-[`2613af3`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/2613af3/tools/hexagon/native_rpc).
+[`f37a1d8`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/f37a1d84695b58c0e4ddfd8f39b9028fc869a24c/tools/hexagon/native_rpc).
 Fixed module names use typed `CStr` literals. The vendor request length still
 excludes the terminating NUL, while its independently writable backing buffer
 includes that NUL and is checked after return. URI, ABI, request ordering and
@@ -201,6 +201,22 @@ nonblocking API with the fixed guarded-Q2 packet instead. It performs no F32
 control automatically and supplies no fallback from a failed timed Q2 call.
 Each control is separately selected, source-bound and charged to the same
 owner-device allowance; missing remaining time leaves later controls pending.
+
+On **2026-11-01**, the bounded X2 guarded-Q2 nonblocking control passed against
+that exact Runner source using the same-run [ARM64 ABI and source-bound fixture
+preparation](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/41318454484).
+All 64 literal integer outputs matched bitwise for K=256/M=32/N=2. Write, read,
+DSP stop, host queue close, host FD unmap and module close returned zero; the
+allocation was freed, `poisoned` was false and the supervisor confirmed an empty
+process Job. This establishes the fixed guarded integer primitive and its
+explicit cleanup cycle. Actual Swift projections, complete logits/state,
+adapters, memory/resource limits, selected DSP-byte identity, complete vendor
+teardown, sustained performance and backend/default promotion remain pending.
+
+The matching owning [Prism hosted
+workflow](https://github.com/symbiogenesis/prism-inference/actions/runs/41318461417)
+passed 19 Windows ARM64 and 12 Windows x64 tests, strict release Clippy,
+documentation checks and the Linux-hosted Windows ARM64 cross-target check.
 
 A nonzero write can follow an already advanced packet queue in the pinned public
 reference implementation. After any write result, the diagnostic therefore

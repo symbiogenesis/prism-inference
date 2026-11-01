@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-gguf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bonsai-native-hash",
  "bonsai-ternary",

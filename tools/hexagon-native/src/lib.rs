@@ -2,8 +2,9 @@
 //!
 //! The ordinary API performs fixed read-only CDSP capability queries. A separate
 //! consuming terminal probe can allocate/register/unregister exactly 4KiB; that
-//! registration may implicitly open a domain session. Neither path loads custom
-//! DSP kernels, changes power/trust or submits inference. Native calls need an
+//! registration may implicitly open a domain session. The separate terminal X2
+//! queue diagnostic submits one fixed F32 matrix to a reviewed signed package.
+//! It changes no OS trust and qualifies no model inference. Native calls need an
 //! external process deadline; synchronous driver calls have no in-process timeout.
 //! The trusted caller also owns the child environment and must exclude vendor
 //! search-path, unsigned-process, power and runtime overrides before loading.
@@ -13,8 +14,13 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+mod compute;
 mod session;
 mod session_mapping;
+pub use compute::{
+    COMPUTE_ALLOCATION_BYTES, COMPUTE_GGML_SOURCE, COMPUTE_K, COMPUTE_M, COMPUTE_N,
+    COMPUTE_REQUEST_BYTES, COMPUTE_RESPONSE_BYTES, QueueComputeReport,
+};
 pub use session::{
     GET_EFFECTIVE_DOMAIN_ID, GET_URI, MAP_FD, MAP_FD_DELAYED, SessionPreparationReport,
 };
@@ -246,6 +252,7 @@ pub fn self_check() -> Result<(), Error> {
         || decode_architecture(0x8a).is_some()
         || MappingProbeReport::new().completed_mapping_cycle()
         || !session::self_check()
+        || !compute::self_check()
     {
         return Err(Error::Contract);
     }
@@ -438,6 +445,44 @@ impl Driver {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             windows::reference_session_mapping_probe(self.inner, package_directory, progress)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, progress);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Submit one fixed F32 matrix operation to the newer signed X2 package.
+    ///
+    /// This consuming terminal diagnostic requires independent source-bound
+    /// Windows ARM64 queue-layout/prototype and seven-argument start-wire
+    /// controls, the exact reviewed v0.10.0 package/catalog/driver identities,
+    /// guarded package files and an external child-process deadline/Job owner.
+    /// It explicitly uses the fixed reference process initializer before open.
+    /// The caller must exclude inherited vendor/runtime overrides; the sole
+    /// exception is `ADSP_LIBRARY_PATH` exactly equal to `package_directory`.
+    /// It changes no OS trust or boot policy. It does not accept caller tensor,
+    /// opcode, pointer, power, mapping, queue or start-field overrides.
+    ///
+    /// All native consumers remain pinned after any uncertain call. Only a
+    /// validated exact numeric response, successful stop/close/unmap allow the
+    /// fixed allocation's normal free; driver/package owners remain pinned to
+    /// process exit regardless. No serving admission or performance verdict
+    /// follows, and vendor-session teardown still needs independent evidence.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms/families, malformed paths, missing exports,
+    /// inherited overrides or metadata failures. Native refusals and partial
+    /// progress are retained as exact codes in the terminal report.
+    pub fn reference_queue_compute_probe(
+        self,
+        package_directory: &Path,
+        progress: impl FnMut(&QueueComputeReport),
+    ) -> Result<QueueComputeReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_queue_compute_probe(self.inner, package_directory, progress)
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {

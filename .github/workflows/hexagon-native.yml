@@ -1,7 +1,7 @@
 name: Experimental native Hexagon boundary
 on:
   push:
-    branches: ['codex/hexagon-**']
+    branches: [main, 'codex/hexagon-**']
     paths:
       - tools/hexagon-native/**
       - .github/workflows/hexagon-native.yml

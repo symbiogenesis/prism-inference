@@ -1,0 +1,370 @@
+//! Fixed newer signed-package F32 matrix control and strict queue reply checks.
+//!
+//! All packet fields are encoded explicitly from ggml's pinned `htp-ops.h` at
+//! `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. This is an access diagnostic,
+//! never a Swift arithmetic, performance, deployment or admission qualification.
+
+use crate::SessionPreparationReport;
+
+/// Signed-package protocol revision for the separate seven-argument start.
+pub const COMPUTE_GGML_SOURCE: &str = "19cce6919992fdffd92e0ac152caaf1e2b8f254e";
+/// Bounded CPU/DSP allocation shared by command, weights, activations and output.
+pub const COMPUTE_ALLOCATION_BYTES: usize = 16_384;
+/// Fixed inner dimension of the matrix access control.
+pub const COMPUTE_K: usize = 32;
+/// Fixed output rows of the matrix access control.
+pub const COMPUTE_M: usize = 32;
+/// Two activation rows exercise the HVX matrix path with mixed signed outputs.
+pub const COMPUTE_N: usize = 2;
+/// Fixed scalar request extent from the pinned HTP operation-batch declaration.
+pub const COMPUTE_REQUEST_BYTES: usize = 24;
+/// Fixed reply extent from the pinned HTP operation-batch declaration.
+pub const COMPUTE_RESPONSE_BYTES: usize = 88;
+
+pub(crate) const WEIGHT_OFFSET: usize = 1024;
+pub(crate) const ACTIVATION_OFFSET: usize = 5120;
+pub(crate) const OUTPUT_OFFSET: usize = 5504;
+pub(crate) const OUTPUT_BYTES: usize = COMPUTE_M * COMPUTE_N * 4;
+pub(crate) const START_SCALARS: u32 = 0x0201_0000;
+pub(crate) const STOP_SCALARS: u32 = 0x0300_0000;
+
+/// Independent observations of one consuming terminal queue operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Keep independently completed native operations separate in evidence"
+)]
+pub struct QueueComputeReport {
+    /// Last entered or completed fixed stage.
+    pub stage: &'static str,
+    /// Session metadata, including original validated effective domain.
+    pub metadata: SessionPreparationReport,
+    /// Reference initialization return; absent means not called.
+    pub process_initialization_result: Option<i32>,
+    /// Raw returned domain; never used as later configuration.
+    pub process_initialization_domain_after: Option<i32>,
+    /// Raw returned enable; never an effective process-class assertion.
+    pub process_initialization_enable_after: Option<i32>,
+    /// Explicit reference process-class request was attempted.
+    pub unsigned_process_requested: bool,
+    /// Fixed signed module open result.
+    pub module_open_result: Option<i32>,
+    /// Open replaced the poisoned 64-bit handle sentinel.
+    pub handle_observed: bool,
+    /// Fixed cached allocation succeeded with a usable descriptor.
+    pub allocation_succeeded: bool,
+    /// Explicit same-domain FD registration return.
+    pub mapping_result: Option<i32>,
+    /// Queue creation return.
+    pub queue_create_result: Option<i32>,
+    /// Queue export return.
+    pub queue_export_result: Option<i32>,
+    /// Seven-argument start invocation return.
+    pub queue_start_result: Option<i32>,
+    /// Fixed packet write return.
+    pub queue_write_result: Option<i32>,
+    /// Latest nonblocking read return, including would-block on expiry.
+    pub queue_read_result: Option<i32>,
+    /// A write was attempted, so its allocation must be treated as in use.
+    pub compute_submitted: bool,
+    /// Exact response, sequence, counts, descriptor and cache flags passed.
+    pub response_validated: bool,
+    /// Every poisoned output was replaced by its independent exact result.
+    pub numeric_validated: bool,
+    /// Stop completed after a fully validated reply and numeric output.
+    pub queue_stop_result: Option<i32>,
+    /// Host queue close after successful DSP stop.
+    pub queue_close_result: Option<i32>,
+    /// Host FD unregistration after successful stop and host queue close.
+    pub unmapping_result: Option<i32>,
+    /// Normal free happened only after known-safe cleanup.
+    pub free_completed: bool,
+    /// Explicit module handle close result.
+    pub module_close_result: Option<i32>,
+    /// All driver/module/catalog owners remain pinned through process exit.
+    pub owner_pinned_until_exit: bool,
+    /// Uncertain native consumers prevent allocation/module release.
+    pub poisoned: bool,
+}
+
+impl QueueComputeReport {
+    pub(crate) const fn new(metadata: SessionPreparationReport) -> Self {
+        Self {
+            stage: "compute-metadata-incomplete",
+            metadata,
+            process_initialization_result: None,
+            process_initialization_domain_after: None,
+            process_initialization_enable_after: None,
+            unsigned_process_requested: false,
+            module_open_result: None,
+            handle_observed: false,
+            allocation_succeeded: false,
+            mapping_result: None,
+            queue_create_result: None,
+            queue_export_result: None,
+            queue_start_result: None,
+            queue_write_result: None,
+            queue_read_result: None,
+            compute_submitted: false,
+            response_validated: false,
+            numeric_validated: false,
+            queue_stop_result: None,
+            queue_close_result: None,
+            unmapping_result: None,
+            free_completed: false,
+            module_close_result: None,
+            owner_pinned_until_exit: false,
+            poisoned: false,
+        }
+    }
+
+    /// An exact successful matrix reply was independently checked.
+    #[must_use]
+    pub const fn compute_executed(self) -> bool {
+        self.compute_submitted
+            && self.response_validated
+            && self.numeric_validated
+            && matches!(self.queue_write_result, Some(0))
+            && matches!(self.queue_read_result, Some(0))
+    }
+
+    /// All fixed access, numeric and explicit cleanup steps completed.
+    ///
+    /// This does not establish complete vendor-session teardown or eligibility.
+    #[must_use]
+    pub const fn completed_cycle(self) -> bool {
+        self.metadata.metadata_prepared()
+            && matches!(self.metadata.architecture, Some(81))
+            && self.unsigned_process_requested
+            && matches!(self.process_initialization_result, Some(0))
+            && self.process_initialization_domain_after.is_some()
+            && self.process_initialization_enable_after.is_some()
+            && matches!(self.module_open_result, Some(0))
+            && self.handle_observed
+            && self.allocation_succeeded
+            && matches!(self.mapping_result, Some(0))
+            && matches!(self.queue_create_result, Some(0))
+            && matches!(self.queue_export_result, Some(0))
+            && matches!(self.queue_start_result, Some(0))
+            && self.compute_executed()
+            && matches!(self.queue_stop_result, Some(0))
+            && matches!(self.queue_close_result, Some(0))
+            && matches!(self.unmapping_result, Some(0))
+            && self.free_completed
+            && matches!(self.module_close_result, Some(0))
+            && self.owner_pinned_until_exit
+            && !self.poisoned
+    }
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+fn get_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+fn get_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+pub(crate) fn start_wire(queue_id: u64) -> [u8; 48] {
+    let mut bytes = [0; 48];
+    // sess_id=0, one HVX, HMX disabled, default VTCM request, 64KiB mapping
+    // budget and explicit balanced power mode. No inherited runtime override.
+    put_u64(&mut bytes, 8, queue_id);
+    put_u32(&mut bytes, 16, 1);
+    put_u64(&mut bytes, 32, 65_536);
+    put_u32(&mut bytes, 40, 4);
+    bytes
+}
+
+pub(crate) fn request_wire() -> [u8; COMPUTE_REQUEST_BYTES] {
+    let mut bytes = [0; COMPUTE_REQUEST_BYTES];
+    put_u64(&mut bytes, 0, 1);
+    put_u32(&mut bytes, 8, 1);
+    put_u32(&mut bytes, 12, 3);
+    put_u32(&mut bytes, 16, 1);
+    bytes
+}
+
+fn tensor(bytes: &mut [u8], offset: usize, data: u64, size: u32, ti: u16, rows: u32, flags: u32) {
+    put_u64(bytes, offset, data);
+    put_u32(bytes, offset + 8, size);
+    put_u32(bytes, offset + 12, flags);
+    put_u16(bytes, offset + 22, ti);
+    for (i, value) in [32, rows, 1, 1].into_iter().enumerate() {
+        put_u32(bytes, offset + 24 + i * 4, value);
+    }
+    for (i, value) in [4, 128, rows * 128, rows * 128].into_iter().enumerate() {
+        put_u32(bytes, offset + 40 + i * 4, value);
+    }
+}
+
+/// Construct the only supported packet image before the device can see it.
+pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES] {
+    let mut bytes = [0; COMPUTE_ALLOCATION_BYTES];
+    // One htp_buf_desc (24), three htp_tensor (56), one htp_op_desc
+    // (232), one reserved htp_prof_desc (48), total minimum command 472.
+    put_u64(&mut bytes, 0, base);
+    put_u64(&mut bytes, 8, 16_384);
+    put_u32(&mut bytes, 20, fd);
+    tensor(&mut bytes, 24, 1024, 4096, 0, 32, 1);
+    tensor(&mut bytes, 80, 5120, 256, 1, 2, 0);
+    tensor(&mut bytes, 136, 5504, 256, 2, 2, 0);
+    const OP: usize = 192;
+    put_u32(&mut bytes, OP, 4); // HTP_OP_MUL_MAT, no stub or fusion flags.
+    const KP: usize = OP + 72;
+    bytes[KP] = 4; // HTP_MM_KERNEL_HVX_F32_F32_VTCM.
+    bytes[KP + 4] = 1; // one compute thread.
+    bytes[KP + 6] = 16; // prefetch rows; source-derived F32 solver choice.
+    put_u32(&mut bytes, KP + 24, 128); // activation row.
+    put_u32(&mut bytes, KP + 28, 2304); // 256 activation + 2048 weight scratch.
+    // init_fastdiv_values(2)=(1,1), init_fastdiv_values(1)=(1,0).
+    for (i, shift) in [1, 1, 0, 0, 0].into_iter().enumerate() {
+        put_u32(&mut bytes, KP + 36 + i * 8, 1);
+        put_u32(&mut bytes, KP + 40 + i * 8, shift);
+    }
+    for index in 0..10 {
+        put_u16(&mut bytes, OP + 200 + index * 2, u16::MAX);
+    }
+    put_u16(&mut bytes, OP + 200, 0);
+    put_u16(&mut bytes, OP + 202, 1);
+    for index in 0..4 {
+        put_u16(&mut bytes, OP + 220 + index * 2, u16::MAX);
+    }
+    put_u16(&mut bytes, OP + 220, 2);
+    for index in 0_u16..32 {
+        let index_usize = usize::from(index);
+        let weight = f32::from(index + 1);
+        put_u32(
+            &mut bytes,
+            WEIGHT_OFFSET + (index_usize * 32 + index_usize) * 4,
+            weight.to_bits(),
+        );
+        put_u32(
+            &mut bytes,
+            ACTIVATION_OFFSET + index_usize * 4,
+            weight.to_bits(),
+        );
+        let second = f32::from(i16::try_from(index * 2).unwrap_or_default() - 17);
+        put_u32(
+            &mut bytes,
+            ACTIVATION_OFFSET + 128 + index_usize * 4,
+            second.to_bits(),
+        );
+    }
+    for index in 0..64 {
+        put_u32(&mut bytes, OUTPUT_OFFSET + index * 4, 0x7fc0_ae51);
+    }
+    bytes
+}
+
+pub(crate) fn response_valid(bytes: &[u8]) -> bool {
+    bytes.len() == COMPUTE_RESPONSE_BYTES
+        && get_u64(bytes, 0) == Some(1)
+        && get_u32(bytes, 24) == Some(1)
+        && get_u32(bytes, 28) == Some(1)
+        && get_u32(bytes, 32) == Some(3)
+        && get_u32(bytes, 36) == Some(1)
+        && bytes
+            .get(44..88)
+            .is_some_and(|traces| traces.iter().all(|byte| *byte == 0))
+}
+
+pub(crate) fn output_valid(bytes: &[u8]) -> bool {
+    if bytes.len() != OUTPUT_BYTES {
+        return false;
+    }
+    for index in 0_u16..32 {
+        let index_usize = usize::from(index);
+        let row = f32::from(index + 1);
+        let second = f32::from(i16::try_from(index * 2).unwrap_or_default() - 17);
+        if get_u32(bytes, index_usize * 4) != Some((row * row).to_bits())
+            || get_u32(bytes, (32 + index_usize) * 4) != Some((row * second).to_bits())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn self_check() -> bool {
+    let image = fixture_image(0x1234_5600, 19);
+    let start = start_wire(0x2132_4354_6576_0718);
+    let mut response = [0; COMPUTE_RESPONSE_BYTES];
+    put_u64(&mut response, 0, 1);
+    for (offset, value) in [(24, 1), (28, 1), (32, 3), (36, 1)] {
+        put_u32(&mut response, offset, value);
+    }
+    response_valid(&response)
+        && !output_valid(&image[OUTPUT_OFFSET..OUTPUT_OFFSET + OUTPUT_BYTES])
+        && request_wire()[..8] == 1_u64.to_le_bytes()
+        && start[4..8] == [0; 4]
+        && start[44..48] == [0; 4]
+        && START_SCALARS == 0x0201_0000
+        && STOP_SCALARS == 0x0300_0000
+        && !QueueComputeReport::new(SessionPreparationReport::new(0x81)).completed_cycle()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_wire_shapes_padding_and_numeric_poison() {
+        assert!(self_check());
+        let image = fixture_image(0x1234_5600, 19);
+        assert_eq!(get_u64(&image, 8), Some(16_384));
+        assert_eq!(get_u32(&image, 20), Some(19));
+        assert_eq!(get_u32(&image, 192), Some(4));
+        assert_eq!(get_u32(&image, 292), Some(2304));
+        assert_eq!(image[472..1024], [0; 552]);
+    }
+
+    #[test]
+    fn response_rejects_every_correlated_field_change_and_wrong_extent() {
+        let mut valid = [0; COMPUTE_RESPONSE_BYTES];
+        put_u64(&mut valid, 0, 1);
+        for (offset, value) in [(24, 1), (28, 1), (32, 3), (36, 1)] {
+            put_u32(&mut valid, offset, value);
+        }
+        assert!(response_valid(&valid));
+        for offset in [0, 7, 24, 28, 32, 36, 44, 87] {
+            let mut wrong = valid;
+            wrong[offset] ^= 0x80;
+            assert!(!response_valid(&wrong));
+        }
+        assert!(!response_valid(&valid[..87]));
+    }
+
+    #[test]
+    fn numeric_control_requires_all_sixty_four_exact_outputs() {
+        let mut output = [0; OUTPUT_BYTES];
+        for index in 0_u16..32 {
+            let row = f32::from(index + 1);
+            let second = f32::from(i16::try_from(index * 2).unwrap_or_default() - 17);
+            put_u32(&mut output, usize::from(index) * 4, (row * row).to_bits());
+            put_u32(
+                &mut output,
+                (32 + usize::from(index)) * 4,
+                (row * second).to_bits(),
+            );
+        }
+        assert!(output_valid(&output));
+        for index in 0..64 {
+            let mut wrong = output;
+            put_u32(&mut wrong, index * 4, 0x7fc0_ae51);
+            assert!(!output_valid(&wrong));
+        }
+    }
+}

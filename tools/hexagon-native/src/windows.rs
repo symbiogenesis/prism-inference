@@ -12,6 +12,8 @@ use std::ptr::{NonNull, null, null_mut};
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
+#[path = "compute_native.rs"]
+mod compute_native;
 #[path = "mapping.rs"]
 mod mapping;
 #[path = "session_mapping_native.rs"]
@@ -424,6 +426,18 @@ pub(super) fn reference_session_mapping_probe(
 ) -> Result<crate::SessionMappingReport, Error> {
     session_mapping_native::reference_probe(driver, package, progress)
 }
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe parent may consume the private native compute owner"
+)]
+pub(super) fn reference_queue_compute_probe(
+    driver: Driver,
+    package: &Path,
+    progress: impl FnMut(&crate::QueueComputeReport),
+) -> Result<crate::QueueComputeReport, Error> {
+    compute_native::probe(driver, package, progress)
+}
+
 impl Drop for Driver {
     fn drop(&mut self) {
         // SAFETY: this owner completed only fixed queries or pre-mapping cleanup.

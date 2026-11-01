@@ -60,8 +60,8 @@ signed-reference ggml host-driver convention. No implementation is vendored.
 The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
-All seven native library source files match Runner revision
-[`7373c020c928a6d188db628bef465f94b612ab9f`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/7373c020c928a6d188db628bef465f94b612ab9f/tools/hexagon/native_rpc).
+All nine native library source files and `sources.json` match Runner revision
+[`898eeee`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/898eeee/tools/hexagon/native_rpc).
 Fixed module names use typed `CStr` literals. The vendor request length still
 excludes the terminating NUL, while its independently writable backing buffer
 includes that NUL and is checked after return. URI, ABI, request ordering and
@@ -92,7 +92,8 @@ open/map/unmap/close results. Any uncertain map/unmap retains the allocation and
 handle without free/close. Every open attempt pins the driver, package guards and
 process lease until supervised process death. Even successful explicit handle
 close does not qualify complete vendor session teardown. Fixed callback progress
-records entered operations only. No compute or unsigned-process control exists.
+records entered operations only. That original probe submits no computation or
+unsigned-process request; the separately named reference probes below do.
 The authoritative public `remote.h` declares a u64 close handle; the reference
 host wrapper's inconsistent 32-bit function-pointer typedef is not reused.
 
@@ -112,7 +113,7 @@ check is allowed under the shared owner-device aggregate budget, including
 setup, compilation, loading/querying when requested and cleanup. This library's
 model-free `self_check()` opens no services, files or libraries.
 
-The branch-only hosted `hexagon-native.yml` workflow runs formatting, all native
+The main and experiment-branch hosted `hexagon-native.yml` workflow runs formatting, all native
 contract tests, strict release Clippy, doctests and documentation compilation on
 Windows ARM64 and x86_64 without a device. Unsupported-target stubs retain the
 same runtime API and reject explicitly; only their constant-stub Clippy suggestion
@@ -121,6 +122,45 @@ private mapping-receipt constructor is compiled only for native ARM64 or tests,
 so ordinary unsupported-target libraries and documentation omit unused code.
 Actual device execution belongs to Runner's separate source-bound supervisor;
 this unpublished crate does not change production runtime dependencies or pins.
+
+## Fixed X2 matrix queue control
+
+`Driver::reference_queue_compute_probe` is a separate consuming diagnostic for
+the exact reviewed newer GenieX v0.10.0 package, restricted to v81. It prepares
+one F32 matrix operation with K=32, M=32 and N=2. The matrix contains diagonal
+weights scaled by row index and two distinct signed integer activation rows;
+all 64 outputs must exactly replace their NaN poison with independently computed
+F32 bit patterns. This verifies neither packed Swift arithmetic nor speed.
+
+The implementation encodes the newer seven-field 48-byte start frame, one
+24-byte request, three tensor descriptors and one precomputed HVX matrix
+descriptor directly in Rust. There is one queue slot, one HVX worker, HMX
+disabled, explicit balanced power and no caller-selected native fields. A
+single 16 KiB mapped allocation contains command, input and output. Its entire
+extent participates in the queue cache flags so output poison and returned
+results are included. The response must match the fixed sequence, status,
+counts, 88-byte message, same FD/address/offset/extent, cache flags and zero
+trace counts before the CPU reads output. The write has a finite timeout; reads
+use the explicit nonblocking export under one three-second absolute deadline.
+Native calls still require an independent external process deadline.
+
+Before invocation, the trusted supervisor must independently pass source-bound
+Windows ARM64 C queue-layout/prototype and generated-start-wire controls, verify
+the exact package/catalog/driver identities, guard package files and establish
+owned-process containment. Public queue declarations and a passed generic access
+fixture alone do not satisfy those prerequisites. The implementation uses no
+SDK, generated C build dependency or C/C++ inference library. Its independent
+controls remain outside the Rust production runtime.
+
+Every native-affecting attempt pins the driver, package guards and process lease.
+No failed, cancelled, expired or malformed submission releases its allocation,
+queue or module. A complete validated numeric response followed by successful
+DSP stop, host queue close, authoritative u64 module close and same-tuple host
+unmap permits normal allocation free. The DLL and package owners remain pinned
+through process exit even then. Explicit cleanup does not establish complete
+vendor-session teardown. Selected DSP bytes, actual-model numerics/state,
+resource behavior, sustained benefit and automatic selection remain unqualified;
+`profileEligible` remains false and the main runtime does not consume this crate.
 
 ## Explicit reference process initialization
 

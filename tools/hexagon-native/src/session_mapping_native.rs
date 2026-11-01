@@ -71,7 +71,11 @@ fn functions(driver: &Driver) -> Result<Functions, Error> {
     })
 }
 
-fn package_guards(package: &Path, architecture: u32) -> Result<Vec<File>, Error> {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "The fixed compute sibling shares exactly the existing guarded package path policy"
+)]
+pub(super) fn package_guards(package: &Path, architecture: u32) -> Result<Vec<File>, Error> {
     if !package.is_absolute()
         || package.components().any(|part| match part {
             Component::Prefix(prefix) => !matches!(prefix.kind(), Prefix::Disk(_)),

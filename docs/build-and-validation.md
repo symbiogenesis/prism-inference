@@ -456,11 +456,19 @@ package cannot preserve that Git-only dependency and substituting registry
 `0.1.0` would omit the required read APIs. Checked GitHub bundles and exact source
 checkouts are the supported delivery paths for this server candidate. A reviewed
 helper registry release and server publication remain separate pending work.
+The hosted [Source package workflow](../.github/workflows/source-package.yml)
+verifies normalized Cargo archives together before registry publication on
+Windows ARM64, Windows x64 and Linux ARM64. A separate application consumes the
+extracted runtime, GGUF and hash archives and runs model-free public API checks
+with scalar, default and parallel-row features. Its receipt retains archive
+digests, source identity, consumer lockfile and executed commands. This checks
+source delivery independently of building inside the original workspace.
+
 The new native hashing implementation needs `bonsai-native-hash` `0.1.0`
 published first, followed by `bonsai-gguf` `0.1.1` and the runtime. The runtime's
 exact GGUF pin selects the new dependency for future registry delivery; the path
 dependency builds that implementation in the reviewed checkout now. Registry
-publication and source verification remain pending. Source preparation and passing
+publication remains separate. Source preparation and passing
 CI alone do not publish registry packages or qualify model serving.
 
 The candidate release-bundle build explicitly enables

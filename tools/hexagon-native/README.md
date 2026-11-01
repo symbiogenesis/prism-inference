@@ -61,7 +61,7 @@ The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
 All nine native library source files and `sources.json` match Runner revision
-[`898eeee`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/898eeee/tools/hexagon/native_rpc).
+[`94b50c0`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/94b50c0/tools/hexagon/native_rpc).
 Fixed module names use typed `CStr` literals. The vendor request length still
 excludes the terminating NUL, while its independently writable backing buffer
 includes that NUL and is checked after return. URI, ABI, request ordering and
@@ -166,6 +166,20 @@ through process exit even then. Explicit cleanup does not establish complete
 vendor-session teardown. Selected DSP bytes, actual-model numerics/state,
 resource behavior, sustained benefit and automatic selection remain unqualified;
 `profileEligible` remains false and the main runtime does not consume this crate.
+
+`Driver::reference_queue_q2_probe` is an explicitly separate fixed control for
+the newer signed Q2 kernel. Its K=256/M=32/N=2 packet uses four tightly packed
+576-byte host weight tiles and two guarded F32 integer-limb rows. DSP DMA stages
+each host tile in a 640-byte VTCM slot; host payload contains no such padding.
+The exact source-derived HVX solver requests 61,440 bytes of scratch. The 64
+independent integer results cover all four symbols, positive/negative guards,
+maximum corrected group sums and odd values beyond FP16's exact-integer range.
+Every output must match exactly before the same conservative cleanup can run.
+This controls the signed quantizer/integer primitive only: actual Swift weights,
+activation preparation, original per-128 reduction, logits/state, adapters and
+end-to-end benefit remain separate qualification gates. It runs no whole-model
+conversion and changes no backend default. Callers select one fixed control;
+there is no automatic fallback or retry between F32 and Q2.
 
 ## Explicit reference process initialization
 

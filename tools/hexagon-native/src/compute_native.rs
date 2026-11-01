@@ -1,4 +1,4 @@
-//! Consuming fixed X2 F32 queue control; no inference-library dependency.
+//! Consuming fixed X2 matrix queue controls; no inference-library dependency.
 //!
 //! The supervisor must qualify the independently compiled Windows ARM64 queue
 //! layouts/prototypes and public seven-argument start frame before execution.
@@ -184,21 +184,34 @@ fn entered(
     reason = "Only the safe parent consumes the native driver"
 )]
 pub(super) fn probe(
+    driver: Driver,
+    package: &Path,
+    progress: impl FnMut(&QueueComputeReport),
+) -> Result<QueueComputeReport, Error> {
+    probe_fixture(driver, package, progress, compute::ComputeFixture::F32)
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe parent selects one of two private fixed compute controls"
+)]
+pub(super) fn probe_fixture(
     mut driver: Driver,
     package: &Path,
     mut progress: impl FnMut(&QueueComputeReport),
+    fixture: compute::ComputeFixture,
 ) -> Result<QueueComputeReport, Error> {
     crate::self_check()?;
     let raw = driver.capability(Capability::Architecture)?;
     let metadata = SessionPreparationReport::new(raw);
     if metadata.architecture != Some(81) {
-        return Ok(QueueComputeReport::new(metadata));
+        return Ok(QueueComputeReport::new_fixture(metadata, fixture));
     }
     let guards = session_mapping_native::package_guards(package, 81)?;
     let calls = calls(&driver)?;
     let control = session_native::session_control(&driver)?;
     let metadata = session_native::prepare_effective_domain(raw, control);
-    let mut report = QueueComputeReport::new(metadata);
+    let mut report = QueueComputeReport::new_fixture(metadata, fixture);
     let Some(domain) = metadata.effective_domain else {
         return Ok(report);
     };
@@ -276,7 +289,7 @@ fn exercise(
         return report;
     };
     report.allocation_succeeded = true;
-    let image = compute::fixture_image(base, fd_u32);
+    let image = compute::fixture_image_for(report.fixture, base, fd_u32);
     // SAFETY: rpcmem returned an exclusive CPU-accessible extent of exactly the
     // requested length. No registration or device consumer exists yet.
     unsafe {
@@ -379,11 +392,11 @@ fn exercise(
     // during asynchronous device use. Only the fixed output subsection is read.
     let output = unsafe {
         std::slice::from_raw_parts(
-            memory.cast::<u8>().add(compute::OUTPUT_OFFSET),
+            memory.cast::<u8>().add(report.fixture.output_offset()),
             compute::OUTPUT_BYTES,
         )
     };
-    report.numeric_validated = compute::output_valid(output);
+    report.numeric_validated = compute::output_valid_for(report.fixture, output);
     if !report.numeric_validated {
         report.stage = "compute-numeric-mismatch-pinned";
         return report;

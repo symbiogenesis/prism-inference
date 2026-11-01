@@ -1,4 +1,4 @@
-//! Fixed newer signed-package F32 matrix control and strict queue reply checks.
+//! Fixed newer signed-package matrix controls and strict queue reply checks.
 //!
 //! All packet fields are encoded explicitly from ggml's pinned `htp-ops.h` at
 //! `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. This is an access diagnostic,
@@ -10,12 +10,29 @@
 
 use crate::SessionPreparationReport;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeFixture {
+    F32,
+    GuardedQ2,
+}
+
+impl ComputeFixture {
+    pub(crate) const fn output_offset(self) -> usize {
+        match self {
+            Self::F32 => OUTPUT_OFFSET,
+            Self::GuardedQ2 => Q2_OUTPUT_OFFSET,
+        }
+    }
+}
+
 /// Signed-package protocol revision for the separate seven-argument start.
 pub const COMPUTE_GGML_SOURCE: &str = "19cce6919992fdffd92e0ac152caaf1e2b8f254e";
 /// Bounded CPU/DSP allocation shared by command, weights, activations and output.
 pub const COMPUTE_ALLOCATION_BYTES: usize = 16_384;
 /// Fixed inner dimension of the matrix access control.
 pub const COMPUTE_K: usize = 32;
+/// Fixed padded K of the separate guarded integer Q2 access control.
+pub const COMPUTE_Q2_K: usize = 256;
 /// Fixed output rows of the matrix access control.
 pub const COMPUTE_M: usize = 32;
 /// Two activation rows exercise the HVX matrix path with mixed signed outputs.
@@ -29,6 +46,11 @@ pub(crate) const WEIGHT_OFFSET: usize = 1024;
 pub(crate) const ACTIVATION_OFFSET: usize = 5120;
 pub(crate) const OUTPUT_OFFSET: usize = 5504;
 pub(crate) const OUTPUT_BYTES: usize = COMPUTE_M * COMPUTE_N * 4;
+const Q2_OUTPUT_OFFSET: usize = 7296;
+const Q2_WEIGHT_BYTES: u16 = 2304;
+const Q2_HOST_TILE_BYTES: usize = 576;
+const Q2_VTCM_TILE_BYTES: u32 = 640;
+const Q2_VTCM_BYTES: u32 = 61_440;
 pub(crate) const START_SCALARS: u32 = 0x0201_0000;
 pub(crate) const STOP_SCALARS: u32 = 0x0300_0000;
 
@@ -39,6 +61,7 @@ pub(crate) const STOP_SCALARS: u32 = 0x0300_0000;
     reason = "Keep independently completed native operations separate in evidence"
 )]
 pub struct QueueComputeReport {
+    pub(crate) fixture: ComputeFixture,
     /// Last entered or completed fixed stage.
     pub stage: &'static str,
     /// Session metadata, including original validated effective domain.
@@ -93,7 +116,15 @@ pub struct QueueComputeReport {
 
 impl QueueComputeReport {
     pub(crate) const fn new(metadata: SessionPreparationReport) -> Self {
+        Self::new_fixture(metadata, ComputeFixture::F32)
+    }
+
+    pub(crate) const fn new_fixture(
+        metadata: SessionPreparationReport,
+        fixture: ComputeFixture,
+    ) -> Self {
         Self {
+            fixture,
             stage: "compute-metadata-incomplete",
             metadata,
             process_initialization_result: None,
@@ -120,6 +151,12 @@ impl QueueComputeReport {
             owner_pinned_until_exit: false,
             poisoned: false,
         }
+    }
+
+    /// This receipt belongs to the separate fixed guarded-Q2 integer control.
+    #[must_use]
+    pub const fn is_guarded_q2_control(self) -> bool {
+        matches!(self.fixture, ComputeFixture::GuardedQ2)
     }
 
     /// An exact successful matrix reply was independently checked.
@@ -273,6 +310,152 @@ pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES
     bytes
 }
 
+fn q2_code(lane: u16) -> i16 {
+    // Three whole 31-lane runs force both guard signs and maximum FP16-exact
+    // corrected sums (+/-1857); the tail supplies nonconstant mixed codes.
+    match lane {
+        0..=30 => -128,
+        31..=61 => 127,
+        62..=92 => -127,
+        _ => i16::try_from((lane * 73 + 19) & 255).unwrap_or_default() - 128,
+    }
+}
+
+fn q2_symbol(row: u16, lane: u16) -> u8 {
+    match row {
+        0 => 1, // Exact zero weights test offset cancellation, including guards.
+        1 => 3, // The fourth symbol is +2, never a ternary-only interpretation.
+        2 => 0,
+        3 => {
+            if q2_code(lane) < 0 {
+                0
+            } else {
+                3
+            }
+        }
+        4 => {
+            if q2_code(lane) < 0 {
+                3
+            } else {
+                0
+            }
+        }
+        _ => u8::try_from(((lane / 4 + row) ^ (lane + row * row + lane / (row + 1))) & 3)
+            .unwrap_or_default(),
+    }
+}
+
+// Independently derived as sum((original_symbol-1)*original_code_limb) over
+// original lanes 0..128, without guards, padding, tile packing or Q8_1 code.
+// Odd results above 2048 reject an accidental FP16-output/HMX route.
+const Q2_EXPECTED_DOTS: [i16; 64] = [
+    0, -4490, 2245, 9406, -11651, -1043, -1393, -871, -976, -1444, -1179, -1918, -391, -1410,
+    -1132, -635, -1175, -1258, -1239, -783, -1265, -1219, -1020, -867, -909, -1647, -779, -739,
+    -1369, -1011, -1161, -1137, 0, -4496, 2248, 9523, -11771, -1040, -1398, -869, -979, -1455,
+    -1177, -1935, -374, -1417, -1128, -623, -1186, -1273, -1243, -781, -1266, -1212, -1021, -871,
+    -907, -1651, -782, -743, -1378, -1011, -1162, -1140,
+];
+
+pub(crate) fn q2_fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES] {
+    const OP: usize = 192;
+    const KP: usize = OP + 72;
+    let mut bytes = fixture_image(base, fd);
+    // Remove the F32 fixture, preserving only common descriptor/op framing.
+    bytes[WEIGHT_OFFSET..].fill(0);
+    tensor(&mut bytes, 24, 1024, u32::from(Q2_WEIGHT_BYTES), 0, 32, 3);
+    put_u32(&mut bytes, 24 + 16, 42); // HTP_TYPE_Q2_0, WEIGHT|TILED.
+    for (index, value) in [256, 32, 1, 1].into_iter().enumerate() {
+        put_u32(&mut bytes, 24 + 24 + index * 4, value);
+    }
+    for (index, value) in [18, 72, 2304, 2304].into_iter().enumerate() {
+        put_u32(&mut bytes, 24 + 40 + index * 4, value);
+    }
+    tensor(&mut bytes, 80, 5120, 2048, 1, 2, 0);
+    put_u32(&mut bytes, 80 + 24, 256);
+    for (index, value) in [4, 1024, 2048, 2048].into_iter().enumerate() {
+        put_u32(&mut bytes, 80 + 40 + index * 4, value);
+    }
+    tensor(&mut bytes, 136, 7296, 256, 2, 2, 0);
+    bytes[KP] = 6; // HTP_MM_KERNEL_HVX_QUANT_ROW: N=2 >= one HVX thread.
+    put_u32(&mut bytes, KP + 16, 576);
+    put_u32(&mut bytes, KP + 20, Q2_VTCM_TILE_BYTES);
+    put_u32(&mut bytes, KP + 24, 10_240); // (round_up(K,128)/32)*1280 Q8_1.
+    // Pinned solver: 2*10240 activation + max(16*4*640 weight,2048 raw).
+    // N>1 has no destination scratch; the raw activation stage overlaps weights.
+    put_u32(&mut bytes, KP + 28, Q2_VTCM_BYTES);
+    for row in 0_u16..32 {
+        let row_index = usize::from(row);
+        for block in 0..4 {
+            let tile = WEIGHT_OFFSET + block * Q2_HOST_TILE_BYTES;
+            // Every lane starts with symbol one: zero weight, including guards.
+            for plane in 0..4 {
+                let index = tile + plane * 128 + row_index * 4;
+                bytes[index..index + 4].fill(0x55);
+            }
+            put_u16(&mut bytes, tile + 512 + row_index * 2, 0x3c00);
+        }
+        for lane in 0_u16..128 {
+            let destination = lane / 31 * 32 + lane % 31;
+            let local = destination % 64;
+            let tile = WEIGHT_OFFSET + usize::from(destination) / 64 * Q2_HOST_TILE_BYTES;
+            let index =
+                tile + usize::from(local) / 16 * 128 + row_index * 4 + usize::from(local) % 4;
+            let shift = local / 4 % 4 * 2;
+            bytes[index] = (bytes[index] & !(3 << shift)) | q2_symbol(row, lane) << shift;
+        }
+    }
+    let mut activation = [[0_i16; COMPUTE_Q2_K]; 2];
+    for lane in 0_u16..128 {
+        let destination = usize::from(lane / 31 * 32 + lane % 31);
+        let code = q2_code(lane);
+        activation[0][destination] = code / 2;
+        activation[1][destination] = code - code / 2;
+    }
+    for (limb_index, limb) in activation.iter_mut().enumerate() {
+        for group in limb.chunks_exact_mut(32) {
+            let sum: i16 = group[..31].iter().sum();
+            group[31] = if sum >= 0 { -127 } else { 127 };
+        }
+        for (lane, value) in limb.iter().enumerate() {
+            put_u32(
+                &mut bytes,
+                ACTIVATION_OFFSET + (limb_index * 256 + lane) * 4,
+                f32::from(*value).to_bits(),
+            );
+        }
+    }
+    for index in 0..64 {
+        put_u32(&mut bytes, Q2_OUTPUT_OFFSET + index * 4, 0x7fc0_ae51);
+    }
+    bytes
+}
+
+pub(crate) fn fixture_image_for(
+    fixture: ComputeFixture,
+    base: u64,
+    fd: u32,
+) -> [u8; COMPUTE_ALLOCATION_BYTES] {
+    match fixture {
+        ComputeFixture::F32 => fixture_image(base, fd),
+        ComputeFixture::GuardedQ2 => q2_fixture_image(base, fd),
+    }
+}
+
+pub(crate) fn output_valid_for(fixture: ComputeFixture, bytes: &[u8]) -> bool {
+    match fixture {
+        ComputeFixture::F32 => output_valid(bytes),
+        ComputeFixture::GuardedQ2 => {
+            bytes.len() == OUTPUT_BYTES
+                && Q2_EXPECTED_DOTS
+                    .iter()
+                    .enumerate()
+                    .all(|(index, &expected)| {
+                        get_u32(bytes, index * 4) == Some(f32::from(expected).to_bits())
+                    })
+        }
+    }
+}
+
 pub(crate) fn response_valid(bytes: &[u8]) -> bool {
     bytes.len() == COMPUTE_RESPONSE_BYTES
         && get_u64(bytes, 0) == Some(1)
@@ -310,8 +493,17 @@ pub(crate) fn self_check() -> bool {
     for (offset, value) in [(24, 1), (28, 1), (32, 3), (36, 1)] {
         put_u32(&mut response, offset, value);
     }
+    let q2_image = fixture_image_for(ComputeFixture::GuardedQ2, 0x1234_5600, 19);
+    let q2_offset = ComputeFixture::GuardedQ2.output_offset();
     response_valid(&response)
         && !output_valid(&image[OUTPUT_OFFSET..OUTPUT_OFFSET + OUTPUT_BYTES])
+        && !output_valid_for(
+            ComputeFixture::GuardedQ2,
+            &q2_image[q2_offset..q2_offset + OUTPUT_BYTES],
+        )
+        && get_u32(&q2_image, 24 + 16) == Some(42)
+        && get_u32(&q2_image, 264 + 24) == Some(10_240)
+        && get_u32(&q2_image, 264 + 28) == Some(Q2_VTCM_BYTES)
         && request_wire()[..8] == 1_u64.to_le_bytes()
         && start[4..8] == [0; 4]
         && start[44..48] == [0; 4]
@@ -370,5 +562,93 @@ mod tests {
             put_u32(&mut wrong, index * 4, 0x7fc0_ae51);
             assert!(!output_valid(&wrong));
         }
+    }
+
+    #[test]
+    fn guarded_q2_image_matches_original_integer_math_and_host_tile_strides()
+    -> Result<(), crate::Error> {
+        let image = fixture_image_for(ComputeFixture::GuardedQ2, 0x1234_5600, 19);
+        assert_eq!(get_u32(&image, 24 + 8), Some(2304));
+        assert_eq!(get_u32(&image, 24 + 12), Some(3));
+        assert_eq!(get_u32(&image, 24 + 16), Some(42));
+        assert_eq!(get_u32(&image, 24 + 24), Some(256));
+        assert_eq!(get_u32(&image, 24 + 44), Some(72));
+        assert_eq!(get_u32(&image, 264 + 16), Some(576));
+        assert_eq!(get_u32(&image, 264 + 20), Some(640));
+        assert_eq!(get_u32(&image, 264 + 24), Some(10_240));
+        assert_eq!(get_u32(&image, 264 + 28), Some(61_440));
+        assert_eq!(image[264], 6);
+        assert_eq!(image[268], 1);
+        assert_eq!(image[270], 16);
+        // Last scale of host tile 0, then tile 1's row-zero symbols (zero weight).
+        assert_eq!(&image[1024 + 574..1024 + 576], &[0x00, 0x3c]);
+        assert_eq!(&image[1600..1604], &[0x55; 4]);
+        for tile in
+            image[WEIGHT_OFFSET..WEIGHT_OFFSET + usize::from(Q2_WEIGHT_BYTES)].chunks_exact(576)
+        {
+            for scale in tile[512..576].chunks_exact(2) {
+                assert_eq!(scale, [0x00, 0x3c]);
+            }
+        }
+        let mut output = [0; OUTPUT_BYTES];
+        let mut observed_guard_sums = Vec::new();
+        for limb in 0..2 {
+            let mut values = [0_i16; COMPUTE_Q2_K];
+            for (lane, value) in values.iter_mut().enumerate() {
+                let bits = get_u32(&image, ACTIVATION_OFFSET + (limb * 256 + lane) * 4)
+                    .ok_or(crate::Error::Contract)?;
+                *value = (-127_i16..=127)
+                    .find(|&integer| f32::from(integer).to_bits() == bits)
+                    .ok_or(crate::Error::Contract)?;
+            }
+            for group in values.chunks_exact(32) {
+                assert_eq!(group.iter().map(|v| v.abs()).max(), Some(127));
+                let sum: i16 = group.iter().sum();
+                assert!(sum.abs() <= 1857);
+                observed_guard_sums.push(sum);
+            }
+            for row in 0_u16..32 {
+                let row_index = usize::from(row);
+                let mut tiled_integer = 0_i32;
+                for (lane, &value) in values.iter().enumerate() {
+                    let tile = WEIGHT_OFFSET + lane / 64 * 576;
+                    let local = lane % 64;
+                    let packed = image[tile + local / 16 * 128 + row_index * 4 + local % 4];
+                    let code = (packed >> (local / 4 % 4 * 2)) & 3;
+                    tiled_integer += (i32::from(code) - 1) * i32::from(value);
+                }
+                let mut original_integer = 0_i32;
+                for lane in 0_u16..128 {
+                    let code = q2_code(lane);
+                    let value = if limb == 0 { code / 2 } else { code - code / 2 };
+                    original_integer += (i32::from(q2_symbol(row, lane)) - 1) * i32::from(value);
+                }
+                assert_eq!(tiled_integer, original_integer);
+                assert_eq!(
+                    original_integer,
+                    i32::from(Q2_EXPECTED_DOTS[limb * 32 + row_index])
+                );
+                let integer = i16::try_from(tiled_integer).map_err(|_| crate::Error::Contract)?;
+                put_u32(
+                    &mut output,
+                    (limb * 32 + row_index) * 4,
+                    f32::from(integer).to_bits(),
+                );
+            }
+        }
+        assert!(observed_guard_sums.contains(&1857));
+        assert!(observed_guard_sums.contains(&-1857));
+        assert!(output_valid_for(ComputeFixture::GuardedQ2, &output));
+        assert!(!output_valid_for(ComputeFixture::F32, &output));
+        for index in 0..64 {
+            let mut wrong = output;
+            put_u32(&mut wrong, index * 4, 0x7fc0_ae51);
+            assert!(!output_valid_for(ComputeFixture::GuardedQ2, &wrong));
+        }
+        assert!(!output_valid_for(
+            ComputeFixture::GuardedQ2,
+            &output[..OUTPUT_BYTES - 1]
+        ));
+        Ok(())
     }
 }

@@ -192,7 +192,10 @@
       { "path": "ggml/src/ggml-hexagon/htp/matmul-ops.h", "sha256": "e2afab4816382eb7b693aafdab6f937c35454889cb356b352436a71a79330ab0" },
       { "path": "ggml/src/ggml-hexagon/htp/matmul-ops.c", "sha256": "f7158e60056c2e67ce3c0d16d8cbe4cc4eac18ab01257339125c54177a93797d" },
       { "path": "ggml/src/ggml-hexagon/htp/hex-fastdiv.h", "sha256": "de933ab1cca4da4b285a38027899d2ed867646d7ccfa6f932620eab2065ca51d" },
-      { "path": "ggml/src/ggml-hexagon/htp-kparams.cpp", "sha256": "d44c099abd94d6be56bb55f2c14387a17611d87ab46c1dfdd8d28238376f6f3f" }
+      { "path": "ggml/src/ggml-hexagon/htp-kparams.cpp", "sha256": "d44c099abd94d6be56bb55f2c14387a17611d87ab46c1dfdd8d28238376f6f3f" },
+      { "path": "ggml/src/ggml-hexagon/htp-repack.cpp", "sha256": "998ee6e3871d235423b5dbef6228ba3e31b8fedc90a086994658d9b50d599c91" },
+      { "path": "ggml/src/ggml-hexagon/htp/htp-tensor.h", "sha256": "50d5d40f1fae236b205307551717238f4858c25e8316e97be706eb2a494f2ef6" },
+      { "path": "ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h", "sha256": "89dbb3c7a2e4da170c657f47d3bce57376a1aad445e2bbd62814ca8bcb00dd6f" }
     ],
     "publicQueueHeader": {
       "repository": "https://github.com/qualcomm/fastrpc",
@@ -217,6 +220,24 @@
     "cacheMaintainedExtent": "entire-allocation-including-output-poison-and-data",
     "matrix": { "k": 32, "m": 32, "n": 2, "type": "F32", "opcode": 4, "outputElements": 64 },
     "kernel": { "type": 4, "nHvx": 1, "nHmx": 0, "nPrefetch": 16, "activationRowBytes": 128, "requiredVtcmBytes": 2304, "requestedVtcmBytes": 0, "maxVmemBytes": 65536, "powerMode": 4 },
+    "guardedQ2Control": {
+      "mode": "--reference-queue-q2-probe",
+      "matrix": { "k": 256, "m": 32, "n": 2, "weightType": 42, "activationType": "F32-internally-quantized-Q8_1", "outputElements": 64 },
+      "kernelType": 6,
+      "hostWeightTileBytes": 576,
+      "vtcmWeightTileBytes": 640,
+      "hostWeightBytes": 2304,
+      "activationInputBytes": 2048,
+      "internalActivationRowBytes": 10240,
+      "requiredVtcmBytes": 61440,
+      "outputOffset": 7296,
+      "originalActivationCodes": "128-independent-full-range-i8-values-split-into-two-exact-limbs",
+      "guardedSums": "both-signs-including-plus-and-minus1857; scale-one; zero-weight-guards",
+      "weightSymbols": "all-four-codes-including-plus2; zero-row-checks-offset-cancellation",
+      "numericControl": "64-independent-literal-integer-dots; odd2245-and11771-reject-FP16-output-substitution",
+      "projectionQualified": false,
+      "signedQuantizerParityQualified": false
+    },
     "nativeQueueDepth": 1,
     "queueBytesPerDirection": 4096,
     "callbacks": false,

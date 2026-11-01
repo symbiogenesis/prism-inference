@@ -18,7 +18,7 @@ mod compute;
 mod session;
 mod session_mapping;
 pub use compute::{
-    COMPUTE_ALLOCATION_BYTES, COMPUTE_GGML_SOURCE, COMPUTE_K, COMPUTE_M, COMPUTE_N,
+    COMPUTE_ALLOCATION_BYTES, COMPUTE_GGML_SOURCE, COMPUTE_K, COMPUTE_M, COMPUTE_N, COMPUTE_Q2_K,
     COMPUTE_REQUEST_BYTES, COMPUTE_RESPONSE_BYTES, QueueComputeReport,
 };
 pub use session::{
@@ -483,6 +483,39 @@ impl Driver {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             windows::reference_queue_compute_probe(self.inner, package_directory, progress)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, progress);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Consume this driver in one fixed guarded-Q2 K=256/M=32/N=2 integer probe.
+    ///
+    /// The same source-bound package, Windows ABI, signed catalog/driver,
+    /// child environment, external deadline and Job prerequisites as the F32
+    /// queue probe apply. All tensor bytes, solver fields and expected outputs
+    /// are fixed internally. The control checks two exact integer limbs through
+    /// the signed `Q2_0`/`Q8_1` quantizer with -128/+127 original code extremes,
+    /// zero-weight guards, both guard signs and the fourth two-bit symbol.
+    /// No original model scales, transforms, adapters or state run on the DSP.
+    ///
+    /// It retains every uncertain consumer through verified teardown and never
+    /// grants model, full quantizer-range, performance or profile qualification.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms/families and the same path, identity,
+    /// export, environment or metadata failures as the fixed F32 queue probe.
+    /// Native partial progress and refusals remain exact terminal-report data.
+    pub fn reference_queue_q2_probe(
+        self,
+        package_directory: &Path,
+        progress: impl FnMut(&QueueComputeReport),
+    ) -> Result<QueueComputeReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_queue_q2_probe(self.inner, package_directory, progress)
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {

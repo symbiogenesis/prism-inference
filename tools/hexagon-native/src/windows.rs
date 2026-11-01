@@ -438,6 +438,23 @@ pub(super) fn reference_queue_compute_probe(
     compute_native::probe(driver, package, progress)
 }
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe parent selects the private fixed guarded-Q2 control"
+)]
+pub(super) fn reference_queue_q2_probe(
+    driver: Driver,
+    package: &Path,
+    progress: impl FnMut(&crate::QueueComputeReport),
+) -> Result<crate::QueueComputeReport, Error> {
+    compute_native::probe_fixture(
+        driver,
+        package,
+        progress,
+        crate::compute::ComputeFixture::GuardedQ2,
+    )
+}
+
 impl Drop for Driver {
     fn drop(&mut self) {
         // SAFETY: this owner completed only fixed queries or pre-mapping cleanup.

@@ -36,6 +36,8 @@ type QueueExport = unsafe extern "C" fn(*mut c_void, *mut u64) -> i32;
 type QueueClose = unsafe extern "C" fn(*mut c_void) -> i32;
 type QueueWrite =
     unsafe extern "C" fn(*mut c_void, u32, u32, *mut QueueBuffer, u32, *const u8, u32) -> i32;
+type QueueWriteNoBlock =
+    unsafe extern "C" fn(*mut c_void, u32, u32, *mut QueueBuffer, u32, *const u8) -> i32;
 type QueueRead = unsafe extern "C" fn(
     *mut c_void,
     *mut u32,
@@ -85,6 +87,11 @@ struct ReferenceProcessRequest {
 const _: () = assert!(size_of::<ReferenceProcessRequest>() == 8);
 const _: () = assert!(align_of::<ReferenceProcessRequest>() == 4);
 
+enum WriteCall {
+    Timed(QueueWrite),
+    Nonblocking(QueueWriteNoBlock),
+}
+
 struct Calls {
     open: Open,
     close: Close,
@@ -97,7 +104,7 @@ struct Calls {
     queue_create: QueueCreate,
     queue_export: QueueExport,
     queue_close: QueueClose,
-    queue_write: QueueWrite,
+    queue_write: WriteCall,
     queue_read: QueueRead,
 }
 
@@ -111,7 +118,7 @@ fn symbol(driver: &Driver, name: &CStr) -> Result<*mut c_void, Error> {
     }
 }
 
-fn calls(driver: &Driver) -> Result<Calls, Error> {
+fn calls(driver: &Driver, fixture: compute::ComputeFixture) -> Result<Calls, Error> {
     let open = symbol(driver, c"remote_handle64_open")?;
     let close = symbol(driver, c"remote_handle64_close")?;
     let invoke = symbol(driver, c"remote_handle64_invoke")?;
@@ -123,7 +130,18 @@ fn calls(driver: &Driver) -> Result<Calls, Error> {
     let create = symbol(driver, c"dspqueue_create")?;
     let export = symbol(driver, c"dspqueue_export")?;
     let qclose = symbol(driver, c"dspqueue_close")?;
-    let write = symbol(driver, c"dspqueue_write")?;
+    let queue_write = if fixture == compute::ComputeFixture::F32NoBlock {
+        let write = symbol(driver, c"dspqueue_write_noblock")?;
+        // SAFETY: the pinned public header and independent C prototype mock
+        // specify exactly six arguments and no timeout for this separate API.
+        WriteCall::Nonblocking(unsafe {
+            std::mem::transmute::<*mut c_void, QueueWriteNoBlock>(write)
+        })
+    } else {
+        let write = symbol(driver, c"dspqueue_write")?;
+        // SAFETY: the independently checked timed-write API has seven arguments.
+        WriteCall::Timed(unsafe { std::mem::transmute::<*mut c_void, QueueWrite>(write) })
+    };
     let read = symbol(driver, c"dspqueue_read_noblock")?;
     // SAFETY: public remote.h pins const char*, uint64* -> int.
     let open = unsafe { std::mem::transmute::<*mut c_void, Open>(open) };
@@ -149,8 +167,6 @@ fn calls(driver: &Driver) -> Result<Calls, Error> {
     let queue_export = unsafe { std::mem::transmute::<*mut c_void, QueueExport>(export) };
     // SAFETY: public dspqueue_close takes one queue pointer.
     let queue_close = unsafe { std::mem::transmute::<*mut c_void, QueueClose>(qclose) };
-    // SAFETY: public dspqueue_write takes the exact checked buffer/message extents.
-    let queue_write = unsafe { std::mem::transmute::<*mut c_void, QueueWrite>(write) };
     // SAFETY: the no-block read has eight arguments and no timeout argument.
     let queue_read = unsafe { std::mem::transmute::<*mut c_void, QueueRead>(read) };
     Ok(Calls {
@@ -193,7 +209,7 @@ pub(super) fn probe(
 
 #[allow(
     clippy::redundant_pub_crate,
-    reason = "Only the safe parent selects one of two private fixed compute controls"
+    reason = "Only the safe parent selects one of three private fixed compute controls"
 )]
 pub(super) fn probe_fixture(
     mut driver: Driver,
@@ -208,7 +224,7 @@ pub(super) fn probe_fixture(
         return Ok(QueueComputeReport::new_fixture(metadata, fixture));
     }
     let guards = session_mapping_native::package_guards(package, 81)?;
-    let calls = calls(&driver)?;
+    let calls = calls(&driver, fixture)?;
     let control = session_native::session_control(&driver)?;
     let metadata = session_native::prepare_effective_domain(raw, control);
     let mut report = QueueComputeReport::new_fixture(metadata, fixture);
@@ -367,20 +383,9 @@ fn exercise(
     let mut descriptor = expected;
     report.compute_submitted = true;
     entered(&mut report, "compute-queue-write-entered", progress);
-    // SAFETY: only one fully prepared mapped packet, exact source-derived
-    // 24byte request, and finite 100ms write timeout. The library copies the
-    // request/descriptor; the shared allocation remains pinned from this point.
-    let result = unsafe {
-        (calls.queue_write)(
-            queue,
-            0,
-            1,
-            &raw mut descriptor,
-            24,
-            request.as_ptr(),
-            100_000,
-        )
-    };
+    // Both selected APIs copy the exact same request/descriptor. There is one
+    // attempt only; any nonzero result pins all uncertain owners without retry.
+    let result = write_packet(&calls.queue_write, queue, &mut descriptor, &request);
     report.queue_write_result = Some(result);
     if result != 0 {
         report.stage = "compute-queue-write-refused-pinned";
@@ -408,6 +413,26 @@ fn exercise(
         return report;
     }
     cleanup(report, calls, handle, queue, domain, fd, memory, progress)
+}
+
+fn write_packet(
+    call: &WriteCall,
+    queue: *mut c_void,
+    descriptor: &mut QueueBuffer,
+    request: &[u8; compute::COMPUTE_REQUEST_BYTES],
+) -> i32 {
+    match *call {
+        WriteCall::Timed(write) => {
+            // SAFETY: one fully prepared mapped packet and exact24byte request;
+            // the existing timed modes retain their fixed100ms timeout.
+            unsafe { write(queue, 0, 1, descriptor, 24, request.as_ptr(), 100_000) }
+        }
+        WriteCall::Nonblocking(write) => {
+            // SAFETY: same packet/flags/FD/cache extent with the separately
+            // checked six-argument nonblocking export. No timeout or retry.
+            unsafe { write(queue, 0, 1, descriptor, 24, request.as_ptr()) }
+        }
+    }
 }
 
 fn read_reply(
@@ -535,4 +560,95 @@ fn cleanup(
     report.poisoned = false;
     report.stage = "compute-numeric-verified-stopped-unmapped-freed";
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TIMED_CALLS: AtomicU32 = AtomicU32::new(0);
+    static NONBLOCKING_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn timed_refusal(
+        queue: *mut c_void,
+        flags: u32,
+        count: u32,
+        buffers: *mut QueueBuffer,
+        bytes: u32,
+        message: *const u8,
+        timeout: u32,
+    ) -> i32 {
+        TIMED_CALLS.fetch_add(1, Ordering::Relaxed);
+        if queue.is_null()
+            && flags == 0
+            && count == 1
+            && !buffers.is_null()
+            && bytes == 24
+            && !message.is_null()
+            && timeout == 100_000
+        {
+            14
+        } else {
+            -77
+        }
+    }
+
+    extern "C" fn nonblocking_refusal(
+        queue: *mut c_void,
+        flags: u32,
+        count: u32,
+        buffers: *mut QueueBuffer,
+        bytes: u32,
+        message: *const u8,
+    ) -> i32 {
+        NONBLOCKING_CALLS.fetch_add(1, Ordering::Relaxed);
+        if queue.is_null()
+            && flags == 0
+            && count == 1
+            && !buffers.is_null()
+            && bytes == 24
+            && !message.is_null()
+        {
+            14
+        } else {
+            -77
+        }
+    }
+
+    #[test]
+    fn refused_nonblocking_write_never_retries_or_calls_timed_api() {
+        TIMED_CALLS.store(0, Ordering::Relaxed);
+        NONBLOCKING_CALLS.store(0, Ordering::Relaxed);
+        let mut descriptor = QueueBuffer {
+            fd: 7,
+            size: 16_384,
+            offset: 0,
+            flags: 0x90,
+            pointer: null_mut(),
+        };
+        let request = compute::request_wire();
+        assert_eq!(
+            write_packet(
+                &WriteCall::Nonblocking(nonblocking_refusal),
+                null_mut(),
+                &mut descriptor,
+                &request
+            ),
+            14
+        );
+        assert_eq!(NONBLOCKING_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(TIMED_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            write_packet(
+                &WriteCall::Timed(timed_refusal),
+                null_mut(),
+                &mut descriptor,
+                &request
+            ),
+            14
+        );
+        assert_eq!(NONBLOCKING_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(TIMED_CALLS.load(Ordering::Relaxed), 1);
+    }
 }

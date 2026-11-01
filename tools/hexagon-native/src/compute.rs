@@ -13,13 +13,14 @@ use crate::SessionPreparationReport;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComputeFixture {
     F32,
+    F32NoBlock,
     GuardedQ2,
 }
 
 impl ComputeFixture {
     pub(crate) const fn output_offset(self) -> usize {
         match self {
-            Self::F32 => OUTPUT_OFFSET,
+            Self::F32 | Self::F32NoBlock => OUTPUT_OFFSET,
             Self::GuardedQ2 => Q2_OUTPUT_OFFSET,
         }
     }
@@ -157,6 +158,12 @@ impl QueueComputeReport {
     #[must_use]
     pub const fn is_guarded_q2_control(self) -> bool {
         matches!(self.fixture, ComputeFixture::GuardedQ2)
+    }
+
+    /// This receipt selects exactly one direct nonblocking F32 packet write.
+    #[must_use]
+    pub const fn is_nonblocking_write_control(self) -> bool {
+        matches!(self.fixture, ComputeFixture::F32NoBlock)
     }
 
     /// An exact successful matrix reply was independently checked.
@@ -436,14 +443,14 @@ pub(crate) fn fixture_image_for(
     fd: u32,
 ) -> [u8; COMPUTE_ALLOCATION_BYTES] {
     match fixture {
-        ComputeFixture::F32 => fixture_image(base, fd),
+        ComputeFixture::F32 | ComputeFixture::F32NoBlock => fixture_image(base, fd),
         ComputeFixture::GuardedQ2 => q2_fixture_image(base, fd),
     }
 }
 
 pub(crate) fn output_valid_for(fixture: ComputeFixture, bytes: &[u8]) -> bool {
     match fixture {
-        ComputeFixture::F32 => output_valid(bytes),
+        ComputeFixture::F32 | ComputeFixture::F32NoBlock => output_valid(bytes),
         ComputeFixture::GuardedQ2 => {
             bytes.len() == OUTPUT_BYTES
                 && Q2_EXPECTED_DOTS
@@ -487,6 +494,7 @@ pub(crate) fn output_valid(bytes: &[u8]) -> bool {
 
 pub(crate) fn self_check() -> bool {
     let image = fixture_image(0x1234_5600, 19);
+    let nonblocking_image = fixture_image_for(ComputeFixture::F32NoBlock, 0x1234_5600, 19);
     let start = start_wire(0x2132_4354_6576_0718);
     let mut response = [0; COMPUTE_RESPONSE_BYTES];
     put_u64(&mut response, 0, 1);
@@ -495,7 +503,8 @@ pub(crate) fn self_check() -> bool {
     }
     let q2_image = fixture_image_for(ComputeFixture::GuardedQ2, 0x1234_5600, 19);
     let q2_offset = ComputeFixture::GuardedQ2.output_offset();
-    response_valid(&response)
+    image == nonblocking_image
+        && response_valid(&response)
         && !output_valid(&image[OUTPUT_OFFSET..OUTPUT_OFFSET + OUTPUT_BYTES])
         && !output_valid_for(
             ComputeFixture::GuardedQ2,
@@ -525,6 +534,21 @@ mod tests {
         assert_eq!(get_u32(&image, 192), Some(4));
         assert_eq!(get_u32(&image, 292), Some(2304));
         assert_eq!(image[472..1024], [0; 552]);
+        assert_eq!(
+            fixture_image_for(ComputeFixture::F32NoBlock, 0x1234_5600, 19),
+            image
+        );
+        assert!(
+            !QueueComputeReport::new(SessionPreparationReport::new(0x81))
+                .is_nonblocking_write_control()
+        );
+        assert!(
+            QueueComputeReport::new_fixture(
+                SessionPreparationReport::new(0x81),
+                ComputeFixture::F32NoBlock
+            )
+            .is_nonblocking_write_control()
+        );
     }
 
     #[test]

@@ -181,6 +181,17 @@ end-to-end benefit remain separate qualification gates. It runs no whole-model
 conversion and changes no backend default. Callers select one fixed control;
 there is no automatic fallback or retry between F32 and Q2.
 
+`Driver::reference_queue_noblock_probe` is a separate F32 diagnostic using one
+call to `dspqueue_write_noblock`. The packet, mapped FD/extent, cache flags,
+numeric checks and conservative cleanup match the timed F32 control exactly.
+Its purpose is to isolate the submission API after an observed timed-write
+refusal; it asserts no cause or fix. The existing timed F32 and Q2 methods keep
+their original seven-argument API and finite timeout. A would-block or any other
+nonzero result is terminal and retains uncertain owners. There is no fallback,
+repeat write or reuse of a queue after failure. Hosted independent C controls
+check both six- and seven-argument prototypes; Rust controls verify that a
+refused nonblocking call never invokes the timed API.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

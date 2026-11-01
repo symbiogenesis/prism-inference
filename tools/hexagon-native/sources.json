@@ -197,6 +197,10 @@
       { "path": "ggml/src/ggml-hexagon/htp/htp-tensor.h", "sha256": "50d5d40f1fae236b205307551717238f4858c25e8316e97be706eb2a494f2ef6" },
       { "path": "ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h", "sha256": "89dbb3c7a2e4da170c657f47d3bce57376a1aad445e2bbd62814ca8bcb00dd6f" }
     ],
+    "publicQueueImplementationControls": [
+      { "repository": "https://github.com/qualcomm/fastrpc", "commit": "a56e9d4de3614a8d8f4b0e15ff561350c4b686e3", "path": "src/dspqueue/dspqueue_cpu.c", "sha256": "a23b9203577cf5d5887acb2fe003563dbc90a2408f2a40ccaf14205453c3da68", "scope": "public-Linux-reference; not-closed-Windows-driver-implementation" },
+      { "repository": "https://github.com/qualcomm/fastrpc", "commit": "a56e9d4de3614a8d8f4b0e15ff561350c4b686e3", "path": "src/fastrpc_mem.c", "sha256": "4f1537b15adcbe8af967299ff7721ba409624b59d2c7b583617acf3e7ddd6387", "scope": "public-Linux-FD-reference-and-map-bookkeeping; not-Windows-behavior" }
+    ],
     "publicQueueHeader": {
       "repository": "https://github.com/qualcomm/fastrpc",
       "commit": "a56e9d4de3614a8d8f4b0e15ff561350c4b686e3",
@@ -237,6 +241,19 @@
       "numericControl": "64-independent-literal-integer-dots; odd2245-and11771-reject-FP16-output-substitution",
       "projectionQualified": false,
       "signedQuantizerParityQualified": false
+    },
+    "nonblockingF32Control": {
+      "mode": "--reference-queue-noblock-probe",
+      "kind": "native-fastrpc-queue-noblock-probe",
+      "export": "dspqueue_write_noblock",
+      "argumentCount": 6,
+      "writeAttempts": 1,
+      "packetDifferenceFromTimedF32": "none; same-request-FD-extent-cache-flags-and-numeric-control",
+      "automaticFallbackOrRetry": false,
+      "purpose": "isolate-submission-API-after-timed-write14; no-cause-or-fix-asserted",
+      "publicReference": "timed-write-calls-nonblocking-write-before-timeout-handling; refdelta0-valid; packet-flags0-auto-adds-message-and-buffers",
+      "closedWindowsEquivalenceQualified": false,
+      "nativeNumericQualified": false
     },
     "nativeQueueDepth": 1,
     "queueBytesPerDirection": 4096,

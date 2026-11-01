@@ -523,6 +523,37 @@ impl Driver {
             Err(Error::UnsupportedPlatform)
         }
     }
+
+    /// Run the fixed F32 control with one direct nonblocking packet write.
+    ///
+    /// This explicit diagnostic isolates submission through the documented
+    /// six-argument `dspqueue_write_noblock` export. It preserves the F32 packet,
+    /// mapping, cache flags, response, numeric and teardown contracts of
+    /// [`Self::reference_queue_compute_probe`]. The timed F32/Q2 methods retain
+    /// their original write path. There is no automatic fallback, no retry and
+    /// no reuse of a queue after a refused or uncertain submission. A would-block
+    /// return pins owners just like any other failed write. Independent hosted
+    /// prototype checks and the existing external process supervision are required.
+    ///
+    /// # Errors
+    /// Rejects the same unsupported platform, metadata, path, override or export
+    /// failures as the original control. A missing nonblocking export rejects
+    /// before native process initialization; no timed alternative is attempted.
+    pub fn reference_queue_noblock_probe(
+        self,
+        package_directory: &Path,
+        progress: impl FnMut(&QueueComputeReport),
+    ) -> Result<QueueComputeReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_queue_noblock_probe(self.inner, package_directory, progress)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, progress);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
     /// Consume this driver in one fixed 4KiB allocation/registration/unmap probe.
     ///
     /// The documented registration call may implicitly open a domain session;

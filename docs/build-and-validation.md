@@ -4,20 +4,77 @@
 
 ## Install from source
 
-Install the published source package with the pinned nightly:
+GitHub bundles and crates.io packages are separate deliveries. This guide targets
+the `0.1.12` GitHub/source release. The latest registry runtime is `0.1.2`;
+publication of the newer source and its dependencies remains separate work.
+Install the tagged release source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-10-22 install prism-inference --version 0.1.1 --locked
+cargo +nightly-2026-10-22 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.12 prism-inference --locked
 prism-inference --help
 ```
 
 `cargo install` compiles source. Consumers using a prebuilt binary bundle should
 pin its version, target and SHA-256 rather than rebuild the runtime on startup.
-Library consumers can retain the existing import path with this dependency:
+The root package installs the CLI and two JSONL workers; the private server and
+GGUF tool are separate workspace packages. See [release bundles](#release-bundles-and-compatibility)
+for the five-executable distribution and registry prerequisites.
+
+## Use the Rust library
+
+The package name is `prism-inference`; the existing Rust import path remains
+`bonsai_prism_runtime`. A tagged scalar library dependency is:
 
 ```toml
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.1" }
+[dependencies]
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.12", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.12", default-features = false }
 ```
+
+Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
+and retain its `Cargo.lock`, which records the resolved Git revision. Enable
+`experimental-neon` for eligible Windows
+ARM64 kernels, or retain default features when using `swift_session::SwiftSession`
+and the JSON-based chat APIs.
+
+This example verifies the pinned original-PQ2 artifact and reuses its tokenizer
+without allocating model weights or constructing an inference graph:
+
+```rust
+use std::path::Path;
+
+use bonsai_prism_runtime::{
+    Result,
+    model::swift::{MODEL_BYTES, MODEL_SHA256},
+    special_input::SpecialInputPolicy,
+    tokenization::{
+        SpecialTokenInsertion, TextTokenizationPolicy, TokenBudget, TokenizationSession,
+    },
+};
+
+fn prompt_ids(model: &Path, text: &str) -> Result<Vec<u32>> {
+    let tokenizer = TokenizationSession::load(
+        model,
+        MODEL_BYTES,
+        MODEL_SHA256,
+        256 * 1024 * 1024,
+    )?;
+    let policy = TextTokenizationPolicy {
+        special_input: SpecialInputPolicy::Literal,
+        insert_special: SpecialTokenInsertion::None,
+        budget: TokenBudget { context: 8192, reserved_output_tokens: 512 },
+    };
+    Ok(tokenizer.encode(text, policy)?.token_ids)
+}
+```
+
+Pass an absolute artifact path. The metadata budget does not bound whole-process
+memory, and verification reads the entire file. Retain the `TokenizationSession`
+when encoding multiple prompts. This plain-text API applies no chat template.
+For generation, `SwiftSession::load` verifies the same original-PQ2 model;
+`prepare` renders and reserves a complete chat request, and `complete` accepts
+an absolute deadline, shared cancellation and a fallible text callback. Use
+[session profiles](swift-session-profiles.md) for explicit PTQ1/adapter selection
+and [runtime contracts](runtime-contracts.md) for ownership and rollback.
 
 ## Cargo features
 
@@ -376,8 +433,8 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.11`; the published crates.io installation
-examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
+The checkout prepares version `0.1.12`; the source installation and library
+examples above select its release tag. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
 records the resulting bytes; its source-to-binary trust still depends on the
@@ -390,22 +447,21 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-The `0.1.11` server is prepared for a GitHub binary prerelease, preserving the
-immutable `0.1.7`, `0.1.8`, `0.1.9` and `0.1.10` artifacts. The
-[release scope](release-0.1.11.md) records its worker-readiness and hash boundaries.
+The `0.1.12` GitHub/source release preserves all older full and prerelease
+artifacts. The [release scope](release-0.1.12.md) compares it with the last full
+release, `0.1.6`, and records its supported delivery and qualification boundaries.
 Its Windows credential helper is pinned to Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
 the lockfile. The server temporarily sets `publish = false`, because a crates.io
 package cannot preserve that Git-only dependency and substituting registry
 `0.1.0` would omit the required read APIs. Checked GitHub bundles and exact source
 checkouts are the supported delivery paths for this server candidate. A reviewed
 helper registry release and server publication remain separate pending work.
-The new native hashing implementation also needs `bonsai-native-hash` published
-first, followed by a new registry version of `bonsai-gguf` and an updated exact
-GGUF dependency in the runtime. The current path dependency builds the reviewed
-checkout for GitHub binaries; its unchanged `=0.1.0` registry pin does not establish
-delivery of that implementation. Registry packaging and source verification remain
-pending. Source preparation and passing CI alone do not publish the candidate or
-qualify model serving.
+The new native hashing implementation needs `bonsai-native-hash` `0.1.0`
+published first, followed by `bonsai-gguf` `0.1.1` and the runtime. The runtime's
+exact GGUF pin selects the new dependency for future registry delivery; the path
+dependency builds that implementation in the reviewed checkout now. Registry
+publication and source verification remain pending. Source preparation and passing
+CI alone do not publish registry packages or qualify model serving.
 
 The candidate release-bundle build explicitly enables
 `prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the

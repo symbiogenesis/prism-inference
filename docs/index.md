@@ -13,12 +13,14 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Choose text, token IDs or tokenization-only mode | [Driver input](cli-and-workers.md#generate-from-text-or-token-ids) |
 | Keep a tokenizer process alive | [Persistent token worker](cli-and-workers.md#persistent-token-worker) |
 | Integrate a worker or the private HTTP server | [Swift worker and private server](cli-and-workers.md#swift-worker-and-private-http-server) |
+| Add the Rust library to an application | [Library dependency and tokenizer example](build-and-validation.md#use-the-rust-library) |
 | Understand budgets and failure recovery | [Runtime contracts](runtime-contracts.md) |
 | Configure opt-in packed projection workers | [Explicit row workers](parallel-rows.md) |
 | Compile, check or package the workspace | [Building and validation](build-and-validation.md) |
 | Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |
 | Capture explicit rank-one adapter correctness evidence | [Adapter correctness path](rank-one-adapter.md) |
 | Check support and remaining qualification | [Roadmap](roadmap.md) |
+| Compare the current release with the previous full release | [0.1.12 release scope](release-0.1.12.md) |
 
 ## Technical reference
 

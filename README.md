@@ -26,7 +26,8 @@ in scope and planned. Prism Inference is an independent implementation, separate
 from PrismML's upstream runtime.
 
 > [!IMPORTANT]
-> **Early development.** Full-model numerical parity and device qualification
+> **Early development.** Bounded original-PQ2 Swift workloads have retained
+> numerical evidence. Broader full-model, PTQ1/adapter and device qualification
 > remain open. See the [current status and roadmap](docs/roadmap.md) before
 > choosing it for an application.
 
@@ -53,15 +54,11 @@ Models are separate downloads; the [CLI guide](docs/cli-and-workers.md) explains
 model identity, input options and resource budgets. SwiftBonsai provides model
 setup and a guarded launcher that consumes the prebuilt private server.
 
-For a source installation, use the pinned Rust nightly. This command compiles
-locally:
-
-```powershell
-cargo +nightly-2026-10-22 install prism-inference --locked
-```
-
-See [building and validation](docs/build-and-validation.md) for all workspace
-tools, Cargo features and development checks.
+For source installation or Rust library integration, follow the
+[build and library guide](docs/build-and-validation.md#install-from-source).
+It pins the reviewed Git source and compiler. GitHub binary releases and
+crates.io versions are separate deliveries; an unpinned `cargo install` can
+select an older runtime.
 
 ## Included tools
 

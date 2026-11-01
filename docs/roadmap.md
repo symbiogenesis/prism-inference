@@ -14,6 +14,13 @@ worker, private HTTP server, GGUF tooling, ternary codecs and native storage
 overlay. SwiftBonsai consumes a prebuilt server inside its guarded Windows Job;
 ordinary SwiftBonsai builds do not compile this runtime.
 
+The [0.1.12 release scope](release-0.1.12.md) compares the GitHub/source release
+with the last full release, `0.1.6`. Binary delivery, crates.io publication and
+application-default promotion have separate requirements. Original PQ2, one row
+worker and fresh per-request state remain the service defaults. PTQ1, approved
+rank-one adapters, parallel row workers and latest-prefix reuse require explicit
+selection; availability does not establish their model or device qualification.
+
 ## What the evidence establishes
 
 The retained model-loading evidence covers the pinned 851-tensor artifact and
@@ -21,9 +28,9 @@ initialization of its 8K graph within the configured CPU budget. At source
 revision `9899a25`, NEON consumes a 61-token Swift chat prefix and three generated
 greedy tokens. All 166,078,464 checked logit and complete logical state elements
 match the pinned native reference byte-for-byte, as do the greedy token IDs.
-The current scalar three-token run also matches native byte-for-byte. Earlier
+The retained scalar three-token run also matches native byte-for-byte. Earlier
 full-prefix scalar/NEON equality is retained at its separate tested revision.
-The [follow-up receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/config/swift-native-mvp-followup.evidence.json)
+The [historical follow-up receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/54d46ad660107c572769dac49c00f411f5c7a6c4/config/swift-native-mvp-followup.evidence.json)
 records exact scopes, revisions, hashes and resource observations.
 
 The pinned Swift chat path has native template-byte/tokenizer-ID captures and
@@ -36,20 +43,24 @@ operators; other model identities and public scalar APIs preserve their existing
 source-order contracts. Decoder identity records the pinned arithmetic choice.
 The operator controls and complete model comparison qualify these bounded Swift
 CPU workloads. Other inputs, longer trajectories and full-context behavior
-still require their own evidence. Runner's released runtime lock remains
-`0.1.1`; ordinary Runner builds do not yet consume these source repairs.
+still require their own evidence. Runner separately pins the reviewed `0.1.11`
+binary/source in its [release integration record](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/docs/evidence/prism-0111-release-integration.json).
+That record keeps actual-model qualification pending. These historical numerical
+results do not transfer automatically to a newer source or binary, and the
+`0.1.12` release does not change Runner's pin or defaults.
 
 The private server also cancels model work when an in-flight request future is
 dropped. Focused recovery checks cover rollback, reset-required admission and a
 successful request after explicit reset. The
-[bounded owned HTTP device receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/config/swift-owned-http-mvp.evidence.json)
+[historical bounded owned HTTP device receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/54d46ad660107c572769dac49c00f411f5c7a6c4/config/swift-owned-http-mvp.evidence.json)
 also covers supplied-history streaming, seeded reset/replay, context rejection
 and recovery, active abandonment with Job cleanup, and a successful request
 after a fresh owned restart. Exact diagnostic binaries use explicit 13.65 GiB
 startup patches in both owner and server; the 12 GiB Job cap and 4 GiB running
 reserve remain enforced. These results do not change the production 16 GiB
 policy or establish released-runtime packaging, full-context service behavior
-or daily security. Reviewed prebuilt consumption remains a delivery step.
+or daily security. The later reviewed prebuilt integration above is a separate
+delivery result and does not replace these device gates.
 
 Synthetic checks cover bounded parsing, exact codec arithmetic, graph state,
 checkpoint isolation, rollback, tokenization and service contracts. The

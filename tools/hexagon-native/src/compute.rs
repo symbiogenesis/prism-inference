@@ -412,7 +412,7 @@ pub(crate) fn q2_fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BY
         activation[1][destination] = code - code / 2;
     }
     for (limb_index, limb) in activation.iter_mut().enumerate() {
-        for group in limb.chunks_exact_mut(32) {
+        for group in limb.as_chunks_mut::<32>().0 {
             let sum: i16 = group[..31].iter().sum();
             group[31] = if sum >= 0 { -127 } else { 127 };
         }
@@ -583,10 +583,11 @@ mod tests {
         // Last scale of host tile 0, then tile 1's row-zero symbols (zero weight).
         assert_eq!(&image[1024 + 574..1024 + 576], &[0x00, 0x3c]);
         assert_eq!(&image[1600..1604], &[0x55; 4]);
-        for tile in
-            image[WEIGHT_OFFSET..WEIGHT_OFFSET + usize::from(Q2_WEIGHT_BYTES)].chunks_exact(576)
+        for tile in image[WEIGHT_OFFSET..WEIGHT_OFFSET + usize::from(Q2_WEIGHT_BYTES)]
+            .as_chunks::<576>()
+            .0
         {
-            for scale in tile[512..576].chunks_exact(2) {
+            for scale in tile[512..576].as_chunks::<2>().0 {
                 assert_eq!(scale, [0x00, 0x3c]);
             }
         }
@@ -601,7 +602,7 @@ mod tests {
                     .find(|&integer| f32::from(integer).to_bits() == bits)
                     .ok_or(crate::Error::Contract)?;
             }
-            for group in values.chunks_exact(32) {
+            for group in values.as_chunks::<32>().0 {
                 assert_eq!(group.iter().map(|v| v.abs()).max(), Some(127));
                 let sum: i16 = group.iter().sum();
                 assert!(sum.abs() <= 1857);

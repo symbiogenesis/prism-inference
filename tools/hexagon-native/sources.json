@@ -255,6 +255,16 @@
       "closedWindowsEquivalenceQualified": false,
       "nativeNumericQualified": false
     },
+    "nonblockingQ2Control": {
+      "mode": "--reference-queue-q2-noblock-probe",
+      "kind": "native-fastrpc-queue-q2-noblock-probe",
+      "export": "dspqueue_write_noblock",
+      "argumentCount": 6,
+      "writeAttempts": 1,
+      "packetDifferenceFromTimedQ2": "none; same-guarded-Q2-weights-activations-and-exact64-integer-output-checks",
+      "automaticFallbackOrRetry": false,
+      "wholeProjectionOrProfileQualified": false
+    },
     "nativeQueueDepth": 1,
     "queueBytesPerDirection": 4096,
     "callbacks": false,

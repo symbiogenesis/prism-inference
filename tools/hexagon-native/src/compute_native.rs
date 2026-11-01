@@ -130,7 +130,10 @@ fn calls(driver: &Driver, fixture: compute::ComputeFixture) -> Result<Calls, Err
     let create = symbol(driver, c"dspqueue_create")?;
     let export = symbol(driver, c"dspqueue_export")?;
     let qclose = symbol(driver, c"dspqueue_close")?;
-    let queue_write = if fixture == compute::ComputeFixture::F32NoBlock {
+    let queue_write = if matches!(
+        fixture,
+        compute::ComputeFixture::F32NoBlock | compute::ComputeFixture::GuardedQ2NoBlock
+    ) {
         let write = symbol(driver, c"dspqueue_write_noblock")?;
         // SAFETY: the pinned public header and independent C prototype mock
         // specify exactly six arguments and no timeout for this separate API.
@@ -209,7 +212,7 @@ pub(super) fn probe(
 
 #[allow(
     clippy::redundant_pub_crate,
-    reason = "Only the safe parent selects one of three private fixed compute controls"
+    reason = "Only the safe parent selects one of four private fixed compute controls"
 )]
 pub(super) fn probe_fixture(
     mut driver: Driver,

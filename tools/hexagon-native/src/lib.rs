@@ -554,6 +554,35 @@ impl Driver {
             Err(Error::UnsupportedPlatform)
         }
     }
+
+    /// Run the fixed guarded-Q2 control with one direct nonblocking packet write.
+    ///
+    /// This separately selected diagnostic preserves the exact Q2 fixture and
+    /// integer-result checks of [`Self::reference_queue_q2_probe`], using the
+    /// one-call submission contract of [`Self::reference_queue_noblock_probe`].
+    /// It does not run an F32 control first, fall back from a timed refusal or
+    /// retry a write. Every selected control requires its own source-bound
+    /// supervisor and contributes to the same aggregate owner-device budget.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms, missing exports, path/environment or
+    /// metadata failures before submission. Native returns and incomplete
+    /// stages retain the same conservative pinned-owner semantics.
+    pub fn reference_queue_q2_noblock_probe(
+        self,
+        package_directory: &Path,
+        progress: impl FnMut(&QueueComputeReport),
+    ) -> Result<QueueComputeReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_queue_q2_noblock_probe(self.inner, package_directory, progress)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, progress);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
     /// Consume this driver in one fixed 4KiB allocation/registration/unmap probe.
     ///
     /// The documented registration call may implicitly open a domain session;

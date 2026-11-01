@@ -15,13 +15,14 @@ pub(crate) enum ComputeFixture {
     F32,
     F32NoBlock,
     GuardedQ2,
+    GuardedQ2NoBlock,
 }
 
 impl ComputeFixture {
     pub(crate) const fn output_offset(self) -> usize {
         match self {
             Self::F32 | Self::F32NoBlock => OUTPUT_OFFSET,
-            Self::GuardedQ2 => Q2_OUTPUT_OFFSET,
+            Self::GuardedQ2 | Self::GuardedQ2NoBlock => Q2_OUTPUT_OFFSET,
         }
     }
 }
@@ -157,13 +158,19 @@ impl QueueComputeReport {
     /// This receipt belongs to the separate fixed guarded-Q2 integer control.
     #[must_use]
     pub const fn is_guarded_q2_control(self) -> bool {
-        matches!(self.fixture, ComputeFixture::GuardedQ2)
+        matches!(
+            self.fixture,
+            ComputeFixture::GuardedQ2 | ComputeFixture::GuardedQ2NoBlock
+        )
     }
 
-    /// This receipt selects exactly one direct nonblocking F32 packet write.
+    /// This receipt selects exactly one direct nonblocking packet write.
     #[must_use]
     pub const fn is_nonblocking_write_control(self) -> bool {
-        matches!(self.fixture, ComputeFixture::F32NoBlock)
+        matches!(
+            self.fixture,
+            ComputeFixture::F32NoBlock | ComputeFixture::GuardedQ2NoBlock
+        )
     }
 
     /// An exact successful matrix reply was independently checked.
@@ -444,14 +451,14 @@ pub(crate) fn fixture_image_for(
 ) -> [u8; COMPUTE_ALLOCATION_BYTES] {
     match fixture {
         ComputeFixture::F32 | ComputeFixture::F32NoBlock => fixture_image(base, fd),
-        ComputeFixture::GuardedQ2 => q2_fixture_image(base, fd),
+        ComputeFixture::GuardedQ2 | ComputeFixture::GuardedQ2NoBlock => q2_fixture_image(base, fd),
     }
 }
 
 pub(crate) fn output_valid_for(fixture: ComputeFixture, bytes: &[u8]) -> bool {
     match fixture {
         ComputeFixture::F32 | ComputeFixture::F32NoBlock => output_valid(bytes),
-        ComputeFixture::GuardedQ2 => {
+        ComputeFixture::GuardedQ2 | ComputeFixture::GuardedQ2NoBlock => {
             bytes.len() == OUTPUT_BYTES
                 && Q2_EXPECTED_DOTS
                     .iter()
@@ -502,8 +509,10 @@ pub(crate) fn self_check() -> bool {
         put_u32(&mut response, offset, value);
     }
     let q2_image = fixture_image_for(ComputeFixture::GuardedQ2, 0x1234_5600, 19);
+    let q2_nonblocking_image = fixture_image_for(ComputeFixture::GuardedQ2NoBlock, 0x1234_5600, 19);
     let q2_offset = ComputeFixture::GuardedQ2.output_offset();
     image == nonblocking_image
+        && q2_image == q2_nonblocking_image
         && response_valid(&response)
         && !output_valid(&image[OUTPUT_OFFSET..OUTPUT_OFFSET + OUTPUT_BYTES])
         && !output_valid_for(

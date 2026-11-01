@@ -192,6 +192,12 @@ repeat write or reuse of a queue after failure. Hosted independent C controls
 check both six- and seven-argument prototypes; Rust controls verify that a
 refused nonblocking call never invokes the timed API.
 
+`Driver::reference_queue_q2_noblock_probe` explicitly selects the same one-call
+nonblocking API with the fixed guarded-Q2 packet instead. It performs no F32
+control automatically and supplies no fallback from a failed timed Q2 call.
+Each control is separately selected, source-bound and charged to the same
+owner-device allowance; missing remaining time leaves later controls pending.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

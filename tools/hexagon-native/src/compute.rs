@@ -621,7 +621,7 @@ mod tests {
             .0
         {
             for scale in tile[512..576].as_chunks::<2>().0 {
-                assert_eq!(scale, [0x00, 0x3c]);
+                assert_eq!(*scale, [0x00, 0x3c]);
             }
         }
         let mut output = [0; OUTPUT_BYTES];

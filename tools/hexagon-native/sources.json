@@ -270,6 +270,17 @@
     "callbacks": false,
     "writeTimeoutMicroseconds": 100000,
     "read": "explicit-read-noblock-with-one-three-second-absolute-deadline",
+    "writeErrorDrain": {
+      "purpose": "a-public-reference-write-can-advance-the-packet-queue-before-returning-a-signaling-error",
+      "maximumRepliesObserved": 1,
+      "readDeadlineSeconds": 3,
+      "additionalWritesOrFallback": false,
+      "preserveOriginalWriteResult": true,
+      "numericObservationMayPassAfterWriteError": true,
+      "completeCycleStillRequiresWriteZero": true,
+      "cleanupAfterAnyWriteError": "never-stop-close-unmap-or-free; retain-all-uncertain-owners-until-supervised-exit",
+      "successfulErrorDrainStage": "compute-write-error-numeric-reply-pinned"
+    },
     "correlation": "exact-sequence1-status1-buffer1-tensor3-op1-traces0-message88-and-same-FD-address-offset-size-cache-flags",
     "numericControl": "32-diagonal-weights-row-plus-one; two-distinct-integer-activation-rows; every-output-exact-f32-bits-after-NaN-poison",
     "safeFreeOrder": ["validated-numeric-response", "DSP-stop-join-and-import-close", "host-queue-close", "u64-module-close", "same-tuple-FD-unmap", "rpcmem-free"],

@@ -198,6 +198,18 @@ control automatically and supplies no fallback from a failed timed Q2 call.
 Each control is separately selected, source-bound and charged to the same
 owner-device allowance; missing remaining time leaves later controls pending.
 
+A nonzero write can follow an already advanced packet queue in the pinned public
+reference implementation. After any write result, the diagnostic therefore
+observes at most one strictly correlated reply under the existing three-second
+read deadline. It never writes again or changes the selected submission API.
+Exact numeric output may be recorded even when the original write returned an
+error, while that error remains unchanged and the complete-cycle verdict stays
+false. Every write-error path keeps all owners pinned and skips Stop, close,
+unmap and free, including after valid numeric output. An empty, invalid or
+expired read supplies no numeric evidence. Hosted failure-state controls verify
+that numeric evidence and stale cleanup fields cannot erase the write error or
+authorize cleanup/admission. Actual closed Windows behavior remains independent.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

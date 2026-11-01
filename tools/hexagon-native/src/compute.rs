@@ -173,13 +173,16 @@ impl QueueComputeReport {
         )
     }
 
-    /// An exact successful matrix reply was independently checked.
+    /// An exact matrix reply and all numeric outputs were independently checked.
+    ///
+    /// A write error can occur after a packet enters the queue. This observation
+    /// may therefore be true while the original write result remains nonzero;
+    /// it never authorizes cleanup, admission or a complete-cycle claim.
     #[must_use]
     pub const fn compute_executed(self) -> bool {
         self.compute_submitted
             && self.response_validated
             && self.numeric_validated
-            && matches!(self.queue_write_result, Some(0))
             && matches!(self.queue_read_result, Some(0))
     }
 
@@ -201,6 +204,7 @@ impl QueueComputeReport {
             && matches!(self.queue_create_result, Some(0))
             && matches!(self.queue_export_result, Some(0))
             && matches!(self.queue_start_result, Some(0))
+            && matches!(self.queue_write_result, Some(0))
             && self.compute_executed()
             && matches!(self.queue_stop_result, Some(0))
             && matches!(self.queue_close_result, Some(0))
@@ -209,6 +213,30 @@ impl QueueComputeReport {
             && matches!(self.module_close_result, Some(0))
             && self.owner_pinned_until_exit
             && !self.poisoned
+    }
+
+    // Shared by the native reply path and model-free failure-state controls.
+    // True permits the caller to enter its explicit cleanup sequence, never an
+    // inference/admission decision. Write errors preserve every uncertain owner
+    // even after an independently validated numeric result has been observed.
+    #[cfg(any(test, all(windows, target_arch = "aarch64")))]
+    pub(crate) fn record_numeric_reply(&mut self, numeric_valid: bool) -> bool {
+        self.numeric_validated =
+            numeric_valid && self.response_validated && matches!(self.queue_read_result, Some(0));
+        if !matches!(self.queue_write_result, Some(0)) {
+            self.poisoned = true;
+            self.stage = if self.numeric_validated {
+                "compute-write-error-numeric-reply-pinned"
+            } else {
+                "compute-write-error-numeric-mismatch-pinned"
+            };
+            return false;
+        }
+        if !self.compute_executed() {
+            self.stage = "compute-numeric-mismatch-pinned";
+            return false;
+        }
+        true
     }
 }
 
@@ -533,6 +561,88 @@ pub(crate) fn self_check() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn submitted_report(fixture: ComputeFixture, write_result: i32) -> QueueComputeReport {
+        let mut metadata = SessionPreparationReport::new(0x81);
+        metadata.domain_result = Some(0);
+        metadata.effective_domain = Some(3);
+        metadata.uri_result = Some(0);
+        metadata.uri_verified = true;
+        let mut report = QueueComputeReport::new_fixture(metadata, fixture);
+        report.unsigned_process_requested = true;
+        report.process_initialization_result = Some(0);
+        report.process_initialization_domain_after = Some(3);
+        report.process_initialization_enable_after = Some(1);
+        report.module_open_result = Some(0);
+        report.handle_observed = true;
+        report.allocation_succeeded = true;
+        report.mapping_result = Some(0);
+        report.queue_create_result = Some(0);
+        report.queue_export_result = Some(0);
+        report.queue_start_result = Some(0);
+        report.queue_write_result = Some(write_result);
+        report.compute_submitted = true;
+        report.queue_read_result = Some(0);
+        report.response_validated = true;
+        report.owner_pinned_until_exit = true;
+        report.poisoned = true;
+        report
+    }
+
+    #[test]
+    fn numeric_reply_after_write_error_preserves_error_and_never_permits_cleanup() {
+        for fixture in [
+            ComputeFixture::F32,
+            ComputeFixture::GuardedQ2,
+            ComputeFixture::F32NoBlock,
+            ComputeFixture::GuardedQ2NoBlock,
+        ] {
+            let mut report = submitted_report(fixture, 14);
+            assert!(!report.record_numeric_reply(true));
+            assert!(report.compute_executed());
+            assert_eq!(report.queue_write_result, Some(14));
+            assert_eq!(report.stage, "compute-write-error-numeric-reply-pinned");
+            assert!(report.owner_pinned_until_exit && report.poisoned);
+            assert_eq!(report.queue_stop_result, None);
+            assert_eq!(report.queue_close_result, None);
+            assert_eq!(report.module_close_result, None);
+            assert_eq!(report.unmapping_result, None);
+            assert!(!report.free_completed);
+            assert!(!report.completed_cycle());
+            // A stale or fabricated successful-cleanup receipt cannot mask the
+            // original write error. The positive control isolates that gate.
+            report.queue_stop_result = Some(0);
+            report.queue_close_result = Some(0);
+            report.module_close_result = Some(0);
+            report.unmapping_result = Some(0);
+            report.free_completed = true;
+            report.poisoned = false;
+            assert!(!report.completed_cycle());
+            report.queue_write_result = Some(0);
+            assert!(report.completed_cycle());
+        }
+    }
+
+    #[test]
+    fn failed_or_uncorrelated_reply_never_becomes_numeric_evidence_or_cleanup() {
+        let mut report = submitted_report(ComputeFixture::F32NoBlock, 14);
+        report.queue_read_result = Some(516);
+        report.response_validated = false;
+        assert!(!report.record_numeric_reply(true));
+        assert!(!report.compute_executed());
+        assert_eq!(report.queue_write_result, Some(14));
+        assert!(report.poisoned && report.owner_pinned_until_exit);
+        assert!(!report.free_completed);
+        assert!(!report.completed_cycle());
+        let mut successful_write = submitted_report(ComputeFixture::F32, 0);
+        assert!(!successful_write.record_numeric_reply(false));
+        assert!(!successful_write.compute_executed());
+        assert!(!successful_write.free_completed);
+        let mut unsubmitted = submitted_report(ComputeFixture::F32, 0);
+        unsubmitted.compute_submitted = false;
+        assert!(!unsubmitted.record_numeric_reply(true));
+        assert!(!unsubmitted.compute_executed());
+    }
 
     #[test]
     fn fixed_wire_shapes_padding_and_numeric_poison() {

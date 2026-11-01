@@ -390,11 +390,15 @@ fn exercise(
     // attempt only; any nonzero result pins all uncertain owners without retry.
     let result = write_packet(&calls.queue_write, queue, &mut descriptor, &request);
     report.queue_write_result = Some(result);
-    if result != 0 {
-        report.stage = "compute-queue-write-refused-pinned";
-        return report;
-    }
-    entered(&mut report, "compute-queue-read-entered", progress);
+    // A write may return a signaling error after advancing the packet queue.
+    // Observe at most one reply under the existing absolute deadline; never resubmit or
+    // change the write API. Any write error still forbids all normal cleanup.
+    let read_stage = if result == 0 {
+        "compute-queue-read-entered"
+    } else {
+        "compute-write-error-drain-entered"
+    };
+    entered(&mut report, read_stage, progress);
     if !read_reply(&mut report, calls, queue, expected) {
         return report;
     }
@@ -410,9 +414,7 @@ fn exercise(
             compute::OUTPUT_BYTES,
         )
     };
-    report.numeric_validated = compute::output_valid_for(report.fixture, output);
-    if !report.numeric_validated {
-        report.stage = "compute-numeric-mismatch-pinned";
+    if !report.record_numeric_reply(compute::output_valid_for(report.fixture, output)) {
         return report;
     }
     cleanup(report, calls, handle, queue, domain, fd, memory, progress)

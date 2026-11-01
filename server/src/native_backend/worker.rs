@@ -45,6 +45,7 @@ impl Engine for SwiftSession {
             representation: self.representation(),
             adapter: self.adapter_identity().is_some(),
             prompt_reuse: self.prompt_reuse(),
+            row_workers: self.row_workers(),
         })
     }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
@@ -128,6 +129,9 @@ impl Drop for Settlement<'_> {
 impl Worker {
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
         let profile = engine.profile()?;
+        if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers) {
+            return Err(NativeBackendError::Configuration);
+        }
         let (commands, receive) = mpsc::sync_channel::<Command>(1);
         let busy = Arc::new(AtomicBool::new(false));
         let idle = Arc::new(Notify::new());

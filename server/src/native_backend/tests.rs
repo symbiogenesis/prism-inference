@@ -92,6 +92,7 @@ struct Observation {
     state: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
     terminated: Arc<AtomicBool>,
+    row_workers: Option<usize>,
 }
 struct FakeEngine(Observation);
 
@@ -103,6 +104,12 @@ impl Drop for FakeEngine {
 
 impl worker::Engine for FakeEngine {
     type Prepared = FakePrepared;
+    fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
+        Ok(ModelProfile {
+            row_workers: self.0.row_workers.unwrap_or(1),
+            ..ModelProfile::default()
+        })
+    }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
         self.0.preparations.fetch_add(1, Ordering::Relaxed);
         let value: Value =
@@ -356,7 +363,7 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
         legacy,
         json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0", "object":"model",
         "model_sha256":swift::MODEL_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
-        "runtime":"prism-inference", "context_tokens":8192, "seed":42}]})
+        "runtime":"prism-inference", "context_tokens":8192, "seed":42, "row_workers":1}]})
     );
     let reused = ModelProfile {
         prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse::Latest,
@@ -390,6 +397,47 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
             }
         }
     }
+}
+
+#[test]
+fn private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts() -> TestResult {
+    use bonsai_prism_runtime::kernels::MAX_ROW_WORKERS;
+    run(async {
+        for row_workers in [1, 4, MAX_ROW_WORKERS] {
+            let observed = Observation {
+                row_workers: Some(row_workers),
+                ..Observation::default()
+            };
+            let mut worker =
+                Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
+            for route in ["/v1/models", "/props"] {
+                let (result, reply) = perform(&mut worker, request(route, &[], true)).await?;
+                assert_eq!(result, Ok(()));
+                let end = reply
+                    .array_windows()
+                    .position(|part| part == b"\r\n\r\n")
+                    .ok_or("missing readiness response head")?
+                    + 4;
+                let body: Value = serde_json::from_slice(&reply[end..])?;
+                assert_eq!(body["data"][0]["row_workers"], row_workers);
+                assert!(body["data"][0].get("parallel_row_operations").is_none());
+            }
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+            assert_eq!(observed.preparations.load(Ordering::Relaxed), 0);
+        }
+        for row_workers in [0, MAX_ROW_WORKERS + 1, usize::MAX] {
+            let observed = Observation {
+                row_workers: Some(row_workers),
+                ..Observation::default()
+            };
+            assert!(matches!(
+                Worker::new(FakeEngine(observed.clone()), 42),
+                Err(NativeBackendError::Configuration)
+            ));
+            assert!(observed.terminated.load(Ordering::Acquire));
+        }
+        Ok(())
+    })
 }
 
 #[test]

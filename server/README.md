@@ -29,7 +29,14 @@ The owning launcher must retain it before deleting temporary CI storage.
 Extended `/v1/models` and `/props` readiness names the exact model ID/hash and
 `weight_representation`, the approved `adapter_sha256` or null, and
 `supports_abliteration_scale`. Adapter profiles also report
-`abliteration_scale_range: [0, 2]`. Legacy PQ2/no-adapter readiness is unchanged.
+`abliteration_scale_range: [0, 2]`. Every private profile additionally reports
+`row_workers`, read from the instantiated session's graph. It identifies the
+configured persistent projection-worker budget (1 through 16), not executed
+parallel operations, an ISA, active thread utilization or measured speedup.
+Small and floating projections can remain serial. Artifact and adapter identities
+remain unchanged. Strict readiness consumers must admit and validate this added
+field when integrating a release built from this source; prior release receipts
+cannot supply the observation. The public API does not accept a worker override.
 Adapter-loaded private requests require exactly `lora: [{"id": 0, "scale": 1.3}]`;
 the scale must be a finite JSON number in 0..2 before conversion to binary32.
 The outer broker owns the public `abliteration_scale` setting; that field is

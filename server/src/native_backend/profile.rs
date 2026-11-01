@@ -9,11 +9,23 @@ use bonsai_prism_runtime::{
 };
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(super) struct ModelProfile {
     pub representation: Representation,
     pub adapter: bool,
     pub prompt_reuse: PromptReuse,
+    pub row_workers: usize,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            representation: Representation::default(),
+            adapter: false,
+            prompt_reuse: PromptReuse::default(),
+            row_workers: 1,
+        }
+    }
 }
 
 impl ModelProfile {
@@ -26,6 +38,7 @@ impl ModelProfile {
             "object": "model", "model_sha256": self.representation.model_sha256(),
             "template_sha256": swift::TEMPLATE_SHA256, "runtime": "prism-inference",
             "context_tokens": swift::CONTEXT_TOKENS, "seed": seed,
+            "row_workers": self.row_workers,
         });
         if self.representation != Representation::Pq2 || self.adapter {
             model["weight_representation"] = json!(self.representation.name());

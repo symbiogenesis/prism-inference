@@ -226,6 +226,15 @@ impl SwiftSession {
         self.runtime.decoder().requested_backend()
     }
 
+    /// Effective persistent projection-worker budget installed in this session.
+    ///
+    /// Small or floating projections can still execute serially. This identity
+    /// does not count executed parallel operations or establish device benefit.
+    #[must_use]
+    pub const fn row_workers(&self) -> usize {
+        self.runtime.decoder().row_workers()
+    }
+
     /// Explicit request-boundary policy; fresh recomputation remains the default.
     #[must_use]
     pub const fn prompt_reuse(&self) -> PromptReuse {

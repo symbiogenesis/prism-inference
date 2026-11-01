@@ -376,7 +376,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.10`; the published crates.io installation
+The checkout prepares version `0.1.11`; the published crates.io installation
 examples above remain at `0.1.1`. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
@@ -390,9 +390,10 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-The `0.1.10` server is prepared for a GitHub binary prerelease, preserving the
-immutable `0.1.7`, `0.1.8` and `0.1.9` artifacts. Its Windows credential helper is
-pinned to Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
+The `0.1.11` server is prepared for a GitHub binary prerelease, preserving the
+immutable `0.1.7`, `0.1.8`, `0.1.9` and `0.1.10` artifacts. The
+[release scope](release-0.1.11.md) records its worker-readiness and hash boundaries.
+Its Windows credential helper is pinned to Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
 the lockfile. The server temporarily sets `publish = false`, because a crates.io
 package cannot preserve that Git-only dependency and substituting registry
 `0.1.0` would omit the required read APIs. Checked GitHub bundles and exact source

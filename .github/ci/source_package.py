@@ -60,7 +60,7 @@ def main():
     selection = [item for name in PACKAGES for item in ("-p", name)]
     run(
         "cargo", "+nightly-2026-10-22", "package", "--manifest-path",
-        str(root / "Cargo.toml"), "--locked", *selection,
+        str(root / "Cargo.toml"), "--registry", "crates-io", "--locked", *selection,
     )
     versions = {
         "bonsai-native-hash": tomllib.loads((root / "Cargo.toml").read_text())[

@@ -11,6 +11,32 @@ on:
 permissions:
   contents: read
 jobs:
+  cross-native-arm64:
+    name: Native ARM64 cross-target lint / Linux host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-x86_64-unknown-linux-gnu
+          components: clippy
+      - name: Type-check the native Windows ARM64 boundary without linking or execution
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          toolchain=nightly-2026-10-22-x86_64-unknown-linux-gnu
+          rustup target add --toolchain "$toolchain" aarch64-pc-windows-msvc
+          # This reaches the real Windows ARM64 cfg and private FFI code while
+          # requiring neither an ARM64 linker nor a vendor driver. It cannot
+          # replace the independent Windows ARM64 test/doc/device gates below.
+          cargo "+$toolchain" check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --target-dir "$RUNNER_TEMP/Prism-Hexagon-Cross-Target" --locked --release -p bonsai-hexagon-native --all-targets
+          cargo "+$toolchain" clippy --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --target-dir "$RUNNER_TEMP/Prism-Hexagon-Cross-Target" --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings
   native-contracts:
     name: Native contracts / ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}

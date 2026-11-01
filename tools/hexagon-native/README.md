@@ -123,6 +123,11 @@ so ordinary unsupported-target libraries and documentation omit unused code.
 Actual device execution belongs to Runner's separate source-bound supervisor;
 this unpublished crate does not change production runtime dependencies or pins.
 
+An additional Ubuntu-hosted lane uses the same dated Rust release to check and
+lint the actual Windows ARM64 target without linking or executing its binaries.
+This reaches native-only FFI code when ARM64 runner capacity is queued, while
+native ARM64 tests, documentation and device acceptance remain separate gates.
+
 ## Fixed X2 matrix queue control
 
 `Driver::reference_queue_compute_probe` is a separate consuming diagnostic for

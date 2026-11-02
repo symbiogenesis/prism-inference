@@ -9,7 +9,7 @@ source gates below pass. Earlier releases and their evidence remain available.
 
 | Area | Result |
 | --- | --- |
-| Graph construction | Immutable tensor payloads are validated once before graph publication, including allowed unused tensors. Shape binding no longer repeats that full payload scan. PTQ1 validation retains extent and finite-scale checks without decoding and discarding valid packed trits. |
+| Graph construction | Retains one complete immutable-payload validation pass before graph publication, including allowed unused tensors. Shape binding no longer repeats large projection payload scans. PTQ1 validation retains extent and finite-scale checks without decoding and discarding valid packed trits. |
 | Request attribution | Optional runtime and Swift session timing APIs separate prefill, decoding, sampling, provisional callbacks, snapshots and recovery. Returned failures preserve completed lower bounds and unknown partial work. Ordinary calls read no additional attribution clocks. |
 | Diagnostic delivery | A bounded source checker uses the production Swift sampler and an original absolute deadline covering input, loading and request work. A hosted main-only workflow prepares its standalone ARM64 executable, exact source/build receipt and focused model-free test logs. The checker is separate from the five executable CPU bundle. |
 | Explicit projection integration | Source APIs support borrowed PQ2/PTQ1 projection executors and complete-request operation admission. Experimental Hexagon helpers add bounded guarded/HMX execution, immutable packed-weight arenas and explicit partial placement. These helpers remain unpublished and are not dependencies of the CPU executables. |

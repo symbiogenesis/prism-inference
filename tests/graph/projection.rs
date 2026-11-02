@@ -187,7 +187,7 @@ fn projection_scope_q8_opt_in_preserves_ptq1_odd_pq2_state_and_adapter() -> Resu
                 fail.set(true);
                 let mut output = vec![42.0];
                 assert!(graph.evaluate_into(1, &mut output).is_err());
-                assert!(output.is_empty());
+                assert_eq!(output, Vec::<f32>::new());
                 assert!(graph.is_faulted());
                 assert_eq!(graph_bits(graph.decoder())?, before);
                 assert!(graph.evaluate(1).is_err());

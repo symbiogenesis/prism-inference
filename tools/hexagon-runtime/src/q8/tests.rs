@@ -158,7 +158,7 @@ fn q8_hmx_matches_independent_pinned_native_dotprod_capture() -> Result<()> {
         executor.project_q8(&tensor, &activation, true, &mut output)?;
         assert_eq!(output[0].to_bits(), expected);
     }
-    assert!(capture.is_empty());
+    assert_eq!(capture, []);
     Ok(())
 }
 
@@ -181,7 +181,7 @@ fn q8_hmx_failure_and_unwritten_output_close_without_replay() -> Result<()> {
                     .matvec_with_executor(&tensor, &mut output, &mut executor)
                     .is_err()
             );
-            assert!(output.is_empty());
+            assert_eq!(output, Vec::<f32>::new());
             assert!(executor.is_faulted());
         }
         assert_eq!(executor.statistics().operations_attempted, 1);

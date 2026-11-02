@@ -56,7 +56,8 @@ impl<'a> HmxQ8Executor<'a> {
     ///
     /// The payload cap includes provisional lane/output storage, packed tiles,
     /// returned planes, block sums and activation planes. Native/DSP storage,
-    /// caller/model input and allocator overhead require separate admission.
+    /// caller/model input, allocator/stack overhead and fixed decoded-row
+    /// temporaries require separate admission.
     #[must_use]
     pub const fn new(
         submitter: &'a mut dyn HmxQ2Submitter,
@@ -294,13 +295,13 @@ fn pack_lanes(block: &[u8], kind: u32, group: usize, row: usize, output: &mut [u
     };
     for lane in 0..4 {
         for source in [group * 32 + lane * 4, group * 32 + lane * 4 + 16] {
-            for index in source..source + 4 {
+            for (index, &symbol) in trits.iter().enumerate().skip(source).take(4) {
                 let destination_row = row * 4 + lane;
                 let tile = (destination_row / 32 * 2 + index / 64) * 576;
                 let local = index % 64;
                 let byte = tile + local / 16 * 128 + destination_row % 32 * 4 + local % 4;
                 let shift = local / 4 % 4 * 2;
-                output[byte] = (output[byte] & !(3 << shift)) | trits[index] << shift;
+                output[byte] = (output[byte] & !(3 << shift)) | symbol << shift;
             }
         }
     }

@@ -411,7 +411,7 @@ fn hmx_resident_incomplete_preparation_faults_before_any_kernel_or_replay() -> R
             .matvec_with_executor(&tensor, &mut output, &mut executor)
             .is_err()
     );
-    assert_eq!(output, [] as [f32; 0]);
+    assert_eq!(output, Vec::<f32>::new());
     assert!(executor.is_faulted());
     assert_eq!(executor.statistics().operations_attempted, 0);
     assert_eq!(executor.residency_statistics().tensors_prepared, 0);
@@ -445,7 +445,7 @@ fn hmx_resident_unwritten_output_and_native_refusal_close_without_replay() -> Re
                 .matvec_with_executor(&tensor, &mut output, &mut executor)
                 .is_err()
         );
-        assert_eq!(output, [] as [f32; 0]);
+        assert_eq!(output, Vec::<f32>::new());
         assert!(executor.is_faulted());
         assert_eq!(executor.statistics().operations_attempted, 1);
         assert_eq!(executor.statistics().operations_completed, 0);

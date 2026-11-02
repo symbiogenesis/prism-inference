@@ -425,6 +425,33 @@ fn hadamard_and_nonexpanding_validation_fixture() -> TestResult {
 }
 
 #[test]
+fn ptq1_validation_preserves_native_byte_domain_finite_scales_and_extents() -> TestResult {
+    for code in 0..=u8::MAX {
+        for scale in [0_u16, 0x8000, 0x3c00, 0x7bff, 0xfbff] {
+            let mut bytes = vec![code; 28];
+            bytes[26..].copy_from_slice(&scale.to_le_bytes());
+            let weights = tensor(143, vec![128], bytes);
+            validate_tensor(&weights)?;
+            assert!(row(&weights, 0)?.into_iter().all(f32::is_finite));
+        }
+    }
+    for scale in [0x7c00_u16, 0xfc00, 0x7c01, 0x7fff, 0xfc01, 0xffff] {
+        let mut bytes = vec![0xff; 28];
+        bytes[26..].copy_from_slice(&scale.to_le_bytes());
+        assert!(validate_tensor(&tensor(143, vec![128], bytes)).is_err());
+    }
+    for (dimensions, bytes) in [
+        (vec![128], 27),
+        (vec![128], 29),
+        (vec![127], 28),
+        (vec![128, 0], 0),
+    ] {
+        assert!(validate_tensor(&tensor(143, dimensions, vec![0; bytes])).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn reusable_rows_and_normalization_clear_and_recover_without_shrinking() -> TestResult {
     let weights = tensor(
         0,

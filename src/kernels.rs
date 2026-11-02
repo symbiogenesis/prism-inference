@@ -196,7 +196,9 @@ pub fn validate_tensor(tensor: &Tensor) -> Result<()> {
         PTQ1 => {
             for block in tensor.data.as_chunks::<28>().0 {
                 scale(&block[26..])?;
-                ptq1_values(block)?;
+                // Every packed byte has native fractional-trit semantics.
+                // Extents were checked above; decoding and discarding 128
+                // trits cannot reject anything beyond the finite scale check.
             }
         }
         Q8_K => {

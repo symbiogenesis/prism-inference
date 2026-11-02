@@ -1198,6 +1198,10 @@ impl Qwen35 {
                 "KV and recurrent state exceed the native state budget",
             ));
         }
+        // Model owns immutable Arc payloads throughout construction. Validate
+        // every payload once, including allowed unused MTP tensors, instead of
+        // scanning each large projection again when binding its graph shape.
+        // Keep this pass after the cheap geometry and state-budget checks.
         for tensor in model.tensors.values() {
             crate::kernels::validate_tensor(tensor)?;
         }
@@ -2134,8 +2138,9 @@ fn tensor(model: &Model, name: &str, shape: &[usize]) -> Result<Tensor> {
     {
         return Err(invalid(format!("tensor shape mismatch: {name}")));
     }
-    // Validate the packed layout without expanding large weight payloads.
-    crate::kernels::validate_tensor(tensor)?;
+    // This private constructor lookup checks graph geometry only. The complete
+    // model pass validates every immutable payload before graph publication;
+    // initial embedding/output bindings are not executed before that pass.
     Ok(tensor.clone())
 }
 

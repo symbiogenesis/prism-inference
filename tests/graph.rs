@@ -1898,6 +1898,46 @@ fn malformed_and_unsupported_metadata_is_rejected() {
 }
 
 #[test]
+fn graph_admission_validates_every_used_and_unused_mtp_payload() -> Result<()> {
+    for recurrent in [false, true] {
+        let valid = fixture(recurrent);
+        for name in valid.tensors.keys() {
+            let mut invalid = fixture(recurrent);
+            let tensor = invalid
+                .tensors
+                .get_mut(name)
+                .ok_or_else(|| std::io::Error::other("fixture tensor missing"))?;
+            Arc::make_mut(&mut tensor.data)[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+            assert!(Qwen35::new(invalid, 1).is_err(), "accepted {name}");
+        }
+        for name in ["nextn.unused", "blk.1.unused"] {
+            for value in [0.0, f32::INFINITY, f32::NAN] {
+                let mut model = fixture(recurrent);
+                model
+                    .metadata
+                    .insert("qwen35.block_count".into(), metadata!(2));
+                model
+                    .metadata
+                    .insert("qwen35.nextn_predict_layers".into(), metadata!(1));
+                model.metadata.insert(
+                    "qwen35.attention.recurrent_layers".into(),
+                    metadata!([recurrent, false]),
+                );
+                model
+                    .tensors
+                    .insert(name.into(), weight(name, &[1], &[value]));
+                assert_eq!(
+                    Qwen35::new(model, 1).is_ok(),
+                    value.is_finite(),
+                    "unused {name}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn unsupported_rope_overrides_and_unconsumed_tensors_fail_closed() {
     for (key, value) in [
         ("qwen35.rope.scale_linear", metadata!(2.0)),

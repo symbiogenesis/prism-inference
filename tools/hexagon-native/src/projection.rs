@@ -132,6 +132,13 @@ impl Q2ProjectionReport {
         }
     }
 
+    /// Whether this terminal report belongs to the distinct HMX bitplane path.
+    /// This distinguishes requested kernels, without proving effective placement.
+    #[must_use]
+    pub const fn is_hmx_bitplane_control(self) -> bool {
+        self.queue.is_hmx_bitplane_control()
+    }
+
     /// All requested work and explicit cleanup passed; no eligibility follows.
     #[must_use]
     pub const fn completed_cycle(self) -> bool {

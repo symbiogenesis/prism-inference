@@ -267,6 +267,32 @@ expired read supplies no numeric evidence. Hosted failure-state controls verify
 that numeric evidence and stale cleanup fields cannot erase the write error or
 authorize cleanup/admission. Actual closed Windows behavior remains independent.
 
+## Bounded HMX bitplane session
+
+`Driver::reference_hmx_q2_projection` consumes the same independently verified
+signed X2 package through one bounded queue and mapped allocation. Its separate
+`HmxQ2Submitter` accepts fixed K=128/N=8 binary activation planes and unit-scale
+576-byte Q2 host tiles, with M a multiple of 32 up to 17,408. The session requests
+one HMX, one HVX worker and 65,536 VTCM bytes. Requests do not establish effective
+HMX placement or a granted VTCM allocation; signed-device qualification remains
+pending.
+
+The pinned nonpipelined HMX2D source solver uses m_chunk=32 and chooses n_chunk
+under that fixed budget, including its cost, tail-waste and size tie rules. At
+full M it chooses n_chunk=128 and requires 57,344 VTCM bytes; at M=32 it needs
+22,528 bytes. Internal 32-row activation padding stays in VTCM; the host receives
+exactly eight contiguous M-row F32 plane results. All returned values must be
+finite integers in -128..=256, with exact-dot comparison still caller-owned.
+
+HMX and guarded HVX use the same queue ownership, monotonic response correlation,
+poisoned output, no-retry and ordered stop/close/unmap/module-close/free protocol.
+The shared report explicitly marks HMX through `is_hmx_bitplane_control()` and
+excludes it from `is_guarded_q2_control()`. Every owner remains pinned after any
+uncertain call, malformed response or deadline until supervised process exit.
+The complete session allowance remains 4..=120 seconds with three seconds
+reserved for cleanup, and an external Job deadline remains mandatory. No model,
+PTQ1, performance or production eligibility follows from model-free controls.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

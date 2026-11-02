@@ -64,6 +64,7 @@ pub(crate) const STOP_SCALARS: u32 = 0x0300_0000;
 )]
 pub struct QueueComputeReport {
     pub(crate) fixture: ComputeFixture,
+    pub(crate) hmx_bitplane: bool,
     /// Last entered or completed fixed stage.
     pub stage: &'static str,
     /// Session metadata, including original validated effective domain.
@@ -127,6 +128,7 @@ impl QueueComputeReport {
     ) -> Self {
         Self {
             fixture,
+            hmx_bitplane: false,
             stage: "compute-metadata-incomplete",
             metadata,
             process_initialization_result: None,
@@ -158,10 +160,18 @@ impl QueueComputeReport {
     /// This receipt belongs to the separate fixed guarded-Q2 integer control.
     #[must_use]
     pub const fn is_guarded_q2_control(self) -> bool {
-        matches!(
-            self.fixture,
-            ComputeFixture::GuardedQ2 | ComputeFixture::GuardedQ2NoBlock
-        )
+        !self.hmx_bitplane
+            && matches!(
+                self.fixture,
+                ComputeFixture::GuardedQ2 | ComputeFixture::GuardedQ2NoBlock
+            )
+    }
+
+    /// This session requests the separately bounded HMX integer-bitplane path.
+    /// A request marker does not qualify effective device placement.
+    #[must_use]
+    pub const fn is_hmx_bitplane_control(self) -> bool {
+        self.hmx_bitplane
     }
 
     /// This receipt selects exactly one direct nonblocking packet write.

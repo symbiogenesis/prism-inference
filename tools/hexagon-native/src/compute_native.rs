@@ -26,6 +26,16 @@ pub(super) fn projection(
     projection_native::run(driver, package, limits, progress, work)
 }
 
+pub(super) fn hmx_projection(
+    driver: Driver,
+    package: &Path,
+    limits: crate::HmxQ2ProjectionLimits,
+    progress: impl FnMut(&crate::HmxQ2ProjectionReport),
+    work: impl FnOnce(&mut dyn crate::HmxQ2Submitter) -> Result<(), Error>,
+) -> Result<crate::HmxQ2ProjectionReport, Error> {
+    projection_native::run_hmx(driver, package, limits, progress, work)
+}
+
 type Open = unsafe extern "C" fn(*const c_char, *mut u64) -> i32;
 type Close = unsafe extern "C" fn(u64) -> i32;
 type Invoke = unsafe extern "C" fn(u64, u32, *mut RemoteBuffer) -> i32;

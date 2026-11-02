@@ -15,12 +15,16 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 mod compute;
+mod hmx_projection;
 mod projection;
 mod session;
 mod session_mapping;
 pub use compute::{
     COMPUTE_ALLOCATION_BYTES, COMPUTE_GGML_SOURCE, COMPUTE_K, COMPUTE_M, COMPUTE_N, COMPUTE_Q2_K,
     COMPUTE_REQUEST_BYTES, COMPUTE_RESPONSE_BYTES, QueueComputeReport,
+};
+pub use hmx_projection::{
+    HMX_Q2_VTCM_REQUEST_BYTES, HmxQ2ProjectionLimits, HmxQ2ProjectionReport, HmxQ2Submitter,
 };
 pub use projection::{
     GuardedQ2Submitter, Q2_PROJECTION_MAX_OPERATIONS, Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits,
@@ -619,6 +623,47 @@ impl Driver {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             windows::reference_q2_projection(self.inner, package_directory, limits, progress, work)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, limits, progress, work);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Execute fixed K128/N8 integer-bitplane operations through one HMX session.
+    ///
+    /// Requires the same retained signed-package/catalog, source-bound ABI,
+    /// driver, child-environment and external process-deadline prerequisites as
+    /// [`Self::reference_q2_projection`]. The fixed session requests one HMX,
+    /// one HVX worker and 64KiB VTCM; these requests establish no effective
+    /// placement or granted memory. Source-derived chunks bound scratch and
+    /// every output is checked before reuse. `work` must independently verify
+    /// exact dots and complete its projection. Any error retains uncertain
+    /// consumers until supervised exit with no retry or CPU replay.
+    ///
+    /// Publish results only after the HMX-marked report's completed cycle. This
+    /// terminal experimental API grants no inference eligibility or speed claim.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms and the guarded bridge's path, identity,
+    /// deployment and lifetime prerequisites; native refusal remains observable.
+    pub fn reference_hmx_q2_projection(
+        self,
+        package_directory: &Path,
+        limits: HmxQ2ProjectionLimits,
+        progress: impl FnMut(&HmxQ2ProjectionReport),
+        work: impl FnOnce(&mut dyn HmxQ2Submitter) -> Result<(), Error>,
+    ) -> Result<HmxQ2ProjectionReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_hmx_q2_projection(
+                self.inner,
+                package_directory,
+                limits,
+                progress,
+                work,
+            )
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {

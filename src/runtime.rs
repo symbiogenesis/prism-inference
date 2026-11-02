@@ -532,11 +532,7 @@ impl<D: Decoder> Runtime<D> {
         mut effects: GenerationEffects<'_, S, impl FnMut(u32) -> Result<()>>,
     ) -> Result<Completion> {
         let started = effects.timings.as_deref_mut().map(|timings| {
-            *timings = GenerationTimings {
-                entered: true,
-                prompt_tokens: prompt.len(),
-                ..GenerationTimings::default()
-            };
+            *timings = GenerationTimings::started(prompt.len());
             Instant::now()
         });
         let checkpoint = measure(

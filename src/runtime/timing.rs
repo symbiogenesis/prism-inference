@@ -131,6 +131,14 @@ pub struct GenerationTimings {
 }
 
 impl GenerationTimings {
+    pub(super) fn started(prompt_tokens: usize) -> Self {
+        Self {
+            entered: true,
+            prompt_tokens,
+            ..Self::default()
+        }
+    }
+
     /// Observations for a fixed phase; missing work has zero attempted calls.
     #[must_use]
     pub const fn phase(&self, phase: GenerationPhase) -> &PhaseTiming {

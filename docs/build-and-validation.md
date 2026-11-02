@@ -266,7 +266,19 @@ second model trial to complete a larger matrix.
 The `request-timing` mode captures one production `SwiftSession` request with
 the fixed Swift sampler, seed 42, native stop set, thinking disabled and no
 prefix reuse. The input is a bounded JSON messages array, admitted to at most
-128 rendered prompt tokens and 1 through 16 reserved output tokens:
+128 rendered prompt tokens and 1 through 16 reserved output tokens.
+
+The manual main-only [request timing preparation workflow](../.github/workflows/request-timing-preparation.yml)
+checks the focused model-free controls and builds the standalone Windows ARM64
+tool with `parallel-rows`. Its artifact includes the executable and exact
+source/run/compiler/file-hash receipt; build and check logs are retained even
+on failure. It starts no owner-device job and executes no actual model.
+The attribution API and checker are unreleased source candidates after 0.1.12;
+this preparation does not update Runner's pinned 0.1.12 runtime or transfer its
+earlier application evidence. The package-version string alone never binds a
+source-built executable to released runtime bytes.
+
+Use its exact source-bound executable under the external owner:
 
 ```text
 swift_model_check --use-repacked-ptq1 --row-workers 4 --rank-one-adapter <absolute-approved-adapter> 1.3 request-timing <absolute-current-PTQ1> <new-existing-evidence-dir> auto <absolute-messages.json> 1 <original-work-deadline-unix-ms> <exact-hosted-source-commit>

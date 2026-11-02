@@ -1,0 +1,128 @@
+name: Swift request timing tool preparation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: request-timing-preparation-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.package.outputs.artifact-id }}
+      artifact-digest: ${{ steps.package.outputs.artifact-digest }}
+    env:
+      CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+      CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+      CARGO_BUILD_FINGERPRINT: content
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+      - name: Check and build the exact native request timing tool without models
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Request-Timing-Build'
+          $logs = Join-Path $env:RUNNER_TEMP 'Request-Timing-Logs'
+          $package = Join-Path $env:RUNNER_TEMP 'Request-Timing-Package'
+          [void][IO.Directory]::CreateDirectory($logs)
+          [void][IO.Directory]::CreateDirectory($package)
+          "REQUEST_TIMING_LOGS=$logs" >> $env:GITHUB_ENV
+          "REQUEST_TIMING_PACKAGE=$package" >> $env:GITHUB_ENV
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          $compiler = @(& rustc +nightly-2026-10-22 -vV)
+          if ($compiler -cnotcontains 'host: aarch64-pc-windows-msvc') { throw 'Native ARM64 compiler identity is required.' }
+          $compiler | Set-Content -LiteralPath (Join-Path $logs 'compiler.txt') -Encoding utf8NoBOM
+          if ((& git -C $env:GITHUB_WORKSPACE rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checkout differs from the owning source revision.' }
+          $commands = [Collections.Generic.List[object]]::new()
+          function Invoke-CargoCheck {
+            param([string]$Name, [string[]]$Arguments)
+            $commands.Add([ordered]@{ name=$Name; executable='cargo'; arguments=$Arguments })
+            $commands | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $logs 'commands.json') -Encoding utf8NoBOM
+            & $cargo @Arguments 2>&1 | Tee-Object -FilePath (Join-Path $logs "$Name.log")
+            if ($LASTEXITCODE -ne 0) { throw "Required hosted check failed: $Name" }
+          }
+          Invoke-CargoCheck 'format' @('+nightly-2026-10-22', 'fmt', '--manifest-path', $manifest, '-p', 'prism-inference', '--', '--check')
+          Invoke-CargoCheck 'clippy' @('+nightly-2026-10-22', 'clippy', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--lib', '--test', 'runtime', '--example', 'swift_model_check', '--', '-D', 'warnings')
+          $env:RUSTDOCFLAGS = '-D warnings'
+          Invoke-CargoCheck 'rustdoc' @('+nightly-2026-10-22', 'doc', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--no-deps', '--lib')
+          $runtimeCases = @(
+            'timing::timing_preserves_sampled_output_state_rng_and_reused_prefix',
+            'timing::timed_stop_draw_is_counted_without_decode_or_callback_work',
+            'timing::failed_callback_retains_provisional_work_and_rolls_back_state_and_rng',
+            'timing::timed_cancel_after_successful_callback_never_reports_committed_output',
+            'timing::failed_prefill_block_keeps_unknown_partial_work_distinct_from_zero'
+          )
+          $exampleCases = @(
+            'request_timing::tests::request_timing_requires_original_bounded_absolute_deadline',
+            'request_timing::tests::unentered_failure_record_has_no_inferred_token_counts_or_input_text',
+            'request_timing::tests::completed_session_stays_distinct_from_failed_aggregate_deadline',
+            'request_timing::tests::request_timing_retains_failure_receipt_and_never_overwrites_prior_capture'
+          )
+          foreach ($target in @(
+            [ordered]@{ kind='--test'; name='runtime'; cases=$runtimeCases },
+            [ordered]@{ kind='--example'; name='swift_model_check'; cases=$exampleCases }
+          )) {
+            $testArguments = @('+nightly-2026-10-22', 'test', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', $target.kind, $target.name)
+            $inventory = @(Invoke-CargoCheck ($target.name + '-inventory') ($testArguments + @('--', '--list')))
+            foreach ($case in $target.cases) {
+              if ($inventory -cnotcontains ($case + ': test')) { throw "Required model-free timing regression is missing: $case" }
+              Invoke-CargoCheck ($case -replace '::', '-') ($testArguments + @($case, '--', '--exact'))
+            }
+          }
+          $messages = Join-Path $logs 'example-build.jsonl'
+          $buildArguments = @('+nightly-2026-10-22', 'build', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--example', 'swift_model_check', '--message-format=json')
+          $commands.Add([ordered]@{ name='example-build'; executable='cargo'; arguments=$buildArguments })
+          $commands | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $logs 'commands.json') -Encoding utf8NoBOM
+          & $cargo @buildArguments 2> (Join-Path $logs 'example-build-stderr.log') | Tee-Object -FilePath $messages
+          if ($LASTEXITCODE -ne 0) { throw 'The standalone ARM64 request timing build failed.' }
+          $artifacts = @(Get-Content -LiteralPath $messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -ceq 'compiler-artifact' -and $_.target.name -ceq 'swift_model_check' -and $_.executable -and -not $_.profile.test })
+          if ($artifacts.Count -ne 1) { throw 'Exactly one standalone example executable is required.' }
+          $binary = Join-Path $package 'swift_model_check.exe'
+          Copy-Item -LiteralPath $artifacts[0].executable -Destination $binary
+          $help = @(& $binary --help)
+          if ($LASTEXITCODE -ne 0 -or -not ($help -match 'request-timing')) { throw 'The built tool lacks its bounded request-timing mode.' }
+          $help | Set-Content -LiteralPath (Join-Path $logs 'help.txt') -Encoding utf8NoBOM
+          $dirty = @(& git -C $env:GITHUB_WORKSPACE status --porcelain)
+          if ($dirty.Count -ne 0) { throw 'Preparation must leave its exact source checkout unchanged.' }
+          $sourceFiles = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'src/runtime.rs', 'src/runtime/timing.rs', 'src/swift_session.rs', 'examples/swift_model_check.rs', 'examples/swift_model_check/request_timing.rs', '.github/workflows/request-timing-preparation.yml') | ForEach-Object {
+            $path = Join-Path $env:GITHUB_WORKSPACE $_
+            [ordered]@{ path=$_; bytes=(Get-Item -LiteralPath $path).Length; sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          [ordered]@{
+            schemaVersion=1; kind='swift-request-timing-hosted-preparation'
+            repository=$env:GITHUB_REPOSITORY; revision=$env:GITHUB_SHA; gitRef=$env:GITHUB_REF
+            workflowPath='.github/workflows/request-timing-preparation.yml'; runId=$env:GITHUB_RUN_ID; runAttempt=[int]$env:GITHUB_RUN_ATTEMPT
+            target='aarch64-pc-windows-msvc'; toolchain='nightly-2026-10-22-aarch64-pc-windows-msvc'; compilerIdentity=($compiler -join "`n")
+            features=@('default', 'parallel-rows'); actualModelExecuted=$false; ownerDeviceJobCreated=$false
+            scope='source-tool preparation only; no device, numerical, performance, service or promotion qualification'
+            requiredRuntimeTests=$runtimeCases; requiredDiagnosticTests=$exampleCases; sourceFiles=$sourceFiles
+            files=@([ordered]@{ name='swift_model_check.exe'; bytes=(Get-Item -LiteralPath $binary).Length; sha256=(Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() })
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $package 'receipt.json') -Encoding utf8NoBOM
+      - name: Retain exact ARM64 tool and source-build receipt
+        id: package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swift-request-timing-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REQUEST_TIMING_PACKAGE }}
+          if-no-files-found: error
+          retention-days: 90
+      - name: Retain build and model-free check logs after success or failure
+        if: always() && env.REQUEST_TIMING_LOGS != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swift-request-timing-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REQUEST_TIMING_LOGS }}
+          if-no-files-found: error
+          retention-days: 90

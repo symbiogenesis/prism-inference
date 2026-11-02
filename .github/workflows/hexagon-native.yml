@@ -6,11 +6,14 @@ on:
       - tools/hexagon-native/**
       - tools/hexagon-runtime/**
       - src/graph.rs
+      - src/lib.rs
+      - src/runtime.rs
       - src/graph/projection.rs
       - src/kernels.rs
       - src/kernels/projection.rs
       - tests/graph.rs
       - tests/graph/projection.rs
+      - tests/graph/admission.rs
       - config/rust-packages.psd1
       - .github/workflows/hexagon-native.yml
       - Cargo.toml

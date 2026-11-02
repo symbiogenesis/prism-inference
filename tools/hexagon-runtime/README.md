@@ -57,6 +57,18 @@ the actual session's remaining writes, including any work preceding the executor
 borrow; the effective allowance is the minimum of both bounds. Custom submitters
 with opaque capacity still require independently matched caller limits.
 
+`ProjectedQwen35` derives per-ingestion and per-evaluation costs from the actual
+graph projections, excluding embedding row gathers and CPU placements. Bounded
+executors must provide stable, nonzero counts for every selected projection.
+The ordinary `Runtime` checks all unreused prompt forwards and the complete
+reserved output length through `Decoder::admit_work` before starting new
+inference or sampling. Early stop is not assumed. Direct graph calls also check
+one complete token before executing its first projection. Capacity refusal
+leaves the scope healthy; errors after admitted evaluation starts remain terminal.
+Reset and checkpoints never replenish the native operation allowance. Operation
+admission establishes no duration, memory, device placement or performance gate;
+outputs still stay provisional until terminal native cleanup succeeds.
+
 For the retained Swift geometry, source arithmetic at the maximum 17,408-row
 tile requires 22,656 submissions for all eligible projections of one ingestion
 token and another 600 for its vocabulary head (23,256 for evaluation). This
@@ -73,6 +85,6 @@ Hosted Hexagon and Foundation CI own these tests and Clippy/documentation checks
 
 This source integration enables no Runner profile or automatic backend selection.
 Signed HMX execution and actual shapes, PQ2/PTQ1 full logits/state and adapter
-qualification, model operation/resource admission, cancellation/device loss,
+qualification, actual resource admission, cancellation/device loss,
 sustained use and paired end-to-end benefit remain pending. Native invocation,
 successful loading or an exact CPU/mock control does not establish NPU speed.

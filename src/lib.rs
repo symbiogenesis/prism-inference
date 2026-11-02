@@ -83,6 +83,20 @@ pub trait Decoder {
     fn vocab_size(&self) -> usize;
     /// Conservative maximum bytes allocated when capturing the current state.
     fn checkpoint_bytes(&self) -> usize;
+    /// Check the maximum remaining forward work before starting new inference.
+    ///
+    /// `ingest_tokens` excludes output projections; `evaluate_tokens` includes
+    /// logits and the complete reserved output length, even if a stop token may
+    /// finish early. Implementations with finite device sessions must reject
+    /// work that cannot fit their remaining operation budget. This check does
+    /// not submit work, change sequence state or replenish a device lifetime.
+    /// CPU decoders have no additional operation limit by default.
+    ///
+    /// # Errors
+    /// Rejects exhausted resources, arithmetic overflow or a closed decoder.
+    fn admit_work(&self, _ingest_tokens: usize, _evaluate_tokens: usize) -> Result<()> {
+        Ok(())
+    }
     /// Clear all sequence state without changing model identity.
     ///
     /// # Errors

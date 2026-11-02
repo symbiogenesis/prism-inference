@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Focused scalar graph, state ownership, and model contract regressions.
 
+#[path = "graph/admission.rs"]
+mod admission;
 #[path = "graph/projection.rs"]
 mod projection;
 

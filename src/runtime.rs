@@ -686,6 +686,14 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         let reused = self.prepare(prompt, check)?;
         check()?;
+        let remaining = prompt.len() - reused;
+        let evaluations = options
+            .max_tokens
+            .checked_add(usize::from(remaining > 0))
+            .ok_or_else(|| invalid("native forward work count overflow"))?;
+        self.decoder
+            .admit_work(remaining.saturating_sub(1), evaluations)?;
+        check()?;
         if let Some((&last, prefix)) = prompt[reused..].split_last() {
             for block in prefix.chunks(prefill.block_tokens) {
                 self.ingest_block(block, check)?;

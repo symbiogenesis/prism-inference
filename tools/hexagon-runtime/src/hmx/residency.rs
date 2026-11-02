@@ -80,7 +80,7 @@ impl Cache {
         })
     }
 
-    pub(super) fn has_metadata_capacity(&self, operations: usize) -> bool {
+    pub(super) const fn has_metadata_capacity(&self, operations: usize) -> bool {
         self.projections.len() < self.projections.capacity()
             && operations <= self.handles.capacity() - self.handles.len()
     }

@@ -432,7 +432,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 self.memory.cast::<u8>().wrapping_add(active.output),
-                std::mem::size_of_val(output),
+                size_of_val(output),
             )
         };
         let output_valid = match self.mode {

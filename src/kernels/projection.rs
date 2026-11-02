@@ -39,6 +39,8 @@ pub trait Pq2ProjectionExecutor {
     ///
     /// `false` keeps this whole projection on its configured CPU backend. A later
     /// execution error is propagated without CPU replay or partial continuation.
+    /// Eligibility and [`Self::operation_count`] must remain stable for the
+    /// complete borrowed graph scope, whose admission may cache these decisions.
     fn supports(&self, tensor: &Tensor) -> bool;
 
     /// Replace the complete projection using the existing exact quantized codes.
@@ -58,6 +60,8 @@ pub trait Pq2ProjectionExecutor {
     ///
     /// Existing executors leave these paths on CPU. Eligibility must precede
     /// submission and must not depend on a failed device attempt.
+    /// Eligibility and operation counts must remain stable for the complete
+    /// borrowed graph scope.
     fn supports_q8(&self, _tensor: &Tensor) -> bool {
         false
     }

@@ -263,6 +263,35 @@ setup, loading, capture, comparison and cleanup must fit the one five-minute
 owner allowance under external process/Job/deadline supervision; do not execute a
 second model trial to complete a larger matrix.
 
+The `request-timing` mode captures one production `SwiftSession` request with
+the fixed Swift sampler, seed 42, native stop set, thinking disabled and no
+prefix reuse. The input is a bounded JSON messages array, admitted to at most
+128 rendered prompt tokens and 1 through 16 reserved output tokens:
+
+```text
+swift_model_check --use-repacked-ptq1 --row-workers 4 --rank-one-adapter <absolute-approved-adapter> 1.3 request-timing <absolute-current-PTQ1> <new-existing-evidence-dir> auto <absolute-messages.json> 1 <original-work-deadline-unix-ms> <exact-hosted-source-commit>
+```
+
+The absolute work deadline must leave between one and 240 seconds at entry.
+It maps once to a monotonic deadline before input intake, executable hashing,
+loading and request work; loading never starts a new allowance. The external
+owner must bind the declared source commit and executable SHA-256 to the exact
+hosted build receipt, supervise synchronous loading, and reserve final receipt
+writing and process cleanup within the same aggregate five-minute limit.
+
+The create-new `request-timing-started.json` and `request-timing.json` retain
+input-byte/executable hashes, selected model/adapter/scale, backend and worker
+identities, and completed operation timings on returned failure as well as
+success. They omit input/output text, token IDs, paths and raw error messages.
+A missing or incomplete final receipt leaves work unknown. Successful prefill
+blocks supply a completed lower bound; a failed block may have executed more
+tokens. Callback counts are provisional token-consumer calls, distinct from
+sampled stops, graph evaluations, decoded text chunks and committed output.
+Runtime success, session terminal delivery and the final aggregate deadline
+have separate result fields. The no-op text consumer measures no HTTP or
+network backpressure, so this diagnostic attributes source-session work without
+qualifying app throughput, private-service lifecycle or release promotion.
+
 PQ2 without an adapter remains the default service profile.
 For the verified lossless export of those same current weights, prefix the
 offline checker command with `--use-repacked-ptq1`:
@@ -271,7 +300,8 @@ offline checker command with `--use-repacked-ptq1`:
 swift_model_check --use-repacked-ptq1 forward <absolute-current-repacked-PTQ1-model> <existing-absolute-evidence-dir> <scalar|auto|neon> <id,id,...>
 ```
 
-The prefix also applies to `inspect`, `load`, `trajectory` and `rollback`. It admits only
+The prefix also applies to `inspect`, `load`, `trajectory`, `rollback` and
+`request-timing`. It admits only
 the current-weight export with SHA-256
 `e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5`,
 5,946,648,928 complete file bytes and the strict 851-tensor PTQ1/F32/BF16
@@ -294,8 +324,9 @@ do not loosen the trusted same-format correctness tolerance to make it pass.
 
 The source graph implements an explicit [rank-one adapter correctness path](rank-one-adapter.md);
 the offline checker accepts `--rank-one-adapter <absolute-approved-adapter> <scale>`
-after the optional `--use-repacked-ptq1` prefix for `load`, `forward`, `trajectory`
-and `rollback`. Both base selection and approved adapter verification remain exact;
+after the optional `--use-repacked-ptq1` prefix for `load`, `forward`, `trajectory`,
+`rollback` and `request-timing`. Both base selection and approved adapter
+verification remain exact;
 the existing PQ2 constructor defaults do not admit the export implicitly.
 The JSONL workers remain adapter-free. The explicit private service requires the
 exact approved adapter and pinned-slot request scale. An approved LoRA's

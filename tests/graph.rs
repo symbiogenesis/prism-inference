@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 //! Focused scalar graph, state ownership, and model contract regressions.
 
+#[path = "graph/projection.rs"]
+mod projection;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

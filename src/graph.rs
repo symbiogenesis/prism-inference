@@ -20,6 +20,9 @@ use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
 use crate::{Decoder, Result, invalid};
 
+mod projection;
+pub use projection::ProjectedQwen35;
+
 /// Maximum admitted live KV/recurrent element payload, also the default budget.
 ///
 /// This excludes model storage, scratch, checkpoints, page-table/Arc metadata
@@ -503,7 +506,7 @@ struct Workspace {
     deltas: Vec<LayerDelta>,
 }
 
-struct Evaluation<'a> {
+struct Evaluation<'a, 'executor> {
     geometry: &'a Geometry,
     arithmetic: Arithmetic,
     transforms: &'a Transforms,
@@ -513,6 +516,7 @@ struct Evaluation<'a> {
     adapter: Option<&'a RankOneAdapter>,
     adapter_scale: f32,
     adapter_scratch: &'a mut AdapterScratch,
+    executor: Option<&'executor mut dyn crate::kernels::Pq2ProjectionExecutor>,
 }
 
 #[derive(Default)]
@@ -695,13 +699,30 @@ impl Transforms {
 
     // The fixed-size group borrows one exact input slice for its whole scope.
     // Nothing is reused across calls, tokens, layers or failed evaluations.
+    #[cfg(test)]
     fn project_group_into<const N: usize>(
+        &self,
+        weights: [&Tensor; N],
+        input: &[f32],
+        geometry: &Geometry,
+        outputs: [&mut Vec<f32>; N],
+        scratch: &mut ProjectionScratch,
+    ) -> Result<()> {
+        self.project_group_into_with_executor(weights, input, geometry, outputs, scratch, &mut None)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep scoped execution separate from CPU scratch and exact transform ownership."
+    )]
+    fn project_group_into_with_executor<const N: usize>(
         &self,
         weights: [&Tensor; N],
         input: &[f32],
         geometry: &Geometry,
         mut outputs: [&mut Vec<f32>; N],
         scratch: &mut ProjectionScratch,
+        executor: &mut Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
         for output in &mut outputs {
             output.clear();
@@ -734,7 +755,11 @@ impl Transforms {
                         && self.basis(weight) == basis
                         && prepared.is_compatible(weight)?
                     {
-                        prepared.matvec_into(weight, output)?;
+                        if let Some(executor) = executor.as_deref_mut() {
+                            prepared.matvec_with_executor(weight, output, executor)?;
+                        } else {
+                            prepared.matvec_into(weight, output)?;
+                        }
                         completed[candidate] = true;
                     }
                 }
@@ -1420,6 +1445,19 @@ impl Qwen35 {
         reason = "Keep validation and transactional graph operation order auditable together."
     )]
     fn evaluate_token_into(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
+        self.evaluate_token_with_executor(token, logits, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep validation and transactional graph operation order auditable together."
+    )]
+    fn evaluate_token_with_executor(
+        &mut self,
+        token: u32,
+        logits: Option<&mut Vec<f32>>,
+        executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    ) -> Result<()> {
         let token = usize::try_from(token)?;
         if token >= self.vocabulary || self.position >= self.context_limit {
             return Err(invalid(
@@ -1445,6 +1483,7 @@ impl Qwen35 {
             adapter: self.adapter.as_ref(),
             adapter_scale: self.adapter_scale,
             adapter_scratch,
+            executor,
         };
         row_into(&self.embedding, token, hidden)?;
         if self.transforms.inverse_embedding {
@@ -1554,7 +1593,7 @@ impl Qwen35 {
     }
 }
 
-impl Evaluation<'_> {
+impl Evaluation<'_, '_> {
     fn project_group_into<const N: usize>(
         &mut self,
         tensors: [&Tensor; N],
@@ -1562,12 +1601,13 @@ impl Evaluation<'_> {
         mut outputs: [&mut Vec<f32>; N],
     ) -> Result<()> {
         let result = (|| {
-            self.transforms.project_group_into(
+            self.transforms.project_group_into_with_executor(
                 tensors,
                 input,
                 self.geometry,
                 outputs.each_mut().map(|output| &mut **output),
                 self.projection,
+                &mut self.executor,
             )?;
             if let Some(adapter) = self.adapter {
                 for (tensor, output) in tensors.into_iter().zip(&mut outputs) {

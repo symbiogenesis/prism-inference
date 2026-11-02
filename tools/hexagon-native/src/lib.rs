@@ -15,11 +15,16 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 mod compute;
+mod projection;
 mod session;
 mod session_mapping;
 pub use compute::{
     COMPUTE_ALLOCATION_BYTES, COMPUTE_GGML_SOURCE, COMPUTE_K, COMPUTE_M, COMPUTE_N, COMPUTE_Q2_K,
     COMPUTE_REQUEST_BYTES, COMPUTE_RESPONSE_BYTES, QueueComputeReport,
+};
+pub use projection::{
+    GuardedQ2Submitter, Q2_PROJECTION_MAX_OPERATIONS, Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits,
+    Q2ProjectionReport,
 };
 pub use session::{
     GET_EFFECTIVE_DOMAIN_ID, GET_URI, MAP_FD, MAP_FD_DELAYED, SessionPreparationReport,
@@ -580,6 +585,44 @@ impl Driver {
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {
             let _ = (self, package_directory, progress);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Execute bounded caller-prepared guarded-Q2 operations in one X2 session.
+    ///
+    /// This experimental terminal bridge uses the same pinned signed package,
+    /// driver, catalog, reference initializer, child environment, source-bound
+    /// Windows ABI controls and external Job/deadline prerequisites as the fixed
+    /// Q2 probe. K=256/N=2 and the audited HVX solver remain fixed; M may range
+    /// from 32 to 17,408 in multiples of 32. A single bounded mapped allocation
+    /// and queue are reused only after each exact correlated completion.
+    ///
+    /// `work` must independently verify the returned integer dots and complete
+    /// its projection before returning success. Any callback error, unwinding,
+    /// deadline, malformed output or native uncertainty pins every owner until
+    /// supervised process exit. No partial projection, CPU replay, inference
+    /// eligibility or performance claim follows from this API. The caller must
+    /// publish results only after [`Q2ProjectionReport::completed_cycle`] passes.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms, malformed inputs and the fixed probe's
+    /// identity/export/path prerequisites. Partial native and callback failure
+    /// remains observable in the returned report with no weaker retry.
+    pub fn reference_q2_projection(
+        self,
+        package_directory: &Path,
+        limits: Q2ProjectionLimits,
+        progress: impl FnMut(&Q2ProjectionReport),
+        work: impl FnOnce(&mut dyn GuardedQ2Submitter) -> Result<(), Error>,
+    ) -> Result<Q2ProjectionReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_q2_projection(self.inner, package_directory, limits, progress, work)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, limits, progress, work);
             Err(Error::UnsupportedPlatform)
         }
     }

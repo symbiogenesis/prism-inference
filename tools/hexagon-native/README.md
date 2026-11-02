@@ -60,14 +60,51 @@ signed-reference ggml host-driver convention. No implementation is vendored.
 The narrow candidate is developed alongside Runner's standalone capability
 fixture; the production engine remains Prism and no Runner runtime pin changes.
 
-All nine native library source files and `sources.json` match Runner revision
-[`f37a1d8`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/f37a1d84695b58c0e4ddfd8f39b9028fc869a24c/tools/hexagon/native_rpc).
+The native library source files and `sources.json` follow Runner's reviewed
+[`bounded projection boundary`](https://github.com/symbiogenesis/SwiftBonsai2Runner/tree/bc45fcfc853916e1b78f1d788d7655db87e668fe/tools/hexagon/native_rpc).
 Fixed module names use typed `CStr` literals. The vendor request length still
 excludes the terminating NUL, while its independently writable backing buffer
 includes that NUL and is checked after return. URI, ABI, request ordering and
 terminal ownership contracts are unchanged. Prior device observations remain
 bound to their original source/build receipts; this synchronization supplies no
 new device or inference qualification.
+
+## Guarded original-projection sessions
+
+`Driver::reference_q2_projection` adds a separate experimental terminal API for
+caller-prepared guarded Q2 integer operations. One owned module, bounded mapped
+allocation and queue serve synchronous operations. The pinned K=256/N=2
+quant-row solver uses one HVX thread and 61,440 bytes of VTCM scratch. M admits
+multiples of 32 through 17,408. The bound Swift up projection can therefore
+preserve its forty original per-128 reductions in forty submissions rather than
+21,760 small-row requests; this is derived scheduling, not measured performance.
+
+The exact pinned `htp-kparams.cpp` and `matmul-ops.h` layout keep scratch
+independent of weight M for N=2, with no destination VTCM. Full-M host mapping
+is bounded at 1,396,736 bytes and its start-frame mapping budget equals that
+allocation. Every request regenerates its mutable command descriptors, updates
+the monotonic sequence and poisons output. Reuse requires an exact correlated
+response, complete FD/extent/address/cache checks and finite integral outputs
+bounded by 16,384. No borrowed host slice spans device work.
+
+`Q2ProjectionLimits` supplies one absolute 4..=120-second session allowance,
+including setup, caller preparation, all operations and a three-second cleanup
+reserve. It also bounds M and total write attempts. Native calls still require
+an external owned process deadline. Every failed write, stale or malformed
+reply, invalid result, expired bound, callback error or unwinding pins uncertain
+consumers through supervised exit with no retry or CPU replay. Successful
+caller work must additionally verify exact integer dots against an independent
+oracle; integer-shaped wrong outputs establish no numerical parity. Publish
+only after the entire caller projection and `completed_cycle()` pass, including
+explicit stop, host queue close, host unmap, u64 module close and allocation free.
+
+Source-bound model-free controls cover dynamic packet extents, unchanged solver
+fields, guard/scales, stale correlation, repeated successful operations, write
+refusal, invalid numeric output, deadlines, operation caps and poisoned retention.
+They do not qualify full-M device solver behavior, selected DSP bytes, complete
+projection/model/state parity, vendor teardown or speed. The crate stays
+unpublished, with no main-runtime dependency, backend availability or profile
+promotion change. Existing device observations retain their original identities.
 
 `Driver::prepare_session_metadata` now prepares the default `cdsp` session's
 effective domain and exact bundled v73/v81 module URI through pinned public

@@ -13,6 +13,19 @@ use std::path::Path;
 use std::ptr::{from_mut, null_mut};
 use std::time::{Duration, Instant};
 
+#[path = "projection_native.rs"]
+mod projection_native;
+
+pub(super) fn projection(
+    driver: Driver,
+    package: &Path,
+    limits: crate::Q2ProjectionLimits,
+    progress: impl FnMut(&crate::Q2ProjectionReport),
+    work: impl FnOnce(&mut dyn crate::GuardedQ2Submitter) -> Result<(), Error>,
+) -> Result<crate::Q2ProjectionReport, Error> {
+    projection_native::run(driver, package, limits, progress, work)
+}
+
 type Open = unsafe extern "C" fn(*const c_char, *mut u64) -> i32;
 type Close = unsafe extern "C" fn(u64) -> i32;
 type Invoke = unsafe extern "C" fn(u64, u32, *mut RemoteBuffer) -> i32;
@@ -235,16 +248,31 @@ pub(super) fn probe(
     reason = "Only the safe parent selects one of four private fixed compute controls"
 )]
 pub(super) fn probe_fixture(
-    mut driver: Driver,
+    driver: Driver,
     package: &Path,
     mut progress: impl FnMut(&QueueComputeReport),
     fixture: compute::ComputeFixture,
 ) -> Result<QueueComputeReport, Error> {
+    let (report, opened) = open_module(driver, package, &mut progress, fixture)?;
+    let Some((handle, domain, calls)) = opened else {
+        return Ok(report);
+    };
+    Ok(exercise(report, handle, domain, &calls, &mut progress))
+}
+
+type OpenedModule = (u64, i32, Calls);
+
+fn open_module(
+    mut driver: Driver,
+    package: &Path,
+    progress: &mut impl FnMut(&QueueComputeReport),
+    fixture: compute::ComputeFixture,
+) -> Result<(QueueComputeReport, Option<OpenedModule>), Error> {
     crate::self_check()?;
     let raw = driver.capability(Capability::Architecture)?;
     let metadata = SessionPreparationReport::new(raw);
     if metadata.architecture != Some(81) {
-        return Ok(QueueComputeReport::new_fixture(metadata, fixture));
+        return Ok((QueueComputeReport::new_fixture(metadata, fixture), None));
     }
     let guards = session_mapping_native::package_guards(package, 81)?;
     let calls = calls(&driver, fixture)?;
@@ -252,10 +280,10 @@ pub(super) fn probe_fixture(
     let metadata = session_native::prepare_effective_domain(raw, control);
     let mut report = QueueComputeReport::new_fixture(metadata, fixture);
     let Some(domain) = metadata.effective_domain else {
-        return Ok(report);
+        return Ok((report, None));
     };
     if metadata.domain_result != Some(0) {
-        return Ok(report);
+        return Ok((report, None));
     }
     mapping::admit_terminal()?;
     // Pin the driver/lease/package files before process initialization. All later
@@ -268,7 +296,7 @@ pub(super) fn probe_fixture(
     entered(
         &mut report,
         "compute-reference-process-init-entered",
-        &mut progress,
+        progress,
     );
     let mut request = ReferenceProcessRequest { domain, enable: 1 };
     // SAFETY: exact existing fixed two-int reference initializer, before module
@@ -279,24 +307,24 @@ pub(super) fn probe_fixture(
     report.process_initialization_enable_after = Some(request.enable);
     if result != 0 {
         report.stage = "compute-reference-process-init-refused-pinned";
-        return Ok(report);
+        return Ok((report, None));
     }
     let mut uri = [0xa5; 256];
     report.metadata = session_native::prepare_fixed_uri(metadata, control, &mut uri)?;
     if !report.metadata.metadata_prepared() {
-        return Ok(report);
+        return Ok((report, None));
     }
     let mut handle = u64::MAX;
-    entered(&mut report, "compute-module-open-entered", &mut progress);
+    entered(&mut report, "compute-module-open-entered", progress);
     // SAFETY: URI is the exact validated, terminated v81/default-CDSP module URI.
     let result = unsafe { (calls.open)(uri.as_ptr().cast(), &raw mut handle) };
     report.module_open_result = Some(result);
     report.handle_observed = handle != u64::MAX;
     if result != 0 || !report.handle_observed {
         report.stage = "compute-module-open-refused-pinned";
-        return Ok(report);
+        return Ok((report, None));
     }
-    Ok(exercise(report, handle, domain, &calls, &mut progress))
+    Ok((report, Some((handle, domain, calls))))
 }
 
 #[allow(
@@ -539,6 +567,25 @@ fn read_reply(
     reason = "Cleanup consumes one fixed exact domain/FD/address tuple and its live owners"
 )]
 fn cleanup(
+    report: QueueComputeReport,
+    calls: &CleanupCalls,
+    handle: u64,
+    queue: *mut c_void,
+    domain: i32,
+    fd: i32,
+    memory: *mut c_void,
+    progress: &mut impl FnMut(&QueueComputeReport),
+) -> QueueComputeReport {
+    cleanup_extent(
+        report, calls, handle, queue, domain, fd, memory, 16_384, progress,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Explicit cleanup retains one exact mapped allocation tuple and its native owners"
+)]
+fn cleanup_extent(
     mut report: QueueComputeReport,
     calls: &CleanupCalls,
     handle: u64,
@@ -546,6 +593,7 @@ fn cleanup(
     domain: i32,
     fd: i32,
     memory: *mut c_void,
+    allocation_bytes: usize,
     progress: &mut impl FnMut(&QueueComputeReport),
 ) -> QueueComputeReport {
     entered(&mut report, "compute-queue-stop-entered", progress);
@@ -571,7 +619,7 @@ fn cleanup(
     // imported queue were drained/stopped and the host queue closed. Keep the
     // remote module/session open through this release, as in the earlier FD
     // mapping control. The allocation remains retained through module close.
-    let result = unsafe { (calls.unmap)(domain, fd, memory, 16_384) };
+    let result = unsafe { (calls.unmap)(domain, fd, memory, allocation_bytes) };
     report.unmapping_result = Some(result);
     if result != 0 {
         report.stage = "compute-fd-unmap-refused-pinned";

@@ -16,7 +16,7 @@ use crate::{
         lora::RankOneAdapter,
         swift::{self, LoadReceipt, Representation},
     },
-    runtime::{Cancellation, Completion, Limits, Prefill, PromptReuse, Runtime},
+    runtime::{Cancellation, Completion, GenerationTimings, Limits, Prefill, PromptReuse, Runtime},
     sampling::SwiftSampler,
     swift_chat::SwiftChatSession,
     text_output::Utf8Output,
@@ -352,6 +352,40 @@ impl SwiftSession {
         prompt: &PreparedChat,
         cancellation: &Cancellation,
         deadline: Instant,
+        emit: impl FnMut(TextEvent<'_>) -> Result<()>,
+    ) -> Result<Completion> {
+        self.complete_observed(prompt, cancellation, deadline, None, emit)
+    }
+
+    /// Complete with optional fixed-size runtime attribution and unchanged sampling.
+    ///
+    /// The record is cleared before session admission. `entered` remains false
+    /// if generation is rejected before reaching the runtime. Runtime success
+    /// does not establish later terminal text delivery: callers must retain the
+    /// result of this session call separately. Runtime callback time includes
+    /// vocabulary/UTF-8 processing and the supplied provisional text consumer;
+    /// rendering, profile reset and final text/accounting delivery are excluded.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::complete`] with the same recovery semantics.
+    pub fn complete_with_timings(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: Instant,
+        timings: &mut GenerationTimings,
+        emit: impl FnMut(TextEvent<'_>) -> Result<()>,
+    ) -> Result<Completion> {
+        *timings = GenerationTimings::default();
+        self.complete_observed(prompt, cancellation, deadline, Some(timings), emit)
+    }
+
+    fn complete_observed(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: Instant,
+        timings: Option<&mut GenerationTimings>,
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
         if self.is_faulted() {
@@ -367,22 +401,36 @@ impl SwiftSession {
         let options = self.chat.generation(prompt.output_tokens)?;
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
-        let completion = self.runtime.generate_sampled_until(
-            &prompt.tokens,
-            &options,
-            Prefill { block_tokens: 64 },
-            cancellation,
-            deadline,
-            &mut self.sampler,
-            |token| {
-                let text = display.push(self.vocabulary.piece(token)?)?;
-                charge_output(&mut output_bytes, text.len())?;
-                if !text.is_empty() {
-                    emit(TextEvent::Delta(&text))?;
-                }
-                Ok(())
-            },
-        )?;
+        let consume = |token| {
+            let text = display.push(self.vocabulary.piece(token)?)?;
+            charge_output(&mut output_bytes, text.len())?;
+            if !text.is_empty() {
+                emit(TextEvent::Delta(&text))?;
+            }
+            Ok(())
+        };
+        let completion = if let Some(timings) = timings {
+            self.runtime.generate_sampled_until_with_timings(
+                &prompt.tokens,
+                &options,
+                Prefill { block_tokens: 64 },
+                cancellation,
+                deadline,
+                &mut self.sampler,
+                timings,
+                consume,
+            )?
+        } else {
+            self.runtime.generate_sampled_until(
+                &prompt.tokens,
+                &options,
+                Prefill { block_tokens: 64 },
+                cancellation,
+                deadline,
+                &mut self.sampler,
+                consume,
+            )?
+        };
         self.delivery_fault = true;
         let suffix = display.finish();
         charge_output(&mut output_bytes, suffix.len())?;

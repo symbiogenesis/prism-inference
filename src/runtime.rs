@@ -10,6 +10,16 @@ use std::sync::{
 };
 use std::time::Instant;
 
+mod timing;
+use timing::measure;
+pub use timing::{GenerationPhase, GenerationTimings, PhaseTiming};
+
+struct GenerationEffects<'a, S, E> {
+    sampler: &'a mut S,
+    emit: E,
+    timings: Option<&'a mut GenerationTimings>,
+}
+
 /// Cancellation shared with the request owner; checked between decoder steps.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
@@ -442,6 +452,44 @@ impl<D: Decoder> Runtime<D> {
         )
     }
 
+    /// Generate with opt-in, value-free runtime phase and token-work attribution.
+    ///
+    /// Uses exactly the transaction, sampling, cancellation and callback contract
+    /// of [`Self::generate_sampled_until`]. Replaces `timings` for this attempt,
+    /// including returned failures. Failed operation counts are lower bounds;
+    /// callback success remains provisional until the full call succeeds.
+    /// Ordinary generation entry points perform no attribution clock reads.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::generate_sampled_until`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Optional attribution extends the existing explicit sampled deadline API."
+    )]
+    pub fn generate_sampled_until_with_timings<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: Instant,
+        sampler: &mut S,
+        timings: &mut GenerationTimings,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Completion> {
+        self.generate_sampled_observed(
+            prompt,
+            options,
+            prefill,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            GenerationEffects {
+                sampler,
+                emit,
+                timings: Some(timings),
+            },
+        )
+    }
+
     fn generate_checked(
         &mut self,
         prompt: &[u32],
@@ -462,10 +510,58 @@ impl<D: Decoder> Runtime<D> {
         sampler: &mut S,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
-        let checkpoint = sampler.clone();
-        let result = self.generate_transaction(prompt, options, prefill, check, sampler, emit);
+        self.generate_sampled_observed(
+            prompt,
+            options,
+            prefill,
+            check,
+            GenerationEffects {
+                sampler,
+                emit,
+                timings: None,
+            },
+        )
+    }
+
+    fn generate_sampled_observed<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        check: &impl Fn() -> Result<()>,
+        mut effects: GenerationEffects<'_, S, impl FnMut(u32) -> Result<()>>,
+    ) -> Result<Completion> {
+        let started = effects.timings.as_deref_mut().map(|timings| {
+            *timings = GenerationTimings {
+                entered: true,
+                prompt_tokens: prompt.len(),
+                ..GenerationTimings::default()
+            };
+            Instant::now()
+        });
+        let checkpoint = measure(
+            &mut effects.timings,
+            GenerationPhase::SamplerSnapshot,
+            0,
+            || Ok(effects.sampler.clone()),
+        )?;
+        let result = self.generate_transaction(prompt, options, prefill, check, &mut effects);
         if result.is_err() {
-            *sampler = checkpoint;
+            measure(
+                &mut effects.timings,
+                GenerationPhase::SamplerRestore,
+                0,
+                || {
+                    *effects.sampler = checkpoint;
+                    Ok(())
+                },
+            )?;
+        }
+        if let (Some(timings), Some(started)) = (effects.timings, started) {
+            timings.total = started.elapsed();
+            timings.succeeded = result.is_ok();
+            timings.committed_generated_tokens =
+                result.as_ref().ok().map(|value| value.generated_tokens);
         }
         result
     }
@@ -476,8 +572,7 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
-        sampler: &mut impl Sampler,
-        mut emit: impl FnMut(u32) -> Result<()>,
+        effects: &mut GenerationEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
     ) -> Result<Completion> {
         if self.faulted {
             return Err(invalid(
@@ -487,18 +582,28 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         self.validate_request(prompt, options, prefill)?;
         check()?;
-        let rollback = self.capture(0, check)?;
+        let rollback = measure(
+            &mut effects.timings,
+            GenerationPhase::RollbackSnapshot,
+            0,
+            || self.capture(0, check),
+        )?;
         let result = (|| {
             check()?;
-            let completion =
-                self.generate_inner(prompt, options, prefill, check, sampler, &mut emit)?;
+            let completion = self.generate_inner(prompt, options, prefill, check, effects)?;
             check()?;
             // A failed optional capture still permits success, but deadline
             // expiry during capture must roll back the completed generation.
             let snapshot = if self.limits.checkpoints == 0 {
                 None
             } else {
-                let snapshot = self.capture(rollback.bytes, check).ok();
+                let snapshot = measure(
+                    &mut effects.timings,
+                    GenerationPhase::CompletionSnapshot,
+                    0,
+                    || self.capture(rollback.bytes, check),
+                )
+                .ok();
                 check()?;
                 snapshot
             };
@@ -520,12 +625,19 @@ impl<D: Decoder> Runtime<D> {
             }
             Err(error) => {
                 self.faulted = true;
-                let restored = self.decoder.restore(&rollback.state);
-                // The public history always describes the committed request,
-                // even if backend recovery fails and admission remains closed.
-                self.tokens = rollback.tokens;
-                self.logits = rollback.logits;
-                restored?;
+                measure(
+                    &mut effects.timings,
+                    GenerationPhase::RollbackRestore,
+                    0,
+                    || {
+                        let restored = self.decoder.restore(&rollback.state);
+                        // History describes the committed request even if backend
+                        // recovery fails and admission remains closed.
+                        self.tokens = rollback.tokens;
+                        self.logits = rollback.logits;
+                        restored
+                    },
+                )?;
                 self.faulted = false;
                 Err(error)
             }
@@ -680,11 +792,18 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
-        sampler: &mut impl Sampler,
-        emit: &mut impl FnMut(u32) -> Result<()>,
+        effects: &mut GenerationEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
     ) -> Result<Completion> {
         check()?;
-        let reused = self.prepare(prompt, check)?;
+        let reused = measure(
+            &mut effects.timings,
+            GenerationPhase::PrefixPreparation,
+            0,
+            || self.prepare(prompt, check),
+        )?;
+        if let Some(timings) = effects.timings.as_deref_mut() {
+            timings.reused_tokens = Some(reused);
+        }
         check()?;
         let remaining = prompt.len() - reused;
         let evaluations = options
@@ -696,9 +815,19 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         if let Some((&last, prefix)) = prompt[reused..].split_last() {
             for block in prefix.chunks(prefill.block_tokens) {
-                self.ingest_block(block, check)?;
+                measure(
+                    &mut effects.timings,
+                    GenerationPhase::PrefillIngestion,
+                    block.len(),
+                    || self.ingest_block(block, check),
+                )?;
             }
-            self.evaluate(last, check)?;
+            measure(
+                &mut effects.timings,
+                GenerationPhase::PrefillEvaluation,
+                1,
+                || self.evaluate(last, check),
+            )?;
         }
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
@@ -708,7 +837,9 @@ impl<D: Decoder> Runtime<D> {
         };
         for _ in 0..options.max_tokens {
             check()?;
-            let token = sampler.sample(&self.logits)?;
+            let token = measure(&mut effects.timings, GenerationPhase::Sampling, 1, || {
+                effects.sampler.sample(&self.logits)
+            })?;
             check()?;
             if usize::try_from(token).map_or(true, |value| value >= self.decoder.vocab_size()) {
                 return Err(invalid(
@@ -719,9 +850,16 @@ impl<D: Decoder> Runtime<D> {
                 completion.finish = Finish::Stop;
                 break;
             }
-            self.evaluate(token, check)?;
+            measure(
+                &mut effects.timings,
+                GenerationPhase::DecodeEvaluation,
+                1,
+                || self.evaluate(token, check),
+            )?;
             check()?;
-            emit(token)?;
+            measure(&mut effects.timings, GenerationPhase::Callback, 1, || {
+                (effects.emit)(token)
+            })?;
             check()?;
             completion.generated_tokens += 1;
         }

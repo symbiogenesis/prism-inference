@@ -82,6 +82,17 @@ for qualification that remains open.
   available. Qwen35 retains bounded graph/kernel scratch and stages per-layer
   state deltas. Outputs are shape/finiteness checked; errors clear direct output.
   Checkpoints own independent committed state/logits, never scratch aliases.
+- `Runtime::generate_sampled_until_with_timings` and
+  `SwiftSession::complete_with_timings` opt into fixed-size request attribution.
+  The ordinary entry points make no attribution clock reads. Separate brackets
+  cover sampler snapshots, rollback snapshots, prefix preparation, state-only
+  prefill, final prompt evaluation, decode evaluation, sampling, callbacks,
+  optional completed-prefix snapshots and error restoration. These measure
+  runtime operations including checks/allocation, not isolated kernels.
+  Failed blocks retain completed lower bounds and explicitly unknown partial
+  work. Successful callbacks remain provisional; stop draws are samples without
+  decode/callback work. Runtime completion and later session terminal delivery
+  are separate outcomes, and a missing receipt establishes no token count.
 - `Decoder::ingest` skips output-only normalization/projection for intermediate
   uncached prompt tokens while validating computed state. Its compatibility
   fallback computes/validates then discards logits. Final prompt tokens and

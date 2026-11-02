@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 //! Recurrent-state ownership regressions independent of a model artifact.
 
+#[path = "runtime/timing.rs"]
+mod timing;
+
 use bonsai_prism_runtime::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result,
     runtime::{Cancellation, Finish, Generation, Limits, Prefill, Runtime},

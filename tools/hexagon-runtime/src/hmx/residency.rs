@@ -1,6 +1,6 @@
 //! Bounded metadata for immutable, append-only native weight residency.
 
-use std::{mem::size_of, sync::Arc};
+use std::sync::Arc;
 
 use bonsai_prism_runtime::model::Tensor;
 use hexagon_native_rpc::HmxQ2WeightHandle;

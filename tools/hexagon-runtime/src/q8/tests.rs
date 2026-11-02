@@ -158,7 +158,7 @@ fn q8_hmx_matches_independent_pinned_native_dotprod_capture() -> Result<()> {
         executor.project_q8(&tensor, &activation, true, &mut output)?;
         assert_eq!(output[0].to_bits(), expected);
     }
-    assert_eq!(capture, []);
+    assert_eq!(capture, b"");
     Ok(())
 }
 

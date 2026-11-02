@@ -113,7 +113,7 @@ fn executable_hash(deadline: Instant) -> Result<String> {
     }
     let mut digest = Sha256::new();
     let mut bytes = 0_u64;
-    let mut buffer = [0_u8; 65_536];
+    let mut buffer = [0_u8; 8_192];
     loop {
         check(deadline)?;
         let count = file.read(&mut buffer)?;

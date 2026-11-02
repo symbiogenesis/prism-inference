@@ -14,8 +14,8 @@ worker, private HTTP server, GGUF tooling, ternary codecs and native storage
 overlay. SwiftBonsai consumes a prebuilt server inside its guarded Windows Job;
 ordinary SwiftBonsai builds do not compile this runtime.
 
-The [0.1.12 release scope](release-0.1.12.md) compares the GitHub/source release
-with the last full release, `0.1.6`. Binary delivery, crates.io publication and
+The [0.1.13 release scope](release-0.1.13.md) compares the prepared CPU release
+with `0.1.12`. Binary delivery, crates.io publication and
 application-default promotion have separate requirements. Original PQ2, one row
 worker and fresh per-request state remain the service defaults. PTQ1, approved
 rank-one adapters, parallel row workers and latest-prefix reuse require explicit
@@ -43,11 +43,12 @@ operators; other model identities and public scalar APIs preserve their existing
 source-order contracts. Decoder identity records the pinned arithmetic choice.
 The operator controls and complete model comparison qualify these bounded Swift
 CPU workloads. Other inputs, longer trajectories and full-context behavior
-still require their own evidence. Runner separately pins the reviewed `0.1.11`
-binary/source in its [release integration record](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/docs/evidence/prism-0111-release-integration.json).
+still require their own evidence. Runner's retained `0.1.11` binary/source
+[release integration record](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/docs/evidence/prism-0111-release-integration.json)
+describes that historical delivery separately.
 That record keeps actual-model qualification pending. These historical numerical
 results do not transfer automatically to a newer source or binary, and the
-`0.1.12` release does not change Runner's pin or defaults.
+`0.1.13` release does not itself change Runner's pin or defaults.
 
 The private server also cancels model work when an in-flight request future is
 dropped. Focused recovery checks cover rollback, reset-required admission and a

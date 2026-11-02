@@ -5,12 +5,13 @@
 ## Install from source
 
 GitHub bundles and crates.io packages are separate deliveries. This guide targets
-the `0.1.12` GitHub/source release. The latest registry runtime is `0.1.2`;
+the prepared `0.1.13` GitHub/source release. The latest registry runtime is `0.1.2`;
 publication of the newer source and its dependencies remains separate work.
-Install the tagged release source with the pinned nightly:
+After the [release gates](release-0.1.13.md#installation-and-provenance) pass and
+the tag is published, install its source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-10-22 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.12 prism-inference --locked
+cargo +nightly-2026-10-22 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.13 prism-inference --locked
 prism-inference --help
 ```
 
@@ -27,7 +28,7 @@ The package name is `prism-inference`; the existing Rust import path remains
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.12", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.12", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.13", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.13", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
@@ -273,10 +274,12 @@ checks the focused model-free controls and builds the standalone Windows ARM64
 tool with `parallel-rows`. Its artifact includes the executable and exact
 source/run/compiler/file-hash receipt; build and check logs are retained even
 on failure. It starts no owner-device job and executes no actual model.
-The attribution API and checker are unreleased source candidates after 0.1.12;
-this preparation does not update Runner's pinned 0.1.12 runtime or transfer its
+The attribution API is included in the prepared 0.1.13 library. The standalone
+checker remains a separately built source tool outside the five CPU bundle
+executables. Its preparation does not update Runner's runtime pin or transfer
 earlier application evidence. The package-version string alone never binds a
-source-built executable to released runtime bytes.
+source-built executable to released runtime bytes; use the exact preparation
+receipt even when both report the same version.
 
 Use its exact source-bound executable under the external owner:
 
@@ -476,7 +479,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.12`; the source installation and library
+The checkout prepares version `0.1.13`; the source installation and library
 examples above select its release tag. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
@@ -490,9 +493,9 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-The `0.1.12` GitHub/source release preserves all older full and prerelease
-artifacts. The [release scope](release-0.1.12.md) compares it with the last full
-release, `0.1.6`, and records its supported delivery and qualification boundaries.
+The prepared `0.1.13` GitHub/source release preserves all older full and prerelease
+artifacts. The [release scope](release-0.1.13.md) compares it with `0.1.12`
+and records its supported delivery, publication gates and qualification boundaries.
 Its Windows credential helper is pinned to Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
 the lockfile. The server temporarily sets `publish = false`, because a crates.io
 package cannot preserve that Git-only dependency and substituting registry

@@ -201,12 +201,7 @@ fn phase_records(timings: &GenerationTimings) -> Vec<Value> {
         .collect()
 }
 
-fn record(
-    selection: &Selection<'_>,
-    observation: &Observation,
-    succeeded: bool,
-    elapsed: Duration,
-) -> Value {
+fn identity_record(selection: &Selection<'_>, observation: &Observation) -> Value {
     json!({
         "schema_version":1, "kind":"swift-source-request-timing",
         "capture_status":if observation.stage == "started" { "in-progress" } else { "returned" },
@@ -222,23 +217,55 @@ fn record(
         "sampler":"production SwiftSampler and model-declared native stops", "prompt_reuse":"disabled",
         "maximum_prompt_tokens":MAX_PROMPT_TOKENS, "output_tokens_reserved":selection.output_tokens,
         "original_deadline_unix_milliseconds":selection.deadline_unix_milliseconds,
-        "elapsed_milliseconds":elapsed.as_secs_f64()*1000.0,
-        "stage":observation.stage, "model_loaded":observation.model_loaded, "request_prepared":observation.request_prepared,
-        "diagnostic_succeeded":(observation.stage != "started").then_some(succeeded),
-        "session_succeeded":observation.session_milliseconds.map(|_| observation.completion.is_some()),
-        "session_milliseconds":observation.session_milliseconds,
-        "load_milliseconds":observation.load_milliseconds, "preparation_milliseconds":observation.preparation_milliseconds,
-        "runtime_entered":observation.timings.entered, "runtime_succeeded":observation.timings.succeeded,
-        "runtime_milliseconds":observation.timings.total.as_secs_f64()*1000.0,
-        "prompt_tokens":observation.timings.entered.then_some(observation.timings.prompt_tokens),
-        "reused_tokens":observation.timings.reused_tokens,
-        "runtime_committed_generated_tokens":observation.timings.committed_generated_tokens,
-        "session_committed_generated_tokens":observation.completion.map(|value| value.generated_tokens),
-        "phases":phase_records(&observation.timings),
-        "counter_scope":"successful callback units remain provisional; failed block/callback progress is unknown beyond earlier completed lower bounds",
-        "timing_scope":"runtime operation brackets include checks and allocation; callback includes UTF-8 processing/no-op consumer; no network backpressure or isolated-kernel claim",
-        "cleanup_scope":"elapsed includes returned session drop but excludes final receipt write and external owner cleanup; original aggregate owner clock and cleanup reserve remain mandatory",
     })
+}
+
+fn record(
+    selection: &Selection<'_>,
+    observation: &Observation,
+    succeeded: bool,
+    elapsed: Duration,
+) -> Value {
+    // Keep each macro expansion bounded while preserving the flat receipt schema.
+    let mut record = identity_record(selection, observation);
+    record["elapsed_milliseconds"] = json!(elapsed.as_secs_f64() * 1000.0);
+    record["stage"] = json!(observation.stage);
+    record["model_loaded"] = json!(observation.model_loaded);
+    record["request_prepared"] = json!(observation.request_prepared);
+    record["diagnostic_succeeded"] = json!((observation.stage != "started").then_some(succeeded));
+    record["session_succeeded"] = json!(
+        observation
+            .session_milliseconds
+            .map(|_| observation.completion.is_some())
+    );
+    record["session_milliseconds"] = json!(observation.session_milliseconds);
+    record["load_milliseconds"] = json!(observation.load_milliseconds);
+    record["preparation_milliseconds"] = json!(observation.preparation_milliseconds);
+    record["runtime_entered"] = json!(observation.timings.entered);
+    record["runtime_succeeded"] = json!(observation.timings.succeeded);
+    record["runtime_milliseconds"] = json!(observation.timings.total.as_secs_f64() * 1000.0);
+    record["prompt_tokens"] = json!(
+        observation
+            .timings
+            .entered
+            .then_some(observation.timings.prompt_tokens)
+    );
+    record["reused_tokens"] = json!(observation.timings.reused_tokens);
+    record["runtime_committed_generated_tokens"] =
+        json!(observation.timings.committed_generated_tokens);
+    record["session_committed_generated_tokens"] =
+        json!(observation.completion.map(|value| value.generated_tokens));
+    record["phases"] = json!(phase_records(&observation.timings));
+    record["counter_scope"] = json!(
+        "successful callback units remain provisional; failed block/callback progress is unknown beyond earlier completed lower bounds"
+    );
+    record["timing_scope"] = json!(
+        "runtime operation brackets include checks and allocation; callback includes UTF-8 processing/no-op consumer; no network backpressure or isolated-kernel claim"
+    );
+    record["cleanup_scope"] = json!(
+        "elapsed includes returned session drop but excludes final receipt write and external owner cleanup; original aggregate owner clock and cleanup reserve remain mandatory"
+    );
+    record
 }
 
 #[allow(

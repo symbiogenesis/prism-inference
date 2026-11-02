@@ -153,7 +153,7 @@ fn failed_callback_retains_provisional_work_and_rolls_back_state_and_rng() -> Re
                 .is_err()
         );
         assert_eq!(sampler, before);
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens(), []);
         assert_eq!(runtime.is_faulted(), restore_fails);
         assert!(!timings.succeeded);
         assert_eq!(timings.committed_generated_tokens, None);
@@ -217,7 +217,7 @@ fn timed_cancel_after_successful_callback_never_reports_committed_output() -> Re
     assert_eq!(timings.committed_generated_tokens, None);
     assert!(!timings.succeeded);
     assert_eq!(sampler, before);
-    assert!(runtime.tokens().is_empty());
+    assert_eq!(runtime.tokens(), []);
     // Reusing the receipt for a rejected attempt must not retain old work.
     assert!(
         runtime
@@ -278,6 +278,6 @@ fn failed_prefill_block_keeps_unknown_partial_work_distinct_from_zero() -> Resul
     assert_eq!(prefill.completed_tokens_lower_bound, 2);
     assert!(prefill.partial_progress_unknown);
     assert_eq!(timings.phase(GenerationPhase::Sampling).attempted_calls, 0);
-    assert!(runtime.tokens().is_empty());
+    assert_eq!(runtime.tokens(), []);
     Ok(())
 }

@@ -12,6 +12,31 @@ Original PQ2 scale bits and per-128-block fused/nonfused reduction order remain 
 CPU. The HMX rows are the eight bits of one token's codes, with signed high-bit
 coefficient -128; they are not eight prefill tokens.
 
+Original-PQ2 `HmxQ2Executor` additionally supports explicit immutable weight
+residency. The caller first reserves a bounded native arena with
+`HmxQ2ProjectionLimits::with_resident_weights`, then enables the executor's
+`with_resident_weights(maximum_cache_metadata_bytes)`. The host metadata
+reservation is charged inside `maximum_owned_payload_bytes` for every supported
+projection, so eligibility and request operation counts stay stable as the cache
+fills. Equal numbers of projection records and tile handles are allocated up
+front; each tensor consumes one record and one handle per block/row-tile operation.
+Original immutable source bytes are retained through strong `Arc` ownership,
+without another model copy. Original model retention, allocator overhead and the
+separately bounded native mapping remain additional resource charges.
+
+An entire projection's padded packed bytes and metadata must fit before its first
+preparation. All its tiles are then prepared before any kernel submission. A
+capacity miss uses the ordinary streaming HMX path for the entire projection;
+unexpected preparation refusal or error closes the executor with no partial
+fallback. Cache identity checks shared immutable source ownership plus tensor
+kind/dimensions, avoiding raw pointer keys, address reuse and per-token hashing.
+Repeated projections reuse the native handles and skip weight packing/copying.
+There is no eviction and no renewal of operation/deadline limits. The native
+arena still participates in the existing mapping/descriptor/cache protocol: this
+does not establish reduced DSP DMA traffic, signed-device parity or speed.
+`residency_statistics` reports complete preparations, cache hits, copied packed
+bytes and reserved host metadata payload independently of kernel work counts.
+
 `HmxQ8Executor` opts into PTQ1 and odd-block PQ2 using the graph's original
 prepared Q8_0 codes and per-32 scales. Four sparse output rows preserve the four
 integer DOTPROD lanes of one original row, with four K128/N8 submissions per

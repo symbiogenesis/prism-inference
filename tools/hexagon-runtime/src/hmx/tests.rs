@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bonsai_prism_runtime::kernels::{MatvecBackend, MatvecScratch, matvec_into};
-use hexagon_native_rpc::Error;
+use hexagon_native_rpc::{Error, HmxQ2WeightHandle, HmxQ2WeightRegistry};
 
 use super::*;
 
@@ -152,6 +152,11 @@ fn hmx_executor_retains_independent_original_fma_golden() -> Result<()> {
         let mut output = Vec::new();
         executor.project(&tensor, &activation, fused, &mut output)?;
         assert_eq!(output[0].to_bits(), expected);
+        let mut resident_submitter = ResidentSubmitter::new(4096)?;
+        let mut resident_executor = HmxQ2Executor::new(&mut resident_submitter, limits, 1 << 20)
+            .with_resident_weights(16_384)?;
+        resident_executor.project(&tensor, &activation, fused, &mut output)?;
+        assert_eq!(output[0].to_bits(), expected);
     }
     Ok(())
 }
@@ -184,6 +189,274 @@ fn hmx_executor_refusal_and_unwritten_output_close_without_replay() -> Result<()
         );
         assert_eq!(executor.statistics().operations_attempted, 1);
         assert_eq!(executor.statistics().operations_completed, 0);
+    }
+    Ok(())
+}
+
+struct ResidentSubmitter {
+    oracle: CpuSubmitter,
+    registry: HmxQ2WeightRegistry,
+    arena: Vec<u8>,
+    preparations: usize,
+    resident_calls: usize,
+    streaming_calls: usize,
+    refuse_preparation: Option<usize>,
+}
+
+impl ResidentSubmitter {
+    fn new(bytes: usize) -> Result<Self> {
+        Ok(Self {
+            oracle: CpuSubmitter::default(),
+            registry: HmxQ2WeightRegistry::new(bytes)?,
+            arena: vec![0; bytes],
+            preparations: 0,
+            resident_calls: 0,
+            streaming_calls: 0,
+            refuse_preparation: None,
+        })
+    }
+}
+
+impl HmxQ2Submitter for ResidentSubmitter {
+    fn residency_capacity_bytes(&self) -> usize {
+        self.registry.remaining_bytes()
+    }
+
+    fn prepare_weights(
+        &mut self,
+        weights: &[u8],
+    ) -> std::result::Result<Option<HmxQ2WeightHandle>, Error> {
+        self.preparations += 1;
+        if self.refuse_preparation == Some(self.preparations) {
+            return Ok(None);
+        }
+        let handle = self.registry.prepare(weights)?;
+        if let Some(handle) = &handle {
+            self.arena[self.registry.range(handle)?].copy_from_slice(weights);
+        }
+        Ok(handle)
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &HmxQ2WeightHandle,
+        activation: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        self.resident_calls += 1;
+        self.oracle.submit(
+            &self.arena[self.registry.range(handle)?],
+            activation,
+            output,
+        )
+    }
+
+    fn submit(
+        &mut self,
+        weights: &[u8],
+        activation: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        self.streaming_calls += 1;
+        self.oracle.submit(weights, activation, output)
+    }
+}
+
+#[test]
+fn hmx_resident_reuse_preserves_complete_original_outputs_and_operation_counts() -> Result<()> {
+    for (columns, rows) in [(256, 1), (768, 35), (512, 64)] {
+        let tensor = fixture(columns, rows);
+        for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+            for tile_rows in [32, 64] {
+                let operations = columns / 128 * rows.div_ceil(tile_rows);
+                let packed_bytes = columns / 128 * rows.next_multiple_of(32) * 36;
+                let limits = HmxQ2ProjectionLimits::new(tile_rows, 100, Duration::from_secs(10))?;
+                let mut submitter = ResidentSubmitter::new(packed_bytes)?;
+                let mut executor = HmxQ2Executor::new(&mut submitter, limits, 1 << 20)
+                    .with_resident_weights(16_384)?;
+                let eligibility = executor.supports(&tensor);
+                for seed in [0, 3] {
+                    let input: Vec<_> = (0..columns)
+                        .map(|lane| [127.0, -128.0, 0.1, -0.0, 53.25][(lane + seed) % 5])
+                        .collect();
+                    let mut expected = Vec::new();
+                    matvec_into(
+                        &tensor,
+                        &input,
+                        &mut expected,
+                        &mut MatvecScratch::with_backend(backend),
+                    )?;
+                    let mut actual = Vec::new();
+                    MatvecScratch::with_backend(backend)
+                        .prepare(&tensor, &input)?
+                        .matvec_with_executor(&tensor.clone(), &mut actual, &mut executor)?;
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(executor.supports(&tensor), eligibility);
+                }
+                assert_eq!(executor.residency_statistics().tensors_prepared, 1);
+                assert_eq!(executor.residency_statistics().cache_hits, 1);
+                assert_eq!(
+                    executor
+                        .residency_statistics()
+                        .weight_payload_bytes_prepared,
+                    u64::try_from(packed_bytes)?
+                );
+                assert!(executor.residency_statistics().metadata_payload_bytes <= 16_384);
+                assert_eq!(
+                    executor.statistics().operations_completed,
+                    u64::try_from(operations * 2)?
+                );
+                drop(executor);
+                assert_eq!(submitter.preparations, operations);
+                assert_eq!(submitter.resident_calls, operations * 2);
+                assert_eq!(submitter.streaming_calls, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hmx_resident_source_identity_retains_arc_and_checks_geometry() -> Result<()> {
+    let tensor = fixture(256, 2);
+    let limits = HmxQ2ProjectionLimits::new(32, 100, Duration::from_secs(10))?;
+    let mut submitter = ResidentSubmitter::new(32_768)?;
+    let mut executor =
+        HmxQ2Executor::new(&mut submitter, limits, 1 << 20).with_resident_weights(16_384)?;
+    let mut changed_data = tensor.clone();
+    let mut changed_geometry = tensor.clone();
+    changed_geometry.dimensions = vec![512, 1];
+    let compare = |current: &Tensor, executor: &mut HmxQ2Executor<'_>| -> Result<()> {
+        let input = vec![1.0; current.dimensions[0]];
+        let mut expected = Vec::new();
+        matvec_into(
+            current,
+            &input,
+            &mut expected,
+            &mut MatvecScratch::default(),
+        )?;
+        let mut actual = Vec::new();
+        MatvecScratch::default()
+            .prepare(current, &input)?
+            .matvec_with_executor(current, &mut actual, executor)?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    };
+    compare(&tensor, &mut executor)?;
+    // Cache retention forces copy-on-write; the original allocation cannot be
+    // mutated or reused behind a resident handle.
+    Arc::make_mut(&mut changed_data.data)[2] ^= 0xff;
+    compare(&changed_data, &mut executor)?;
+    compare(&changed_geometry, &mut executor)?;
+    assert_eq!(executor.residency_statistics().tensors_prepared, 3);
+    assert_eq!(executor.residency_statistics().cache_hits, 0);
+    Ok(())
+}
+
+#[test]
+fn hmx_resident_capacity_refusal_streams_whole_projection_before_preparation() -> Result<()> {
+    // Refuse either insufficient native bytes or insufficient host handle slots
+    // before any preparation, even when at least one operation would fit.
+    for (native_bytes, metadata_bytes) in [(1152, 16_384), (16_384, 128)] {
+        let tensor = fixture(256, 35);
+        let limits = HmxQ2ProjectionLimits::new(32, 100, Duration::from_secs(10))?;
+        let mut submitter = ResidentSubmitter::new(native_bytes)?;
+        let mut executor = HmxQ2Executor::new(&mut submitter, limits, 1 << 20)
+            .with_resident_weights(metadata_bytes)?;
+        let mut actual = Vec::new();
+        MatvecScratch::default()
+            .prepare(&tensor, &[1.0; 256])?
+            .matvec_with_executor(&tensor, &mut actual, &mut executor)?;
+        assert_eq!(executor.residency_statistics().tensors_prepared, 0);
+        assert!(!executor.is_faulted());
+        drop(executor);
+        assert_eq!(submitter.preparations, 0);
+        assert_eq!(submitter.resident_calls, 0);
+        assert_eq!(submitter.streaming_calls, 4);
+    }
+    Ok(())
+}
+
+#[test]
+fn hmx_resident_incomplete_preparation_faults_before_any_kernel_or_replay() -> Result<()> {
+    let tensor = fixture(256, 35);
+    let limits = HmxQ2ProjectionLimits::new(32, 100, Duration::from_secs(10))?;
+    let mut submitter = ResidentSubmitter::new(16_384)?;
+    submitter.refuse_preparation = Some(2);
+    let mut executor =
+        HmxQ2Executor::new(&mut submitter, limits, 1 << 20).with_resident_weights(16_384)?;
+    let mut output = vec![42.0];
+    let mut scratch = MatvecScratch::default();
+    let mut prepared = scratch.prepare(&tensor, &[1.0; 256])?;
+    assert!(
+        prepared
+            .matvec_with_executor(&tensor, &mut output, &mut executor)
+            .is_err()
+    );
+    assert!(output.is_empty());
+    assert!(executor.is_faulted());
+    assert_eq!(executor.statistics().operations_attempted, 0);
+    assert_eq!(executor.residency_statistics().tensors_prepared, 0);
+    assert!(
+        prepared
+            .matvec_with_executor(&tensor, &mut output, &mut executor)
+            .is_err()
+    );
+    drop(executor);
+    assert_eq!(submitter.preparations, 2);
+    assert_eq!(submitter.resident_calls, 0);
+    assert_eq!(submitter.streaming_calls, 0);
+    Ok(())
+}
+
+#[test]
+fn hmx_resident_unwritten_output_and_native_refusal_close_without_replay() -> Result<()> {
+    for partial in [false, true] {
+        let tensor = fixture(256, 1);
+        let limits = HmxQ2ProjectionLimits::new(32, 10, Duration::from_secs(10))?;
+        let mut submitter = ResidentSubmitter::new(4096)?;
+        submitter.oracle.fail = !partial;
+        submitter.oracle.partial = partial;
+        let mut executor =
+            HmxQ2Executor::new(&mut submitter, limits, 1 << 20).with_resident_weights(16_384)?;
+        let mut output = vec![42.0];
+        let mut scratch = MatvecScratch::default();
+        let mut prepared = scratch.prepare(&tensor, &[1.0; 256])?;
+        assert!(
+            prepared
+                .matvec_with_executor(&tensor, &mut output, &mut executor)
+                .is_err()
+        );
+        assert!(output.is_empty());
+        assert!(executor.is_faulted());
+        assert_eq!(executor.statistics().operations_attempted, 1);
+        assert_eq!(executor.statistics().operations_completed, 0);
+        assert!(
+            prepared
+                .matvec_with_executor(&tensor, &mut output, &mut executor)
+                .is_err()
+        );
+        drop(executor);
+        assert_eq!(submitter.resident_calls, 1);
+        assert_eq!(submitter.streaming_calls, 0);
     }
     Ok(())
 }

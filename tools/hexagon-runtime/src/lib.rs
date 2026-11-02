@@ -9,7 +9,7 @@
 mod guarded;
 pub use guarded::{GuardedQ2Executor, ProjectionStatistics};
 mod hmx;
-pub use hmx::HmxQ2Executor;
+pub use hmx::{HmxQ2Executor, HmxResidencyStatistics};
 mod q8;
 pub use q8::HmxQ8Executor;
 

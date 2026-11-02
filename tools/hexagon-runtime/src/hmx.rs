@@ -7,6 +7,9 @@ use hexagon_native_rpc::{HmxQ2ProjectionLimits, HmxQ2Submitter};
 use crate::guarded::{dimensions, finite, scale, zeroed};
 use crate::{ProjectionStatistics, Result, invalid};
 
+mod residency;
+pub use residency::HmxResidencyStatistics;
+
 /// Experimental original-PQ2 executor using the signed Q2 HMX operation.
 ///
 /// K=128/N=8 preserves one original block and represents its original `Q8_K` codes
@@ -21,6 +24,7 @@ pub struct HmxQ2Executor<'a> {
     maximum_owned_payload_bytes: usize,
     failed: bool,
     statistics: ProjectionStatistics,
+    residency: Option<residency::Cache>,
 }
 
 impl<'a> HmxQ2Executor<'a> {
@@ -47,7 +51,47 @@ impl<'a> HmxQ2Executor<'a> {
                 operations_attempted: 0,
                 operations_completed: 0,
             },
+            residency: None,
         }
+    }
+
+    /// Enable immutable packed-weight reuse in the caller's admitted native arena.
+    ///
+    /// The native session must separately reserve its arena through
+    /// `HmxQ2ProjectionLimits::with_resident_weights`. This host metadata
+    /// reservation is included in `maximum_owned_payload_bytes` for every
+    /// projection, keeping eligibility stable as the cache fills. Equal bounded
+    /// numbers of projection records and handles are reserved up front; the
+    /// caller must leave sufficient room for both. Source bytes are retained by
+    /// a strong immutable `Arc`, without copying the original model.
+    ///
+    /// Entire tensors that do not fit either remaining reservation use the
+    /// ordinary streaming HMX path, decided before preparation or submission.
+    /// There is no eviction and no CPU replay. Preparation after successful
+    /// capacity admission must complete in full or fault the executor.
+    ///
+    /// # Errors
+    /// Rejects repeated/late configuration, absent native capacity, invalid host
+    /// bounds or metadata allocation failure before any native operation.
+    pub fn with_resident_weights(mut self, maximum_cache_metadata_bytes: usize) -> Result<Self> {
+        if self.residency.is_some()
+            || self.statistics.operations_attempted != 0
+            || self.failed
+            || self.submitter.residency_capacity_bytes() == 0
+            || maximum_cache_metadata_bytes > self.maximum_owned_payload_bytes
+        {
+            return Err(invalid("invalid HMX resident-weight configuration"));
+        }
+        self.residency = Some(residency::Cache::new(maximum_cache_metadata_bytes)?);
+        Ok(self)
+    }
+
+    /// Native-arena preparation and host metadata observations; no speed claim.
+    #[must_use]
+    pub fn residency_statistics(&self) -> HmxResidencyStatistics {
+        self.residency
+            .as_ref()
+            .map_or_else(HmxResidencyStatistics::default, |cache| cache.statistics)
     }
 
     /// Actual synchronous projection/submission counts; no performance claim.
@@ -67,6 +111,61 @@ impl<'a> HmxQ2Executor<'a> {
         rows.checked_mul(4)?
             .checked_add(padded_rows.checked_mul(68)?)?
             .checked_add(4096)
+            .and_then(|bytes| {
+                bytes.checked_add(self.residency.as_ref().map_or(0, |cache| cache.reservation))
+            })
+    }
+
+    fn prepare_resident(&mut self, tensor: &Tensor, weights: &mut [u8]) -> Result<Option<usize>> {
+        let Some(cache) = &mut self.residency else {
+            return Ok(None);
+        };
+        let (columns, rows) = dimensions(tensor)?;
+        let blocks = columns / 128;
+        let tiles = rows.div_ceil(self.maximum_rows);
+        let operations = blocks
+            .checked_mul(tiles)
+            .ok_or_else(|| invalid("HMX resident operation count overflow"))?;
+        let packed_bytes = rows
+            .next_multiple_of(32)
+            .checked_mul(36)
+            .and_then(|bytes| bytes.checked_mul(blocks))
+            .ok_or_else(|| invalid("HMX resident packed extent overflow"))?;
+        if !cache.has_metadata_capacity(operations)
+            || packed_bytes > self.submitter.residency_capacity_bytes()
+        {
+            return Ok(None);
+        }
+        let first_handle = cache.handles.len();
+        for row_start in (0..rows).step_by(self.maximum_rows) {
+            let active = (rows - row_start).min(self.maximum_rows);
+            let mapped = active.next_multiple_of(32);
+            let weights = &mut weights[..mapped * 36];
+            for block in 0..blocks {
+                initialize_weights(weights);
+                for row in 0..active {
+                    let offset = ((row_start + row) * blocks + block) * 34;
+                    pack_weights(&tensor.data[offset..offset + 34], row, weights);
+                }
+                // A refusal after complete-capacity admission is terminal. Any
+                // prepared prefix remains owned by the same native session.
+                let handle = self
+                    .submitter
+                    .prepare_weights(weights)?
+                    .ok_or_else(|| invalid("HMX resident preparation contradicted capacity"))?;
+                if handle.rows() != mapped || handle.packed_bytes() != weights.len() {
+                    return Err(invalid(
+                        "HMX resident preparation returned invalid geometry",
+                    ));
+                }
+                cache.handles.push(handle);
+                cache.statistics.weight_payload_bytes_prepared = cache
+                    .statistics
+                    .weight_payload_bytes_prepared
+                    .saturating_add(u64::try_from(weights.len())?);
+            }
+        }
+        Ok(Some(cache.commit(tensor, first_handle)))
     }
 
     #[allow(
@@ -91,35 +190,61 @@ impl<'a> HmxQ2Executor<'a> {
         if !self.supports(tensor) || activation.len() != columns / 256 {
             return Err(invalid("unsupported HMX Hexagon projection contract"));
         }
-        for block in tensor.data.as_chunks::<34>().0 {
-            scale(block)?;
+        let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
+        if cached.is_none() {
+            for block in tensor.data.as_chunks::<34>().0 {
+                scale(block)?;
+            }
         }
         for block in activation {
             finite(block.scale)?;
         }
         let mut pending = zeroed(rows, 0.0_f32)?;
         let padded_rows = rows.min(self.maximum_rows).next_multiple_of(32);
-        let mut weights = zeroed(padded_rows * 36, 0_u8)?;
+        let mut weights = if cached.is_none() {
+            zeroed(padded_rows * 36, 0_u8)?
+        } else {
+            Vec::new()
+        };
         let mut dots = zeroed(padded_rows * 8, 0.0_f32)?;
+        let resident = if let Some(index) = cached {
+            if let Some(cache) = &mut self.residency {
+                cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
+            }
+            Some(index)
+        } else {
+            self.prepare_resident(tensor, &mut weights)?
+        };
         let blocks = columns / 128;
+        let mut operation = 0;
         for row_start in (0..rows).step_by(self.maximum_rows) {
             let active_rows = (rows - row_start).min(self.maximum_rows);
             let mapped_rows = active_rows.next_multiple_of(32);
-            let weights = &mut weights[..mapped_rows * 36];
             let dots = &mut dots[..mapped_rows * 8];
             for block_index in 0..blocks {
                 let quantized = &activation[block_index / 2];
                 let start = block_index % 2 * 128;
                 let planes = activation_planes(&quantized.values[start..start + 128]);
-                initialize_weights(weights);
-                for row in 0..active_rows {
-                    let index = ((row_start + row) * blocks + block_index) * 34;
-                    pack_weights(&tensor.data[index..index + 34], row, weights);
-                }
                 dots.fill(f32::NAN);
                 self.statistics.operations_attempted =
                     self.statistics.operations_attempted.saturating_add(1);
-                self.submitter.submit(weights, &planes, dots)?;
+                if let Some(index) = resident {
+                    let cache = self
+                        .residency
+                        .as_ref()
+                        .ok_or_else(|| invalid("HMX resident cache is unavailable"))?;
+                    let handle = &cache.handles[cache.projections[index].first_handle + operation];
+                    self.submitter.submit_resident(handle, &planes, dots)?;
+                } else {
+                    let weights = &mut weights[..mapped_rows * 36];
+                    initialize_weights(weights);
+                    for row in 0..active_rows {
+                        let index = ((row_start + row) * blocks + block_index) * 34;
+                        pack_weights(&tensor.data[index..index + 34], row, weights);
+                    }
+                    self.submitter.submit(weights, &planes, dots)?;
+                }
+                operation += 1;
                 for &value in dots.iter() {
                     if !value.is_finite()
                         || value.fract() != 0.0
@@ -164,7 +289,11 @@ impl<'a> HmxQ2Executor<'a> {
 
 impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
     fn identity(&self) -> &'static str {
-        "hexagon-hmx-binary-pq2-q8k-v1-experimental"
+        if self.residency.is_some() {
+            "hexagon-hmx-binary-pq2-q8k-resident-v1-experimental"
+        } else {
+            "hexagon-hmx-binary-pq2-q8k-v1-experimental"
+        }
     }
     fn operation_capacity(&self) -> Option<u64> {
         let local =

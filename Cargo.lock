@@ -89,9 +89,11 @@ version = "0.1.0"
 name = "bonsai-hexagon-runtime"
 version = "0.1.0"
 dependencies = [
+ "bonsai-gguf",
  "bonsai-hexagon-native",
  "bonsai-ternary",
  "prism-inference",
+ "sha2",
 ]
 
 [[package]]

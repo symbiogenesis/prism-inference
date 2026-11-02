@@ -109,6 +109,18 @@ unsupported CPU paths and terminal failure after provisional attention state.
 Hosted Hexagon and Foundation CI own these tests and Clippy/documentation checks.
 
 This source integration enables no Runner profile or automatic backend selection.
+`PlacedProjectionExecutor` freezes an explicit model-tensor subset before graph
+construction. For example, select `blk.0.ffn_up.weight` while leaving the other
+projections on CPU. Unknown model names, duplicates and unsupported arithmetic
+reject at construction, and immutable storage/geometry checks prevent another
+tensor from borrowing the selection. Its deterministic identity binds model,
+executor, selected names and operation counts. The existing graph counts this
+placement for complete-request admission before new inference; reset never
+restores native capacity. Selection does not establish that an otherwise unused
+model tensor is an executed graph projection: qualification must observe the
+expected nonzero submissions and exact placement. Hosted controls exercise real
+graph admission, unchanged logits/state and refusal before state mutation.
+
 Signed HMX execution and actual shapes, PQ2/PTQ1 full logits/state and adapter
 qualification, actual resource admission, cancellation/device loss,
 sustained use and paired end-to-end benefit remain pending. Native invocation,

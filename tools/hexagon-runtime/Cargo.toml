@@ -14,6 +14,10 @@ categories = ["hardware-support"]
 prism-inference = { path = "../..", default-features = false }
 bonsai-hexagon-native = { path = "../hexagon-native" }
 bonsai-ternary = { path = "../ternary" }
+sha2 = { version = "=0.11.1", default-features = false }
+
+[dev-dependencies]
+bonsai-gguf = { path = "../gguf", default-features = false }
 
 [lints]
 workspace = true

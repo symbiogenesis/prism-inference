@@ -12,6 +12,8 @@ mod hmx;
 pub use hmx::{HmxQ2Executor, HmxResidencyStatistics};
 mod q8;
 pub use q8::HmxQ8Executor;
+mod placement;
+pub use placement::PlacedProjectionExecutor;
 
 type Result<T> = bonsai_prism_runtime::Result<T>;
 

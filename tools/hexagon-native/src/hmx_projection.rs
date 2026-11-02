@@ -50,7 +50,7 @@ impl HmxQ2ProjectionLimits {
     ///
     /// # Errors
     /// Rejects more than 64 MiB before opening a module or allocating memory.
-    pub fn with_resident_weights(mut self, bytes: usize) -> Result<Self, Error> {
+    pub const fn with_resident_weights(mut self, bytes: usize) -> Result<Self, Error> {
         if bytes > HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES {
             return Err(Error::Contract);
         }

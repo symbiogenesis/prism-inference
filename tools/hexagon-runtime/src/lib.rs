@@ -10,6 +10,8 @@ mod guarded;
 pub use guarded::{GuardedQ2Executor, ProjectionStatistics};
 mod hmx;
 pub use hmx::HmxQ2Executor;
+mod q8;
+pub use q8::HmxQ8Executor;
 
 type Result<T> = bonsai_prism_runtime::Result<T>;
 

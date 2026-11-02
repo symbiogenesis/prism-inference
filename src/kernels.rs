@@ -438,10 +438,17 @@ fn q8k_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8KBloc
     )
 }
 
-struct Q8Block {
-    scale: f32,
-    sum: f32,
-    values: [i8; 32],
+/// One already prepared 32-element activation block.
+///
+/// The scale retains its exact original preparation rounding. External projection
+/// executors consume these codes directly rather than quantizing a second time.
+pub struct Q8Block {
+    /// Original finite activation scale, including its zero sign.
+    pub scale: f32,
+    /// Original scaled code sum; unused by PQ2 and PTQ1 integer projections.
+    pub sum: f32,
+    /// Original signed quantization codes in source lane order.
+    pub values: [i8; 32],
 }
 
 fn q8_into(input: &[f32], output: &mut Vec<Q8Block>) -> Result<()> {

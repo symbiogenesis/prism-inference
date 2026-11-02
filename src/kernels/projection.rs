@@ -2,7 +2,7 @@
 
 use bonsai_ternary::Q8KBlock;
 
-use super::{PQ2, PreparedMatvec, dimensions, finite};
+use super::{PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, finite};
 use crate::{Result, invalid, model::Tensor};
 
 /// Scoped executor for original PQ2 rows and already prepared `Q8_K` activations.
@@ -16,6 +16,24 @@ use crate::{Result, invalid, model::Tensor};
 pub trait Pq2ProjectionExecutor {
     /// Stable arithmetic/placement identity, excluding unverified device claims.
     fn identity(&self) -> &str;
+
+    /// Remaining submissions admitted by this caller-bound executor session.
+    ///
+    /// `None` denotes an opaque capacity. A bounded executor must report counts
+    /// for every selected projection, allowing complete-work admission before
+    /// the first submission. The caller must bind the native session's actual
+    /// remaining capacity, including work performed before borrowing it.
+    fn operation_capacity(&self) -> Option<u64> {
+        None
+    }
+
+    /// Stable submission count for one selected projection, or unknown.
+    ///
+    /// When capacity is bounded, an unknown count must reject admission. Counts
+    /// include every row tile, original block and arithmetic lane composition.
+    fn operation_count(&self, _tensor: &Tensor) -> Option<u64> {
+        None
+    }
 
     /// Decide eligibility from validated geometry before any device submission.
     ///
@@ -35,12 +53,41 @@ pub trait Pq2ProjectionExecutor {
         fused: bool,
         output: &mut Vec<f32>,
     ) -> Result<()>;
+
+    /// Opt in to PTQ1 or odd-block PQ2 with original prepared `Q8_0` codes.
+    ///
+    /// Existing executors leave these paths on CPU. Eligibility must precede
+    /// submission and must not depend on a failed device attempt.
+    fn supports_q8(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    /// Execute a complete `Q8_0` projection without changing its float order.
+    ///
+    /// When `pinned` and PTQ1, retain four independent DOTPROD lanes across the
+    /// complete row: each per-32 group's lane sums positions `4*i..4*i+4` and
+    /// `4*i+16..4*i+20`, FMA into that lane, then reduce adjacent pairs once.
+    /// Otherwise retain per-32 scale multiplication, per-128 group summation and
+    /// outer weight-scale multiplication in their original nonfused order.
+    ///
+    /// # Errors
+    /// Rejects unsupported arithmetic, submission failures and invalid output.
+    fn project_q8(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[Q8Block],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(invalid("projection executor does not support Q8_0"))
+    }
 }
 
 impl PreparedMatvec<'_> {
     /// Execute an eligible original-PQ2 projection through a scoped executor.
     ///
-    /// Other types and the odd-block `Q8_0` path retain configured CPU execution.
+    /// PTQ1 and odd-block PQ2 use `Q8_0` only with an explicit executor opt-in.
+    /// Other types retain configured CPU execution.
     /// Eligibility is decided before submission. Executor errors never trigger
     /// replay. Complete finite output is required before publication; CPU backend
     /// statistics do not count work performed by an external executor.
@@ -61,15 +108,25 @@ impl PreparedMatvec<'_> {
                     "incompatible prepared projection executor activation",
                 ));
             }
-            if tensor.kind != PQ2 || !columns.is_multiple_of(256) || !executor.supports(tensor) {
+            if tensor.kind == PQ2 && columns.is_multiple_of(256) && executor.supports(tensor) {
+                executor.project(
+                    tensor,
+                    &self.scratch.q8k,
+                    self.scratch.pinned_accumulation,
+                    output,
+                )?;
+            } else if (tensor.kind == PTQ1 || tensor.kind == PQ2 && !columns.is_multiple_of(256))
+                && executor.supports_q8(tensor)
+            {
+                executor.project_q8(
+                    tensor,
+                    &self.scratch.q8,
+                    self.scratch.pinned_accumulation,
+                    output,
+                )?;
+            } else {
                 return self.matvec_into(tensor, output);
             }
-            executor.project(
-                tensor,
-                &self.scratch.q8k,
-                self.scratch.pinned_accumulation,
-                output,
-            )?;
             if output.len() != rows {
                 return Err(invalid("projection executor returned incomplete output"));
             }

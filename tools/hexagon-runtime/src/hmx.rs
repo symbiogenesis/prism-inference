@@ -17,6 +17,7 @@ use crate::{ProjectionStatistics, Result, invalid};
 pub struct HmxQ2Executor<'a> {
     submitter: &'a mut dyn HmxQ2Submitter,
     maximum_rows: usize,
+    maximum_operations: u32,
     maximum_owned_payload_bytes: usize,
     failed: bool,
     statistics: ProjectionStatistics,
@@ -38,6 +39,7 @@ impl<'a> HmxQ2Executor<'a> {
         Self {
             submitter,
             maximum_rows: limits.maximum_rows(),
+            maximum_operations: limits.maximum_operations(),
             maximum_owned_payload_bytes,
             failed: false,
             statistics: ProjectionStatistics {
@@ -163,6 +165,15 @@ impl<'a> HmxQ2Executor<'a> {
 impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
     fn identity(&self) -> &'static str {
         "hexagon-hmx-binary-pq2-q8k-v1-experimental"
+    }
+    fn operation_capacity(&self) -> Option<u64> {
+        let local =
+            u64::from(self.maximum_operations).saturating_sub(self.statistics.operations_attempted);
+        Some(local.min(self.submitter.remaining_operations().unwrap_or(local)))
+    }
+    fn operation_count(&self, tensor: &Tensor) -> Option<u64> {
+        let (columns, rows) = dimensions(tensor).ok()?;
+        u64::try_from((columns / 128).checked_mul(rows.div_ceil(self.maximum_rows))?).ok()
     }
     fn supports(&self, tensor: &Tensor) -> bool {
         dimensions(tensor).is_ok_and(|(_, rows)| {

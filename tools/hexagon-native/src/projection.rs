@@ -83,6 +83,14 @@ impl Q2ProjectionLimits {
 
 /// Safe synchronous submission of one original-128-block integer operation.
 pub trait GuardedQ2Submitter {
+    /// Remaining writes in the actual borrowed native session, when known.
+    ///
+    /// Custom submitters returning `None` require independently matched limits.
+    /// Native sessions include all earlier work, including previous executors.
+    fn remaining_operations(&self) -> Option<u64> {
+        None
+    }
+
     /// Submit tightly packed 576-byte host tiles and two guarded F32 K=256 rows.
     ///
     /// `output` has two contiguous M-row limbs, M a multiple of 32. No pointer,

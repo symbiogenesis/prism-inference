@@ -12,11 +12,22 @@ Original PQ2 scale bits and per-128-block fused/nonfused reduction order remain 
 CPU. The HMX rows are the eight bits of one token's codes, with signed high-bit
 coefficient -128; they are not eight prefill tokens.
 
+`HmxQ8Executor` opts into PTQ1 and odd-block PQ2 using the graph's original
+prepared Q8_0 codes and per-32 scales. Four sparse output rows preserve the four
+integer DOTPROD lanes of one original row, with four K128/N8 submissions per
+128-weight block. Pinned PTQ1 keeps four independent FMA accumulators across the
+complete row and the final adjacent-pair reduction. Generic PTQ1 and odd-block
+PQ2 retain their original per-32 and per-128 nonfused reduction order. Native
+PTQ1 fractional-byte aliases retain decoder semantics; no canonical conversion
+or expanded model copy is required. The fourfold row duplication reduces the
+original-row tile capacity to the native limit divided by four. This exact
+composition is an experimental compatibility path, not an efficiency claim.
+
 The graph applies the existing Hadamard/sign/grouped transformations before
 projection and the existing approved rank-one adapter corrections afterward.
 Embedding, attention, GDN, convolution, sampling and complete committed state
 remain in their original Rust graph. PTQ1 and odd-block PQ2/Q8_0 use the configured
-CPU implementation. Any submitted error clears provisional output and permanently
+CPU implementation unless the executor explicitly opts in. Any submitted error clears provisional output and permanently
 closes the executor and scoped decoder; no failed work is replayed on CPU.
 
 Use `Qwen35::with_projection_executor` inside
@@ -40,6 +51,12 @@ complete model/token may exceed them. An outer process deadline, exact signed
 package/driver verification, child-only environment and verified teardown remain
 the trusted caller's responsibility.
 
+Every executor reports its exact source-derived projection operation count and
+remaining caller-bound work allowance. The native submitter additionally reports
+the actual session's remaining writes, including any work preceding the executor
+borrow; the effective allowance is the minimum of both bounds. Custom submitters
+with opaque capacity still require independently matched caller limits.
+
 For the retained Swift geometry, source arithmetic at the maximum 17,408-row
 tile requires 22,656 submissions for all eligible projections of one ingestion
 token and another 600 for its vocabulary head (23,256 for evaluation). This
@@ -48,7 +65,7 @@ are not a device observation: full-model use needs an admitted explicit partial
 placement or a separately reviewed persistent-session/operation contract.
 
 Model-free controls compare complete fused and nonfused matvec bits, multiple and
-partial row tiles, all i8 bitplane codes and refusal/poisoned output behavior.
+partial row tiles, all i8 bitplane codes, native PTQ1 DOTPROD captures and refusal/poisoned output behavior.
 The CPU runtime's `projection_scope` graph regressions cover attention/recurrent
 state, transforms, loaded-zero/nonzero adapter corrections, checkpoints, reset,
 unsupported CPU paths and terminal failure after provisional attention state.

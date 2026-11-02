@@ -2,8 +2,8 @@
 
 use std::{cell::Cell, rc::Rc};
 
-use bonsai_prism_runtime::kernels::Pq2ProjectionExecutor;
-use bonsai_ternary::{Q8KBlock, half_to_float};
+use bonsai_prism_runtime::kernels::{Pq2ProjectionExecutor, Q8Block};
+use bonsai_ternary::{Q8KBlock, decode_ptq_trits, half_to_float};
 
 use super::*;
 
@@ -11,6 +11,7 @@ struct ReferenceExecutor {
     calls: Rc<Cell<usize>>,
     fail: Rc<Cell<bool>>,
     malformed: bool,
+    q8: bool,
 }
 
 impl Pq2ProjectionExecutor for ReferenceExecutor {
@@ -19,6 +20,80 @@ impl Pq2ProjectionExecutor for ReferenceExecutor {
     }
     fn supports(&self, _: &Tensor) -> bool {
         true
+    }
+
+    fn supports_q8(&self, _: &Tensor) -> bool {
+        self.q8
+    }
+
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        reason = "Independent scalar original-code reduction with exact bounded integer sums."
+    )]
+    fn project_q8(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[Q8Block],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.calls.set(self.calls.get() + 1);
+        output.clear();
+        if self.fail.get() {
+            return Err(std::io::Error::other("synthetic submitted Q8_0 loss").into());
+        }
+        let bytes = if tensor.kind == 143 { 28 } else { 34 };
+        let blocks = tensor.dimensions[0] / 128;
+        for row in tensor.data.chunks_exact(blocks * bytes) {
+            let mut lanes = [0.0_f32; 4];
+            let mut sum = 0.0_f32;
+            for (index, block) in row.chunks_exact(bytes).enumerate() {
+                let (weights, d) = if tensor.kind == 143 {
+                    (
+                        decode_ptq_trits(block.try_into()?),
+                        half_to_float(u16::from_le_bytes([block[26], block[27]])),
+                    )
+                } else {
+                    (
+                        std::array::from_fn(|lane| {
+                            i16::from((block[2 + lane / 4] >> (lane % 4 * 2)) & 3) - 1
+                        }),
+                        half_to_float(u16::from_le_bytes([block[0], block[1]])),
+                    )
+                };
+                let mut block_sum = 0.0_f32;
+                for group in 0..4 {
+                    let activation = &activation[index * 4 + group];
+                    let mut integers = [0_i32; 4];
+                    for (lane, integer) in integers.iter_mut().enumerate() {
+                        for start in [lane * 4, lane * 4 + 16] {
+                            for position in start..start + 4 {
+                                *integer += i32::from(weights[group * 32 + position])
+                                    * i32::from(activation.values[position]);
+                            }
+                        }
+                    }
+                    if pinned && tensor.kind == 143 {
+                        for (lane, integer) in lanes.iter_mut().zip(integers) {
+                            *lane = (integer as f32).mul_add(d * activation.scale, *lane);
+                        }
+                    } else {
+                        block_sum += activation.scale * integers.into_iter().sum::<i32>() as f32;
+                    }
+                }
+                if !pinned || tensor.kind != 143 {
+                    sum += d * block_sum;
+                }
+            }
+            output.push(if pinned && tensor.kind == 143 {
+                (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+            } else {
+                sum
+            });
+        }
+        Ok(())
     }
     #[allow(
         clippy::as_conversions,
@@ -75,10 +150,52 @@ fn executor() -> (ReferenceExecutor, Rc<Cell<usize>>, Rc<Cell<bool>>) {
             calls: calls.clone(),
             fail: fail.clone(),
             malformed: false,
+            q8: false,
         },
         calls,
         fail,
     )
+}
+
+#[test]
+fn projection_scope_q8_opt_in_preserves_ptq1_odd_pq2_state_and_adapter() -> Result<()> {
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for (kind, width) in [(142, 128), (143, 256)] {
+        for recurrent in [false, true] {
+            for adapter_scale in [0.0, 1.3] {
+                let build = || -> Result<Qwen35> {
+                    let base = backend_fixture(recurrent, kind, width)?;
+                    let target = if recurrent {
+                        "blk.0.ssm_out.weight"
+                    } else {
+                        "blk.0.attn_output.weight"
+                    };
+                    let factors =
+                        rank_one_factors(&base, &["blk.0.ffn_down.weight", target], 0.125);
+                    rank_one_graph(base, factors, adapter_scale)
+                };
+                let mut control = build()?;
+                let (mut executor, calls, fail) = executor();
+                executor.q8 = true;
+                let mut graph = build()?.with_projection_executor(&mut executor)?;
+                for token in [0, 1, 0] {
+                    assert_eq!(bits(graph.evaluate(token)?), bits(control.evaluate(token)?));
+                    assert_eq!(graph_bits(graph.decoder())?, graph_bits(&control)?);
+                }
+                assert_eq!(calls.get(), 3);
+                let before = graph_bits(graph.decoder())?;
+                fail.set(true);
+                let mut output = vec![42.0];
+                assert!(graph.evaluate_into(1, &mut output).is_err());
+                assert!(output.is_empty());
+                assert!(graph.is_faulted());
+                assert_eq!(graph_bits(graph.decoder())?, before);
+                assert!(graph.evaluate(1).is_err());
+                assert_eq!(calls.get(), 4);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

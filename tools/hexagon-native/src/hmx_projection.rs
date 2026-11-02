@@ -63,6 +63,14 @@ pub type HmxQ2ProjectionReport = Q2ProjectionReport;
 
 /// Synchronous exact integer bitplane submission to the fixed source HMX path.
 pub trait HmxQ2Submitter {
+    /// Remaining writes in the actual borrowed native session, when known.
+    ///
+    /// Custom submitters returning `None` require independently matched limits.
+    /// Native sessions include all earlier work, including previous executors.
+    fn remaining_operations(&self) -> Option<u64> {
+        None
+    }
+
     /// Submit unit-scale tiled Q2 weights and eight binary F32 K=128 planes.
     /// `output` is contiguous `[plane][M-row]`, with M a multiple of 32.
     /// All correlated outputs must be integral in -128..=256; the caller must

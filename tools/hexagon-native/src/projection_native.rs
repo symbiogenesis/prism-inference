@@ -456,6 +456,18 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> GuardedQ2Submitter for Session<'_, P> {
+    fn remaining_operations(&self) -> Option<u64> {
+        Some(if self.failed {
+            0
+        } else {
+            u64::from(
+                self.limits
+                    .operations
+                    .saturating_sub(self.report.operations_submitted),
+            )
+        })
+    }
+
     fn submit(
         &mut self,
         weights: &[u8],
@@ -467,6 +479,18 @@ impl<P: FnMut(&Q2ProjectionReport)> GuardedQ2Submitter for Session<'_, P> {
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
+    fn remaining_operations(&self) -> Option<u64> {
+        Some(if self.failed {
+            0
+        } else {
+            u64::from(
+                self.limits
+                    .operations
+                    .saturating_sub(self.report.operations_submitted),
+            )
+        })
+    }
+
     fn submit(
         &mut self,
         weights: &[u8],

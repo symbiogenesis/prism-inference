@@ -691,15 +691,18 @@ mod tests {
                 failed: false,
             };
             let mut output = [99.0; 64];
+            assert_eq!(GuardedQ2Submitter::remaining_operations(&session), Some(2));
             let first = GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output);
             if case == 0 {
                 assert!(first.is_ok());
+                assert_eq!(GuardedQ2Submitter::remaining_operations(&session), Some(1));
                 assert_eq!(output, [7.0; 64]);
                 assert!(
                     GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output)
                         .is_ok()
                 );
                 assert_eq!(session.report.operations_completed, 2);
+                assert_eq!(GuardedQ2Submitter::remaining_operations(&session), Some(0));
                 assert!(
                     GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output)
                         .is_err()
@@ -708,6 +711,7 @@ mod tests {
                 assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 2);
             } else {
                 assert!(first.is_err());
+                assert_eq!(GuardedQ2Submitter::remaining_operations(&session), Some(0));
                 assert!(output.iter().all(|value| value.is_nan()));
                 assert!(
                     GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output)
@@ -779,15 +783,18 @@ mod tests {
                 failed: false,
             };
             let mut output = [99.0; 256];
+            assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(2));
             let first = HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output);
             if case == 0 {
                 assert!(first.is_ok());
+                assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(1));
                 assert_eq!(output, [7.0; 256]);
                 assert!(
                     HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)
                         .is_ok()
                 );
                 assert_eq!(session.report.operations_completed, 2);
+                assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
                 assert!(
                     HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)
                         .is_err()
@@ -795,6 +802,7 @@ mod tests {
                 assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 2);
             } else {
                 assert!(first.is_err());
+                assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
                 assert!(output.iter().all(|value| value.is_nan()));
                 assert!(
                     HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)

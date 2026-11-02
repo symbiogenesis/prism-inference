@@ -293,6 +293,28 @@ The complete session allowance remains 4..=120 seconds with three seconds
 reserved for cleanup, and an external Job deadline remains mandatory. No model,
 PTQ1, performance or production eligibility follows from model-free controls.
 
+The optional `HmxQ2ProjectionLimits::with_resident_weights(bytes)` reserves an
+additional host-mapped immutable packed-weight arena, disabled by default and
+bounded by 64 MiB. Its aligned allocation is reported by `allocation_bytes()`;
+these bytes require separate resource admission. `prepare_weights` validates and
+copies each packed extent once, issuing an opaque session-owned handle.
+`submit_resident` uses that handle without copying its weights into the mutable
+working tile again. Preparations are append-only, consume no kernel operations
+and never evict an earlier extent. Capacity refusal leaves a healthy session and
+its remaining operation allowance unchanged. Foreign-session handles, malformed
+activation, queue failures and deadlines close the owner with the existing
+poisoned-buffer lifetime rule. Handles do not retain native memory after teardown.
+
+`HmxQ2WeightRegistry` exposes the metadata-only owner/range allocator for custom
+model-free submitters. The native session keeps the existing full-allocation FD
+descriptor and cache flags: adding the arena enlarges the extent covered by
+**every** submission and may increase cache-maintenance work. Signed kernels
+still stream their weights into VTCM. This infrastructure avoids repeated CPU
+packing/copying only; it establishes no DSP residency, reduced DMA/cache traffic,
+speedup, persistent serving or increased operation/deadline capacity. The report
+retains mapped descriptor extent, prepared payload/count and resident write
+attempts as work/resource observations, not measured traffic.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

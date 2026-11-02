@@ -5,8 +5,9 @@ use super::{
     open_module, write_packet,
 };
 use crate::{
-    Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter, Q2ProjectionLimits,
-    Q2ProjectionReport, SessionPreparationReport, hmx_projection, projection,
+    Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter, HmxQ2WeightHandle,
+    HmxQ2WeightRegistry, Q2ProjectionLimits, Q2ProjectionReport, SessionPreparationReport,
+    hmx_projection, projection,
 };
 use std::ffi::c_void;
 use std::path::Path;
@@ -37,6 +38,7 @@ pub(super) fn run(
         package,
         limits,
         Mode::Guarded,
+        0,
         progress,
         |session| work(session),
     )
@@ -54,6 +56,7 @@ pub(super) fn run_hmx(
         package,
         limits.common,
         Mode::Hmx,
+        limits.resident_weight_bytes,
         progress,
         |session| work(session),
     )
@@ -83,6 +86,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
     package: &Path,
     limits: Q2ProjectionLimits,
     mode: Mode,
+    resident_weight_bytes: usize,
     mut progress: P,
     work: impl FnOnce(&mut Session<'_, P>) -> Result<(), Error>,
 ) -> Result<Q2ProjectionReport, Error> {
@@ -115,7 +119,8 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         report.queue.stage = "projection-initialization-expired-pinned";
         return Ok(report);
     }
-    let allocation_bytes = mode.allocation_bytes(limits.rows);
+    let allocation_bytes =
+        (mode.allocation_bytes(limits.rows) + resident_weight_bytes).next_multiple_of(4096);
     let allocator_request = i32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     let descriptor_size = u32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     entered(&mut report, "projection-allocation-entered", &mut progress);
@@ -144,6 +149,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         report.queue.stage = "projection-fd-map-refused-pinned";
         return Ok(report);
     }
+    report.mapped_allocation_bytes = allocation_bytes;
     let mut queue = null_mut();
     entered(
         &mut report,
@@ -219,6 +225,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
             expected,
             limits,
             mode,
+            resident_weights: HmxQ2WeightRegistry::new(resident_weight_bytes)?,
             work_deadline,
             progress: &mut progress,
             failed: false,
@@ -269,6 +276,7 @@ struct Session<'a, P> {
     expected: QueueBuffer,
     limits: Q2ProjectionLimits,
     mode: Mode,
+    resident_weights: HmxQ2WeightRegistry,
     work_deadline: Instant,
     progress: &'a mut P,
     failed: bool,
@@ -357,10 +365,20 @@ enum Activation<'a> {
     Hmx(&'a [[f32; 128]; 8]),
 }
 
+#[derive(Clone, Copy)]
+enum Weights<'a> {
+    Transient(&'a [u8]),
+    Resident(&'a HmxQ2WeightHandle),
+}
+
 impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep both transient and immutable arena validation beside the shared correlated native submission"
+    )]
     fn submit_inner(
         &mut self,
-        weights: &[u8],
+        weights: Weights<'_>,
         activation: Activation<'_>,
         output: &mut [f32],
     ) -> Result<(), Error> {
@@ -371,13 +389,25 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         if !self.within_deadline() {
             return Err(Error::Contract);
         }
-        let rows = match (&activation, self.mode) {
-            (Activation::Guarded(values), Mode::Guarded) => {
+        let rows = match (weights, &activation, self.mode) {
+            (Weights::Transient(weights), Activation::Guarded(values), Mode::Guarded) => {
                 projection::validate_inputs(self.limits.rows, weights, values, output.len())
             }
-            (Activation::Hmx(values), Mode::Hmx) => {
+            (Weights::Transient(weights), Activation::Hmx(values), Mode::Hmx) => {
                 hmx_projection::validate_inputs(self.limits.rows, weights, values, output.len())
             }
+            (Weights::Resident(handle), Activation::Hmx(values), Mode::Hmx) => self
+                .resident_weights
+                .range(handle)
+                .and_then(|_| {
+                    hmx_projection::validate_activation(
+                        self.limits.rows,
+                        handle.rows(),
+                        values,
+                        output.len(),
+                    )
+                })
+                .map(|()| handle.rows()),
             _ => Err(Error::Contract),
         };
         let Ok(rows) = rows else {
@@ -386,32 +416,55 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         let Ok(base) = u64::try_from(self.memory.addr()) else {
             return Err(self.fail("projection-address-refused-pinned"));
         };
+        let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
+            return Err(self.fail("projection-allocation-size-refused-pinned"));
+        };
+        let working_bytes = self.mode.allocation_bytes(self.limits.rows);
         // SAFETY: the single previous operation completed and cache invalidation
         // was validated before any allocation reuse. There is no DSP consumer
         // before the first write and no mutable view survives this preparation.
-        let image = unsafe {
-            std::slice::from_raw_parts_mut(
-                self.memory.cast::<u8>(),
-                self.mode.allocation_bytes(self.limits.rows),
-            )
-        };
-        let active = match activation {
-            Activation::Guarded(values) => {
-                projection::image(image, base, self.expected.fd, rows, weights, values)
-            }
-            Activation::Hmx(values) => {
-                hmx_projection::image(image, base, self.expected.fd, rows, weights, values)
-            }
+        let image =
+            unsafe { std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes) };
+        let active = match (weights, activation) {
+            (Weights::Transient(weights), Activation::Guarded(values)) => projection::image(
+                &mut image[..working_bytes],
+                base,
+                self.expected.fd,
+                rows,
+                weights,
+                values,
+            ),
+            (Weights::Transient(weights), Activation::Hmx(values)) => hmx_projection::image(
+                &mut image[..working_bytes],
+                base,
+                self.expected.fd,
+                rows,
+                weights,
+                values,
+            ),
+            (Weights::Resident(handle), Activation::Hmx(values)) => hmx_projection::image_resident(
+                image,
+                base,
+                self.expected.fd,
+                working_bytes,
+                handle,
+                values,
+            ),
+            _ => Err(Error::Contract),
         };
         let Ok(active) = active else {
             return Err(self.fail("projection-frame-refused-pinned"));
         };
+        image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
         if !self.within_deadline() {
             return Err(Error::Contract);
         }
         self.report.queue.response_validated = false;
         self.report.queue.numeric_validated = false;
         self.report.operations_submitted += 1;
+        if matches!(weights, Weights::Resident(_)) {
+            self.report.resident_submissions += 1;
+        }
         self.report.queue.compute_submitted = true;
         let sequence = u64::from(self.report.operations_submitted);
         let request = projection::request(sequence);
@@ -474,7 +527,11 @@ impl<P: FnMut(&Q2ProjectionReport)> GuardedQ2Submitter for Session<'_, P> {
         activation: &[[f32; 256]; 2],
         output: &mut [f32],
     ) -> Result<(), Error> {
-        self.submit_inner(weights, Activation::Guarded(activation), output)
+        self.submit_inner(
+            Weights::Transient(weights),
+            Activation::Guarded(activation),
+            output,
+        )
     }
 }
 
@@ -497,7 +554,71 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
         activation: &[[f32; 128]; 8],
         output: &mut [f32],
     ) -> Result<(), Error> {
-        self.submit_inner(weights, Activation::Hmx(activation), output)
+        self.submit_inner(
+            Weights::Transient(weights),
+            Activation::Hmx(activation),
+            output,
+        )
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        if self.failed || self.mode != Mode::Hmx {
+            0
+        } else {
+            self.resident_weights.remaining_bytes()
+        }
+    }
+
+    fn prepare_weights(&mut self, weights: &[u8]) -> Result<Option<HmxQ2WeightHandle>, Error> {
+        if self.failed || self.mode != Mode::Hmx {
+            return Err(self.fail("projection-resident-owner-refused-pinned"));
+        }
+        if !self.within_deadline() {
+            return Err(Error::Contract);
+        }
+        let rows = weights.len() / 36;
+        if hmx_projection::validate_inputs(self.limits.rows, weights, &[[0.0; 128]; 8], rows * 8)
+            .is_err()
+        {
+            return Err(self.fail("projection-resident-input-refused-pinned"));
+        }
+        let handle = match self.resident_weights.prepare(weights) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
+        };
+        let range = self.resident_weights.range(&handle)?;
+        let offset = self.mode.allocation_bytes(self.limits.rows) + range.start;
+        // SAFETY: this fresh append-only reservation is inside the explicitly
+        // admitted allocation. No queued consumer remains after a validated
+        // previous operation. No existing immutable reservation is overwritten,
+        // and the temporary exclusive slice ends before exposing its handle.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.memory.cast::<u8>().wrapping_add(offset),
+                weights.len(),
+            )
+        };
+        destination.copy_from_slice(weights);
+        self.report.resident_weight_bytes_prepared += weights.len();
+        self.report.resident_weight_preparations += 1;
+        if !self.within_deadline() {
+            return Err(Error::Contract);
+        }
+        Ok(Some(handle))
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &HmxQ2WeightHandle,
+        activation: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.submit_inner(
+            Weights::Resident(handle),
+            Activation::Hmx(activation),
+            output,
+        )
     }
 }
 
@@ -682,6 +803,7 @@ mod tests {
                 expected,
                 limits,
                 mode: Mode::Guarded,
+                resident_weights: HmxQ2WeightRegistry::new(0)?,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -774,6 +896,7 @@ mod tests {
                 expected,
                 limits: limits.common,
                 mode: Mode::Hmx,
+                resident_weights: HmxQ2WeightRegistry::new(0)?,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -817,6 +940,123 @@ mod tests {
             assert!(session.report.is_hmx_bitplane_control());
             assert!(!session.report.queue.is_guarded_q2_control());
             assert!(session.report.queue.is_nonblocking_write_control());
+            assert!(session.report.queue.poisoned);
+            assert_eq!(session.report.queue.queue_stop_result, None);
+            assert_eq!(session.report.queue.unmapping_result, None);
+            assert!(!session.report.completed_cycle());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Exercise one complete native owner across independent queue and identity failure cases"
+    )]
+    fn resident_hmx_reuses_immutable_arena_and_never_reuses_a_faulted_owner() -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let mut weights = vec![0x55; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let activation = [[1.0; 128]; 8];
+        for case in 0..6 {
+            {
+                let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+                state.writes = 0;
+                state.sequence = 0;
+                state.write_error = case == 1;
+                state.stale_reply = case == 2;
+                state.bad_numeric = case == 3;
+            }
+            let limits = HmxQ2ProjectionLimits::new(32, 3, Duration::from_secs(4))?
+                .with_resident_weights(2304)?;
+            let mut memory = vec![0; limits.allocation_bytes()];
+            let pointer = memory.as_mut_ptr().cast::<c_void>();
+            let expected = QueueBuffer {
+                fd: 7,
+                size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+                offset: 0,
+                flags: 0x90,
+                pointer,
+            };
+            let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            report.queue.hmx_bitplane = true;
+            report.queue.poisoned = true;
+            let queue_write = WriteCall::Nonblocking(write);
+            let mut progress = |_: &Q2ProjectionReport| {};
+            let mut session = Session {
+                report: &mut report,
+                queue_write: &queue_write,
+                queue_read: read,
+                queue: null_mut(),
+                memory: pointer,
+                expected,
+                limits: limits.common,
+                mode: Mode::Hmx,
+                resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+                work_deadline: if case == 4 {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_secs(1)
+                },
+                progress: &mut progress,
+                failed: false,
+            };
+            if case == 4 {
+                assert!(HmxQ2Submitter::prepare_weights(&mut session, &weights).is_err());
+                assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
+                assert_eq!(HmxQ2Submitter::residency_capacity_bytes(&session), 0);
+                assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 0);
+                continue;
+            }
+            let first =
+                HmxQ2Submitter::prepare_weights(&mut session, &weights)?.ok_or(Error::Contract)?;
+            let second =
+                HmxQ2Submitter::prepare_weights(&mut session, &weights)?.ok_or(Error::Contract)?;
+            assert!(HmxQ2Submitter::prepare_weights(&mut session, &weights)?.is_none());
+            assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(3));
+            assert_eq!(HmxQ2Submitter::residency_capacity_bytes(&session), 0);
+            let arena = hmx_projection::layout(32).allocation;
+            assert_eq!(&memory[arena..arena + 1152], &weights);
+            assert_eq!(&memory[arena + 1152..arena + 2304], &weights);
+            let mut foreign = HmxQ2WeightRegistry::new(1152)?;
+            let foreign = foreign.prepare(&weights)?.ok_or(Error::Contract)?;
+            let handle = if case == 5 { &foreign } else { &first };
+            let mut output = [99.0; 256];
+            let result =
+                HmxQ2Submitter::submit_resident(&mut session, handle, &activation, &mut output);
+            if case == 0 {
+                assert!(result.is_ok());
+                assert_eq!(output, [7.0; 256]);
+                HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)?;
+                HmxQ2Submitter::submit_resident(&mut session, &second, &activation, &mut output)?;
+                assert_eq!(session.report.operations_completed, 3);
+                assert_eq!(&memory[arena..arena + 1152], &weights);
+                assert_eq!(&memory[arena + 1152..arena + 2304], &weights);
+                assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
+                assert!(
+                    HmxQ2Submitter::submit_resident(&mut session, &first, &activation, &mut output)
+                        .is_err()
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(output.iter().all(|value| value.is_nan()));
+                assert_eq!(session.report.operations_completed, 0);
+                assert!(
+                    HmxQ2Submitter::submit_resident(&mut session, &first, &activation, &mut output)
+                        .is_err()
+                );
+                assert!(HmxQ2Submitter::prepare_weights(&mut session, &weights).is_err());
+                assert_eq!(
+                    STATE.lock().map_err(|_| Error::Contract)?.writes,
+                    u32::from(case != 5)
+                );
+            }
+            assert!(session.failed);
+            assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
             assert!(session.report.queue.poisoned);
             assert_eq!(session.report.queue.queue_stop_result, None);
             assert_eq!(session.report.queue.unmapping_result, None);

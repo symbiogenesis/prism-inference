@@ -12,15 +12,20 @@
 )]
 
 use crate::{Error, Q2ProjectionLimits, Q2ProjectionReport, compute, projection};
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Fixed VTCM request used to derive the HMX chunks; refusal never falls back.
 pub const HMX_Q2_VTCM_REQUEST_BYTES: u32 = 65_536;
+/// Maximum opt-in host-mapped immutable packed-weight arena; this is not VTCM.
+pub const HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 64 * 1024 * 1024;
 
 /// One terminal K=128/N=8 bitplane session's explicit lifetime and work limits.
 #[derive(Clone, Copy, Debug)]
 pub struct HmxQ2ProjectionLimits {
     pub(crate) common: Q2ProjectionLimits,
+    pub(crate) resident_weight_bytes: usize,
 }
 
 impl HmxQ2ProjectionLimits {
@@ -32,7 +37,31 @@ impl HmxQ2ProjectionLimits {
     pub fn new(rows: usize, operations: u32, duration: Duration) -> Result<Self, Error> {
         Ok(Self {
             common: Q2ProjectionLimits::new(rows, operations, duration)?,
+            resident_weight_bytes: 0,
         })
+    }
+
+    /// Reserve an optional immutable host-mapped weight arena in the same FD.
+    ///
+    /// This increases the allocation bound, without changing VTCM, operation or
+    /// lifetime limits. The caller separately admits these bytes. Existing
+    /// whole-allocation cache flags remain unchanged; no reduced DMA or cache
+    /// traffic follows from avoiding repeated host tile copies.
+    ///
+    /// # Errors
+    /// Rejects more than 64 MiB before opening a module or allocating memory.
+    pub fn with_resident_weights(mut self, bytes: usize) -> Result<Self, Error> {
+        if bytes > HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES {
+            return Err(Error::Contract);
+        }
+        self.resident_weight_bytes = bytes;
+        Ok(self)
+    }
+
+    /// Explicit opt-in immutable packed-weight payload capacity, excluding padding.
+    #[must_use]
+    pub const fn resident_weight_bytes(self) -> usize {
+        self.resident_weight_bytes
     }
 
     /// Largest active output-row extent for one operation.
@@ -43,7 +72,7 @@ impl HmxQ2ProjectionLimits {
     /// Maximum mapped host allocation, including the command and eight outputs.
     #[must_use]
     pub const fn allocation_bytes(self) -> usize {
-        layout(self.common.rows).allocation
+        (layout(self.common.rows).allocation + self.resident_weight_bytes).next_multiple_of(4096)
     }
     /// Maximum single-attempt writes in the complete session.
     #[must_use]
@@ -54,6 +83,103 @@ impl HmxQ2ProjectionLimits {
     #[must_use]
     pub const fn maximum_duration(self) -> Duration {
         self.common.maximum_duration()
+    }
+}
+
+/// An immutable packed-weight extent owned by one submitter's registry.
+///
+/// The private owner identity prevents a handle from another session from
+/// addressing native memory. Cloning a handle never extends a native session's
+/// lifetime, frees storage or changes its append-only contents.
+#[derive(Clone, Debug)]
+pub struct HmxQ2WeightHandle {
+    owner: Arc<()>,
+    range: Range<usize>,
+    rows: usize,
+}
+
+impl HmxQ2WeightHandle {
+    /// Exact active weight-row count, always a positive multiple of 32.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Exact packed payload size, excluding alignment gaps.
+    #[must_use]
+    pub const fn packed_bytes(&self) -> usize {
+        self.range.end - self.range.start
+    }
+}
+
+/// Metadata-only append-only allocator for one submitter's packed-weight arena.
+///
+/// Custom model-free submitters may use this to issue and validate opaque
+/// handles. The registry stores no payload or native pointer. The submitter
+/// copies a successful reservation's bytes exactly once before exposing its
+/// handle, and never changes or frees them while the session can consume them.
+pub struct HmxQ2WeightRegistry {
+    owner: Arc<()>,
+    capacity: usize,
+    used: usize,
+}
+
+impl HmxQ2WeightRegistry {
+    /// Create one independent owner with an explicitly admitted payload bound.
+    ///
+    /// # Errors
+    /// Rejects capacity above the same 64 MiB native bound.
+    pub fn new(capacity_bytes: usize) -> Result<Self, Error> {
+        if capacity_bytes > HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES {
+            return Err(Error::Contract);
+        }
+        Ok(Self {
+            owner: Arc::new(()),
+            capacity: capacity_bytes,
+            used: 0,
+        })
+    }
+
+    /// Remaining payload extent, including alignment charged by prior reservations.
+    #[must_use]
+    pub const fn remaining_bytes(&self) -> usize {
+        self.capacity - self.used
+    }
+
+    /// Validate and reserve one immutable, 128-byte-aligned packed-weight extent.
+    ///
+    /// `None` means insufficient capacity and leaves the registry unchanged.
+    /// This consumes no native operation. No reservation is ever evicted/reused.
+    ///
+    /// # Errors
+    /// Rejects malformed geometry or non-unit packed scales before reservation.
+    pub fn prepare(&mut self, weights: &[u8]) -> Result<Option<HmxQ2WeightHandle>, Error> {
+        let rows = validate_weights(projection::Q2_PROJECTION_MAX_ROWS, weights)?;
+        let start = self.used.next_multiple_of(128);
+        let end = start.checked_add(weights.len()).ok_or(Error::Contract)?;
+        if end > self.capacity {
+            return Ok(None);
+        }
+        self.used = end;
+        Ok(Some(HmxQ2WeightHandle {
+            owner: Arc::clone(&self.owner),
+            range: start..end,
+            rows,
+        }))
+    }
+
+    /// Recover an owner-checked byte range inside this registry's arena.
+    ///
+    /// # Errors
+    /// Rejects handles issued by any other registry, including earlier sessions.
+    pub fn range(&self, handle: &HmxQ2WeightHandle) -> Result<Range<usize>, Error> {
+        if !Arc::ptr_eq(&self.owner, &handle.owner)
+            || handle.range.end > self.used
+            || handle.range.end > self.capacity
+        {
+            return Err(Error::Contract);
+        }
+        Ok(handle.range.clone())
     }
 }
 
@@ -69,6 +195,42 @@ pub trait HmxQ2Submitter {
     /// Native sessions include all earlier work, including previous executors.
     fn remaining_operations(&self) -> Option<u64> {
         None
+    }
+
+    /// Remaining optional immutable host-mapped weight capacity, including padding.
+    /// The default submitter supports no residency and preserves ordinary submission.
+    fn residency_capacity_bytes(&self) -> usize {
+        0
+    }
+
+    /// Copy immutable packed weights into an optional session-owned arena once.
+    ///
+    /// Capacity refusal returns `None` without consuming an operation or
+    /// faulting a healthy native session. Custom submitters may use
+    /// [`HmxQ2WeightRegistry`] to issue owner-checked handles.
+    ///
+    /// # Errors
+    /// Malformed weights or an expired/faulted native session reject explicitly.
+    fn prepare_weights(&mut self, _weights: &[u8]) -> Result<Option<HmxQ2WeightHandle>, Error> {
+        Ok(None)
+    }
+
+    /// Submit a previously prepared immutable extent without copying its weights.
+    ///
+    /// Geometry, activation, queue correlation, work and deadline checks match
+    /// ordinary submission. The handle must belong to this exact session.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles and submission failures reject;
+    /// native failures permanently close the session with no CPU replay.
+    fn submit_resident(
+        &mut self,
+        _handle: &HmxQ2WeightHandle,
+        _activation: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        output.fill(f32::NAN);
+        Err(Error::Contract)
     }
 
     /// Submit unit-scale tiled Q2 weights and eight binary F32 K=128 planes.
@@ -160,12 +322,22 @@ pub(crate) fn validate_inputs(
     activation: &[[f32; 128]; 8],
     outputs: usize,
 ) -> Result<usize, Error> {
-    let rows = outputs / 8;
-    if outputs != rows * 8
+    let rows = validate_weights(maximum_rows, weights)?;
+    validate_activation(maximum_rows, rows, activation, outputs)?;
+    Ok(rows)
+}
+
+pub(crate) fn validate_activation(
+    maximum_rows: usize,
+    rows: usize,
+    activation: &[[f32; 128]; 8],
+    outputs: usize,
+) -> Result<(), Error> {
+    if outputs / 8 != rows
+        || !outputs.is_multiple_of(8)
         || rows == 0
         || rows > maximum_rows
         || !rows.is_multiple_of(32)
-        || weights.len() != layout(rows).weights
     {
         return Err(Error::Contract);
     }
@@ -176,13 +348,23 @@ pub(crate) fn validate_inputs(
     {
         return Err(Error::Contract);
     }
-    if weights.as_chunks::<576>().0.iter().any(|tile| {
-        tile[512..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .any(|scale| *scale != [0, 0x3c])
-    }) {
+    Ok(())
+}
+
+fn validate_weights(maximum_rows: usize, weights: &[u8]) -> Result<usize, Error> {
+    let rows = weights.len() / 36;
+    if rows == 0
+        || rows > maximum_rows
+        || !rows.is_multiple_of(32)
+        || weights.len() != layout(rows).weights
+        || weights.as_chunks::<576>().0.iter().any(|tile| {
+            tile[512..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|scale| *scale != [0, 0x3c])
+        })
+    {
         return Err(Error::Contract);
     }
     Ok(rows)
@@ -194,6 +376,54 @@ pub(crate) fn image(
     fd: u32,
     rows: usize,
     weights: &[u8],
+    activation: &[[f32; 128]; 8],
+) -> Result<projection::Layout, Error> {
+    let active = frame(bytes, base, fd, rows, activation)?;
+    if weights.len() != active.weights {
+        return Err(Error::Contract);
+    }
+    bytes[1024..1024 + weights.len()].copy_from_slice(weights);
+    Ok(active)
+}
+
+pub(crate) fn image_resident(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    handle: &HmxQ2WeightHandle,
+    activation: &[[f32; 128]; 8],
+) -> Result<projection::Layout, Error> {
+    let allocation = bytes.len();
+    let weight_offset = arena_start
+        .checked_add(handle.range.start)
+        .ok_or(Error::Contract)?;
+    let weight_end = arena_start
+        .checked_add(handle.range.end)
+        .ok_or(Error::Contract)?;
+    if weight_end > allocation || handle.packed_bytes() != layout(handle.rows).weights {
+        return Err(Error::Contract);
+    }
+    let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
+    let active = frame(working, base, fd, handle.rows, activation)?;
+    put64(
+        bytes,
+        8,
+        u64::try_from(allocation).map_err(|_| Error::Contract)?,
+    );
+    put64(
+        bytes,
+        24,
+        u64::try_from(weight_offset).map_err(|_| Error::Contract)?,
+    );
+    Ok(active)
+}
+
+fn frame(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    rows: usize,
     activation: &[[f32; 128]; 8],
 ) -> Result<projection::Layout, Error> {
     const KP: usize = 264;
@@ -272,7 +502,6 @@ pub(crate) fn image(
         put32(bytes, KP + 36 + index * 8, 1);
         put32(bytes, KP + 40 + index * 8, shift);
     }
-    bytes[1024..1024 + weights.len()].copy_from_slice(weights);
     for (index, value) in activation.iter().flatten().enumerate() {
         put32(bytes, active.activation + index * 4, value.to_bits());
     }
@@ -334,6 +563,89 @@ mod tests {
         }
         for value in [-128.0_f32, 0.0, 256.0] {
             assert!(output_valid(&value.to_le_bytes()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resident_registry_has_owner_identity_and_transactional_capacity_refusal() -> Result<(), Error>
+    {
+        let mut weights = vec![0x55; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let mut owner = HmxQ2WeightRegistry::new(2304)?;
+        let mut other = HmxQ2WeightRegistry::new(2304)?;
+        let first = owner.prepare(&weights)?.ok_or(Error::Contract)?;
+        let second = owner.prepare(&weights)?.ok_or(Error::Contract)?;
+        assert_eq!(first.rows(), 32);
+        assert_eq!(first.packed_bytes(), 1152);
+        assert_eq!(owner.range(&first)?, 0..1152);
+        assert_eq!(owner.range(&second)?, 1152..2304);
+        assert_eq!(owner.remaining_bytes(), 0);
+        assert!(owner.prepare(&weights)?.is_none());
+        assert_eq!(owner.remaining_bytes(), 0);
+        assert!(other.range(&first).is_err());
+        let foreign = other.prepare(&weights)?.ok_or(Error::Contract)?;
+        assert!(owner.range(&foreign).is_err());
+        weights[512] = 1;
+        assert!(other.prepare(&weights).is_err());
+        assert_eq!(other.remaining_bytes(), 1152);
+        assert!(HmxQ2WeightRegistry::new(HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES + 1).is_err());
+        let limits = HmxQ2ProjectionLimits::new(32, 3, Duration::from_secs(4))?;
+        assert_eq!(limits.resident_weight_bytes(), 0);
+        assert_eq!(limits.allocation_bytes(), 8192);
+        let resident = limits.with_resident_weights(2304)?;
+        assert_eq!(resident.resident_weight_bytes(), 2304);
+        assert_eq!(resident.allocation_bytes(), 12288);
+        assert_eq!(resident.maximum_operations(), limits.maximum_operations());
+        assert_eq!(resident.maximum_duration(), limits.maximum_duration());
+        assert!(
+            limits
+                .with_resident_weights(HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES + 1)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resident_frame_preserves_immutable_arena_and_signed_solver_fields() -> Result<(), Error> {
+        let mut weights = vec![0x55; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let mut registry = HmxQ2WeightRegistry::new(2304)?;
+        let first = registry.prepare(&weights)?.ok_or(Error::Contract)?;
+        let second = registry.prepare(&weights)?.ok_or(Error::Contract)?;
+        let working_bytes = layout(32).allocation;
+        let mut bytes = vec![0xa5; 12288];
+        bytes[working_bytes..working_bytes + 1152].copy_from_slice(&weights);
+        bytes[working_bytes + 1152..working_bytes + 2304].copy_from_slice(&weights);
+        let retained = bytes[working_bytes..].to_vec();
+        let activation = [[1.0; 128]; 8];
+        let mut ordinary = vec![0; working_bytes];
+        image(&mut ordinary, 0x1234, 7, 32, &weights, &activation)?;
+        for handle in [&first, &second, &first] {
+            let active = image_resident(&mut bytes, 0x1234, 7, working_bytes, handle, &activation)?;
+            assert_eq!(&bytes[working_bytes..], &retained);
+            assert_eq!(&bytes[8..16], &12288_u64.to_le_bytes());
+            let offset = working_bytes + registry.range(handle)?.start;
+            assert_eq!(
+                &bytes[24..32],
+                &u64::try_from(offset)
+                    .map_err(|_| Error::Contract)?
+                    .to_le_bytes()
+            );
+            assert_eq!(&bytes[32..1024], &ordinary[32..1024]);
+            assert_eq!(
+                &bytes[active.activation..active.output],
+                &ordinary[active.activation..active.output]
+            );
+            assert!(!output_valid(&bytes[active.output..active.output + 1024]));
         }
         Ok(())
     }

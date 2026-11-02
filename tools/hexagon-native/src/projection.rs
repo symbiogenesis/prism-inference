@@ -120,6 +120,15 @@ pub struct Q2ProjectionReport {
     pub operations_submitted: u32,
     /// Correlated, integer-validated operations returned synchronously.
     pub operations_completed: u32,
+    /// Successful mapped allocation extent also covered by each queue descriptor.
+    /// This is not a measured cache-maintenance or bus-transfer byte count.
+    pub mapped_allocation_bytes: usize,
+    /// Immutable packed payload copied into the host arena, excluding padding.
+    pub resident_weight_bytes_prepared: usize,
+    /// Successfully copied immutable weight extents; preparation submits no kernel.
+    pub resident_weight_preparations: u32,
+    /// Attempted kernel writes using immutable arena handles, including failed writes.
+    pub resident_submissions: u32,
     /// Caller completed the entire projection and independently accepted output.
     pub work_completed: bool,
     /// The one absolute session/work deadline expired.
@@ -135,6 +144,10 @@ impl Q2ProjectionReport {
             ),
             operations_submitted: 0,
             operations_completed: 0,
+            mapped_allocation_bytes: 0,
+            resident_weight_bytes_prepared: 0,
+            resident_weight_preparations: 0,
+            resident_submissions: 0,
             work_completed: false,
             deadline_expired: false,
         }

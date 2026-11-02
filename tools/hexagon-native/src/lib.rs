@@ -24,7 +24,8 @@ pub use compute::{
     COMPUTE_REQUEST_BYTES, COMPUTE_RESPONSE_BYTES, QueueComputeReport,
 };
 pub use hmx_projection::{
-    HMX_Q2_VTCM_REQUEST_BYTES, HmxQ2ProjectionLimits, HmxQ2ProjectionReport, HmxQ2Submitter,
+    HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES, HMX_Q2_VTCM_REQUEST_BYTES, HmxQ2ProjectionLimits,
+    HmxQ2ProjectionReport, HmxQ2Submitter, HmxQ2WeightHandle, HmxQ2WeightRegistry,
 };
 pub use projection::{
     GuardedQ2Submitter, Q2_PROJECTION_MAX_OPERATIONS, Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits,

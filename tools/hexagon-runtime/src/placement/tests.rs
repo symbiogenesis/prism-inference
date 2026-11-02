@@ -215,7 +215,7 @@ fn submitted_failure_clears_output_and_permanently_closes_placement() -> Result<
                 placed.project(tensor, &[], true, &mut output)
             };
             assert!(result.is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [f32; 0]);
             assert!(placed.is_faulted());
             assert_eq!(placed.operation_capacity(), Some(0));
         }

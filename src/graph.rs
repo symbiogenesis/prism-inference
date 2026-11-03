@@ -22,6 +22,8 @@ use crate::{Decoder, Result, invalid};
 
 mod projection;
 pub use projection::ProjectedQwen35;
+mod prefill;
+pub use prefill::TiledPrefillStatistics;
 
 /// Maximum admitted live KV/recurrent element payload, also the default budget.
 ///
@@ -861,6 +863,7 @@ pub struct Qwen35 {
     context_limit: usize,
     position: usize,
     vocabulary: usize,
+    tiled_prefill: Option<prefill::TiledPrefill>,
 }
 
 impl Qwen35 {
@@ -1393,6 +1396,7 @@ impl Qwen35 {
             context_limit,
             position: 0,
             vocabulary,
+            tiled_prefill: None,
         })
     }
 
@@ -1927,6 +1931,9 @@ impl Decoder for Qwen35 {
     }
     fn ingest(&mut self, token: u32) -> Result<()> {
         self.evaluate_token_into(token, None)
+    }
+    fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
+        self.ingest_prefill_block(tokens, check)
     }
     fn checkpoint_bytes(&self) -> usize {
         // Deliberately charge each referenced page in full for every snapshot,

@@ -42,6 +42,7 @@ pub(crate) mod pinned_activations;
 pub(crate) mod pinned_attention;
 pub(crate) mod pinned_convolution;
 pub(crate) mod pinned_gdn;
+pub(crate) mod prefill;
 mod signquants;
 mod tquants;
 

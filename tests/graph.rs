@@ -5,6 +5,8 @@
 mod admission;
 #[path = "graph/projection.rs"]
 mod projection;
+#[path = "graph/prefill.rs"]
+mod tiled_prefill;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

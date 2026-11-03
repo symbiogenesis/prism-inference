@@ -1,0 +1,230 @@
+//! End-to-end exact tiles, separately qualified GDN chunks and request recovery.
+
+use std::cell::Cell;
+
+use super::*;
+
+fn tiled(model: Model, tokens: usize, chunkwise: bool) -> Result<Qwen35> {
+    let graph = Qwen35::new(model, 192)?;
+    let bytes = graph.tiled_prefill_scratch_bytes(tokens)?;
+    let graph = graph.with_tiled_prefill(tokens, bytes)?;
+    if chunkwise {
+        graph.with_chunkwise_gdn_prefill()
+    } else {
+        Ok(graph)
+    }
+}
+
+fn state_values(graph: &Qwen35) -> Result<Vec<f32>> {
+    let mut result = Vec::new();
+    graph.visit_state(&mut |_, _, values| {
+        result.extend_from_slice(values);
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+fn close(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= 0.001 + 0.001 * expected.abs(),
+            "chunk value {actual} differs from {expected}"
+        );
+    }
+}
+
+#[test]
+fn tiled_prefill_exact_hybrid_state_and_logits_cross_pages() -> Result<()> {
+    for tokens in [8, 16, 32] {
+        for length in [1, 7, 8, 9, 31, 32, 33, 63, 64, 65] {
+            let prompt: Vec<_> = [0, 1].into_iter().cycle().take(length).collect();
+            let mut expected = Qwen35::new(paged_hybrid_fixture(), 192)?;
+            let mut actual = tiled(paged_hybrid_fixture(), tokens, false)?;
+            let checkpoint = actual.checkpoint()?;
+            for &token in &prompt {
+                expected.ingest(token)?;
+            }
+            actual.ingest_block(&prompt, &|| Ok(()))?;
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+            assert_eq!(actual.evaluate(1)?, expected.evaluate(1)?);
+            actual.restore(&checkpoint)?;
+            actual.ingest_block(&prompt, &|| Ok(()))?;
+            actual.evaluate(1)?;
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tiled_prefill_packed_ffn_and_adapter_preserve_original_basis_bits() -> Result<()> {
+    for recurrent in [false, true] {
+        for (kind, width) in [(142, 128), (142, 256), (143, 128)] {
+            for scale in [0.0, 1.3] {
+                let build = || -> Result<Qwen35> {
+                    let model = backend_fixture(recurrent, kind, width)?;
+                    let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                    rank_one_graph(model, factors, scale)
+                };
+                let mut expected = build()?;
+                let graph = build()?;
+                let reserve = graph.tiled_prefill_scratch_bytes(8)?;
+                let mut actual = graph.with_tiled_prefill(8, reserve)?;
+                let prompt = [0, 1, 1, 0, 1, 0, 0, 1, 0];
+                for token in prompt {
+                    expected.ingest(token)?;
+                }
+                actual.ingest_block(&prompt, &|| Ok(()))?;
+                assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+                assert_eq!(actual.evaluate(1)?, expected.evaluate(1)?);
+                let stats = actual.tiled_prefill_statistics();
+                assert_eq!(stats.completed_tiles, 2);
+                assert_eq!(stats.completed_tokens, 9);
+                assert_eq!(stats.packed_projections, 2);
+                assert_eq!(
+                    stats.decoded_weight_blocks,
+                    u64::try_from(width / 128 * 2 * 2)?
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tiled_prefill_failure_restores_request_and_explicit_reset_clears_first_tile() -> Result<()> {
+    for chunkwise in [false, true] {
+        let mut graph = tiled(paged_hybrid_fixture(), 8, chunkwise)?;
+        let original = graph.checkpoint()?;
+        let checks = Cell::new(0);
+        let result = graph.ingest_block(&[0, 1, 0, 1, 0, 1, 0, 1], &|| {
+            checks.set(checks.get() + 1);
+            if checks.get() == 14 {
+                Err("synthetic tile cancellation".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        graph.reset()?;
+        assert!(state_values(&graph)?.iter().all(|&value| value == 0.0));
+        graph.restore(&original)?;
+        graph.ingest_block(&[0, 1, 0], &|| Ok(()))?;
+        let mut reference = Qwen35::new(paged_hybrid_fixture(), 192)?;
+        for token in [0, 1, 0] {
+            reference.ingest(token)?;
+        }
+        if chunkwise {
+            close(&state_values(&graph)?, &state_values(&reference)?);
+        } else {
+            assert_eq!(graph_bits(&graph)?, graph_bits(&reference)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn chunkwise_gdn_prefill_continuation_restore_and_identity_are_separate() -> Result<()> {
+    for tokens in [8, 16, 32] {
+        let mut actual = tiled(paged_hybrid_fixture(), tokens, true)?;
+        let mut expected = Qwen35::new(paged_hybrid_fixture(), 192)?;
+        assert_ne!(actual.identity(), expected.identity());
+        let prompt: Vec<_> = [0, 1].into_iter().cycle().take(65).collect();
+        actual.ingest_block(&prompt, &|| Ok(()))?;
+        for &token in &prompt {
+            expected.ingest(token)?;
+        }
+        close(&state_values(&actual)?, &state_values(&expected)?);
+        let saved = actual.checkpoint()?;
+        for token in [0, 1, 1, 0] {
+            close(&actual.evaluate(token)?, &expected.evaluate(token)?);
+        }
+        actual.restore(&saved)?;
+        let mut fresh = Qwen35::new(paged_hybrid_fixture(), 192)?;
+        for token in prompt {
+            fresh.ingest(token)?;
+        }
+        close(&actual.evaluate(0)?, &fresh.evaluate(0)?);
+        assert!(actual.tiled_prefill_statistics().chunkwise_gdn_heads > 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn tiled_prefill_rejects_unadmitted_geometry_and_preserves_state() -> Result<()> {
+    for tokens in [0, 1, 4, 33] {
+        assert!(
+            Qwen35::new(hybrid_fixture(), 16)?
+                .with_tiled_prefill(tokens, usize::MAX)
+                .is_err()
+        );
+    }
+    let graph = Qwen35::new(hybrid_fixture(), 16)?;
+    let required = graph.tiled_prefill_scratch_bytes(8)?;
+    assert!(graph.with_tiled_prefill(8, required - 1).is_err());
+    let mut graph = tiled(paged_hybrid_fixture(), 8, false)?;
+    let before = graph_bits(&graph)?;
+    for prompt in [vec![], vec![2], vec![0; 193]] {
+        assert!(graph.ingest_block(&prompt, &|| Ok(())).is_err());
+        assert_eq!(before, graph_bits(&graph)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn tiled_prefill_runtime_failure_restores_all_layer_state_before_replay() -> Result<()> {
+    for chunkwise in [false, true] {
+        let limits = Limits {
+            context_tokens: 192,
+            checkpoints: 0,
+            checkpoint_bytes: 1_048_576,
+        };
+        let mut runtime = Runtime::new(tiled(paged_hybrid_fixture(), 8, chunkwise)?, limits)?;
+        let cancellation = Cancellation::default();
+        let generation = Generation {
+            max_tokens: 1,
+            stop_tokens: Vec::new(),
+        };
+        let prefill = Prefill { block_tokens: 32 };
+        let prompt: Vec<_> = [0, 1].into_iter().cycle().take(65).collect();
+        assert!(
+            runtime
+                .generate_with_prefill(&prompt, &generation, prefill, &cancellation, |_| Err(
+                    "synthetic emitted-token failure".into()
+                ))
+                .is_err()
+        );
+        assert!(runtime.tokens().is_empty());
+        assert!(
+            state_values(runtime.decoder())?
+                .iter()
+                .all(|&value| value == 0.0)
+        );
+        assert!(!runtime.is_faulted());
+        let mut actual = Vec::new();
+        runtime.generate_with_prefill(&prompt, &generation, prefill, &cancellation, |token| {
+            actual.push(token);
+            Ok(())
+        })?;
+        let mut reference = Runtime::new(Qwen35::new(paged_hybrid_fixture(), 192)?, limits)?;
+        let mut expected = Vec::new();
+        reference.generate(&prompt, &generation, &cancellation, |token| {
+            expected.push(token);
+            Ok(())
+        })?;
+        assert_eq!(actual, expected);
+        if chunkwise {
+            close(
+                &state_values(runtime.decoder())?,
+                &state_values(reference.decoder())?,
+            );
+        } else {
+            assert_eq!(
+                graph_bits(runtime.decoder())?,
+                graph_bits(reference.decoder())?
+            );
+        }
+    }
+    Ok(())
+}

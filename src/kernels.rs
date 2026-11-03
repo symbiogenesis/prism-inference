@@ -25,6 +25,17 @@ mod kquants;
 mod legacy;
 mod parallel_rows;
 pub use parallel_rows::{MAX_ROW_WORKERS, RowParallelism};
+#[cfg(any(
+    test,
+    all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )
+))]
+mod packed_pq2;
 mod projection;
 pub use projection::Pq2ProjectionExecutor;
 pub(crate) mod pinned_activations;
@@ -1175,8 +1186,21 @@ pub fn packed_dot(kind: u32, count: usize, weights: &[u8], activations: &[u8]) -
 /// Construct with [`Default::default`]. Storage grows fallibly to accommodate
 /// each call and retains its capacity across tensors, activation formats and
 /// errors. Scratch contains no tensor-sized decoded matrix or model state.
+/// Eligible PQ2 NEON dispatch additionally retains one input-width byte layout
+/// and one f32 scale per 128 columns, shared by rows and prepared siblings.
 pub struct MatvecScratch {
     q8k: Vec<Q8KBlock>,
+    #[cfg(any(
+        test,
+        all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        )
+    ))]
+    pq2_consumption: Vec<packed_pq2::Activation>,
     q8: Vec<Q8Block>,
     activations: Vec<f32>,
     row: Vec<f32>,
@@ -1404,6 +1428,17 @@ impl Default for MatvecScratch {
     fn default() -> Self {
         Self {
             q8k: Vec::new(),
+            #[cfg(any(
+                test,
+                all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                )
+            ))]
+            pq2_consumption: Vec::new(),
             q8: Vec::new(),
             activations: Vec::new(),
             row: Vec::new(),
@@ -1468,6 +1503,20 @@ impl MatvecScratch {
     }
 
     fn prepare_input(&mut self, tensor: &Tensor, input: &[f32]) -> Result<ActivationContract> {
+        // A new scoped preparation invalidates every rearranged activation,
+        // including a preparation which fails before dispatch. Capacity alone
+        // is retained; neither pointers nor prior input contents identify reuse.
+        #[cfg(any(
+            test,
+            all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            )
+        ))]
+        self.pq2_consumption.clear();
         let (columns, _, _) = dimensions(tensor)?;
         if input.len() != columns || input.iter().any(|value| !value.is_finite()) {
             return Err(invalid(
@@ -1732,6 +1781,35 @@ impl PreparedMatvec<'_> {
                 if scratch.row_parallelism.uses_pool(rows) {
                     scratch.statistics.parallel_row_operations =
                         scratch.statistics.parallel_row_operations.saturating_add(1);
+                }
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                if matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon) {
+                    // Share one byte-per-column consumption layout across all
+                    // rows and compatible sibling projections in this scope.
+                    // Original Q8_K blocks stay untouched for other consumers.
+                    if scratch.pq2_consumption.is_empty() {
+                        packed_pq2::prepare(&scratch.q8k, &mut scratch.pq2_consumption)?;
+                    }
+                    let pinned = scratch.pinned_accumulation;
+                    return scratch.row_parallelism.fill(
+                        &tensor.data,
+                        row_bytes,
+                        output,
+                        &mut scratch.row_errors,
+                        |bytes| {
+                            if pinned {
+                                packed_pq2::dot_row::<true>(bytes, &scratch.pq2_consumption)
+                            } else {
+                                packed_pq2::dot_row::<false>(bytes, &scratch.pq2_consumption)
+                            }
+                        },
+                    );
                 }
                 scratch.row_parallelism.fill(
                     &tensor.data,

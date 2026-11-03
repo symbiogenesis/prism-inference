@@ -76,6 +76,67 @@ pub(super) fn dot(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
     total.reduce_sum()
 }
 
+/// Consumes scoped digit-plane activations without unpack interleaves per row.
+///
+/// Each sixteen packed bytes describe sixty-four consecutive weights. Their
+/// low/high two-bit digits pair directly with activation planes prepared once
+/// in `packed_pq2`. Two independent i32 accumulators retain all four symbols,
+/// including +2 and activation -128; their combined absolute sum is at most
+/// 32,768. No floating arithmetic or optional ISA is used here.
+#[inline]
+pub(super) fn dot_consumption_order(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return packed
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(activations.as_chunks::<64>().0)
+            .map(|(bytes, values)| {
+                bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| {
+                        (0..4)
+                            .map(|digit| {
+                                (i32::from((byte >> (digit * 2)) & 3) - 1)
+                                    * i32::from(values[digit * 16 + index])
+                            })
+                            .sum::<i32>()
+                    })
+                    .sum::<i32>()
+            })
+            .sum();
+    };
+    let mut even = i32x4::splat(neon, 0);
+    let mut odd = i32x4::splat(neon, 0);
+    for (bytes, values) in packed
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(activations.as_chunks::<64>().0)
+    {
+        let packed = u8x16::from_slice(neon, bytes);
+        let planes = values.as_chunks::<16>().0;
+        even += dot16(
+            (packed & 3).bitcast::<i8x16<Neon>>() - 1,
+            i8x16::from_slice(neon, &planes[0]),
+        );
+        odd += dot16(
+            ((packed >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
+            i8x16::from_slice(neon, &planes[1]),
+        );
+        even += dot16(
+            ((packed >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
+            i8x16::from_slice(neon, &planes[2]),
+        );
+        odd += dot16(
+            (packed >> 6).bitcast::<i8x16<Neon>>() - 1,
+            i8x16::from_slice(neon, &planes[3]),
+        );
+    }
+    (even + odd).reduce_sum()
+}
+
 #[inline]
 fn dot32(neon: Neon, low: i8x16<Neon>, high: i8x16<Neon>, values: &[i8; 32]) -> i32 {
     (dot16(low, i8x16::from_slice(neon, &values[..16]))
@@ -240,7 +301,7 @@ pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{dot, dot_groups, dot_ptq1_groups};
+    use super::{dot, dot_consumption_order, dot_groups, dot_ptq1_groups};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -253,6 +314,57 @@ mod tests {
             }
         }
         sum
+    }
+
+    fn consumption_order(activations: &[i8; 128]) -> [i8; 128] {
+        let mut output = [0; 128];
+        for (source, value) in activations.iter().enumerate() {
+            let packed_byte = source / 4;
+            let half = packed_byte / 16;
+            let digit = source % 4;
+            output[half * 64 + digit * 16 + packed_byte % 16] = *value;
+        }
+        output
+    }
+
+    #[test]
+    fn simd_neon_packed_consumption_exhaustive_bytes_and_extreme_lanes() {
+        let original = std::array::from_fn(|index: usize| {
+            i8::from_ne_bytes([index.to_le_bytes()[0].wrapping_mul(197).wrapping_add(13)])
+        });
+        let prepared = consumption_order(&original);
+        for position in 0..32 {
+            for byte in 0..=u8::MAX {
+                let mut packed = [0x55; 32];
+                packed[position] = byte;
+                assert_eq!(
+                    dot_consumption_order(&packed, &prepared),
+                    reference(&packed, &original)
+                );
+            }
+        }
+        for position in 0..128 {
+            for code in 0..=3 {
+                let mut packed = [0x55; 32];
+                packed[position / 4] &= !(3 << (2 * (position % 4)));
+                packed[position / 4] |= code << (2 * (position % 4));
+                for value in [i8::MIN, -127, -1, 0, 1, i8::MAX] {
+                    let mut original = [0; 128];
+                    original[position] = value;
+                    assert_eq!(
+                        dot_consumption_order(&packed, &consumption_order(&original)),
+                        (i32::from(code) - 1) * i32::from(value)
+                    );
+                }
+            }
+        }
+        for value in [i8::MIN, i8::MAX] {
+            let original = [value; 128];
+            assert_eq!(
+                dot_consumption_order(&[0xff; 32], &consumption_order(&original)),
+                reference(&[0xff; 32], &original)
+            );
+        }
     }
 
     #[test]

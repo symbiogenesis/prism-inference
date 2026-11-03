@@ -59,13 +59,30 @@ The successful baseline [41535008203](https://github.com/symbiogenesis/prism-inf
 took 31m53s, including its initial queue. Backend tool preparation took 5m16s,
 planning occupied a 5m26s span, and execution occupied 14m53s. Most backend artifact
 steps took seconds; ordinary source partition 3 spent about three minutes packing
-and uploading. The routine warm-cache target is roughly three minutes, about a
-tenfold reduction; hosted measurement must distinguish queue time, cold compilation
-and regression execution before claiming that speedup. Full matrix coverage and
-duration remain separate.
+and uploading. Full matrix coverage and duration remain separate from routine
+regression.
 The selected 23 Rust contracts totaled 3.110 seconds in that run's retained
 command receipts (the longest, RoPE, took 1.459 seconds); compilation, cache and
 queue overhead now dominate the expected routine duration.
+
+The new tier passed on source revision
+[`925430f`](https://github.com/symbiogenesis/prism-inference/commit/925430f92cb96d419885db8add36ef92cb21ca5a):
+
+| Hosted run | End-to-end duration, including queues | Result |
+| --- | --- | --- |
+| [Previous full conformance](https://github.com/symbiogenesis/prism-inference/actions/runs/41535008203) | 31m53s | Pass |
+| [First cold regression](https://github.com/symbiogenesis/prism-inference/actions/runs/41584956314) | 6m27s | Pass |
+| [Cached regression](https://github.com/symbiogenesis/prism-inference/actions/runs/41585429205) | 3m20s | Pass |
+
+The cached routine run is 9.565 times faster than the previous full workflow.
+Its Rust job took 55 seconds: cache restore eight seconds, Cargo verification/build
+eight seconds and the assertion step five seconds. The retained controller
+receipt records 23 passing contracts in 2.761 seconds; the step also includes
+Python startup and report handling. Native codec parity and the aggregate gate
+also passed. The initial cold Rust compilation took 159 seconds. These observations
+compare the intentionally different routine/full workloads; they do not measure
+a tenfold speedup of exhaustive conformance or of inference kernels. Queue delays
+and cold compilation remain visible rather than being subtracted from the total.
 The selected 23 Rust contracts totaled 3.110 seconds in that run's retained
 command receipts (the longest, RoPE, took 1.459 seconds); compilation, cache and
 queue overhead now dominate the expected routine duration.

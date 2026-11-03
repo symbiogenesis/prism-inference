@@ -228,3 +228,33 @@ fn tiled_prefill_runtime_failure_restores_all_layer_state_before_replay() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance() -> Result<()> {
+    for chunkwise in [false, true] {
+        let base = fixture(true);
+        let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+        let graph = rank_one_graph(base, factors, 1.3)?;
+        let required = graph.tiled_prefill_scratch_bytes(8)?;
+        let graph = graph.with_tiled_prefill(8, required)?;
+        let mut graph = if chunkwise {
+            graph.with_chunkwise_gdn_prefill()?
+        } else {
+            graph
+        };
+        let original_identity = graph.identity().to_owned();
+        graph.ingest_block(&[0, 1, 0], &|| Ok(()))?;
+        let original_checkpoint = graph.checkpoint()?;
+        for scale in [1.3, 0.5, 1.3] {
+            let old = graph.checkpoint()?;
+            graph.reset_with_adapter_scale(scale)?;
+            assert!(graph.identity().contains(":cpu-tiled-ffn-v1:8"));
+            assert_eq!(graph.identity().contains(":gdn-wy-f32-v1"), chunkwise);
+            assert!(graph.restore(&old).is_err());
+            graph.ingest_block(&[0, 1, 0], &|| Ok(()))?;
+        }
+        assert_eq!(graph.identity(), original_identity);
+        assert!(graph.restore(&original_checkpoint).is_err());
+    }
+    Ok(())
+}

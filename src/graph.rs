@@ -1035,6 +1035,7 @@ impl Qwen35 {
             adapter.identity(),
             scale.to_bits()
         )?;
+        self.append_tiled_prefill_identity(&mut identity)?;
         let provenance = Arc::new(());
         self.reset()?;
         self.identity = identity;

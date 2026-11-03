@@ -1,5 +1,7 @@
 //! Explicit layer-major CPU prompt tiles with unchanged token arithmetic.
 
+use std::fmt::Write as _;
+
 use super::{
     Arithmetic, Attention, Evaluation, LayerDelta, LayerState, Qwen35, Transforms, add,
     checked_product, finite, row_into,
@@ -83,6 +85,20 @@ impl TiledPrefill {
 }
 
 impl Qwen35 {
+    // Rebuild execution identity from the selected typed policy whenever an
+    // adapter reset replaces its trailing scale contract. Never infer a live
+    // numerical policy by parsing an old identity string.
+    pub(super) fn append_tiled_prefill_identity(&self, identity: &mut String) -> Result<()> {
+        if let Some(tile) = &self.tiled_prefill {
+            identity.try_reserve_exact(64)?;
+            write!(identity, ":cpu-tiled-ffn-v1:{}", tile.tokens)?;
+            if tile.chunkwise_gdn {
+                identity.push_str(":gdn-wy-f32-v1");
+            }
+        }
+        Ok(())
+    }
+
     /// Conservative extra payload/metadata reservation for a CPU prompt tile.
     ///
     /// This is additional to live state, ordinary graph scratch, checkpoints,

@@ -2,7 +2,7 @@
 
 use super::{
     Sampler,
-    upstream::{Candidate, Candidates, Config, State},
+    upstream::{Candidate, Candidates, Config, State, top_k_logits},
 };
 use crate::{Result, invalid};
 
@@ -13,7 +13,7 @@ use crate::{Result, invalid};
 /// Repetition is one and presence/frequency penalties are zero; these identity
 /// stages retain no history and consume no draws. There is no reasoning cutoff.
 /// Each call admits exactly the complete Swift vocabulary before filtering and
-/// reuses one bounded candidate allocation after its first successful reserve.
+/// retains only the native-ordered top 20 candidates in reusable scratch.
 /// Cloning independently copies the RNG without copying candidate scratch, so
 /// [`crate::runtime::Runtime`] can roll it back on any request error.
 pub struct SwiftSampler {
@@ -31,6 +31,8 @@ impl Clone for SwiftSampler {
 }
 
 impl SwiftSampler {
+    const TOP_K: usize = 20;
+
     /// Vocabulary extent declared by the pinned Swift model.
     pub const VOCABULARY: usize = 248_320;
 
@@ -65,16 +67,8 @@ impl Sampler for SwiftSampler {
             ));
         }
         let mut backing = std::mem::take(&mut self.backing);
-        backing.clear();
-        backing.try_reserve_exact(logits.len())?;
-        for (index, &logit) in logits.iter().enumerate() {
-            backing.push(Candidate {
-                id: i32::try_from(index)?,
-                logit,
-                probability: 0.0,
-            });
-        }
-        let mut candidates = Candidates::new(backing, -1, false)?;
+        top_k_logits(logits, Self::TOP_K, &mut backing)?;
+        let mut candidates = Candidates::new(backing, -1, true)?;
         let selected = self.sample_candidates(&mut candidates);
         self.backing = candidates.into_backing();
         selected
@@ -84,7 +78,6 @@ impl Sampler for SwiftSampler {
 impl SwiftSampler {
     fn sample_candidates(&mut self, candidates: &mut Candidates) -> Result<u32> {
         for config in [
-            Config::TopK(20),
             Config::TopP {
                 probability: 0.95,
                 min_keep: 1,
@@ -110,18 +103,100 @@ impl SwiftSampler {
 #[cfg(test)]
 mod tests {
     use super::{Sampler, SwiftSampler};
+    use crate::sampling::upstream::{Candidate, Candidates, Config, State, top_k_logits};
 
     #[test]
-    fn candidate_storage_reuses_full_backing_across_filters_rejection_and_reset()
+    fn bounded_top_k_matches_full_candidate_filter_bit_for_bit() -> crate::Result<()> {
+        let mut bounded = Vec::new();
+        for kind in 0..8 {
+            let logits = (0..SwiftSampler::VOCABULARY)
+                .map(|index| {
+                    Ok(match kind {
+                        0 => 0.0,
+                        1 => {
+                            if index.is_multiple_of(2) {
+                                0.0
+                            } else {
+                                -0.0
+                            }
+                        }
+                        2 => f32::from(u16::try_from(index * 17 % 7)?) - 3.0,
+                        3 => f32::from(u16::try_from(index / 4)?),
+                        4 => -f32::from(u16::try_from(index / 4)?),
+                        5 => {
+                            let bits = u32::try_from(index)?
+                                .wrapping_mul(1_664_525)
+                                .wrapping_add(1_013_904_223);
+                            // Clear one exponent bit to retain finite values,
+                            // including subnormals, signs and wide magnitudes.
+                            f32::from_bits(bits & 0xff7f_ffff)
+                        }
+                        6 => {
+                            if index == SwiftSampler::VOCABULARY - 1 {
+                                f32::MAX
+                            } else {
+                                f32::MIN
+                            }
+                        }
+                        _ => {
+                            if index == SwiftSampler::VOCABULARY - 1 {
+                                f32::MIN
+                            } else {
+                                f32::MAX
+                            }
+                        }
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let full = logits
+                .iter()
+                .enumerate()
+                .map(|(index, &logit)| {
+                    Ok(Candidate {
+                        id: i32::try_from(index)?,
+                        logit,
+                        probability: 0.0,
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let mut reference = Candidates::new(full, -1, false)?;
+            State::new(Config::TopK(20))?.apply(&mut reference)?;
+            top_k_logits(&logits, SwiftSampler::TOP_K, &mut bounded)?;
+            assert_eq!(bounded.len(), SwiftSampler::TOP_K);
+            assert_eq!(bounded.capacity(), SwiftSampler::TOP_K);
+            for (actual, expected) in bounded.iter().zip(reference.data()) {
+                assert_eq!(actual.id, expected.id, "input kind {kind}");
+                assert_eq!(actual.logit.to_bits(), expected.logit.to_bits());
+                assert_eq!(actual.probability.to_bits(), expected.probability.to_bits());
+            }
+
+            // Compare the unchanged probability and RNG stages against the full
+            // candidate route after exercising every replacement/tie pattern.
+            let mut sampler = SwiftSampler::new(4242)?;
+            let mut control = SwiftSampler::new(4242)?;
+            assert_eq!(
+                sampler.sample(&logits)?,
+                control.sample_candidates(&mut reference)?,
+                "input kind {kind}"
+            );
+            let uniform = vec![0.0; SwiftSampler::VOCABULARY];
+            assert_eq!(sampler.sample(&uniform)?, control.sample(&uniform)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_storage_reuses_top_k_backing_across_filters_rejection_and_reset()
     -> crate::Result<()> {
         let mut sampler = SwiftSampler::new(0)?;
         let mut logits = vec![0.0; SwiftSampler::VOCABULARY];
         assert_eq!(sampler.sample(&logits)?, 13);
         let allocation = sampler.backing.as_ptr();
         let capacity = sampler.backing.capacity();
-        assert_eq!(sampler.backing.len(), SwiftSampler::VOCABULARY);
+        assert_eq!(sampler.backing.len(), SwiftSampler::TOP_K);
+        assert_eq!(capacity, SwiftSampler::TOP_K);
 
-        // Transaction checkpoints copy RNG state but never the vocabulary-sized
+        // Transaction checkpoints copy RNG state but never the top-k
         // scratch allocation. Subsequent independent draws still match.
         let mut control = sampler.clone();
         assert_eq!(control.backing.capacity(), 0);

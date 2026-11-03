@@ -200,10 +200,12 @@ optional decoded-vocabulary/output storage and allocator overhead. Text mode adm
 at most 1,000,000 vocabulary entries, 64 MiB of decoded piece bytes and 1 MiB per
 piece; the entry table and output buffers are additional bounded storage.
 Reference sampling admits at most 1,048,576 finite logits and allocates bounded
-candidate scratch retained across draws. Swift sampling retains at most 248,320
-12-byte candidates (2,979,840 payload bytes) after its first sample. Sampler
+candidate scratch retained across draws. Swift sampling validates all 248,320
+logits, then streams them through the native top-k heap schedule, retaining only
+20 12-byte candidates (240 payload bytes) after its first sample. It preserves
+native tie ordering, probability arithmetic and seeded draw progression. Sampler
 clones copy options and RNG state without copying candidate scratch; the next
-sample rebuilds candidates in token-ID order. Reset preserves reusable capacity.
+sample visits logits in token-ID order. Reset preserves reusable capacity.
 Request rollback may replace warmed scratch with an empty checkpoint sampler.
 Scratch is outside model/state/checkpoint payload budgets, and allocation reuse
 does not establish lower process peak memory or measured throughput.

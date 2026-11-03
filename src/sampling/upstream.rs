@@ -443,12 +443,7 @@ impl State {
 // order and sort_heap therefore all matter to seeded token identity. A Rust
 // unstable full sort has different ties even for a completely uniform input.
 fn partial_top_k(data: &mut [Candidate], keep: usize) {
-    if keep > 1 {
-        for parent in (0..=(keep - 2) / 2).rev() {
-            let value = data[parent];
-            adjust_heap(data, parent, keep, value);
-        }
-    }
+    make_top_k_heap(&mut data[..keep]);
     for index in keep..data.len() {
         if data[index].logit > data[0].logit {
             let value = data[index];
@@ -456,7 +451,57 @@ fn partial_top_k(data: &mut [Candidate], keep: usize) {
             adjust_heap(data, 0, keep, value);
         }
     }
-    for end in (1..keep).rev() {
+    sort_top_k_heap(&mut data[..keep]);
+}
+
+// Swift validates the complete finite vocabulary before this bounded selection.
+// Preserve partial_top_k's initial heap, strict comparison, token traversal and
+// final heap sort, including equal logits and signed zero. Discarded tail entries
+// are never read again by partial_top_k, so they need no Candidate storage here.
+pub(super) fn top_k_logits(
+    logits: &[f32],
+    keep: usize,
+    backing: &mut Vec<Candidate>,
+) -> Result<()> {
+    if keep == 0 || keep > 128 || keep > logits.len() || logits.len() > MAX_CANDIDATES {
+        return Err(invalid("bounded logit top-k extent is invalid"));
+    }
+    backing.clear();
+    backing.try_reserve_exact(keep)?;
+    for (index, &logit) in logits[..keep].iter().enumerate() {
+        backing.push(Candidate {
+            id: i32::try_from(index)?,
+            logit,
+            probability: 0.0,
+        });
+    }
+    make_top_k_heap(backing);
+    for (index, &logit) in logits.iter().enumerate().skip(keep) {
+        if logit > backing[0].logit {
+            let value = Candidate {
+                id: i32::try_from(index)?,
+                logit,
+                probability: 0.0,
+            };
+            adjust_heap(backing, 0, keep, value);
+        }
+    }
+    sort_top_k_heap(backing);
+    Ok(())
+}
+
+fn make_top_k_heap(data: &mut [Candidate]) {
+    let keep = data.len();
+    if keep > 1 {
+        for parent in (0..=(keep - 2) / 2).rev() {
+            let value = data[parent];
+            adjust_heap(data, parent, keep, value);
+        }
+    }
+}
+
+fn sort_top_k_heap(data: &mut [Candidate]) {
+    for end in (1..data.len()).rev() {
         let value = data[end];
         data[end] = data[0];
         adjust_heap(data, 0, end, value);

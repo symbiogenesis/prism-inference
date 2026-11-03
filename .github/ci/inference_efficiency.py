@@ -43,6 +43,7 @@ CONTROLS = {
         "prefill::chunkwise_gdn_prefill_continuation_restore_and_identity_are_separate",
         "prefill::tiled_prefill_rejects_unadmitted_geometry_and_preserves_state",
         "prefill::tiled_prefill_runtime_failure_restores_all_layer_state_before_replay",
+        "prefill::tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance",
     ],
     "swift_sampling": [
         "swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",

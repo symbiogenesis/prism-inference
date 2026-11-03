@@ -24,6 +24,10 @@ fn state_values(graph: &Qwen35) -> Result<Vec<f32>> {
     Ok(result)
 }
 
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Retain the declared separately rounded absolute-plus-relative tolerance."
+)]
 fn close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (&actual, &expected) in actual.iter().zip(expected) {
@@ -195,7 +199,7 @@ fn tiled_prefill_runtime_failure_restores_all_layer_state_before_replay() -> Res
                 ))
                 .is_err()
         );
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens(), [0_u32; 0]);
         assert!(
             state_values(runtime.decoder())?
                 .iter()

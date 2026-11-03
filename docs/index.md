@@ -18,6 +18,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Configure opt-in packed projection workers | [Explicit row workers](parallel-rows.md) |
 | Review prepared CPU work/storage reductions | [Inference efficiency candidate](inference-efficiency.md) |
 | Review scoped packed activation preparation | [PQ2 consumption layout](packed-pq2-consumption.md) |
+| Select separately qualified CPU prompt tiles or GDN chunks | [CPU tiled prefill](cpu-tiled-prefill.md) |
 | Qualify exact latest-state service reuse | [Latest-prefix service](latest-prefix-service.md) |
 | Compile, check or package the workspace | [Building and validation](build-and-validation.md) |
 | Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |

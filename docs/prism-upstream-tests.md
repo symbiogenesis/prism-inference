@@ -31,6 +31,45 @@ read as an assertion-level pass rate or full-model qualification.
 
 ## What runs
 
+Routine pushes run [Runtime regression](../.github/workflows/runtime-regression.yml):
+one native Windows ARM64 Rust job replays 23 existing source contracts with their
+unchanged inputs and assertions, and a separate job retains native codec parity
+when affected. The [selected corpus](../.github/ci/runtime_regression.py) covers
+PQ2/PTQ1 mapping, tensor numerics, sampling, grammar, templates, allocation, GGUF
+and PEG parsing. Every selected Rust result must pass; unsupported, missing,
+duplicate and failed results fail the regression job. Execution has a shared
+120-second deadline after compilation, with 30 seconds per source. Foundation
+continues to own complete Rust tests, analyzers and native overlay integration.
+
+This routine tier does not rebuild or replay the C++ reference, run the 22,817
+backend geometries, download external tokenizer/model corpora, enumerate all
+32-bit float patterns, or run the long timed/model schedules. Its receipt records
+`FullSourceGate=false` and `NativeReferenceReplay=false`, current project revision,
+harness hash, upstream pin and exact selected source IDs. These are regression
+results, not complete source or model qualification.
+
+Dispatch **Runtime conformance** on `main` for exhaustive source/reference and
+backend qualification before release. Its existing workflow ID, name, complete
+gate, four source partitions, 16 planning partitions and 32 execution partitions
+are retained; full conformance no longer starts on every push. Existing benchmark
+and gradient inputs remain explicit opt-ins. A green Runtime regression result
+does not satisfy the Runtime conformance release requirement.
+
+The successful baseline [41535008203](https://github.com/symbiogenesis/prism-inference/actions/runs/41535008203)
+took 31m53s, including its initial queue. Backend tool preparation took 5m16s,
+planning occupied a 5m26s span, and execution occupied 14m53s. Most backend artifact
+steps took seconds; ordinary source partition 3 spent about three minutes packing
+and uploading. The routine warm-cache target is roughly three minutes, about a
+tenfold reduction; hosted measurement must distinguish queue time, cold compilation
+and regression execution before claiming that speedup. Full matrix coverage and
+duration remain separate.
+The selected 23 Rust contracts totaled 3.110 seconds in that run's retained
+command receipts (the longest, RoPE, took 1.459 seconds); compilation, cache and
+queue overhead now dominate the expected routine duration.
+The selected 23 Rust contracts totaled 3.110 seconds in that run's retained
+command receipts (the longest, RoPE, took 1.459 seconds); compilation, cache and
+queue overhead now dominate the expected routine duration.
+
 All original C++ test executables and fixture exporters are retired. Their
 importer and replay build were removed after Windows ARM64 CI proved the safe
 Rust replacements for every previously required C++ control. Native builds

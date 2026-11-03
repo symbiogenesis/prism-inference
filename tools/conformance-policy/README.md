@@ -10,10 +10,13 @@ Invoke `prism-conformance-policy --version`, or pass `prism-baseline`/`prism-sou
 followed by `--request ABSOLUTE_JSON_PATH`. Requests are bounded to 16 MiB. Source
 result fan-in retains its separate 1 MiB receipt and 128 MiB report bounds.
 
-`.github/workflows/runtime-conformance.yml` runs only on `main`, preserving all
+`.github/workflows/runtime-conformance.yml` is explicitly dispatched on `main`, preserving all
 four ordinary source partitions, 16 backend planning partitions, 32 execution
 partitions and the complete baseline gate. Benchmarks and gradients are explicit
-manual opt-ins. `.github/workflows/prism-focused.yml` diagnoses one named source
+manual opt-ins. Routine pushes use `.github/workflows/runtime-regression.yml` and
+its compact Rust corpus plus affected native codec parity. Regression receipts
+record `FullSourceGate=false` and cannot replace complete release qualification.
+`.github/workflows/prism-focused.yml` diagnoses one named source
 without claiming complete coverage. `scripts/Bonsai.PrismSource.psm1` always
 selects this checkout; only the separately hash-pinned C++ reference is downloaded.
 

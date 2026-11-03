@@ -1,18 +1,5 @@
 name: Runtime conformance
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
-      - 'server/**'
-      - 'tools/rust-trial/**'
-      - 'tools/conformance-policy/**'
-      - 'tools/validation/**'
-      - 'scripts/New-ReleaseBundle.ps1'
-      - 'tests/Test-ReleaseBundle.ps1'
-      - 'tests/Test-RustNightly.ps1'
-      - 'config/rust-nightly-trial.json'
   workflow_dispatch:
     inputs:
       prism_benchmarks:
@@ -35,11 +22,10 @@ env:
   # proof. Keep this in sync with the prism-backend-run matrix below.
   PRISM_BACKEND_EXECUTION_COUNT: '32'
 concurrency:
-  # Pushes select cumulatively from the last successful ancestor, so a newer
-  # revision safely replaces obsolete work instead of occupying all ARM64 slots.
-  # Explicit diagnostic/measurement dispatches keep their own independent run.
-  group: runtime-conformance-${{ github.event_name }}-${{ github.ref }}-${{ github.event_name == 'push' && 'latest' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  # Full source/reference qualification is an explicit release/diagnostic request.
+  # Routine pushes use runtime-regression.yml and never satisfy this full gate.
+  group: runtime-conformance-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 jobs:
   changes:
     if: github.ref == 'refs/heads/main'

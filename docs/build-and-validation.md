@@ -164,10 +164,15 @@ correctness/TPS/quality/security acceptance. Full suites and every benchmark
 remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
 
 This repository also owns the [complete upstream conformance guide](prism-upstream-tests.md).
-Its [runtime workflow](../.github/workflows/runtime-conformance.yml) preserves
-four ordinary source partitions, 16 planning partitions and 32 execution partitions,
-plus native codec parity and a fail-closed aggregate. Measurements and gradients
-remain explicit manual opt-ins. The [focused workflow](../.github/workflows/prism-focused.yml)
+Routine pushes use [Runtime regression](../.github/workflows/runtime-regression.yml):
+23 existing Rust source contracts in one cached native ARM64 job, affected native
+codec parity and a fail-closed aggregate. Its receipts explicitly record
+`FullSourceGate=false`; it does not replay the C++ reference or replace full release
+qualification. The manual [Runtime conformance workflow](../.github/workflows/runtime-conformance.yml)
+preserves four ordinary source partitions, 16 planning partitions, 32 execution
+partitions, codec parity and the full aggregate gate. Dispatch it on `main` before
+release. Measurements and gradients remain explicit manual opt-ins.
+The [focused workflow](../.github/workflows/prism-focused.yml)
 diagnoses one named source without replacing the complete gate.
 
 The [standards workflow](../.github/workflows/standards.yml) owns PowerShell and
@@ -184,12 +189,12 @@ Automatic workflows skip pushes limited to root Markdown files and `docs/`.
 For other pushes, the [impact map](../.github/ci/impact.json) combines changed
 paths with Cargo's local dependency graph. A server-only change checks the
 server; a ternary-codec change also checks its GGUF/runtime/server consumers and
-the native codec lane. Runtime changes select upstream conformance; unrelated
-server or policy-tool changes do not start its backend partitions. Shared
+the native codec lane. Runtime changes select routine upstream regression; unrelated
+server or policy-tool changes do not start its regression job. Shared
 manifests, lockfiles, toolchains, CI policy and unclassified inputs select full
 validation. Manual dispatch always selects every group in that workflow.
 Known unrelated server, compiler-trial, policy-tool, packaging and C# analyzer
-paths also bypass the conformance workflow at its push trigger. The native
+paths also bypass the regression workflow at its push trigger. The native
 codec lane builds its probe and checks parity; Foundation owns its Rust analyzers.
 
 Each workflow compares with its most recent successful push revision on the

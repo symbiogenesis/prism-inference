@@ -1,0 +1,21 @@
+{
+  "SchemaVersion": 1,
+  "Scope": "Focused regression-controller and existing CI impact unit contracts only",
+  "ControllerTests": 4,
+  "ImpactTests": 27,
+  "Status": "pass",
+  "ChargedUpperBoundSeconds": 2,
+  "PowerBefore": {
+    "AcConnected": "unknown",
+    "BatterySaver": "unknown",
+    "Charge": "unknown"
+  },
+  "PowerAfter": {
+    "AcConnected": "unknown",
+    "BatterySaver": "unknown",
+    "Charge": "unknown"
+  },
+  "PowerObservationLimitation": "Endpoint queries executed, but the external evidence-file write was denied and their values were not retained. No later query substitutes for those endpoints.",
+  "PerformanceQualification": false,
+  "NativeOrModelWorkloadExecuted": false
+}

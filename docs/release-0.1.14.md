@@ -44,7 +44,8 @@ verify the new release before selecting it.
 
 ## Installation and provenance
 
-Publication requires successful Foundation, runtime conformance and source-package
+Publication requires successful Foundation, explicitly dispatched full Runtime
+conformance (not the push Runtime regression tier), and source-package
 checks on the exact release commit. Attach the unchanged ARM64 and x64 Foundation
 archives and matching integrity receipts from that commit. Receipts bind source,
 compiler, target, all five executable hashes, the four license/notice files and

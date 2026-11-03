@@ -61,13 +61,18 @@ impl SwiftSampler {
 
 impl Sampler for SwiftSampler {
     fn sample(&mut self, logits: &[f32]) -> Result<u32> {
-        if logits.len() != Self::VOCABULARY || logits.iter().any(|value| !value.is_finite()) {
+        if logits.len() != Self::VOCABULARY {
             return Err(invalid(
                 "Swift sampling requires the complete finite pinned vocabulary",
             ));
         }
         let mut backing = std::mem::take(&mut self.backing);
-        top_k_logits(logits, Self::TOP_K, &mut backing)?;
+        // Selection validates every logit, including discarded candidates, in
+        // the same traversal. Preserve reusable storage if that validation fails.
+        if let Err(error) = top_k_logits(logits, Self::TOP_K, &mut backing) {
+            self.backing = backing;
+            return Err(error);
+        }
         let mut candidates = Candidates::new(backing, -1, true)?;
         let selected = self.sample_candidates(&mut candidates);
         self.backing = candidates.into_backing();
@@ -224,6 +229,29 @@ mod tests {
             assert_eq!(sampler.sample(&logits)?, expected);
             assert_eq!(sampler.backing.as_ptr(), allocation);
             assert_eq!(sampler.backing.capacity(), capacity);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selection_rejects_nonfinite_discarded_logits_without_losing_rng_or_storage()
+    -> crate::Result<()> {
+        let mut actual = SwiftSampler::new(42)?;
+        let mut expected = SwiftSampler::new(42)?;
+        let mut logits = vec![0.0; SwiftSampler::VOCABULARY];
+        assert_eq!(actual.sample(&logits)?, expected.sample(&logits)?);
+        let allocation = actual.backing.as_ptr();
+        let capacity = actual.backing.capacity();
+        for index in [0, 19, 20, SwiftSampler::VOCABULARY - 1] {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                logits[index] = value;
+                assert!(actual.sample(&logits).is_err());
+                assert!(actual.backing.is_empty());
+                assert_eq!(actual.backing.as_ptr(), allocation);
+                assert_eq!(actual.backing.capacity(), capacity);
+                logits[index] = 0.0;
+                assert_eq!(actual.sample(&logits)?, expected.sample(&logits)?);
+            }
         }
         Ok(())
     }

@@ -454,7 +454,7 @@ fn partial_top_k(data: &mut [Candidate], keep: usize) {
     sort_top_k_heap(&mut data[..keep]);
 }
 
-// Swift validates the complete finite vocabulary before this bounded selection.
+// Validate the complete finite vocabulary during this bounded selection.
 // Preserve partial_top_k's initial heap, strict comparison, token traversal and
 // final heap sort, including equal logits and signed zero. Discarded tail entries
 // are never read again by partial_top_k, so they need no Candidate storage here.
@@ -469,6 +469,12 @@ pub(super) fn top_k_logits(
     backing.clear();
     backing.try_reserve_exact(keep)?;
     for (index, &logit) in logits[..keep].iter().enumerate() {
+        if !logit.is_finite() {
+            backing.clear();
+            return Err(invalid(
+                "Swift sampling requires the complete finite pinned vocabulary",
+            ));
+        }
         backing.push(Candidate {
             id: i32::try_from(index)?,
             logit,
@@ -477,6 +483,12 @@ pub(super) fn top_k_logits(
     }
     make_top_k_heap(backing);
     for (index, &logit) in logits.iter().enumerate().skip(keep) {
+        if !logit.is_finite() {
+            backing.clear();
+            return Err(invalid(
+                "Swift sampling requires the complete finite pinned vocabulary",
+            ));
+        }
         if logit > backing[0].logit {
             let value = Candidate {
                 id: i32::try_from(index)?,

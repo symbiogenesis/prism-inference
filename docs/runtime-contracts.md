@@ -232,6 +232,14 @@ Process/hardware admission remains the caller's responsibility. SwiftBonsai
 supplies its guarded development launcher; these payload bounds do not admit
 process memory.
 
+Reset at position zero skips clearing already canonical empty live state. This
+avoids repeating the 149.625 MiB Swift recurrent/convolution zero fill during
+construction/runtime initialization and request reset followed by prefix preparation.
+Failed first-token evaluation may dirty workspace but never committed state;
+nonempty reset still clears all live values, and adapter-scale reset still renews
+identity and checkpoint provenance. This removes redundant writes without claiming
+measured request latency or changing retained memory and admission bounds.
+
 Graph workspace retains high-water allocations across evaluations/reset. KV
 pages grow within the context bound, sealing only complete pages. Checkpoint
 admission charges every referenced immutable page per snapshot, page-table

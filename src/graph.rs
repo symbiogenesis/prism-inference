@@ -1884,6 +1884,14 @@ impl Decoder for Qwen35 {
     }
 
     fn reset(&mut self) -> Result<()> {
+        // Construction and successful reset establish canonical empty state.
+        // Evaluation writes only provisional deltas until its infallible commit
+        // advances position, and failed restore staging never changes live state.
+        // Avoid refilling the recurrent buffers when callers reset twice (for
+        // example request-boundary reset followed by runtime prefix preparation).
+        if self.position == 0 {
+            return Ok(());
+        }
         for state in &mut self.state {
             match state {
                 LayerState::Full { keys, values } => {

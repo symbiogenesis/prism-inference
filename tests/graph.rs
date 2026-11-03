@@ -1485,6 +1485,56 @@ fn full_attention_uses_causal_binary16_values_and_gate() -> Result<()> {
 }
 
 #[test]
+fn empty_reset_preserves_hybrid_state_after_late_failure_and_checkpoint_restore() -> Result<()> {
+    let fault_fixture = || {
+        let mut model = hybrid_fixture();
+        model.tensors.insert(
+            "output.weight".to_owned(),
+            weight("output.weight", &[2, 2], &[f32::MAX; 4]),
+        );
+        model
+    };
+    let mut decoder = Qwen35::new(fault_fixture(), 16)?;
+    let mut fresh = Qwen35::new(fault_fixture(), 16)?;
+    let initial = graph_bits(&decoder)?;
+    let empty = decoder.checkpoint()?;
+    for _ in 0..2 {
+        decoder.reset()?;
+        assert_eq!(graph_bits(&decoder)?, initial);
+    }
+
+    // Final output overflow occurs after full-attention and recurrent deltas
+    // have been populated, while committed position and state remain empty.
+    let mut logits = vec![f32::NAN; 2];
+    assert!(decoder.evaluate_into(0, &mut logits).is_err());
+    assert!(logits.is_empty());
+    decoder.reset()?;
+    decoder.restore(&empty)?;
+    assert_eq!(graph_bits(&decoder)?, initial);
+    decoder.ingest(0)?;
+    fresh.ingest(0)?;
+    assert_eq!(graph_bits(&decoder)?, graph_bits(&fresh)?);
+    let prefix = decoder.checkpoint()?;
+    decoder.ingest(1)?;
+    fresh.ingest(1)?;
+    let continued = graph_bits(&fresh)?;
+    assert_eq!(graph_bits(&decoder)?, continued);
+
+    // A nonempty reset must still clear every committed value; a subsequent
+    // empty reset cannot affect independent snapshots or continuation bits.
+    decoder.reset()?;
+    decoder.reset()?;
+    assert_eq!(graph_bits(&decoder)?, initial);
+    decoder.restore(&prefix)?;
+    decoder.ingest(1)?;
+    assert_eq!(graph_bits(&decoder)?, continued);
+    decoder.restore(&empty)?;
+    decoder.reset()?;
+    assert_eq!(graph_bits(&decoder)?, initial);
+    Ok(())
+}
+
+#[test]
 fn empty_checkpoint_omits_recurrent_payload_after_construction_and_reset() -> Result<()> {
     let mut decoder = Qwen35::new(fixture(true), 16)?;
     let empty_bytes = decoder.checkpoint_bytes();

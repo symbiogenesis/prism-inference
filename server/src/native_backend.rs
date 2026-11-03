@@ -294,13 +294,15 @@ async fn deliver<W: AsyncWrite + Unpin>(
                     && !delivered.load(Ordering::Acquire)
                     && let Some(writer) = &mut writer
                 {
-                    write_json(
-                        writer,
-                        400,
-                        &json!({"error":"native request rejected"}),
-                        deadline,
-                    )
-                    .await?;
+                    let context =
+                        result == Err(NativeBackendError::Admission(Rejection::ContextLimit));
+                    let status = if context { 413 } else { 400 };
+                    let body = if context {
+                        json!({"error":{"code":"context_length_exceeded"}})
+                    } else {
+                        json!({"error":"native request rejected"})
+                    };
+                    write_json(writer, status, &body, deadline).await?;
                 }
                 return result.and_then(|()| {
                     if delivered.load(Ordering::Acquire) {
@@ -577,6 +579,8 @@ async fn write_json<W: AsyncWrite + Unpin>(
         "OK"
     } else if status == 401 {
         "Unauthorized"
+    } else if status == 413 {
+        "Content Too Large"
     } else {
         "Bad Request"
     };

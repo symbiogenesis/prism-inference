@@ -197,7 +197,15 @@ impl Bpe {
             return Ok(());
         }
         if max_tokens == 0 {
-            return Err(invalid("BPE output exceeds token limit"));
+            // Missing byte vocabulary is corruption, including when no output
+            // capacity remains. Preserve that classification before the bound.
+            if bytes
+                .iter()
+                .any(|&byte| self.bytes[usize::from(byte)].is_none())
+            {
+                return Err(invalid("BPE input byte has no normal single-byte token"));
+            }
+            return Err(crate::TokenLimitExceeded.into());
         }
         let BpeScratch { nodes, candidates } = scratch;
         nodes.clear();
@@ -248,7 +256,7 @@ impl Bpe {
             }
         }
         if remaining > max_tokens {
-            return Err(invalid("BPE output exceeds token limit"));
+            return Err(crate::TokenLimitExceeded.into());
         }
         output.try_reserve_exact(remaining)?;
         let mut current = Some(0);

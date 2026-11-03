@@ -108,6 +108,36 @@ fn text_encoding_specials_require_explicit_opt_in_and_preserve_surrounding_bytes
 }
 
 #[test]
+fn text_token_capacity_is_typed_without_reclassifying_byte_safety_limits() -> Result<()> {
+    let values = metadata()?;
+    let tokenizer = Tokenizer::from_metadata(&values, 260)?;
+    let special = SpecialTokens::from_metadata(&values, 260)?;
+    for (text, limit) in [("a!", 1), ("<stop><tag>", 1)] {
+        assert!(
+            tokenizer
+                .encode(text, limit, SpecialInputPolicy::Parse)
+                .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+        );
+    }
+    assert!(
+        tokenizer
+            .encode_with_special_tokens("", 1, SpecialInputPolicy::Parse, &special)
+            .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
+    assert!(
+        tokenizer
+            .encode(
+                &"a".repeat(MAX_BPE_INPUT_BYTES + 1),
+                0,
+                SpecialInputPolicy::Parse
+            )
+            .is_err_and(|error| !error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
+    assert_eq!(tokenizer.encode("ab", 1, SpecialInputPolicy::Parse)?, [256]);
+    Ok(())
+}
+
+#[test]
 fn text_encoding_unicode_and_control_bytes_round_trip_with_bounded_output() -> Result<()> {
     let values = metadata()?;
     let tokenizer = Tokenizer::from_metadata(&values, 260)?;

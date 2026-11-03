@@ -233,6 +233,31 @@ fn missing_normal_byte_fallback_fails_even_if_a_longer_or_byte_type_token_exists
 }
 
 #[test]
+fn token_capacity_error_preserves_corruption_and_piece_safety_classification() -> Result<()> {
+    let bpe = Bpe::from_metadata(&complete_metadata()?, 256)?;
+    for (bytes, limit) in [(b"ab".as_slice(), 1), (b"a".as_slice(), 0)] {
+        assert!(
+            bpe.encode_piece(bytes, limit)
+                .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+        );
+    }
+    assert!(
+        bpe.encode_piece(&vec![b'a'; MAX_BPE_PIECE_BYTES + 1], 0)
+            .is_err_and(|error| !error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
+    let corrupt = Bpe::from_metadata(&metadata(&[("a", 1)], &[]), 1)?;
+    for limit in [0, 1] {
+        assert!(
+            corrupt
+                .encode_piece(b"b", limit)
+                .is_err_and(|error| !error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+        );
+    }
+    assert_eq!(bpe.encode_piece(b"ab", 2)?, [97, 98]);
+    Ok(())
+}
+
+#[test]
 fn merge_metadata_has_strict_type_and_required_presence() {
     let valid = metadata(&[("a", 1)], &[]);
     for value in [MetadataValue::String("a a".to_owned()), vec![1_i32].into()] {

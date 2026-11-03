@@ -70,13 +70,23 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
             .transpose()?;
         let prompt = session
             .prepare_with_settings(messages, output, enable_thinking, adapter_scale)
-            .map_err(|_| Rejection::TokenCountUnavailable)?;
+            .map_err(|error| classify_preparation_error(error.as_ref()))?;
         let count = prompt.prompt_tokens();
         prepared = Some(prompt);
         Ok(count)
     })?;
     let prompt = prepared.ok_or(Rejection::TokenCountUnavailable)?;
     Ok(NativeChat { admitted, prompt })
+}
+
+fn classify_preparation_error(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Rejection {
+    if error.is::<bonsai_prism_runtime::TokenLimitExceeded>() {
+        Rejection::ContextLimit
+    } else {
+        Rejection::TokenCountUnavailable
+    }
 }
 
 /// Stream one admitted request on its original verified native session.
@@ -96,4 +106,42 @@ pub fn complete(
     emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
 ) -> bonsai_prism_runtime::Result<Completion> {
     session.complete(&chat.prompt, cancellation, deadline, emit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_preparation_error;
+    use crate::Rejection;
+
+    #[test]
+    fn native_swift_context_classification_requires_concrete_token_limit_error() {
+        assert_eq!(
+            classify_preparation_error(&bonsai_prism_runtime::TokenLimitExceeded),
+            Rejection::ContextLimit
+        );
+        for message in [
+            "token output exceeds token limit",
+            "invalid UTF-8",
+            "missing byte vocabulary",
+            "byte limit exceeded",
+            "allocation failed",
+        ] {
+            assert_eq!(
+                classify_preparation_error(&std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message
+                )),
+                Rejection::TokenCountUnavailable
+            );
+        }
+        let bytes = std::hint::black_box([u8::MAX]);
+        let utf8 = std::str::from_utf8(&bytes).err();
+        assert!(utf8.is_some());
+        if let Some(error) = utf8 {
+            assert_eq!(
+                classify_preparation_error(&error),
+                Rejection::TokenCountUnavailable
+            );
+        }
+    }
 }

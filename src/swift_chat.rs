@@ -289,6 +289,8 @@ impl SwiftChatSession {
     /// # Errors
     /// Rejects unsupported/bounded message shapes, zero or more than 4096 output
     /// tokens, template failure and prompt plus output beyond 8192 tokens.
+    /// Only encoded prompt-capacity overflow preserves the concrete
+    /// [`crate::TokenLimitExceeded`] marker; other failures retain their type.
     pub fn prepare(&self, messages: &Value, reserved_output_tokens: usize) -> Result<SwiftPrompt> {
         self.prepare_with_thinking(messages, reserved_output_tokens, true)
     }

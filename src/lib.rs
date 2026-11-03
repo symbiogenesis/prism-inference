@@ -58,6 +58,24 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// A checked native runtime operation.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// An encoded token sequence exceeds its explicit caller-supplied output capacity.
+///
+/// This value-free marker distinguishes token output accounting from malformed
+/// tokenizers, byte/piece safety limits and allocation failures. A session may
+/// classify it as context rejection only when that capacity is derived from its
+/// validated prompt-plus-output context budget. Existing boxed results retain
+/// the concrete type for checked downcasting; display text is not a protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenLimitExceeded;
+
+impl std::fmt::Display for TokenLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("token output exceeds token limit")
+    }
+}
+
+impl std::error::Error for TokenLimitExceeded {}
+
 /// Maximum number of state-only prompt tokens admitted in one prefill block.
 /// This bounds scheduling granularity, without implying a batched graph kernel.
 pub const MAX_PREFILL_BLOCK_TOKENS: usize = 256;

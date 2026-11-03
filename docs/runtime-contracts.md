@@ -39,6 +39,20 @@ existing guarded Windows Job. The private HTTP server preserves authentication,
 exact prepared-input binding, bounded reasoning/content streaming and reset
 requirements. Ordinary SwiftBonsai builds do not compile this runtime.
 
+Authenticated private count requests distinguish a genuine encoded prompt token
+capacity overflow from unavailable counting. The runtime preserves a value-free
+`TokenLimitExceeded` concrete error through existing boxed results; only that
+error, produced under the session's validated context reservation, maps to
+`ContextLimit`. Tokenizer corruption, invalid text/schema, byte/piece safety
+bounds and allocation failures retain their failure classification. Display text
+never selects an HTTP error. Before response generation begins, a context
+rejection returns `413 Content Too Large` and exactly
+`{"error":{"code":"context_length_exceeded"}}`, with bounded JSON length,
+connection close, no-store and nosniff headers. Other engine/admission failures
+keep the generic failure response. Rejection clears any earlier counted prompt
+seal, performs no generation and leaves a healthy owner available for a fresh
+count/generation exchange. It does not reset a faulted generation or replay work.
+
 The release also includes `prism-inference`, `bonsai-token-worker`,
 `bonsai-swift-worker` and `bonsai-gguf`. The legacy worker names and Rust library
 name `bonsai_prism_runtime` preserve first-release protocol/API compatibility.

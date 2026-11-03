@@ -293,3 +293,32 @@ fn swift_actual_artifact_matches_native_prompt_bytes_ids_and_budget() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn swift_chat_context_overflow_is_typed_and_preserves_healthy_tokenizer() -> Result<()> {
+    let session = SwiftChatSession::from_metadata(&synthetic_swift_metadata()?)?;
+    let valid = json!([{"role":"user","content":"Hi"}]);
+    let first = session.prepare_with_thinking(&valid, 1, false)?;
+    let overflow = json!([{"role":"user","content":" q".repeat(5000)}]);
+    assert!(
+        session
+            .prepare_with_thinking(&overflow, 4096, false)
+            .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
+    for (messages, output) in [
+        (json!([{"role":"user","content":"Hi","unknown":true}]), 1),
+        (
+            json!([{"role":"user","content":"a".repeat(1024*1024+1)}]),
+            1,
+        ),
+        (valid.clone(), 0),
+    ] {
+        assert!(
+            session
+                .prepare_with_thinking(&messages, output, false)
+                .is_err_and(|error| !error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+        );
+    }
+    assert_eq!(session.prepare_with_thinking(&valid, 1, false)?, first);
+    Ok(())
+}

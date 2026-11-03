@@ -77,7 +77,7 @@ impl Tokenizer {
                 InputSegment::Special(token) => {
                     charge_pieces(&mut piece_count, 1)?;
                     if output.len() == max_tokens {
-                        return Err(invalid("tokenizer output exceeds token limit"));
+                        return Err(crate::TokenLimitExceeded.into());
                     }
                     output.push(token);
                 }
@@ -137,7 +137,7 @@ impl Tokenizer {
         let insertion_count = usize::from(beginning.is_some()) + usize::from(end.is_some());
         let text_limit = max_tokens
             .checked_sub(insertion_count)
-            .ok_or_else(|| invalid("tokenizer insertions exceed token limit"))?;
+            .ok_or(crate::TokenLimitExceeded)?;
         let mut output = self.encode(text, text_limit, policy)?;
         output.try_reserve_exact(insertion_count)?;
         if let Some(token) = beginning {

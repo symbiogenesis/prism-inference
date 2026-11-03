@@ -93,6 +93,7 @@ struct Observation {
     resets: Arc<AtomicUsize>,
     terminated: Arc<AtomicBool>,
     row_workers: Option<usize>,
+    preparation_rejection: Option<(usize, Rejection)>,
 }
 struct FakeEngine(Observation);
 
@@ -111,7 +112,12 @@ impl worker::Engine for FakeEngine {
         })
     }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
-        self.0.preparations.fetch_add(1, Ordering::Relaxed);
+        let preparation = self.0.preparations.fetch_add(1, Ordering::Relaxed);
+        if let Some((index, error)) = self.0.preparation_rejection
+            && preparation == index
+        {
+            return Err(NativeBackendError::Admission(error));
+        }
         let value: Value =
             serde_json::from_slice(&pending.body).map_err(|_| NativeBackendError::Schema)?;
         let thinking = value["chat_template_kwargs"]["enable_thinking"]
@@ -185,6 +191,101 @@ async fn perform(
     };
     let (result, output) = together(serving, receive).await;
     Ok((result, output?))
+}
+
+#[test]
+fn private_typed_context_rejection_clears_count_seal_without_faulting_owner() -> TestResult {
+    run(async {
+        for rejection in [
+            Rejection::ContextLimit,
+            Rejection::TokenCountUnavailable,
+            Rejection::ChatSchema,
+        ] {
+            let observed = Observation {
+                preparation_rejection: Some((1, rejection)),
+                ..Observation::default()
+            };
+            let mut worker = Worker::new(FakeEngine(observed.clone()), 42)
+                .map_err(|error| format!("{error:?}"))?;
+            let body = pending(true, 128)
+                .map_err(|error| format!("{error:?}"))?
+                .body;
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, false),
+            )
+            .await?;
+            assert_eq!(result, Err(NativeBackendError::Unauthorized));
+            assert_eq!(observed.preparations.load(Ordering::Relaxed), 1);
+            let (result, reply) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Err(NativeBackendError::Admission(rejection)));
+            let boundary = reply
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .ok_or("missing HTTP framing")?;
+            let head = std::str::from_utf8(&reply[..boundary])?;
+            let payload = &reply[boundary + 4..];
+            let context = rejection == Rejection::ContextLimit;
+            assert_eq!(
+                head.lines().next(),
+                Some(if context {
+                    "HTTP/1.1 413 Content Too Large"
+                } else {
+                    "HTTP/1.1 400 Bad Request"
+                })
+            );
+            for header in [
+                "Content-Type: application/json",
+                "Connection: close",
+                "Cache-Control: no-store",
+                "X-Content-Type-Options: nosniff",
+            ] {
+                assert!(head.lines().any(|line| line == header));
+            }
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .ok_or("missing content length")?
+                .parse::<usize>()?;
+            assert_eq!(length, payload.len());
+            assert_eq!(
+                serde_json::from_slice::<Value>(payload)?,
+                if context {
+                    json!({"error":{"code":"context_length_exceeded"}})
+                } else {
+                    json!({"error":"native request rejected"})
+                }
+            );
+            assert!(!std::str::from_utf8(&reply)?.contains("A scene."));
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+            let (result, _) =
+                perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
+            assert_eq!(result, Err(NativeBackendError::CountMismatch));
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let (result, _) =
+                perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
+            assert_eq!(result, Ok(()));
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 1);
+            assert_eq!(observed.resets.load(Ordering::Relaxed), 0);
+        }
+        Ok(())
+    })
 }
 
 #[test]

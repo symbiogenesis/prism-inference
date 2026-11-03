@@ -159,7 +159,11 @@ fn session_keeps_special_parsing_insertion_and_empty_input_explicit() -> Result<
     assert_eq!(session.encode("", request)?.token_ids, [259, 258]);
     assert_eq!(session.encode("", policy(1, 0))?.token_ids, [0_u32; 0]);
     request.budget.context = 2;
-    assert!(error(session.encode("", request))?.contains("insertions exceed token limit"));
+    assert!(
+        session
+            .encode("", request)
+            .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
     Ok(())
 }
 

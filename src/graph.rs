@@ -815,7 +815,10 @@ impl Transforms {
 }
 
 /// Exact conversation state with shared immutable KV pages and an owned tail.
+///
 /// Convolution and recurrent payloads are copied exactly, without F16 rounding.
+/// A zero-position checkpoint retains only provenance and metadata: construction
+/// and reset establish empty KV and positive-zero recurrent/convolution state.
 pub struct Qwen35Checkpoint {
     provenance: Arc<()>,
     identity: String,
@@ -1924,10 +1927,17 @@ impl Decoder for Qwen35 {
         // retained recurrent snapshots. Tails are private: subsequent append
         // needs no payload COW. Allocator overhead and graph scratch remain
         // outside this element/metadata storage bound, as for live state.
+        // Empty checkpoints retain no layer payload. Continue charging their
+        // unused layer-table capacity conservatively, without charging the
+        // canonical zero recurrent buffers or spare KV capacity after reset.
         size_of::<Qwen35Checkpoint>()
             + self.identity.capacity()
             + self.state.capacity() * size_of::<LayerState>()
-            + self.state.iter().map(LayerState::bytes).sum::<usize>()
+            + if self.position == 0 {
+                0
+            } else {
+                self.state.iter().map(LayerState::bytes).sum::<usize>()
+            }
     }
 
     fn checkpoint(&self) -> Result<Self::Checkpoint> {
@@ -1936,7 +1946,14 @@ impl Decoder for Qwen35 {
             identity: copy_string(&self.identity)?,
             context_limit: self.context_limit,
             position: self.position,
-            layers: copy_state(&self.state)?,
+            // Graph evaluation commits all layer deltas and position together.
+            // Position zero therefore has one exact representation, even after
+            // a failed first evaluation has populated workspace scratch.
+            layers: if self.position == 0 {
+                Vec::new()
+            } else {
+                copy_state(&self.state)?
+            },
         })
     }
 
@@ -1944,12 +1961,21 @@ impl Decoder for Qwen35 {
         if !Arc::ptr_eq(&checkpoint.provenance, &self.provenance)
             || checkpoint.identity != self.identity
             || checkpoint.context_limit != self.context_limit
-            || checkpoint.layers.len() != self.layers.len()
+            || if checkpoint.position == 0 {
+                !checkpoint.layers.is_empty()
+            } else {
+                checkpoint.layers.len() != self.layers.len()
+            }
             || checkpoint.position > self.context_limit
         {
             return Err(invalid(
                 "checkpoint belongs to a different model or context",
             ));
+        }
+        if checkpoint.position == 0 {
+            // All provenance and shape checks precede this infallible reset of
+            // existing live storage; scratch and other snapshots remain private.
+            return self.reset();
         }
         restore_state(&mut self.state, &checkpoint.layers, KvCache::copy)?;
         self.position = checkpoint.position;

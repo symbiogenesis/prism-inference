@@ -1485,6 +1485,134 @@ fn full_attention_uses_causal_binary16_values_and_gate() -> Result<()> {
 }
 
 #[test]
+fn empty_checkpoint_omits_recurrent_payload_after_construction_and_reset() -> Result<()> {
+    let mut decoder = Qwen35::new(fixture(true), 16)?;
+    let empty_bytes = decoder.checkpoint_bytes();
+    let empty = decoder.checkpoint()?;
+    decoder.ingest(0)?;
+    // This fixture owns six convolution and four recurrent binary32 values.
+    assert_eq!(
+        decoder.checkpoint_bytes() - empty_bytes,
+        10 * size_of::<f32>()
+    );
+    decoder.restore(&empty)?;
+    assert_eq!(decoder.checkpoint_bytes(), empty_bytes);
+    assert!(graph_bits(&decoder)?.iter().all(|&bits| bits == 0));
+    decoder.ingest(1)?;
+    decoder.reset()?;
+    assert_eq!(decoder.checkpoint_bytes(), empty_bytes);
+    Ok(())
+}
+
+#[test]
+fn empty_checkpoint_restores_hybrid_pages_and_preserves_nonempty_snapshot() -> Result<()> {
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let mut decoder = Qwen35::new(paged_hybrid_fixture(), 192)?;
+    let initial_bits = graph_bits(&decoder)?;
+    let empty_bytes = decoder.checkpoint_bytes();
+    let empty = decoder.checkpoint()?;
+    decoder.ingest(0)?;
+    let prefix_bits = graph_bits(&decoder)?;
+    let prefix = decoder.checkpoint()?;
+    // Cross a page seal so empty restoration must discard both pages and tails.
+    for token in [1, 0].into_iter().cycle().take(70) {
+        decoder.ingest(token)?;
+    }
+    for _ in 0..2 {
+        decoder.restore(&empty)?;
+        assert_eq!(graph_bits(&decoder)?, initial_bits);
+        assert_eq!(decoder.checkpoint_bytes(), empty_bytes);
+        let mut fresh = Qwen35::new(paged_hybrid_fixture(), 192)?;
+        for token in [1, 1, 0] {
+            assert_eq!(bits(decoder.evaluate(token)?), bits(fresh.evaluate(token)?));
+            assert_eq!(graph_bits(&decoder)?, graph_bits(&fresh)?);
+        }
+        // Empty restoration cannot mutate a separately saved nonempty prefix.
+        decoder.restore(&prefix)?;
+        assert_eq!(graph_bits(&decoder)?, prefix_bits);
+        fresh.reset()?;
+        fresh.ingest(0)?;
+        assert_eq!(bits(decoder.evaluate(1)?), bits(fresh.evaluate(1)?));
+        assert_eq!(graph_bits(&decoder)?, graph_bits(&fresh)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_checkpoint_rejects_foreign_and_stale_adapter_provenance() -> Result<()> {
+    let graph = || {
+        let base = fixture(true);
+        let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+        rank_one_graph(base, factors, 1.3)
+    };
+    let mut decoder = graph()?;
+    let empty = decoder.checkpoint()?;
+    let mut foreign = graph()?;
+    foreign.ingest(1)?;
+    let before = graph_bits(&foreign)?;
+    assert!(foreign.restore(&empty).is_err());
+    assert_eq!(graph_bits(&foreign)?, before);
+    // Even restoring the original scale cannot renew an old empty snapshot.
+    for scale in [0.0, 1.3] {
+        decoder.reset_with_adapter_scale(scale)?;
+        decoder.ingest(0)?;
+        let before = graph_bits(&decoder)?;
+        assert!(decoder.restore(&empty).is_err());
+        assert_eq!(graph_bits(&decoder)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_checkpoint_request_rollback_replays_fresh_after_delivery_failure() -> Result<()> {
+    let runtime = || {
+        Runtime::new(
+            Qwen35::new(hybrid_fixture(), 16)?,
+            Limits {
+                context_tokens: 16,
+                checkpoints: 0,
+                checkpoint_bytes: 1024 * 1024,
+            },
+        )
+    };
+    let mut actual = runtime()?;
+    let mut expected = runtime()?;
+    let initial = graph_bits(actual.decoder())?;
+    let options = Generation {
+        max_tokens: 2,
+        stop_tokens: vec![],
+    };
+    let cancellation = Cancellation::default();
+    assert!(
+        actual
+            .generate(&[0, 1], &options, &cancellation, |_| Err(
+                "delivery failed".into()
+            ))
+            .is_err()
+    );
+    assert_eq!(actual.tokens(), [0_u32; 0]);
+    assert!(!actual.is_faulted());
+    assert_eq!(graph_bits(actual.decoder())?, initial);
+    let mut actual_tokens = Vec::new();
+    let mut expected_tokens = Vec::new();
+    actual.generate(&[1, 0], &options, &cancellation, |token| {
+        actual_tokens.push(token);
+        Ok(())
+    })?;
+    expected.generate(&[1, 0], &options, &cancellation, |token| {
+        expected_tokens.push(token);
+        Ok(())
+    })?;
+    assert_eq!(actual_tokens, expected_tokens);
+    assert_eq!(actual.tokens(), expected.tokens());
+    assert_eq!(
+        graph_bits(actual.decoder())?,
+        graph_bits(expected.decoder())?
+    );
+    Ok(())
+}
+
+#[test]
 fn hybrid_state_checkpoint_restores_exact_recurrent_prefix() -> Result<()> {
     let mut decoder = Qwen35::new(fixture(true), 16)?;
     decoder.evaluate(0)?;

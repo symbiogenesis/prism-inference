@@ -120,6 +120,12 @@ for qualification that remains open.
 - Full-attention checkpoints share sealed 64-token FP16 KV pages. Each snapshot
   copies the private mutable tail and complete F32 convolution/recurrent state;
   later append, reset or restoration cannot modify saved pages.
+- At position zero, graph checkpoints store provenance and metadata without
+  copying canonical empty KV or positive-zero convolution/recurrent payloads.
+  Restore validates provenance before clearing existing live state. This avoids
+  copying and retaining 149.625 MiB of Swift recurrent/convolution payload for a
+  reset-started request's rollback checkpoint. Nonempty snapshots remain complete
+  and independent; this byte accounting is not a measured process-memory gain.
 - Scoped prepared matvecs share activation preparation across compatible FFN,
   full-attention and recurrent sibling projections. Groups require the same
   exact input, transform/permutation, width and activation contract; mixed
@@ -229,7 +235,9 @@ pages grow within the context bound, sealing only complete pages. Checkpoint
 admission charges every referenced immutable page per snapshot, page-table
 capacity, copied private tails and recurrent storage. This conservatively
 overcharges shared payload rather than depending on current reference counts;
-the bound covers worst-case independent copies. Tight budgets can reject rollback
+the bound covers worst-case independent copies. Canonical zero-position snapshots
+charge metadata, including conservative layer-table capacity, but no numerical
+payload or spare KV storage retained after reset. Tight budgets can reject rollback
 capture or retain fewer prefixes. RoPE reuse lasts one
 evaluation attempt. Neither retained-model nor checkpoint budgets cover workspace.
 Synthetic capacity reuse does not establish full-model allocation, peak-memory or

@@ -1,6 +1,6 @@
 //! Scoped PQ2 activation layout for baseline NEON's packed consumption order.
 //!
-//! Only activation bytes are rearranged. Original Q8_K blocks remain available
+//! Only activation bytes are rearranged. Original `Q8_K` blocks remain available
 //! to other formats and external executors; weights never expand or repack.
 
 use bonsai_ternary::Q8KBlock;

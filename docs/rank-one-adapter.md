@@ -48,6 +48,16 @@ reuses one rank value and one output-width vector. No dense vocabulary-sized
 correction is constructed. These storage properties do not establish process
 peak RAM, a lower admission budget or a speed improvement.
 
+One-column F32 projections stream each B scalar directly from its immutable
+payload after one geometry check. They retain the existing scalar dot's F32
+product and binary64 reduction, including signed zero, and reject nonfinite
+weights and products before publishing output. This removes decoded-row
+validation and scratch preparation for every B output channel (660,480 across
+the approved Swift adapter per token), without a second factor copy. Focused
+bitwise controls compare the previous decoded-row route, including subnormals,
+signed zero, product overflow and recovery. Whole-model speed and parity remain
+separate qualification gates.
+
 ## Capture actual-model correctness evidence
 
 Build the `swift_model_check` example through the external working-directory and

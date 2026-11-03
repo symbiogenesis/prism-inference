@@ -1697,6 +1697,19 @@ impl PreparedMatvec<'_> {
         let scratch = &mut *self.scratch;
         output.try_reserve_exact(rows)?;
         match tensor.kind {
+            F32 if columns == 1 => {
+                scratch.diagnostics = scratch.diagnostics.select(false);
+                // Rank-one adapter B factors have one scalar per output row.
+                // Geometry is already checked above: stream those scalars
+                // instead of validating and preparing a row Vec for each one.
+                // Keep the exact generic dot, including its binary64 reduction
+                // and signed-zero behavior. The pinned FMA path requires 16
+                // columns, so it never applies to these one-column matrices.
+                for bytes in tensor.data.as_chunks::<4>().0 {
+                    let weight = finite(f32::from_le_bytes(*bytes))?;
+                    output.push(finite(float_dot(&[weight], &scratch.activations))?);
+                }
+            }
             16..=23 | 29 | 34 | 35 | 39..=42 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
                 for bytes in tensor.data.chunks_exact(row_bytes) {
@@ -2404,10 +2417,101 @@ mod tests {
         tensor.data = Arc::from(2.0_f32.to_le_bytes().as_slice());
         matvec_into(&tensor, &[3.0], &mut output, &mut scratch)?;
         assert_eq!(scratch.activations.len(), 1);
-        assert_eq!(scratch.row.len(), 1);
+        // The scalar-column projection does not touch decoded-row scratch.
+        assert_eq!(scratch.row.len(), 2);
         assert_eq!(scratch.activations.as_ptr(), activation_pointer);
         assert_eq!(scratch.row.as_ptr(), row_pointer);
         assert_eq!(output, [6.0]);
+        Ok(())
+    }
+
+    fn scalar_column_tensor(weights: &[f32]) -> Tensor {
+        Tensor {
+            name: "rank-one-columns".to_owned(),
+            dimensions: vec![1, weights.len()],
+            kind: super::F32,
+            data: Arc::from(
+                weights
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    #[test]
+    fn scalar_column_projection_matches_decoded_rows_without_row_storage() -> crate::Result<()> {
+        let mut weights = vec![
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0,
+            -1.0,
+            4097.0,
+        ];
+        // Exercise varying signs, exponents and mantissas without overflowing
+        // for the finite inputs below. The expected route is the former row
+        // decoder plus the same declared scalar accumulation contract.
+        let mut bits = 0x1234_5678_u32;
+        for _ in 0..1024 {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            weights.push(f32::from_bits(bits & 0xbf7f_ffff));
+        }
+        let tensor = scalar_column_tensor(&weights);
+        let mut decoded = Vec::new();
+        for pinned in [false, true] {
+            let mut scratch = if pinned {
+                MatvecScratch::with_pinned_backend(super::MatvecBackend::Scalar)
+            } else {
+                MatvecScratch::with_backend(super::MatvecBackend::Scalar)
+            };
+            let mut output = Vec::new();
+            for input in [0.0, -0.0, f32::from_bits(1), -1.0, 0.5, 4097.0] {
+                matvec_into(&tensor, &[input], &mut output, &mut scratch)?;
+                for (index, actual) in output.iter().enumerate() {
+                    super::row_into(&tensor, index, &mut decoded)?;
+                    let expected = super::float_dot(&decoded, &[input]);
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+                assert_eq!(scratch.row.capacity(), 0);
+                let diagnostics = scratch.diagnostics();
+                assert!(diagnostics.dispatched);
+                assert!(diagnostics.succeeded);
+                assert_eq!(diagnostics.selected_backend, super::MatvecBackend::Scalar);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_column_projection_rejects_nonfinite_and_recovers_output() -> crate::Result<()> {
+        let mut scratch = MatvecScratch::default();
+        let mut output = vec![99.0; 3];
+        let allocation = output.as_ptr();
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+            let tensor = scalar_column_tensor(&[1.0, invalid, 2.0]);
+            assert!(matvec_into(&tensor, &[2.0], &mut output, &mut scratch).is_err());
+            assert_eq!(output, Vec::<f32>::new());
+            assert_eq!(output.as_ptr(), allocation);
+            assert_eq!(scratch.row.capacity(), 0);
+            assert!(scratch.diagnostics().dispatched);
+            assert!(!scratch.diagnostics().succeeded);
+        }
+        let tensor = scalar_column_tensor(&[1.0, -0.0, f32::MAX]);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matvec_into(&tensor, &[invalid], &mut output, &mut scratch).is_err());
+            assert_eq!(output, Vec::<f32>::new());
+            assert!(!scratch.diagnostics().dispatched);
+        }
+        matvec_into(&tensor, &[1.0], &mut output, &mut scratch)?;
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(output[2].to_bits(), f32::MAX.to_bits());
+        assert_eq!(output.as_ptr(), allocation);
+        assert!(scratch.diagnostics().succeeded);
         Ok(())
     }
 }

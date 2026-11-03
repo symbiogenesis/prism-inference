@@ -1,0 +1,161 @@
+"""Run the fixed model-free CPU efficiency controls on an owning hosted runner."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+
+TOOLCHAIN = "+nightly-2026-10-22"
+CONTROLS = {
+    "lib": [
+        "kernels::tests::scalar_column_projection_matches_decoded_rows_without_row_storage",
+        "kernels::tests::scalar_column_projection_rejects_nonfinite_and_recovers_output",
+        "sampling::swift::tests::bounded_top_k_matches_full_candidate_filter_bit_for_bit",
+        "sampling::swift::tests::candidate_storage_reuses_top_k_backing_across_filters_rejection_and_reset",
+        "sampling::swift::tests::selection_rejects_nonfinite_discarded_logits_without_losing_rng_or_storage",
+        "kernels::pinned_attention::padding_tests::pruned_dot_padding_matches_full_physical_rows_bitwise",
+        "kernels::pinned_attention::padding_tests::pruned_value_padding_matches_full_rows_at_every_lane_boundary",
+        "kernels::pinned_attention::padding_tests::pruned_softmax_padding_matches_full_physical_groups_bitwise",
+        "graph::tests::decayed_heads_preserve_bits_and_independent_state_across_scratch_reuse",
+    ],
+    "graph": [
+        "rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits",
+        "rank_one_checkpoint_and_failed_generation_preserve_complete_state",
+        "empty_reset_preserves_hybrid_state_after_late_failure_and_checkpoint_restore",
+        "empty_checkpoint_omits_recurrent_payload_after_construction_and_reset",
+        "empty_checkpoint_restores_hybrid_pages_and_preserves_nonempty_snapshot",
+        "empty_checkpoint_rejects_foreign_and_stale_adapter_provenance",
+        "empty_checkpoint_request_rollback_replays_fresh_after_delivery_failure",
+    ],
+    "swift_sampling": [
+        "swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",
+        "swift_rejects_invalid_full_vocabulary_without_consuming_draws_and_resets_seed",
+    ],
+}
+
+
+def successful_exact_control(output, name):
+    """A zero-match, ignored, failed or duplicated test can never close a gate."""
+    lines = output.replace("\r\n", "\n").splitlines()
+    return (
+        lines.count("running 1 test") == 1
+        and lines.count(f"test {name} ... ok") == 1
+        and sum(bool(re.fullmatch(
+            r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in .+",
+            line,
+        )) for line in lines) == 1
+    )
+
+
+def test_artifacts(output):
+    """Select only the three explicitly built test executables from Cargo JSON."""
+    selected = {}
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("reason") != "compiler-artifact" or not record.get("executable"):
+            continue
+        target = record["target"]
+        if not record.get("profile", {}).get("test"):
+            continue
+        key = "lib" if target["kind"] == ["lib"] and target["name"] == "bonsai_prism_runtime" else target["name"]
+        if key not in CONTROLS:
+            continue
+        if key in selected:
+            raise ValueError(f"Duplicate test executable for {key}")
+        selected[key] = record["executable"]
+    if set(selected) != set(CONTROLS):
+        raise ValueError("Cargo did not retain every fixed efficiency test executable")
+    return selected
+
+
+def source_hashes(root):
+    """Bind all runtime source and selected fixtures rather than a display version."""
+    files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml"}
+    for directory in ["src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src"]:
+        files.update((root / directory).rglob("*.rs"))
+    for directory in ["tools/ternary", "tools/gguf", "tools/native-hash", "tools/prism"]:
+        files.add(root / directory / "Cargo.toml")
+    files.update((root / "tests/graph").rglob("*.rs"))
+    files.update(root / path for path in [
+        "tests/graph.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
+    ])
+    return {str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(files)}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--evidence", type=Path, required=True)
+    arguments = parser.parse_args()
+    revision = os.environ.get("GITHUB_SHA", "")
+    if (os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("GITHUB_REF") != "refs/heads/main"
+            or not re.fullmatch("[0-9a-f]{40}", revision)
+            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
+        raise SystemExit("Efficiency qualification requires an owning hosted main runner")
+    root = arguments.manifest.resolve(strict=True).parent
+    evidence = arguments.evidence
+    if not evidence.is_absolute() or evidence.resolve().is_relative_to(root):
+        raise SystemExit("Efficiency receipts require external absolute evidence storage")
+    evidence.mkdir(parents=True, exist_ok=False)
+    initial_hashes = source_hashes(root)
+    receipt = {
+        "schemaVersion": 1,
+        "kind": "hosted-model-free-inference-efficiency",
+        "sourceCommit": revision,
+        "toolchain": TOOLCHAIN.removeprefix("+"),
+        "target": os.environ.get("EFFICIENCY_TARGET", "unknown"),
+        "sourceSha256": initial_hashes,
+        "controls": [],
+        "status": "failed",
+        "modelsExecuted": 0,
+        "benchmarksExecuted": 0,
+        "performanceQualified": False,
+        "deviceAcceptanceQualified": False,
+    }
+    try:
+        compiler = subprocess.run(["rustc", TOOLCHAIN, "-vV"], capture_output=True, text=True, check=False)
+        receipt["compiler"] = {"exitCode": compiler.returncode, "identity": compiler.stdout}
+        if compiler.returncode or f"host: {receipt['target']}" not in compiler.stdout.splitlines():
+            raise RuntimeError("Efficiency compiler host differs from the selected target")
+        command = ["cargo", TOOLCHAIN, "test", "--manifest-path", str(root / "Cargo.toml"),
+                   "--locked", "--release", "--package", "prism-inference", "--features", "parallel-rows",
+                   "--lib", "--test", "graph", "--test", "swift_sampling", "--no-run", "--message-format=json"]
+        compiled = subprocess.run(command, capture_output=True, text=True, check=False)
+        (evidence / "compile.log").write_text(compiled.stdout + compiled.stderr, encoding="utf-8")
+        receipt["compile"] = {"arguments": command, "exitCode": compiled.returncode}
+        if compiled.returncode:
+            raise RuntimeError("Efficiency control compilation failed")
+        executables = test_artifacts(compiled.stdout)
+        for target, names in CONTROLS.items():
+            executable = Path(executables[target]).resolve(strict=True)
+            executable_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
+            for name in names:
+                command = [str(executable), "--exact", name, "--nocapture"]
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                output = result.stdout + result.stderr
+                log = f"{target}-{name.replace('::', '-')}.log"
+                (evidence / log).write_text(output, encoding="utf-8")
+                passed = result.returncode == 0 and successful_exact_control(output, name)
+                receipt["controls"].append({"name": name, "target": target,
+                    "executableSha256": executable_hash, "exitCode": result.returncode,
+                    "status": "passed" if passed else "failed", "log": log})
+                if not passed:
+                    raise RuntimeError(f"Exact efficiency control failed or was absent: {name}")
+        if source_hashes(root) != initial_hashes:
+            raise RuntimeError("Efficiency sources changed during qualification")
+        receipt["status"] = "passed"
+    finally:
+        (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

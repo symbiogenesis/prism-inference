@@ -36,13 +36,25 @@ class EfficiencyReceiptTests(unittest.TestCase):
 
     def test_fixed_inventory_is_unique_and_all_controls_exist_in_source(self):
         root = Path(__file__).resolve().parents[2]
-        names = [name for controls in efficiency.CONTROLS.values() for name in controls]
+        names = [name for controls in efficiency.controls_for_target("aarch64-pc-windows-msvc").values()
+                 for name in controls]
         self.assertEqual(len(names), len(set(names)))
         sources = "\n".join(path.read_text(encoding="utf-8")
                             for directory in [root / "src", root / "tests", root / "server/src"]
                             for path in directory.rglob("*.rs"))
         for name in names:
             self.assertIn("fn " + name.split("::")[-1] + "(", sources)
+
+    def test_neon_controls_require_the_exact_supported_target_without_mutating_portable_gate(self):
+        before = {key: list(names) for key, names in efficiency.CONTROLS.items()}
+        selected = efficiency.controls_for_target("aarch64-pc-windows-msvc")
+        self.assertEqual(set(selected), set(before))
+        self.assertEqual(selected["lib"], before["lib"] + efficiency.WINDOWS_ARM64_NEON_CONTROLS)
+        for target in ["x86_64-pc-windows-msvc", "aarch64-unknown-linux-gnu", "unknown"]:
+            self.assertEqual(efficiency.controls_for_target(target), before)
+        self.assertEqual(efficiency.CONTROLS, before)
+        selected["lib"].clear()
+        self.assertEqual(efficiency.CONTROLS, before)
 
 
 if __name__ == "__main__":

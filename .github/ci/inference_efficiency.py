@@ -23,6 +23,8 @@ CONTROLS = {
         "graph::tests::decayed_heads_preserve_bits_and_independent_state_across_scratch_reuse",
         "kernels::prefill::tests::tiled_packed_projection_reuses_blocks_and_preserves_independent_rows",
         "kernels::prefill::tests::tiled_projection_clears_all_outputs_on_late_rejection",
+        "kernels::prefill::tests::tiled_projection_clears_completed_rows_on_cancel_and_bad_scale",
+        "kernels::prefill::dot::tests::tiled_integer_reductions_preserve_extreme_values_and_native_lanes",
         "graph::prefill::gdn::tests::chunkwise_gdn_triangular_solve_matches_sequential_signed_and_zero_decay",
         "graph::prefill::gdn::tests::chunkwise_gdn_rejects_invalid_shapes_and_gates",
     ],
@@ -53,6 +55,25 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
 }
+
+# The kernel module is compiled only by the default-feature Windows ARM64
+# build. Keep its exact controls out of other targets instead of accepting
+# their zero-match results as numerical coverage.
+WINDOWS_ARM64_NEON_CONTROLS = [
+    "kernels::neon::tests::simd_neon_integer_dot_exhaustive_packed_bytes",
+    "kernels::neon::tests::simd_neon_integer_dot_each_lane_and_extremes",
+    "kernels::neon::tests::simd_neon_integer_dot_unaligned_random_blocks",
+    "kernels::neon::tests::simd_neon_packed_consumption_exhaustive_bytes_and_extreme_lanes",
+    "kernels::neon::tests::simd_neon_pq2_pair_accumulation_extremal_mixed_lanes",
+]
+
+
+def controls_for_target(target):
+    """Select fixed exact controls without changing the shared portable gate."""
+    controls = {key: list(names) for key, names in CONTROLS.items()}
+    if target == "aarch64-pc-windows-msvc":
+        controls["lib"].extend(WINDOWS_ARM64_NEON_CONTROLS)
+    return controls
 
 
 def successful_exact_control(output, name):
@@ -160,7 +181,7 @@ def main():
         if compiled.returncode:
             raise RuntimeError("Efficiency control compilation failed")
         executables = test_artifacts(compiled.stdout)
-        for target, names in CONTROLS.items():
+        for target, names in controls_for_target(receipt["target"]).items():
             executable = Path(executables[target]).resolve(strict=True)
             executable_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
             for name in names:

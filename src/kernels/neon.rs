@@ -1,6 +1,6 @@
 //! Experimental baseline NEON integer arithmetic for native PQ2/PTQ1 blocks.
 
-use fearless_simd::{Neon, i8x16, i32x4, prelude::*, u8x16, u16x8, u32x4, u64x2};
+use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8, u32x4, u64x2};
 
 use crate::Result;
 
@@ -36,6 +36,25 @@ fn dot16(weights: i8x16<Neon>, activations: i8x16<Neon>) -> i32x4<Neon> {
 }
 
 #[inline]
+fn pq2_pair_sums(weights: i8x16<Neon>, activations: i8x16<Neon>) -> i16x8<Neon> {
+    let (weight_low, weight_high) = weights.widen();
+    let (activation_low, activation_high) = activations.widen();
+    // PQ2 weights are -1..=2 and activations are -128..=127. Each signed
+    // product is -256..=254, so each pair is -512..=508 in i16. Only the
+    // PQ2 block dots below use this helper; native PTQ1 lane sums stay separate.
+    weight_low * activation_low + weight_high * activation_high
+}
+
+#[inline]
+fn pq2_reduce(pairs: i16x8<Neon>) -> i32 {
+    // A 128-weight block contributes eight pairs to each lane: -4096..=4064.
+    // Widen before adding low/high lanes or horizontally reducing. The full
+    // i32 dot is -32768..=32512; no narrow horizontal sum is performed.
+    let (low, high) = pairs.widen();
+    (low + high).reduce_sum()
+}
+
+#[inline]
 fn scalar(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
     activations
         .iter()
@@ -61,28 +80,32 @@ pub(super) fn dot(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return scalar(packed, activations);
     };
-    let mut total = i32x4::splat(neon, 0);
+    let mut even = i16x8::splat(neon, 0);
+    let mut odd = i16x8::splat(neon, 0);
     for (bytes, values) in packed
         .as_chunks::<16>()
         .0
         .iter()
         .zip(activations.as_chunks::<64>().0)
     {
-        let decoded = decode(u8x16::from_slice(neon, bytes));
-        for (weights, activations) in decoded.into_iter().zip(values.as_chunks::<16>().0) {
-            total += dot16(weights, i8x16::from_slice(neon, activations));
-        }
+        let [a, b, c, d] = decode(u8x16::from_slice(neon, bytes));
+        let planes = values.as_chunks::<16>().0;
+        even += pq2_pair_sums(a, i8x16::from_slice(neon, &planes[0]));
+        odd += pq2_pair_sums(b, i8x16::from_slice(neon, &planes[1]));
+        even += pq2_pair_sums(c, i8x16::from_slice(neon, &planes[2]));
+        odd += pq2_pair_sums(d, i8x16::from_slice(neon, &planes[3]));
     }
-    total.reduce_sum()
+    pq2_reduce(even + odd)
 }
 
 /// Consumes scoped digit-plane activations without unpack interleaves per row.
 ///
 /// Each sixteen packed bytes describe sixty-four consecutive weights. Their
 /// low/high two-bit digits pair directly with activation planes prepared once
-/// in `packed_pq2`. Two independent i32 accumulators retain all four symbols,
-/// including +2 and activation -128; their combined absolute sum is at most
-/// 32,768. No floating arithmetic or optional ISA is used here.
+/// in `packed_pq2`. Two independent i16 accumulators retain all four symbols,
+/// including +2 and activation -128. Each accumulated lane is -2048..=2032;
+/// combining them gives -4096..=4064 before widening for the i32 reduction.
+/// No floating arithmetic or optional ISA is used here.
 #[inline]
 pub(super) fn dot_consumption_order(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
@@ -107,8 +130,8 @@ pub(super) fn dot_consumption_order(packed: &[u8; 32], activations: &[i8; 128]) 
             })
             .sum();
     };
-    let mut even = i32x4::splat(neon, 0);
-    let mut odd = i32x4::splat(neon, 0);
+    let mut even = i16x8::splat(neon, 0);
+    let mut odd = i16x8::splat(neon, 0);
     for (bytes, values) in packed
         .as_chunks::<16>()
         .0
@@ -117,24 +140,24 @@ pub(super) fn dot_consumption_order(packed: &[u8; 32], activations: &[i8; 128]) 
     {
         let packed = u8x16::from_slice(neon, bytes);
         let planes = values.as_chunks::<16>().0;
-        even += dot16(
+        even += pq2_pair_sums(
             (packed & 3).bitcast::<i8x16<Neon>>() - 1,
             i8x16::from_slice(neon, &planes[0]),
         );
-        odd += dot16(
+        odd += pq2_pair_sums(
             ((packed >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
             i8x16::from_slice(neon, &planes[1]),
         );
-        even += dot16(
+        even += pq2_pair_sums(
             ((packed >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
             i8x16::from_slice(neon, &planes[2]),
         );
-        odd += dot16(
+        odd += pq2_pair_sums(
             (packed >> 6).bitcast::<i8x16<Neon>>() - 1,
             i8x16::from_slice(neon, &planes[3]),
         );
     }
-    (even + odd).reduce_sum()
+    pq2_reduce(even + odd)
 }
 
 #[inline]
@@ -410,6 +433,31 @@ mod tests {
     }
 
     #[test]
+    fn simd_neon_pq2_pair_accumulation_extremal_mixed_lanes() {
+        // Exercise cancellation across widened lane halves, digit planes and
+        // both packed loads, including the fourth symbol's maximum products.
+        // The reference accumulates each original symbol independently in i32.
+        for mask in 0..=u8::MAX {
+            for byte in [0x00, 0xff, 0x1b, 0xe4] {
+                let packed = [byte; 32];
+                let activations = std::array::from_fn(|index| {
+                    if mask & (1 << ((index % 8 + index / 16) % 8)) == 0 {
+                        i8::MIN
+                    } else {
+                        i8::MAX
+                    }
+                });
+                let expected = reference(&packed, &activations);
+                assert_eq!(dot(&packed, &activations), expected);
+                assert_eq!(
+                    dot_consumption_order(&packed, &consumption_order(&activations)),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn simd_neon_integer_dot_unaligned_random_blocks() -> TestResult {
         #[repr(align(16))]
         struct Aligned<T>(T);
@@ -433,6 +481,10 @@ mod tests {
             let packed = <&[u8; 32]>::try_from(&packed_storage.0[1..33])?;
             let activations = <&[i8; 128]>::try_from(&activation_storage.0[3..131])?;
             assert_eq!(dot(packed, activations), reference(packed, activations));
+            assert_eq!(
+                dot_consumption_order(packed, &consumption_order(activations)),
+                reference(packed, activations)
+            );
             let groups = <&[[i8; 32]; 4]>::try_from(activations.as_chunks::<32>().0)?;
             let sums = dot_groups(packed, groups.each_ref());
             for (group, sum) in sums.into_iter().enumerate() {

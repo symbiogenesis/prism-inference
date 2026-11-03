@@ -39,6 +39,9 @@ impl Transcript {
         }
         let spilled = self.spill.take().is_some();
         if success && self.discard_on_success {
+            // The spill is complete and its handle is closed. If deletion fails,
+            // Drop must not recreate it from the now-empty memory buffer.
+            self.finished = true;
             if spilled {
                 fs::remove_file(&self.path)?;
             }
@@ -92,6 +95,38 @@ impl Drop for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_spill_deletion_does_not_truncate_retained_diagnostics() -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "prism-transcript-delete-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)?;
+        let path = directory.join("spill.jsonl");
+        let bytes = vec![b'x'; MEMORY_BYTES + 1];
+        let mut transcript = Transcript::new(&path);
+        transcript.write_all(&bytes)?;
+        // Permit reads/writes (including a buggy recreation), but deny deletion.
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(3)
+            .open(&path)?;
+        transcript.discard_on_success();
+        assert!(transcript.finish(true).is_err());
+        drop(transcript);
+        assert_eq!(fs::read(&path)?, bytes);
+        drop(guard);
+        fs::remove_file(path)?;
+        fs::remove_dir(directory)
+    }
 
     #[test]
     fn transcripts_skip_successful_files_and_preserve_failure_and_spill_bytes() -> io::Result<()> {

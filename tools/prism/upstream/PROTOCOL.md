@@ -53,8 +53,12 @@ most 22,817 geometry scopes, each with at most 524,288 actions and the existing
 4 GiB file bound. `shutdown` requires no open geometry and exits successfully.
 Production actions and their observations use the existing backend schema.
 
-Rust retains per-geometry `actions.jsonl` and `observations.jsonl` until the
-existing successful-case cleanup or failed-case digest/retention policy applies.
+Rust buffers each geometry's `actions.jsonl` and `observations.jsonl` in memory
+up to 256 KiB per stream, then spills larger transcripts to disk. Successful
+planner/execution cases discard these diagnostics only after controller and
+session completion; returned errors and unwinding retain them for the existing
+failure digest/retention policy. A hard process kill or abort can lose the
+unflushed in-memory prefix. Default transport diagnostics retain transcripts.
 Partition stderr and process-exit receipts remain separate diagnostics. Framing,
 count, I/O, deadline or process failures poison the session and abort further
 geometries. The original file/checkpoint transport remains available to focused

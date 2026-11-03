@@ -15,6 +15,18 @@ const CACHE_PADDING: usize = 256;
 /// A contiguous cache-line-sized segment of binary16 value channels.
 pub(crate) const VALUE_TILE: usize = 32;
 
+#[cfg(test)]
+#[path = "pinned_attention_padding_tests.rs"]
+mod padding_tests;
+
+const fn padded_dot_steps(logical: usize) -> usize {
+    let padding = logical.div_ceil(CACHE_PADDING) * CACHE_PADDING - logical;
+    // A zero FMA can turn -0 into +0. Each accumulator lane therefore keeps
+    // its first masked FMA, but repeating it cannot change a finite result.
+    // Nonfinite accumulators still fail the final finite-result check.
+    logical + if padding < 16 { padding } else { 16 }
+}
+
 /// Reduces adjacent value channels without rereading the paged cache per channel.
 ///
 /// Each channel retains [`dot`]'s exact FMA lanes, zero padding and reduction
@@ -59,9 +71,8 @@ pub(crate) fn value_tile<'a>(
         let lane = &mut sum[last % 16 / 4][last % 4];
         *lane = value.mul_add(weights[last], *lane);
     }
-    // Zero FMAs are observable for signed zero, so retain every masked lane.
-    let physical = weights.len().div_ceil(CACHE_PADDING) * CACHE_PADDING;
-    for index in weights.len()..physical {
+    // Retain the first masked FMA for each lane, including signed-zero effects.
+    for index in weights.len()..padded_dot_steps(weights.len()) {
         for sum in &mut sums[..output.len()] {
             let lane = &mut sum[index % 16 / 4][index % 4];
             *lane = 0.0_f32.mul_add(0.0, *lane);
@@ -88,9 +99,8 @@ pub(crate) fn dot(mut values: impl Iterator<Item = f32>, weights: &[f32]) -> Res
     if weights.is_empty() || weights.len() > crate::model::swift::CONTEXT_TOKENS {
         return Err(invalid("invalid pinned attention dot width"));
     }
-    let physical = weights.len().div_ceil(CACHE_PADDING) * CACHE_PADDING;
     let mut sums = [[0.0_f32; 4]; 4];
-    for index in 0..physical {
+    for index in 0..padded_dot_steps(weights.len()) {
         let (value, weight) = if index < weights.len() {
             (
                 values
@@ -135,9 +145,10 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
         return Err(invalid("invalid pinned attention softmax row"));
     }
     let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let physical = scores.len().div_ceil(CACHE_PADDING) * CACHE_PADDING;
     let mut total = 0.0_f64;
-    for offset in (0..physical).step_by(4) {
+    // Keep the final partial group's exact pairwise tree. Later physical
+    // groups add only +0 to the positive total and cannot change its bits.
+    for offset in (0..scores.len()).step_by(4) {
         let mut group = [0.0; 4];
         for (lane, output) in group.iter_mut().enumerate() {
             if let Some(score) = scores.get_mut(offset + lane) {

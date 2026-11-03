@@ -284,10 +284,15 @@ Attention-value reads use tiles of at most 32 adjacent dimensions, with at most
 2 KiB of stack accumulator payload. Each tile traverses the paged FP16 cache
 once, preserving each dimension's token order. Source arithmetic retains rounded
 F32 products accumulated in F64 and the separate current-token addition. Pinned
-Swift retains its four-register F32 FMA tree, zero padding through 256-token
-boundaries and final pairwise reduction. The cache representation, FP16
+Swift retains its four-register F32 FMA tree, the effect of zero padding through
+256-token boundaries and final pairwise reduction. Masked dots execute only the
+first zero FMA for each affected accumulator lane (at most 16 padding steps);
+this preserves signed-zero canonicalization, while repeated zero FMAs are
+idempotent for finite accumulators. Nonfinite results still reject. Softmax keeps
+the final partially masked four-score group and omits later all-zero groups,
+which cannot change its positive total. The cache representation, FP16
 probability rounding and transactional state are unchanged. Fewer page traversals
-do not establish a whole-model TPS gain.
+and masked operations do not establish a whole-model TPS gain.
 
 ## SIMD dispatch and diagnostics
 

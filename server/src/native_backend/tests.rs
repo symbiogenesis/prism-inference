@@ -93,6 +93,7 @@ struct Observation {
     resets: Arc<AtomicUsize>,
     terminated: Arc<AtomicBool>,
     row_workers: Option<usize>,
+    prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse,
     preparation_rejection: Option<(usize, Rejection)>,
 }
 struct FakeEngine(Observation);
@@ -108,6 +109,7 @@ impl worker::Engine for FakeEngine {
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
         Ok(ModelProfile {
             row_workers: self.0.row_workers.unwrap_or(1),
+            prompt_reuse: self.0.prompt_reuse,
             ..ModelProfile::default()
         })
     }
@@ -541,6 +543,83 @@ fn private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts() -
             ));
             assert!(observed.terminated.load(Ordering::Acquire));
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries() -> TestResult
+{
+    use bonsai_prism_runtime::runtime::PromptReuse;
+
+    run(async {
+        let observed = Observation {
+            prompt_reuse: PromptReuse::Latest,
+            ..Observation::default()
+        };
+        let mut worker =
+            Worker::new(FakeEngine(observed.clone()), 42).map_err(|error| format!("{error:?}"))?;
+        let (result, reply) = perform(&mut worker, request("/v1/models", &[], true)).await?;
+        assert_eq!(result, Ok(()));
+        let end = reply
+            .array_windows()
+            .position(|part| part == b"\r\n\r\n")
+            .ok_or("missing readiness head")?
+            + 4;
+        let readiness: Value = serde_json::from_slice(&reply[end..])?;
+        assert_eq!(readiness["data"][0]["prompt_reuse"], "latest");
+
+        let body = pending(true, 128)
+            .map_err(|error| format!("{error:?}"))?
+            .body;
+        for committed in 1..=2 {
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            assert_eq!(observed.state.load(Ordering::Relaxed), committed - 1);
+            let (result, _) =
+                perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
+            assert_eq!(result, Ok(()));
+            assert_eq!(observed.state.load(Ordering::Relaxed), committed);
+            assert_eq!(observed.resets.load(Ordering::Relaxed), 0);
+        }
+
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
+        fail_acknowledgement(&mut worker, &body, false).await?;
+        assert_eq!(observed.state.load(Ordering::Relaxed), 2);
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Err(NativeBackendError::Engine));
+        let (result, _) = perform(&mut worker, request("/reset", &[], true)).await?;
+        assert_eq!(result, Ok(()));
+        assert_eq!(observed.state.load(Ordering::Relaxed), 0);
+        assert_eq!(observed.resets.load(Ordering::Relaxed), 1);
+        // Reset invalidates the one-use count seal as well as all live prefix state.
+        let (result, _) =
+            perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
+        assert_eq!(result, Err(NativeBackendError::CountMismatch));
+        let (result, _) = perform(
+            &mut worker,
+            request("/v1/chat/completions/input_tokens", &body, true),
+        )
+        .await?;
+        assert_eq!(result, Ok(()));
+        let (result, _) =
+            perform(&mut worker, request("/v1/chat/completions", &body, true)).await?;
+        assert_eq!(result, Ok(()));
+        assert_eq!(observed.state.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.profile.prompt_reuse, PromptReuse::Latest);
         Ok(())
     })
 }

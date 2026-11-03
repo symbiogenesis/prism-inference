@@ -1507,7 +1507,7 @@ fn empty_reset_preserves_hybrid_state_after_late_failure_and_checkpoint_restore(
     // have been populated, while committed position and state remain empty.
     let mut logits = vec![f32::NAN; 2];
     assert!(decoder.evaluate_into(0, &mut logits).is_err());
-    assert!(logits.is_empty());
+    assert_eq!(logits, Vec::<f32>::new());
     decoder.reset()?;
     decoder.restore(&empty)?;
     assert_eq!(graph_bits(&decoder)?, initial);

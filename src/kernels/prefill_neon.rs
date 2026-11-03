@@ -2,7 +2,7 @@
 
 use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*};
 
-pub(super) struct Block {
+pub(in crate::kernels::prefill) struct Block {
     neon: Neon,
     weights: [i16x8<Neon>; 16],
 }

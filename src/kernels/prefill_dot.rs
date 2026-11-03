@@ -77,9 +77,7 @@ impl Block {
     #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         match self {
-            Self::Scalar(weights) => {
-                q8_native_lanes(&weights[group * 32..group * 32 + 32], values)
-            }
+            Self::Scalar(weights) => q8_native_lanes(&weights[group * 32..group * 32 + 32], values),
             #[cfg(all(
                 feature = "experimental-neon",
                 target_arch = "aarch64",
@@ -136,7 +134,10 @@ mod tests {
                 for (group, values) in values.as_chunks::<32>().0.iter().enumerate() {
                     let weights = &weights[group * 32..group * 32 + 32];
                     assert_eq!(block.dot32(group, values), scalar(weights, values));
-                    assert_eq!(block.lanes32(group, values), q8_native_lanes(weights, values));
+                    assert_eq!(
+                        block.lanes32(group, values),
+                        q8_native_lanes(weights, values)
+                    );
                 }
             }
         }

@@ -21,6 +21,10 @@ CONTROLS = {
         "kernels::pinned_attention::padding_tests::pruned_value_padding_matches_full_rows_at_every_lane_boundary",
         "kernels::pinned_attention::padding_tests::pruned_softmax_padding_matches_full_physical_groups_bitwise",
         "graph::tests::decayed_heads_preserve_bits_and_independent_state_across_scratch_reuse",
+        "kernels::prefill::tests::tiled_packed_projection_reuses_blocks_and_preserves_independent_rows",
+        "kernels::prefill::tests::tiled_projection_clears_all_outputs_on_late_rejection",
+        "graph::prefill::gdn::tests::chunkwise_gdn_triangular_solve_matches_sequential_signed_and_zero_decay",
+        "graph::prefill::gdn::tests::chunkwise_gdn_rejects_invalid_shapes_and_gates",
     ],
     "graph": [
         "rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits",
@@ -30,10 +34,22 @@ CONTROLS = {
         "empty_checkpoint_restores_hybrid_pages_and_preserves_nonempty_snapshot",
         "empty_checkpoint_rejects_foreign_and_stale_adapter_provenance",
         "empty_checkpoint_request_rollback_replays_fresh_after_delivery_failure",
+        "profile_reuse_matches_fresh_state_and_sampled_failure_replay",
+        "profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary",
+        "profile_reuse_preserves_mixed_state_and_stop_draws_across_kv_page_seals",
+        "prefill::tiled_prefill_exact_hybrid_state_and_logits_cross_pages",
+        "prefill::tiled_prefill_packed_ffn_and_adapter_preserve_original_basis_bits",
+        "prefill::tiled_prefill_failure_restores_request_and_explicit_reset_clears_first_tile",
+        "prefill::chunkwise_gdn_prefill_continuation_restore_and_identity_are_separate",
+        "prefill::tiled_prefill_rejects_unadmitted_geometry_and_preserves_state",
+        "prefill::tiled_prefill_runtime_failure_restores_all_layer_state_before_replay",
     ],
     "swift_sampling": [
         "swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",
         "swift_rejects_invalid_full_vocabulary_without_consuming_draws_and_resets_seed",
+    ],
+    "server": [
+        "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
 }
 
@@ -52,7 +68,7 @@ def successful_exact_control(output, name):
 
 
 def test_artifacts(output):
-    """Select only the three explicitly built test executables from Cargo JSON."""
+    """Select only explicitly built test executables from Cargo JSON."""
     selected = {}
     for line in output.splitlines():
         try:
@@ -65,6 +81,8 @@ def test_artifacts(output):
         if not record.get("profile", {}).get("test"):
             continue
         key = "lib" if target["kind"] == ["lib"] and target["name"] == "bonsai_prism_runtime" else target["name"]
+        if target["kind"] == ["lib"] and target["name"] == "prism_inference_server":
+            key = "server"
         if key not in CONTROLS:
             continue
         if key in selected:
@@ -78,13 +96,18 @@ def test_artifacts(output):
 def source_hashes(root):
     """Bind all runtime source and selected fixtures rather than a display version."""
     files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml"}
-    for directory in ["src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src"]:
+    for directory in ["src", "server/src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src"]:
         files.update((root / directory).rglob("*.rs"))
-    for directory in ["tools/ternary", "tools/gguf", "tools/native-hash", "tools/prism"]:
+    for directory in ["server", "tools/ternary", "tools/gguf", "tools/native-hash", "tools/prism"]:
         files.add(root / directory / "Cargo.toml")
+        build_script = root / directory / "build.rs"
+        if build_script.is_file():
+            files.add(build_script)
     files.update((root / "tests/graph").rglob("*.rs"))
+    files.update(path for path in (root / "tests/fixtures").rglob("*") if path.is_file())
     files.update(root / path for path in [
         "tests/graph.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
+        ".github/ci/test_inference_efficiency.py", ".github/workflows/inference-efficiency.yml",
     ])
     return {str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(files)}
@@ -127,7 +150,8 @@ def main():
         if compiler.returncode or f"host: {receipt['target']}" not in compiler.stdout.splitlines():
             raise RuntimeError("Efficiency compiler host differs from the selected target")
         command = ["cargo", TOOLCHAIN, "test", "--manifest-path", str(root / "Cargo.toml"),
-                   "--locked", "--release", "--package", "prism-inference", "--features", "parallel-rows",
+                   "--locked", "--release", "--package", "prism-inference", "--package", "prism-inference-server",
+                   "--features", "prism-inference/parallel-rows,prism-inference-server/parallel-rows",
                    "--lib", "--test", "graph", "--test", "swift_sampling", "--no-run", "--message-format=json"]
         compiled = subprocess.run(command, capture_output=True, text=True, check=False)
         (evidence / "compile.log").write_text(compiled.stdout + compiled.stderr, encoding="utf-8")

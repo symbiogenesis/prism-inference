@@ -23,9 +23,9 @@ class EfficiencyReceiptTests(unittest.TestCase):
     def test_artifacts_require_all_unique_selected_test_executables(self):
         records = []
         for key in efficiency.CONTROLS:
+            name = {"lib": "bonsai_prism_runtime", "server": "prism_inference_server"}.get(key, key)
             records.append({"reason": "compiler-artifact", "profile": {"test": True},
-                "target": {"name": "bonsai_prism_runtime" if key == "lib" else key,
-                           "kind": ["lib"] if key == "lib" else ["test"]},
+                "target": {"name": name, "kind": ["lib"] if key in {"lib", "server"} else ["test"]},
                 "executable": f"/tmp/{key}"})
         encoded = "\n".join(json.dumps(record) for record in records)
         self.assertEqual(set(efficiency.test_artifacts(encoded)), set(efficiency.CONTROLS))
@@ -39,7 +39,7 @@ class EfficiencyReceiptTests(unittest.TestCase):
         names = [name for controls in efficiency.CONTROLS.values() for name in controls]
         self.assertEqual(len(names), len(set(names)))
         sources = "\n".join(path.read_text(encoding="utf-8")
-                            for directory in [root / "src", root / "tests"]
+                            for directory in [root / "src", root / "tests", root / "server/src"]
                             for path in directory.rglob("*.rs"))
         for name in names:
             self.assertIn("fn " + name.split("::")[-1] + "(", sources)

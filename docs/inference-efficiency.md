@@ -22,7 +22,7 @@ old full-candidate route, independent full-padding attention controls, empty and
 nonempty snapshot ownership, adapter provenance, cancellation and seeded rollback.
 The fused copy/decay test remains a synthetic control, not production selection.
 
-The runner compiles its three test targets once and requires exactly one passed,
+The runner compiles its four test targets once and requires exactly one passed,
 nonignored test for every exact name. Missing or renamed controls, zero matches,
 ignored tests, duplicate executables and failures reject. Receipts retain the
 revision, source hashes, executable digests and raw results. Strict Release

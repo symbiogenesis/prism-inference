@@ -218,7 +218,11 @@ fn private_typed_context_rejection_clears_count_seal_without_faulting_owner() ->
             assert_eq!(result, Ok(()));
             let (result, _) = perform(
                 &mut worker,
-                request("/v1/chat/completions/input_tokens", &body, false),
+                // Authentication rejects before reading a body. This helper
+                // sends before reading through a small duplex, so retain a
+                // header-only negative control rather than requiring a denied
+                // peer to consume a complete canonical request body.
+                request("/v1/chat/completions/input_tokens", b"", false),
             )
             .await?;
             assert_eq!(result, Err(NativeBackendError::Unauthorized));

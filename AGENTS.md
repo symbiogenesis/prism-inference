@@ -18,6 +18,17 @@ pending checks have passed; pending CI does not block local completion.
 
 # Owner-device execution budgets
 
-Owner-device diagnostics, model qualification and benchmarks share a five-minute
-total ceiling, including setup, loading, comparison and cleanup. Full suites
-and benchmarks run only in CI; do not split a long matrix into repeated owner runs.
+Owner-device diagnostics, model qualification and benchmarks default to five
+minutes total, preferably less. A dedicated, predeclared workload may use the
+smallest justified longer allowance, up to fifteen minutes total. Record its
+fixed work, conservative time estimate and reason before starting; fifteen
+minutes is a ceiling, not a target. Charge setup, intake, loading, every comparison
+arm, power observations, cleanup and evidence retention to one original clock.
+Existing narrower capture, helper and workflow limits remain effective until
+explicitly extended. Stop early on completion or a known no-go. Do not restart
+clocks, retry a failed trial or divide a long matrix into repeated owner runs.
+Historical trial deadlines stay closed. Full suites and benchmarks run only in
+CI; hosted cloud CI retains its own workflow limits.
+
+Runner's explicit 5/10/15-minute native-runtime acceptance option does not extend
+Prism's numerical/accelerator captures or existing external owner helpers.

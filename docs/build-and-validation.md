@@ -163,6 +163,37 @@ adapter numerical/service qualification, broader process/OS ownership qualificat
 correctness/TPS/quality/security acceptance. Full suites and every benchmark
 remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
 
+### Owner-device budgets
+
+Diagnostics, model qualification and benchmarks on the owner's laptop default
+to **five minutes total, preferably less**. A dedicated, predeclared workload
+may use the smallest justified longer allowance, with an absolute **fifteen-minute
+maximum**, only when the entire supervising harness supports that declaration.
+Record the fixed work, conservative time estimate and reason before starting.
+Setup, tool intake, loading, every comparison arm, power observations, cleanup
+and evidence retention share one original clock. Stop early on completion or a
+known no-go; do not restart clocks, retry a failed trial or split a longer matrix
+into repeated owner runs. Historical sessions retain their original closed clocks.
+Full suites and every benchmark remain CI-only, with dispatch and monitoring
+owned by the owner.
+
+Existing narrower source-checker, accelerator, workflow and external-helper
+limits remain effective until explicitly extended and reviewed together. Runner's
+native-runtime acceptance workflow offers explicit 5/10/15-minute jobs; selecting
+one does not lengthen Prism's numerical or accelerator lanes, the 240-second
+request-timing entry bound below, or an older external owner watchdog. Hosted
+cloud CI keeps its independent workflow limits.
+
+Reduce device time through offline review of retained data, hosted preparation
+of source-bound tools, reuse of verified immutable downloads and the shortest
+prompt/output that exercises each required behavior. Reuse a loaded service only
+where the declared test permits it; fresh-owner isolation, replay and rollback
+controls still require fresh owners. Estimate full-context/output work from
+measured prefill/decode costs before scheduling it. Short smoke checks do not
+replace full numerical, long-output or human-quality acceptance.
+
+### Owning workflows
+
 This repository also owns the [complete upstream conformance guide](prism-upstream-tests.md).
 Routine pushes use [Runtime regression](../.github/workflows/runtime-regression.yml):
 23 existing Rust source contracts in one cached native ARM64 job, affected native
@@ -265,8 +296,9 @@ This source checker does not qualify released private HTTP cancellation, the
 reset-every-request serving policy, numerical parity with an independent engine,
 quality, resources or performance. Actual-model evidence is pending until a
 source-bound hosted build and an audited owning device capture pass. All device
-setup, loading, capture, comparison and cleanup must fit the one five-minute
-owner allowance under external process/Job/deadline supervision; do not execute a
+setup, loading, capture, comparison and cleanup must fit this lane's existing
+five-minute owner allowance under external process/Job/deadline supervision;
+the general fifteen-minute ceiling does not extend this capture. Do not execute a
 second model trial to complete a larger matrix.
 
 The `request-timing` mode captures one production `SwiftSession` request with

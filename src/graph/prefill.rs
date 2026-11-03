@@ -208,14 +208,16 @@ impl Qwen35 {
             || tokens
                 .iter()
                 .any(|&token| usize::try_from(token).map_or(true, |value| value >= self.vocabulary))
-            || self
+        {
+            return Err(invalid("invalid native prefill block bounds or tokens"));
+        }
+        if self.tiled_prefill.is_some()
+            && self
                 .position
                 .checked_add(tokens.len())
                 .is_none_or(|end| end > self.context_limit)
         {
-            return Err(invalid(
-                "invalid CPU prefill block bounds, tokens or context",
-            ));
+            return Err(invalid("CPU prefill block exceeds remaining context"));
         }
         let Some(mut tile) = self.tiled_prefill.take() else {
             for &token in tokens {

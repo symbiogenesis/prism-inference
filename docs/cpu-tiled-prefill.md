@@ -28,16 +28,25 @@ For each packed output row, one 128-weight block is decoded once, followed by
 all token dots. PQ2 retains the +2 fourth symbol, Q8_K activation preparation and
 original per-128 scale/FMA order. Odd-block PQ2 retains Q8_0. PTQ1 retains its
 quantizer, scale grouping and pinned four-lane FMA/reduction order. Floating and
-other supported formats use the existing scalar matvec contract. Each token is
+other supported formats use the existing matvec contract. Each token is
 transformed independently; adapters consume the original untransformed input.
 No decoded matrix or persistent repacked weight copy is retained.
 
 Without the separate chunkwise selection, full attention, recurrent attention,
 convolution and FP32 GDN retain their previous per-token operations. The graph's
 `ingest_block` path is the consumer; this is more than a standalone tiled helper.
-The tile kernel currently uses scalar integer reductions. It must be compared
-against the existing NEON/worker path before assuming that reduced decoding work
-improves complete prompt time.
+The tile inherits the graph's requested matrix backend. On the existing eligible
+Windows ARM64 MSVC build, Auto/NEON prepare sixteen baseline NEON vectors from
+the one decoded block and reuse them across token dots. Signed products widen
+before summation; the complete PQ2 dot is bounded by 32,768, and PTQ1 keeps its
+four native integer lanes separate until the original floating FMAs. Explicit
+scalar forcing and unsupported builds retain scalar reductions. The fixed
+256-byte decoded payload is stack-scoped, with no new retained activation or
+weight allocation. Optional DOTPROD/I8MM instructions are not selected.
+
+Row-worker parallelism remains absent from this tile kernel. It must be compared
+against the existing NEON/worker matvec path before assuming that shared decoding
+and explicit SIMD improve complete prompt time.
 
 ## Separate chunkwise GDN
 
@@ -93,6 +102,9 @@ cargo test --release --locked --features parallel-rows --test graph chunkwise_gd
 ```
 
 Independent existing matvec rows cover both quantizers and pinned FMA ordering;
+tile controls compare all requested backends and repeated pinned/unpinned reuse
+bit for bit against scalar matvec, plus extreme integer/native-lane reductions
+and cancellation or an invalid final scale after a complete output row.
 the chunk unit control uses ordinary recurrence, signed key correlations and zero
 decay. Graph controls exercise packed FFN, nonzero/zero adapters, hybrid KV page
 boundaries, continuation, checkpoint restore, cancellation/reset and runtime

@@ -6,7 +6,7 @@ use super::{
     Arithmetic, Attention, Evaluation, LayerDelta, LayerState, Qwen35, Transforms, add,
     checked_product, finite, row_into,
 };
-use crate::kernels::prefill::ProjectionTile;
+use crate::kernels::{MatvecBackend, prefill::ProjectionTile};
 use crate::model::Tensor;
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
@@ -52,7 +52,12 @@ pub(super) struct TiledPrefill {
 }
 
 impl TiledPrefill {
-    fn new(tokens: usize, width: usize, scratch_bytes: usize) -> Result<Self> {
+    fn new(
+        tokens: usize,
+        width: usize,
+        scratch_bytes: usize,
+        backend: MatvecBackend,
+    ) -> Result<Self> {
         let create = || -> Result<Vec<Vec<f32>>> {
             let mut rows = Vec::new();
             rows.try_reserve_exact(tokens)?;
@@ -78,7 +83,7 @@ impl TiledPrefill {
             attended: create()?,
             attention: create()?,
             chunkwise_gdn: false,
-            projector: ProjectionTile::default(),
+            projector: ProjectionTile::with_backend(backend),
             statistics: TiledPrefillStatistics::default(),
         })
     }
@@ -158,6 +163,7 @@ impl Qwen35 {
                 .max(self.geometry.convolution_width())
                 .max(self.geometry.value_width()),
             required,
+            self.requested_backend(),
         )?;
         let suffix = format!(":cpu-tiled-ffn-v1:{tokens}");
         self.identity.try_reserve_exact(suffix.len())?;

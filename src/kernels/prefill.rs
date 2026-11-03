@@ -11,21 +11,32 @@
 )]
 
 use super::{
-    MatvecBackend, MatvecScratch, PQ2, PTQ1, dimensions, dot_integer, finite, integer_float,
-    matvec_into, pq2_values, ptq1_values, q8_native_lanes, scale,
+    MatvecBackend, MatvecScratch, PQ2, PTQ1, dimensions, finite, integer_float, matvec_into,
+    pq2_values, ptq1_values, scale,
 };
 use crate::{Result, invalid, model::Tensor};
+
+#[path = "prefill_dot.rs"]
+mod dot;
 
 pub(crate) const MAX_TILE_TOKENS: usize = 32;
 
 #[derive(Default)]
 pub(crate) struct ProjectionTile {
+    backend: MatvecBackend,
     preparations: Vec<MatvecScratch>,
     pub(crate) packed_projections: u64,
     pub(crate) decoded_blocks: u64,
 }
 
 impl ProjectionTile {
+    pub(crate) fn with_backend(backend: MatvecBackend) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+
     #[allow(
         clippy::suboptimal_flops,
         clippy::too_many_lines,
@@ -51,9 +62,9 @@ impl ProjectionTile {
             while self.preparations.len() < inputs.len() {
                 self.preparations.try_reserve_exact(1)?;
                 self.preparations.push(if pinned {
-                    MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                    MatvecScratch::with_pinned_backend(self.backend)
                 } else {
-                    MatvecScratch::with_backend(MatvecBackend::Scalar)
+                    MatvecScratch::with_backend(self.backend)
                 });
             }
             for ((scratch, input), output) in self
@@ -97,13 +108,18 @@ impl ProjectionTile {
                     } else {
                         scale(&block[26..])?
                     };
+                    // Prepare one SIMD/scalar block for all tokens. This stays
+                    // stack-scoped and never expands or retains a matrix.
+                    let weights = dot::Block::new(weights, self.backend);
                     self.decoded_blocks = self.decoded_blocks.saturating_add(1);
                     for (token, scratch) in self.preparations[..inputs.len()].iter().enumerate() {
                         if tensor.kind == PQ2 && columns.is_multiple_of(256) {
                             let activation = &scratch.q8k[index / 2];
                             let start = (index % 2) * 128;
                             let d = weight_scale * activation.scale;
-                            let dot = dot_integer(&weights, &activation.values[start..start + 128]);
+                            let dot = integer_float(
+                                weights.dot128(activation.values[start..start + 128].try_into()?),
+                            );
                             sums[token] = if pinned {
                                 d.mul_add(dot, sums[token])
                             } else {
@@ -112,20 +128,18 @@ impl ProjectionTile {
                         } else {
                             let activations = &scratch.q8[index * 4..index * 4 + 4];
                             let mut sum = 0.0;
-                            for (group, activation) in
-                                weights.as_chunks::<32>().0.iter().zip(activations)
-                            {
+                            for (group, activation) in activations.iter().enumerate() {
                                 if tensor.kind == PTQ1 && pinned {
                                     let d = weight_scale * activation.scale;
                                     for (lane, integer) in lanes[token]
                                         .iter_mut()
-                                        .zip(q8_native_lanes(group, &activation.values))
+                                        .zip(weights.lanes32(group, &activation.values))
                                     {
                                         *lane = integer_float(integer).mul_add(d, *lane);
                                     }
                                 } else {
-                                    sum +=
-                                        activation.scale * dot_integer(group, &activation.values);
+                                    sum += activation.scale
+                                        * integer_float(weights.dot32(group, &activation.values));
                                 }
                             }
                             if tensor.kind != PTQ1 || !pinned {
@@ -156,6 +170,7 @@ impl ProjectionTile {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use super::*;
@@ -184,23 +199,37 @@ mod tests {
                             .collect()
                     })
                     .collect();
-                for pinned in [false, true] {
-                    let mut actual = vec![vec![f32::NAN]; count];
-                    let mut tiled = ProjectionTile::default();
-                    tiled.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
-                    assert_eq!(tiled.decoded_blocks, u64::try_from(columns / 128 * 3)?);
-                    for (input, actual) in inputs.iter().zip(actual) {
-                        let mut scratch = if pinned {
-                            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
-                        } else {
-                            MatvecScratch::with_backend(MatvecBackend::Scalar)
-                        };
-                        let mut expected = Vec::new();
-                        matvec_into(&tensor, input, &mut expected, &mut scratch)?;
+                for backend in [
+                    MatvecBackend::Scalar,
+                    MatvecBackend::Auto,
+                    MatvecBackend::ExperimentalNeon,
+                ] {
+                    let mut tiled = ProjectionTile::with_backend(backend);
+                    for (pass, pinned) in [false, true, false].into_iter().enumerate() {
+                        let mut actual = vec![vec![f32::NAN]; count];
+                        tiled.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
                         assert_eq!(
-                            actual.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
-                            expected.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+                            tiled.decoded_blocks,
+                            u64::try_from(columns / 128 * 3 * (pass + 1))?
                         );
+                        assert!(tiled.preparations.iter().all(|scratch| {
+                            scratch.requested_backend() == backend
+                                && scratch.pinned_accumulation == pinned
+                                && scratch.pq2_consumption.capacity() == 0
+                        }));
+                        for (input, actual) in inputs.iter().zip(actual) {
+                            let mut scratch = if pinned {
+                                MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                            } else {
+                                MatvecScratch::with_backend(MatvecBackend::Scalar)
+                            };
+                            let mut expected = Vec::new();
+                            matvec_into(&tensor, input, &mut expected, &mut scratch)?;
+                            assert_eq!(
+                                actual.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                                expected.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+                            );
+                        }
                     }
                 }
             }
@@ -230,5 +259,60 @@ mod tests {
             );
             assert!(outputs.iter().all(Vec::is_empty));
         }
+    }
+
+    #[test]
+    fn tiled_projection_clears_completed_rows_on_cancel_and_bad_scale() -> Result<()> {
+        for backend in [
+            MatvecBackend::Scalar,
+            MatvecBackend::Auto,
+            MatvecBackend::ExperimentalNeon,
+        ] {
+            for kind in [PQ2, PTQ1] {
+                let mut packed = [0x66; 34];
+                packed[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                let block = if kind == PTQ1 {
+                    bonsai_ternary::pack_ptq(&packed)?.to_vec()
+                } else {
+                    packed.to_vec()
+                };
+                let mut tensor = Tensor {
+                    name: "late-tile-error".into(),
+                    dimensions: vec![256, 2],
+                    kind,
+                    data: Arc::from(block.repeat(4)),
+                };
+                let inputs = vec![vec![1.5; 256]; 8];
+                let mut output = vec![vec![1.0]; 8];
+                let mut tile = ProjectionTile::with_backend(backend);
+                let calls = Cell::new(0);
+                assert!(
+                    tile.project(&tensor, &inputs, &mut output, true, &|| {
+                        calls.set(calls.get() + 1);
+                        // Eight preparations, first row, then cancel at row two.
+                        if calls.get() == 10 {
+                            Err(invalid("cancel after completed tile row"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+                );
+                assert_eq!(tile.decoded_blocks, 2);
+                assert!(output.iter().all(Vec::is_empty));
+                tile.project(&tensor, &inputs, &mut output, true, &|| Ok(()))?;
+                assert!(output.iter().all(|row| row.len() == 2));
+                let mut bad = tensor.data.to_vec();
+                let offset = block.len() * 3 + if kind == PTQ1 { 26 } else { 0 };
+                bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
+                tensor.data = Arc::from(bad);
+                assert!(
+                    tile.project(&tensor, &inputs, &mut output, false, &|| Ok(()))
+                        .is_err()
+                );
+                assert!(output.iter().all(Vec::is_empty));
+            }
+        }
+        Ok(())
     }
 }

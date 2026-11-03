@@ -20,14 +20,40 @@ type WorkerResult = Result<Option<Value>>;
 #[path = "pipe.rs"]
 mod pipe;
 pub(super) use pipe::Partition;
+#[path = "transcript.rs"]
+mod transcript;
+pub(super) use transcript::Transcript;
 
 pub(super) enum Session {
     File(FileSession),
     Pipe(pipe::Case),
-    Rust(super::rust::GraphSession),
+    Rust(Box<super::rust::GraphSession>),
 }
 
 impl Session {
+    pub(super) fn discard_transcripts_on_success(&mut self) {
+        match self {
+            Self::File(_) => {}
+            Self::Pipe(session) => {
+                session.requests.discard_on_success();
+                session.responses.discard_on_success();
+            }
+            Self::Rust(session) => session.discard_transcripts_on_success(),
+        }
+    }
+
+    fn finish_transcripts(&mut self, success: bool) -> Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Pipe(session) => {
+                session.requests.finish(success)?;
+                session.responses.finish(success)?;
+                Ok(())
+            }
+            Self::Rust(session) => session.finish_transcripts(success),
+        }
+    }
+
     pub(super) fn exchange(&mut self, actions: impl AsRef<[Value]>) -> Result<Vec<Value>> {
         let actions = actions.as_ref();
         match self {

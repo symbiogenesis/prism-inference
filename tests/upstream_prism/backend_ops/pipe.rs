@@ -3,7 +3,7 @@
 
 use super::super::super::engine::Engine;
 use super::super::super::{Result, invalid};
-use super::{MAX_ACTION_FILE, MAX_ACTIONS, MAX_FILE_BYTES, MAX_OBSERVATION, Session};
+use super::{MAX_ACTION_FILE, MAX_ACTIONS, MAX_FILE_BYTES, MAX_OBSERVATION, Session, Transcript};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -297,8 +297,8 @@ pub(in super::super) struct Case {
     pub(super) directory: PathBuf,
     deadline: Instant,
     total_actions: usize,
-    requests: BufWriter<File>,
-    responses: BufWriter<File>,
+    pub(super) requests: Transcript,
+    pub(super) responses: Transcript,
 }
 
 impl Case {
@@ -381,12 +381,16 @@ impl Partition {
             // model_session_spec returns None for the Rust target, whose
             // production backend lives in this process. A missing pipe is
             // therefore not an unsupported production graph API.
-            let mut session = Session::Rust(super::super::rust::GraphSession::open(
+            let mut session = Session::Rust(Box::new(super::super::rust::GraphSession::open(
                 &directory,
                 usize::try_from(MAX_FILE_BYTES)?,
                 deadline,
-            )?);
-            return controller(&mut session).map(Some);
+            )?));
+            let result = controller(&mut session);
+            let transcripts = session.finish_transcripts(result.is_ok());
+            let result = result?;
+            transcripts?;
+            return Ok(Some(result));
         };
         worker.borrow_mut().case_deadline = Some(deadline);
         worker.borrow_mut().call(
@@ -395,8 +399,8 @@ impl Partition {
         )?;
         let mut session = Session::Pipe(Case {
             worker: Rc::clone(worker),
-            requests: BufWriter::new(File::create(directory.join("actions.jsonl"))?),
-            responses: BufWriter::new(File::create(directory.join("observations.jsonl"))?),
+            requests: Transcript::new(&directory.join("actions.jsonl")),
+            responses: Transcript::new(&directory.join("observations.jsonl")),
             directory,
             deadline,
             // Retain the file protocol's initial and per-exchange checkpoint
@@ -410,6 +414,9 @@ impl Partition {
             worker.case_deadline = None;
             *lock(&worker.monitor.deadline) = None;
         }
+        let transcripts = session.finish_transcripts(
+            result.is_ok() && completion.as_ref().is_ok_and(|value| value == &json!({})),
+        );
         let result = result?;
         if completion? != json!({}) {
             worker
@@ -417,6 +424,7 @@ impl Partition {
                 .poison("backend pipe close acknowledgement differs");
             return Err(invalid("backend pipe close acknowledgement differs"));
         }
+        transcripts?;
         Ok(Some(result))
     }
 

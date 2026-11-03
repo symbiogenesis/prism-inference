@@ -95,7 +95,10 @@ pub(super) fn plan(
                 mode.code(),
             );
             let prepared = prepare(&mut host, geometry, mode, filter)?;
-            receipt(&host, &prepared, geometry, case_index)
+            let observed = receipt(&host, &prepared, geometry, case_index)?;
+            drop(host);
+            session.discard_transcripts_on_success();
+            Ok(observed)
         })?;
         let Some(observed) = observed else {
             return Ok(

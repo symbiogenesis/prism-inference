@@ -1,5 +1,6 @@
 //! Continuation serialization for the production owned CPU backend.
 
+use super::super::transport::Transcript;
 use super::{
     Argument, CpuBackend, Observation, Result, TensorId, Value, array, hex, integer, invalid, json,
     text, unhex, unsigned,
@@ -8,7 +9,7 @@ use bonsai_prism_runtime::backend::{GraphId, operation_name, type_layout, unary_
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,8 +21,8 @@ const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
 /// Its state belongs to one geometry, with no polling files or worker thread.
 pub(in super::super) struct GraphSession {
     state: State,
-    requests: BufWriter<File>,
-    responses: BufWriter<File>,
+    requests: Transcript,
+    responses: Transcript,
     total_actions: usize,
     deadline: Instant,
     poisoned: bool,
@@ -49,8 +50,8 @@ impl GraphSession {
     ) -> Result<Self> {
         let state = State::open(directory, maximum)?;
         Ok(Self {
-            requests: BufWriter::new(File::create(state.directory.join("actions.jsonl"))?),
-            responses: BufWriter::new(File::create(state.directory.join("observations.jsonl"))?),
+            requests: Transcript::new(&state.directory.join("actions.jsonl")),
+            responses: Transcript::new(&state.directory.join("observations.jsonl")),
             state,
             total_actions: 1,
             deadline,
@@ -60,6 +61,17 @@ impl GraphSession {
 
     pub(in super::super) fn directory(&self) -> &Path {
         &self.state.directory
+    }
+
+    pub(in super::super) fn discard_transcripts_on_success(&mut self) {
+        self.requests.discard_on_success();
+        self.responses.discard_on_success();
+    }
+
+    pub(in super::super) fn finish_transcripts(&mut self, success: bool) -> Result<()> {
+        self.requests.finish(success)?;
+        self.responses.finish(success)?;
+        Ok(())
     }
 
     pub(in super::super) fn exchange(&mut self, actions: &[Value]) -> Result<Vec<Value>> {
@@ -1005,6 +1017,7 @@ mod tests {
             assert_eq!(session.exchange(&actions).is_ok(), success);
             if success {
                 assert_eq!(session.total_actions, MAX_ACTIONS);
+                session.finish_transcripts(true)?;
                 let response: Value =
                     serde_json::from_slice(&fs::read(directory.join("observations.jsonl"))?)?;
                 assert_eq!(array(&response["Trace"])?.len(), 1);

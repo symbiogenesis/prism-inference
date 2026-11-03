@@ -200,12 +200,21 @@ fn one(
             result["InputAndOutputReceipts"] = json!(host.inputs.receipts);
             Ok(result)
         })();
-        fs::write(
-            directory.join("input-state.json"),
-            serde_json::to_vec_pretty(
-                &json!({"SchemaVersion":1,"GeometryIndex":index,"RandomDeviceAlgorithm":"SplitMix64 low32; initial state is GeometryIndex","RandomDeviceSeeds":host.inputs.ledger.seeds,"InputAndOutputReceipts":host.inputs.receipts,"CrtOffset":offset,"CrtDraws":host.crt.draws}),
-            )?,
-        )?;
+        let passed = observed.as_ref().is_ok_and(|result| {
+            matches!(result["Status"].as_str(), Some("pass" | "skip" | "measured"))
+        });
+        if !passed {
+            fs::write(
+                directory.join("input-state.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"SchemaVersion":1,"GeometryIndex":index,"RandomDeviceAlgorithm":"SplitMix64 low32; initial state is GeometryIndex","RandomDeviceSeeds":host.inputs.ledger.seeds,"InputAndOutputReceipts":host.inputs.receipts,"CrtOffset":offset,"CrtDraws":host.crt.draws}),
+                )?,
+            )?;
+        }
+        drop(host);
+        if passed {
+            session.discard_transcripts_on_success();
+        }
         observed
     })
 }

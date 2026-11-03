@@ -5,6 +5,11 @@
 //! its original activation quantizer, ordered block accumulation and pinned
 //! PTQ1 four-lane reduction. No decoded matrix survives this call.
 
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "Keep graph-consumed tile types crate scoped inside the private kernel module."
+)]
+
 use super::{
     MatvecBackend, MatvecScratch, PQ2, PTQ1, dimensions, dot_integer, finite, integer_float,
     matvec_into, pq2_values, ptq1_values, q8_native_lanes, scale,
@@ -107,7 +112,9 @@ impl ProjectionTile {
                         } else {
                             let activations = &scratch.q8[index * 4..index * 4 + 4];
                             let mut sum = 0.0;
-                            for (group, activation) in weights.chunks_exact(32).zip(activations) {
+                            for (group, activation) in
+                                weights.as_chunks::<32>().0.iter().zip(activations)
+                            {
                                 if tensor.kind == PTQ1 && pinned {
                                     let d = weight_scale * activation.scale;
                                     for (lane, integer) in lanes[token]

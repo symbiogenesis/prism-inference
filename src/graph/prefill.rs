@@ -55,6 +55,13 @@ pub(super) struct TiledPrefill {
 }
 
 impl TiledPrefill {
+    #[cfg_attr(
+        not(feature = "parallel-rows"),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "The delegated setter drops the replaced pool owner in parallel builds; retain one signature across feature sets."
+        )
+    )]
     pub(super) fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
         self.projector.set_row_parallelism(parallelism);
     }

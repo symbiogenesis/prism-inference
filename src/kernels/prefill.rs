@@ -39,6 +39,13 @@ impl ProjectionTile {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "parallel-rows"),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "The parallel-rows build drops the replaced pool owner; retain one non-const signature across feature sets."
+        )
+    )]
     pub(crate) fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
         self.row_parallelism = parallelism;
     }

@@ -45,6 +45,34 @@ const MAX_REQUEST_BYTES: u64 = 8192;
 const MODEL_MEMORY_LIMIT: usize = 12 * 1024 * 1024 * 1024;
 const MAX_HOST_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_TOKENS: usize = 8;
+// Exact original-Swift geometry is independently enforced by swift::load:
+// 48 recurrent blocks, state head128, value heads48, key groups16 and conv4.
+// visit_state promotes the sixteen full-attention blocks' F16 K/V to F32.
+const CONTROL_RECURRENT_BYTES: usize = 48 * (128 * 128 * 48 + 3 * (2 * 128 * 16 + 128 * 48)) * 4;
+const CONTROL_KV_BYTES_PER_TOKEN: usize = 16 * 2 * 256 * 4 * 4;
+
+#[derive(Debug)]
+struct ControlStateBudgetExceeded {
+    required: usize,
+    available: usize,
+}
+
+impl std::fmt::Display for ControlStateBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CPU control snapshots require {} bytes, exceeding the {} byte allowance",
+            self.required, self.available
+        )
+    }
+}
+
+impl std::error::Error for ControlStateBudgetExceeded {}
+
+fn control_state_bytes(tokens: usize) -> Result<usize> {
+    require((1..=MAX_TOKENS).contains(&tokens))?;
+    Ok(tokens * CONTROL_RECURRENT_BYTES + CONTROL_KV_BYTES_PER_TOKEN * tokens * (tokens + 1) / 2)
+}
 
 #[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -209,6 +237,14 @@ impl Request {
                 && self.expected_parent_pid != 0
                 && self.expected_parent_creation_time != 0,
         )?;
+        let required = control_state_bytes(tokens.len())?;
+        if required > self.state_budget_bytes {
+            return Err(ControlStateBudgetExceeded {
+                required,
+                available: self.state_budget_bytes,
+            }
+            .into());
+        }
         Ok(Q2ProjectionLimits::new(
             17_408,
             self.maximum_operations,
@@ -419,14 +455,39 @@ fn graph_for_arm(model: Model, request: &Request, cpu_baseline: bool) -> Result<
     Ok(graph)
 }
 
+fn cpu_stage<T>(
+    stage: &str,
+    token_index: Option<usize>,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    cpu_stage_with_report(stage, token_index, work, emit)
+}
+
+fn cpu_stage_with_report<T>(
+    stage: &str,
+    token_index: Option<usize>,
+    work: impl FnOnce() -> Result<T>,
+    report: impl FnOnce(&Value) -> Result<()>,
+) -> Result<T> {
+    let result = work();
+    if result.is_err() {
+        report(&json!({"event":"cpu-control-failure","stage":stage,"tokenIndex":token_index}))?;
+    }
+    result
+}
+
 fn cpu_control(model: Model, request: &Request) -> Result<Vec<Control>> {
-    let mut graph = graph_for_arm(model, request, true)?;
+    let mut graph = cpu_stage("graph-construction", None, || {
+        graph_for_arm(model, request, true)
+    })?;
     let mut controls = Vec::new();
     let mut remaining_state_bytes = request.state_budget_bytes;
     controls.try_reserve_exact(request.tokens().len())?;
-    for &token in request.tokens() {
-        let logits = graph.evaluate(token)?;
-        let rows = capture_state(&graph, remaining_state_bytes)?;
+    for (index, &token) in request.tokens().iter().enumerate() {
+        let logits = cpu_stage("evaluate", Some(index), || graph.evaluate(token))?;
+        let rows = cpu_stage("state-capture", Some(index), || {
+            capture_state(&graph, remaining_state_bytes)
+        })?;
         for row in &rows {
             remaining_state_bytes = remaining_state_bytes
                 .checked_sub(row.bits.len().checked_mul(4).ok_or_else(reject)?)
@@ -434,7 +495,7 @@ fn cpu_control(model: Model, request: &Request) -> Result<Vec<Control>> {
         }
         controls.push(Control {
             logits,
-            state_sha256: state_digest(&graph)?,
+            state_sha256: cpu_stage("state-digest", Some(index), || state_digest(&graph))?,
             rows,
         });
     }
@@ -848,6 +909,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["cpuBaselineAdapterScaleBits"] = json!(request.adapter_case.scale().to_bits());
     value["cpuBackend"] = json!(request.cpu_backend.name());
     value["rowWorkers"] = json!(request.row_workers);
+    value["requiredControlStateBytes"] = json!(control_state_bytes(request.tokens().len())?);
     value["maximumOperations"] = json!(request.maximum_operations);
     value["sessionSeconds"] = json!(request.session_seconds);
     value["nativeHmxBitplaneControl"] = json!(report.is_hmx_bitplane_control());
@@ -919,9 +981,15 @@ fn main_work() -> Result<()> {
 
 fn main() -> ExitCode {
     main_work().map_or_else(
-        |_| {
-            let _ = emit(&json!({"event":"error","schemaVersion":1,"completed":false,
-                "reason":"hexagon-model-probe-rejected","profileEligible":false}));
+        |error| {
+            let mut failure = json!({"event":"error","schemaVersion":1,"completed":false,
+                "reason":"hexagon-model-probe-rejected","profileEligible":false});
+            if let Some(budget) = error.downcast_ref::<ControlStateBudgetExceeded>() {
+                failure["reason"] = json!("control-snapshot-budget");
+                failure["requiredControlStateBytes"] = json!(budget.required);
+                failure["stateBudgetBytes"] = json!(budget.available);
+            }
+            let _ = emit(&failure);
             ExitCode::FAILURE
         },
         |()| ExitCode::SUCCESS,
@@ -1002,9 +1070,86 @@ mod tests {
         eight["tokenIds"] = json!([0, 1, 2, 3, 4, 5, 6, 7]);
         eight["contextLimit"] = json!(8);
         eight["maximumOperations"] = json!(320);
+        eight["stateBudgetBytes"] = json!(control_state_bytes(8)?);
         serde_json::from_value::<Request>(eight.clone())?.limits()?;
         eight["maximumOperations"] = json!(319);
         assert!(serde_json::from_value::<Request>(eight)?.limits().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn model_probe_admits_complete_cpu_snapshot_retention_before_model_work() -> Result<()> {
+        assert_eq!(
+            CONTROL_RECURRENT_BYTES + CONTROL_KV_BYTES_PER_TOKEN / 2 * swift::CONTEXT_TOKENS,
+            swift::STATE_PAYLOAD_BYTES
+        );
+        assert_eq!(control_state_bytes(3)?, 471_465_984);
+        assert_eq!(control_state_bytes(4)?, 628_883_456);
+        assert!(control_state_bytes(0).is_err());
+        assert!(control_state_bytes(MAX_TOKENS + 1).is_err());
+        let mut three = request();
+        three["tokenIds"] = json!([0, 42, 43]);
+        three["contextLimit"] = json!(3);
+        serde_json::from_value::<Request>(three)?.limits()?;
+        let mut four = request();
+        four["tokenIds"] = json!([0, 42, 43, 44]);
+        four["contextLimit"] = json!(4);
+        let error = serde_json::from_value::<Request>(four.clone())?
+            .limits()
+            .err()
+            .ok_or_else(reject)?;
+        let budget = error
+            .downcast_ref::<ControlStateBudgetExceeded>()
+            .ok_or_else(reject)?;
+        assert_eq!(budget.required, 628_883_456);
+        assert_eq!(budget.available, 536_870_912);
+        four["stateBudgetBytes"] = json!(628_883_456);
+        serde_json::from_value::<Request>(four.clone())?.limits()?;
+        four["stateBudgetBytes"] = json!(628_883_455);
+        assert!(serde_json::from_value::<Request>(four)?.limits().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn model_probe_cpu_failure_reports_stage_and_index_without_a_success_claim() -> Result<()> {
+        let mut events = Vec::new();
+        let result: Result<()> = cpu_stage_with_report(
+            "state-capture",
+            Some(3),
+            || Err(reject()),
+            |value| {
+                events.push(value.clone());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            events,
+            vec![json!({"event":"cpu-control-failure","stage":"state-capture","tokenIndex":3})]
+        );
+        events.clear();
+        cpu_stage_with_report(
+            "evaluate",
+            Some(0),
+            || Ok(()),
+            |value| {
+                events.push(value.clone());
+                Ok(())
+            },
+        )?;
+        assert!(events.is_empty());
+        let result: Result<()> = cpu_stage_with_report(
+            "graph-construction",
+            None,
+            || Err(reject()),
+            |value| {
+                events.push(value.clone());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(events[0]["stage"], "graph-construction");
+        assert!(events[0]["tokenIndex"].is_null());
         Ok(())
     }
 

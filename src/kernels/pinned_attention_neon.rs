@@ -89,7 +89,8 @@ mod tests {
     }
 
     #[test]
-    fn neon_value_tile_baseline_is_available_and_accumulator_remains_two_kib() -> crate::Result<()> {
+    fn neon_value_tile_baseline_is_available_and_accumulator_remains_two_kib() -> crate::Result<()>
+    {
         let neon = fearless_simd::Level::baseline()
             .as_neon()
             .ok_or_else(|| crate::invalid("required attention baseline NEON token is absent"))?;
@@ -119,7 +120,11 @@ mod tests {
             &(0..VALUE_TILE),
             &mut output,
         )?;
-        assert!(output.iter().all(|value| value.to_bits() == captured.native_bits));
+        assert!(
+            output
+                .iter()
+                .all(|value| value.to_bits() == captured.native_bits)
+        );
         Ok(())
     }
 }

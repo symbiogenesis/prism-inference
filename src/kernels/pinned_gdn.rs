@@ -139,13 +139,20 @@ mod tests {
     fn pinned_gdn_dispatch_matches_scalar_bits_and_tail() -> Result<()> {
         for width in (0..=33).chain([63, 64, 65, 127, 128, 129, 255, 256, 257, 5120]) {
             let (first, second) = vectors(width);
-            assert_eq!(dot(&first, &second)?.to_bits(), dot_scalar(&first, &second)?.to_bits());
+            assert_eq!(
+                dot(&first, &second)?.to_bits(),
+                dot_scalar(&first, &second)?.to_bits()
+            );
             for scale in [0.0, -0.0, 0.375, -1.125, f32::from_bits(1)] {
                 let mut expected = first.clone();
                 let mut actual = first.clone();
                 scalar_add_scaled(&mut expected, &second, scale)?;
                 add_scaled(&mut actual, &second, scale)?;
-                assert_eq!(bits(&actual), bits(&expected), "width {width}, scale {scale}");
+                assert_eq!(
+                    bits(&actual),
+                    bits(&expected),
+                    "width {width}, scale {scale}"
+                );
             }
         }
         Ok(())
@@ -166,8 +173,16 @@ mod tests {
             let mut actual = vec![-1.0; width];
             add_scaled(&mut actual, &vec![input; width], scale)?;
             let vectorized = width / 16 * 16;
-            assert!(actual[..vectorized].iter().all(|value| value.to_bits() == fused.to_bits()));
-            assert!(actual[vectorized..].iter().all(|value| value.to_bits() == nonfused.to_bits()));
+            assert!(
+                actual[..vectorized]
+                    .iter()
+                    .all(|value| value.to_bits() == fused.to_bits())
+            );
+            assert!(
+                actual[vectorized..]
+                    .iter()
+                    .all(|value| value.to_bits() == nonfused.to_bits())
+            );
         }
         Ok(())
     }
@@ -175,13 +190,26 @@ mod tests {
     #[test]
     fn pinned_gdn_preserves_exceptional_bits_and_first_failure_mutation() -> Result<()> {
         let values = [
-            0.0, -0.0, f32::from_bits(1), -f32::from_bits(1),
-            f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1.0, -1.0,
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0,
+            -1.0,
         ];
         for width in [0, 1, 15, 16, 17, 31, 32, 33, 128, 129] {
-            let first = (0..width).map(|index| values[index % values.len()]).collect::<Vec<_>>();
-            let second = (0..width).map(|index| values[(index + 3) % values.len()]).collect::<Vec<_>>();
-            assert_eq!(dot(&first, &second)?.to_bits(), dot_scalar(&first, &second)?.to_bits());
+            let first = (0..width)
+                .map(|index| values[index % values.len()])
+                .collect::<Vec<_>>();
+            let second = (0..width)
+                .map(|index| values[(index + 3) % values.len()])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                dot(&first, &second)?.to_bits(),
+                dot_scalar(&first, &second)?.to_bits()
+            );
             for scale in [0.0, -0.0, 0.5, -1.0] {
                 let mut actual = first.clone();
                 let mut expected = first.clone();
@@ -199,9 +227,17 @@ mod tests {
                     let mut expected = actual.clone();
                     assert!(scalar_add_scaled(&mut expected, &input, 2.0).is_err());
                     assert!(add_scaled(&mut actual, &input, 2.0).is_err());
-                    assert_eq!(bits(&actual), bits(&expected), "width {width}, failing lane {failing}");
+                    assert_eq!(
+                        bits(&actual),
+                        bits(&expected),
+                        "width {width}, failing lane {failing}"
+                    );
                     assert_eq!(actual[failing].to_bits(), 1.0_f32.to_bits());
-                    assert!(actual[failing..].iter().all(|value| value.to_bits() == 1.0_f32.to_bits()));
+                    assert!(
+                        actual[failing..]
+                            .iter()
+                            .all(|value| value.to_bits() == 1.0_f32.to_bits())
+                    );
                 }
             }
         }
@@ -227,8 +263,14 @@ mod tests {
     fn pinned_gdn_neon_executes_exact_vector_and_tail_contract() -> Result<()> {
         let (first, second) = vectors(129);
         let actual = super::neon::dot(&first, &second);
-        assert!(actual.is_some(), "qualified baseline must provide a NEON token");
-        assert_eq!(actual.map(f32::to_bits), Some(dot_scalar(&first, &second)?.to_bits()));
+        assert!(
+            actual.is_some(),
+            "qualified baseline must provide a NEON token"
+        );
+        assert_eq!(
+            actual.map(f32::to_bits),
+            Some(dot_scalar(&first, &second)?.to_bits())
+        );
         let mut expected = first.clone();
         let mut actual = first;
         scalar_add_scaled(&mut expected, &second, -0.375)?;

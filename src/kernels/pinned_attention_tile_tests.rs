@@ -26,9 +26,7 @@ fn pinned_value_vector_tiles_preserve_scalar_bits_at_channel_and_padding_boundar
                 .map(half_to_float)
                 .collect();
             let weights: Vec<_> = (0..length)
-                .map(|token| {
-                    half_to_float([0x0000, 0x8000, 0x0001, 0x3c00, 0xb800][token % 5])
-                })
+                .map(|token| half_to_float([0x0000, 0x8000, 0x0001, 0x3c00, 0xb800][token % 5]))
                 .collect();
             let past = rows[..length - 1].iter().map(Vec::as_slice);
             let mut actual = vec![f32::NAN; width];
@@ -98,7 +96,8 @@ fn pinned_value_vector_tiles_preserve_validation_and_finite_failure_publication(
             let mut expected = actual;
             assert!(value_tile([].into_iter(), &current, &[2.0], 0, &mut actual).is_err());
             assert!(
-                value_tile_scalar([].into_iter(), &current, &[2.0], &(0..4), &mut expected).is_err()
+                value_tile_scalar([].into_iter(), &current, &[2.0], &(0..4), &mut expected)
+                    .is_err()
             );
             assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
             for (channel, &value) in actual.iter().enumerate() {

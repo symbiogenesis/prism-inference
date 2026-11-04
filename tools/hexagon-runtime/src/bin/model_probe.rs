@@ -16,13 +16,14 @@
 )]
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     env,
     fs::{self, File},
     io::{self, Read as _, Write as _},
     path::{Component, Path, PathBuf},
     process::ExitCode,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bonsai_hexagon_runtime::{GuardedQ2Executor, HmxQ2Executor, PlacedProjectionExecutor};
@@ -423,6 +424,7 @@ struct Control {
     logits: Vec<f32>,
     state_sha256: String,
     rows: Vec<StateRow>,
+    evaluation_duration: Duration,
 }
 
 fn graph_for_arm(model: Model, request: &Request, cpu_baseline: bool) -> Result<Qwen35> {
@@ -484,7 +486,9 @@ fn cpu_control(model: Model, request: &Request) -> Result<Vec<Control>> {
     let mut remaining_state_bytes = request.state_budget_bytes;
     controls.try_reserve_exact(request.tokens().len())?;
     for (index, &token) in request.tokens().iter().enumerate() {
+        let started = Instant::now();
         let logits = cpu_stage("evaluate", Some(index), || graph.evaluate(token))?;
+        let evaluation_duration = started.elapsed();
         let rows = cpu_stage("state-capture", Some(index), || {
             capture_state(&graph, remaining_state_bytes)
         })?;
@@ -497,14 +501,45 @@ fn cpu_control(model: Model, request: &Request) -> Result<Vec<Control>> {
             logits,
             state_sha256: cpu_stage("state-digest", Some(index), || state_digest(&graph))?,
             rows,
+            evaluation_duration,
         });
     }
     Ok(controls)
 }
 
+#[derive(Default)]
+struct SubmitTimings {
+    native: Cell<Duration>,
+    oracle: Cell<Duration>,
+}
+
+fn timed<T>(accumulator: &Cell<Duration>, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = work();
+    accumulator.set(accumulator.get().saturating_add(started.elapsed()));
+    result
+}
+
+fn token_timings(
+    cpu: Duration,
+    native_graph: Duration,
+    native_submit: Duration,
+    integer_oracle: Duration,
+) -> Value {
+    json!({
+        "cpuEvaluationMilliseconds":cpu.as_secs_f64() * 1000.0,
+        "nativeCheckedEvaluationMilliseconds":native_graph.as_secs_f64() * 1000.0,
+        "nativeSubmitAndWaitMilliseconds":native_submit.as_secs_f64() * 1000.0,
+        "independentIntegerOracleMilliseconds":integer_oracle.as_secs_f64() * 1000.0,
+        "nativeEvaluationExcludingIntegerOracleMilliseconds":
+            native_graph.saturating_sub(integer_oracle).as_secs_f64() * 1000.0,
+    })
+}
+
 /// Independent scalar oracle over each signed operation's serialized operands.
 struct CheckedSubmitter<'a> {
     native: &'a mut dyn GuardedQ2Submitter,
+    timings: &'a SubmitTimings,
     compared: u64,
     failed: bool,
 }
@@ -573,8 +608,13 @@ impl GuardedQ2Submitter for CheckedSubmitter<'_> {
         // Mark terminal before calling the native owner so any failure, including
         // an oracle mismatch, makes later submission impossible without replay.
         self.failed = true;
-        self.native.submit(weights, activation, output)?;
-        let count = compare_limbs(weights, activation, output).map_err(|_| Error::Contract)?;
+        timed(&self.timings.native, || {
+            self.native.submit(weights, activation, output)
+        })?;
+        let count = timed(&self.timings.oracle, || {
+            compare_limbs(weights, activation, output)
+        })
+        .map_err(|_| Error::Contract)?;
         self.compared = self.compared.checked_add(count).ok_or(Error::Contract)?;
         self.failed = false;
         Ok(())
@@ -627,6 +667,7 @@ fn compare_planes(weights: &[u8], activation: &[[f32; 128]; 8], output: &[f32]) 
 
 struct CheckedHmxSubmitter<'a> {
     native: &'a mut dyn HmxQ2Submitter,
+    timings: &'a SubmitTimings,
     compared: u64,
     failed: bool,
 }
@@ -652,8 +693,13 @@ impl HmxQ2Submitter for CheckedHmxSubmitter<'_> {
         }
         self.failed = true;
         let result = (|| {
-            self.native.submit(weights, activation, output)?;
-            let count = compare_planes(weights, activation, output).map_err(|_| Error::Contract)?;
+            timed(&self.timings.native, || {
+                self.native.submit(weights, activation, output)
+            })?;
+            let count = timed(&self.timings.oracle, || {
+                compare_planes(weights, activation, output)
+            })
+            .map_err(|_| Error::Contract)?;
             self.compared = self.compared.checked_add(count).ok_or(Error::Contract)?;
             Ok(())
         })();
@@ -674,6 +720,7 @@ fn compare_graph_sequence(
     controls: &[Control],
     request: &Request,
     parent: &bonsai_windows_process::ParentProcess,
+    timings: &SubmitTimings,
 ) -> Result<Value> {
     require(controls.len() == request.tokens().len())?;
     let mut placed = PlacedProjectionExecutor::new(executor, placement_model, &[PROJECTION])?;
@@ -684,7 +731,17 @@ fn compare_graph_sequence(
     comparisons.try_reserve_exact(controls.len())?;
     for (index, (&token, control)) in request.tokens().iter().zip(controls).enumerate() {
         parent.ensure_alive()?;
+        let submit_before = timings.native.get();
+        let oracle_before = timings.oracle.get();
+        let started = Instant::now();
         let actual = projected.evaluate(token)?;
+        let evaluation_duration = started.elapsed();
+        let token_timing = token_timings(
+            control.evaluation_duration,
+            evaluation_duration,
+            timings.native.get().saturating_sub(submit_before),
+            timings.oracle.get().saturating_sub(oracle_before),
+        );
         require(
             actual.len() == control.logits.len()
                 && actual
@@ -697,7 +754,8 @@ fn compare_graph_sequence(
         require(actual_state == control.state_sha256)?;
         comparisons.push(json!({"index":index,"tokenId":token,
             "logitsBitwiseEqual":true,"stateBitwiseEqual":true,
-            "logitsSha256":logits_digest(&actual)?,"stateSha256":actual_state}));
+            "logitsSha256":logits_digest(&actual)?,"stateSha256":actual_state,
+            "timing":token_timing}));
     }
     let last = comparisons.last().ok_or_else(reject)?;
     Ok(
@@ -770,6 +828,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     let npu_power_before = power_value();
     let mut result = None;
     let mut progress_failed = false;
+    let submit_timings = SubmitTimings::default();
     let report_result = (|| {
         let driver = Driver::open_system()?;
         let driver_dll = driver.path().to_path_buf();
@@ -803,6 +862,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                     let work = (|| -> Result<()> {
                         let mut checked = CheckedSubmitter {
                             native,
+                            timings: &submit_timings,
                             compared: 0,
                             failed: false,
                         };
@@ -819,6 +879,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                 &controls,
                                 request,
                                 &parent,
+                                &submit_timings,
                             )?;
                             (value, executor.statistics())
                         };
@@ -842,6 +903,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                         let work = (|| -> Result<()> {
                             let mut checked = CheckedHmxSubmitter {
                                 native,
+                                timings: &submit_timings,
                                 compared: 0,
                                 failed: false,
                             };
@@ -858,6 +920,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                     &controls,
                                     request,
                                     &parent,
+                                    &submit_timings,
                                 )?;
                                 (value, executor.statistics())
                             };
@@ -915,6 +978,13 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["nativeHmxBitplaneControl"] = json!(report.is_hmx_bitplane_control());
     value["profileEligible"] = json!(false);
     value["performanceMeasured"] = json!(false);
+    value["timingScope"] = json!({
+        "kind":"single-run-diagnostic-evaluation-windows",
+        "includes":"All CPU-owned graph work, offload packing/reconstruction, native submission and wait inside evaluate; checked native evaluation also includes the independently timed integer oracle.",
+        "excludes":"Model loading, graph construction, device setup/cleanup, state snapshots/digests and final graph comparisons.",
+        "qualifiedBenefitComparison":false,
+        "subtractedOracleWindowIsEstimated":true,
+    });
     value["cpuPowerBefore"] = cpu_power_before;
     value["cpuPowerAfter"] = cpu_power_after;
     value["npuPowerBefore"] = npu_power_before;
@@ -1296,8 +1366,10 @@ mod tests {
                 fail,
                 wrong,
             };
+            let timings = SubmitTimings::default();
             let mut checked = CheckedHmxSubmitter {
                 native: &mut native,
+                timings: &timings,
                 compared: 0,
                 failed: false,
             };
@@ -1324,8 +1396,10 @@ mod tests {
             fail: false,
             wrong: false,
         };
+        let timings = SubmitTimings::default();
         let mut checked = CheckedHmxSubmitter {
             native: &mut native,
+            timings: &timings,
             compared: 0,
             failed: false,
         };
@@ -1452,8 +1526,10 @@ mod tests {
                 fail,
                 wrong,
             };
+            let timings = SubmitTimings::default();
             let mut checked = CheckedSubmitter {
                 native: &mut native,
+                timings: &timings,
                 compared: 0,
                 failed: false,
             };
@@ -1482,8 +1558,10 @@ mod tests {
             fail: false,
             wrong: false,
         };
+        let timings = SubmitTimings::default();
         let mut checked = CheckedSubmitter {
             native: &mut native,
+            timings: &timings,
             compared: 0,
             failed: false,
         };
@@ -1493,5 +1571,27 @@ mod tests {
         assert_eq!(checked.compared, 128);
         assert!(!checked.failed);
         Ok(())
+    }
+
+    #[test]
+    fn model_probe_timing_windows_keep_native_wait_and_oracle_separate() {
+        let timing = token_timings(
+            Duration::from_millis(100),
+            Duration::from_millis(180),
+            Duration::from_millis(30),
+            Duration::from_millis(50),
+        );
+        assert_eq!(timing["cpuEvaluationMilliseconds"], json!(100.0));
+        assert_eq!(timing["nativeCheckedEvaluationMilliseconds"], json!(180.0));
+        assert_eq!(timing["nativeSubmitAndWaitMilliseconds"], json!(30.0));
+        assert_eq!(timing["independentIntegerOracleMilliseconds"], json!(50.0));
+        assert_eq!(
+            timing["nativeEvaluationExcludingIntegerOracleMilliseconds"],
+            json!(130.0)
+        );
+        let accumulated = Cell::new(Duration::from_secs(1));
+        let failure: Result<()> = timed(&accumulated, || Err(reject()));
+        assert!(failure.is_err());
+        assert!(accumulated.get() >= Duration::from_secs(1));
     }
 }

@@ -69,12 +69,11 @@ impl RowParallelism {
             // At most 16 * 32 mutable slice descriptors and one error/count per
             // worker, all stack-scoped. Existing output capacities were reserved
             // fallibly by the caller; no second matrix or result transpose exists.
-            let mut tasks: [Task<'_, TOKENS>; MAX_ROW_WORKERS] =
-                std::array::from_fn(|_| Task {
-                    outputs: std::array::from_fn(|_| &mut []),
-                    error: None,
-                    decoded_blocks: 0,
-                });
+            let mut tasks: [Task<'_, TOKENS>; MAX_ROW_WORKERS] = std::array::from_fn(|_| Task {
+                outputs: std::array::from_fn(|_| -> &mut [f32] { &mut [] }),
+                error: None,
+                decoded_blocks: 0,
+            });
             for (token, output) in outputs.iter_mut().enumerate() {
                 output.resize(rows, 0.0);
                 for (task, chunk) in tasks.iter_mut().zip(output.chunks_mut(task_rows)) {
@@ -164,7 +163,7 @@ mod tests {
     #[test]
     fn tiled_parallel_rows_borrow_outputs_and_keep_callback_on_caller() -> Result<()> {
         assert!(
-            std::mem::size_of::<[Task<'_, 32>; MAX_ROW_WORKERS]>() + 1024
+            size_of::<[Task<'_, 32>; MAX_ROW_WORKERS]>() + 1024
                 <= crate::kernels::prefill::ROW_TASK_SCRATCH_BYTES
         );
         let policy = RowParallelism::new(4)?;
@@ -186,8 +185,15 @@ mod tests {
                 Ok(())
             },
             |row, blocks| {
-                assert_eq!(row.as_ptr(), data.as_ptr().wrapping_add(usize::from(row[0])));
-                assert!(std::thread::current().name().is_some_and(|name| name.starts_with("prism-row-")));
+                assert_eq!(
+                    row.as_ptr(),
+                    data.as_ptr().wrapping_add(usize::from(row[0]))
+                );
+                assert!(
+                    std::thread::current()
+                        .name()
+                        .is_some_and(|name| name.starts_with("prism-row-"))
+                );
                 let wait = std::time::Instant::now();
                 while !checked.load(Ordering::Acquire) {
                     assert!(wait.elapsed() < std::time::Duration::from_secs(2));
@@ -216,49 +222,74 @@ mod tests {
         let data = [0_u8, 1, 2, 3, 4, 5, 6, 7];
         let mut outputs = vec![Vec::with_capacity(data.len()); 1];
         let mut blocks = 0;
-        let failure = policy.fill_tile(&data, 1, &mut outputs, &mut blocks, &|| Ok(()), |row, blocks| {
-            *blocks += 1;
-            if row[0] == 3 || row[0] == 7 {
-                Err(invalid(format!("failed tile row {}", row[0])))
-            } else {
-                Ok([f32::from(row[0])])
-            }
-        });
-        assert_eq!(failure.map_err(|error| error.to_string()), Err("failed tile row 3".to_owned()));
+        let failure = policy.fill_tile(
+            &data,
+            1,
+            &mut outputs,
+            &mut blocks,
+            &|| Ok(()),
+            |row, blocks| {
+                *blocks += 1;
+                if row[0] == 3 || row[0] == 7 {
+                    Err(invalid(format!("failed tile row {}", row[0])))
+                } else {
+                    Ok([f32::from(row[0])])
+                }
+            },
+        );
+        assert_eq!(
+            failure.map_err(|error| error.to_string()),
+            Err("failed tile row 3".to_owned())
+        );
         assert_eq!(blocks, 8);
 
         let started = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
         let checks = Cell::new(0);
-        let failure = policy.fill_tile::<1>(&data, 1, &mut outputs, &mut blocks, &|| {
-            checks.set(checks.get() + 1);
-            if started.load(Ordering::Acquire) {
-                cancelled.store(true, Ordering::Release);
-                Err(invalid("caller cancelled tile"))
-            } else {
-                Ok(())
-            }
-        }, |_, blocks| {
-            started.store(true, Ordering::Release);
-            let wait = std::time::Instant::now();
-            while !cancelled.load(Ordering::Acquire) {
-                assert!(wait.elapsed() < std::time::Duration::from_secs(2));
-                std::thread::yield_now();
-            }
-            *blocks += 1;
-            Err(invalid("provisional worker failure"))
-        });
-        assert_eq!(failure.map_err(|error| error.to_string()), Err("caller cancelled tile".to_owned()));
+        let failure = policy.fill_tile::<1>(
+            &data,
+            1,
+            &mut outputs,
+            &mut blocks,
+            &|| {
+                checks.set(checks.get() + 1);
+                if started.load(Ordering::Acquire) {
+                    cancelled.store(true, Ordering::Release);
+                    Err(invalid("caller cancelled tile"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_, blocks| {
+                started.store(true, Ordering::Release);
+                let wait = std::time::Instant::now();
+                while !cancelled.load(Ordering::Acquire) {
+                    assert!(wait.elapsed() < std::time::Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
+                *blocks += 1;
+                Err(invalid("provisional worker failure"))
+            },
+        );
+        assert_eq!(
+            failure.map_err(|error| error.to_string()),
+            Err("caller cancelled tile".to_owned())
+        );
         assert!(checks.get() >= 1);
         // After returning, every task has joined and subsequent use is safe.
         outputs[0].clear();
-        policy.fill_tile(&data, 1, &mut outputs, &mut blocks, &|| Ok(()), |row, _| Ok([f32::from(row[0])]))?;
+        policy.fill_tile(&data, 1, &mut outputs, &mut blocks, &|| Ok(()), |row, _| {
+            Ok([f32::from(row[0])])
+        })?;
         assert_eq!(outputs[0], data.map(f32::from));
         Ok(())
     }
 
     #[test]
-    #[allow(clippy::panic, reason = "Inject a worker unwind to verify its completion guard and joined scope.")]
+    #[allow(
+        clippy::panic,
+        reason = "Inject a worker unwind to verify its completion guard and joined scope."
+    )]
     fn tiled_parallel_rows_worker_panic_cannot_strand_caller() -> Result<()> {
         let policy = RowParallelism::new(2)?;
         let mut outputs = vec![Vec::with_capacity(2); 1];

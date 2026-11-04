@@ -107,68 +107,71 @@ impl ProjectionTile {
                 &mut self.decoded_blocks,
                 check,
                 |row, decoded_blocks| {
-                let mut sums = [0.0_f32; MAX_TILE_TOKENS];
-                let mut lanes = [[0.0_f32; 4]; MAX_TILE_TOKENS];
-                let bytes = if tensor.kind == PQ2 { 34 } else { 28 };
-                for (index, block) in row.chunks_exact(bytes).enumerate() {
-                    let weights = if tensor.kind == PQ2 {
-                        pq2_values(block)
-                    } else {
-                        ptq1_values(block)?
-                    };
-                    let weight_scale = if tensor.kind == PQ2 {
-                        scale(block)?
-                    } else {
-                        scale(&block[26..])?
-                    };
-                    // Prepare one SIMD/scalar block for all tokens. This stays
-                    // stack-scoped and never expands or retains a matrix.
-                    let weights = dot::Block::new(weights, backend);
-                    *decoded_blocks = decoded_blocks.saturating_add(1);
-                    for (token, scratch) in preparations.iter().enumerate() {
-                        if tensor.kind == PQ2 && columns.is_multiple_of(256) {
-                            let activation = &scratch.q8k[index / 2];
-                            let start = (index % 2) * 128;
-                            let d = weight_scale * activation.scale;
-                            let dot = integer_float(
-                                weights.dot128(activation.values[start..start + 128].try_into()?),
-                            );
-                            sums[token] = if pinned {
-                                d.mul_add(dot, sums[token])
-                            } else {
-                                sums[token] + d * dot
-                            };
+                    let mut sums = [0.0_f32; MAX_TILE_TOKENS];
+                    let mut lanes = [[0.0_f32; 4]; MAX_TILE_TOKENS];
+                    let bytes = if tensor.kind == PQ2 { 34 } else { 28 };
+                    for (index, block) in row.chunks_exact(bytes).enumerate() {
+                        let weights = if tensor.kind == PQ2 {
+                            pq2_values(block)
                         } else {
-                            let activations = &scratch.q8[index * 4..index * 4 + 4];
-                            let mut sum = 0.0;
-                            for (group, activation) in activations.iter().enumerate() {
-                                if tensor.kind == PTQ1 && pinned {
-                                    let d = weight_scale * activation.scale;
-                                    for (lane, integer) in lanes[token]
-                                        .iter_mut()
-                                        .zip(weights.lanes32(group, &activation.values))
-                                    {
-                                        *lane = integer_float(integer).mul_add(d, *lane);
-                                    }
+                            ptq1_values(block)?
+                        };
+                        let weight_scale = if tensor.kind == PQ2 {
+                            scale(block)?
+                        } else {
+                            scale(&block[26..])?
+                        };
+                        // Prepare one SIMD/scalar block for all tokens. This stays
+                        // stack-scoped and never expands or retains a matrix.
+                        let weights = dot::Block::new(weights, backend);
+                        *decoded_blocks = decoded_blocks.saturating_add(1);
+                        for (token, scratch) in preparations.iter().enumerate() {
+                            if tensor.kind == PQ2 && columns.is_multiple_of(256) {
+                                let activation = &scratch.q8k[index / 2];
+                                let start = (index % 2) * 128;
+                                let d = weight_scale * activation.scale;
+                                let dot = integer_float(
+                                    weights
+                                        .dot128(activation.values[start..start + 128].try_into()?),
+                                );
+                                sums[token] = if pinned {
+                                    d.mul_add(dot, sums[token])
                                 } else {
-                                    sum += activation.scale
-                                        * integer_float(weights.dot32(group, &activation.values));
+                                    sums[token] + d * dot
+                                };
+                            } else {
+                                let activations = &scratch.q8[index * 4..index * 4 + 4];
+                                let mut sum = 0.0;
+                                for (group, activation) in activations.iter().enumerate() {
+                                    if tensor.kind == PTQ1 && pinned {
+                                        let d = weight_scale * activation.scale;
+                                        for (lane, integer) in lanes[token]
+                                            .iter_mut()
+                                            .zip(weights.lanes32(group, &activation.values))
+                                        {
+                                            *lane = integer_float(integer).mul_add(d, *lane);
+                                        }
+                                    } else {
+                                        sum += activation.scale
+                                            * integer_float(
+                                                weights.dot32(group, &activation.values),
+                                            );
+                                    }
                                 }
-                            }
-                            if tensor.kind != PTQ1 || !pinned {
-                                sums[token] += weight_scale * sum;
+                                if tensor.kind != PTQ1 || !pinned {
+                                    sums[token] += weight_scale * sum;
+                                }
                             }
                         }
                     }
-                }
-                for (sum, lanes) in sums.iter_mut().zip(lanes).take(inputs.len()) {
-                    *sum = finite(if tensor.kind == PTQ1 && pinned {
-                        (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
-                    } else {
-                        *sum
-                    })?;
-                }
-                Ok(sums)
+                    for (sum, lanes) in sums.iter_mut().zip(lanes).take(inputs.len()) {
+                        *sum = finite(if tensor.kind == PTQ1 && pinned {
+                            (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+                        } else {
+                            *sum
+                        })?;
+                    }
+                    Ok(sums)
                 },
             )
         })();
@@ -212,19 +215,30 @@ mod tests {
                     data: Arc::from(block.repeat(columns / 128 * 7)),
                 };
                 for count in [8, 16, 32] {
-                    let inputs: Vec<Vec<f32>> = (0..count).map(|token| {
-                        (0..columns).map(|index| {
-                            [1.5, -128.0, 0.0, -0.0, 63.5, -3.25][(index + token) % 6]
-                        }).collect()
-                    }).collect();
-                    for backend in [MatvecBackend::Scalar, MatvecBackend::Auto, MatvecBackend::ExperimentalNeon] {
+                    let inputs: Vec<Vec<f32>> = (0..count)
+                        .map(|token| {
+                            (0..columns)
+                                .map(|index| {
+                                    [1.5, -128.0, 0.0, -0.0, 63.5, -3.25][(index + token) % 6]
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    for backend in [
+                        MatvecBackend::Scalar,
+                        MatvecBackend::Auto,
+                        MatvecBackend::ExperimentalNeon,
+                    ] {
                         let mut tile = ProjectionTile::with_backend(backend);
                         tile.set_row_parallelism(parallelism.clone());
                         for pinned in [false, true] {
                             let mut actual = vec![vec![f32::NAN]; count];
                             let previous_blocks = tile.decoded_blocks;
                             tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
-                            assert_eq!(tile.decoded_blocks - previous_blocks, u64::try_from(columns / 128 * 7)?);
+                            assert_eq!(
+                                tile.decoded_blocks - previous_blocks,
+                                u64::try_from(columns / 128 * 7)?
+                            );
                             for (input, output) in inputs.iter().zip(&actual) {
                                 let mut scratch = if pinned {
                                     MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
@@ -233,14 +247,27 @@ mod tests {
                                 };
                                 let mut expected = Vec::new();
                                 matvec_into(&tensor, input, &mut expected, &mut scratch)?;
-                                assert_eq!(output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                                assert_eq!(
+                                    output
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                    expected
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>()
+                                );
                             }
                             let valid = tensor.data.clone();
                             let mut bad = valid.to_vec();
-                            let offset = bad.len() - block.len() + if kind == PTQ1 { 26 } else { 0 };
+                            let offset =
+                                bad.len() - block.len() + if kind == PTQ1 { 26 } else { 0 };
                             bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
                             tensor.data = Arc::from(bad);
-                            assert!(tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(())).is_err());
+                            assert!(
+                                tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))
+                                    .is_err()
+                            );
                             assert!(actual.iter().all(Vec::is_empty));
                             tensor.data = valid;
                             tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;

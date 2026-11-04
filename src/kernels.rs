@@ -2716,7 +2716,10 @@ mod tests {
         let mut output = Vec::new();
         matvec_into(&tensor, &input, &mut output, &mut scratch)?;
         super::row_into(&tensor, 0, &mut decoded)?;
-        assert_eq!(output[0].to_bits(), super::float_dot(&decoded, &input).to_bits());
+        assert_eq!(
+            output[0].to_bits(),
+            super::float_dot(&decoded, &input).to_bits()
+        );
         assert_eq!(scratch.row.capacity(), 0);
         Ok(())
     }
@@ -2772,7 +2775,11 @@ mod tests {
         assert_eq!(output.as_ptr(), allocation);
         assert_eq!(scratch.row.as_ptr(), row_pointer);
         assert_eq!(
-            scratch.row.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            scratch
+                .row
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
             retained_bits
         );
         assert!(scratch.diagnostics().succeeded);

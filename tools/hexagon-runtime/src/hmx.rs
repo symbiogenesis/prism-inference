@@ -343,13 +343,19 @@ fn initialize_weights(weights: &mut [u8]) {
 }
 
 fn pack_weights(original: &[u8], row: usize, weights: &mut [u8]) {
-    for lane in 0..128 {
-        let tile = (row / 32 * 2 + lane / 64) * 576;
-        let local = lane % 64;
-        let byte = tile + local / 16 * 128 + row % 32 * 4 + local % 4;
-        let shift = local / 4 % 4 * 2;
-        let symbol = (original[2 + lane / 4] >> (lane % 4 * 2)) & 3;
-        weights[byte] = (weights[byte] & !(3 << shift)) | symbol << shift;
+    for (chunk, original) in original[2..].as_chunks::<4>().0.iter().enumerate() {
+        // Each original byte holds four consecutive two-bit symbols. The signed
+        // tile wants the four equally positioned symbols in one byte: transpose
+        // the 4x4 two-bit matrix with two nonoverlapping bit-pair swaps. Writing
+        // complete bytes avoids 128 individual read/modify/write lane updates.
+        let mut packed = u32::from_le_bytes(*original);
+        let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc;
+        packed ^= swap ^ (swap << 6);
+        let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0;
+        packed ^= swap ^ (swap << 12);
+        let tile = (row / 32 * 2 + chunk / 4) * 576;
+        let byte = tile + chunk % 4 * 128 + row % 32 * 4;
+        weights[byte..byte + 4].copy_from_slice(&packed.to_le_bytes());
     }
 }
 

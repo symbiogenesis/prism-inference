@@ -75,6 +75,35 @@ fn fixture(columns: usize, rows: usize) -> Tensor {
 }
 
 #[test]
+fn hmx_weight_transpose_preserves_every_symbol_position_and_other_rows() {
+    for row in [0, 1, 31, 32, 63] {
+        for lane in 0..128 {
+            for symbol in 0_u8..4 {
+                let mut original = [0x55_u8; 34];
+                let shift = lane % 4 * 2;
+                original[2 + lane / 4] =
+                    (original[2 + lane / 4] & !(3 << shift)) | (symbol << shift);
+                let mut actual = vec![0; 64 * 36];
+                initialize_weights(&mut actual);
+                let mut expected = actual.clone();
+                // Independent scalar lane mapping, including padding and every
+                // unaffected row/scale byte in both complete 32-row tiles.
+                for current in 0..128 {
+                    let tile = (row / 32 * 2 + current / 64) * 576;
+                    let local = current % 64;
+                    let byte = tile + local / 16 * 128 + row % 32 * 4 + local % 4;
+                    let shift = local / 4 % 4 * 2;
+                    let value = (original[2 + current / 4] >> (current % 4 * 2)) & 3;
+                    expected[byte] = (expected[byte] & !(3 << shift)) | (value << shift);
+                }
+                pack_weights(&original, row, &mut actual);
+                assert_eq!(actual, expected, "row={row} lane={lane} symbol={symbol}");
+            }
+        }
+    }
+}
+
+#[test]
 fn hmx_executor_preserves_preparation_fma_and_all_row_tiles() -> Result<()> {
     for (columns, rows) in [(256, 1), (768, 35), (512, 64)] {
         let tensor = fixture(columns, rows);

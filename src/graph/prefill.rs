@@ -55,7 +55,7 @@ pub(super) struct TiledPrefill {
 }
 
 impl TiledPrefill {
-    pub(super) const fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+    pub(super) fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
         self.projector.set_row_parallelism(parallelism);
     }
 

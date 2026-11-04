@@ -70,7 +70,8 @@ The original model/prepared activations/caller output, allocator and stack overh
 native shared allocation, VTCM and resources outside the process are additional.
 Insufficient host payload or unsupported geometry selects CPU before submission;
 native operation/deadline exhaustion fails the scope. Native bounds remain
-4..=120 seconds with a three-second cleanup reserve and at most 21,760 operations.
+4..=120 seconds with a three-second cleanup reserve and at most 24,000 write
+attempts.
 They are terminal experiment limits, not a daily service session contract; a
 complete model/token may exceed them. An outer process deadline, exact signed
 package/driver verification, child-only environment and verified teardown remain
@@ -97,9 +98,14 @@ outputs still stay provisional until terminal native cleanup succeeds.
 For the retained Swift geometry, source arithmetic at the maximum 17,408-row
 tile requires 22,656 submissions for all eligible projections of one ingestion
 token and another 600 for its vocabulary head (23,256 for evaluation). This
-exceeds the terminal limit before even one complete token. Those derived counts
-are not a device observation: full-model use needs an admitted explicit partial
-placement or a separately reviewed persistent-session/operation contract.
+fits the owner-authorized 24,000-write cap for one evaluation token, with 744
+writes left. One ingestion token plus one evaluation needs 45,912 writes and
+still exceeds the cap. Complete-request admission continues to reserve all
+unreused prompt work and the maximum output before the first submission;
+the higher cap is not a complete-chat or persistent-serving qualification.
+Those derived counts are not a device observation: useful full-model requests
+need an admitted explicit partial placement or a separately reviewed
+persistent-session/operation contract.
 
 Model-free controls compare complete fused and nonfused matvec bits, multiple and
 partial row tiles, all i8 bitplane codes, native PTQ1 DOTPROD captures and refusal/poisoned output behavior.

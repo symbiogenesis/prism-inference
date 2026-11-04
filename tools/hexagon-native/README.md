@@ -89,8 +89,11 @@ bounded by 16,384. No borrowed host slice spans device work.
 
 `Q2ProjectionLimits` supplies one absolute 4..=120-second session allowance,
 including setup, caller preparation, all operations and a three-second cleanup
-reserve. It also bounds M and total write attempts. Native calls still require
-an external owned process deadline. Every failed write, stale or malformed
+reserve. The owner-authorized session cap is 24,000 total write attempts for
+both HVX and HMX; attempts consumed by earlier executors remain charged, and
+failed writes cannot replenish capacity. The cap does not extend the deadline
+or establish complete-request admission. It also bounds M. Native calls still
+require an external owned process deadline. Every failed write, stale or malformed
 reply, invalid result, expired bound, callback error or unwinding pins uncertain
 consumers through supervised exit with no retry or CPU replay. Successful
 caller work must additionally verify exact integer dots against an independent

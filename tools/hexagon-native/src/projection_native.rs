@@ -780,7 +780,7 @@ mod tests {
                 state.stale_reply = case == 2;
                 state.bad_numeric = case == 3;
             }
-            let limits = Q2ProjectionLimits::new(32, 2, Duration::from_secs(4))?;
+            let limits = Q2ProjectionLimits::new(32, 24_000, Duration::from_secs(4))?;
             let mut memory = vec![0; limits.allocation_bytes()];
             let pointer = memory.as_mut_ptr().cast::<c_void>();
             let expected = QueueBuffer {
@@ -791,6 +791,10 @@ mod tests {
                 pointer,
             };
             let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            // Seed prior accepted work to exercise the real 24,000-write edge
+            // without submitting a diagnostic-sized workload in a unit test.
+            report.operations_submitted = 23_998;
+            report.operations_completed = 23_998;
             report.queue.poisoned = true;
             let queue_write = WriteCall::Nonblocking(write);
             let mut progress = |_: &Q2ProjectionReport| {};
@@ -823,7 +827,8 @@ mod tests {
                     GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output)
                         .is_ok()
                 );
-                assert_eq!(session.report.operations_completed, 2);
+                assert_eq!(session.report.operations_completed, 24_000);
+                assert_eq!(session.report.operations_submitted, 24_000);
                 assert_eq!(GuardedQ2Submitter::remaining_operations(&session), Some(0));
                 assert!(
                     GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output)
@@ -839,7 +844,11 @@ mod tests {
                     GuardedQ2Submitter::submit(&mut session, weights, &activation, &mut output)
                         .is_err()
                 );
-                assert_eq!(session.report.operations_completed, 0);
+                assert_eq!(session.report.operations_completed, 23_998);
+                assert_eq!(
+                    session.report.operations_submitted,
+                    23_998 + u32::from(case != 4)
+                );
                 assert_eq!(
                     STATE.lock().map_err(|_| Error::Contract)?.writes,
                     u32::from(case != 4)
@@ -872,7 +881,7 @@ mod tests {
                 state.stale_reply = case == 2;
                 state.bad_numeric = case == 3;
             }
-            let limits = HmxQ2ProjectionLimits::new(32, 2, Duration::from_secs(4))?;
+            let limits = HmxQ2ProjectionLimits::new(32, 24_000, Duration::from_secs(4))?;
             let mut memory = vec![0; limits.allocation_bytes()];
             let pointer = memory.as_mut_ptr().cast::<c_void>();
             let expected = QueueBuffer {
@@ -884,6 +893,8 @@ mod tests {
             };
             let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
             report.queue.hmx_bitplane = true;
+            report.operations_submitted = 23_998;
+            report.operations_completed = 23_998;
             report.queue.poisoned = true;
             let queue_write = WriteCall::Nonblocking(write);
             let mut progress = |_: &Q2ProjectionReport| {};
@@ -916,7 +927,8 @@ mod tests {
                     HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)
                         .is_ok()
                 );
-                assert_eq!(session.report.operations_completed, 2);
+                assert_eq!(session.report.operations_completed, 24_000);
+                assert_eq!(session.report.operations_submitted, 24_000);
                 assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
                 assert!(
                     HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)
@@ -931,7 +943,11 @@ mod tests {
                     HmxQ2Submitter::submit(&mut session, &weights, &activation, &mut output)
                         .is_err()
                 );
-                assert_eq!(session.report.operations_completed, 0);
+                assert_eq!(session.report.operations_completed, 23_998);
+                assert_eq!(
+                    session.report.operations_submitted,
+                    23_998 + u32::from(case != 4)
+                );
                 assert_eq!(
                     STATE.lock().map_err(|_| Error::Contract)?.writes,
                     u32::from(case != 4)

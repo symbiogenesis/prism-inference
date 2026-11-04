@@ -29,7 +29,7 @@ pub struct HmxQ2ProjectionLimits {
 }
 
 impl HmxQ2ProjectionLimits {
-    /// Validate 32-row multiples up to 17,408, at most 21,760 operations and
+    /// Validate 32-row multiples up to 17,408, at most 24,000 write attempts and
     /// one 4..=120-second allowance including initialization and cleanup.
     ///
     /// # Errors
@@ -530,6 +530,23 @@ fn put64(bytes: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmx_limits_share_the_authorized_cap_without_extending_time_or_allocation() -> Result<(), Error>
+    {
+        let limits = HmxQ2ProjectionLimits::new(17_408, 24_000, Duration::from_secs(120))?;
+        assert_eq!(
+            limits.maximum_operations(),
+            projection::Q2_PROJECTION_MAX_OPERATIONS
+        );
+        assert_eq!(limits.maximum_duration(), Duration::from_secs(120));
+        assert_eq!(limits.allocation_bytes(), 1_191_936);
+        for operations in [0, 24_001, u32::MAX] {
+            assert!(HmxQ2ProjectionLimits::new(32, operations, Duration::from_secs(4)).is_err());
+        }
+        assert!(HmxQ2ProjectionLimits::new(32, 24_000, Duration::from_secs(121)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn fixed_hmx_solver_and_frame_keep_eight_planes_and_exact_bounded_extents() -> Result<(), Error>

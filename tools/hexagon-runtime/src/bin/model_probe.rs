@@ -3,8 +3,9 @@
 //! The Runner owner verifies source/package/driver identities and creates this
 //! worker suspended in its deadline-owned, kill-on-close Job. This executable
 //! grants no service admission. Up to eight real graph tokens offload only the original
-//! first FFN up projection; every native integer limb/plane and complete CPU logits
-//! and logical state must match before the final result is published.
+//! first FFN up projection. Complete CPU logits and logical state must match
+//! before publication. Streaming controls independently replay every returned
+//! integer; the explicit resident timing screen uses graph parity alone.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(windows),
@@ -35,7 +36,7 @@ use bonsai_prism_runtime::{
 };
 use hexagon_native_rpc::{
     Driver, DriverLocation, Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter,
-    Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
+    HmxQ2WeightHandle, Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,6 +47,8 @@ const MAX_REQUEST_BYTES: u64 = 8192;
 const MODEL_MEMORY_LIMIT: usize = 12 * 1024 * 1024 * 1024;
 const MAX_HOST_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_TOKENS: usize = 8;
+const RESIDENT_WEIGHT_BYTES: usize = 17_408 * 36 * 40;
+const RESIDENT_METADATA_BYTES: usize = 64 * 1024;
 // Exact original-Swift geometry is independently enforced by swift::load:
 // 48 recurrent blocks, state head128, value heads48, key groups16 and conv4.
 // visit_state promotes the sixteen full-attention blocks' F16 K/V to F32.
@@ -182,6 +185,8 @@ struct Request {
     #[serde(default)]
     execution_backend: ExecutionBackend,
     #[serde(default)]
+    resident_host_weights: bool,
+    #[serde(default)]
     adapter_path: Option<PathBuf>,
     #[serde(default)]
     adapter_case: AdapterCase,
@@ -231,6 +236,8 @@ impl Request {
                     .contains(&self.state_budget_bytes)
                 && (1..=MAX_HOST_PAYLOAD).contains(&self.maximum_owned_payload_bytes)
                 && self.maximum_operations >= u32::try_from(tokens.len())? * 40
+                && (!self.resident_host_weights
+                    || self.execution_backend == ExecutionBackend::HmxBitplane)
                 && self.adapter_path.is_some() == self.adapter_case.loaded()
                 && self.cpu_backend.available()
                 && matches!(self.row_workers, 1 | 4)
@@ -712,6 +719,80 @@ impl HmxQ2Submitter for CheckedHmxSubmitter<'_> {
     }
 }
 
+/// Resident timing mode checks complete graph parity instead of replaying dots.
+/// It owns no copied weight oracle and refuses any streaming fallback.
+struct TimedHmxSubmitter<'a> {
+    native: &'a mut dyn HmxQ2Submitter,
+    timings: &'a SubmitTimings,
+    failed: bool,
+}
+
+impl HmxQ2Submitter for TimedHmxSubmitter<'_> {
+    fn remaining_operations(&self) -> Option<u64> {
+        if self.failed {
+            Some(0)
+        } else {
+            self.native.remaining_operations()
+        }
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        if self.failed {
+            0
+        } else {
+            self.native.residency_capacity_bytes()
+        }
+    }
+
+    fn prepare_weights(
+        &mut self,
+        weights: &[u8],
+    ) -> std::result::Result<Option<HmxQ2WeightHandle>, Error> {
+        if self.failed {
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let handle = self.native.prepare_weights(weights)?;
+        if handle.is_some() {
+            self.failed = false;
+        }
+        Ok(handle)
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &HmxQ2WeightHandle,
+        activation: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        if self.failed {
+            output.fill(f32::NAN);
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let result = timed(&self.timings.native, || {
+            self.native.submit_resident(handle, activation, output)
+        });
+        if result.is_ok() {
+            self.failed = false;
+        } else {
+            output.fill(f32::NAN);
+        }
+        result
+    }
+
+    fn submit(
+        &mut self,
+        _: &[u8],
+        _: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        self.failed = true;
+        output.fill(f32::NAN);
+        Err(Error::Contract)
+    }
+}
+
 #[cfg(windows)]
 fn compare_graph_sequence(
     graph: Qwen35,
@@ -774,7 +855,12 @@ fn check_statistics(
     let tokens = u64::try_from(request.tokens().len())?;
     require(
         !failed
-            && compared == request.execution_backend.values_per_token() * tokens
+            && compared
+                == if request.resident_host_weights {
+                    0
+                } else {
+                    request.execution_backend.values_per_token() * tokens
+                }
             && statistics.projections_completed == tokens
             && statistics.operations_completed == tokens * 40
             && statistics.operations_attempted == tokens * 40,
@@ -890,17 +976,56 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                 },
             ),
             ExecutionBackend::HmxBitplane => {
-                let hmx_limits = HmxQ2ProjectionLimits::new(
+                let mut hmx_limits = HmxQ2ProjectionLimits::new(
                     17_408,
                     request.maximum_operations,
                     Duration::from_secs(request.session_seconds),
                 )?;
+                if request.resident_host_weights {
+                    hmx_limits = hmx_limits.with_resident_weights(RESIDENT_WEIGHT_BYTES)?;
+                }
                 driver.reference_hmx_q2_projection(
                     &request.package_directory,
                     hmx_limits,
                     progress,
                     |native| {
                         let work = (|| -> Result<()> {
+                            if request.resident_host_weights {
+                                let mut timed = TimedHmxSubmitter {
+                                    native,
+                                    timings: &submit_timings,
+                                    failed: false,
+                                };
+                                let (mut value, statistics, residency) = {
+                                    let mut executor = HmxQ2Executor::new(
+                                        &mut timed,
+                                        hmx_limits,
+                                        request.maximum_owned_payload_bytes,
+                                    ).with_resident_weights(RESIDENT_METADATA_BYTES)?;
+                                    let value = compare_graph_sequence(
+                                        graph,
+                                        &mut executor,
+                                        &placement_model,
+                                        &controls,
+                                        request,
+                                        &parent,
+                                        &submit_timings,
+                                    )?;
+                                    (value, executor.statistics(), executor.residency_statistics())
+                                };
+                                check_statistics(statistics, 0, timed.failed, request)?;
+                                require(residency.tensors_prepared == 1
+                                    && residency.cache_hits == u64::try_from(request.tokens().len() - 1)?
+                                    && residency.weight_payload_bytes_prepared == u64::try_from(RESIDENT_WEIGHT_BYTES)?
+                                    && (1..=RESIDENT_METADATA_BYTES).contains(&residency.metadata_payload_bytes))?;
+                                value["hostResidency"] = json!({
+                                    "tensorsPrepared":residency.tensors_prepared,
+                                    "cacheHits":residency.cache_hits,
+                                    "weightPayloadBytesPrepared":residency.weight_payload_bytes_prepared,
+                                    "metadataPayloadBytes":residency.metadata_payload_bytes,
+                                });
+                                return accept(value, statistics, 0);
+                            }
                             let mut checked = CheckedHmxSubmitter {
                                 native,
                                 timings: &submit_timings,
@@ -960,6 +1085,12 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["tokenId"] = json!(request.token_id);
     value["tokenIds"] = json!(request.tokens());
     value["executionBackend"] = json!(request.execution_backend.name());
+    value["residentHostWeights"] = json!(request.resident_host_weights);
+    value["integerAudit"] = json!(if request.resident_host_weights {
+        "graph-parity-only"
+    } else {
+        "all-returned-integers"
+    });
     value["adapterCase"] = json!(request.adapter_case.name());
     value["adapterLoaded"] = json!(request.adapter_case.loaded());
     value["adapterSha256"] = if request.adapter_case.loaded() {
@@ -983,7 +1114,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
         "includes":"All CPU-owned graph work, offload packing/reconstruction, native submission and wait inside evaluate; checked native evaluation also includes the independently timed integer oracle.",
         "excludes":"Model loading, graph construction, device setup/cleanup, state snapshots/digests and final graph comparisons.",
         "qualifiedBenefitComparison":false,
-        "subtractedOracleWindowIsEstimated":true,
+        "subtractedOracleWindowIsEstimated":!request.resident_host_weights,
     });
     value["cpuPowerBefore"] = cpu_power_before;
     value["cpuPowerAfter"] = cpu_power_after;
@@ -1355,6 +1486,72 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn submit_resident(
+            &mut self,
+            _: &HmxQ2WeightHandle,
+            activation: &[[f32; 128]; 8],
+            output: &mut [f32],
+        ) -> std::result::Result<(), Error> {
+            self.submit(&[], activation, output)
+        }
+    }
+
+    #[test]
+    fn model_probe_resident_timing_mode_binds_audit_and_refuses_streaming() -> Result<()> {
+        let mut value = request();
+        value["residentHostWeights"] = json!(true);
+        assert!(
+            serde_json::from_value::<Request>(value.clone())?
+                .limits()
+                .is_err()
+        );
+        value["executionBackend"] = json!("hmx-bitplane");
+        let resident: Request = serde_json::from_value(value)?;
+        resident.limits()?;
+        let statistics = bonsai_hexagon_runtime::ProjectionStatistics {
+            projections_completed: 1,
+            operations_attempted: 40,
+            operations_completed: 40,
+        };
+        check_statistics(statistics, 0, false, &resident)?;
+        assert!(check_statistics(statistics, 1, false, &resident).is_err());
+        assert!(check_statistics(statistics, 0, true, &resident).is_err());
+        let mut registry = hexagon_native_rpc::HmxQ2WeightRegistry::new(4096)?;
+        let handle = registry
+            .prepare(&zero_hmx_weights(32))?
+            .ok_or_else(reject)?;
+        let calls = Rc::new(Cell::new(0));
+        let mut native = HmxSubmitter {
+            calls: calls.clone(),
+            fail: false,
+            wrong: false,
+        };
+        let timings = SubmitTimings::default();
+        let mut timed = TimedHmxSubmitter {
+            native: &mut native,
+            timings: &timings,
+            failed: false,
+        };
+        let mut output = [f32::NAN; 256];
+        timed.submit_resident(&handle, &[[1.0; 128]; 8], &mut output)?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(timings.oracle.get(), Duration::ZERO);
+        assert!(!timed.failed);
+        assert!(
+            timed
+                .submit(&zero_hmx_weights(32), &[[1.0; 128]; 8], &mut output)
+                .is_err()
+        );
+        assert!(output.iter().all(|value| value.is_nan()));
+        assert!(
+            timed
+                .submit_resident(&handle, &[[1.0; 128]; 8], &mut output)
+                .is_err()
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(timed.remaining_operations(), Some(0));
+        Ok(())
     }
 
     #[test]

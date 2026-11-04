@@ -39,7 +39,7 @@ impl ProjectionTile {
         }
     }
 
-    pub(crate) fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+    pub(crate) const fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
         self.row_parallelism = parallelism;
     }
 

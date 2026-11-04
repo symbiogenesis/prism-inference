@@ -19,6 +19,20 @@ pub(crate) const VALUE_TILE: usize = 32;
 #[path = "pinned_attention_padding_tests.rs"]
 mod padding_tests;
 
+#[cfg(test)]
+#[path = "pinned_attention_tile_tests.rs"]
+mod tile_tests;
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[path = "pinned_attention_neon.rs"]
+mod neon;
+
 const fn padded_dot_steps(logical: usize) -> usize {
     let padding = logical.div_ceil(CACHE_PADDING) * CACHE_PADDING - logical;
     // A zero FMA can turn -0 into +0. Each accumulator lane therefore keeps
@@ -35,7 +49,7 @@ const fn padded_dot_steps(logical: usize) -> usize {
 /// # Errors
 /// Rejects invalid tile/row geometry, unequal token counts and nonfinite results.
 pub(crate) fn value_tile<'a>(
-    mut past: impl Iterator<Item = &'a [u16]>,
+    past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     weights: &[f32],
     offset: usize,
@@ -52,12 +66,36 @@ pub(crate) fn value_tile<'a>(
     let end = offset
         .checked_add(output.len())
         .ok_or_else(|| invalid("pinned attention value offset overflow"))?;
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if output.len().is_multiple_of(4)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return neon::value_tile(neon, past, current, weights, &(offset..end), output);
+    }
+
+    value_tile_scalar(past, current, weights, &(offset..end), output)
+}
+
+fn value_tile_scalar<'a>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[f32],
+    range: &std::ops::Range<usize>,
+    output: &mut [f32],
+) -> Result<()> {
     let mut sums = [[[0.0_f32; 4]; 4]; VALUE_TILE];
     let last = weights.len() - 1;
     for (index, &weight) in weights[..last].iter().enumerate() {
         let values = past
             .next()
-            .and_then(|row| row.get(offset..end))
+            .and_then(|row| row.get(range.start..range.end))
             .ok_or_else(|| invalid("pinned attention value row is short"))?;
         for (sum, &value) in sums.iter_mut().zip(values) {
             let lane = &mut sum[index % 16 / 4][index % 4];

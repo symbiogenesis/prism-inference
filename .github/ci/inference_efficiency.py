@@ -23,6 +23,16 @@ CONTROLS = {
         "kernels::pinned_attention::padding_tests::pruned_dot_padding_matches_full_physical_rows_bitwise",
         "kernels::pinned_attention::padding_tests::pruned_value_padding_matches_full_rows_at_every_lane_boundary",
         "kernels::pinned_attention::padding_tests::pruned_softmax_padding_matches_full_physical_groups_bitwise",
+        "kernels::pinned_attention::tests::pinned_value_tiles_match_native_capture_and_visit_each_cached_row_once",
+        "kernels::pinned_attention::tests::pinned_value_tiles_reject_malformed_extents_and_nonfinite_results",
+        "kernels::pinned_attention::tile_tests::pinned_value_vector_tiles_preserve_scalar_bits_at_channel_and_padding_boundaries",
+        "kernels::pinned_attention::tile_tests::pinned_value_vector_tiles_preserve_validation_and_finite_failure_publication",
+        "kernels::pinned_gdn::tests::pinned_gdn_dispatch_matches_scalar_bits_and_tail",
+        "kernels::pinned_gdn::tests::pinned_gdn_retains_fused_vector_and_nonfused_tail_rounding",
+        "kernels::pinned_gdn::tests::pinned_gdn_preserves_exceptional_bits_and_first_failure_mutation",
+        "kernels::pinned_gdn::tests::pinned_gdn_rejects_mismatched_rows_and_nonfinite_results",
+        "graph::tests::pinned_gdn_arithmetic_matches_independent_native_capture",
+        "graph::tests::attention_value_tiles_preserve_strided_oracle_bits_across_cache_pages",
         "graph::tests::decayed_heads_preserve_bits_and_independent_state_across_scratch_reuse",
         "kernels::prefill::tests::tiled_packed_projection_reuses_blocks_and_preserves_independent_rows",
         "kernels::prefill::tests::tiled_projection_clears_all_outputs_on_late_rejection",
@@ -73,6 +83,8 @@ WINDOWS_ARM64_NEON_CONTROLS = [
     "kernels::neon::tests::simd_neon_integer_dot_unaligned_random_blocks",
     "kernels::neon::tests::simd_neon_packed_consumption_exhaustive_bytes_and_extreme_lanes",
     "kernels::neon::tests::simd_neon_pq2_pair_accumulation_extremal_mixed_lanes",
+    "kernels::pinned_gdn::tests::pinned_gdn_neon_executes_exact_vector_and_tail_contract",
+    "kernels::pinned_attention::neon::tests::neon_value_tile_baseline_is_available_and_accumulator_remains_two_kib",
 ]
 
 

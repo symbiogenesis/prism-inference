@@ -1902,7 +1902,7 @@ impl PreparedMatvec<'_> {
                             && matches!(tensor.kind, F32 | F16)
                             && columns.is_multiple_of(16)
                         {
-                            pinned_gdn::dot(&scratch.row, &scratch.activations)?
+                            pinned_gdn::dot_scalar(&scratch.row, &scratch.activations)?
                         } else {
                             finite(float_dot(&scratch.row, &scratch.activations))?
                         },

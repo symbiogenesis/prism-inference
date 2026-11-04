@@ -412,7 +412,6 @@ impl GuardedQ2Submitter for CheckedSubmitter<'_> {
 /// binary activation planes. This does not reuse the production HMX packer or
 /// reconstruction helpers.
 #[allow(
-    clippy::cast_precision_loss,
     clippy::float_cmp,
     reason = "Binary activation planes and bounded integer sums are exactly representable in F32."
 )]
@@ -437,17 +436,17 @@ fn compare_planes(weights: &[u8], activation: &[[f32; 128]; 8], output: &[f32]) 
     for (plane, values) in activation.iter().enumerate() {
         require(values.iter().all(|&value| value == 0.0 || value == 1.0))?;
         for row in 0..rows {
-            let mut dot = 0_i32;
+            let mut dot = 0_i16;
             for (lane, &value) in values.iter().enumerate() {
                 if value == 1.0 {
                     let local = lane % 64;
                     let tile = (row / 32 * 2 + lane / 64) * 576;
                     let byte = weights[tile + local / 16 * 128 + row % 32 * 4 + local % 4];
                     let symbol = (byte >> (local / 4 % 4 * 2)) & 3;
-                    dot += i32::from(symbol) - 1;
+                    dot += i16::from(symbol) - 1;
                 }
             }
-            require(output[plane * rows + row] == dot as f32)?;
+            require(output[plane * rows + row] == f32::from(dot))?;
         }
     }
     Ok(u64::try_from(output.len())?)

@@ -1087,6 +1087,30 @@ fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
         .sum::<f64>() as f32
 }
 
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+fn bf16_dot(bytes: &[u8], input: &[f32]) -> Result<f32> {
+    // The caller checks the complete tensor geometry before borrowing this
+    // row. Consume each BF16 scalar once instead of materializing a F32 row.
+    // Result's sum delegates to the same f64 Sum used by float_dot, including
+    // its reduction order and signed-zero identity. Every weight is still
+    // checked, including weights multiplied by zero activations.
+    let sum = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(input)
+        .map(|(bytes, &activation)| {
+            finite(f32::from_bits(u32::from(u16::from_le_bytes(*bytes)) << 16))
+                .map(|weight| f64::from(weight * activation))
+        })
+        .sum::<Result<f64>>()?;
+    finite(sum as f32)
+}
+
 /// Computes a scalar dot directly from native packed weight and activation bytes.
 ///
 /// Activations use `Q8_K` for PQ2, `Q8_0` for PTQ1/`Q1_0`/`Q2_0`/`Q4_0`/`Q8_0`,
@@ -1788,6 +1812,14 @@ impl PreparedMatvec<'_> {
                 for bytes in tensor.data.as_chunks::<4>().0 {
                     let weight = finite(f32::from_le_bytes(*bytes))?;
                     output.push(finite(float_dot(&[weight], &scratch.activations))?);
+                }
+            }
+            BF16 => {
+                scratch.diagnostics = scratch.diagnostics.select(false);
+                // Swift's recurrent alpha/beta projections retain their
+                // binary64 scalar contract even for pinned accumulation.
+                for bytes in tensor.data.chunks_exact(row_bytes) {
+                    output.push(bf16_dot(bytes, &scratch.activations)?);
                 }
             }
             16..=23 | 29 | 34 | 35 | 39..=42 => {
@@ -2601,6 +2633,143 @@ mod tests {
         assert_eq!(output[0].to_bits(), 1.0_f32.to_bits());
         assert_eq!(output[2].to_bits(), f32::MAX.to_bits());
         assert_eq!(output.as_ptr(), allocation);
+        assert!(scratch.diagnostics().succeeded);
+        Ok(())
+    }
+
+    fn bf16_tensor(columns: usize, rows: usize, weights: &[u16]) -> Tensor {
+        Tensor {
+            name: "streaming-bf16-projection".to_owned(),
+            dimensions: vec![columns, rows],
+            kind: super::BF16,
+            data: Arc::from(
+                weights
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    #[test]
+    fn bf16_projection_matches_decoded_rows_without_row_storage() -> crate::Result<()> {
+        let codes = [
+            0x0000, 0x8000, 0x0001, 0x8001, 0x0080, 0x8080, 0x3f80, 0xbf80, 0x4701, 0xc701,
+        ];
+        let mut decoded = Vec::new();
+        for columns in [1, 3, 15, 16, 17, 32, 128, 5120] {
+            let weights: Vec<_> = (0..columns * 7)
+                .map(|index| codes[(index * 7 + index / columns) % codes.len()])
+                .collect();
+            let tensor = bf16_tensor(columns, 7, &weights);
+            for pinned in [false, true] {
+                for backend in [
+                    super::MatvecBackend::Scalar,
+                    super::MatvecBackend::Auto,
+                    super::MatvecBackend::ExperimentalNeon,
+                ] {
+                    let mut scratch = if pinned {
+                        MatvecScratch::with_pinned_backend(backend)
+                    } else {
+                        MatvecScratch::with_backend(backend)
+                    };
+                    let mut output = Vec::new();
+                    for shift in 0..4 {
+                        let input: Vec<_> = (0..columns)
+                            .map(|index| {
+                                [
+                                    0.0,
+                                    -0.0,
+                                    f32::from_bits(1),
+                                    -f32::MIN_POSITIVE,
+                                    f32::from_bits(0x3f80_8001),
+                                    -4097.0,
+                                    0.5,
+                                ][(index + shift) % 7]
+                            })
+                            .collect();
+                        let prepared: Vec<_> =
+                            input.iter().copied().map(super::round_bf16).collect();
+                        matvec_into(&tensor, &input, &mut output, &mut scratch)?;
+                        for (index, actual) in output.iter().enumerate() {
+                            super::row_into(&tensor, index, &mut decoded)?;
+                            let expected = super::float_dot(&decoded, &prepared);
+                            assert_eq!(actual.to_bits(), expected.to_bits());
+                        }
+                        assert_eq!(scratch.row.capacity(), 0);
+                        let diagnostics = scratch.diagnostics();
+                        assert!(diagnostics.dispatched);
+                        assert!(diagnostics.succeeded);
+                        assert_eq!(diagnostics.selected_backend, super::MatvecBackend::Scalar);
+                    }
+                }
+            }
+        }
+        let tensor = bf16_tensor(4, 1, &[0x7f7f, 0xff7f, 0x0001, 0x8000]);
+        let input = [0.5, 0.5, f32::MIN_POSITIVE, -0.0];
+        let mut scratch = MatvecScratch::default();
+        let mut output = Vec::new();
+        matvec_into(&tensor, &input, &mut output, &mut scratch)?;
+        super::row_into(&tensor, 0, &mut decoded)?;
+        assert_eq!(output[0].to_bits(), super::float_dot(&decoded, &input).to_bits());
+        assert_eq!(scratch.row.capacity(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_projection_rejects_bad_payload_input_and_geometry_then_recovers() -> crate::Result<()> {
+        // Other floating formats may already own this storage. BF16 must not
+        // mutate it, grow it or use stale decoded weights after a failed call.
+        let mut scratch = MatvecScratch {
+            row: vec![f32::NAN, -0.0, 17.0],
+            ..MatvecScratch::default()
+        };
+        let row_pointer = scratch.row.as_ptr();
+        let retained_bits: Vec<_> = scratch.row.iter().map(|value| value.to_bits()).collect();
+        let mut output = vec![99.0; 3];
+        let allocation = output.as_ptr();
+        for invalid in [0x7fc1, 0x7f80, 0xff80, 0x7f7f] {
+            let tensor = bf16_tensor(1, 3, &[0x3f80, invalid, 0x4000]);
+            assert!(matvec_into(&tensor, &[2.0], &mut output, &mut scratch).is_err());
+            assert!(output.is_empty());
+            assert!(scratch.diagnostics().dispatched);
+            assert!(!scratch.diagnostics().succeeded);
+        }
+        for invalid in [0x7fc1, 0x7f80, 0xff80] {
+            let tensor = bf16_tensor(3, 1, &[0x3f80, 0x4000, invalid]);
+            assert!(matvec_into(&tensor, &[1.0, 2.0, 0.0], &mut output, &mut scratch).is_err());
+            assert!(output.is_empty());
+        }
+        let tensor = bf16_tensor(3, 1, &[0x3f80, 0x8000, 0x4000]);
+        assert!(matvec_into(&tensor, &[1.0; 2], &mut output, &mut scratch).is_err());
+        assert!(output.is_empty());
+        assert!(!scratch.diagnostics().dispatched);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+            assert!(matvec_into(&tensor, &[1.0, 0.0, invalid], &mut output, &mut scratch).is_err());
+            assert!(output.is_empty());
+            assert!(!scratch.diagnostics().dispatched);
+        }
+        let mut odd_payload = bf16_tensor(3, 1, &[0x3f80, 0x4000, 0x4040]);
+        odd_payload.data = Arc::from([0_u8; 5]);
+        for malformed in [
+            bf16_tensor(3, 1, &[0x3f80, 0x4000]),
+            bf16_tensor(2, 1, &[0x3f80, 0x4000, 0x4040]),
+            bf16_tensor(0, 1, &[]),
+            bf16_tensor(3, 0, &[]),
+            odd_payload,
+        ] {
+            assert!(matvec_into(&malformed, &[1.0; 3], &mut output, &mut scratch).is_err());
+            assert!(output.is_empty());
+            assert!(!scratch.diagnostics().dispatched);
+        }
+        matvec_into(&tensor, &[1.0, -0.0, 2.0], &mut output, &mut scratch)?;
+        assert_eq!(output, [5.0]);
+        assert_eq!(output.as_ptr(), allocation);
+        assert_eq!(scratch.row.as_ptr(), row_pointer);
+        assert_eq!(
+            scratch.row.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            retained_bits
+        );
         assert!(scratch.diagnostics().succeeded);
         Ok(())
     }

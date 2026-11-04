@@ -1,10 +1,24 @@
 # CPU inference efficiency candidate
 
-The current source combines the direct one-column F32 adapter projection,
+The current source combines direct one-column F32 adapter and streaming BF16 projections,
 canonical-empty rollback checkpoint, native-order top-20 sampler, redundant
 empty-reset elimination and exact masked-attention padding pruning. The released
 0.1.14 Runner pin predates these changes. Their source work and storage reductions
 are not measured end-to-end gains or permission to lower admission limits.
+
+BF16 projections now consume each immutable weight directly from its two-byte
+payload after one complete tensor-geometry check. They preserve BF16 activation
+rounding, each separately rounded F32 product, the original binary64 sum and its
+final F32 rounding, including pinned execution. Every stored weight still receives
+its finite check; malformed geometry, nonfinite payloads/activations and overflow
+still reject with empty output. The decoded-row allocation is neither populated
+nor changed, and rows remain sequential. Swift's 48 recurrent layers each have
+two 5,120-by-48 BF16 alpha/beta matrices. Avoiding their F32 row materialization
+removes a nominal 90 MiB of scratch writes and the matching rereads per processed
+token; this is a source work count, not measured memory traffic or throughput.
+Independent decoded-row controls cover pinned/unpinned requests, backend requests,
+awkward widths through 5,120, signed zeros, subnormals, finite extremes, failed
+payload/activation/geometry admission, output clearing and scratch preservation.
 
 The sampler now checks every logit while selecting the bounded heap, avoiding a
 separate full-vocabulary validation traversal. A nonfinite value anywhere,

@@ -1068,7 +1068,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::rc::Rc;
 
     use super::*;
 

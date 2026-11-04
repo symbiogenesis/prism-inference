@@ -1417,8 +1417,13 @@ impl Qwen35 {
     /// keep their exact kernel arithmetic. Other graph work remains serial.
     /// Reset and checkpoint restoration preserve this resource policy. It does
     /// not change numerical/state identity or preempt in-flight projections;
-    /// cancellation is still checked between synchronous decoder operations.
+    /// ordinary decode cancellation is checked between synchronous operations.
+    /// Explicit CPU tiles share this pool and keep cooperative cancellation on
+    /// their calling thread while workers finish or stop before the next row.
     pub fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+        if let Some(tile) = &mut self.tiled_prefill {
+            tile.set_row_parallelism(parallelism.clone());
+        }
         self.workspace
             .projection
             .matvec

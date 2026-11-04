@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 use crate::{Result, invalid};
 
+#[path = "parallel_tile.rs"]
+mod tile;
+
 /// Largest explicit number of persistent projection workers.
 pub const MAX_ROW_WORKERS: usize = 16;
 

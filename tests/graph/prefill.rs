@@ -96,6 +96,63 @@ fn tiled_prefill_packed_ffn_and_adapter_preserve_original_basis_bits() -> Result
     Ok(())
 }
 
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn tiled_prefill_parallel_workers_preserve_state_restore_and_policy_changes() -> Result<()> {
+    use bonsai_prism_runtime::kernels::RowParallelism;
+
+    let four = RowParallelism::new(4)?;
+    let two = RowParallelism::new(2)?;
+    for recurrent in [false, true] {
+        for (kind, width) in [(142, 128), (142, 256), (143, 128)] {
+            for scale in [0.0, 1.3] {
+                for select_before_tile in [false, true] {
+                    let build = || -> Result<Qwen35> {
+                        let model = backend_fixture(recurrent, kind, width)?;
+                        let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                        rank_one_graph(model, factors, scale)
+                    };
+                    let mut expected = build()?;
+                    let mut graph = build()?;
+                    if select_before_tile {
+                        graph.set_row_parallelism(four.clone());
+                    }
+                    let required = graph.tiled_prefill_scratch_bytes(8)?;
+                    let mut actual = graph.with_tiled_prefill(8, required)?;
+                    if !select_before_tile {
+                        actual.set_row_parallelism(four.clone());
+                    }
+                    assert_eq!(actual.row_workers(), 4);
+                    let checkpoint = actual.checkpoint()?;
+                    let prompt = [0, 1, 1, 0, 1, 0, 0, 1, 0];
+                    for token in prompt {
+                        expected.ingest(token)?;
+                    }
+                    let caller = std::thread::current().id();
+                    let calls = Cell::new(0);
+                    actual.ingest_block(&prompt, &|| {
+                        assert_eq!(std::thread::current().id(), caller);
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    })?;
+                    assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+                    assert_eq!(actual.evaluate(1)?, expected.evaluate(1)?);
+                    assert!(calls.get() > 0);
+                    actual.set_row_parallelism(two.clone());
+                    actual.restore(&checkpoint)?;
+                    assert_eq!(actual.row_workers(), 2);
+                    actual.ingest_block(&prompt, &|| Ok(()))?;
+                    actual.evaluate(1)?;
+                    assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+                    actual.reset()?;
+                    assert_eq!(actual.row_workers(), 2);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn tiled_prefill_failure_restores_request_and_explicit_reset_clears_first_tile() -> Result<()> {
     for chunkwise in [false, true] {

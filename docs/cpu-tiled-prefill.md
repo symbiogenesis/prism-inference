@@ -44,9 +44,15 @@ scalar forcing and unsupported builds retain scalar reductions. The fixed
 256-byte decoded payload is stack-scoped, with no new retained activation or
 weight allocation. Optional DOTPROD/I8MM instructions are not selected.
 
-Row-worker parallelism remains absent from this tile kernel. It must be compared
-against the existing NEON/worker matvec path before assuming that shared decoding
-and explicit SIMD improve complete prompt time.
+Packed tiles inherit the graph's existing private row-worker pool, including
+selection before or after enabling tiles. The pool is shared with ordinary
+matvec work; projections create no additional workers. Each worker borrows
+original weights and prepared activations, owns disjoint output row slices
+and decodes each packed row block once across all tile tokens. One worker and
+builds without `parallel-rows` retain sequential execution. Floating fallback
+continues to use the ordinary sequential projection contract. This source path
+still needs comparison against ordinary NEON/worker matvec before assuming that
+shared decoding and explicit SIMD improve complete prompt time.
 
 ## Separate chunkwise GDN
 
@@ -78,11 +84,24 @@ activation contracts, floating fallback high-water storage and small triangular
 matrices at once. The graph reports this reservation separately. It includes a
 fixed 64 KiB allowance for the maximum triangular
 tables and temporary metadata, including eight-token or very narrow fixtures.
+A further fixed 16 KiB covers the maximum sixteen row-task descriptors, their
+32 token-output slices, errors, counters and cancellation synchronization.
+The descriptors are stack-scoped; no row-major result matrix, transpose copy or
+retained packed-weight expansion is introduced. This charge is present even
+under one worker so a later row-policy change cannot exceed the reservation.
 Owners must add it to ordinary live state, checkpoint, scratch and worker-stack charges; allocator
 overhead remains separate. No existing admission limit is reduced.
 
 Cancellation/deadline checks surround token preprocessing, causal attention,
-recurrent heads, layers and projections, and occur for every packed output row.
+recurrent heads, layers and projections. Serial projections check every packed
+output row. During a parallel projection the original callback stays on its
+calling thread, with nominal one-millisecond waits between checks; it needs
+neither `Send` nor `Sync`. Workers observe cancellation before each next row.
+This is a cooperative bound rather than a real-time scheduling guarantee.
+All scoped tasks join before a callback cancellation or the earliest failing
+row chunk is returned and all provisional outputs are cleared. Completion
+guards also release the caller's wait if a worker unwinds. The implementation
+does not initialize or use Rayon's global pool.
 As allowed by the decoder block contract, failure can leave provisional
 layer-major state. The runtime restores its entire request checkpoint before
 reuse. Position is marked nonempty before the first mutation so explicit reset
@@ -105,7 +124,13 @@ Independent existing matvec rows cover both quantizers and pinned FMA ordering;
 tile controls compare all requested backends and repeated pinned/unpinned reuse
 bit for bit against scalar matvec, plus extreme integer/native-lane reductions
 and cancellation or an invalid final scale after a complete output row.
-the chunk unit control uses ordinary recurrence, signed key correlations and zero
+Parallel controls cover awkward row counts, two/four-worker exact PQ2/Q8_K,
+odd PQ2/Q8_0 and PTQ1 tiles, invalid-scale clearing/retry, callback thread affinity,
+joined cancellation, deterministic failure and worker unwind. A fixed-size
+assertion checks task metadata against the explicit reservation. Graph controls
+set workers before/after tile selection and preserve adapter/state bits through
+continuation, policy change, checkpoint restoration and reset.
+The chunk unit control uses ordinary recurrence, signed key correlations and zero
 decay. Graph controls exercise packed FFN, nonzero/zero adapters, hybrid KV page
 boundaries, continuation, checkpoint restore, cancellation/reset and runtime
 request rollback. Prepared tests are not a compiled verdict. Owner-managed

@@ -6,7 +6,10 @@ use super::{
     Arithmetic, Attention, Evaluation, LayerDelta, LayerState, Qwen35, Transforms, add,
     checked_product, finite, row_into,
 };
-use crate::kernels::{MatvecBackend, prefill::ProjectionTile};
+use crate::kernels::{
+    MatvecBackend, RowParallelism,
+    prefill::{ProjectionTile, ROW_TASK_SCRATCH_BYTES},
+};
 use crate::model::Tensor;
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
@@ -52,11 +55,16 @@ pub(super) struct TiledPrefill {
 }
 
 impl TiledPrefill {
+    pub(super) fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+        self.projector.set_row_parallelism(parallelism);
+    }
+
     fn new(
         tokens: usize,
         width: usize,
         scratch_bytes: usize,
         backend: MatvecBackend,
+        parallelism: RowParallelism,
     ) -> Result<Self> {
         let create = || -> Result<Vec<Vec<f32>>> {
             let mut rows = Vec::new();
@@ -68,6 +76,8 @@ impl TiledPrefill {
             }
             Ok(rows)
         };
+        let mut projector = ProjectionTile::with_backend(backend);
+        projector.set_row_parallelism(parallelism);
         Ok(Self {
             tokens,
             scratch_bytes,
@@ -83,7 +93,7 @@ impl TiledPrefill {
             attended: create()?,
             attention: create()?,
             chunkwise_gdn: false,
-            projector: ProjectionTile::with_backend(backend),
+            projector,
             statistics: TiledPrefillStatistics::default(),
         })
     }
@@ -127,6 +137,9 @@ impl Qwen35 {
             // The four fixed 32x32 coefficient/product tables and their small
             // temporary vectors exist even for an eight-token, narrow graph.
             .and_then(|bytes| bytes.checked_add(64 * 1024))
+            // Fixed task slice/error descriptors stay bounded at 16 workers
+            // and 32 token outputs, including later worker-policy changes.
+            .and_then(|bytes| bytes.checked_add(ROW_TASK_SCRATCH_BYTES))
             .ok_or_else(|| invalid("CPU prefill scratch reservation overflow"))
     }
 
@@ -164,6 +177,7 @@ impl Qwen35 {
                 .max(self.geometry.value_width()),
             required,
             self.requested_backend(),
+            self.workspace.projection.matvec.clone_row_parallelism(),
         )?;
         let suffix = format!(":cpu-tiled-ffn-v1:{tokens}");
         self.identity.try_reserve_exact(suffix.len())?;

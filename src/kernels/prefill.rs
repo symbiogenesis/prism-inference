@@ -11,8 +11,8 @@
 )]
 
 use super::{
-    MatvecBackend, MatvecScratch, PQ2, PTQ1, dimensions, finite, integer_float, matvec_into,
-    pq2_values, ptq1_values, scale,
+    MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, dimensions, finite, integer_float,
+    matvec_into, pq2_values, ptq1_values, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -20,11 +20,13 @@ use crate::{Result, invalid, model::Tensor};
 mod dot;
 
 pub(crate) const MAX_TILE_TOKENS: usize = 32;
+pub(crate) const ROW_TASK_SCRATCH_BYTES: usize = 16 * 1024;
 
 #[derive(Default)]
 pub(crate) struct ProjectionTile {
     backend: MatvecBackend,
     preparations: Vec<MatvecScratch>,
+    row_parallelism: RowParallelism,
     pub(crate) packed_projections: u64,
     pub(crate) decoded_blocks: u64,
 }
@@ -35,6 +37,10 @@ impl ProjectionTile {
             backend,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
+        self.row_parallelism = parallelism;
     }
 
     #[allow(
@@ -92,8 +98,15 @@ impl ProjectionTile {
                 return Ok(());
             }
             self.packed_projections = self.packed_projections.saturating_add(1);
-            for row in tensor.data.chunks_exact(block_bytes) {
-                check()?;
+            let backend = self.backend;
+            let preparations = &self.preparations[..inputs.len()];
+            self.row_parallelism.fill_tile(
+                &tensor.data,
+                block_bytes,
+                outputs,
+                &mut self.decoded_blocks,
+                check,
+                |row, decoded_blocks| {
                 let mut sums = [0.0_f32; MAX_TILE_TOKENS];
                 let mut lanes = [[0.0_f32; 4]; MAX_TILE_TOKENS];
                 let bytes = if tensor.kind == PQ2 { 34 } else { 28 };
@@ -110,9 +123,9 @@ impl ProjectionTile {
                     };
                     // Prepare one SIMD/scalar block for all tokens. This stays
                     // stack-scoped and never expands or retains a matrix.
-                    let weights = dot::Block::new(weights, self.backend);
-                    self.decoded_blocks = self.decoded_blocks.saturating_add(1);
-                    for (token, scratch) in self.preparations[..inputs.len()].iter().enumerate() {
+                    let weights = dot::Block::new(weights, backend);
+                    *decoded_blocks = decoded_blocks.saturating_add(1);
+                    for (token, scratch) in preparations.iter().enumerate() {
                         if tensor.kind == PQ2 && columns.is_multiple_of(256) {
                             let activation = &scratch.q8k[index / 2];
                             let start = (index % 2) * 128;
@@ -148,16 +161,16 @@ impl ProjectionTile {
                         }
                     }
                 }
-                for (token, output) in outputs.iter_mut().enumerate() {
-                    output.push(finite(if tensor.kind == PTQ1 && pinned {
-                        (lanes[token][0] + lanes[token][1]) + (lanes[token][2] + lanes[token][3])
+                for (sum, lanes) in sums.iter_mut().zip(lanes).take(inputs.len()) {
+                    *sum = finite(if tensor.kind == PTQ1 && pinned {
+                        (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
                     } else {
-                        sums[token]
-                    })?);
+                        *sum
+                    })?;
                 }
-            }
-            check()?;
-            Ok(())
+                Ok(sums)
+                },
+            )
         })();
         if result.is_err() {
             for output in outputs {
@@ -174,6 +187,72 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[cfg(feature = "parallel-rows")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep exact format/backend/tile parity and malformed-row recovery in one control."
+    )]
+    fn tiled_parallel_projection_matches_serial_and_recovers() -> Result<()> {
+        for workers in [2, 4] {
+            let parallelism = RowParallelism::new(workers)?;
+            for (kind, columns) in [(PQ2, 256), (PQ2, 384), (PTQ1, 256)] {
+                let mut packed = [if kind == PTQ1 { 0x66 } else { 0xe4 }; 34];
+                packed[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                let block = if kind == PTQ1 {
+                    bonsai_ternary::pack_ptq(&packed)?.to_vec()
+                } else {
+                    packed.to_vec()
+                };
+                let mut tensor = Tensor {
+                    name: "parallel-packed-tile".into(),
+                    dimensions: vec![columns, 7],
+                    kind,
+                    data: Arc::from(block.repeat(columns / 128 * 7)),
+                };
+                for count in [8, 16, 32] {
+                    let inputs: Vec<Vec<f32>> = (0..count).map(|token| {
+                        (0..columns).map(|index| {
+                            [1.5, -128.0, 0.0, -0.0, 63.5, -3.25][(index + token) % 6]
+                        }).collect()
+                    }).collect();
+                    for backend in [MatvecBackend::Scalar, MatvecBackend::Auto, MatvecBackend::ExperimentalNeon] {
+                        let mut tile = ProjectionTile::with_backend(backend);
+                        tile.set_row_parallelism(parallelism.clone());
+                        for pinned in [false, true] {
+                            let mut actual = vec![vec![f32::NAN]; count];
+                            let previous_blocks = tile.decoded_blocks;
+                            tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
+                            assert_eq!(tile.decoded_blocks - previous_blocks, u64::try_from(columns / 128 * 7)?);
+                            for (input, output) in inputs.iter().zip(&actual) {
+                                let mut scratch = if pinned {
+                                    MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                                } else {
+                                    MatvecScratch::with_backend(MatvecBackend::Scalar)
+                                };
+                                let mut expected = Vec::new();
+                                matvec_into(&tensor, input, &mut expected, &mut scratch)?;
+                                assert_eq!(output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                            }
+                            let valid = tensor.data.clone();
+                            let mut bad = valid.to_vec();
+                            let offset = bad.len() - block.len() + if kind == PTQ1 { 26 } else { 0 };
+                            bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
+                            tensor.data = Arc::from(bad);
+                            assert!(tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(())).is_err());
+                            assert!(actual.iter().all(Vec::is_empty));
+                            tensor.data = valid;
+                            tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
+                            assert!(actual.iter().all(|output| output.len() == 7));
+                        }
+                        assert_eq!(tile.row_parallelism.workers(), workers);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn tiled_packed_projection_reuses_blocks_and_preserves_independent_rows() -> Result<()> {

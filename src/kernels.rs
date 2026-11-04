@@ -1492,6 +1492,11 @@ impl MatvecScratch {
         self.row_parallelism.workers()
     }
 
+    /// Share the existing private pool with another scoped projection consumer.
+    pub(crate) fn clone_row_parallelism(&self) -> RowParallelism {
+        self.row_parallelism.clone()
+    }
+
     /// Prepares one exact activation vector for compatible sibling projections.
     ///
     /// Quantization or floating activation rounding occurs once. Compatibility

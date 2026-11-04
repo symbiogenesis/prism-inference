@@ -15,6 +15,15 @@ prism-inference = { path = "../..", default-features = false }
 bonsai-hexagon-native = { path = "../hexagon-native" }
 bonsai-ternary = { path = "../ternary" }
 sha2 = { version = "=0.11.1", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+
+[target.'cfg(windows)'.dependencies]
+bonsai-windows-process = "=0.1.0"
+
+[[bin]]
+name = "prism-hexagon-model-probe"
+path = "src/bin/model_probe.rs"
 
 [dev-dependencies]
 bonsai-gguf = { path = "../gguf", default-features = false }

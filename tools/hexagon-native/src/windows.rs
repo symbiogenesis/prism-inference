@@ -16,10 +16,20 @@ use std::sync::{Mutex, MutexGuard};
 mod compute_native;
 #[path = "mapping.rs"]
 mod mapping;
+#[path = "power_native.rs"]
+mod power_native;
 #[path = "session_mapping_native.rs"]
 mod session_mapping_native;
 #[path = "session_native.rs"]
 mod session_native;
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Safe crate root owns the read-only native observation."
+)]
+pub(super) fn power_status() -> Result<crate::PowerStatus, Error> {
+    power_native::query()
+}
 
 #[allow(
     clippy::redundant_pub_crate,

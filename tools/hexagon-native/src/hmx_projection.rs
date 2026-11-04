@@ -532,8 +532,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hmx_limits_share_the_authorized_cap_without_extending_time_or_allocation() -> Result<(), Error>
-    {
+    fn hmx_limits_share_the_authorized_cap_without_extending_time_or_allocation()
+    -> Result<(), Error> {
         let limits = HmxQ2ProjectionLimits::new(17_408, 24_000, Duration::from_secs(120))?;
         assert_eq!(
             limits.maximum_operations(),

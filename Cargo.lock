@@ -92,7 +92,10 @@ dependencies = [
  "bonsai-gguf",
  "bonsai-hexagon-native",
  "bonsai-ternary",
+ "bonsai-windows-process",
  "prism-inference",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

@@ -354,6 +354,8 @@
     "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw",
     "https://learn.microsoft.com/en-us/windows/win32/api/wintrust/ns-wintrust-wintrust_data",
     "https://learn.microsoft.com/en-us/windows/win32/api/wintrust/ns-wintrust-wintrust_file_info",
-    "https://learn.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust"
+    "https://learn.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust",
+    "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getsystempowerstatus",
+    "https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-system_power_status"
   ]
 }

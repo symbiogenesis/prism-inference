@@ -16,13 +16,15 @@ pub(super) fn dot(first: &[f32], second: &[f32]) -> Option<f32> {
     let vectorized = first.len() / 16 * 16;
     let mut sums = [f32x4::splat(neon, 0.0); 4];
     for (first, second) in first[..vectorized]
-        .chunks_exact(16)
-        .zip(second[..vectorized].chunks_exact(16))
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(second[..vectorized].as_chunks::<16>().0)
     {
         for ((sum, first), second) in sums
             .iter_mut()
-            .zip(first.chunks_exact(4))
-            .zip(second.chunks_exact(4))
+            .zip(first.as_chunks::<4>().0)
+            .zip(second.as_chunks::<4>().0)
         {
             *sum = f32x4::from_slice(neon, first)
                 .mul_add_precise(f32x4::from_slice(neon, second), *sum);
@@ -53,8 +55,10 @@ fn add_scaled_with_neon(neon: Neon, target: &mut [f32], input: &[f32], scale: f3
     let vectorized = target.len() / 16 * 16;
     let scales = f32x4::splat(neon, scale);
     for (target, input) in target[..vectorized]
-        .chunks_exact_mut(4)
-        .zip(input[..vectorized].chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(input[..vectorized].as_chunks::<4>().0)
     {
         let updated = scales.mul_add_precise(
             f32x4::from_slice(neon, input),

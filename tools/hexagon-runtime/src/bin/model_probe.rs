@@ -2,7 +2,7 @@
 //!
 //! The Runner owner verifies source/package/driver identities and creates this
 //! worker suspended in its deadline-owned, kill-on-close Job. This executable
-//! grants no service admission. Up to two real graph tokens offload only the original
+//! grants no service admission. Up to eight real graph tokens offload only the original
 //! first FFN up projection; every native integer limb/plane and complete CPU logits
 //! and logical state must match before the final result is published.
 #![forbid(unsafe_code)]
@@ -29,8 +29,8 @@ use bonsai_hexagon_runtime::{GuardedQ2Executor, HmxQ2Executor, PlacedProjectionE
 use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{Qwen35, StateComponent},
-    kernels::{MatvecBackend, Pq2ProjectionExecutor},
-    model::{Model, swift},
+    kernels::{MatvecBackend, Pq2ProjectionExecutor, RowParallelism},
+    model::{Model, lora::RankOneAdapter, swift},
 };
 use hexagon_native_rpc::{
     Driver, DriverLocation, Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter,
@@ -44,6 +44,78 @@ const PROJECTION: &str = "blk.0.ffn_up.weight";
 const MAX_REQUEST_BYTES: u64 = 8192;
 const MODEL_MEMORY_LIMIT: usize = 12 * 1024 * 1024 * 1024;
 const MAX_HOST_PAYLOAD: usize = 64 * 1024 * 1024;
+const MAX_TOKENS: usize = 8;
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum AdapterCase {
+    #[default]
+    None,
+    LoadedZero,
+    #[serde(rename = "standard-scale-1.3")]
+    StandardScale13,
+}
+
+impl AdapterCase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LoadedZero => "loaded-zero",
+            Self::StandardScale13 => "standard-scale-1.3",
+        }
+    }
+
+    const fn loaded(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn scale(self) -> f32 {
+        if matches!(self, Self::StandardScale13) {
+            1.3
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum CpuBackend {
+    #[default]
+    Scalar,
+    Neon,
+}
+
+impl CpuBackend {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Neon => "neon",
+        }
+    }
+
+    const fn backend(self) -> MatvecBackend {
+        match self {
+            Self::Scalar => MatvecBackend::Scalar,
+            Self::Neon => MatvecBackend::ExperimentalNeon,
+        }
+    }
+
+    const fn available(self) -> bool {
+        matches!(self, Self::Scalar)
+            || cfg!(all(
+                feature = "experimental-neon",
+                target_os = "windows",
+                target_arch = "aarch64",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))
+    }
+}
+
+const fn default_row_workers() -> usize {
+    1
+}
 
 #[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -80,6 +152,14 @@ struct Request {
     token_ids: Option<Vec<u32>>,
     #[serde(default)]
     execution_backend: ExecutionBackend,
+    #[serde(default)]
+    adapter_path: Option<PathBuf>,
+    #[serde(default)]
+    adapter_case: AdapterCase,
+    #[serde(default)]
+    cpu_backend: CpuBackend,
+    #[serde(default = "default_row_workers")]
+    row_workers: usize,
     context_limit: usize,
     model_memory_limit_bytes: usize,
     state_budget_bytes: usize,
@@ -109,7 +189,7 @@ impl Request {
         let tokens = self.tokens();
         require(
             self.schema_version == 1
-                && (1..=2).contains(&tokens.len())
+                && (1..=MAX_TOKENS).contains(&tokens.len())
                 && tokens.first() == Some(&self.token_id)
                 && tokens.iter().all(|&token| {
                     usize::try_from(token).is_ok_and(|token| token < swift::VOCAB_SIZE)
@@ -122,6 +202,10 @@ impl Request {
                     .contains(&self.state_budget_bytes)
                 && (1..=MAX_HOST_PAYLOAD).contains(&self.maximum_owned_payload_bytes)
                 && self.maximum_operations >= u32::try_from(tokens.len())? * 40
+                && self.adapter_path.is_some() == self.adapter_case.loaded()
+                && self.cpu_backend.available()
+                && matches!(self.row_workers, 1 | 4)
+                && (self.row_workers == 1 || cfg!(feature = "parallel-rows"))
                 && self.expected_parent_pid != 0
                 && self.expected_parent_creation_time != 0,
         )?;
@@ -136,6 +220,9 @@ impl Request {
         let limits = self.limits()?;
         external(&self.model_path)?;
         external(&self.package_directory)?;
+        if let Some(path) = &self.adapter_path {
+            external(path)?;
+        }
         Ok(limits)
     }
 }
@@ -302,13 +389,38 @@ struct Control {
     rows: Vec<StateRow>,
 }
 
+fn graph_for_arm(model: Model, request: &Request, cpu_baseline: bool) -> Result<Qwen35> {
+    // The loaded-zero case deliberately uses a bare CPU graph as the oracle:
+    // equal results prove identity with the original base, not just agreement
+    // between two copies of the same loaded adapter path.
+    let load_adapter = request.adapter_case.loaded()
+        && !(cpu_baseline && request.adapter_case == AdapterCase::LoadedZero);
+    let mut graph = if load_adapter {
+        let path = request.adapter_path.as_deref().ok_or_else(reject)?;
+        let adapter = RankOneAdapter::load_swift(path, &model)?;
+        Qwen35::with_rank_one_adapter(
+            model,
+            request.context_limit,
+            request.state_budget_bytes,
+            request.cpu_backend.backend(),
+            adapter,
+            request.adapter_case.scale(),
+        )?
+    } else {
+        Qwen35::with_state_budget(
+            model,
+            request.context_limit,
+            request.state_budget_bytes,
+            request.cpu_backend.backend(),
+        )?
+    };
+    graph.set_row_parallelism(RowParallelism::new(request.row_workers)?);
+    require(graph.row_workers() == request.row_workers)?;
+    Ok(graph)
+}
+
 fn cpu_control(model: Model, request: &Request) -> Result<Vec<Control>> {
-    let mut graph = Qwen35::with_state_budget(
-        model,
-        request.context_limit,
-        request.state_budget_bytes,
-        MatvecBackend::Scalar,
-    )?;
+    let mut graph = graph_for_arm(model, request, true)?;
     let mut controls = Vec::new();
     let mut remaining_state_bytes = request.state_budget_bytes;
     controls.try_reserve_exact(request.tokens().len())?;
@@ -592,12 +704,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
         &json!({"event":"cpu-control-complete", "logitsSha256":logits_digest(&last_control.logits)?,
         "stateSha256":last_control.state_sha256,"tokenIds":request.tokens()}),
     )?;
-    let graph = Qwen35::with_state_budget(
-        model,
-        request.context_limit,
-        request.state_budget_bytes,
-        MatvecBackend::Scalar,
-    )?;
+    let graph = graph_for_arm(model, request, false)?;
     parent.ensure_alive()?;
     let npu_power_before = power_value();
     let mut result = None;
@@ -729,6 +836,18 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["tokenId"] = json!(request.token_id);
     value["tokenIds"] = json!(request.tokens());
     value["executionBackend"] = json!(request.execution_backend.name());
+    value["adapterCase"] = json!(request.adapter_case.name());
+    value["adapterLoaded"] = json!(request.adapter_case.loaded());
+    value["adapterSha256"] = if request.adapter_case.loaded() {
+        json!(bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256)
+    } else {
+        Value::Null
+    };
+    value["adapterScaleBits"] = json!(request.adapter_case.scale().to_bits());
+    value["cpuBaselineAdapterLoaded"] = json!(request.adapter_case == AdapterCase::StandardScale13);
+    value["cpuBaselineAdapterScaleBits"] = json!(request.adapter_case.scale().to_bits());
+    value["cpuBackend"] = json!(request.cpu_backend.name());
+    value["rowWorkers"] = json!(request.row_workers);
     value["maximumOperations"] = json!(request.maximum_operations);
     value["sessionSeconds"] = json!(request.session_seconds);
     value["nativeHmxBitplaneControl"] = json!(report.is_hmx_bitplane_control());
@@ -864,7 +983,7 @@ mod tests {
         for (name, invalid) in [
             ("tokenIds", json!([])),
             ("tokenIds", json!([1, 42])),
-            ("tokenIds", json!([0, 1, 2])),
+            ("tokenIds", json!([0, 1, 2, 3, 4, 5, 6, 7, 8])),
             ("tokenIds", json!([0, swift::VOCAB_SIZE])),
             ("contextLimit", json!(1)),
             ("maximumOperations", json!(79)),
@@ -879,6 +998,78 @@ mod tests {
         }
         two["executionBackend"] = json!("automatic");
         assert!(serde_json::from_value::<Request>(two).is_err());
+        let mut eight = request();
+        eight["tokenIds"] = json!([0, 1, 2, 3, 4, 5, 6, 7]);
+        eight["contextLimit"] = json!(8);
+        eight["maximumOperations"] = json!(320);
+        serde_json::from_value::<Request>(eight.clone())?.limits()?;
+        eight["maximumOperations"] = json!(319);
+        assert!(serde_json::from_value::<Request>(eight)?.limits().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn model_probe_adapter_case_requires_an_explicit_path_and_approved_scale() -> Result<()> {
+        let value = request();
+        for case in ["loaded-zero", "standard-scale-1.3"] {
+            let mut changed = value.clone();
+            changed["adapterCase"] = json!(case);
+            assert!(
+                serde_json::from_value::<Request>(changed.clone())?
+                    .limits()
+                    .is_err()
+            );
+            changed["adapterPath"] = json!("C:\\approved-adapter.gguf");
+            let parsed: Request = serde_json::from_value(changed)?;
+            parsed.limits()?;
+            assert!(parsed.adapter_case.loaded());
+            assert_eq!(parsed.adapter_case.name(), case);
+            assert_eq!(
+                parsed.adapter_case.scale().to_bits(),
+                if case == "loaded-zero" {
+                    0
+                } else {
+                    1.3_f32.to_bits()
+                }
+            );
+        }
+        let mut extra = value.clone();
+        extra["adapterPath"] = json!("C:\\approved-adapter.gguf");
+        assert!(serde_json::from_value::<Request>(extra)?.limits().is_err());
+        for invalid_case in ["standard", "standard-scale-1.0", "arbitrary"] {
+            let mut invalid = value.clone();
+            invalid["adapterCase"] = json!(invalid_case);
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_probe_cpu_policy_rejects_silent_worker_and_neon_fallback() -> Result<()> {
+        for workers in [0, 2, 3, 5, 16] {
+            let mut invalid = request();
+            invalid["rowWorkers"] = json!(workers);
+            assert!(
+                serde_json::from_value::<Request>(invalid)?
+                    .limits()
+                    .is_err()
+            );
+        }
+        let mut four = request();
+        four["rowWorkers"] = json!(4);
+        assert_eq!(
+            serde_json::from_value::<Request>(four)?.limits().is_ok(),
+            cfg!(feature = "parallel-rows")
+        );
+        let mut neon = request();
+        neon["cpuBackend"] = json!("neon");
+        assert_eq!(
+            serde_json::from_value::<Request>(neon)?.limits().is_ok(),
+            CpuBackend::Neon.available()
+        );
+        let mut automatic = request();
+        automatic["cpuBackend"] = json!("auto");
+        assert!(serde_json::from_value::<Request>(automatic).is_err());
         Ok(())
     }
 

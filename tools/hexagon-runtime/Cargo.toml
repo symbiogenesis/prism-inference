@@ -10,6 +10,10 @@ description = "Experimental scoped Hexagon projection execution for the native R
 keywords = ["hexagon", "prism", "inference"]
 categories = ["hardware-support"]
 
+[features]
+experimental-neon = ["prism-inference/experimental-neon"]
+parallel-rows = ["prism-inference/parallel-rows"]
+
 [dependencies]
 prism-inference = { path = "../..", default-features = false }
 bonsai-hexagon-native = { path = "../hexagon-native" }

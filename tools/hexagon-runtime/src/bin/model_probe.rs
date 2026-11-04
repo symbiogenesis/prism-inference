@@ -2,8 +2,8 @@
 //!
 //! The Runner owner verifies source/package/driver identities and creates this
 //! worker suspended in its deadline-owned, kill-on-close Job. This executable
-//! grants no service admission. One real graph token offloads only the original
-//! first FFN up projection; every native integer limb and complete CPU logits
+//! grants no service admission. Up to two real graph tokens offload only the original
+//! first FFN up projection; every native integer limb/plane and complete CPU logits
 //! and logical state must match before the final result is published.
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -25,16 +25,16 @@ use std::{
     time::Duration,
 };
 
-use bonsai_hexagon_runtime::{GuardedQ2Executor, PlacedProjectionExecutor};
+use bonsai_hexagon_runtime::{GuardedQ2Executor, HmxQ2Executor, PlacedProjectionExecutor};
 use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{Qwen35, StateComponent},
-    kernels::MatvecBackend,
+    kernels::{MatvecBackend, Pq2ProjectionExecutor},
     model::{Model, swift},
 };
 use hexagon_native_rpc::{
-    Driver, DriverLocation, Error, GuardedQ2Submitter, Q2_PROJECTION_MAX_OPERATIONS,
-    Q2ProjectionLimits,
+    Driver, DriverLocation, Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter,
+    Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,6 +45,30 @@ const MAX_REQUEST_BYTES: u64 = 8192;
 const MODEL_MEMORY_LIMIT: usize = 12 * 1024 * 1024 * 1024;
 const MAX_HOST_PAYLOAD: usize = 64 * 1024 * 1024;
 
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutionBackend {
+    #[default]
+    GuardedHvx,
+    HmxBitplane,
+}
+
+impl ExecutionBackend {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::GuardedHvx => "guarded-hvx",
+            Self::HmxBitplane => "hmx-bitplane",
+        }
+    }
+
+    const fn values_per_token(self) -> u64 {
+        match self {
+            Self::GuardedHvx => 1_392_640,
+            Self::HmxBitplane => 5_570_560,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {
@@ -52,6 +76,10 @@ struct Request {
     model_path: PathBuf,
     package_directory: PathBuf,
     token_id: u32,
+    #[serde(default)]
+    token_ids: Option<Vec<u32>>,
+    #[serde(default)]
+    execution_backend: ExecutionBackend,
     context_limit: usize,
     model_memory_limit_bytes: usize,
     state_budget_bytes: usize,
@@ -71,17 +99,29 @@ fn require(value: bool) -> Result<()> {
 }
 
 impl Request {
+    fn tokens(&self) -> &[u32] {
+        self.token_ids
+            .as_deref()
+            .unwrap_or_else(|| std::slice::from_ref(&self.token_id))
+    }
+
     fn limits(&self) -> Result<Q2ProjectionLimits> {
+        let tokens = self.tokens();
         require(
             self.schema_version == 1
-                && self.token_id < u32::try_from(swift::VOCAB_SIZE)?
+                && (1..=2).contains(&tokens.len())
+                && tokens.first() == Some(&self.token_id)
+                && tokens.iter().all(|&token| {
+                    usize::try_from(token).is_ok_and(|token| token < swift::VOCAB_SIZE)
+                })
                 && (1..=16).contains(&self.context_limit)
+                && self.context_limit >= tokens.len()
                 && (swift::TENSOR_PAYLOAD_BYTES..=MODEL_MEMORY_LIMIT)
                     .contains(&self.model_memory_limit_bytes)
                 && (1..=bonsai_prism_runtime::graph::MAX_STATE_BYTES)
                     .contains(&self.state_budget_bytes)
                 && (1..=MAX_HOST_PAYLOAD).contains(&self.maximum_owned_payload_bytes)
-                && self.maximum_operations >= 40
+                && self.maximum_operations >= u32::try_from(tokens.len())? * 40
                 && self.expected_parent_pid != 0
                 && self.expected_parent_creation_time != 0,
         )?;
@@ -262,19 +302,31 @@ struct Control {
     rows: Vec<StateRow>,
 }
 
-fn cpu_control(model: Model, request: &Request) -> Result<Control> {
+fn cpu_control(model: Model, request: &Request) -> Result<Vec<Control>> {
     let mut graph = Qwen35::with_state_budget(
         model,
         request.context_limit,
         request.state_budget_bytes,
         MatvecBackend::Scalar,
     )?;
-    let logits = graph.evaluate(request.token_id)?;
-    Ok(Control {
-        logits,
-        state_sha256: state_digest(&graph)?,
-        rows: capture_state(&graph, request.state_budget_bytes)?,
-    })
+    let mut controls = Vec::new();
+    let mut remaining_state_bytes = request.state_budget_bytes;
+    controls.try_reserve_exact(request.tokens().len())?;
+    for &token in request.tokens() {
+        let logits = graph.evaluate(token)?;
+        let rows = capture_state(&graph, remaining_state_bytes)?;
+        for row in &rows {
+            remaining_state_bytes = remaining_state_bytes
+                .checked_sub(row.bits.len().checked_mul(4).ok_or_else(reject)?)
+                .ok_or_else(reject)?;
+        }
+        controls.push(Control {
+            logits,
+            state_sha256: state_digest(&graph)?,
+            rows,
+        });
+    }
+    Ok(controls)
 }
 
 /// Independent scalar oracle over each signed operation's serialized operands.
@@ -356,6 +408,149 @@ impl GuardedQ2Submitter for CheckedSubmitter<'_> {
     }
 }
 
+/// Independent decoding of the serialized signed-kernel Q2 tiles and all eight
+/// binary activation planes. This does not reuse the production HMX packer or
+/// reconstruction helpers.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::float_cmp,
+    reason = "Binary activation planes and bounded integer sums are exactly representable in F32."
+)]
+fn compare_planes(weights: &[u8], activation: &[[f32; 128]; 8], output: &[f32]) -> Result<u64> {
+    let rows = output.len() / 8;
+    require(
+        rows != 0
+            && output.len() == rows * 8
+            && rows.is_multiple_of(32)
+            && rows <= 17_408
+            && weights.len() == rows * 36,
+    )?;
+    for tile in weights.as_chunks::<576>().0 {
+        require(
+            tile[512..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|scale| *scale == [0, 0x3c]),
+        )?;
+    }
+    for (plane, values) in activation.iter().enumerate() {
+        require(values.iter().all(|&value| value == 0.0 || value == 1.0))?;
+        for row in 0..rows {
+            let mut dot = 0_i32;
+            for (lane, &value) in values.iter().enumerate() {
+                if value == 1.0 {
+                    let local = lane % 64;
+                    let tile = (row / 32 * 2 + lane / 64) * 576;
+                    let byte = weights[tile + local / 16 * 128 + row % 32 * 4 + local % 4];
+                    let symbol = (byte >> (local / 4 % 4 * 2)) & 3;
+                    dot += i32::from(symbol) - 1;
+                }
+            }
+            require(output[plane * rows + row] == dot as f32)?;
+        }
+    }
+    Ok(u64::try_from(output.len())?)
+}
+
+struct CheckedHmxSubmitter<'a> {
+    native: &'a mut dyn HmxQ2Submitter,
+    compared: u64,
+    failed: bool,
+}
+
+impl HmxQ2Submitter for CheckedHmxSubmitter<'_> {
+    fn remaining_operations(&self) -> Option<u64> {
+        if self.failed {
+            Some(0)
+        } else {
+            self.native.remaining_operations()
+        }
+    }
+
+    fn submit(
+        &mut self,
+        weights: &[u8],
+        activation: &[[f32; 128]; 8],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        if self.failed {
+            output.fill(f32::NAN);
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let result = (|| {
+            self.native.submit(weights, activation, output)?;
+            let count = compare_planes(weights, activation, output).map_err(|_| Error::Contract)?;
+            self.compared = self.compared.checked_add(count).ok_or(Error::Contract)?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            self.failed = false;
+        } else {
+            output.fill(f32::NAN);
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+fn compare_graph_sequence(
+    graph: Qwen35,
+    executor: &mut dyn Pq2ProjectionExecutor,
+    placement_model: &Model,
+    controls: &[Control],
+    request: &Request,
+    parent: &bonsai_windows_process::ParentProcess,
+) -> Result<Value> {
+    require(controls.len() == request.tokens().len())?;
+    let mut placed = PlacedProjectionExecutor::new(executor, placement_model, &[PROJECTION])?;
+    let mut projected = graph.with_projection_executor(&mut placed)?;
+    // Reserve the complete sequence before the first submitted projection.
+    projected.admit_work(0, request.tokens().len())?;
+    let mut comparisons = Vec::new();
+    comparisons.try_reserve_exact(controls.len())?;
+    for (index, (&token, control)) in request.tokens().iter().zip(controls).enumerate() {
+        parent.ensure_alive()?;
+        let actual = projected.evaluate(token)?;
+        require(
+            actual.len() == control.logits.len()
+                && actual
+                    .iter()
+                    .zip(&control.logits)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+        )?;
+        compare_state(projected.decoder(), &control.rows)?;
+        let actual_state = state_digest(projected.decoder())?;
+        require(actual_state == control.state_sha256)?;
+        comparisons.push(json!({"index":index,"tokenId":token,
+            "logitsBitwiseEqual":true,"stateBitwiseEqual":true,
+            "logitsSha256":logits_digest(&actual)?,"stateSha256":actual_state}));
+    }
+    let last = comparisons.last().ok_or_else(reject)?;
+    Ok(
+        json!({"placementIdentity":projected.identity(),"tokenComparisons":comparisons,
+        "logitsBitwiseEqual":true,"stateBitwiseEqual":true,
+        "logitsSha256":last["logitsSha256"],"stateSha256":last["stateSha256"]}),
+    )
+}
+
+fn check_statistics(
+    statistics: bonsai_hexagon_runtime::ProjectionStatistics,
+    compared: u64,
+    failed: bool,
+    request: &Request,
+) -> Result<()> {
+    let tokens = u64::try_from(request.tokens().len())?;
+    require(
+        !failed
+            && compared == request.execution_backend.values_per_token() * tokens
+            && statistics.projections_completed == tokens
+            && statistics.operations_completed == tokens * 40
+            && statistics.operations_attempted == tokens * 40,
+    )
+}
+
 #[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
@@ -391,15 +586,12 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
         &json!({"event":"cpu-arm-finished", "completed":control.is_ok(),
         "powerBefore":cpu_power_before,"powerAfter":cpu_power_after}),
     )?;
-    let Control {
-        logits: expected_logits,
-        state_sha256: expected_state,
-        rows: expected_rows,
-    } = control?;
+    let controls = control?;
+    let last_control = controls.last().ok_or_else(reject)?;
     parent.ensure_alive()?;
     emit(
-        &json!({"event":"cpu-control-complete", "logitsSha256":logits_digest(&expected_logits)?,
-        "stateSha256":expected_state}),
+        &json!({"event":"cpu-control-complete", "logitsSha256":logits_digest(&last_control.logits)?,
+        "stateSha256":last_control.state_sha256,"tokenIds":request.tokens()}),
     )?;
     let graph = Qwen35::with_state_budget(
         model,
@@ -414,49 +606,107 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     let report_result = (|| {
         let driver = Driver::open_system()?;
         let driver_dll = driver.path().to_path_buf();
-        driver.reference_q2_projection(&request.package_directory, limits,
-        |report| {
-            if emit(&json!({"event":"native-progress", "stage":report.queue.stage,
+        let progress = |report: &hexagon_native_rpc::Q2ProjectionReport| {
+            if emit(
+                &json!({"event":"native-progress", "stage":report.queue.stage,
                 "operationsSubmitted":report.operations_submitted,
-                "operationsCompleted":report.operations_completed})).is_err() {
+                "operationsCompleted":report.operations_completed}),
+            )
+            .is_err()
+            {
                 progress_failed = true;
             }
-        },
-        |native| {
-            let work = (|| -> Result<Value> {
-                parent.ensure_alive()?;
-                let mut checked = CheckedSubmitter { native, compared:0, failed:false };
-                let (statistics, identity, actual, actual_state) = {
-                let mut executor = GuardedQ2Executor::new(&mut checked, limits, request.maximum_owned_payload_bytes);
-                let mut placed = PlacedProjectionExecutor::new(&mut executor, &placement_model, &[PROJECTION])?;
-                let mut projected = graph.with_projection_executor(&mut placed)?;
-                projected.admit_work(0, 1)?;
-                let actual = projected.evaluate(request.token_id)?;
-                require(actual.len() == expected_logits.len() && actual.iter().zip(&expected_logits).all(|(actual, expected)| actual.to_bits() == expected.to_bits()))?;
-                let actual_state = state_digest(projected.decoder())?;
-                compare_state(projected.decoder(), &expected_rows)?;
-                require(actual_state == expected_state)?;
-                let identity = projected.identity().to_owned();
-                drop(projected);
-                drop(placed);
-                (executor.statistics(), identity, actual, actual_state)
-                };
-                require(!checked.failed && checked.compared == 1_392_640 && statistics.projections_completed == 1 && statistics.operations_completed == 40 && statistics.operations_attempted == 40)?;
-                parent.ensure_alive()?;
-                Ok(json!({"event":"result", "schemaVersion":1,"completed":true,
-                    "requestSha256":request_sha256,"modelSha256":swift::MODEL_SHA256,
-                    "modelBytes":swift::MODEL_BYTES,"projection":PROJECTION,"tokenId":request.token_id,
-                    "driverDll":driver_dll,"placementIdentity":identity,
-                    "maximumOperations":request.maximum_operations,"sessionSeconds":request.session_seconds,
-                    "projectionsCompleted":statistics.projections_completed,
-                    "integerValuesCompared":checked.compared,"logitsBitwiseEqual":true,
-                    "stateBitwiseEqual":true,"logitsSha256":logits_digest(&actual)?,
-                    "stateSha256":actual_state,"profileEligible":false,"performanceMeasured":false,
-                    "cpuPowerBefore":cpu_power_before,"cpuPowerAfter":cpu_power_after,
-                    "npuPowerBefore":npu_power_before}))
-            })();
-            work.map(|value| result = Some(value)).map_err(|_| Error::Contract)
-        })
+        };
+        let mut accept = |mut value: Value,
+                          statistics: bonsai_hexagon_runtime::ProjectionStatistics,
+                          compared: u64| {
+            parent.ensure_alive()?;
+            value["driverDll"] = json!(driver_dll);
+            value["projectionsCompleted"] = json!(statistics.projections_completed);
+            value["integerValuesCompared"] = json!(compared);
+            result = Some(value);
+            Ok::<(), bonsai_prism_runtime::Error>(())
+        };
+        match request.execution_backend {
+            ExecutionBackend::GuardedHvx => driver.reference_q2_projection(
+                &request.package_directory,
+                limits,
+                progress,
+                |native| {
+                    let work = (|| -> Result<()> {
+                        let mut checked = CheckedSubmitter {
+                            native,
+                            compared: 0,
+                            failed: false,
+                        };
+                        let (value, statistics) = {
+                            let mut executor = GuardedQ2Executor::new(
+                                &mut checked,
+                                limits,
+                                request.maximum_owned_payload_bytes,
+                            );
+                            let value = compare_graph_sequence(
+                                graph,
+                                &mut executor,
+                                &placement_model,
+                                &controls,
+                                request,
+                                &parent,
+                            )?;
+                            (value, executor.statistics())
+                        };
+                        check_statistics(statistics, checked.compared, checked.failed, request)?;
+                        accept(value, statistics, checked.compared)
+                    })();
+                    work.map_err(|_| Error::Contract)
+                },
+            ),
+            ExecutionBackend::HmxBitplane => {
+                let hmx_limits = HmxQ2ProjectionLimits::new(
+                    17_408,
+                    request.maximum_operations,
+                    Duration::from_secs(request.session_seconds),
+                )?;
+                driver.reference_hmx_q2_projection(
+                    &request.package_directory,
+                    hmx_limits,
+                    progress,
+                    |native| {
+                        let work = (|| -> Result<()> {
+                            let mut checked = CheckedHmxSubmitter {
+                                native,
+                                compared: 0,
+                                failed: false,
+                            };
+                            let (value, statistics) = {
+                                let mut executor = HmxQ2Executor::new(
+                                    &mut checked,
+                                    hmx_limits,
+                                    request.maximum_owned_payload_bytes,
+                                );
+                                let value = compare_graph_sequence(
+                                    graph,
+                                    &mut executor,
+                                    &placement_model,
+                                    &controls,
+                                    request,
+                                    &parent,
+                                )?;
+                                (value, executor.statistics())
+                            };
+                            check_statistics(
+                                statistics,
+                                checked.compared,
+                                checked.failed,
+                                request,
+                            )?;
+                            accept(value, statistics, checked.compared)
+                        })();
+                        work.map_err(|_| Error::Contract)
+                    },
+                )
+            }
+        }
     })();
     let npu_power_after = power_value();
     emit(
@@ -465,11 +715,47 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     )?;
     let report = report_result?;
     require(!progress_failed && report.completed_cycle())?;
+    require(
+        report.is_hmx_bitplane_control()
+            == (request.execution_backend == ExecutionBackend::HmxBitplane),
+    )?;
     let mut value = result.ok_or_else(reject)?;
+    value["event"] = json!("result");
+    value["schemaVersion"] = json!(1);
+    value["completed"] = json!(true);
+    value["requestSha256"] = json!(request_sha256);
+    value["modelSha256"] = json!(swift::MODEL_SHA256);
+    value["modelBytes"] = json!(swift::MODEL_BYTES);
+    value["projection"] = json!(PROJECTION);
+    value["tokenId"] = json!(request.token_id);
+    value["tokenIds"] = json!(request.tokens());
+    value["executionBackend"] = json!(request.execution_backend.name());
+    value["maximumOperations"] = json!(request.maximum_operations);
+    value["sessionSeconds"] = json!(request.session_seconds);
+    value["nativeHmxBitplaneControl"] = json!(report.is_hmx_bitplane_control());
+    value["profileEligible"] = json!(false);
+    value["performanceMeasured"] = json!(false);
+    value["cpuPowerBefore"] = cpu_power_before;
+    value["cpuPowerAfter"] = cpu_power_after;
+    value["npuPowerBefore"] = npu_power_before;
     value["nativeCompletedCycle"] = json!(true);
     value["nativeOperationsSubmitted"] = json!(report.operations_submitted);
     value["nativeOperationsCompleted"] = json!(report.operations_completed);
     value["nativeStage"] = json!(report.queue.stage);
+    value["nativeCleanup"] = json!({
+        "queueStopResult":report.queue.queue_stop_result,
+        "queueCloseResult":report.queue.queue_close_result,
+        "unmappingResult":report.queue.unmapping_result,
+        "moduleCloseResult":report.queue.module_close_result,
+        "freeCompleted":report.queue.free_completed,
+        "poisoned":report.queue.poisoned,
+        "ownerPinnedUntilExit":report.queue.owner_pinned_until_exit});
+    value["nativeResources"] = json!({
+        "mappedAllocationBytes":report.mapped_allocation_bytes,
+        "architecture":report.queue.metadata.architecture,
+        "effectiveDomain":report.queue.metadata.effective_domain,
+        "residentWeightBytesPrepared":report.resident_weight_bytes_prepared,
+        "effectiveHmxPlacementVerified":false,"effectiveVtcmBytes":null});
     value["npuPowerAfter"] = npu_power_after;
     parent.ensure_alive()?;
     emit(&value)
@@ -562,6 +848,161 @@ mod tests {
                     .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn model_probe_sequence_requires_bounded_tokens_context_and_complete_work() -> Result<()> {
+        let mut two = request();
+        two["tokenIds"] = json!([0, 42]);
+        two["contextLimit"] = json!(2);
+        two["maximumOperations"] = json!(80);
+        two["executionBackend"] = json!("hmx-bitplane");
+        let parsed: Request = serde_json::from_value(two.clone())?;
+        parsed.limits()?;
+        assert_eq!(parsed.tokens(), &[0, 42]);
+        assert_eq!(parsed.execution_backend.name(), "hmx-bitplane");
+        for (name, invalid) in [
+            ("tokenIds", json!([])),
+            ("tokenIds", json!([1, 42])),
+            ("tokenIds", json!([0, 1, 2])),
+            ("tokenIds", json!([0, swift::VOCAB_SIZE])),
+            ("contextLimit", json!(1)),
+            ("maximumOperations", json!(79)),
+        ] {
+            let mut changed = two.clone();
+            changed[name] = invalid;
+            assert!(
+                serde_json::from_value::<Request>(changed)?
+                    .limits()
+                    .is_err()
+            );
+        }
+        two["executionBackend"] = json!("automatic");
+        assert!(serde_json::from_value::<Request>(two).is_err());
+        Ok(())
+    }
+
+    fn zero_hmx_weights(rows: usize) -> Vec<u8> {
+        let mut weights = vec![0x55; rows * 36];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        weights
+    }
+
+    #[test]
+    fn model_probe_hmx_oracle_checks_all_planes_row_tiles_signs_and_output_bytes() -> Result<()> {
+        let mut weights = zero_hmx_weights(64);
+        weights[0] = (weights[0] & !3) | 2; // Row0, lane0: +1.
+        weights[133] &= !3; // Row1, lane17: -1.
+        weights[1728] = (weights[1728] & !3) | 3; // Row32, lane64: +2.
+        weights[2239] = (weights[2239] & 0x3f) | (2 << 6); // Row63, lane127: +1.
+        let mut planes = [[0.0; 128]; 8];
+        planes[0][0] = 1.0;
+        planes[0][17] = 1.0;
+        planes[1][64] = 1.0;
+        planes[7][127] = 1.0;
+        let mut output = [0.0; 512];
+        output[0] = 1.0;
+        output[1] = -1.0;
+        output[96] = 2.0;
+        output[511] = 1.0;
+        assert_eq!(compare_planes(&weights, &planes, &output)?, 512);
+        let mut wrong = output;
+        wrong[511] = 0.0;
+        assert!(compare_planes(&weights, &planes, &wrong).is_err());
+        wrong[511] = f32::NAN;
+        assert!(compare_planes(&weights, &planes, &wrong).is_err());
+        assert!(compare_planes(&weights, &planes, &output[..504]).is_err());
+        planes[3][5] = 0.5;
+        assert!(compare_planes(&weights, &planes, &output).is_err());
+        planes[3][5] = 0.0;
+        weights[512] = 1;
+        assert!(compare_planes(&weights, &planes, &output).is_err());
+        Ok(())
+    }
+
+    struct HmxSubmitter {
+        calls: Rc<Cell<u32>>,
+        fail: bool,
+        wrong: bool,
+    }
+
+    impl HmxQ2Submitter for HmxSubmitter {
+        fn remaining_operations(&self) -> Option<u64> {
+            Some(80)
+        }
+
+        fn submit(
+            &mut self,
+            _: &[u8],
+            _: &[[f32; 128]; 8],
+            output: &mut [f32],
+        ) -> std::result::Result<(), Error> {
+            self.calls.set(self.calls.get() + 1);
+            output.fill(if self.wrong { 1.0 } else { 0.0 });
+            if self.fail {
+                Err(Error::Contract)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn model_probe_hmx_native_failure_and_plane_mismatch_close_without_replay() {
+        for (fail, wrong) in [(true, false), (false, true)] {
+            let calls = Rc::new(Cell::new(0));
+            let mut native = HmxSubmitter {
+                calls: calls.clone(),
+                fail,
+                wrong,
+            };
+            let mut checked = CheckedHmxSubmitter {
+                native: &mut native,
+                compared: 0,
+                failed: false,
+            };
+            let weights = zero_hmx_weights(32);
+            let mut output = [f32::NAN; 256];
+            for _ in 0..2 {
+                assert!(
+                    checked
+                        .submit(&weights, &[[1.0; 128]; 8], &mut output)
+                        .is_err()
+                );
+                assert!(output.iter().all(|value| value.is_nan()));
+            }
+            assert_eq!(checked.remaining_operations(), Some(0));
+            assert_eq!(checked.compared, 0);
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn model_probe_hmx_success_counts_every_plane_across_submissions() -> Result<()> {
+        let mut native = HmxSubmitter {
+            calls: Rc::new(Cell::new(0)),
+            fail: false,
+            wrong: false,
+        };
+        let mut checked = CheckedHmxSubmitter {
+            native: &mut native,
+            compared: 0,
+            failed: false,
+        };
+        for _ in 0..2 {
+            checked.submit(
+                &zero_hmx_weights(32),
+                &[[1.0; 128]; 8],
+                &mut [f32::NAN; 256],
+            )?;
+        }
+        assert_eq!(checked.compared, 512);
+        assert!(!checked.failed);
         Ok(())
     }
 

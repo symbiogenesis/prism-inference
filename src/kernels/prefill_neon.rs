@@ -44,9 +44,10 @@ impl Block {
     #[inline]
     pub(super) fn dot32(&self, group: usize, values: &[i8; 32]) -> i32 {
         let halves = values.as_chunks::<16>().0;
-        let [a, b, c, d] = self.products16(group * 4, &halves[0]);
-        let [e, f, g, h] = self.products16(group * 4 + 2, &halves[1]);
-        ((a + b) + (c + d) + (e + f) + (g + h)).reduce_sum()
+        let low = self.products16(group * 4, &halves[0]);
+        let high = self.products16(group * 4 + 2, &halves[1]);
+        ((low[0] + low[1]) + (low[2] + low[3]) + (high[0] + high[1]) + (high[2] + high[3]))
+            .reduce_sum()
     }
 
     #[inline]

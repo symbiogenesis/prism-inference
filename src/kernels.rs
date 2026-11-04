@@ -1795,6 +1795,10 @@ impl PreparedMatvec<'_> {
         result
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep checked format dispatch and its ordered arithmetic branches together."
+    )]
     fn multiply(&mut self, tensor: &Tensor, output: &mut Vec<f32>) -> Result<()> {
         let (columns, rows, row_bytes) = dimensions(tensor)?;
         if columns != self.input.len()

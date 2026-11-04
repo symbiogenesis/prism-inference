@@ -57,6 +57,7 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           python -B -m unittest discover -s (Join-Path $env:GITHUB_WORKSPACE '.github/ci') -p test_inference_efficiency.py
           cargo +nightly-2026-10-22 fmt --manifest-path $manifest --all -- --check
+          cargo +nightly-2026-10-22 check --manifest-path $manifest --locked --release -p prism-inference --lib --no-default-features
           python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/inference_efficiency.py') --manifest $manifest --evidence $env:EFFICIENCY_EVIDENCE
           cargo +nightly-2026-10-22 clippy --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
           cargo +nightly-2026-10-22 build --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server --bins --features prism-inference/parallel-rows,prism-inference-server/parallel-rows

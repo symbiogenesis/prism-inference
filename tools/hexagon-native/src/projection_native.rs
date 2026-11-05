@@ -7,7 +7,9 @@ use super::{
 use crate::{
     Error, GuardedQ2Submitter, HMX_Q2_BATCH_OPERATIONS, HMX_Q2_BATCH10_OPERATIONS,
     HmxQ2ProjectionLimits, HmxQ2Submitter, HmxQ2WeightHandle, HmxQ2WeightRegistry,
-    Q2ProjectionLimits, Q2ProjectionReport, SessionPreparationReport, hmx_projection, projection,
+    NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle, NativeQ2WeightRegistry,
+    Q2ProjectionLimits, Q2ProjectionReport, SessionPreparationReport, hmx_projection, native_q2,
+    projection,
 };
 use std::ffi::c_void;
 use std::path::Path;
@@ -67,12 +69,33 @@ pub(super) fn run_hmx(
     )
 }
 
+pub(super) fn run_native_q2(
+    driver: Driver,
+    package: &Path,
+    limits: NativeQ2ProjectionLimits,
+    progress: impl FnMut(&Q2ProjectionReport),
+    work: impl FnOnce(&mut dyn NativeQ2Submitter) -> Result<(), Error>,
+) -> Result<Q2ProjectionReport, Error> {
+    run_mode(
+        driver,
+        package,
+        limits.common,
+        Mode::NativeQ2 {
+            columns: limits.columns,
+        },
+        limits.resident_weight_bytes,
+        progress,
+        |session| work(session),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Guarded,
     Hmx,
     HmxBatch4,
     HmxBatch10,
+    NativeQ2 { columns: usize },
 }
 
 impl Mode {
@@ -80,9 +103,13 @@ impl Mode {
         matches!(self, Self::Hmx | Self::HmxBatch4 | Self::HmxBatch10)
     }
 
+    const fn is_native_q2(self) -> bool {
+        matches!(self, Self::NativeQ2 { .. })
+    }
+
     const fn batch_operations(self) -> u32 {
         match self {
-            Self::Guarded | Self::Hmx => 1,
+            Self::Guarded | Self::Hmx | Self::NativeQ2 { .. } => 1,
             Self::HmxBatch4 => 4,
             Self::HmxBatch10 => 10,
         }
@@ -94,6 +121,7 @@ impl Mode {
             Self::Hmx => hmx_projection::layout(rows).allocation,
             Self::HmxBatch4 => hmx_projection::batch_layout(rows).allocation,
             Self::HmxBatch10 => hmx_projection::batch10_layout(rows).allocation,
+            Self::NativeQ2 { columns } => native_q2::layout(columns, rows).allocation,
         }
     }
 }
@@ -218,6 +246,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => {
             hmx_projection::start_wire(queue_id, allocation_bytes)?
         }
+        Mode::NativeQ2 { .. } => native_q2::start_wire(queue_id, allocation_bytes)?,
     };
     let mut argument = RemoteBuffer {
         pointer: start.as_mut_ptr().cast(),
@@ -250,6 +279,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
             limits,
             mode,
             resident_weights: HmxQ2WeightRegistry::new(resident_weight_bytes)?,
+            native_resident_weights: NativeQ2WeightRegistry::new(resident_weight_bytes)?,
             work_deadline,
             progress: &mut progress,
             failed: false,
@@ -309,6 +339,7 @@ struct Session<'a, P> {
     limits: Q2ProjectionLimits,
     mode: Mode,
     resident_weights: HmxQ2WeightRegistry,
+    native_resident_weights: NativeQ2WeightRegistry,
     work_deadline: Instant,
     progress: &'a mut P,
     failed: bool,
@@ -401,12 +432,19 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
 enum Activation<'a> {
     Guarded(&'a [[f32; 256]; 2]),
     Hmx(&'a [[f32; 128]; 8]),
+    NativeQ2(&'a [f32]),
 }
 
 #[derive(Clone, Copy)]
 enum Weights<'a> {
     Transient(&'a [u8]),
     Resident(&'a HmxQ2WeightHandle),
+    NativeTransient {
+        columns: usize,
+        rows: usize,
+        bytes: &'a [u8],
+    },
+    NativeResident(&'a NativeQ2WeightHandle),
 }
 
 #[derive(Clone, Copy)]
@@ -455,6 +493,46 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                     )
                 })
                 .map(|()| handle.rows()),
+            (
+                Weights::NativeTransient {
+                    columns,
+                    rows,
+                    bytes,
+                },
+                Activation::NativeQ2(values),
+                Mode::NativeQ2 {
+                    columns: max_columns,
+                },
+            ) => native_q2::validate_inputs(
+                max_columns,
+                self.limits.rows,
+                columns,
+                rows,
+                bytes,
+                values,
+                output.len(),
+            )
+            .map(|()| rows),
+            (
+                Weights::NativeResident(handle),
+                Activation::NativeQ2(values),
+                Mode::NativeQ2 {
+                    columns: max_columns,
+                },
+            ) => self
+                .native_resident_weights
+                .range(handle)
+                .and_then(|_| {
+                    native_q2::validate_activation(
+                        max_columns,
+                        self.limits.rows,
+                        handle.columns(),
+                        handle.rows(),
+                        values,
+                        output.len(),
+                    )
+                })
+                .map(|()| handle.rows()),
             _ => Err(Error::Contract),
         };
         let Ok(rows) = rows else {
@@ -497,6 +575,32 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 handle,
                 values,
             ),
+            (
+                Weights::NativeTransient {
+                    columns,
+                    rows: active_rows,
+                    bytes,
+                },
+                Activation::NativeQ2(values),
+            ) => native_q2::image(
+                &mut image[..working_bytes],
+                base,
+                self.expected.fd,
+                columns,
+                active_rows,
+                bytes,
+                values,
+            ),
+            (Weights::NativeResident(handle), Activation::NativeQ2(values)) => {
+                native_q2::image_resident(
+                    image,
+                    base,
+                    self.expected.fd,
+                    working_bytes,
+                    handle,
+                    values,
+                )
+            }
             _ => Err(Error::Contract),
         };
         let Ok(active) = active else {
@@ -510,7 +614,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         self.report.queue.numeric_validated = false;
         self.report.operations_submitted += 1;
         self.report.queue_writes_submitted += 1;
-        if matches!(weights, Weights::Resident(_)) {
+        if matches!(weights, Weights::Resident(_) | Weights::NativeResident(_)) {
             self.report.resident_submissions += 1;
         }
         self.report.queue.compute_submitted = true;
@@ -539,6 +643,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         let output_valid = match self.mode {
             Mode::Guarded => projection::output_valid(bytes),
             Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => hmx_projection::output_valid(bytes),
+            Mode::NativeQ2 { .. } => native_q2::output_valid(bytes),
         };
         if !output_valid {
             return Err(self.fail("projection-numeric-refused-pinned"));
@@ -879,6 +984,109 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
     }
 }
 
+impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
+    fn remaining_operations(&self) -> Option<u64> {
+        Some(if self.failed {
+            0
+        } else {
+            u64::from(
+                self.limits
+                    .operations
+                    .saturating_sub(self.report.operations_submitted),
+            )
+        })
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        if self.failed || !self.mode.is_native_q2() {
+            0
+        } else {
+            self.native_resident_weights.remaining_bytes()
+        }
+    }
+
+    fn prepare_weights(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        let Mode::NativeQ2 {
+            columns: max_columns,
+        } = self.mode
+        else {
+            return Err(self.fail("projection-resident-owner-refused-pinned"));
+        };
+        if self.failed {
+            return Err(self.fail("projection-resident-owner-refused-pinned"));
+        }
+        if !self.within_deadline() {
+            return Err(Error::Contract);
+        }
+        if native_q2::validate_weights(max_columns, self.limits.rows, columns, rows, weights)
+            .is_err()
+        {
+            return Err(self.fail("projection-resident-input-refused-pinned"));
+        }
+        let handle = match self.native_resident_weights.prepare(columns, rows, weights) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
+        };
+        let range = self.native_resident_weights.range(&handle)?;
+        let offset = self.mode.allocation_bytes(self.limits.rows) + range.start;
+        // SAFETY: this fresh append-only reservation is inside the explicitly
+        // admitted allocation. No queued consumer remains after a validated
+        // previous operation. No existing immutable reservation is overwritten,
+        // and the temporary exclusive slice ends before exposing its handle.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.memory.cast::<u8>().wrapping_add(offset),
+                weights.len(),
+            )
+        };
+        destination.copy_from_slice(weights);
+        self.report.resident_weight_bytes_prepared += weights.len();
+        self.report.resident_weight_preparations += 1;
+        if !self.within_deadline() {
+            return Err(Error::Contract);
+        }
+        Ok(Some(handle))
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.submit_inner(
+            Weights::NativeResident(handle),
+            Activation::NativeQ2(activation),
+            output,
+        )
+    }
+
+    fn submit(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.submit_inner(
+            Weights::NativeTransient {
+                columns,
+                rows,
+                bytes: weights,
+            },
+            Activation::NativeQ2(activation),
+            output,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,6 +1305,7 @@ mod tests {
                 limits,
                 mode: Mode::Guarded,
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
+                native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -1205,6 +1414,7 @@ mod tests {
                 limits: limits.common,
                 mode: Mode::Hmx,
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
+                native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -1312,6 +1522,7 @@ mod tests {
                 limits: limits.common,
                 mode: Mode::Hmx,
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+                native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -1442,6 +1653,7 @@ mod tests {
                 limits: limits.common,
                 mode: Mode::HmxBatch4,
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+                native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -1570,6 +1782,7 @@ mod tests {
                 limits: limits.common,
                 mode: Mode::HmxBatch10,
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+                native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,

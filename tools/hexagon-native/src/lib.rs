@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 mod compute;
 mod hmx_projection;
+mod htp_ops;
+mod native_q2;
 mod power;
 mod projection;
 mod session;
@@ -30,6 +32,15 @@ pub use hmx_projection::{
     HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES, HMX_Q2_POWER_MODE_BURST, HMX_Q2_VTCM_REQUEST_BYTES,
     HmxQ2ProjectionLimits, HmxQ2ProjectionReport, HmxQ2Submitter, HmxQ2WeightHandle,
     HmxQ2WeightRegistry,
+};
+pub use htp_ops::{
+    HtpOpCode, HtpOpPassFlags, htp_fastdiv, solve_binary_kparams, solve_glu_kparams,
+    solve_unary_kparams,
+};
+pub use native_q2::{
+    NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_ROWS, NATIVE_Q2_VTCM_REQUEST_BYTES,
+    NativeQ2ProjectionLimits, NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2WeightHandle,
+    NativeQ2WeightRegistry,
 };
 pub use power::{PowerStatus, power_status};
 pub use projection::{
@@ -664,6 +675,41 @@ impl Driver {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             windows::reference_hmx_q2_projection(
+                self.inner,
+                package_directory,
+                limits,
+                progress,
+                work,
+            )
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, limits, progress, work);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    /// Execute full-`K` 1-op native `HTP_TYPE_Q2_0` operations through one X2 session.
+    ///
+    /// Uses the same retained signed-package/catalog, source-bound ABI, driver,
+    /// child-environment and external process-deadline prerequisites as
+    /// [`Self::reference_q2_projection`]. The session requests 8 HVX workers,
+    /// 2 MiB VTCM and burst power mode, executing a full `K <= 5120`, `M <= 17408`
+    /// (`N = 1`) projection in a single DSP operation (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`).
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms and the guarded bridge's path, identity,
+    /// deployment and lifetime prerequisites; native refusal remains observable.
+    pub fn reference_native_q2_projection(
+        self,
+        package_directory: &Path,
+        limits: NativeQ2ProjectionLimits,
+        progress: impl FnMut(&NativeQ2ProjectionReport),
+        work: impl FnOnce(&mut dyn NativeQ2Submitter) -> Result<(), Error>,
+    ) -> Result<NativeQ2ProjectionReport, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::reference_native_q2_projection(
                 self.inner,
                 package_directory,
                 limits,

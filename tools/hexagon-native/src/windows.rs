@@ -59,6 +59,20 @@ pub(super) fn reference_hmx_q2_projection(
     compute_native::hmx_projection(driver, package, limits, progress, work)
 }
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe crate root consumes the native driver"
+)]
+pub(super) fn reference_native_q2_projection(
+    driver: Driver,
+    package: &Path,
+    limits: crate::NativeQ2ProjectionLimits,
+    progress: impl FnMut(&crate::NativeQ2ProjectionReport),
+    work: impl FnOnce(&mut dyn crate::NativeQ2Submitter) -> Result<(), Error>,
+) -> Result<crate::NativeQ2ProjectionReport, Error> {
+    compute_native::native_q2_projection(driver, package, limits, progress, work)
+}
+
 type Handle = *mut c_void;
 type Control = unsafe extern "C" fn(u32, *mut c_void, u32) -> i32;
 

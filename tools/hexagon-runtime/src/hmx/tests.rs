@@ -10,8 +10,10 @@ use super::*;
 #[derive(Default)]
 struct CpuSubmitter {
     calls: usize,
+    batch_calls: usize,
     fail: bool,
     partial: bool,
+    fail_member: Option<usize>,
 }
 
 #[allow(
@@ -53,6 +55,33 @@ impl HmxQ2Submitter for CpuSubmitter {
                 }
                 output[plane * rows + row] = dot as f32;
             }
+        }
+        Ok(())
+    }
+
+    fn submit_batch4(
+        &mut self,
+        weights: [&[u8]; 4],
+        activations: [&[[f32; 128]; 8]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), Error> {
+        self.batch_calls += 1;
+        if self.fail {
+            return Err(Error::Contract);
+        }
+        for (member, ((weight, activation), output)) in weights
+            .into_iter()
+            .zip(activations)
+            .zip(outputs)
+            .enumerate()
+        {
+            let saved_partial = self.partial;
+            if self.fail_member == Some(member) {
+                self.partial = true;
+            }
+            let result = self.submit(weight, activation, output);
+            self.partial = saved_partial;
+            result?;
         }
         Ok(())
     }
@@ -229,6 +258,8 @@ struct ResidentSubmitter {
     preparations: usize,
     resident_calls: usize,
     streaming_calls: usize,
+    resident_batch_calls: usize,
+    streaming_batch_calls: usize,
     refuse_preparation: Option<usize>,
 }
 
@@ -241,6 +272,8 @@ impl ResidentSubmitter {
             preparations: 0,
             resident_calls: 0,
             streaming_calls: 0,
+            resident_batch_calls: 0,
+            streaming_batch_calls: 0,
             refuse_preparation: None,
         })
     }
@@ -288,6 +321,43 @@ impl HmxQ2Submitter for ResidentSubmitter {
     ) -> std::result::Result<(), Error> {
         self.streaming_calls += 1;
         self.oracle.submit(weights, activation, output)
+    }
+
+    fn submit_batch4(
+        &mut self,
+        weights: [&[u8]; 4],
+        activations: [&[[f32; 128]; 8]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), Error> {
+        self.streaming_batch_calls += 1;
+        self.streaming_calls += 4;
+        self.oracle.submit_batch4(weights, activations, outputs)
+    }
+
+    fn submit_resident_batch4(
+        &mut self,
+        handles: [&HmxQ2WeightHandle; 4],
+        activations: [&[[f32; 128]; 8]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), Error> {
+        self.resident_batch_calls += 1;
+        self.resident_calls += 4;
+        let ranges = [
+            self.registry.range(handles[0])?,
+            self.registry.range(handles[1])?,
+            self.registry.range(handles[2])?,
+            self.registry.range(handles[3])?,
+        ];
+        self.oracle.submit_batch4(
+            [
+                &self.arena[ranges[0].clone()],
+                &self.arena[ranges[1].clone()],
+                &self.arena[ranges[2].clone()],
+                &self.arena[ranges[3].clone()],
+            ],
+            activations,
+            outputs,
+        )
     }
 }
 
@@ -486,6 +556,125 @@ fn hmx_resident_unwritten_output_and_native_refusal_close_without_replay() -> Re
         drop(executor);
         assert_eq!(submitter.resident_calls, 1);
         assert_eq!(submitter.streaming_calls, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn hmx_batch4_streaming_and_resident_preserve_exact_outputs_and_queue_write_counts() -> Result<()> {
+    for (columns, rows) in [(512, 1), (1024, 35), (512, 64)] {
+        let tensor = fixture(columns, rows);
+        let input: Vec<_> = (0..columns)
+            .map(|lane| [127.0, -128.0, 0.1, -0.0, 53.25][lane % 5])
+            .collect();
+        for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+            let mut expected = Vec::new();
+            matvec_into(
+                &tensor,
+                &input,
+                &mut expected,
+                &mut MatvecScratch::with_backend(backend),
+            )?;
+            for tile_rows in [32, 64] {
+                let operations = columns / 128 * rows.div_ceil(tile_rows);
+                let writes = operations / 4;
+                let packed_bytes = columns / 128 * rows.next_multiple_of(32) * 36;
+                let limits = HmxQ2ProjectionLimits::new(tile_rows, 100, Duration::from_secs(10))?
+                    .with_batch_four()?;
+                let mut submitter = CpuSubmitter::default();
+                let mut executor = HmxQ2Executor::new(&mut submitter, limits, 1 << 20);
+                assert_eq!(
+                    executor.identity(),
+                    "hexagon-hmx-binary-pq2-q8k-batch4-v1-experimental"
+                );
+                assert!(!executor.supports(&fixture(256, 1)));
+                let mut actual = Vec::new();
+                MatvecScratch::with_backend(backend)
+                    .prepare(&tensor, &input)?
+                    .matvec_with_executor(&tensor, &mut actual, &mut executor)?;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    executor.statistics().operations_completed,
+                    u64::try_from(operations)?
+                );
+                assert_eq!(executor.queue_writes_attempted(), u64::try_from(writes)?);
+                assert_eq!(executor.queue_writes_completed(), u64::try_from(writes)?);
+                drop(executor);
+                assert_eq!(submitter.batch_calls, writes);
+
+                let mut resident_submitter = ResidentSubmitter::new(packed_bytes)?;
+                let mut resident_executor =
+                    HmxQ2Executor::new(&mut resident_submitter, limits, 1 << 20)
+                        .with_resident_weights(16_384)?;
+                assert_eq!(
+                    resident_executor.identity(),
+                    "hexagon-hmx-binary-pq2-q8k-resident-batch4-v1-experimental"
+                );
+                for _ in 0..2 {
+                    let mut resident_actual = Vec::new();
+                    MatvecScratch::with_backend(backend)
+                        .prepare(&tensor, &input)?
+                        .matvec_with_executor(
+                            &tensor,
+                            &mut resident_actual,
+                            &mut resident_executor,
+                        )?;
+                    assert_eq!(
+                        resident_actual
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                }
+                assert_eq!(resident_executor.residency_statistics().tensors_prepared, 1);
+                assert_eq!(resident_executor.residency_statistics().cache_hits, 1);
+                assert_eq!(
+                    resident_executor.statistics().operations_completed,
+                    u64::try_from(operations * 2)?
+                );
+                assert_eq!(
+                    resident_executor.queue_writes_completed(),
+                    u64::try_from(writes * 2)?
+                );
+                drop(resident_executor);
+                assert_eq!(resident_submitter.preparations, operations);
+                assert_eq!(resident_submitter.resident_batch_calls, writes * 2);
+                assert_eq!(resident_submitter.streaming_batch_calls, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hmx_batch4_member_failure_rejects_whole_batch_without_partial_completion() -> Result<()> {
+    for member in 0..4 {
+        let tensor = fixture(512, 1);
+        let limits =
+            HmxQ2ProjectionLimits::new(32, 16, Duration::from_secs(10))?.with_batch_four()?;
+        let mut submitter = CpuSubmitter {
+            fail_member: Some(member),
+            ..Default::default()
+        };
+        let mut executor = HmxQ2Executor::new(&mut submitter, limits, 1 << 20);
+        let mut scratch = MatvecScratch::default();
+        let mut prepared = scratch.prepare(&tensor, &[1.0; 512])?;
+        let mut output = vec![42.0];
+        assert!(
+            prepared
+                .matvec_with_executor(&tensor, &mut output, &mut executor)
+                .is_err()
+        );
+        assert_eq!(output, Vec::<f32>::new());
+        assert!(executor.is_faulted());
+        assert_eq!(executor.statistics().operations_attempted, 4);
+        assert_eq!(executor.statistics().operations_completed, 0);
+        assert_eq!(executor.queue_writes_attempted(), 1);
+        assert_eq!(executor.queue_writes_completed(), 0);
     }
     Ok(())
 }

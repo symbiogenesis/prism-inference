@@ -187,6 +187,8 @@ struct Request {
     #[serde(default)]
     resident_host_weights: bool,
     #[serde(default)]
+    batch_four_operations: bool,
+    #[serde(default)]
     adapter_path: Option<PathBuf>,
     #[serde(default)]
     adapter_case: AdapterCase,
@@ -238,6 +240,9 @@ impl Request {
                 && self.maximum_operations >= u32::try_from(tokens.len())? * 40
                 && (!self.resident_host_weights
                     || self.execution_backend == ExecutionBackend::HmxBitplane)
+                && (!self.batch_four_operations
+                    || (self.execution_backend == ExecutionBackend::HmxBitplane
+                        && self.maximum_operations.is_multiple_of(4)))
                 && self.adapter_path.is_some() == self.adapter_case.loaded()
                 && self.cpu_backend.available()
                 && matches!(self.row_workers, 1 | 4)
@@ -717,6 +722,51 @@ impl HmxQ2Submitter for CheckedHmxSubmitter<'_> {
         }
         result
     }
+
+    fn submit_batch4(
+        &mut self,
+        weights: [&[u8]; 4],
+        activations: [&[[f32; 128]; 8]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), Error> {
+        if self.failed {
+            for output in outputs {
+                output.fill(f32::NAN);
+            }
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let [out0, out1, out2, out3] = outputs;
+        let result = (|| {
+            timed(&self.timings.native, || {
+                self.native
+                    .submit_batch4(weights, activations, [out0, out1, out2, out3])
+            })?;
+            let count = timed(&self.timings.oracle, || -> Result<u64> {
+                let mut total = 0_u64;
+                for ((weight, activation), output) in weights
+                    .into_iter()
+                    .zip(activations)
+                    .zip([&*out0, &*out1, &*out2, &*out3])
+                {
+                    let member_count = compare_planes(weight, activation, output)?;
+                    total = total.checked_add(member_count).ok_or_else(reject)?;
+                }
+                Ok(total)
+            })
+            .map_err(|_| Error::Contract)?;
+            self.compared = self.compared.checked_add(count).ok_or(Error::Contract)?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            self.failed = false;
+        } else {
+            for output in [out0, out1, out2, out3] {
+                output.fill(f32::NAN);
+            }
+        }
+        result
+    }
 }
 
 /// Resident timing mode checks complete graph parity instead of replaying dots.
@@ -781,6 +831,34 @@ impl HmxQ2Submitter for TimedHmxSubmitter<'_> {
         result
     }
 
+    fn submit_resident_batch4(
+        &mut self,
+        handles: [&HmxQ2WeightHandle; 4],
+        activations: [&[[f32; 128]; 8]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), Error> {
+        if self.failed {
+            for output in outputs {
+                output.fill(f32::NAN);
+            }
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let [out0, out1, out2, out3] = outputs;
+        let result = timed(&self.timings.native, || {
+            self.native
+                .submit_resident_batch4(handles, activations, [out0, out1, out2, out3])
+        });
+        if result.is_ok() {
+            self.failed = false;
+        } else {
+            for output in [out0, out1, out2, out3] {
+                output.fill(f32::NAN);
+            }
+        }
+        result
+    }
+
     fn submit(
         &mut self,
         _: &[u8],
@@ -789,6 +867,19 @@ impl HmxQ2Submitter for TimedHmxSubmitter<'_> {
     ) -> std::result::Result<(), Error> {
         self.failed = true;
         output.fill(f32::NAN);
+        Err(Error::Contract)
+    }
+
+    fn submit_batch4(
+        &mut self,
+        _: [&[u8]; 4],
+        _: [&[[f32; 128]; 8]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), Error> {
+        self.failed = true;
+        for output in outputs {
+            output.fill(f32::NAN);
+        }
         Err(Error::Contract)
     }
 }
@@ -921,8 +1012,11 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
         let progress = |report: &hexagon_native_rpc::Q2ProjectionReport| {
             if emit(
                 &json!({"event":"native-progress", "stage":report.queue.stage,
+                "batchOperations":report.batch_operations,
                 "operationsSubmitted":report.operations_submitted,
-                "operationsCompleted":report.operations_completed}),
+                "operationsCompleted":report.operations_completed,
+                "queueWritesSubmitted":report.queue_writes_submitted,
+                "queueWritesCompleted":report.queue_writes_completed}),
             )
             .is_err()
             {
@@ -981,6 +1075,9 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                     request.maximum_operations,
                     Duration::from_secs(request.session_seconds),
                 )?;
+                if request.batch_four_operations {
+                    hmx_limits = hmx_limits.with_batch_four()?;
+                }
                 if request.resident_host_weights {
                     hmx_limits = hmx_limits.with_resident_weights(RESIDENT_WEIGHT_BYTES)?;
                 }
@@ -990,13 +1087,15 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                     progress,
                     |native| {
                         let work = (|| -> Result<()> {
+                            let expected_writes = u64::try_from(request.tokens().len())?
+                                * if request.batch_four_operations { 10 } else { 40 };
                             if request.resident_host_weights {
                                 let mut timed = TimedHmxSubmitter {
                                     native,
                                     timings: &submit_timings,
                                     failed: false,
                                 };
-                                let (mut value, statistics, residency) = {
+                                let (mut value, statistics, residency, writes_attempted, writes_completed) = {
                                     let mut executor = HmxQ2Executor::new(
                                         &mut timed,
                                         hmx_limits,
@@ -1011,9 +1110,19 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                         &parent,
                                         &submit_timings,
                                     )?;
-                                    (value, executor.statistics(), executor.residency_statistics())
+                                    (
+                                        value,
+                                        executor.statistics(),
+                                        executor.residency_statistics(),
+                                        executor.queue_writes_attempted(),
+                                        executor.queue_writes_completed(),
+                                    )
                                 };
                                 check_statistics(statistics, 0, timed.failed, request)?;
+                                require(
+                                    writes_attempted == expected_writes
+                                        && writes_completed == expected_writes,
+                                )?;
                                 require(residency.tensors_prepared == 1
                                     && residency.cache_hits == u64::try_from(request.tokens().len() - 1)?
                                     && residency.weight_payload_bytes_prepared == u64::try_from(RESIDENT_WEIGHT_BYTES)?
@@ -1032,7 +1141,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                 compared: 0,
                                 failed: false,
                             };
-                            let (value, statistics) = {
+                            let (value, statistics, writes_attempted, writes_completed) = {
                                 let mut executor = HmxQ2Executor::new(
                                     &mut checked,
                                     hmx_limits,
@@ -1047,13 +1156,22 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                     &parent,
                                     &submit_timings,
                                 )?;
-                                (value, executor.statistics())
+                                (
+                                    value,
+                                    executor.statistics(),
+                                    executor.queue_writes_attempted(),
+                                    executor.queue_writes_completed(),
+                                )
                             };
                             check_statistics(
                                 statistics,
                                 checked.compared,
                                 checked.failed,
                                 request,
+                            )?;
+                            require(
+                                writes_attempted == expected_writes
+                                    && writes_completed == expected_writes,
                             )?;
                             accept(value, statistics, checked.compared)
                         })();
@@ -1074,6 +1192,13 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
         report.is_hmx_bitplane_control()
             == (request.execution_backend == ExecutionBackend::HmxBitplane),
     )?;
+    let expected_batch = if request.batch_four_operations { 4 } else { 1 };
+    let expected_writes = u32::try_from(request.tokens().len())? * (40 / expected_batch);
+    require(
+        report.batch_operations == expected_batch
+            && report.queue_writes_submitted == expected_writes
+            && report.queue_writes_completed == expected_writes,
+    )?;
     let mut value = result.ok_or_else(reject)?;
     value["event"] = json!("result");
     value["schemaVersion"] = json!(1);
@@ -1086,6 +1211,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["tokenIds"] = json!(request.tokens());
     value["executionBackend"] = json!(request.execution_backend.name());
     value["residentHostWeights"] = json!(request.resident_host_weights);
+    value["batchFourOperations"] = json!(request.batch_four_operations);
     value["integerAudit"] = json!(if request.resident_host_weights {
         "graph-parity-only"
     } else {
@@ -1120,8 +1246,11 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["cpuPowerAfter"] = cpu_power_after;
     value["npuPowerBefore"] = npu_power_before;
     value["nativeCompletedCycle"] = json!(true);
+    value["nativeBatchOperations"] = json!(report.batch_operations);
     value["nativeOperationsSubmitted"] = json!(report.operations_submitted);
     value["nativeOperationsCompleted"] = json!(report.operations_completed);
+    value["nativeQueueWritesSubmitted"] = json!(report.queue_writes_submitted);
+    value["nativeQueueWritesCompleted"] = json!(report.queue_writes_completed);
     value["nativeStage"] = json!(report.queue.stage);
     value["nativeCleanup"] = json!({
         "queueStopResult":report.queue.queue_stop_result,
@@ -1495,6 +1624,76 @@ mod tests {
         ) -> std::result::Result<(), Error> {
             self.submit(&[], activation, output)
         }
+
+        fn submit_batch4(
+            &mut self,
+            _: [&[u8]; 4],
+            _: [&[[f32; 128]; 8]; 4],
+            outputs: [&mut [f32]; 4],
+        ) -> std::result::Result<(), Error> {
+            self.calls.set(self.calls.get() + 1);
+            for output in outputs {
+                output.fill(if self.wrong { 1.0 } else { 0.0 });
+            }
+            if self.fail {
+                Err(Error::Contract)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn submit_resident_batch4(
+            &mut self,
+            _: [&HmxQ2WeightHandle; 4],
+            activations: [&[[f32; 128]; 8]; 4],
+            outputs: [&mut [f32]; 4],
+        ) -> std::result::Result<(), Error> {
+            self.submit_batch4([&[], &[], &[], &[]], activations, outputs)
+        }
+    }
+
+    #[test]
+    fn model_probe_batch4_requires_hmx_backend_and_checks_all_four_members() -> Result<()> {
+        let mut value = request();
+        value["batchFourOperations"] = json!(true);
+        assert!(
+            serde_json::from_value::<Request>(value.clone())?
+                .limits()
+                .is_err()
+        );
+        value["executionBackend"] = json!("hmx-bitplane");
+        serde_json::from_value::<Request>(value.clone())?.limits()?;
+        value["maximumOperations"] = json!(42);
+        assert!(serde_json::from_value::<Request>(value)?.limits().is_err());
+
+        let calls = Rc::new(Cell::new(0));
+        let mut native = HmxSubmitter {
+            calls: calls.clone(),
+            fail: false,
+            wrong: false,
+        };
+        let timings = SubmitTimings::default();
+        let mut checked = CheckedHmxSubmitter {
+            native: &mut native,
+            timings: &timings,
+            compared: 0,
+            failed: false,
+        };
+        let weights = zero_hmx_weights(32);
+        let activation = [[1.0; 128]; 8];
+        let mut out0 = [f32::NAN; 256];
+        let mut out1 = [f32::NAN; 256];
+        let mut out2 = [f32::NAN; 256];
+        let mut out3 = [f32::NAN; 256];
+        checked.submit_batch4(
+            [&weights, &weights, &weights, &weights],
+            [&activation, &activation, &activation, &activation],
+            [&mut out0, &mut out1, &mut out2, &mut out3],
+        )?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(checked.compared, 1024);
+        assert!(!checked.failed);
+        Ok(())
     }
 
     #[test]

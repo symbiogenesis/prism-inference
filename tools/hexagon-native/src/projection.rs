@@ -119,7 +119,13 @@ pub trait GuardedQ2Submitter {
 pub struct Q2ProjectionReport {
     /// Exact native setup, latest queue operation and explicit cleanup receipts.
     pub queue: QueueComputeReport,
-    /// Number of writes attempted, including a refused/uncertain final write.
+    /// Logical operations carried in each queue packet (1 or 4).
+    pub batch_operations: u32,
+    /// Number of queue packet writes attempted, including a refused/uncertain final write.
+    pub queue_writes_submitted: u32,
+    /// Correlated queue packet replies validated synchronously.
+    pub queue_writes_completed: u32,
+    /// Number of logical operations attempted, including a refused/uncertain final write.
     pub operations_submitted: u32,
     /// Correlated, integer-validated operations returned synchronously.
     pub operations_completed: u32,
@@ -145,6 +151,9 @@ impl Q2ProjectionReport {
                 metadata,
                 compute::ComputeFixture::GuardedQ2NoBlock,
             ),
+            batch_operations: 1,
+            queue_writes_submitted: 0,
+            queue_writes_completed: 0,
             operations_submitted: 0,
             operations_completed: 0,
             mapped_allocation_bytes: 0,
@@ -168,8 +177,15 @@ impl Q2ProjectionReport {
     pub const fn completed_cycle(self) -> bool {
         self.work_completed
             && !self.deadline_expired
+            && matches!(self.batch_operations, 1 | 4)
+            && self.queue_writes_submitted > 0
+            && self.queue_writes_submitted == self.queue_writes_completed
             && self.operations_submitted > 0
             && self.operations_submitted == self.operations_completed
+            && self.operations_submitted
+                == self
+                    .queue_writes_submitted
+                    .saturating_mul(self.batch_operations)
             && self.queue.completed_cycle()
     }
 }
@@ -200,14 +216,39 @@ pub(crate) fn request(sequence: u64) -> [u8; compute::COMPUTE_REQUEST_BYTES] {
     result
 }
 
+pub(crate) fn request_batch(
+    sequence: u64,
+    batch_operations: u32,
+) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
+    if !matches!(batch_operations, 1 | 4) {
+        return Err(Error::Contract);
+    }
+    let mut result = request(sequence);
+    put32(&mut result, 12, batch_operations * 3);
+    put32(&mut result, 16, batch_operations);
+    Ok(result)
+}
+
+#[cfg(test)]
 pub(crate) fn response_valid(bytes: &[u8], sequence: u64) -> bool {
-    if sequence == 0 || bytes.len() != compute::COMPUTE_RESPONSE_BYTES {
+    response_batch_valid(bytes, sequence, 1)
+}
+
+pub(crate) fn response_batch_valid(bytes: &[u8], sequence: u64, batch_operations: u32) -> bool {
+    if !matches!(batch_operations, 1 | 4)
+        || sequence == 0
+        || bytes.len() != compute::COMPUTE_RESPONSE_BYTES
+    {
         return false;
     }
     let mut fixed = [0; compute::COMPUTE_RESPONSE_BYTES];
     fixed.copy_from_slice(bytes);
-    let correlated = fixed[..8] == sequence.to_le_bytes();
+    let correlated = fixed[..8] == sequence.to_le_bytes()
+        && fixed[32..36] == (batch_operations * 3).to_le_bytes()
+        && fixed[36..40] == batch_operations.to_le_bytes();
     fixed[..8].copy_from_slice(&1_u64.to_le_bytes());
+    fixed[32..36].copy_from_slice(&3_u32.to_le_bytes());
+    fixed[36..40].copy_from_slice(&1_u32.to_le_bytes());
     correlated && compute::response_valid(&fixed)
 }
 
@@ -364,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_validation_never_accepts_stale_reply() {
+    fn sequence_validation_never_accepts_stale_reply() -> Result<(), Error> {
         let mut bytes = [0; compute::COMPUTE_RESPONSE_BYTES];
         bytes[..8].copy_from_slice(&42_u64.to_le_bytes());
         for (offset, value) in [(24, 1_u32), (28, 1), (32, 3), (36, 1)] {
@@ -373,7 +414,22 @@ mod tests {
         assert!(response_valid(&bytes, 42));
         assert!(!response_valid(&bytes, 41));
         assert!(!response_valid(&bytes, 0));
+        assert!(!response_batch_valid(&bytes, 42, 4));
+        assert!(!response_batch_valid(&bytes, 42, 2));
         assert_eq!(&request(u64::MAX)[..8], &u64::MAX.to_le_bytes());
+        let batch_req = request_batch(7, 4)?;
+        assert_eq!(&batch_req[..8], &7_u64.to_le_bytes());
+        assert_eq!(
+            &batch_req[8..24],
+            &[1, 0, 0, 0, 12, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(request_batch(7, 2).is_err());
+        put32(&mut bytes, 32, 12);
+        put32(&mut bytes, 36, 4);
+        assert!(response_batch_valid(&bytes, 42, 4));
+        assert!(!response_batch_valid(&bytes, 41, 4));
+        assert!(!response_valid(&bytes, 42));
+        Ok(())
     }
 
     #[test]

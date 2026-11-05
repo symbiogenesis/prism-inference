@@ -302,49 +302,59 @@ impl<'a> HmxQ2Executor<'a> {
                         }
                     }
                     operation += 4;
-                    for &value in batch_dots.iter() {
-                        if !value.is_finite()
-                            || value.fract() != 0.0
-                            || !(-128.0..=256.0).contains(&value)
-                        {
-                            return Err(invalid("invalid Hexagon HMX plane result"));
-                        }
-                    }
                     for member in 0..4 {
                         let member_dots =
                             &batch_dots[member * mapped_rows * 8..(member + 1) * mapped_rows * 8];
                         for row in active_rows..mapped_rows {
-                            if (0..8).any(|plane| member_dots[plane * mapped_rows + row] != 0.0) {
-                                return Err(invalid("Hexagon HMX padding output changed"));
+                            for plane in 0..8 {
+                                match valid_plane_dot(member_dots[plane * mapped_rows + row]) {
+                                    Some(0) => {}
+                                    Some(_) => {
+                                        return Err(invalid("Hexagon HMX padding output changed"));
+                                    }
+                                    None => {
+                                        return Err(invalid("invalid Hexagon HMX plane result"));
+                                    }
+                                }
                             }
                         }
                     }
-                    for member in 0..4 {
-                        let block_index = block_base + member;
-                        let quantized = &activation[block_index / 2];
-                        let member_dots =
-                            &batch_dots[member * mapped_rows * 8..(member + 1) * mapped_rows * 8];
-                        for row in 0..active_rows {
+                    let first_scale = activation[block_base / 2].scale;
+                    let second_scale = activation[block_base / 2 + 1].scale;
+                    let member_scales = [first_scale, first_scale, second_scale, second_scale];
+                    let member_stride = mapped_rows * 8;
+                    for (row, target) in pending[row_start..row_start + active_rows]
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        let row_block_base = (row_start + row) * blocks + block_base;
+                        let mut accumulated = *target;
+                        for (member, &quantized_scale) in member_scales.iter().enumerate() {
+                            let member_base = member * member_stride + row;
                             let mut integer = 0_i32;
                             for plane in 0..8 {
+                                let Some(dot) =
+                                    valid_plane_dot(batch_dots[member_base + plane * mapped_rows])
+                                else {
+                                    return Err(invalid("invalid Hexagon HMX plane result"));
+                                };
                                 let coefficient = if plane == 7 { -128 } else { 1 << plane };
-                                integer +=
-                                    coefficient * member_dots[plane * mapped_rows + row] as i32;
+                                integer += coefficient * dot;
                             }
                             if !(-32768..=32768).contains(&integer) {
                                 return Err(invalid(
                                     "Hexagon HMX reconstructed dot is out of range",
                                 ));
                             }
-                            let index = ((row_start + row) * blocks + block_index) * 34;
-                            let factor = scale(&tensor.data[index..index + 34])? * quantized.scale;
-                            let prior = pending[row_start + row];
-                            pending[row_start + row] = finite(if fused {
-                                factor.mul_add(integer as f32, prior)
+                            let index = (row_block_base + member) * 34;
+                            let factor = scale(&tensor.data[index..index + 34])? * quantized_scale;
+                            accumulated = finite(if fused {
+                                factor.mul_add(integer as f32, accumulated)
                             } else {
-                                prior + factor * integer as f32
+                                accumulated + factor * integer as f32
                             })?;
                         }
+                        *target = accumulated;
                     }
                     self.statistics.operations_completed =
                         self.statistics.operations_completed.saturating_add(4);
@@ -378,40 +388,46 @@ impl<'a> HmxQ2Executor<'a> {
                         self.submitter.submit(weights, &planes, dots)?;
                     }
                     operation += 1;
-                    for &value in dots.iter() {
-                        if !value.is_finite()
-                            || value.fract() != 0.0
-                            || !(-128.0..=256.0).contains(&value)
-                        {
-                            return Err(invalid("invalid Hexagon HMX plane result"));
-                        }
-                    }
                     for row in active_rows..mapped_rows {
-                        if (0..8).any(|plane| dots[plane * mapped_rows + row] != 0.0) {
-                            return Err(invalid("Hexagon HMX padding output changed"));
+                        for plane in 0..8 {
+                            match valid_plane_dot(dots[plane * mapped_rows + row]) {
+                                Some(0) => {}
+                                Some(_) => {
+                                    return Err(invalid("Hexagon HMX padding output changed"));
+                                }
+                                None => {
+                                    return Err(invalid("invalid Hexagon HMX plane result"));
+                                }
+                            }
                         }
                     }
-                    self.statistics.operations_completed =
-                        self.statistics.operations_completed.saturating_add(1);
-                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
-                    for row in 0..active_rows {
+                    for (row, target) in pending[row_start..row_start + active_rows]
+                        .iter_mut()
+                        .enumerate()
+                    {
                         let mut integer = 0_i32;
                         for plane in 0..8 {
+                            let Some(dot) = valid_plane_dot(dots[plane * mapped_rows + row]) else {
+                                return Err(invalid("invalid Hexagon HMX plane result"));
+                            };
                             let coefficient = if plane == 7 { -128 } else { 1 << plane };
-                            integer += coefficient * dots[plane * mapped_rows + row] as i32;
+                            integer += coefficient * dot;
                         }
                         if !(-32768..=32768).contains(&integer) {
                             return Err(invalid("Hexagon HMX reconstructed dot is out of range"));
                         }
                         let index = ((row_start + row) * blocks + block_index) * 34;
                         let factor = scale(&tensor.data[index..index + 34])? * quantized.scale;
-                        let prior = pending[row_start + row];
-                        pending[row_start + row] = finite(if fused {
+                        let prior = *target;
+                        *target = finite(if fused {
                             factor.mul_add(integer as f32, prior)
                         } else {
                             prior + factor * integer as f32
                         })?;
                     }
+                    self.statistics.operations_completed =
+                        self.statistics.operations_completed.saturating_add(1);
+                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
                 }
             }
         }
@@ -465,9 +481,27 @@ impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
     }
 }
 
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::float_cmp,
+    reason = "Exact i16 roundtrip validates finite integral plane dots in -128..=256 without per-value truncf calls."
+)]
+#[inline]
+fn valid_plane_dot(value: f32) -> Option<i32> {
+    let integer = value as i16;
+    (f32::from(integer) == value && (-128..=256).contains(&integer)).then_some(i32::from(integer))
+}
+
 fn activation_planes(codes: &[i8]) -> [[f32; 128]; 8] {
     std::array::from_fn(|bit| {
-        std::array::from_fn(|lane| f32::from((codes[lane].cast_unsigned() >> bit) & 1))
+        std::array::from_fn(|lane| {
+            if (codes[lane].cast_unsigned() >> bit) & 1 != 0 {
+                1.0
+            } else {
+                0.0
+            }
+        })
     })
 }
 

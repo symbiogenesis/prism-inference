@@ -18,7 +18,7 @@
 
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::{self, Read as _, Write as _},
@@ -183,6 +183,8 @@ struct Request {
     #[serde(default)]
     token_ids: Option<Vec<u32>>,
     #[serde(default)]
+    projections: Option<Vec<String>>,
+    #[serde(default)]
     execution_backend: ExecutionBackend,
     #[serde(default)]
     resident_host_weights: bool,
@@ -214,6 +216,20 @@ fn require(value: bool) -> Result<()> {
     if value { Ok(()) } else { Err(reject()) }
 }
 
+fn valid_projection_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return false;
+    };
+    let Some((index, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    !index.is_empty()
+        && index.len() <= 2
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && index.parse::<usize>().is_ok_and(|layer| layer < 64)
+        && matches!(suffix, "ffn_up.weight" | "ffn_gate.weight")
+}
+
 impl Request {
     fn tokens(&self) -> &[u32] {
         self.token_ids
@@ -221,8 +237,18 @@ impl Request {
             .unwrap_or_else(|| std::slice::from_ref(&self.token_id))
     }
 
+    fn projection_names(&self) -> Vec<&str> {
+        self.projections.as_ref().map_or_else(
+            || vec![PROJECTION],
+            |names| names.iter().map(String::as_str).collect(),
+        )
+    }
+
     fn limits(&self) -> Result<Q2ProjectionLimits> {
         let tokens = self.tokens();
+        let projections = self.projection_names();
+        let max_projections = if self.resident_host_weights { 2 } else { 4 };
+        let unique_projections: BTreeSet<&str> = projections.iter().copied().collect();
         require(
             self.schema_version == 1
                 && (1..=MAX_TOKENS).contains(&tokens.len())
@@ -230,6 +256,10 @@ impl Request {
                 && tokens.iter().all(|&token| {
                     usize::try_from(token).is_ok_and(|token| token < swift::VOCAB_SIZE)
                 })
+                && (1..=max_projections).contains(&projections.len())
+                && projections.first() == Some(&PROJECTION)
+                && unique_projections.len() == projections.len()
+                && projections.iter().all(|&name| valid_projection_name(name))
                 && (1..=16).contains(&self.context_limit)
                 && self.context_limit >= tokens.len()
                 && (swift::TENSOR_PAYLOAD_BYTES..=MODEL_MEMORY_LIMIT)
@@ -237,7 +267,7 @@ impl Request {
                 && (1..=bonsai_prism_runtime::graph::MAX_STATE_BYTES)
                     .contains(&self.state_budget_bytes)
                 && (1..=MAX_HOST_PAYLOAD).contains(&self.maximum_owned_payload_bytes)
-                && self.maximum_operations >= u32::try_from(tokens.len())? * 40
+                && self.maximum_operations >= u32::try_from(tokens.len() * projections.len())? * 40
                 && (!self.resident_host_weights
                     || self.execution_backend == ExecutionBackend::HmxBitplane)
                 && (!self.batch_four_operations
@@ -895,7 +925,8 @@ fn compare_graph_sequence(
     timings: &SubmitTimings,
 ) -> Result<Value> {
     require(controls.len() == request.tokens().len())?;
-    let mut placed = PlacedProjectionExecutor::new(executor, placement_model, &[PROJECTION])?;
+    let projections = request.projection_names();
+    let mut placed = PlacedProjectionExecutor::new(executor, placement_model, &projections)?;
     let mut projected = graph.with_projection_executor(&mut placed)?;
     // Reserve the complete sequence before the first submitted projection.
     projected.admit_work(0, request.tokens().len())?;
@@ -944,17 +975,19 @@ fn check_statistics(
     request: &Request,
 ) -> Result<()> {
     let tokens = u64::try_from(request.tokens().len())?;
+    let projections = u64::try_from(request.projection_names().len())?;
+    let total_projections = tokens * projections;
     require(
         !failed
             && compared
                 == if request.resident_host_weights {
                     0
                 } else {
-                    request.execution_backend.values_per_token() * tokens
+                    request.execution_backend.values_per_token() * total_projections
                 }
-            && statistics.projections_completed == tokens
-            && statistics.operations_completed == tokens * 40
-            && statistics.operations_attempted == tokens * 40,
+            && statistics.projections_completed == total_projections
+            && statistics.operations_completed == total_projections * 40
+            && statistics.operations_attempted == total_projections * 40,
     )
 }
 
@@ -965,6 +998,8 @@ fn check_statistics(
 )]
 fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     let limits = request.validate()?;
+    let projections = request.projection_names();
+    let projection_count = projections.len();
     let parent = bonsai_windows_process::ParentProcess::open(
         request.expected_parent_pid,
         request.expected_parent_creation_time,
@@ -973,15 +1008,19 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     emit(
         &json!({"event":"started", "schemaVersion":1, "requestSha256":request_sha256,
         "processId":std::process::id(), "modelSha256":swift::MODEL_SHA256,
-        "modelBytes":swift::MODEL_BYTES, "projection":PROJECTION}),
+        "modelBytes":swift::MODEL_BYTES, "projection":PROJECTION, "projections":projections}),
     )?;
     let (model, _) = swift::load(&request.model_path, request.model_memory_limit_bytes)?;
-    let selected = model.tensors.get(PROJECTION).ok_or_else(reject)?;
-    require(selected.kind == 142 && selected.dimensions == [5120, 17_408])?;
+    let mut selected_tensors = BTreeMap::new();
+    for &name in &projections {
+        let selected = model.tensors.get(name).ok_or_else(reject)?;
+        require(selected.kind == 142 && selected.dimensions == [5120, 17_408])?;
+        selected_tensors.insert(name.to_owned(), selected.clone());
+    }
     let shadow = shared_model(&model);
     let placement_model = Model {
         metadata: BTreeMap::default(),
-        tensors: [(PROJECTION.to_owned(), selected.clone())].into(),
+        tensors: selected_tensors,
         identity: model.identity.clone(),
     };
     // Shared serialized weights are never copied. The shadow graph is dropped
@@ -1070,6 +1109,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                 },
             ),
             ExecutionBackend::HmxBitplane => {
+                let resident_weight_bytes = RESIDENT_WEIGHT_BYTES * projection_count;
                 let mut hmx_limits = HmxQ2ProjectionLimits::new(
                     17_408,
                     request.maximum_operations,
@@ -1079,7 +1119,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                     hmx_limits = hmx_limits.with_batch_four()?;
                 }
                 if request.resident_host_weights {
-                    hmx_limits = hmx_limits.with_resident_weights(RESIDENT_WEIGHT_BYTES)?;
+                    hmx_limits = hmx_limits.with_resident_weights(resident_weight_bytes)?;
                 }
                 driver.reference_hmx_q2_projection(
                     &request.package_directory,
@@ -1087,8 +1127,9 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                     progress,
                     |native| {
                         let work = (|| -> Result<()> {
-                            let expected_writes = u64::try_from(request.tokens().len())?
-                                * if request.batch_four_operations { 10 } else { 40 };
+                            let expected_writes =
+                                u64::try_from(request.tokens().len() * projection_count)?
+                                    * if request.batch_four_operations { 10 } else { 40 };
                             if request.resident_host_weights {
                                 let mut timed = TimedHmxSubmitter {
                                     native,
@@ -1123,9 +1164,10 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                     writes_attempted == expected_writes
                                         && writes_completed == expected_writes,
                                 )?;
-                                require(residency.tensors_prepared == 1
-                                    && residency.cache_hits == u64::try_from(request.tokens().len() - 1)?
-                                    && residency.weight_payload_bytes_prepared == u64::try_from(RESIDENT_WEIGHT_BYTES)?
+                                let projections_u64 = u64::try_from(projection_count)?;
+                                require(residency.tensors_prepared == projections_u64
+                                    && residency.cache_hits == projections_u64 * u64::try_from(request.tokens().len() - 1)?
+                                    && residency.weight_payload_bytes_prepared == u64::try_from(resident_weight_bytes)?
                                     && (1..=RESIDENT_METADATA_BYTES).contains(&residency.metadata_payload_bytes))?;
                                 value["hostResidency"] = json!({
                                     "tensorsPrepared":residency.tensors_prepared,
@@ -1193,7 +1235,8 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
             == (request.execution_backend == ExecutionBackend::HmxBitplane),
     )?;
     let expected_batch = if request.batch_four_operations { 4 } else { 1 };
-    let expected_writes = u32::try_from(request.tokens().len())? * (40 / expected_batch);
+    let expected_writes =
+        u32::try_from(request.tokens().len() * projection_count)? * (40 / expected_batch);
     require(
         report.batch_operations == expected_batch
             && report.queue_writes_submitted == expected_writes
@@ -1207,6 +1250,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["modelSha256"] = json!(swift::MODEL_SHA256);
     value["modelBytes"] = json!(swift::MODEL_BYTES);
     value["projection"] = json!(PROJECTION);
+    value["projections"] = json!(projections);
     value["tokenId"] = json!(request.token_id);
     value["tokenIds"] = json!(request.tokens());
     value["executionBackend"] = json!(request.execution_backend.name());
@@ -1989,5 +2033,77 @@ mod tests {
         let failure: Result<()> = timed(&accumulated, || Err(reject()));
         assert!(failure.is_err());
         assert!(accumulated.get() >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn model_probe_multi_projection_admission_bounds_resident_arena_and_operations() -> Result<()> {
+        let mut two_proj = request();
+        two_proj["tokenIds"] = json!([42, 43, 128]);
+        two_proj["tokenId"] = json!(42);
+        two_proj["contextLimit"] = json!(3);
+        two_proj["executionBackend"] = json!("hmx-bitplane");
+        two_proj["residentHostWeights"] = json!(true);
+        two_proj["batchFourOperations"] = json!(true);
+        two_proj["projections"] = json!(["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight"]);
+        two_proj["maximumOperations"] = json!(240);
+        let parsed: Request = serde_json::from_value(two_proj.clone())?;
+        parsed.limits()?;
+        assert_eq!(
+            parsed.projection_names(),
+            vec!["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight"]
+        );
+        check_statistics(
+            bonsai_hexagon_runtime::ProjectionStatistics {
+                projections_completed: 6,
+                operations_attempted: 240,
+                operations_completed: 240,
+            },
+            0,
+            false,
+            &parsed,
+        )?;
+        assert!(
+            check_statistics(
+                bonsai_hexagon_runtime::ProjectionStatistics {
+                    projections_completed: 3,
+                    operations_attempted: 240,
+                    operations_completed: 240,
+                },
+                0,
+                false,
+                &parsed,
+            )
+            .is_err()
+        );
+        for (field, invalid) in [
+            ("projections", json!([])),
+            ("projections", json!(["blk.0.ffn_gate.weight"])),
+            (
+                "projections",
+                json!(["blk.0.ffn_up.weight", "blk.0.ffn_up.weight"]),
+            ),
+            (
+                "projections",
+                json!(["blk.0.ffn_up.weight", "blk.0.ffn_down.weight"]),
+            ),
+            (
+                "projections",
+                json!([
+                    "blk.0.ffn_up.weight",
+                    "blk.0.ffn_gate.weight",
+                    "blk.1.ffn_up.weight"
+                ]),
+            ),
+            ("maximumOperations", json!(236)),
+        ] {
+            let mut changed = two_proj.clone();
+            changed[field] = invalid;
+            assert!(
+                serde_json::from_value::<Request>(changed)?
+                    .limits()
+                    .is_err()
+            );
+        }
+        Ok(())
     }
 }

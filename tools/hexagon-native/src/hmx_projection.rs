@@ -620,7 +620,7 @@ fn frame_batch4(
     }
     let mut single = [0_u8; 1024];
     write_single_header(&mut single, base, bytes.len(), fd, rows, layout(rows))?;
-    bytes[..active.activation].fill(0);
+    bytes[..2048].fill(0);
     bytes[..24].copy_from_slice(&single[..24]);
     put64(
         bytes,
@@ -661,13 +661,21 @@ fn frame_batch4(
         put16(bytes, operation_desc + 200, ti_base);
         put16(bytes, operation_desc + 202, ti_base + 1);
         put16(bytes, operation_desc + 220, ti_base + 2);
-        for (index, value) in activations[member].iter().flatten().enumerate() {
-            put32(bytes, member_activation + index * 4, value.to_bits());
+        for (dst, value) in bytes[member_activation..member_activation + 4096]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(activations[member].iter().flatten())
+        {
+            *dst = value.to_bits().to_le_bytes();
         }
     }
     let total_output_words = HMX_Q2_BATCH_OPERATIONS * rows * 8;
-    for index in 0..total_output_words {
-        put32(bytes, active.output + index * 4, 0x7fc0_ae51);
+    for dst in bytes[active.output..active.output + total_output_words * 4]
+        .as_chunks_mut::<4>()
+        .0
+    {
+        *dst = 0x7fc0_ae51_u32.to_le_bytes();
     }
     bytes[active.output + total_output_words * 4..].fill(0);
     Ok(active)
@@ -767,25 +775,41 @@ fn frame(
         return Err(Error::Contract);
     }
     let allocation_bytes = bytes.len();
-    bytes.fill(0);
     let mut header = [0_u8; 1024];
     write_single_header(&mut header, base, allocation_bytes, fd, rows, active)?;
     bytes[..1024].copy_from_slice(&header);
-    for (index, value) in activation.iter().flatten().enumerate() {
-        put32(bytes, active.activation + index * 4, value.to_bits());
+    for (dst, value) in bytes[active.activation..active.activation + 4096]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(activation.iter().flatten())
+    {
+        *dst = value.to_bits().to_le_bytes();
     }
-    for index in 0..rows * 8 {
-        put32(bytes, active.output + index * 4, 0x7fc0_ae51);
+    let output_bytes = rows * 32;
+    for dst in bytes[active.output..active.output + output_bytes]
+        .as_chunks_mut::<4>()
+        .0
+    {
+        *dst = 0x7fc0_ae51_u32.to_le_bytes();
     }
+    bytes[active.output + output_bytes..].fill(0);
     Ok(active)
 }
 
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::float_cmp,
+    reason = "Exact i16 roundtrip rejects NaN, infinities, fractions and out-of-range plane sums without scalar truncf calls."
+)]
 pub(crate) fn output_valid(bytes: &[u8]) -> bool {
     !bytes.is_empty()
         && bytes.len().is_multiple_of(4)
         && bytes.as_chunks::<4>().0.iter().all(|value| {
             let value = f32::from_le_bytes(*value);
-            value.is_finite() && value.fract() == 0.0 && (-128.0..=256.0).contains(&value)
+            let integer = value as i16;
+            f32::from(integer) == value && (-128..=256).contains(&integer)
         })
 }
 

@@ -16,8 +16,14 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Fixed VTCM request used to derive the HMX chunks; refusal never falls back.
-pub const HMX_Q2_VTCM_REQUEST_BYTES: u32 = 65_536;
+/// Fixed 2 MiB VTCM request (of 8 MiB hardware VTCM) used to derive the HMX chunks; refusal never falls back.
+pub const HMX_Q2_VTCM_REQUEST_BYTES: u32 = 2_097_152;
+/// Fixed 128-byte HVX worker count for HMX sessions on the 8-HVX v81 CDSP domain.
+pub const HMX_Q2_HVX_WORKERS: u32 = 8;
+/// Fixed F32-to-F16 activation worker count (`min(n_threads, K / 32)` for `K = 128`).
+pub const HMX_Q2_ACT_WORKERS: u8 = 4;
+/// Fixed `HTP_POWER_MODE_BURST` (`7`) value pinning core/bus/HMX voltage corners during active HMX sessions.
+pub const HMX_Q2_POWER_MODE_BURST: u32 = 7;
 /// Maximum opt-in host-mapped immutable packed-weight arena; this is not VTCM.
 pub const HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 64 * 1024 * 1024;
 /// Fixed logical operation count in one batched HMX bitplane packet.
@@ -421,8 +427,10 @@ pub(crate) const fn batch_n_layout<const B: usize, const CMD_PAD: usize>(
 
 pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], Error> {
     let mut result = compute::start_wire(queue_id);
+    put32(&mut result, 16, HMX_Q2_HVX_WORKERS);
     put32(&mut result, 20, 1);
     put32(&mut result, 24, HMX_Q2_VTCM_REQUEST_BYTES);
+    put32(&mut result, 40, HMX_Q2_POWER_MODE_BURST);
     put64(
         &mut result,
         32,
@@ -432,11 +440,12 @@ pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], E
 }
 
 // Specialization of htp_mm_hmx_compute_chunks and solve_2d_params at pinned
-// 19cce691: K128, m8 padded32, Q2_0, one thread, no pipeline/bias, 64KiB.
+// 19cce691: K128, m8 padded32, Q2_0, 8 HVX threads (4 act threads), no pipeline/bias, 2 MiB VTCM.
 // Per-N=2*640/32+128*2=296, per-M=256, per-MN=2, overhead=5*2048+256.
 // Cost ties prefer least tail waste then largest mc*nc, as the source does.
 pub(crate) fn chunks(rows: usize) -> Result<(u32, u32), Error> {
-    let usable = 65_536 - 10_496;
+    let vtcm_budget = usize::try_from(HMX_Q2_VTCM_REQUEST_BYTES).map_err(|_| Error::Contract)?;
+    let usable = vtcm_budget - 10_496;
     let mut best: Option<(usize, usize, usize)> = None;
     for columns in (32..=rows.min(usable / 296)).step_by(32) {
         let remaining = usable - columns * 296;
@@ -463,9 +472,9 @@ pub(crate) fn chunks(rows: usize) -> Result<(u32, u32), Error> {
     let output = (32 * columns * 2).next_multiple_of(2048);
     let scratch = (columns * 256).next_multiple_of(2048);
     let compute_group = weight + output + scratch;
-    let activation_temp = compute_group.clamp(2048, 32_768).next_multiple_of(128);
+    let activation_temp = compute_group.clamp(4096, 131_072).next_multiple_of(128);
     let bytes = 2048 + 8192 + compute_group.max(activation_temp);
-    if bytes > 65_536 {
+    if bytes > vtcm_budget {
         return Err(Error::Contract);
     }
     Ok((
@@ -811,8 +820,8 @@ fn write_single_header(
     bytes[KP..KP + 128].fill(0);
     bytes[KP] = 1; // HTP_MM_KERNEL_HMX_2D.
     bytes[KP + 3] = 1; // n_hmx; no pipeline for N8.
-    bytes[KP + 4] = 1; // one HVX worker.
-    bytes[KP + 5] = 1; // one F32->F16 activation worker.
+    bytes[KP + 4] = u8::try_from(HMX_Q2_HVX_WORKERS).map_err(|_| Error::Contract)?; // eight HVX workers.
+    bytes[KP + 5] = HMX_Q2_ACT_WORKERS; // four F32->F16 activation workers.
     for (offset, value) in [
         (8, 32),
         (12, n_chunk),
@@ -824,7 +833,7 @@ fn write_single_header(
         put32(bytes, KP + offset, value);
     }
     // fastdiv(8)=(1,3), (1)=(1,0), (128)=(1,7).
-    for (index, shift) in [3, 3, 0, 0, 0, 0, 7].into_iter().enumerate() {
+    for (index, shift) in [3, 3, 0, 0, 0, 2, 7].into_iter().enumerate() {
         put32(bytes, KP + 36 + index * 8, 1);
         put32(bytes, KP + 40 + index * 8, shift);
     }
@@ -919,11 +928,12 @@ mod tests {
     {
         assert_eq!(chunks(32)?, (32, 22528));
         assert_eq!(chunks(64)?, (64, 34816));
-        assert_eq!(chunks(17_408)?, (128, 57344));
+        assert_eq!(chunks(17_408)?, (4352, 1_576_960));
         let limits = HmxQ2ProjectionLimits::new(17_408, 40, Duration::from_secs(20))?;
         assert_eq!(limits.allocation_bytes(), 1_191_936);
         let start = start_wire(0x1234, limits.allocation_bytes())?;
-        assert_eq!(&start[16..28], &[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(&start[16..28], &[8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 32, 0]);
+        assert_eq!(&start[40..44], &[7, 0, 0, 0]);
         let mut weights = vec![0x55; 1152];
         for tile in weights.as_chunks_mut::<576>().0 {
             for scale in tile[512..].as_chunks_mut::<2>().0 {
@@ -934,7 +944,8 @@ mod tests {
         assert_eq!(validate_inputs(32, &weights, &activation, 256)?, 32);
         let mut bytes = vec![0; layout(32).allocation];
         let active = image(&mut bytes, 0x1234_5600, 7, 32, &weights, &activation)?;
-        assert_eq!(&bytes[264..270], &[1, 0, 0, 1, 1, 1]);
+        assert_eq!(&bytes[264..270], &[1, 0, 0, 1, 8, 4]);
+        assert_eq!(&bytes[264 + 76..264 + 84], &[1, 0, 0, 0, 2, 0, 0, 0]);
         assert_eq!(&bytes[264 + 8..264 + 16], &[32, 0, 0, 0, 32, 0, 0, 0]);
         assert_eq!(&bytes[264 + 28..264 + 32], &22528_u32.to_le_bytes());
         assert!(!output_valid(&bytes[active.output..active.output + 1024]));

@@ -5,9 +5,9 @@ use super::{
     open_module, write_packet,
 };
 use crate::{
-    Error, GuardedQ2Submitter, HMX_Q2_BATCH_OPERATIONS, HmxQ2ProjectionLimits, HmxQ2Submitter,
-    HmxQ2WeightHandle, HmxQ2WeightRegistry, Q2ProjectionLimits, Q2ProjectionReport,
-    SessionPreparationReport, hmx_projection, projection,
+    Error, GuardedQ2Submitter, HMX_Q2_BATCH_OPERATIONS, HMX_Q2_BATCH10_OPERATIONS,
+    HmxQ2ProjectionLimits, HmxQ2Submitter, HmxQ2WeightHandle, HmxQ2WeightRegistry,
+    Q2ProjectionLimits, Q2ProjectionReport, SessionPreparationReport, hmx_projection, projection,
 };
 use std::ffi::c_void;
 use std::path::Path;
@@ -51,10 +51,10 @@ pub(super) fn run_hmx(
     progress: impl FnMut(&Q2ProjectionReport),
     work: impl FnOnce(&mut dyn HmxQ2Submitter) -> Result<(), Error>,
 ) -> Result<Q2ProjectionReport, Error> {
-    let mode = if limits.batch_four {
-        Mode::HmxBatch4
-    } else {
-        Mode::Hmx
+    let mode = match limits.batch_operations {
+        HMX_Q2_BATCH_OPERATIONS => Mode::HmxBatch4,
+        HMX_Q2_BATCH10_OPERATIONS => Mode::HmxBatch10,
+        _ => Mode::Hmx,
     };
     run_mode(
         driver,
@@ -72,17 +72,19 @@ enum Mode {
     Guarded,
     Hmx,
     HmxBatch4,
+    HmxBatch10,
 }
 
 impl Mode {
     const fn is_hmx(self) -> bool {
-        matches!(self, Self::Hmx | Self::HmxBatch4)
+        matches!(self, Self::Hmx | Self::HmxBatch4 | Self::HmxBatch10)
     }
 
     const fn batch_operations(self) -> u32 {
         match self {
             Self::Guarded | Self::Hmx => 1,
             Self::HmxBatch4 => 4,
+            Self::HmxBatch10 => 10,
         }
     }
 
@@ -91,6 +93,7 @@ impl Mode {
             Self::Guarded => projection::layout(rows).allocation,
             Self::Hmx => hmx_projection::layout(rows).allocation,
             Self::HmxBatch4 => hmx_projection::batch_layout(rows).allocation,
+            Self::HmxBatch10 => hmx_projection::batch10_layout(rows).allocation,
         }
     }
 }
@@ -212,7 +215,9 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
             start[32..40].copy_from_slice(&u64::from(descriptor_size).to_le_bytes());
             start
         }
-        Mode::Hmx | Mode::HmxBatch4 => hmx_projection::start_wire(queue_id, allocation_bytes)?,
+        Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => {
+            hmx_projection::start_wire(queue_id, allocation_bytes)?
+        }
     };
     let mut argument = RemoteBuffer {
         pointer: start.as_mut_ptr().cast(),
@@ -328,7 +333,9 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
     }
 
     fn read(&mut self, sequence: u64, batch_operations: u32) -> bool {
-        let deadline = (Instant::now() + Duration::from_secs(3)).min(self.work_deadline);
+        let started = Instant::now();
+        let deadline = (started + Duration::from_secs(3)).min(self.work_deadline);
+        let spin_deadline = (started + Duration::from_millis(15)).min(deadline);
         loop {
             if Instant::now() >= deadline {
                 if Instant::now() >= self.work_deadline {
@@ -364,7 +371,11 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             };
             self.report.queue.queue_read_result = Some(result);
             if result == 516 {
-                std::thread::sleep(Duration::from_millis(1));
+                if Instant::now() < spin_deadline {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 continue;
             }
             self.report.queue.response_validated = result == 0
@@ -399,9 +410,9 @@ enum Weights<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum BatchWeights<'a> {
-    Transient([&'a [u8]; HMX_Q2_BATCH_OPERATIONS]),
-    Resident([&'a HmxQ2WeightHandle; HMX_Q2_BATCH_OPERATIONS]),
+enum BatchWeights<'a, const B: usize> {
+    Transient([&'a [u8]; B]),
+    Resident([&'a HmxQ2WeightHandle; B]),
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
@@ -527,7 +538,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         };
         let output_valid = match self.mode {
             Mode::Guarded => projection::output_valid(bytes),
-            Mode::Hmx | Mode::HmxBatch4 => hmx_projection::output_valid(bytes),
+            Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => hmx_projection::output_valid(bytes),
         };
         if !output_valid {
             return Err(self.fail("projection-numeric-refused-pinned"));
@@ -547,21 +558,25 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "Keep four-member capacity reservation, descriptor regeneration and full-batch output checks together"
+        reason = "Keep batch capacity reservation, descriptor regeneration and full-batch output checks together"
     )]
-    fn submit_batch4_inner(
+    fn submit_batch_inner<const B: usize, const CMD_PAD: usize>(
         &mut self,
-        weights: BatchWeights<'_>,
-        activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
-        mut outputs: [&mut [f32]; HMX_Q2_BATCH_OPERATIONS],
+        expected_mode: Mode,
+        weights: BatchWeights<'_, B>,
+        activations: [&[[f32; 128]; 8]; B],
+        mut outputs: [&mut [f32]; B],
     ) -> Result<(), Error> {
         for output in &mut outputs {
             output.fill(f32::NAN);
         }
+        let Ok(batch_u32) = u32::try_from(B) else {
+            return Err(self.fail("projection-session-bound-refused-pinned"));
+        };
         let Some(next_operations) = self
             .report
             .operations_submitted
-            .checked_add(4)
+            .checked_add(batch_u32)
             .filter(|&next| !self.failed && next <= self.limits.operations)
         else {
             return Err(self.fail("projection-session-bound-refused-pinned"));
@@ -577,12 +592,12 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         if !self.within_deadline() {
             return Err(Error::Contract);
         }
-        if self.mode != Mode::HmxBatch4 {
+        if self.mode != expected_mode {
             return Err(self.fail("projection-input-refused-pinned"));
         }
         let output_lens = std::array::from_fn(|member| outputs[member].len());
         let rows = match weights {
-            BatchWeights::Transient(weights) => hmx_projection::validate_batch4_inputs(
+            BatchWeights::Transient(weights) => hmx_projection::validate_batch_inputs::<B>(
                 self.limits.rows,
                 weights,
                 activations,
@@ -592,7 +607,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 for handle in handles {
                     self.resident_weights.range(handle)?;
                 }
-                hmx_projection::validate_batch4_resident(
+                hmx_projection::validate_batch_resident::<B>(
                     self.limits.rows,
                     handles,
                     activations,
@@ -616,7 +631,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         let image =
             unsafe { std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes) };
         let active = match weights {
-            BatchWeights::Transient(weights) => hmx_projection::image_batch4(
+            BatchWeights::Transient(weights) => hmx_projection::image_batch::<B, CMD_PAD>(
                 &mut image[..working_bytes],
                 base,
                 self.expected.fd,
@@ -624,7 +639,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 weights,
                 activations,
             ),
-            BatchWeights::Resident(handles) => hmx_projection::image_batch4_resident(
+            BatchWeights::Resident(handles) => hmx_projection::image_batch_resident::<B, CMD_PAD>(
                 image,
                 base,
                 self.expected.fd,
@@ -641,7 +656,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return Err(Error::Contract);
         }
         let sequence = u64::from(next_writes);
-        let Ok(request) = projection::request_batch(sequence, 4) else {
+        let Ok(request) = projection::request_batch(sequence, batch_u32) else {
             return Err(self.fail("projection-frame-refused-pinned"));
         };
         self.report.queue.response_validated = false;
@@ -649,7 +664,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         self.report.operations_submitted = next_operations;
         self.report.queue_writes_submitted = next_writes;
         if matches!(weights, BatchWeights::Resident(_)) {
-            self.report.resident_submissions += 4;
+            self.report.resident_submissions += batch_u32;
         }
         self.report.queue.compute_submitted = true;
         let mut descriptor = self.expected;
@@ -660,13 +675,13 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return Err(self.fail("projection-write-refused-pinned"));
         }
         entered(self.report, "projection-queue-read-entered", self.progress);
-        if !self.read(sequence, 4) {
+        if !self.read(sequence, batch_u32) {
             return Err(Error::Contract);
         }
         let member_bytes = rows * 32;
-        let total_output_bytes = HMX_Q2_BATCH_OPERATIONS * member_bytes;
+        let total_output_bytes = B * member_bytes;
         // SAFETY: exact correlated response validated same FD, full allocation,
-        // pointer, n_tensors=12 and n_ops=4. All four output regions are checked
+        // pointer, n_tensors=3*B and n_ops=B. All B output regions are checked
         // before any member is copied to the caller.
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -813,7 +828,12 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
         activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
         outputs: [&mut [f32]; HMX_Q2_BATCH_OPERATIONS],
     ) -> Result<(), Error> {
-        self.submit_batch4_inner(BatchWeights::Transient(weights), activations, outputs)
+        self.submit_batch_inner::<HMX_Q2_BATCH_OPERATIONS, 2048>(
+            Mode::HmxBatch4,
+            BatchWeights::Transient(weights),
+            activations,
+            outputs,
+        )
     }
 
     fn submit_resident_batch4(
@@ -822,7 +842,40 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
         activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
         outputs: [&mut [f32]; HMX_Q2_BATCH_OPERATIONS],
     ) -> Result<(), Error> {
-        self.submit_batch4_inner(BatchWeights::Resident(handles), activations, outputs)
+        self.submit_batch_inner::<HMX_Q2_BATCH_OPERATIONS, 2048>(
+            Mode::HmxBatch4,
+            BatchWeights::Resident(handles),
+            activations,
+            outputs,
+        )
+    }
+
+    fn submit_batch10(
+        &mut self,
+        weights: [&[u8]; HMX_Q2_BATCH10_OPERATIONS],
+        activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH10_OPERATIONS],
+        outputs: [&mut [f32]; HMX_Q2_BATCH10_OPERATIONS],
+    ) -> Result<(), Error> {
+        self.submit_batch_inner::<HMX_Q2_BATCH10_OPERATIONS, 8192>(
+            Mode::HmxBatch10,
+            BatchWeights::Transient(weights),
+            activations,
+            outputs,
+        )
+    }
+
+    fn submit_resident_batch10(
+        &mut self,
+        handles: [&HmxQ2WeightHandle; HMX_Q2_BATCH10_OPERATIONS],
+        activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH10_OPERATIONS],
+        outputs: [&mut [f32]; HMX_Q2_BATCH10_OPERATIONS],
+    ) -> Result<(), Error> {
+        self.submit_batch_inner::<HMX_Q2_BATCH10_OPERATIONS, 8192>(
+            Mode::HmxBatch10,
+            BatchWeights::Resident(handles),
+            activations,
+            outputs,
+        )
     }
 }
 
@@ -1455,6 +1508,123 @@ mod tests {
                     u32::from(case != 7)
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Exercise batch-ten streaming, resident, capacity, and per-member failure cases on one mock queue"
+    )]
+    fn batch10_hmx_session_checks_all_thirty_tensors_ten_outputs_and_capacity() -> Result<(), Error>
+    {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let mut weights = vec![0x55; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let activation = [[1.0; 128]; 8];
+        for case in 0..4 {
+            {
+                let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+                state.writes = 0;
+                state.sequence = 0;
+                state.batch_operations = 10;
+                state.write_error = case == 1;
+                state.stale_reply = false;
+                state.bad_numeric = false;
+                state.bad_member = if case == 2 { Some(9) } else { None };
+            }
+            let limits = HmxQ2ProjectionLimits::new(32, 24_000, Duration::from_secs(4))?
+                .with_batch_ten()?
+                .with_resident_weights(10 * 1152)?;
+            let mut memory = vec![0; limits.allocation_bytes()];
+            let pointer = memory.as_mut_ptr().cast::<c_void>();
+            let expected = QueueBuffer {
+                fd: 7,
+                size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+                offset: 0,
+                flags: 0x90,
+                pointer,
+            };
+            let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            report.queue.hmx_bitplane = true;
+            report.batch_operations = 10;
+            report.operations_submitted = if case == 3 { 23_995 } else { 23_980 };
+            report.operations_completed = report.operations_submitted;
+            report.queue_writes_submitted = report.operations_submitted / 10;
+            report.queue_writes_completed = report.operations_completed / 10;
+            report.queue.poisoned = true;
+            let queue_write = WriteCall::Nonblocking(write);
+            let mut progress = |_: &Q2ProjectionReport| {};
+            let mut session = Session {
+                report: &mut report,
+                queue_write: &queue_write,
+                queue_read: read,
+                queue: null_mut(),
+                memory: pointer,
+                expected,
+                limits: limits.common,
+                mode: Mode::HmxBatch10,
+                resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+                work_deadline: Instant::now() + Duration::from_secs(1),
+                progress: &mut progress,
+                failed: false,
+            };
+            let mut handles = Vec::new();
+            for _ in 0..10 {
+                handles.push(
+                    HmxQ2Submitter::prepare_weights(&mut session, &weights)?
+                        .ok_or(Error::Contract)?,
+                );
+            }
+            let handle_refs: [&HmxQ2WeightHandle; 10] =
+                std::array::from_fn(|member| &handles[member]);
+            let mut outs = [[99.0_f32; 256]; 10];
+            let res = {
+                let out_refs: [&mut [f32]; 10] = outs.each_mut().map(<[f32; 256]>::as_mut_slice);
+                HmxQ2Submitter::submit_batch10(
+                    &mut session,
+                    [&weights; 10],
+                    [&activation; 10],
+                    out_refs,
+                )
+            };
+            if case == 0 {
+                assert!(res.is_ok());
+                for (member, out) in outs.iter().enumerate() {
+                    let step = u8::try_from(member).map_err(|_| Error::Contract)?;
+                    assert_eq!(*out, [7.0 + f32::from(step); 256]);
+                }
+                assert_eq!(session.report.operations_submitted, 23_990);
+                assert_eq!(session.report.operations_completed, 23_990);
+                assert_eq!(session.report.queue_writes_submitted, 2399);
+                assert_eq!(session.report.queue_writes_completed, 2399);
+                let res2 = {
+                    let out_refs: [&mut [f32]; 10] =
+                        outs.each_mut().map(<[f32; 256]>::as_mut_slice);
+                    HmxQ2Submitter::submit_resident_batch10(
+                        &mut session,
+                        handle_refs,
+                        [&activation; 10],
+                        out_refs,
+                    )
+                };
+                assert!(res2.is_ok());
+                assert_eq!(session.report.operations_submitted, 24_000);
+                assert_eq!(session.report.operations_completed, 24_000);
+                assert_eq!(session.report.queue_writes_submitted, 2400);
+                assert_eq!(session.report.queue_writes_completed, 2400);
+            } else {
+                assert!(res.is_err());
+                for out in &outs {
+                    assert!(out.iter().all(|value| value.is_nan()));
+                }
+            }
+            assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
         }
         Ok(())
     }

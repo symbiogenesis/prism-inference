@@ -115,6 +115,33 @@ mod tests {
         assert!(errors.capacity() <= 2);
         Ok(())
     }
+
+    #[test]
+    fn update_rows_partitions_in_place_and_reports_earliest_chunk_failure() -> Result<()> {
+        let policy = RowParallelism::new(4)?;
+        let mut values = vec![1.0_f32; 10];
+        policy.update_rows(&mut values, |base, chunk| {
+            for (offset, target) in chunk.iter_mut().enumerate() {
+                *target += f32::from(u8::try_from(base + offset)?);
+            }
+            Ok(())
+        })?;
+        let expected: Vec<f32> = (0_u8..10).map(|idx| 1.0 + f32::from(idx)).collect();
+        assert_eq!(values, expected);
+        let err = policy.update_rows(&mut values, |base, _chunk| {
+            if base >= 3 {
+                Err(invalid(format!("chunk-at-{base}")))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(error_text(err), Err("chunk-at-3".to_owned()));
+        Ok(())
+    }
+
+    fn error_text(result: Result<()>) -> std::result::Result<(), String> {
+        result.map_err(|error| error.to_string())
+    }
 }
 
 impl Default for RowParallelism {
@@ -161,6 +188,56 @@ impl RowParallelism {
     #[must_use]
     pub const fn workers(&self) -> usize {
         self.workers
+    }
+
+    /// Updates contiguous row chunks of `target` in place across the private pool.
+    ///
+    /// Serial execution (`workers == 1` or `target.len() <= 1`) runs directly on
+    /// the calling thread. Parallel execution partitions `target` into at most
+    /// `workers` contiguous chunks and returns the earliest chunk failure after
+    /// all workers join.
+    ///
+    /// # Errors
+    /// Rejects unavailable `parallel-rows` support, error-slot allocation
+    /// failure, or the first chunk failure returned by `update`.
+    pub fn update_rows(
+        &self,
+        target: &mut [f32],
+        update: impl Fn(usize, &mut [f32]) -> Result<()> + Sync,
+    ) -> Result<()> {
+        #[cfg(not(feature = "parallel-rows"))]
+        if self.uses_pool(target.len()) {
+            return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool
+            && target.len() > 1
+        {
+            use rayon::prelude::*;
+
+            let rows = target.len();
+            let task_rows = rows.div_ceil(self.workers);
+            let tasks = rows.div_ceil(task_rows);
+            let mut errors = Vec::new();
+            errors.try_reserve_exact(tasks)?;
+            errors.resize_with(tasks, || None);
+            pool.install(|| {
+                target
+                    .par_chunks_mut(task_rows)
+                    .zip(errors.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(task, (chunk, error))| {
+                        if let Err(failure) = update(task * task_rows, chunk) {
+                            *error = Some(failure);
+                        }
+                    });
+            });
+            if let Some(failure) = errors.into_iter().flatten().next() {
+                return Err(failure);
+            }
+            return Ok(());
+        }
+        update(0, target)
     }
 
     pub(super) const fn uses_pool(&self, rows: usize) -> bool {

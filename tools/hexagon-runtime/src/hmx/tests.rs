@@ -85,6 +85,33 @@ impl HmxQ2Submitter for CpuSubmitter {
         }
         Ok(())
     }
+
+    fn submit_batch10(
+        &mut self,
+        weights: [&[u8]; 10],
+        activations: [&[[f32; 128]; 8]; 10],
+        outputs: [&mut [f32]; 10],
+    ) -> std::result::Result<(), Error> {
+        self.batch_calls += 1;
+        if self.fail {
+            return Err(Error::Contract);
+        }
+        for (member, ((weight, activation), output)) in weights
+            .into_iter()
+            .zip(activations)
+            .zip(outputs)
+            .enumerate()
+        {
+            let saved_partial = self.partial;
+            if self.fail_member == Some(member) {
+                self.partial = true;
+            }
+            let result = self.submit(weight, activation, output);
+            self.partial = saved_partial;
+            result?;
+        }
+        Ok(())
+    }
 }
 
 fn fixture(columns: usize, rows: usize) -> Tensor {
@@ -358,6 +385,35 @@ impl HmxQ2Submitter for ResidentSubmitter {
             activations,
             outputs,
         )
+    }
+
+    fn submit_batch10(
+        &mut self,
+        weights: [&[u8]; 10],
+        activations: [&[[f32; 128]; 8]; 10],
+        outputs: [&mut [f32]; 10],
+    ) -> std::result::Result<(), Error> {
+        self.streaming_batch_calls += 1;
+        self.streaming_calls += 10;
+        self.oracle.submit_batch10(weights, activations, outputs)
+    }
+
+    fn submit_resident_batch10(
+        &mut self,
+        handles: [&HmxQ2WeightHandle; 10],
+        activations: [&[[f32; 128]; 8]; 10],
+        outputs: [&mut [f32]; 10],
+    ) -> std::result::Result<(), Error> {
+        self.resident_batch_calls += 1;
+        self.resident_calls += 10;
+        let mut ranges = Vec::new();
+        for handle in handles {
+            ranges.push(self.registry.range(handle)?);
+        }
+        let weight_refs: [&[u8]; 10] =
+            std::array::from_fn(|member| &self.arena[ranges[member].clone()]);
+        self.oracle
+            .submit_batch10(weight_refs, activations, outputs)
     }
 }
 
@@ -675,6 +731,86 @@ fn hmx_batch4_member_failure_rejects_whole_batch_without_partial_completion() ->
         assert_eq!(executor.statistics().operations_completed, 0);
         assert_eq!(executor.queue_writes_attempted(), 1);
         assert_eq!(executor.queue_writes_completed(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn hmx_batch10_and_parallel_rows_preserve_exact_outputs_and_queue_write_counts() -> Result<()> {
+    for (columns, rows) in [(1280, 1), (2560, 70), (1280, 128)] {
+        let tensor = fixture(columns, rows);
+        let input: Vec<_> = (0..columns)
+            .map(|lane| [127.0, -128.0, 0.1, -0.0, 53.25][lane % 5])
+            .collect();
+        let mut expected = Vec::new();
+        matvec_into(
+            &tensor,
+            &input,
+            &mut expected,
+            &mut MatvecScratch::with_backend(MatvecBackend::Scalar),
+        )?;
+        let operations = columns / 128 * rows.div_ceil(64);
+        let writes = operations / 10;
+        let packed_bytes = columns / 128 * rows.next_multiple_of(32) * 36;
+        let limits =
+            HmxQ2ProjectionLimits::new(64, 100, Duration::from_secs(10))?.with_batch_ten()?;
+        let worker_counts = if cfg!(feature = "parallel-rows") {
+            vec![1, 4]
+        } else {
+            vec![1]
+        };
+        for workers in worker_counts {
+            let mut submitter = CpuSubmitter::default();
+            let mut executor = HmxQ2Executor::new(&mut submitter, limits, 1 << 20)
+                .with_row_parallelism(RowParallelism::new(workers)?)?;
+            assert_eq!(
+                executor.identity(),
+                "hexagon-hmx-binary-pq2-q8k-batch10-v1-experimental"
+            );
+            assert!(!executor.supports(&fixture(512, 1)));
+            let mut actual = Vec::new();
+            MatvecScratch::default()
+                .prepare(&tensor, &input)?
+                .matvec_with_executor(&tensor, &mut actual, &mut executor)?;
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                executor.statistics().operations_completed,
+                u64::try_from(operations)?
+            );
+            assert_eq!(executor.queue_writes_completed(), u64::try_from(writes)?);
+
+            let mut resident_submitter = ResidentSubmitter::new(packed_bytes)?;
+            let mut resident_executor =
+                HmxQ2Executor::new(&mut resident_submitter, limits, 1 << 20)
+                    .with_resident_weights(16_384)?
+                    .with_row_parallelism(RowParallelism::new(workers)?)?;
+            assert_eq!(
+                resident_executor.identity(),
+                "hexagon-hmx-binary-pq2-q8k-resident-batch10-v1-experimental"
+            );
+            for _ in 0..2 {
+                let mut resident_actual = Vec::new();
+                MatvecScratch::default()
+                    .prepare(&tensor, &input)?
+                    .matvec_with_executor(&tensor, &mut resident_actual, &mut resident_executor)?;
+                assert_eq!(
+                    resident_actual
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(resident_executor.residency_statistics().tensors_prepared, 1);
+            assert_eq!(resident_executor.residency_statistics().cache_hits, 1);
+            assert_eq!(
+                resident_executor.queue_writes_completed(),
+                u64::try_from(writes * 2)?
+            );
+        }
     }
     Ok(())
 }

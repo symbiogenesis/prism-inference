@@ -1,6 +1,9 @@
 //! Original integer dots represented as eight exact binary HMX rows.
 
-use bonsai_prism_runtime::{kernels::Pq2ProjectionExecutor, model::Tensor};
+use bonsai_prism_runtime::{
+    kernels::{Pq2ProjectionExecutor, RowParallelism},
+    model::Tensor,
+};
 use bonsai_ternary::Q8KBlock;
 use hexagon_native_rpc::{HmxQ2ProjectionLimits, HmxQ2Submitter};
 
@@ -22,12 +25,13 @@ pub struct HmxQ2Executor<'a> {
     maximum_rows: usize,
     maximum_operations: u32,
     maximum_owned_payload_bytes: usize,
-    batch_four: bool,
+    batch_operations: usize,
     failed: bool,
     statistics: ProjectionStatistics,
     queue_writes_attempted: u64,
     queue_writes_completed: u64,
     residency: Option<residency::Cache>,
+    row_parallelism: Option<RowParallelism>,
 }
 
 impl<'a> HmxQ2Executor<'a> {
@@ -48,7 +52,7 @@ impl<'a> HmxQ2Executor<'a> {
             maximum_rows: limits.maximum_rows(),
             maximum_operations: limits.maximum_operations(),
             maximum_owned_payload_bytes,
-            batch_four: limits.batch_operations() == 4,
+            batch_operations: limits.batch_operations(),
             failed: false,
             statistics: ProjectionStatistics {
                 projections_completed: 0,
@@ -58,7 +62,23 @@ impl<'a> HmxQ2Executor<'a> {
             queue_writes_attempted: 0,
             queue_writes_completed: 0,
             residency: None,
+            row_parallelism: None,
         }
+    }
+
+    /// Configure row-parallel eight-plane reconstruction across an explicit pool.
+    ///
+    /// # Errors
+    /// Rejects repeated or late configuration after any attempted operation.
+    pub fn with_row_parallelism(mut self, row_parallelism: RowParallelism) -> Result<Self> {
+        if self.row_parallelism.is_some()
+            || self.statistics.operations_attempted != 0
+            || self.failed
+        {
+            return Err(invalid("invalid HMX row-parallelism configuration"));
+        }
+        self.row_parallelism = Some(row_parallelism);
+        Ok(self)
     }
 
     /// Enable immutable packed-weight reuse in the caller's admitted native arena.
@@ -126,7 +146,7 @@ impl<'a> HmxQ2Executor<'a> {
 
     fn payload_bytes(&self, rows: usize) -> Option<usize> {
         let padded_rows = rows.min(self.maximum_rows).next_multiple_of(32);
-        let batch = if self.batch_four { 4 } else { 1 };
+        let batch = self.batch_operations;
         rows.checked_mul(4)?
             .checked_add(padded_rows.checked_mul(68 * batch)?)?
             .checked_add(4096 * batch)
@@ -220,7 +240,7 @@ impl<'a> HmxQ2Executor<'a> {
         }
         let mut pending = zeroed(rows, 0.0_f32)?;
         let padded_rows = rows.min(self.maximum_rows).next_multiple_of(32);
-        let batch = if self.batch_four { 4 } else { 1 };
+        let batch = self.batch_operations;
         let mut weights = if cached.is_none() {
             zeroed(padded_rows * 36 * batch, 0_u8)?
         } else {
@@ -240,7 +260,87 @@ impl<'a> HmxQ2Executor<'a> {
         for row_start in (0..rows).step_by(self.maximum_rows) {
             let active_rows = (rows - row_start).min(self.maximum_rows);
             let mapped_rows = active_rows.next_multiple_of(32);
-            if self.batch_four {
+            if self.batch_operations == 10 {
+                let batch_dots = &mut dots[..10 * mapped_rows * 8];
+                for block_base in (0..blocks).step_by(10) {
+                    let planes: [[[f32; 128]; 8]; 10] = std::array::from_fn(|member| {
+                        let block_index = block_base + member;
+                        let quantized = &activation[block_index / 2];
+                        let start = block_index % 2 * 128;
+                        activation_planes(&quantized.values[start..start + 128])
+                    });
+                    batch_dots.fill(f32::NAN);
+                    self.statistics.operations_attempted =
+                        self.statistics.operations_attempted.saturating_add(10);
+                    self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                    {
+                        let plane_refs: [&[[f32; 128]; 8]; 10] =
+                            std::array::from_fn(|member| &planes[member]);
+                        let (o0, rest) = batch_dots.split_at_mut(mapped_rows * 8);
+                        let (o1, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o2, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o3, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o4, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o5, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o6, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o7, rest) = rest.split_at_mut(mapped_rows * 8);
+                        let (o8, o9) = rest.split_at_mut(mapped_rows * 8);
+                        let outputs = [o0, o1, o2, o3, o4, o5, o6, o7, o8, o9];
+                        if let Some(index) = resident {
+                            let cache = self
+                                .residency
+                                .as_ref()
+                                .ok_or_else(|| invalid("HMX resident cache is unavailable"))?;
+                            let base_handle = cache.projections[index].first_handle + operation;
+                            let handles: [&hexagon_native_rpc::HmxQ2WeightHandle; 10] =
+                                std::array::from_fn(|member| &cache.handles[base_handle + member]);
+                            self.submitter
+                                .submit_resident_batch10(handles, plane_refs, outputs)?;
+                        } else {
+                            let weight_stride = mapped_rows * 36;
+                            let batch_weights = &mut weights[..10 * weight_stride];
+                            for member in 0..10 {
+                                let block_index = block_base + member;
+                                let member_weights = &mut batch_weights
+                                    [member * weight_stride..(member + 1) * weight_stride];
+                                initialize_weights(member_weights);
+                                for row in 0..active_rows {
+                                    let offset = ((row_start + row) * blocks + block_index) * 34;
+                                    pack_weights(
+                                        &tensor.data[offset..offset + 34],
+                                        row,
+                                        member_weights,
+                                    );
+                                }
+                            }
+                            let weight_refs: [&[u8]; 10] = std::array::from_fn(|member| {
+                                &batch_weights[member * weight_stride..(member + 1) * weight_stride]
+                            });
+                            self.submitter
+                                .submit_batch10(weight_refs, plane_refs, outputs)?;
+                        }
+                    }
+                    operation += 10;
+                    let member_scales: [f32; 10] =
+                        std::array::from_fn(|member| activation[block_base / 2 + member / 2].scale);
+                    accumulate_batch::<10>(
+                        &tensor.data,
+                        blocks,
+                        row_start,
+                        active_rows,
+                        mapped_rows,
+                        block_base,
+                        member_scales,
+                        batch_dots,
+                        fused,
+                        self.row_parallelism.as_ref(),
+                        &mut pending[row_start..row_start + active_rows],
+                    )?;
+                    self.statistics.operations_completed =
+                        self.statistics.operations_completed.saturating_add(10);
+                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                }
+            } else if self.batch_operations == 4 {
                 let batch_dots = &mut dots[..4 * mapped_rows * 8];
                 for block_base in (0..blocks).step_by(4) {
                     let planes: [[[f32; 128]; 8]; 4] = std::array::from_fn(|member| {
@@ -302,60 +402,22 @@ impl<'a> HmxQ2Executor<'a> {
                         }
                     }
                     operation += 4;
-                    for member in 0..4 {
-                        let member_dots =
-                            &batch_dots[member * mapped_rows * 8..(member + 1) * mapped_rows * 8];
-                        for row in active_rows..mapped_rows {
-                            for plane in 0..8 {
-                                match valid_plane_dot(member_dots[plane * mapped_rows + row]) {
-                                    Some(0) => {}
-                                    Some(_) => {
-                                        return Err(invalid("Hexagon HMX padding output changed"));
-                                    }
-                                    None => {
-                                        return Err(invalid("invalid Hexagon HMX plane result"));
-                                    }
-                                }
-                            }
-                        }
-                    }
                     let first_scale = activation[block_base / 2].scale;
                     let second_scale = activation[block_base / 2 + 1].scale;
                     let member_scales = [first_scale, first_scale, second_scale, second_scale];
-                    let member_stride = mapped_rows * 8;
-                    for (row, target) in pending[row_start..row_start + active_rows]
-                        .iter_mut()
-                        .enumerate()
-                    {
-                        let row_block_base = (row_start + row) * blocks + block_base;
-                        let mut accumulated = *target;
-                        for (member, &quantized_scale) in member_scales.iter().enumerate() {
-                            let member_base = member * member_stride + row;
-                            let mut integer = 0_i32;
-                            for plane in 0..8 {
-                                let Some(dot) =
-                                    valid_plane_dot(batch_dots[member_base + plane * mapped_rows])
-                                else {
-                                    return Err(invalid("invalid Hexagon HMX plane result"));
-                                };
-                                let coefficient = if plane == 7 { -128 } else { 1 << plane };
-                                integer += coefficient * dot;
-                            }
-                            if !(-32768..=32768).contains(&integer) {
-                                return Err(invalid(
-                                    "Hexagon HMX reconstructed dot is out of range",
-                                ));
-                            }
-                            let index = (row_block_base + member) * 34;
-                            let factor = scale(&tensor.data[index..index + 34])? * quantized_scale;
-                            accumulated = finite(if fused {
-                                factor.mul_add(integer as f32, accumulated)
-                            } else {
-                                accumulated + factor * integer as f32
-                            })?;
-                        }
-                        *target = accumulated;
-                    }
+                    accumulate_batch::<4>(
+                        &tensor.data,
+                        blocks,
+                        row_start,
+                        active_rows,
+                        mapped_rows,
+                        block_base,
+                        member_scales,
+                        batch_dots,
+                        fused,
+                        self.row_parallelism.as_ref(),
+                        &mut pending[row_start..row_start + active_rows],
+                    )?;
                     self.statistics.operations_completed =
                         self.statistics.operations_completed.saturating_add(4);
                     self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
@@ -388,43 +450,19 @@ impl<'a> HmxQ2Executor<'a> {
                         self.submitter.submit(weights, &planes, dots)?;
                     }
                     operation += 1;
-                    for row in active_rows..mapped_rows {
-                        for plane in 0..8 {
-                            match valid_plane_dot(dots[plane * mapped_rows + row]) {
-                                Some(0) => {}
-                                Some(_) => {
-                                    return Err(invalid("Hexagon HMX padding output changed"));
-                                }
-                                None => {
-                                    return Err(invalid("invalid Hexagon HMX plane result"));
-                                }
-                            }
-                        }
-                    }
-                    for (row, target) in pending[row_start..row_start + active_rows]
-                        .iter_mut()
-                        .enumerate()
-                    {
-                        let mut integer = 0_i32;
-                        for plane in 0..8 {
-                            let Some(dot) = valid_plane_dot(dots[plane * mapped_rows + row]) else {
-                                return Err(invalid("invalid Hexagon HMX plane result"));
-                            };
-                            let coefficient = if plane == 7 { -128 } else { 1 << plane };
-                            integer += coefficient * dot;
-                        }
-                        if !(-32768..=32768).contains(&integer) {
-                            return Err(invalid("Hexagon HMX reconstructed dot is out of range"));
-                        }
-                        let index = ((row_start + row) * blocks + block_index) * 34;
-                        let factor = scale(&tensor.data[index..index + 34])? * quantized.scale;
-                        let prior = *target;
-                        *target = finite(if fused {
-                            factor.mul_add(integer as f32, prior)
-                        } else {
-                            prior + factor * integer as f32
-                        })?;
-                    }
+                    accumulate_batch::<1>(
+                        &tensor.data,
+                        blocks,
+                        row_start,
+                        active_rows,
+                        mapped_rows,
+                        block_index,
+                        [quantized.scale],
+                        dots,
+                        fused,
+                        self.row_parallelism.as_ref(),
+                        &mut pending[row_start..row_start + active_rows],
+                    )?;
                     self.statistics.operations_completed =
                         self.statistics.operations_completed.saturating_add(1);
                     self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
@@ -440,11 +478,13 @@ impl<'a> HmxQ2Executor<'a> {
 
 impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
     fn identity(&self) -> &'static str {
-        match (self.residency.is_some(), self.batch_four) {
-            (false, false) => "hexagon-hmx-binary-pq2-q8k-v1-experimental",
-            (true, false) => "hexagon-hmx-binary-pq2-q8k-resident-v1-experimental",
-            (false, true) => "hexagon-hmx-binary-pq2-q8k-batch4-v1-experimental",
-            (true, true) => "hexagon-hmx-binary-pq2-q8k-resident-batch4-v1-experimental",
+        match (self.residency.is_some(), self.batch_operations) {
+            (false, 10) => "hexagon-hmx-binary-pq2-q8k-batch10-v1-experimental",
+            (true, 10) => "hexagon-hmx-binary-pq2-q8k-resident-batch10-v1-experimental",
+            (false, 4) => "hexagon-hmx-binary-pq2-q8k-batch4-v1-experimental",
+            (true, 4) => "hexagon-hmx-binary-pq2-q8k-resident-batch4-v1-experimental",
+            (false, _) => "hexagon-hmx-binary-pq2-q8k-v1-experimental",
+            (true, _) => "hexagon-hmx-binary-pq2-q8k-resident-v1-experimental",
         }
     }
     fn operation_capacity(&self) -> Option<u64> {
@@ -458,7 +498,7 @@ impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
     }
     fn supports(&self, tensor: &Tensor) -> bool {
         dimensions(tensor).is_ok_and(|(columns, rows)| {
-            (!self.batch_four || (columns / 128).is_multiple_of(4))
+            (columns / 128).is_multiple_of(self.batch_operations)
                 && self
                     .payload_bytes(rows)
                     .is_some_and(|bytes| bytes <= self.maximum_owned_payload_bytes)
@@ -478,6 +518,95 @@ impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
             output.clear();
         }
         result
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "Checked integral plane dots reconstruct an exact bounded i32 before declared fused/nonfused F32 reduction."
+)]
+fn accumulate_batch<const B: usize>(
+    tensor_data: &[u8],
+    blocks: usize,
+    row_start: usize,
+    active_rows: usize,
+    mapped_rows: usize,
+    block_base: usize,
+    member_scales: [f32; B],
+    batch_dots: &[f32],
+    fused: bool,
+    row_parallelism: Option<&RowParallelism>,
+    pending_slice: &mut [f32],
+) -> Result<()> {
+    for member in 0..B {
+        let member_dots = &batch_dots[member * mapped_rows * 8..(member + 1) * mapped_rows * 8];
+        for row in active_rows..mapped_rows {
+            for plane in 0..8 {
+                match valid_plane_dot(member_dots[plane * mapped_rows + row]) {
+                    Some(0) => {}
+                    Some(_) => {
+                        return Err(invalid("Hexagon HMX padding output changed"));
+                    }
+                    None => {
+                        return Err(invalid("invalid Hexagon HMX plane result"));
+                    }
+                }
+            }
+        }
+    }
+    let update_chunk = |chunk_offset: usize, chunk_targets: &mut [f32]| -> Result<()> {
+        let mut reconstructed = [[0_i32; 64]; B];
+        for (tile_index, tile_targets) in chunk_targets.chunks_mut(64).enumerate() {
+            let tile_row_base = chunk_offset + tile_index * 64;
+            let tile_len = tile_targets.len();
+            for (member, reconstructed_row) in reconstructed.iter_mut().enumerate() {
+                let member_base = member * mapped_rows * 8 + tile_row_base;
+                let member_reconstructed = &mut reconstructed_row[..tile_len];
+                member_reconstructed.fill(0);
+                for plane in 0..8 {
+                    let slice = &batch_dots[member_base + plane * mapped_rows
+                        ..member_base + plane * mapped_rows + tile_len];
+                    if slice.iter().any(|&value| valid_plane_dot(value).is_none()) {
+                        return Err(invalid("invalid Hexagon HMX plane result"));
+                    }
+                    let coefficient = if plane == 7 { -128_i32 } else { 1_i32 << plane };
+                    for (dst, &value) in member_reconstructed.iter_mut().zip(slice) {
+                        *dst += coefficient * i32::from(value as i16);
+                    }
+                }
+                if member_reconstructed
+                    .iter()
+                    .any(|&integer| !(-32768..=32768).contains(&integer))
+                {
+                    return Err(invalid("Hexagon HMX reconstructed dot is out of range"));
+                }
+            }
+            for (local_row, target) in tile_targets.iter_mut().enumerate() {
+                let row_block_base = (row_start + tile_row_base + local_row) * blocks + block_base;
+                let mut accumulated = *target;
+                for (member, &quantized_scale) in member_scales.iter().enumerate() {
+                    let integer = reconstructed[member][local_row];
+                    let index = (row_block_base + member) * 34;
+                    let factor = scale(&tensor_data[index..index + 34])? * quantized_scale;
+                    accumulated = finite(if fused {
+                        factor.mul_add(integer as f32, accumulated)
+                    } else {
+                        accumulated + factor * integer as f32
+                    })?;
+                }
+                *target = accumulated;
+            }
+        }
+        Ok(())
+    };
+    if let Some(policy) = row_parallelism {
+        policy.update_rows(pending_slice, update_chunk)
+    } else {
+        update_chunk(0, pending_slice)
     }
 }
 

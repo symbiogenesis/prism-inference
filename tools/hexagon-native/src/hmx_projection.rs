@@ -24,13 +24,18 @@ pub const HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 64 * 1024 * 1024;
 pub const HMX_Q2_BATCH_OPERATIONS: usize = 4;
 /// Command header bytes for one buffer, twelve tensors, four operations and four reserved profile records.
 pub const HMX_Q2_BATCH_COMMAND_BYTES: usize = 24 + HMX_Q2_BATCH_OPERATIONS * (3 * 56 + 232 + 48);
+/// Fixed logical operation count in one ten-operation batched HMX bitplane packet.
+pub const HMX_Q2_BATCH10_OPERATIONS: usize = 10;
+/// Command header bytes for one buffer, thirty tensors, ten operations and ten reserved profile records.
+pub const HMX_Q2_BATCH10_COMMAND_BYTES: usize =
+    24 + HMX_Q2_BATCH10_OPERATIONS * (3 * 56 + 232 + 48);
 
 /// One terminal K=128/N=8 bitplane session's explicit lifetime and work limits.
 #[derive(Clone, Copy, Debug)]
 pub struct HmxQ2ProjectionLimits {
     pub(crate) common: Q2ProjectionLimits,
     pub(crate) resident_weight_bytes: usize,
-    pub(crate) batch_four: bool,
+    pub(crate) batch_operations: usize,
 }
 
 impl HmxQ2ProjectionLimits {
@@ -43,7 +48,7 @@ impl HmxQ2ProjectionLimits {
         Ok(Self {
             common: Q2ProjectionLimits::new(rows, operations, duration)?,
             resident_weight_bytes: 0,
-            batch_four: false,
+            batch_operations: 1,
         })
     }
 
@@ -54,23 +59,37 @@ impl HmxQ2ProjectionLimits {
     /// issuing one queue write.
     ///
     /// # Errors
-    /// Rejects sessions whose logical operation allowance is smaller than four.
+    /// Rejects sessions whose logical operation allowance is smaller than four or
+    /// that have already selected a different batch mode.
     pub const fn with_batch_four(mut self) -> Result<Self, Error> {
-        if self.common.operations < 4 {
+        if self.common.operations < 4 || self.batch_operations != 1 {
             return Err(Error::Contract);
         }
-        self.batch_four = true;
+        self.batch_operations = HMX_Q2_BATCH_OPERATIONS;
         Ok(self)
     }
 
-    /// Logical operations carried in each queue write packet (`1` or `4`).
+    /// Select the fixed ten-operation batch packet layout (`30` tensors, `10` ops).
+    ///
+    /// Logical operation capacity remains bounded by `maximum_operations` (`24,000`
+    /// ceiling), and each batch submission reserves ten logical attempts before
+    /// issuing one queue write (`4` queue writes per 40-block `5120`-column projection).
+    ///
+    /// # Errors
+    /// Rejects sessions whose logical operation allowance is smaller than ten or
+    /// that have already selected a different batch mode.
+    pub const fn with_batch_ten(mut self) -> Result<Self, Error> {
+        if self.common.operations < 10 || self.batch_operations != 1 {
+            return Err(Error::Contract);
+        }
+        self.batch_operations = HMX_Q2_BATCH10_OPERATIONS;
+        Ok(self)
+    }
+
+    /// Logical operations carried in each queue write packet (`1`, `4` or `10`).
     #[must_use]
     pub const fn batch_operations(self) -> usize {
-        if self.batch_four {
-            HMX_Q2_BATCH_OPERATIONS
-        } else {
-            1
-        }
+        self.batch_operations
     }
 
     /// Reserve an optional immutable host-mapped weight arena in the same FD.
@@ -104,10 +123,10 @@ impl HmxQ2ProjectionLimits {
     /// Maximum mapped host allocation, including the command and eight outputs.
     #[must_use]
     pub const fn allocation_bytes(self) -> usize {
-        let working = if self.batch_four {
-            batch_layout(self.common.rows).allocation
-        } else {
-            layout(self.common.rows).allocation
+        let working = match self.batch_operations {
+            HMX_Q2_BATCH_OPERATIONS => batch_layout(self.common.rows).allocation,
+            HMX_Q2_BATCH10_OPERATIONS => batch10_layout(self.common.rows).allocation,
+            _ => layout(self.common.rows).allocation,
         };
         (working + self.resident_weight_bytes).next_multiple_of(4096)
     }
@@ -324,6 +343,46 @@ pub trait HmxQ2Submitter {
         }
         Err(Error::Contract)
     }
+
+    /// Submit ten independent K=128/N=8 bitplane operations in one queue packet.
+    ///
+    /// All ten members must share the same active row extent and pass tile/plane
+    /// validation before the single packet write. All ten outputs are validated
+    /// before any caller slice is populated.
+    ///
+    /// # Errors
+    /// Rejects unconfigured ten-operation batch mode, malformed inputs, insufficient
+    /// ten-operation capacity, native failures, deadlines and invalid outputs.
+    fn submit_batch10(
+        &mut self,
+        _weights: [&[u8]; HMX_Q2_BATCH10_OPERATIONS],
+        _activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH10_OPERATIONS],
+        outputs: [&mut [f32]; HMX_Q2_BATCH10_OPERATIONS],
+    ) -> Result<(), Error> {
+        for output in outputs {
+            output.fill(f32::NAN);
+        }
+        Err(Error::Contract)
+    }
+
+    /// Submit ten previously prepared resident-weight extents in one queue packet.
+    ///
+    /// All ten handles must belong to this session and share the same row extent.
+    ///
+    /// # Errors
+    /// Rejects unconfigured ten-operation batch mode or residency, foreign handles,
+    /// insufficient capacity, native failures, deadlines and invalid outputs.
+    fn submit_resident_batch10(
+        &mut self,
+        _handles: [&HmxQ2WeightHandle; HMX_Q2_BATCH10_OPERATIONS],
+        _activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH10_OPERATIONS],
+        outputs: [&mut [f32]; HMX_Q2_BATCH10_OPERATIONS],
+    ) -> Result<(), Error> {
+        for output in outputs {
+            output.fill(f32::NAN);
+        }
+        Err(Error::Contract)
+    }
 }
 
 pub(crate) const fn layout(rows: usize) -> projection::Layout {
@@ -339,14 +398,24 @@ pub(crate) const fn layout(rows: usize) -> projection::Layout {
 }
 
 pub(crate) const fn batch_layout(rows: usize) -> projection::Layout {
+    batch_n_layout::<HMX_Q2_BATCH_OPERATIONS, 2048>(rows)
+}
+
+pub(crate) const fn batch10_layout(rows: usize) -> projection::Layout {
+    batch_n_layout::<HMX_Q2_BATCH10_OPERATIONS, 8192>(rows)
+}
+
+pub(crate) const fn batch_n_layout<const B: usize, const CMD_PAD: usize>(
+    rows: usize,
+) -> projection::Layout {
     let weights = rows / 32 * 1152;
-    let activation = (2048 + HMX_Q2_BATCH_OPERATIONS * weights).next_multiple_of(128);
-    let output = activation + HMX_Q2_BATCH_OPERATIONS * 4096;
+    let activation = (CMD_PAD + B * weights).next_multiple_of(128);
+    let output = activation + B * 4096;
     projection::Layout {
         weights,
         activation,
         output,
-        allocation: (output + HMX_Q2_BATCH_OPERATIONS * rows * 32).next_multiple_of(4096),
+        allocation: (output + B * rows * 32).next_multiple_of(4096),
     }
 }
 
@@ -416,14 +485,14 @@ pub(crate) fn validate_inputs(
     Ok(rows)
 }
 
-pub(crate) fn validate_batch4_inputs(
+pub(crate) fn validate_batch_inputs<const B: usize>(
     maximum_rows: usize,
-    weights: [&[u8]; HMX_Q2_BATCH_OPERATIONS],
-    activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
-    outputs: [usize; HMX_Q2_BATCH_OPERATIONS],
+    weights: [&[u8]; B],
+    activations: [&[[f32; 128]; 8]; B],
+    outputs: [usize; B],
 ) -> Result<usize, Error> {
     let rows = validate_inputs(maximum_rows, weights[0], activations[0], outputs[0])?;
-    for member in 1..HMX_Q2_BATCH_OPERATIONS {
+    for member in 1..B {
         if validate_inputs(
             maximum_rows,
             weights[member],
@@ -437,14 +506,14 @@ pub(crate) fn validate_batch4_inputs(
     Ok(rows)
 }
 
-pub(crate) fn validate_batch4_resident(
+pub(crate) fn validate_batch_resident<const B: usize>(
     maximum_rows: usize,
-    handles: [&HmxQ2WeightHandle; HMX_Q2_BATCH_OPERATIONS],
-    activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
-    outputs: [usize; HMX_Q2_BATCH_OPERATIONS],
+    handles: [&HmxQ2WeightHandle; B],
+    activations: [&[[f32; 128]; 8]; B],
+    outputs: [usize; B],
 ) -> Result<usize, Error> {
     let rows = handles[0].rows();
-    for member in 0..HMX_Q2_BATCH_OPERATIONS {
+    for member in 0..B {
         if handles[member].rows() != rows {
             return Err(Error::Contract);
         }
@@ -545,39 +614,39 @@ pub(crate) fn image_resident(
     Ok(active)
 }
 
-pub(crate) fn image_batch4(
+pub(crate) fn image_batch<const B: usize, const CMD_PAD: usize>(
     bytes: &mut [u8],
     base: u64,
     fd: u32,
     rows: usize,
-    weights: [&[u8]; HMX_Q2_BATCH_OPERATIONS],
-    activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
+    weights: [&[u8]; B],
+    activations: [&[[f32; 128]; 8]; B],
 ) -> Result<projection::Layout, Error> {
-    let active = batch_layout(rows);
-    let weight_offsets = std::array::from_fn(|member| 2048 + member * active.weights);
-    let active = frame_batch4(bytes, base, fd, rows, weight_offsets, activations)?;
+    let active = batch_n_layout::<B, CMD_PAD>(rows);
+    let weight_offsets = std::array::from_fn(|member| CMD_PAD + member * active.weights);
+    let active = frame_batch::<B, CMD_PAD>(bytes, base, fd, rows, weight_offsets, activations)?;
     for (member, weight) in weights.into_iter().enumerate() {
         if weight.len() != active.weights {
             return Err(Error::Contract);
         }
-        let start = 2048 + member * active.weights;
+        let start = CMD_PAD + member * active.weights;
         bytes[start..start + active.weights].copy_from_slice(weight);
     }
     Ok(active)
 }
 
-pub(crate) fn image_batch4_resident(
+pub(crate) fn image_batch_resident<const B: usize, const CMD_PAD: usize>(
     bytes: &mut [u8],
     base: u64,
     fd: u32,
     arena_start: usize,
-    handles: [&HmxQ2WeightHandle; HMX_Q2_BATCH_OPERATIONS],
-    activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
+    handles: [&HmxQ2WeightHandle; B],
+    activations: [&[[f32; 128]; 8]; B],
 ) -> Result<projection::Layout, Error> {
     let allocation = bytes.len();
     let rows = handles[0].rows;
-    let expected_weights = batch_layout(rows).weights;
-    let mut weight_offsets = [0_usize; HMX_Q2_BATCH_OPERATIONS];
+    let expected_weights = batch_n_layout::<B, CMD_PAD>(rows).weights;
+    let mut weight_offsets = [0_usize; B];
     for (member, handle) in handles.into_iter().enumerate() {
         let start = arena_start
             .checked_add(handle.range.start)
@@ -591,7 +660,7 @@ pub(crate) fn image_batch4_resident(
         weight_offsets[member] = start;
     }
     let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
-    let active = frame_batch4(working, base, fd, rows, weight_offsets, activations)?;
+    let active = frame_batch::<B, CMD_PAD>(working, base, fd, rows, weight_offsets, activations)?;
     put64(
         bytes,
         8,
@@ -602,25 +671,25 @@ pub(crate) fn image_batch4_resident(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep twelve tensor descriptors, four op descriptors and four poison regions auditable together"
+    reason = "Keep batched tensor descriptors, op descriptors and output poison regions auditable together"
 )]
-fn frame_batch4(
+fn frame_batch<const B: usize, const CMD_PAD: usize>(
     bytes: &mut [u8],
     base: u64,
     fd: u32,
     rows: usize,
-    weight_offsets: [usize; HMX_Q2_BATCH_OPERATIONS],
-    activations: [&[[f32; 128]; 8]; HMX_Q2_BATCH_OPERATIONS],
+    weight_offsets: [usize; B],
+    activations: [&[[f32; 128]; 8]; B],
 ) -> Result<projection::Layout, Error> {
-    let active = batch_layout(rows);
+    let active = batch_n_layout::<B, CMD_PAD>(rows);
     if bytes.len() < active.allocation
-        || bytes.len() > batch_layout(projection::Q2_PROJECTION_MAX_ROWS).allocation
+        || bytes.len() > batch_n_layout::<B, CMD_PAD>(projection::Q2_PROJECTION_MAX_ROWS).allocation
     {
         return Err(Error::Contract);
     }
     let mut single = [0_u8; 1024];
     write_single_header(&mut single, base, bytes.len(), fd, rows, layout(rows))?;
-    bytes[..2048].fill(0);
+    bytes[..CMD_PAD].fill(0);
     bytes[..24].copy_from_slice(&single[..24]);
     put64(
         bytes,
@@ -628,7 +697,8 @@ fn frame_batch4(
         u64::try_from(bytes.len()).map_err(|_| Error::Contract)?,
     );
     let member_output_bytes = rows * 32;
-    for member in 0..HMX_Q2_BATCH_OPERATIONS {
+    let operations_base = 24 + B * 3 * 56;
+    for member in 0..B {
         let ti_base = u16::try_from(member * 3).map_err(|_| Error::Contract)?;
         let weight_desc = 24 + (member * 3) * 56;
         let act_desc = weight_desc + 56;
@@ -656,7 +726,7 @@ fn frame_batch4(
             u64::try_from(member_output).map_err(|_| Error::Contract)?,
         );
         put16(bytes, out_desc + 22, ti_base + 2);
-        let operation_desc = 696 + member * 232;
+        let operation_desc = operations_base + member * 232;
         bytes[operation_desc..operation_desc + 232].copy_from_slice(&single[192..424]);
         put16(bytes, operation_desc + 200, ti_base);
         put16(bytes, operation_desc + 202, ti_base + 1);
@@ -670,7 +740,7 @@ fn frame_batch4(
             *dst = value.to_bits().to_le_bytes();
         }
     }
-    let total_output_words = HMX_Q2_BATCH_OPERATIONS * rows * 8;
+    let total_output_words = B * rows * 8;
     for dst in bytes[active.output..active.output + total_output_words * 4]
         .as_chunks_mut::<4>()
         .0
@@ -1003,12 +1073,12 @@ mod tests {
             &activations[3],
         ];
         assert_eq!(
-            validate_batch4_inputs(32, [&weights; 4], activation_refs, [256; 4])?,
+            validate_batch_inputs::<4>(32, [&weights; 4], activation_refs, [256; 4])?,
             32
         );
         let working = batch_layout(32);
         let mut streaming = vec![0xa5; working.allocation];
-        image_batch4(
+        image_batch::<4, 2048>(
             &mut streaming,
             0x1234_5600,
             7,
@@ -1082,7 +1152,7 @@ mod tests {
         let arena_snapshot = resident[working.allocation..].to_vec();
         // Simulate DSP pointer rewrites in the command header before regenerating.
         resident[24..696].fill(0xff);
-        image_batch4_resident(
+        image_batch_resident::<4, 2048>(
             &mut resident,
             0x1234_5600,
             7,
@@ -1092,6 +1162,154 @@ mod tests {
         )?;
         assert_eq!(&resident[working.allocation..], &arena_snapshot);
         for member in 0..4 {
+            let w_desc = 24 + member * 3 * 56;
+            let expected = working.allocation + member * 1152;
+            assert_eq!(
+                &resident[w_desc..w_desc + 8],
+                &u64::try_from(expected)
+                    .map_err(|_| Error::Contract)?
+                    .to_le_bytes()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep both streaming and resident batch-ten frame layout checks together"
+    )]
+    fn batch10_frame_builds_thirty_tensors_ten_ops_and_preserves_resident_arena()
+    -> Result<(), Error> {
+        assert_eq!(HMX_Q2_BATCH10_OPERATIONS, 10);
+        assert_eq!(HMX_Q2_BATCH10_COMMAND_BYTES, 4504);
+        assert!(
+            HmxQ2ProjectionLimits::new(32, 9, Duration::from_secs(4))?
+                .with_batch_ten()
+                .is_err()
+        );
+        assert!(
+            HmxQ2ProjectionLimits::new(32, 40, Duration::from_secs(4))?
+                .with_batch_four()?
+                .with_batch_ten()
+                .is_err()
+        );
+        let full =
+            HmxQ2ProjectionLimits::new(17_408, 40, Duration::from_secs(20))?.with_batch_ten()?;
+        assert_eq!(full.batch_operations(), 10);
+        assert_eq!(full.allocation_bytes(), 11_886_592);
+        assert_eq!(
+            full.with_resident_weights(25_067_520)?.allocation_bytes(),
+            36_954_112
+        );
+        assert_eq!(
+            full.with_resident_weights(2 * 25_067_520)?
+                .allocation_bytes(),
+            62_021_632
+        );
+        let mut weights = vec![0x55; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let activations: [[[f32; 128]; 8]; 10] = std::array::from_fn(|member| {
+            let mut planes = [[0.0_f32; 128]; 8];
+            planes[member % 8][member / 8] = 1.0;
+            planes
+        });
+        let activation_refs: [&[[f32; 128]; 8]; 10] =
+            std::array::from_fn(|member| &activations[member]);
+        assert_eq!(
+            validate_batch_inputs::<10>(32, [&weights; 10], activation_refs, [256; 10])?,
+            32
+        );
+        let working = batch10_layout(32);
+        let mut streaming = vec![0xa5; working.allocation];
+        image_batch::<10, 8192>(
+            &mut streaming,
+            0x1234_5600,
+            7,
+            32,
+            [&weights; 10],
+            activation_refs,
+        )?;
+        assert_eq!(&streaming[4024..8192], &[0; 4168]);
+        for member in 0..10 {
+            let weight_desc = 24 + member * 3 * 56;
+            let act_desc = weight_desc + 56;
+            let out_desc = act_desc + 56;
+            let operation_desc = 1704 + member * 232;
+            let ti = u16::try_from(member * 3).map_err(|_| Error::Contract)?;
+            assert_eq!(
+                &streaming[weight_desc..weight_desc + 8],
+                &u64::try_from(8192 + member * 1152)
+                    .map_err(|_| Error::Contract)?
+                    .to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[weight_desc + 22..weight_desc + 24],
+                &ti.to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[act_desc..act_desc + 8],
+                &u64::try_from(working.activation + member * 4096)
+                    .map_err(|_| Error::Contract)?
+                    .to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[act_desc + 22..act_desc + 24],
+                &(ti + 1).to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[out_desc..out_desc + 8],
+                &u64::try_from(working.output + member * 1024)
+                    .map_err(|_| Error::Contract)?
+                    .to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[out_desc + 22..out_desc + 24],
+                &(ti + 2).to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[operation_desc + 200..operation_desc + 202],
+                &ti.to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[operation_desc + 202..operation_desc + 204],
+                &(ti + 1).to_le_bytes()
+            );
+            assert_eq!(
+                &streaming[operation_desc + 220..operation_desc + 222],
+                &(ti + 2).to_le_bytes()
+            );
+            assert!(!output_valid(
+                &streaming[working.output + member * 1024..working.output + (member + 1) * 1024]
+            ));
+        }
+        let mut registry = HmxQ2WeightRegistry::new(10 * 1152)?;
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            handles.push(registry.prepare(&weights)?.ok_or(Error::Contract)?);
+        }
+        let handle_refs: [&HmxQ2WeightHandle; 10] = std::array::from_fn(|member| &handles[member]);
+        let mut resident = vec![0xa5; working.allocation + 12_288];
+        for member in 0..10 {
+            let start = working.allocation + member * 1152;
+            resident[start..start + 1152].copy_from_slice(&weights);
+        }
+        let arena_snapshot = resident[working.allocation..].to_vec();
+        resident[24..1704].fill(0xff);
+        image_batch_resident::<10, 8192>(
+            &mut resident,
+            0x1234_5600,
+            7,
+            working.allocation,
+            handle_refs,
+            activation_refs,
+        )?;
+        assert_eq!(&resident[working.allocation..], &arena_snapshot);
+        for member in 0..10 {
             let w_desc = 24 + member * 3 * 56;
             let expected = working.allocation + member * 1152;
             assert_eq!(

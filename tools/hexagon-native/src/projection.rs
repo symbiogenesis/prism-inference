@@ -119,7 +119,7 @@ pub trait GuardedQ2Submitter {
 pub struct Q2ProjectionReport {
     /// Exact native setup, latest queue operation and explicit cleanup receipts.
     pub queue: QueueComputeReport,
-    /// Logical operations carried in each queue packet (1 or 4).
+    /// Logical operations carried in each queue packet (1, 4 or 10).
     pub batch_operations: u32,
     /// Number of queue packet writes attempted, including a refused/uncertain final write.
     pub queue_writes_submitted: u32,
@@ -177,7 +177,7 @@ impl Q2ProjectionReport {
     pub const fn completed_cycle(self) -> bool {
         self.work_completed
             && !self.deadline_expired
-            && matches!(self.batch_operations, 1 | 4)
+            && matches!(self.batch_operations, 1 | 4 | 10)
             && self.queue_writes_submitted > 0
             && self.queue_writes_submitted == self.queue_writes_completed
             && self.operations_submitted > 0
@@ -220,7 +220,7 @@ pub(crate) fn request_batch(
     sequence: u64,
     batch_operations: u32,
 ) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
-    if !matches!(batch_operations, 1 | 4) {
+    if !matches!(batch_operations, 1 | 4 | 10) {
         return Err(Error::Contract);
     }
     let mut result = request(sequence);
@@ -235,7 +235,7 @@ pub(crate) fn response_valid(bytes: &[u8], sequence: u64) -> bool {
 }
 
 pub(crate) fn response_batch_valid(bytes: &[u8], sequence: u64, batch_operations: u32) -> bool {
-    if !matches!(batch_operations, 1 | 4)
+    if !matches!(batch_operations, 1 | 4 | 10)
         || sequence == 0
         || bytes.len() != compute::COMPUTE_RESPONSE_BYTES
     {
@@ -429,6 +429,16 @@ mod tests {
         assert!(response_batch_valid(&bytes, 42, 4));
         assert!(!response_batch_valid(&bytes, 41, 4));
         assert!(!response_valid(&bytes, 42));
+        let batch10_req = request_batch(9, 10)?;
+        assert_eq!(&batch10_req[..8], &9_u64.to_le_bytes());
+        assert_eq!(
+            &batch10_req[8..24],
+            &[1, 0, 0, 0, 30, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0]
+        );
+        put32(&mut bytes, 32, 30);
+        put32(&mut bytes, 36, 10);
+        assert!(response_batch_valid(&bytes, 42, 10));
+        assert!(!response_batch_valid(&bytes, 42, 4));
         Ok(())
     }
 

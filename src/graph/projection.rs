@@ -11,13 +11,10 @@ struct Work {
 
 fn projection_operations(executor: &dyn Pq2ProjectionExecutor, tensor: &Tensor) -> Result<u64> {
     let columns = tensor.dimensions[0];
-    let selected = if tensor.kind == 142 && columns.is_multiple_of(256) {
-        executor.supports(tensor)
-    } else if matches!(tensor.kind, 142 | 143) {
-        executor.supports_q8(tensor)
-    } else {
-        false
-    };
+    let selected =
+        (tensor.kind == 142 && columns.is_multiple_of(128) && executor.supports_f32(tensor))
+            || (tensor.kind == 142 && columns.is_multiple_of(256) && executor.supports(tensor))
+            || (matches!(tensor.kind, 142 | 143) && executor.supports_q8(tensor));
     if !selected {
         return Ok(0);
     }

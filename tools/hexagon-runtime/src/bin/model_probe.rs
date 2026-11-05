@@ -27,7 +27,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bonsai_hexagon_runtime::{GuardedQ2Executor, HmxQ2Executor, PlacedProjectionExecutor};
+use bonsai_hexagon_runtime::{
+    GuardedQ2Executor, HmxQ2Executor, NativeQ2Executor, PlacedProjectionExecutor,
+};
 use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{Qwen35, StateComponent},
@@ -36,7 +38,8 @@ use bonsai_prism_runtime::{
 };
 use hexagon_native_rpc::{
     Driver, DriverLocation, Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter,
-    HmxQ2WeightHandle, Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
+    HmxQ2WeightHandle, NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle,
+    Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -155,6 +158,7 @@ enum ExecutionBackend {
     #[default]
     GuardedHvx,
     HmxBitplane,
+    NativeQ2,
 }
 
 impl ExecutionBackend {
@@ -162,6 +166,14 @@ impl ExecutionBackend {
         match self {
             Self::GuardedHvx => "guarded-hvx",
             Self::HmxBitplane => "hmx-bitplane",
+            Self::NativeQ2 => "native-q2",
+        }
+    }
+
+    const fn operations_per_projection(self) -> u32 {
+        match self {
+            Self::GuardedHvx | Self::HmxBitplane => 40,
+            Self::NativeQ2 => 1,
         }
     }
 
@@ -169,6 +181,7 @@ impl ExecutionBackend {
         match self {
             Self::GuardedHvx => 1_392_640,
             Self::HmxBitplane => 5_570_560,
+            Self::NativeQ2 => 0,
         }
     }
 }
@@ -281,9 +294,14 @@ impl Request {
                 && (1..=bonsai_prism_runtime::graph::MAX_STATE_BYTES)
                     .contains(&self.state_budget_bytes)
                 && (1..=MAX_HOST_PAYLOAD).contains(&self.maximum_owned_payload_bytes)
-                && self.maximum_operations >= u32::try_from(tokens.len() * projections.len())? * 40
+                && self.maximum_operations
+                    >= u32::try_from(tokens.len() * projections.len())?
+                        * self.execution_backend.operations_per_projection()
                 && (!self.resident_host_weights
-                    || self.execution_backend == ExecutionBackend::HmxBitplane)
+                    || matches!(
+                        self.execution_backend,
+                        ExecutionBackend::HmxBitplane | ExecutionBackend::NativeQ2
+                    ))
                 && (batch_ops == 1
                     || (self.execution_backend == ExecutionBackend::HmxBitplane
                         && self.maximum_operations.is_multiple_of(batch_ops)))
@@ -1018,6 +1036,169 @@ impl HmxQ2Submitter for TimedHmxSubmitter<'_> {
     }
 }
 
+struct TimedNativeQ2Submitter<'a> {
+    native: &'a mut dyn NativeQ2Submitter,
+    timings: &'a SubmitTimings,
+    resident_only: bool,
+    failed: bool,
+}
+
+impl NativeQ2Submitter for TimedNativeQ2Submitter<'_> {
+    fn remaining_operations(&self) -> Option<u64> {
+        if self.failed {
+            Some(0)
+        } else {
+            self.native.remaining_operations()
+        }
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        if self.failed || !self.resident_only {
+            0
+        } else {
+            self.native.residency_capacity_bytes()
+        }
+    }
+
+    fn prepare_weights(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+    ) -> std::result::Result<Option<NativeQ2WeightHandle>, Error> {
+        if self.failed || !self.resident_only {
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let handle = self.native.prepare_weights(columns, rows, weights)?;
+        if handle.is_some() {
+            self.failed = false;
+        }
+        Ok(handle)
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        if self.failed || !self.resident_only {
+            output.fill(f32::NAN);
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let result = timed(&self.timings.native, || {
+            self.native.submit_resident(handle, activation, output)
+        });
+        if result.is_ok() {
+            self.failed = false;
+        } else {
+            output.fill(f32::NAN);
+        }
+        result
+    }
+
+    fn submit(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> std::result::Result<(), Error> {
+        if self.failed || self.resident_only {
+            output.fill(f32::NAN);
+            return Err(Error::Contract);
+        }
+        self.failed = true;
+        let result = timed(&self.timings.native, || {
+            self.native
+                .submit(columns, rows, weights, activation, output)
+        });
+        if result.is_ok() {
+            self.failed = false;
+        } else {
+            output.fill(f32::NAN);
+        }
+        result
+    }
+}
+
+#[cfg(any(windows, test))]
+fn top5_indices(values: &[f32]) -> [usize; 5] {
+    let mut top = [(0_usize, f32::NEG_INFINITY); 5];
+    for (idx, &val) in values.iter().enumerate() {
+        if val > top[4].1 {
+            top[4] = (idx, val);
+            for k in (0..4).rev() {
+                if top[k + 1].1 > top[k].1 {
+                    top.swap(k, k + 1);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    std::array::from_fn(|i| top[i].0)
+}
+
+#[cfg(any(windows, test))]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "Vocabulary size (248,320) fits exactly in f64."
+)]
+fn compute_logits_tolerance(actual: &[f32], expected: &[f32]) -> Result<(bool, Value)> {
+    require(actual.len() == expected.len() && !actual.is_empty())?;
+    let mut max_abs_diff = 0.0_f64;
+    let mut sum_abs_diff = 0.0_f64;
+    let mut sum_sq_diff = 0.0_f64;
+    let mut dot = 0.0_f64;
+    let mut norm_actual = 0.0_f64;
+    let mut norm_expected = 0.0_f64;
+    for (&act, &exp) in actual.iter().zip(expected) {
+        require(act.is_finite() && exp.is_finite())?;
+        let act_f64 = f64::from(act);
+        let exp_f64 = f64::from(exp);
+        let diff = (act_f64 - exp_f64).abs();
+        if diff > max_abs_diff {
+            max_abs_diff = diff;
+        }
+        sum_abs_diff += diff;
+        sum_sq_diff = f64::mul_add(diff, diff, sum_sq_diff);
+        dot = f64::mul_add(act_f64, exp_f64, dot);
+        norm_actual = f64::mul_add(act_f64, act_f64, norm_actual);
+        norm_expected = f64::mul_add(exp_f64, exp_f64, norm_expected);
+    }
+    let count = actual.len() as f64;
+    let mean_abs_diff = sum_abs_diff / count;
+    let rmse = (sum_sq_diff / count).sqrt();
+    let denom = (norm_actual * norm_expected).sqrt();
+    let cosine_similarity = if denom > 0.0 { dot / denom } else { 1.0 };
+    let cpu_top5 = top5_indices(expected);
+    let npu_top5 = top5_indices(actual);
+    let top1_match = cpu_top5[0] == npu_top5[0];
+    let top5_overlap = npu_top5
+        .iter()
+        .filter(|&&idx| cpu_top5.contains(&idx))
+        .count();
+    let pass = cosine_similarity >= 0.995 && rmse <= 0.5 && max_abs_diff <= 5.0;
+    Ok((
+        pass,
+        json!({
+            "maxAbsDiff": max_abs_diff,
+            "meanAbsDiff": mean_abs_diff,
+            "rmse": rmse,
+            "cosineSimilarity": cosine_similarity,
+            "cpuTop1Token": cpu_top5[0],
+            "npuTop1Token": npu_top5[0],
+            "top1Match": top1_match,
+            "top5Overlap": top5_overlap,
+        }),
+    ))
+}
+
 #[cfg(windows)]
 fn compare_graph_sequence(
     graph: Qwen35,
@@ -1036,6 +1217,8 @@ fn compare_graph_sequence(
     projected.admit_work(0, request.tokens().len())?;
     let mut comparisons = Vec::new();
     comparisons.try_reserve_exact(controls.len())?;
+    let mut all_logits_bitwise = true;
+    let mut all_state_bitwise = true;
     for (index, (&token, control)) in request.tokens().iter().zip(controls).enumerate() {
         parent.ensure_alive()?;
         let submit_before = timings.native.get();
@@ -1049,27 +1232,41 @@ fn compare_graph_sequence(
             timings.native.get().saturating_sub(submit_before),
             timings.oracle.get().saturating_sub(oracle_before),
         );
-        require(
-            actual.len() == control.logits.len()
-                && actual
-                    .iter()
-                    .zip(&control.logits)
-                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
-        )?;
-        compare_state(projected.decoder(), &control.rows)?;
+        let logits_bitwise = actual.len() == control.logits.len()
+            && actual
+                .iter()
+                .zip(&control.logits)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits());
         let actual_state = state_digest(projected.decoder())?;
-        require(actual_state == control.state_sha256)?;
-        comparisons.push(json!({"index":index,"tokenId":token,
-            "logitsBitwiseEqual":true,"stateBitwiseEqual":true,
-            "logitsSha256":logits_digest(&actual)?,"stateSha256":actual_state,
-            "timing":token_timing}));
+        let state_bitwise = compare_state(projected.decoder(), &control.rows).is_ok()
+            && actual_state == control.state_sha256;
+        all_logits_bitwise &= logits_bitwise;
+        all_state_bitwise &= state_bitwise;
+        if request.execution_backend == ExecutionBackend::NativeQ2 {
+            let (tol_pass, tol_json) = compute_logits_tolerance(&actual, &control.logits)?;
+            require(tol_pass)?;
+            comparisons.push(json!({"index":index,"tokenId":token,
+                "logitsBitwiseEqual":logits_bitwise,"stateBitwiseEqual":state_bitwise,
+                "logitsBoundedTolerancePass":true,"numericalTolerance":tol_json,
+                "logitsSha256":logits_digest(&actual)?,"stateSha256":actual_state,
+                "timing":token_timing}));
+        } else {
+            require(logits_bitwise && state_bitwise)?;
+            comparisons.push(json!({"index":index,"tokenId":token,
+                "logitsBitwiseEqual":true,"stateBitwiseEqual":true,
+                "logitsSha256":logits_digest(&actual)?,"stateSha256":actual_state,
+                "timing":token_timing}));
+        }
     }
     let last = comparisons.last().ok_or_else(reject)?;
-    Ok(
-        json!({"placementIdentity":projected.identity(),"tokenComparisons":comparisons,
-        "logitsBitwiseEqual":true,"stateBitwiseEqual":true,
-        "logitsSha256":last["logitsSha256"],"stateSha256":last["stateSha256"]}),
-    )
+    let mut summary = json!({"placementIdentity":projected.identity(),"tokenComparisons":comparisons,
+        "logitsBitwiseEqual":all_logits_bitwise,"stateBitwiseEqual":all_state_bitwise,
+        "logitsSha256":last["logitsSha256"],"stateSha256":last["stateSha256"]});
+    if request.execution_backend == ExecutionBackend::NativeQ2 {
+        summary["logitsBoundedTolerancePass"] = json!(true);
+        summary["numericalTolerance"] = last["numericalTolerance"].clone();
+    }
+    Ok(summary)
 }
 
 fn check_statistics(
@@ -1081,6 +1278,7 @@ fn check_statistics(
     let tokens = u64::try_from(request.tokens().len())?;
     let projections = u64::try_from(request.projection_names().len())?;
     let total_projections = tokens * projections;
+    let ops_per_proj = u64::from(request.execution_backend.operations_per_projection());
     require(
         !failed
             && compared
@@ -1090,8 +1288,8 @@ fn check_statistics(
                     request.execution_backend.values_per_token() * total_projections
                 }
             && statistics.projections_completed == total_projections
-            && statistics.operations_completed == total_projections * 40
-            && statistics.operations_attempted == total_projections * 40,
+            && statistics.operations_completed == total_projections * ops_per_proj
+            && statistics.operations_attempted == total_projections * ops_per_proj,
     )
 }
 
@@ -1332,6 +1530,94 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                     },
                 )
             }
+            ExecutionBackend::NativeQ2 => {
+                let resident_weight_bytes = RESIDENT_WEIGHT_BYTES * projection_count;
+                let mut native_limits = NativeQ2ProjectionLimits::new(
+                    5120,
+                    17_408,
+                    request.maximum_operations,
+                    Duration::from_secs(request.session_seconds),
+                )?;
+                if request.resident_host_weights {
+                    native_limits = native_limits.with_resident_weights(resident_weight_bytes)?;
+                }
+                driver.reference_native_q2_projection(
+                    &request.package_directory,
+                    native_limits,
+                    progress,
+                    |native| {
+                        let work = (|| -> Result<()> {
+                            let expected_writes =
+                                u64::try_from(request.tokens().len() * projection_count)?;
+                            let mut timed = TimedNativeQ2Submitter {
+                                native,
+                                timings: &submit_timings,
+                                resident_only: request.resident_host_weights,
+                                failed: false,
+                            };
+                            let (
+                                mut value,
+                                statistics,
+                                residency,
+                                writes_attempted,
+                                writes_completed,
+                            ) = {
+                                let mut executor = NativeQ2Executor::new(
+                                    &mut timed,
+                                    native_limits,
+                                    request.maximum_owned_payload_bytes,
+                                );
+                                if request.resident_host_weights {
+                                    executor =
+                                        executor.with_resident_weights(RESIDENT_METADATA_BYTES)?;
+                                }
+                                let value = compare_graph_sequence(
+                                    graph,
+                                    &mut executor,
+                                    &placement_model,
+                                    &controls,
+                                    request,
+                                    &parent,
+                                    &submit_timings,
+                                )?;
+                                (
+                                    value,
+                                    executor.statistics(),
+                                    executor.residency_statistics(),
+                                    executor.queue_writes_attempted(),
+                                    executor.queue_writes_completed(),
+                                )
+                            };
+                            check_statistics(statistics, 0, timed.failed, request)?;
+                            require(
+                                writes_attempted == expected_writes
+                                    && writes_completed == expected_writes,
+                            )?;
+                            if request.resident_host_weights {
+                                let projections_u64 = u64::try_from(projection_count)?;
+                                require(
+                                    residency.tensors_prepared == projections_u64
+                                        && residency.cache_hits
+                                            == projections_u64
+                                                * u64::try_from(request.tokens().len() - 1)?
+                                        && residency.weight_payload_bytes_prepared
+                                            == u64::try_from(resident_weight_bytes)?
+                                        && (1..=RESIDENT_METADATA_BYTES)
+                                            .contains(&residency.metadata_payload_bytes),
+                                )?;
+                                value["hostResidency"] = json!({
+                                    "tensorsPrepared":residency.tensors_prepared,
+                                    "cacheHits":residency.cache_hits,
+                                    "weightPayloadBytesPrepared":residency.weight_payload_bytes_prepared,
+                                    "metadataPayloadBytes":residency.metadata_payload_bytes,
+                                });
+                            }
+                            accept(value, statistics, 0)
+                        })();
+                        work.map_err(|_| Error::Contract)
+                    },
+                )
+            }
         }
     })();
     let npu_power_after = power_value();
@@ -1346,8 +1632,9 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
             == (request.execution_backend == ExecutionBackend::HmxBitplane),
     )?;
     let expected_batch = request.batch_operations()?;
+    let ops_per_proj = request.execution_backend.operations_per_projection();
     let expected_writes =
-        u32::try_from(request.tokens().len() * projection_count)? * (40 / expected_batch);
+        u32::try_from(request.tokens().len() * projection_count)? * (ops_per_proj / expected_batch);
     require(
         report.batch_operations == expected_batch
             && report.queue_writes_submitted == expected_writes
@@ -1368,7 +1655,9 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["residentHostWeights"] = json!(request.resident_host_weights);
     value["batchFourOperations"] = json!(request.batch_four_operations);
     value["batchTenOperations"] = json!(request.batch_ten_operations);
-    value["integerAudit"] = json!(if request.resident_host_weights {
+    value["integerAudit"] = json!(if request.execution_backend == ExecutionBackend::NativeQ2 {
+        "bounded-float-tolerance"
+    } else if request.resident_host_weights {
         "graph-parity-only"
     } else {
         "all-returned-integers"
@@ -2306,6 +2595,61 @@ mod tests {
                     .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn model_probe_native_q2_admission_and_bounded_tolerance() -> Result<()> {
+        let mut native_req = request();
+        native_req["tokenIds"] = json!([42, 43, 128]);
+        native_req["tokenId"] = json!(42);
+        native_req["contextLimit"] = json!(3);
+        native_req["executionBackend"] = json!("native-q2");
+        native_req["residentHostWeights"] = json!(true);
+        native_req["projections"] = json!(["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight"]);
+        native_req["maximumOperations"] = json!(6);
+        let parsed: Request = serde_json::from_value(native_req.clone())?;
+        assert!(parsed.execution_backend == ExecutionBackend::NativeQ2);
+        assert_eq!(parsed.execution_backend.name(), "native-q2");
+        assert_eq!(parsed.execution_backend.operations_per_projection(), 1);
+        assert_eq!(parsed.execution_backend.values_per_token(), 0);
+        parsed.limits()?;
+        check_statistics(
+            bonsai_hexagon_runtime::ProjectionStatistics {
+                projections_completed: 6,
+                operations_attempted: 6,
+                operations_completed: 6,
+            },
+            0,
+            false,
+            &parsed,
+        )?;
+        let mut wrong_ops = native_req.clone();
+        wrong_ops["maximumOperations"] = json!(5);
+        assert!(
+            serde_json::from_value::<Request>(wrong_ops)?
+                .limits()
+                .is_err()
+        );
+        let mut wrong_batch = native_req;
+        wrong_batch["batchFourOperations"] = json!(true);
+        assert!(
+            serde_json::from_value::<Request>(wrong_batch)?
+                .limits()
+                .is_err()
+        );
+
+        let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
+        let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];
+        let (pass, tol) = compute_logits_tolerance(&actual, &expected)?;
+        assert!(pass);
+        assert_eq!(tol["cpuTop1Token"], json!(3));
+        assert_eq!(tol["npuTop1Token"], json!(3));
+        assert_eq!(tol["top1Match"], json!(true));
+        assert_eq!(tol["top5Overlap"], json!(5));
+        let diverged = [-10.0_f32, -2.0, -3.0, -1.0, -5.0, -4.0];
+        let (div_pass, _) = compute_logits_tolerance(&diverged, &expected)?;
+        assert!(!div_pass);
         Ok(())
     }
 }

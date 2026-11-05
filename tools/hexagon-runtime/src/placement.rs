@@ -15,6 +15,7 @@ const MAX_SELECTIONS: usize = 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Route {
+    F32,
     Q8K,
     Q8,
 }
@@ -77,9 +78,14 @@ impl<'a> PlacedProjectionExecutor<'a> {
                 .get(name)
                 .filter(|tensor| tensor.name == name && tensor.dimensions.len() == 2)
                 .ok_or_else(|| invalid("unknown projection placement tensor"))?;
-            let route = match (tensor.kind, tensor.dimensions[0].is_multiple_of(256)) {
-                (142, true) if executor.supports(tensor) => Route::Q8K,
-                (142, false) | (143, _) if executor.supports_q8(tensor) => Route::Q8,
+            let route = match (
+                tensor.kind,
+                tensor.dimensions[0].is_multiple_of(128),
+                tensor.dimensions[0].is_multiple_of(256),
+            ) {
+                (142, true, _) if executor.supports_f32(tensor) => Route::F32,
+                (142, _, true) if executor.supports(tensor) => Route::Q8K,
+                (142, _, false) | (143, _, _) if executor.supports_q8(tensor) => Route::Q8,
                 _ => return Err(invalid("unsupported explicit projection placement tensor")),
             };
             let operations = executor.operation_count(tensor);
@@ -199,6 +205,11 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
             .is_some_and(|selection| selection.route == Route::Q8)
     }
 
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        self.selection(tensor)
+            .is_some_and(|selection| selection.route == Route::F32)
+    }
+
     fn project(
         &mut self,
         tensor: &Tensor,
@@ -230,6 +241,27 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
             return Err(invalid("unavailable explicit Q8_0 projection placement"));
         }
         let result = self.executor.project_q8(tensor, activation, pinned, output);
+        if result.is_err() {
+            self.faulted = true;
+            output.clear();
+        }
+        result
+    }
+
+    fn project_f32(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        output.clear();
+        if self.faulted || !self.supports_f32(tensor) {
+            return Err(invalid("unavailable explicit F32 projection placement"));
+        }
+        let result = self
+            .executor
+            .project_f32(tensor, activation, pinned, output);
         if result.is_err() {
             self.faulted = true;
             output.clear();

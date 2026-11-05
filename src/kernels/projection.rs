@@ -85,6 +85,27 @@ pub trait Pq2ProjectionExecutor {
     ) -> Result<()> {
         Err(invalid("projection executor does not support Q8_0"))
     }
+
+    /// Opt in to direct full-`K` `F32` activation submission for `PQ2_0` tensors.
+    ///
+    /// Existing bitplane and integer-guarded executors leave this `false`.
+    fn supports_f32(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    /// Execute a complete `PQ2_0` projection directly from the `F32` activation vector.
+    ///
+    /// # Errors
+    /// Rejects unsupported arithmetic, submission failures and invalid output.
+    fn project_f32(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[f32],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(invalid("projection executor does not support direct F32"))
+    }
 }
 
 impl PreparedMatvec<'_> {
@@ -112,7 +133,15 @@ impl PreparedMatvec<'_> {
                     "incompatible prepared projection executor activation",
                 ));
             }
-            if tensor.kind == PQ2 && columns.is_multiple_of(256) && executor.supports(tensor) {
+            if tensor.kind == PQ2 && columns.is_multiple_of(128) && executor.supports_f32(tensor) {
+                executor.project_f32(
+                    tensor,
+                    self.input,
+                    self.scratch.pinned_accumulation,
+                    output,
+                )?;
+            } else if tensor.kind == PQ2 && columns.is_multiple_of(256) && executor.supports(tensor)
+            {
                 executor.project(
                     tensor,
                     &self.scratch.q8k,

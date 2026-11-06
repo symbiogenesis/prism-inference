@@ -246,7 +246,7 @@ mod tests {
             for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
                 logits[index] = value;
                 assert!(actual.sample(&logits).is_err());
-                assert!(actual.backing.is_empty());
+                assert_eq!(actual.backing.len(), 0);
                 assert_eq!(actual.backing.as_ptr(), allocation);
                 assert_eq!(actual.backing.capacity(), capacity);
                 logits[index] = 0.0;

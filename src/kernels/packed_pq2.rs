@@ -240,13 +240,13 @@ mod tests {
         for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
             scratch = MatvecScratch::with_backend(backend);
             assert!(matvec_into(&bad, &input, &mut output, &mut scratch).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [0.0_f32; 0]);
             assert!(!scratch.diagnostics().succeeded);
             matvec_into(&tensor, &input, &mut output, &mut scratch)?;
             assert_eq!(output.len(), 3);
             input[0] = f32::NAN;
             assert!(matvec_into(&tensor, &input, &mut output, &mut scratch).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [0.0_f32; 0]);
             assert!(scratch.pq2_consumption.is_empty());
             input[0] = 1.0;
         }

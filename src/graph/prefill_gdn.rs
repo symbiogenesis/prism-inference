@@ -294,7 +294,7 @@ mod tests {
                 for element in &mut expected {
                     *element *= input.decay;
                 }
-                for (row, &value) in expected.chunks_exact_mut(2).zip(input.value) {
+                for (row, &value) in expected.as_chunks_mut::<2>().0.iter_mut().zip(input.value) {
                     let predicted = row[0] * input.key[0] + row[1] * input.key[1];
                     let delta = (value - predicted) * input.beta;
                     for (element, &key) in row.iter_mut().zip(input.key) {

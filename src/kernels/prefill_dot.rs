@@ -26,6 +26,10 @@ pub(super) enum Block {
 }
 
 impl Block {
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "Only the scalar fallback is constant; retain one signature across targets and feature sets."
+    )]
     pub(super) fn new(weights: [i16; 128], backend: MatvecBackend) -> Self {
         #[cfg(all(
             feature = "experimental-neon",

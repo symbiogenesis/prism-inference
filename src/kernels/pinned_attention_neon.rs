@@ -82,6 +82,10 @@ mod tests {
     }
 
     #[derive(serde::Deserialize)]
+    #[allow(
+        clippy::struct_field_names,
+        reason = "Field names match the immutable JSON fixture schema."
+    )]
     struct WeightedValue {
         value_half_bits: Vec<u16>,
         probability_half_bits: Vec<u16>,
@@ -99,7 +103,7 @@ mod tests {
             "../../tests/fixtures/swift-attention-dot.json"
         ))?;
         let captured = capture.weighted_value;
-        assert!(!captured.value_half_bits.is_empty());
+        assert_ne!(captured.value_half_bits, [0_u16; 0]);
         let last = captured.value_half_bits.len() - 1;
         let rows: Vec<_> = captured.value_half_bits[..last]
             .iter()

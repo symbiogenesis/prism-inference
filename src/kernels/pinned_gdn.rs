@@ -79,6 +79,7 @@ pub(super) fn dot_scalar(first: &[f32], second: &[f32]) -> Result<f32> {
 ///
 /// # Errors
 /// Rejects unequal vector lengths before mutation, or a nonfinite dot result.
+#[cfg(test)]
 pub(crate) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
     if state.len() != key.len() {
         return Err(invalid("pinned GDN dot requires matching vectors"));
@@ -95,6 +96,35 @@ pub(crate) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Resul
     }
     for element in state.iter_mut() {
         *element *= decay;
+    }
+    dot_scalar(state, key)
+}
+
+/// Scales `previous` by `decay` into `state` and computes its pinned NEON F32 dot with `key` in a single pass.
+///
+/// # Errors
+/// Rejects unequal vector lengths before mutation, or a nonfinite dot result.
+pub(crate) fn decay_and_dot_from(
+    previous: &[f32],
+    state: &mut [f32],
+    key: &[f32],
+    decay: f32,
+) -> Result<f32> {
+    if previous.len() != state.len() || state.len() != key.len() {
+        return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::decay_and_dot_from(previous, state, key, decay) {
+        return super::finite(result);
+    }
+    for (element, &prev) in state.iter_mut().zip(previous) {
+        *element = prev * decay;
     }
     dot_scalar(state, key)
 }
@@ -166,7 +196,10 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{add_scaled, decay_and_dot, dot, dot_scalar, scalar_add_scaled, update_and_dot};
+    use super::{
+        add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_scalar, scalar_add_scaled,
+        update_and_dot,
+    };
     use crate::Result;
 
     fn vectors(width: usize) -> (Vec<f32>, Vec<f32>) {
@@ -214,6 +247,10 @@ mod tests {
                 let actual_dot = decay_and_dot(&mut decayed_actual, &second, scale)?;
                 assert_eq!(actual_dot.to_bits(), expected_dot.to_bits());
                 assert_eq!(bits(&decayed_actual), bits(&decayed_expected));
+                let mut decayed_from = vec![f32::NAN; width];
+                let from_dot = decay_and_dot_from(&first, &mut decayed_from, &second, scale)?;
+                assert_eq!(from_dot.to_bits(), expected_dot.to_bits());
+                assert_eq!(bits(&decayed_from), bits(&decayed_expected));
 
                 let mut upd_expected = first.clone();
                 scalar_add_scaled(&mut upd_expected, &second, scale)?;

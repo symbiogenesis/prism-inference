@@ -38,6 +38,7 @@ pub(super) fn dot(first: &[f32], second: &[f32]) -> Option<f32> {
 }
 
 /// Scales `state` by `decay` and accumulates its four-register FMA dot product with `key` in one pass.
+#[cfg(test)]
 #[inline]
 #[allow(
     clippy::suboptimal_flops,
@@ -68,6 +69,53 @@ pub(super) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Optio
     for (state, &key) in state[vectorized..].iter_mut().zip(&key[vectorized..]) {
         *state *= decay;
         result += *state * key;
+    }
+    Some(result)
+}
+
+/// Scales `previous` by `decay` into `state` and accumulates its four-register FMA dot product with `key` in one pass.
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+pub(super) fn decay_and_dot_from(
+    previous: &[f32],
+    state: &mut [f32],
+    key: &[f32],
+    decay: f32,
+) -> Option<f32> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let vectorized = state.len() / 16 * 16;
+    let decays = f32x4::splat(neon, decay);
+    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    for ((prev, state), key) in previous[..vectorized]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(state[..vectorized].as_chunks_mut::<16>().0)
+        .zip(key[..vectorized].as_chunks::<16>().0)
+    {
+        for (((sum, prev), state), key) in sums
+            .iter_mut()
+            .zip(prev.as_chunks::<4>().0)
+            .zip(state.as_chunks_mut::<4>().0)
+            .zip(key.as_chunks::<4>().0)
+        {
+            let decayed = f32x4::from_slice(neon, prev) * decays;
+            decayed.store_slice(state);
+            *sum = decayed.mul_add_precise(f32x4::from_slice(neon, key), *sum);
+        }
+    }
+    let mut result = ((sums[0] + sums[2]) + (sums[1] + sums[3])).reduce_sum();
+    for ((&prev, state), &key) in previous[vectorized..]
+        .iter()
+        .zip(&mut state[vectorized..])
+        .zip(&key[vectorized..])
+    {
+        let decayed = prev * decay;
+        *state = decayed;
+        result += decayed * key;
     }
     Some(result)
 }

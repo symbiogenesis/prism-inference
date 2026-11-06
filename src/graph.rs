@@ -118,15 +118,23 @@ impl Arithmetic {
         }
     }
 
-    fn gdn_decay_and_dot(self, state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
+    fn gdn_decay_and_dot_from(
+        self,
+        previous: &[f32],
+        state: &mut [f32],
+        key: &[f32],
+        decay: f32,
+    ) -> Result<f32> {
         match self {
             Self::Source => {
-                for element in state.iter_mut() {
-                    *element *= decay;
+                for (element, &prev) in state.iter_mut().zip(previous) {
+                    *element = prev * decay;
                 }
                 Ok(dot(state, key))
             }
-            Self::PinnedSwift => crate::kernels::pinned_gdn::decay_and_dot(state, key, decay),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_gdn::decay_and_dot_from(previous, state, key, decay)
+            }
         }
     }
 
@@ -859,7 +867,7 @@ impl Transforms {
         transformed: &mut Vec<f32>,
     ) -> Result<()> {
         if self.grouped_values && weight.name.ends_with(".ssm_out.weight") {
-            zeros_into(input.len(), transformed)?;
+            resize_into(input.len(), transformed)?;
             let repetitions = geometry.ssm_values / geometry.ssm_keys;
             for key in 0..geometry.ssm_keys {
                 for repeat in 0..repetitions {
@@ -871,7 +879,7 @@ impl Transforms {
             }
             self.sign(transformed);
         } else if let Some(signs) = self.signs.get(&input.len()) {
-            zeros_into(input.len(), transformed)?;
+            resize_into(input.len(), transformed)?;
             let overlap = input.len().min(signs.len());
             mul_slice_into(
                 &input[..overlap],
@@ -1980,7 +1988,11 @@ impl Evaluation<'_, '_> {
             ],
         )?;
         let hist_width = g.convolution - 1;
-        zeros_into(history.len(), convolution)?;
+        if hist_width > 0 {
+            resize_into(history.len(), convolution)?;
+        } else {
+            zeros_into(history.len(), convolution)?;
+        }
         let mixed = &mut scratch.projected;
         for (channel, mixed_value) in mixed.iter_mut().enumerate() {
             let projected = *mixed_value;
@@ -1992,7 +2004,11 @@ impl Evaluation<'_, '_> {
                 projected,
                 coefficients,
             )?;
-            if hist_width > 0 {
+            if hist_width == 3 {
+                convolution[start] = history[start + 1];
+                convolution[start + 1] = history[start + 2];
+                convolution[start + 2] = projected;
+            } else if hist_width > 0 {
                 convolution[start..start + hist_width - 1]
                     .copy_from_slice(&history[start + 1..start + hist_width]);
                 convolution[start + hist_width - 1] = projected;
@@ -2003,8 +2019,8 @@ impl Evaluation<'_, '_> {
         for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
             l2_norm(head, g.epsilon);
         }
-        copy_into(previous, matrix)?;
-        zeros_into(g.value_width(), &mut scratch.attended)?;
+        resize_into(previous.len(), matrix)?;
+        resize_into(g.value_width(), &mut scratch.attended)?;
         let scale = 1.0 / small_float(g.ssm_head)?.sqrt();
         let head_state_len = g.ssm_head * g.ssm_head;
         let arithmetic = self.arithmetic;
@@ -2027,6 +2043,8 @@ impl Evaluation<'_, '_> {
                         .enumerate()
                     {
                         let head = base_head + offset;
+                        let prev_state =
+                            &previous[head * head_state_len..(head + 1) * head_state_len];
                         // ggml repeat tiles key groups; it does not repeat each key head contiguously.
                         let key_head = head % g.ssm_keys;
                         let q = &mixed_ref[key_head * g.ssm_head..(key_head + 1) * g.ssm_head];
@@ -2042,12 +2060,14 @@ impl Evaluation<'_, '_> {
                         };
                         let decay = (softplus * layer.decay[head]).exp();
                         let update = sigmoid(beta_ref[head]);
-                        for ((state_row, &value), out) in state
+                        for (((state_row, prev_row), &value), out) in state
                             .chunks_exact_mut(g.ssm_head)
+                            .zip(prev_state.chunks_exact(g.ssm_head))
                             .zip(v)
                             .zip(output.iter_mut())
                         {
-                            let dot_k = arithmetic.gdn_decay_and_dot(state_row, k, decay)?;
+                            let dot_k =
+                                arithmetic.gdn_decay_and_dot_from(prev_row, state_row, k, decay)?;
                             let delta = (value - dot_k) * update;
                             *out = arithmetic.gdn_update_and_dot(state_row, k, delta, q)? * scale;
                         }
@@ -2503,6 +2523,13 @@ fn prepare<T>(output: &mut Vec<T>, count: usize) -> Result<()> {
 fn zeros_into(count: usize, output: &mut Vec<f32>) -> Result<()> {
     prepare(output, count)?;
     output.resize(count, 0.0);
+    Ok(())
+}
+
+fn resize_into(count: usize, output: &mut Vec<f32>) -> Result<()> {
+    if output.len() != count {
+        zeros_into(count, output)?;
+    }
     Ok(())
 }
 

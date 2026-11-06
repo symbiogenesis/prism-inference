@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use bonsai_prism_runtime::{
-    kernels::{Pq2ProjectionExecutor, RowParallelism},
+    kernels::{Pq2ProjectionExecutor, RowParallelism, is_finite_slice},
     model::Tensor,
 };
 use bonsai_ternary::Q8KBlock;
@@ -17,6 +17,15 @@ use hexagon_native_rpc::{NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2We
 
 use crate::guarded::{finite, scale, zeroed};
 use crate::{HmxResidencyStatistics, ProjectionStatistics, Result, invalid};
+
+#[inline]
+fn finite_slice(values: &[f32]) -> Result<()> {
+    if is_finite_slice(values) {
+        Ok(())
+    } else {
+        Err(invalid("nonfinite Hexagon projection value"))
+    }
+}
 
 /// Residency statistics for [`NativeQ2Executor`].
 pub type NativeQ2ResidencyStatistics = HmxResidencyStatistics;
@@ -468,9 +477,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             self.submitter
                 .submit(columns, rows, weights, activation, output.as_mut_slice())?;
         }
-        for &val in output.iter() {
-            finite(val)?;
-        }
+        finite_slice(output)?;
         self.statistics.operations_completed =
             self.statistics.operations_completed.saturating_add(1);
         self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
@@ -506,9 +513,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 scale(block)?;
             }
         }
-        for &value in activation {
-            finite(value)?;
-        }
+        finite_slice(activation)?;
         let max_chunk_cols = columns.min(self.maximum_columns);
         let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
         let mut weights = if cached.is_none() {
@@ -682,9 +687,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         if activation.len() != columns {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
-        for &value in activation {
-            finite(value)?;
-        }
+        finite_slice(activation)?;
         let mut weights = Vec::new();
         let mut indices = [0_usize; 3];
         let mut rows_per_member = [0_usize; 3];
@@ -760,9 +763,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             _ => return Err(invalid("unsupported native Q2 batch size")),
         }
         for output in outputs.iter() {
-            for &val in output.iter() {
-                finite(val)?;
-            }
+            finite_slice(output)?;
         }
         self.statistics.operations_completed = self
             .statistics

@@ -607,8 +607,7 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
             .max(v2.abs())
             .max(v3.abs());
     }
-    let mut max_lanes = [0.0_f32; 4];
-    max_abs_vec.store_slice(&mut max_lanes);
+    let max_lanes = max_abs_vec.to_array();
     let maximum = max_lanes[0]
         .max(max_lanes[1])
         .max(max_lanes[2])
@@ -939,10 +938,9 @@ pub(super) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) -> bool {
     };
     let mut squares = 0.0_f64;
     let (chunks, tail) = input.as_chunks::<4>();
-    let mut sq_lanes = [0.0_f32; 4];
     for chunk in chunks {
         let v = f32x4::from_slice(neon, chunk);
-        (v * v).store_slice(&mut sq_lanes);
+        let sq_lanes = (v * v).to_array();
         squares += f64::from(sq_lanes[0]);
         squares += f64::from(sq_lanes[1]);
         squares += f64::from(sq_lanes[2]);
@@ -970,12 +968,11 @@ pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let (in_chunks, in_tail) = input.as_chunks::<4>();
     let (w_chunks, w_tail) = weight.as_chunks::<4>();
-    let mut sq_lanes = [0.0_f32; 4];
     for (in_chunk, w_chunk) in in_chunks.iter().zip(w_chunks) {
         let v = f32x4::from_slice(neon, in_chunk);
         let w = f32x4::from_slice(neon, w_chunk);
         finite_mask = finite_mask & v.is_finite() & w.is_finite();
-        (v * v).store_slice(&mut sq_lanes);
+        let sq_lanes = (v * v).to_array();
         sum += f64::from(sq_lanes[0]);
         sum += f64::from(sq_lanes[1]);
         sum += f64::from(sq_lanes[2]);
@@ -1672,6 +1669,23 @@ fn transpose_4x4(
 }
 
 #[inline]
+fn hadamard_16_registers(
+    neon: Neon,
+    block: &[f32],
+) -> ([f32x4<Neon>; 4], fearless_simd::mask32x4<Neon>) {
+    let r0 = f32x4::from_slice(neon, &block[0..4]);
+    let r1 = f32x4::from_slice(neon, &block[4..8]);
+    let r2 = f32x4::from_slice(neon, &block[8..12]);
+    let r3 = f32x4::from_slice(neon, &block[12..16]);
+    let finite = r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite();
+    let [a0, a1, a2, a3] = transpose_4x4(r0, r1, r2, r3);
+    let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+    let [v0, v1, v2, v3] = transpose_4x4(b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+    let (c0, c1, c2, c3) = (v0 + v1, v0 - v1, v2 + v3, v2 - v3);
+    ([c0 + c2, c1 + c3, c0 - c2, c1 - c3], finite)
+}
+
+#[inline]
 fn hadamard_radix4_stage(neon: Neon, values: &mut [f32], half: usize) {
     for block in values.chunks_exact_mut(half * 4) {
         let (first_half, second_half) = block.split_at_mut(half * 2);
@@ -1703,53 +1717,129 @@ fn hadamard_radix4_stage(neon: Neon, values: &mut [f32], half: usize) {
 
 /// Evaluates the normalized Sylvester Hadamard butterfly stages in NEON `f32x4`.
 ///
-/// Requires a power-of-two slice of at least four elements. Stages `half = 1, 2, 4, 8`
-/// are fused per 16-element block when `values.len() >= 16`, subsequent stages are
-/// fused in radix-4 pairs (`half` and `half * 2`), and the final butterfly stage is
-/// fused with normalization while preserving exact IEEE 754 addition and subtraction order.
+/// Requires a power-of-two slice of at least four elements. Stages `half = 1..=32`
+/// are fused in registers per 64-element block when `values.len() >= 64` (or
+/// `half = 1..=8` per 16-element block when `values.len() >= 16`), subsequent
+/// stages run in radix-4 pairs (`half` and `half * 2`), and the final radix-4 or
+/// radix-2 butterfly stage is fused with normalization while preserving exact
+/// IEEE 754 addition and subtraction order.
 #[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep register-fused 16/64-element and final radix-4/radix-2 normalization stages together."
+)]
 pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<()>> {
     if values.len() < 4 {
         return None;
     }
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    if !is_finite_slice(values)? {
-        return Some(Err(crate::invalid(
-            "Hadamard requires a finite power-of-two block",
-        )));
-    }
-    let mut half = if values.len() >= 16 {
+    let norm = f32x4::splat(neon, normalization);
+    let mut in_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut finite_mask = in_finite;
+    let mut half = if values.len() >= 64 {
+        let fuse_norm = values.len() == 64;
+        for block in values.as_chunks_mut::<64>().0 {
+            let (q0, f0) = hadamard_16_registers(neon, &block[0..16]);
+            let (q1, f1) = hadamard_16_registers(neon, &block[16..32]);
+            let (q2, f2) = hadamard_16_registers(neon, &block[32..48]);
+            let (q3, f3) = hadamard_16_registers(neon, &block[48..64]);
+            in_finite &= f0 & f1 & f2 & f3;
+            for i in 0..4 {
+                let b0 = q0[i] + q1[i];
+                let b1 = q0[i] - q1[i];
+                let b2 = q2[i] + q3[i];
+                let b3 = q2[i] - q3[i];
+                let (mut out0, mut out1, mut out2, mut out3) = (b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+                if fuse_norm {
+                    out0 *= norm;
+                    out1 *= norm;
+                    out2 *= norm;
+                    out3 *= norm;
+                    finite_mask &=
+                        out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
+                }
+                let base = i * 4;
+                out0.store_slice(&mut block[base..base + 4]);
+                out1.store_slice(&mut block[16 + base..20 + base]);
+                out2.store_slice(&mut block[32 + base..36 + base]);
+                out3.store_slice(&mut block[48 + base..52 + base]);
+            }
+        }
+        64
+    } else if values.len() >= 16 {
+        let fuse_norm = values.len() == 16;
         for block in values.as_chunks_mut::<16>().0 {
-            let [a0, a1, a2, a3] = transpose_4x4(
-                f32x4::from_slice(neon, &block[0..4]),
-                f32x4::from_slice(neon, &block[4..8]),
-                f32x4::from_slice(neon, &block[8..12]),
-                f32x4::from_slice(neon, &block[12..16]),
-            );
-            let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
-            let [v0, v1, v2, v3] = transpose_4x4(b0 + b2, b1 + b3, b0 - b2, b1 - b3);
-            let (c0, c1, c2, c3) = (v0 + v1, v0 - v1, v2 + v3, v2 - v3);
-            (c0 + c2).store_slice(&mut block[0..4]);
-            (c1 + c3).store_slice(&mut block[4..8]);
-            (c0 - c2).store_slice(&mut block[8..12]);
-            (c1 - c3).store_slice(&mut block[12..16]);
+            let ([mut d0, mut d1, mut d2, mut d3], f0) = hadamard_16_registers(neon, block);
+            in_finite &= f0;
+            if fuse_norm {
+                d0 *= norm;
+                d1 *= norm;
+                d2 *= norm;
+                d3 *= norm;
+                finite_mask &= d0.is_finite() & d1.is_finite() & d2.is_finite() & d3.is_finite();
+            }
+            d0.store_slice(&mut block[0..4]);
+            d1.store_slice(&mut block[4..8]);
+            d2.store_slice(&mut block[8..12]);
+            d3.store_slice(&mut block[12..16]);
         }
         16
     } else {
         for chunk in values.as_chunks_mut::<4>().0 {
+            in_finite &= f32x4::from_slice(neon, chunk).is_finite();
             let [a0, a1, a2, a3] = *chunk;
             let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
             *chunk = [b0 + b2, b1 + b3, b0 - b2, b1 - b3];
         }
         4
     };
-    while half * 2 < values.len() {
+    if !in_finite.all_true() {
+        return Some(Err(crate::invalid(
+            "Hadamard requires a finite power-of-two block",
+        )));
+    }
+    if half == values.len() && values.len() >= 16 {
+        if !finite_mask.all_true() {
+            return Some(Err(crate::invalid("nonfinite kernel output")));
+        }
+        return Some(Ok(()));
+    }
+    while half * 4 < values.len() {
         hadamard_radix4_stage(neon, values, half);
         half *= 4;
     }
-    let norm = f32x4::splat(neon, normalization);
-    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    if half < values.len() {
+    if half * 4 == values.len() {
+        let (first_half, second_half) = values.split_at_mut(half * 2);
+        let (q0, q1) = first_half.split_at_mut(half);
+        let (q2, q3) = second_half.split_at_mut(half);
+        for (((c0_slice, c1_slice), c2_slice), c3_slice) in q0
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(q1.as_chunks_mut::<4>().0)
+            .zip(q2.as_chunks_mut::<4>().0)
+            .zip(q3.as_chunks_mut::<4>().0)
+        {
+            let v0 = f32x4::from_slice(neon, c0_slice);
+            let v1 = f32x4::from_slice(neon, c1_slice);
+            let v2 = f32x4::from_slice(neon, c2_slice);
+            let v3 = f32x4::from_slice(neon, c3_slice);
+            let b0 = v0 + v1;
+            let b1 = v0 - v1;
+            let b2 = v2 + v3;
+            let b3 = v2 - v3;
+            let out0 = (b0 + b2) * norm;
+            let out1 = (b1 + b3) * norm;
+            let out2 = (b0 - b2) * norm;
+            let out3 = (b1 - b3) * norm;
+            finite_mask &=
+                out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
+            out0.store_slice(c0_slice);
+            out1.store_slice(c1_slice);
+            out2.store_slice(c2_slice);
+            out3.store_slice(c3_slice);
+        }
+    } else if half < values.len() {
         let (left_half, right_half) = values.split_at_mut(half);
         for (left, right) in left_half
             .as_chunks_mut::<4>()
@@ -1780,7 +1870,9 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_ptq1_groups};
+    use super::{
+        block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_ptq1_groups, hadamard,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -2138,5 +2230,55 @@ mod tests {
                 assert!(!block16_all_finite_le(&block, f32::MAX));
             }
         }
+    }
+
+    #[test]
+    fn simd_neon_hadamard_matches_scalar_across_power_of_two_blocks() -> TestResult {
+        for len in [4_usize, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
+            let norm = 1.0 / super::super::integer_float(i32::try_from(len)?).sqrt();
+            let mut actual: Vec<f32> = (0..len)
+                .map(|idx| {
+                    let s = i32::try_from((idx.wrapping_mul(73) ^ (idx >> 2)) % 251).unwrap_or(0);
+                    super::super::integer_float(s - 125) * 0.03125
+                })
+                .collect();
+            let mut expected = actual.clone();
+            let mut half = 1;
+            while half < len {
+                for block in expected.chunks_exact_mut(half * 2) {
+                    let (left_half, right_half) = block.split_at_mut(half);
+                    for (left, right) in left_half.iter_mut().zip(right_half) {
+                        let l = *left;
+                        let r = *right;
+                        *left = l + r;
+                        *right = l - r;
+                    }
+                }
+                half *= 2;
+            }
+            for value in &mut expected {
+                *value *= norm;
+            }
+            hadamard(&mut actual, norm).ok_or("missing baseline NEON token")??;
+            let actual_bits: Vec<u32> = actual.iter().copied().map(f32::to_bits).collect();
+            let expected_bits: Vec<u32> = expected.iter().copied().map(f32::to_bits).collect();
+            assert_eq!(actual_bits, expected_bits, "Hadamard mismatch at len={len}");
+
+            let mut nonfinite = vec![1.0_f32; len];
+            nonfinite[len - 1] = f32::NAN;
+            assert!(
+                hadamard(&mut nonfinite, norm)
+                    .ok_or("missing baseline NEON token")?
+                    .is_err()
+            );
+
+            let mut overflow = vec![f32::MAX; len];
+            assert!(
+                hadamard(&mut overflow, norm)
+                    .ok_or("missing baseline NEON token")?
+                    .is_err()
+            );
+        }
+        Ok(())
     }
 }

@@ -2276,7 +2276,9 @@ pub(crate) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) {
     output.extend(values.iter().copied().map(half_bits));
 }
 
-pub(crate) fn is_finite_slice(values: &[f32]) -> bool {
+/// Returns `true` when every binary32 element in `values` is finite.
+#[must_use]
+pub fn is_finite_slice(values: &[f32]) -> bool {
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",

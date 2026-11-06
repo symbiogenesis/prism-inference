@@ -50,16 +50,46 @@ impl Block {
     pub(super) fn dot128(&self, values: &[i8; 128]) -> i32 {
         // Each signed product is in -256..=254 for accepted -1..=2 weights.
         // Sixteen products per i16 lane are bounded by 4,096 before widening.
-        let mut even = i16x8::splat(self.neon, 0);
-        let mut odd = i16x8::splat(self.neon, 0);
+        let mut acc = i16x8::splat(self.neon, 0);
         for (index, values) in values.as_chunks::<16>().0.iter().enumerate() {
             let (low, high) = i8x16::from_slice(self.neon, values).widen();
-            even += self.weights[index * 2] * low;
-            odd += self.weights[index * 2 + 1] * high;
+            acc += self.weights[index * 2] * low + self.weights[index * 2 + 1] * high;
         }
         // The complete dot's absolute bound is 128 * 2 * 128 = 32,768.
-        let (sum_low, sum_high) = (even + odd).widen();
+        let (sum_low, sum_high) = acc.widen();
         (sum_low + sum_high).reduce_sum()
+    }
+
+    #[inline]
+    pub(super) fn dot128_four(&self, values: [&[i8; 128]; 4]) -> [i32; 4] {
+        let mut acc = [i16x8::splat(self.neon, 0); 4];
+        let v0 = values[0].as_chunks::<16>().0;
+        let v1 = values[1].as_chunks::<16>().0;
+        let v2 = values[2].as_chunks::<16>().0;
+        let v3 = values[3].as_chunks::<16>().0;
+        for index in 0..8 {
+            let w_low = self.weights[index * 2];
+            let w_high = self.weights[index * 2 + 1];
+            let (l0, h0) = i8x16::from_slice(self.neon, &v0[index]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &v1[index]).widen();
+            let (l2, h2) = i8x16::from_slice(self.neon, &v2[index]).widen();
+            let (l3, h3) = i8x16::from_slice(self.neon, &v3[index]).widen();
+            acc[0] += w_low * l0 + w_high * h0;
+            acc[1] += w_low * l1 + w_high * h1;
+            acc[2] += w_low * l2 + w_high * h2;
+            acc[3] += w_low * l3 + w_high * h3;
+        }
+        let (s0_l, s0_h) = acc[0].widen();
+        let (s1_l, s1_h) = acc[1].widen();
+        let (s2_l, s2_h) = acc[2].widen();
+        let (s3_l, s3_h) = acc[3].widen();
+        let r0 = s0_l + s0_h;
+        let r1 = s1_l + s1_h;
+        let r2 = s2_l + s2_h;
+        let r3 = s3_l + s3_h;
+        let p01 = r0.unzip_low(r1) + r0.unzip_high(r1);
+        let p23 = r2.unzip_low(r3) + r2.unzip_high(r3);
+        (p01.unzip_low(p23) + p01.unzip_high(p23)).to_array()
     }
 
     #[inline]

@@ -19,6 +19,14 @@ pub(super) struct Activation {
         target_feature = "neon"
     ))]
     pub(super) widened: [i16; 128],
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pub(super) sum: i32,
 }
 
 /// Prepare four digit planes for each consecutive 16-byte weight load.
@@ -41,11 +49,12 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Resul
                     target_feature = "neon"
                 ))]
                 {
-                    let (values, widened) = super::neon::prepare_pq2_activations(source);
+                    let (values, widened, sum) = super::neon::prepare_pq2_activations(source);
                     output.push(Activation {
                         scale,
                         values,
                         widened,
+                        sum,
                     });
                 }
                 #[cfg(not(all(
@@ -88,6 +97,7 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &[Activation]) -> 
         let sum = super::integer_float(super::neon::dot_consumption_order_prewidened(
             block[2..].try_into()?,
             &activation.widened,
+            activation.sum,
         ));
         output = if FUSED {
             d.mul_add(sum, output)

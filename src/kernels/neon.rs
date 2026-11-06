@@ -98,15 +98,56 @@ fn pq2_pair_sums_prewidened(
 }
 
 #[inline]
-pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 128]) {
+fn pq2_unsigned_pair_sums_prewidened(
+    codes: u8x16<Neon>,
+    activation_low: i16x8<Neon>,
+    activation_high: i16x8<Neon>,
+) -> i16x8<Neon> {
+    // Each byte of `codes` is in 0..=3, so bitcasting to i8x16 before widening
+    // produces exact unsigned two-bit codes 0..=3 in i16x8. Across all eight
+    // planes (16 products per lane), each i16 lane is bounded by -6144..=6096.
+    let (weight_low, weight_high) = codes.bitcast::<i8x16<Neon>>().widen();
+    weight_low * activation_low + weight_high * activation_high
+}
+
+#[inline]
+fn reduce4_i32x4(
+    v0: i32x4<Neon>,
+    v1: i32x4<Neon>,
+    v2: i32x4<Neon>,
+    v3: i32x4<Neon>,
+) -> i32x4<Neon> {
+    let p01 = v0.unzip_low(v1) + v0.unzip_high(v1);
+    let p23 = v2.unzip_low(v3) + v2.unzip_high(v3);
+    p01.unzip_low(p23) + p01.unzip_high(p23)
+}
+
+#[inline]
+fn reduce4_i16x8_to_i32x4(
+    s0: i16x8<Neon>,
+    s1: i16x8<Neon>,
+    s2: i16x8<Neon>,
+    s3: i16x8<Neon>,
+) -> i32x4<Neon> {
+    let (l0, h0) = s0.widen();
+    let (l1, h1) = s1.widen();
+    let (l2, h2) = s2.widen();
+    let (l3, h3) = s3.widen();
+    reduce4_i32x4(l0 + h0, l1 + h1, l2 + h2, l3 + h3)
+}
+
+#[inline]
+pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 128], i32) {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let values = std::array::from_fn(|index| {
             source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
         });
-        return (values, values.map(i16::from));
+        let sum = source.iter().map(|&v| i32::from(v)).sum();
+        return (values, values.map(i16::from), sum);
     };
     let mut output = [0_i8; 128];
     let mut widened = [0_i16; 128];
+    let mut sum_acc = i16x8::splat(neon, 0);
     for ((src_half, dst_half), wide_half) in source
         .as_chunks::<64>()
         .0
@@ -138,11 +179,12 @@ pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 1
             .zip(wide.as_chunks_mut::<2>().0)
         {
             let (low, high) = plane.widen();
+            sum_acc += low + high;
             low.store_slice(&mut pair[0]);
             high.store_slice(&mut pair[1]);
         }
     }
-    (output, widened)
+    (output, widened, pq2_reduce(sum_acc))
 }
 
 #[inline]
@@ -193,7 +235,11 @@ const fn scale_u16(block: &[u8; 34]) -> u16 {
 }
 
 #[inline]
-pub(super) fn dot_consumption_order_prewidened(packed: &[u8; 32], widened: &[i16; 128]) -> i32 {
+pub(super) fn dot_consumption_order_prewidened(
+    packed: &[u8; 32],
+    widened: &[i16; 128],
+    activation_sum: i32,
+) -> i32 {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return packed
             .as_chunks::<16>()
@@ -216,8 +262,7 @@ pub(super) fn dot_consumption_order_prewidened(packed: &[u8; 32], widened: &[i16
             })
             .sum();
     };
-    let mut even = i16x8::splat(neon, 0);
-    let mut odd = i16x8::splat(neon, 0);
+    let mut acc = i16x8::splat(neon, 0);
     for (bytes, values) in packed
         .as_chunks::<16>()
         .0
@@ -226,28 +271,28 @@ pub(super) fn dot_consumption_order_prewidened(packed: &[u8; 32], widened: &[i16
     {
         let w = u8x16::from_slice(neon, bytes);
         let planes = values.as_chunks::<8>().0;
-        even += pq2_pair_sums_prewidened(
-            (w & 3).bitcast::<i8x16<Neon>>() - 1,
+        acc += pq2_unsigned_pair_sums_prewidened(
+            w & 3,
             i16x8::from_slice(neon, &planes[0]),
             i16x8::from_slice(neon, &planes[1]),
         );
-        odd += pq2_pair_sums_prewidened(
-            ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
+        acc += pq2_unsigned_pair_sums_prewidened(
+            (w >> 2) & 3,
             i16x8::from_slice(neon, &planes[2]),
             i16x8::from_slice(neon, &planes[3]),
         );
-        even += pq2_pair_sums_prewidened(
-            ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
+        acc += pq2_unsigned_pair_sums_prewidened(
+            (w >> 4) & 3,
             i16x8::from_slice(neon, &planes[4]),
             i16x8::from_slice(neon, &planes[5]),
         );
-        odd += pq2_pair_sums_prewidened(
-            (w >> 6).bitcast::<i8x16<Neon>>() - 1,
+        acc += pq2_unsigned_pair_sums_prewidened(
+            w >> 6,
             i16x8::from_slice(neon, &planes[6]),
             i16x8::from_slice(neon, &planes[7]),
         );
     }
-    pq2_reduce(even + odd)
+    pq2_reduce(acc) - activation_sum
 }
 
 #[inline]
@@ -261,18 +306,16 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
     let c2 = rows[2].as_chunks::<34>().0;
     let c3 = rows[3].as_chunks::<34>().0;
     let mut outputs = f32x4::splat(neon, 0.0);
+    let mut scales_finite = outputs.is_finite();
     for ((((b0, b1), b2), b3), activation) in c0.iter().zip(c1).zip(c2).zip(c3).zip(input) {
         let row_scales = f16_bits_to_f32_x4(
             neon,
             [scale_u16(b0), scale_u16(b1), scale_u16(b2), scale_u16(b3)],
         );
-        if !row_scales.is_finite().all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
+        scales_finite &= row_scales.is_finite();
         let ds = row_scales * f32x4::splat(neon, activation.scale);
         let blocks = [b0, b1, b2, b3];
-        let mut even = [i16x8::splat(neon, 0); 4];
-        let mut odd = [i16x8::splat(neon, 0); 4];
+        let mut acc = [i16x8::splat(neon, 0); 4];
         for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
             let planes = values.as_chunks::<8>().0;
             let p0_low = i16x8::from_slice(neon, &planes[0]);
@@ -286,29 +329,14 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..4 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                even[row] +=
-                    pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
-                odd[row] += pq2_pair_sums_prewidened(
-                    ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
-                    p1_low,
-                    p1_high,
-                );
-                even[row] += pq2_pair_sums_prewidened(
-                    ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
-                    p2_low,
-                    p2_high,
-                );
-                odd[row] += pq2_pair_sums_prewidened(
-                    (w >> 6).bitcast::<i8x16<Neon>>() - 1,
-                    p3_low,
-                    p3_high,
-                );
+                acc[row] += pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
+                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
+                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
+                acc[row] += pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
             }
         }
-        let sums = i32x4::from_slice(
-            neon,
-            &std::array::from_fn::<i32, 4, _>(|row| pq2_reduce(even[row] + odd[row])),
-        )
+        let sums = (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3])
+            - i32x4::splat(neon, activation.sum))
         .to_float::<f32x4<Neon>>();
         outputs = if FUSED {
             ds.mul_add(sums, outputs)
@@ -316,7 +344,7 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
             outputs + ds * sums
         };
     }
-    if !outputs.is_finite().all_true() {
+    if !(scales_finite & outputs.is_finite()).all_true() {
         return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     let mut result = [0.0_f32; 4];
@@ -333,6 +361,7 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
     let chunks: [&[[u8; 34]]; 8] = rows.map(|row| row.as_chunks::<34>().0);
     let mut out_lo = f32x4::splat(neon, 0.0);
     let mut out_hi = f32x4::splat(neon, 0.0);
+    let mut scales_finite = out_lo.is_finite();
     for (block_idx, activation) in input.iter().enumerate() {
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|row| &chunks[row][block_idx]);
         let scales_lo = f16_bits_to_f32_x4(
@@ -353,14 +382,11 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
                 scale_u16(blocks[7]),
             ],
         );
-        if !(scales_lo.is_finite() & scales_hi.is_finite()).all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
+        scales_finite = scales_finite & scales_lo.is_finite() & scales_hi.is_finite();
         let act_scale = f32x4::splat(neon, activation.scale);
         let ds_lo = scales_lo * act_scale;
         let ds_hi = scales_hi * act_scale;
-        let mut even = [i16x8::splat(neon, 0); 8];
-        let mut odd = [i16x8::splat(neon, 0); 8];
+        let mut acc = [i16x8::splat(neon, 0); 8];
         for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
             let planes = values.as_chunks::<8>().0;
             let p0_low = i16x8::from_slice(neon, &planes[0]);
@@ -374,35 +400,17 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..8 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                even[row] +=
-                    pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
-                odd[row] += pq2_pair_sums_prewidened(
-                    ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
-                    p1_low,
-                    p1_high,
-                );
-                even[row] += pq2_pair_sums_prewidened(
-                    ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
-                    p2_low,
-                    p2_high,
-                );
-                odd[row] += pq2_pair_sums_prewidened(
-                    (w >> 6).bitcast::<i8x16<Neon>>() - 1,
-                    p3_low,
-                    p3_high,
-                );
+                acc[row] += pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
+                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
+                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
+                acc[row] += pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
             }
         }
-        let sums_lo = i32x4::from_slice(
-            neon,
-            &std::array::from_fn::<i32, 4, _>(|row| pq2_reduce(even[row] + odd[row])),
-        )
-        .to_float::<f32x4<Neon>>();
-        let sums_hi = i32x4::from_slice(
-            neon,
-            &std::array::from_fn::<i32, 4, _>(|row| pq2_reduce(even[row + 4] + odd[row + 4])),
-        )
-        .to_float::<f32x4<Neon>>();
+        let act_sum = i32x4::splat(neon, activation.sum);
+        let sums_lo = (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3]) - act_sum)
+            .to_float::<f32x4<Neon>>();
+        let sums_hi = (reduce4_i16x8_to_i32x4(acc[4], acc[5], acc[6], acc[7]) - act_sum)
+            .to_float::<f32x4<Neon>>();
         if FUSED {
             out_lo = ds_lo.mul_add(sums_lo, out_lo);
             out_hi = ds_hi.mul_add(sums_hi, out_hi);
@@ -411,7 +419,7 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             out_hi += ds_hi * sums_hi;
         }
     }
-    if !(out_lo.is_finite() & out_hi.is_finite()).all_true() {
+    if !(scales_finite & out_lo.is_finite() & out_hi.is_finite()).all_true() {
         return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     let mut result = [0.0_f32; 8];
@@ -1053,8 +1061,7 @@ pub(super) fn dot_consumption_order_four(
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return packed.map(|row| dot_consumption_order(row, activations));
     };
-    let mut even = [i16x8::splat(neon, 0); 4];
-    let mut odd = [i16x8::splat(neon, 0); 4];
+    let mut acc = [i16x8::splat(neon, 0); 4];
     for (half, values) in activations.as_chunks::<64>().0.iter().enumerate() {
         let planes = values.as_chunks::<16>().0;
         let (p0_low, p0_high) = i8x16::from_slice(neon, &planes[0]).widen();
@@ -1064,23 +1071,23 @@ pub(super) fn dot_consumption_order_four(
         for row in 0..4 {
             let bytes = &packed[row].as_chunks::<16>().0[half];
             let w = u8x16::from_slice(neon, bytes);
-            even[row] +=
+            acc[row] +=
                 pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
-            odd[row] += pq2_pair_sums_prewidened(
+            acc[row] += pq2_pair_sums_prewidened(
                 ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
                 p1_low,
                 p1_high,
             );
-            even[row] += pq2_pair_sums_prewidened(
+            acc[row] += pq2_pair_sums_prewidened(
                 ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
                 p2_low,
                 p2_high,
             );
-            odd[row] +=
+            acc[row] +=
                 pq2_pair_sums_prewidened((w >> 6).bitcast::<i8x16<Neon>>() - 1, p3_low, p3_high);
         }
     }
-    std::array::from_fn(|row| pq2_reduce(even[row] + odd[row]))
+    reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3]).to_array()
 }
 
 #[inline]
@@ -1095,6 +1102,22 @@ fn dot32(neon: Neon, low: i8x16<Neon>, high: i8x16<Neon>, values: &[i8; 32]) -> 
 }
 
 #[inline]
+fn dot32_native_lanes_i32x4(
+    low: i8x16<Neon>,
+    high: i8x16<Neon>,
+    v0_l: i16x8<Neon>,
+    v0_h: i16x8<Neon>,
+    v1_l: i16x8<Neon>,
+    v1_h: i16x8<Neon>,
+) -> i32x4<Neon> {
+    let (w0_l, w0_h) = low.widen();
+    let (w1_l, w1_h) = high.widen();
+    let (a, b) = (w0_l * v0_l + w1_l * v1_l).widen();
+    let (c, d) = (w0_h * v0_h + w1_h * v1_h).widen();
+    reduce4_i32x4(a, b, c, d)
+}
+
+#[inline]
 fn dot32_native_lanes_prewidened(
     low: i8x16<Neon>,
     high: i8x16<Neon>,
@@ -1103,16 +1126,7 @@ fn dot32_native_lanes_prewidened(
     v1_l: i16x8<Neon>,
     v1_h: i16x8<Neon>,
 ) -> [i32; 4] {
-    let (w0_l, w0_h) = low.widen();
-    let (w1_l, w1_h) = high.widen();
-    let (a, b) = (w0_l * v0_l + w1_l * v1_l).widen();
-    let (c, d) = (w0_h * v0_h + w1_h * v1_h).widen();
-    [
-        a.reduce_sum(),
-        b.reduce_sum(),
-        c.reduce_sum(),
-        d.reduce_sum(),
-    ]
+    dot32_native_lanes_i32x4(low, high, v0_l, v0_h, v1_l, v1_h).to_array()
 }
 
 #[inline]
@@ -1267,13 +1281,17 @@ pub(super) fn dot_ptq1_row_pinned(bytes: &[u8], input: &[super::Q8Block]) -> Res
         let decoded = decode_ptq1(neon, block);
         let weight_scale = super::scale(&block[26..])?;
         for (group, activation) in activations.iter().enumerate() {
-            let integers = dot32_native_lanes(
-                neon,
+            let (v0_l, v0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            let floats = dot32_native_lanes_i32x4(
                 decoded[group * 2],
                 decoded[group * 2 + 1],
-                &activation.values,
-            );
-            let floats = f32x4::load_array(neon, integers.map(super::integer_float));
+                v0_l,
+                v0_h,
+                v1_l,
+                v1_h,
+            )
+            .to_float::<f32x4<Neon>>();
             let d = f32x4::splat(neon, weight_scale * activation.scale);
             lanes = floats.mul_add_precise(d, lanes);
         }
@@ -1314,15 +1332,15 @@ pub(super) fn dot_ptq1_four_rows_pinned(
             let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
             let act_scale = activation.scale;
             for r in 0..4 {
-                let integers = dot32_native_lanes_prewidened(
+                let floats = dot32_native_lanes_i32x4(
                     decoded[r][group * 2],
                     decoded[r][group * 2 + 1],
                     v0_l,
                     v0_h,
                     v1_l,
                     v1_h,
-                );
-                let floats = f32x4::load_array(neon, integers.map(super::integer_float));
+                )
+                .to_float::<f32x4<Neon>>();
                 let d = f32x4::splat(neon, scales[r] * act_scale);
                 lanes[r] = floats.mul_add_precise(d, lanes[r]);
             }
@@ -1364,15 +1382,15 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
             let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
             let act_scale = activation.scale;
             for r in 0..8 {
-                let integers = dot32_native_lanes_prewidened(
+                let floats = dot32_native_lanes_i32x4(
                     decoded[r][group * 2],
                     decoded[r][group * 2 + 1],
                     v0_l,
                     v0_h,
                     v1_l,
                     v1_h,
-                );
-                let floats = f32x4::load_array(neon, integers.map(super::integer_float));
+                )
+                .to_float::<f32x4<Neon>>();
                 let d = f32x4::splat(neon, scales[r] * act_scale);
                 lanes[r] = floats.mul_add_precise(d, lanes[r]);
             }
@@ -1420,27 +1438,29 @@ pub(super) fn float_dot(weights: &[f32], input: &[f32]) -> Option<f32> {
 #[inline]
 pub(super) fn bf16_dot(bytes: &[u8], input: &[f32]) -> Option<Result<f32>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let (b_chunks, b_rem) = bytes.as_chunks::<8>();
-    let (in_chunks, in_rem) = input.as_chunks::<4>();
+    let zero = u16x8::splat(neon, 0);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (b_chunks, b_rem) = bytes.as_chunks::<16>();
+    let (in_chunks, in_rem) = input.as_chunks::<8>();
     let mut sum = -0.0_f64;
     for (b_chunk, in_chunk) in b_chunks.iter().zip(in_chunks) {
-        let weights = f32x4::load_array(
-            neon,
-            [
-                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[0], b_chunk[1]])) << 16),
-                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[2], b_chunk[3]])) << 16),
-                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[4], b_chunk[5]])) << 16),
-                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[6], b_chunk[7]])) << 16),
-            ],
-        );
-        if !weights.is_finite().all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
-        let prod = (weights * f32x4::from_slice(neon, in_chunk)).to_array();
-        sum += f64::from(prod[0]);
-        sum += f64::from(prod[1]);
-        sum += f64::from(prod[2]);
-        sum += f64::from(prod[3]);
+        let raw = u8x16::from_slice(neon, b_chunk).bitcast::<u16x8<Neon>>();
+        let w0 = zero.zip_low(raw).bitcast::<f32x4<Neon>>();
+        let w1 = zero.zip_high(raw).bitcast::<f32x4<Neon>>();
+        finite_mask = finite_mask & w0.is_finite() & w1.is_finite();
+        let prod0 = (w0 * f32x4::from_slice(neon, &in_chunk[..4])).to_array();
+        let prod1 = (w1 * f32x4::from_slice(neon, &in_chunk[4..])).to_array();
+        sum += f64::from(prod0[0]);
+        sum += f64::from(prod0[1]);
+        sum += f64::from(prod0[2]);
+        sum += f64::from(prod0[3]);
+        sum += f64::from(prod1[0]);
+        sum += f64::from(prod1[1]);
+        sum += f64::from(prod1[2]);
+        sum += f64::from(prod1[3]);
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for (b, &act) in b_rem.as_chunks::<2>().0.iter().zip(in_rem) {
         match super::finite(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16)) {
@@ -1449,6 +1469,25 @@ pub(super) fn bf16_dot(bytes: &[u8], input: &[f32]) -> Option<Result<f32>> {
         }
     }
     Some(super::finite(sum as f32))
+}
+
+#[inline]
+fn transpose_4x4(
+    r0: f32x4<Neon>,
+    r1: f32x4<Neon>,
+    r2: f32x4<Neon>,
+    r3: f32x4<Neon>,
+) -> [f32x4<Neon>; 4] {
+    let t0 = r0.zip_low(r2);
+    let t1 = r0.zip_high(r2);
+    let t2 = r1.zip_low(r3);
+    let t3 = r1.zip_high(r3);
+    [
+        t0.zip_low(t2),
+        t0.zip_high(t2),
+        t1.zip_low(t3),
+        t1.zip_high(t3),
+    ]
 }
 
 #[inline]
@@ -1502,13 +1541,15 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
     }
     let mut half = if values.len() >= 16 {
         for block in values.as_chunks_mut::<16>().0 {
-            let mut v = [f32x4::splat(neon, 0.0); 4];
-            for (sub, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
-                let [a0, a1, a2, a3] = *chunk;
-                let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
-                v[sub] = f32x4::load_array(neon, [b0 + b2, b1 + b3, b0 - b2, b1 - b3]);
-            }
-            let (c0, c1, c2, c3) = (v[0] + v[1], v[0] - v[1], v[2] + v[3], v[2] - v[3]);
+            let [a0, a1, a2, a3] = transpose_4x4(
+                f32x4::from_slice(neon, &block[0..4]),
+                f32x4::from_slice(neon, &block[4..8]),
+                f32x4::from_slice(neon, &block[8..12]),
+                f32x4::from_slice(neon, &block[12..16]),
+            );
+            let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+            let [v0, v1, v2, v3] = transpose_4x4(b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+            let (c0, c1, c2, c3) = (v0 + v1, v0 - v1, v2 + v3, v2 - v3);
             (c0 + c2).store_slice(&mut block[0..4]);
             (c1 + c3).store_slice(&mut block[4..8]);
             (c0 - c2).store_slice(&mut block[8..12]);

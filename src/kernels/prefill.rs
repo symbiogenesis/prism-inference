@@ -131,21 +131,51 @@ impl ProjectionTile {
                             dot::Block::new(ptq1_values(block)?, backend)
                         };
                         *decoded_blocks = decoded_blocks.saturating_add(1);
-                        for (token, scratch) in preparations.iter().enumerate() {
-                            if tensor.kind == PQ2 && columns.is_multiple_of(256) {
+                        if tensor.kind == PQ2 && columns.is_multiple_of(256) {
+                            let start = (index % 2) * 128;
+                            let (chunks, rem) = preparations.as_chunks::<4>();
+                            for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                                let base = chunk_idx * 4;
+                                let a0 = &chunk[0].q8k[index / 2];
+                                let a1 = &chunk[1].q8k[index / 2];
+                                let a2 = &chunk[2].q8k[index / 2];
+                                let a3 = &chunk[3].q8k[index / 2];
+                                let dots = weights.dot128_four([
+                                    a0.values[start..start + 128].try_into()?,
+                                    a1.values[start..start + 128].try_into()?,
+                                    a2.values[start..start + 128].try_into()?,
+                                    a3.values[start..start + 128].try_into()?,
+                                ]);
+                                for (offset, (act, dot_int)) in
+                                    [a0, a1, a2, a3].into_iter().zip(dots).enumerate()
+                                {
+                                    let d = weight_scale * act.scale;
+                                    let dot = integer_float(dot_int);
+                                    let token = base + offset;
+                                    sums[token] = if pinned {
+                                        d.mul_add(dot, sums[token])
+                                    } else {
+                                        sums[token] + d * dot
+                                    };
+                                }
+                            }
+                            let rem_base = chunks.len() * 4;
+                            for (offset, scratch) in rem.iter().enumerate() {
                                 let activation = &scratch.q8k[index / 2];
-                                let start = (index % 2) * 128;
                                 let d = weight_scale * activation.scale;
                                 let dot = integer_float(
                                     weights
                                         .dot128(activation.values[start..start + 128].try_into()?),
                                 );
+                                let token = rem_base + offset;
                                 sums[token] = if pinned {
                                     d.mul_add(dot, sums[token])
                                 } else {
                                     sums[token] + d * dot
                                 };
-                            } else {
+                            }
+                        } else {
+                            for (token, scratch) in preparations.iter().enumerate() {
                                 let activations = &scratch.q8[index * 4..index * 4 + 4];
                                 let mut sum = 0.0;
                                 for (group, activation) in activations.iter().enumerate() {

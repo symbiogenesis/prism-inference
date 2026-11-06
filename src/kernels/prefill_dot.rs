@@ -83,6 +83,21 @@ impl Block {
     }
 
     #[inline]
+    pub(super) fn dot128_four(&self, values: [&[i8; 128]; 4]) -> [i32; 4] {
+        match self {
+            Self::Scalar(weights) => values.map(|token| scalar(weights, token)),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.dot128_four(values),
+        }
+    }
+
+    #[inline]
     pub(super) fn dot32(&self, group: usize, values: &[i8; 32]) -> i32 {
         match self {
             Self::Scalar(weights) => scalar(&weights[group * 32..group * 32 + 32], values),
@@ -153,7 +168,9 @@ mod tests {
                 if backend != MatvecBackend::Scalar {
                     assert!(matches!(block, Block::Neon(_)));
                 }
-                assert_eq!(block.dot128(&values), scalar(&weights, &values));
+                let expected128 = scalar(&weights, &values);
+                assert_eq!(block.dot128(&values), expected128);
+                assert_eq!(block.dot128_four([&values; 4]), [expected128; 4]);
                 for (group, values) in values.as_chunks::<32>().0.iter().enumerate() {
                     let weights = &weights[group * 32..group * 32 + 32];
                     assert_eq!(block.dot32(group, values), scalar(weights, values));

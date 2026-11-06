@@ -232,7 +232,6 @@ impl Decoder for ProjectedQwen35<'_> {
         Ok(logits)
     }
     fn evaluate_into(&mut self, token: u32, output: &mut Vec<f32>) -> Result<()> {
-        output.clear();
         let result = self.evaluate_token(token, Some(output));
         if result.is_err() {
             output.clear();

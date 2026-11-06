@@ -765,9 +765,6 @@ impl Transforms {
         scratch: &mut ProjectionScratch,
         executor: &mut Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
-        for output in &mut outputs {
-            output.clear();
-        }
         let result = (|| {
             if N > 4 {
                 return Err(invalid("projection group exceeds four siblings"));
@@ -885,6 +882,10 @@ impl Transforms {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep grouped-value permutation, fused sign-Hadamard blocks, and parallel chunking together."
+    )]
     fn transform_into_with_parallelism(
         &self,
         weight: &Tensor,
@@ -901,6 +902,43 @@ impl Transforms {
                 .get(&input.len())
                 .filter(|signs| signs.len() >= input.len())
             {
+                if parallelism.workers() > 1
+                    && self.block >= 256
+                    && geometry.ssm_head > 0
+                    && self.block.is_multiple_of(geometry.ssm_head)
+                    && input.len() >= self.block.saturating_mul(2)
+                    && input.len().is_multiple_of(self.block)
+                {
+                    let heads_per_block = self.block / geometry.ssm_head;
+                    return parallelism.update_chunks(
+                        transformed,
+                        self.block,
+                        |base_block, chunk| {
+                            for (local_idx, out_block) in
+                                chunk.chunks_exact_mut(self.block).enumerate()
+                            {
+                                let block_idx = base_block + local_idx;
+                                for h in 0..heads_per_block {
+                                    let target_head = block_idx * heads_per_block + h;
+                                    let key = target_head / repetitions;
+                                    let repeat = target_head % repetitions;
+                                    let source =
+                                        (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
+                                    let target = target_head * geometry.ssm_head;
+                                    let out_head = &mut out_block
+                                        [h * geometry.ssm_head..(h + 1) * geometry.ssm_head];
+                                    mul_slice_into(
+                                        &input[source..source + geometry.ssm_head],
+                                        &signs[target..target + geometry.ssm_head],
+                                        out_head,
+                                    );
+                                }
+                                crate::kernels::hadamard(out_block)?;
+                            }
+                            Ok(())
+                        },
+                    );
+                }
                 for key in 0..geometry.ssm_keys {
                     for repeat in 0..repetitions {
                         let source = (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
@@ -923,6 +961,36 @@ impl Transforms {
                 }
                 self.sign(transformed);
             }
+        } else if self.block > 0
+            && input.len().is_multiple_of(self.block)
+            && self
+                .signs
+                .get(&input.len())
+                .is_none_or(|signs| signs.len() >= input.len())
+        {
+            resize_into(input.len(), transformed)?;
+            let signs = self.signs.get(&input.len()).map(Vec::as_slice);
+            if parallelism.workers() > 1
+                && self.block >= 256
+                && input.len() >= self.block.saturating_mul(2)
+            {
+                return parallelism.update_chunks(transformed, self.block, |base_block, chunk| {
+                    for (local_idx, out_block) in chunk.chunks_exact_mut(self.block).enumerate() {
+                        let offset = (base_block + local_idx) * self.block;
+                        let in_block = &input[offset..offset + self.block];
+                        let sign_block = signs.map(|s| &s[offset..offset + self.block]);
+                        crate::kernels::hadamard_into(in_block, sign_block, out_block)?;
+                    }
+                    Ok(())
+                });
+            }
+            for (block_idx, out_block) in transformed.chunks_exact_mut(self.block).enumerate() {
+                let offset = block_idx * self.block;
+                let in_block = &input[offset..offset + self.block];
+                let sign_block = signs.map(|s| &s[offset..offset + self.block]);
+                crate::kernels::hadamard_into(in_block, sign_block, out_block)?;
+            }
+            return Ok(());
         } else if let Some(signs) = self.signs.get(&input.len()) {
             resize_into(input.len(), transformed)?;
             let overlap = input.len().min(signs.len());
@@ -1885,6 +1953,7 @@ impl Evaluation<'_, '_> {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         clippy::suboptimal_flops,
         clippy::cast_possible_truncation,
         clippy::as_conversions,
@@ -1909,21 +1978,6 @@ impl Evaluation<'_, '_> {
             input,
             [&mut scratch.projected, key, value],
         )?;
-        prepare(&mut scratch.query, g.head * g.heads)?;
-        prepare(&mut scratch.gate, g.head * g.heads)?;
-        for head in scratch.projected.chunks_exact_mut(2 * g.head) {
-            self.arithmetic.normalize_in_place(
-                &mut head[..g.head],
-                &layer.query_norm,
-                g.epsilon,
-            )?;
-            scratch.query.extend_from_slice(&head[..g.head]);
-            scratch.gate.extend_from_slice(&head[g.head..]);
-        }
-        for head in key.chunks_exact_mut(g.head) {
-            self.arithmetic
-                .normalize_in_place(head, &layer.key_norm, g.epsilon)?;
-        }
         // Geometry and position are shared by every full-attention layer in
         // this token evaluation. Reuse the exact scalar frequencies for Q/K
         // and subsequent layers; the flag resets for every evaluation attempt.
@@ -1931,20 +1985,52 @@ impl Evaluation<'_, '_> {
             rope_frequencies(g, self.position, &mut scratch.frequencies)?;
             self.frequencies_ready = true;
         }
-        self.arithmetic
-            .attention_rope(&mut scratch.query, g, &scratch.frequencies)?;
+        resize_into(g.head * g.heads, &mut scratch.query)?;
+        resize_into(g.head * g.heads, &mut scratch.gate)?;
+        let arithmetic = self.arithmetic;
+        let projected: &[f32] = &scratch.projected;
+        let query_norm: &[f32] = &layer.query_norm;
+        let frequencies: &[(f32, f32)] = &scratch.frequencies;
+        self.projection
+            .matvec
+            .row_parallelism()
+            .update_paired_chunks(
+                &mut scratch.query,
+                g.head,
+                &mut scratch.gate,
+                g.head,
+                |base_head, query_chunk, gate_chunk| {
+                    for (head_offset, (query_head, gate_head)) in query_chunk
+                        .chunks_exact_mut(g.head)
+                        .zip(gate_chunk.chunks_exact_mut(g.head))
+                        .enumerate()
+                    {
+                        let head_idx = base_head + head_offset;
+                        let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
+                        query_head.copy_from_slice(&src[..g.head]);
+                        gate_head.copy_from_slice(&src[g.head..]);
+                        arithmetic.normalize_in_place(query_head, query_norm, g.epsilon)?;
+                        arithmetic.attention_rope(query_head, g, frequencies)?;
+                        // F16 K x Q converts the F32 query to F16 even with F32 precision.
+                        round_f16_slice(query_head);
+                    }
+                    Ok(())
+                },
+            )?;
+        for head in key.chunks_exact_mut(g.head) {
+            self.arithmetic
+                .normalize_in_place(head, &layer.key_norm, g.epsilon)?;
+        }
         self.arithmetic
             .attention_rope(key, g, &scratch.frequencies)?;
-        // F16 K x Q converts the F32 query to F16 even with F32 precision.
-        round_f16_slice(&mut scratch.query);
         round_f16_slice(key);
         round_f16_slice(value);
         finite(&scratch.query, "binary16 attention query")?;
         finite(key, "binary16 key cache")?;
         finite(value, "binary16 value cache")?;
-        zeros_into(g.head * g.heads, &mut scratch.attended)?;
+        resize_into(g.head * g.heads, &mut scratch.attended)?;
         let score_len = self.position + 1;
-        zeros_into(g.heads * score_len, &mut scratch.scores)?;
+        resize_into(g.heads * score_len, &mut scratch.scores)?;
         let scale = 1.0 / small_float(g.head)?.sqrt();
         let arithmetic = self.arithmetic;
         let query_ref: &[f32] = &scratch.query;
@@ -2269,7 +2355,6 @@ impl Decoder for Qwen35 {
     }
 
     fn evaluate_into(&mut self, token: u32, logits: &mut Vec<f32>) -> Result<()> {
-        logits.clear();
         let result = self.evaluate_token_into(token, Some(logits));
         if result.is_err() {
             logits.clear();
@@ -2670,6 +2755,10 @@ fn resize_into(count: usize, output: &mut Vec<f32>) -> Result<()> {
 }
 
 fn copy_into(input: &[f32], output: &mut Vec<f32>) -> Result<()> {
+    if output.len() == input.len() {
+        output.copy_from_slice(input);
+        return Ok(());
+    }
     prepare(output, input.len())?;
     output.extend_from_slice(input);
     Ok(())

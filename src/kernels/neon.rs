@@ -345,10 +345,11 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..4 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                acc[row] += pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
-                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
-                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
-                acc[row] += pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
+                let s0 = pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
+                let s1 = pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
+                let s2 = pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
+                let s3 = pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
+                acc[row] += (s0 + s1) + (s2 + s3);
             }
         }
         let sums = (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3])
@@ -380,18 +381,13 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
     let mut scales_finite = out_lo.is_finite();
     for (block_idx, activation) in input.iter().enumerate() {
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|row| &chunks[row][block_idx]);
-        let scales_lo = f16_bits_to_f32_x4(
+        let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
             neon,
-            [
+            &[
                 scale_u16(blocks[0]),
                 scale_u16(blocks[1]),
                 scale_u16(blocks[2]),
                 scale_u16(blocks[3]),
-            ],
-        );
-        let scales_hi = f16_bits_to_f32_x4(
-            neon,
-            [
                 scale_u16(blocks[4]),
                 scale_u16(blocks[5]),
                 scale_u16(blocks[6]),
@@ -416,10 +412,11 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..8 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                acc[row] += pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
-                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
-                acc[row] += pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
-                acc[row] += pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
+                let s0 = pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
+                let s1 = pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
+                let s2 = pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
+                let s3 = pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
+                acc[row] += (s0 + s1) + (s2 + s3);
             }
         }
         let act_sum = i32x4::splat(neon, activation.sum);
@@ -447,19 +444,21 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
 #[inline]
 fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
     let mut max_abs_vec = f32x4::splat(neon, 0.0);
+    let mut finite_mask = max_abs_vec.is_finite();
     for group in chunk.as_chunks::<16>().0 {
         let v0 = f32x4::from_slice(neon, &group[0..4]);
         let v1 = f32x4::from_slice(neon, &group[4..8]);
         let v2 = f32x4::from_slice(neon, &group[8..12]);
         let v3 = f32x4::from_slice(neon, &group[12..16]);
-        if !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
-            return Err(crate::invalid("nonfinite tensor or activation value"));
-        }
+        finite_mask &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
         max_abs_vec = max_abs_vec
             .max(v0.abs())
             .max(v1.abs())
             .max(v2.abs())
             .max(v3.abs());
+    }
+    if !finite_mask.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
     }
     let mut max_lanes = [0.0_f32; 4];
     max_abs_vec.store_slice(&mut max_lanes);
@@ -525,6 +524,7 @@ pub(super) fn q8k_block<const PINNED: bool>(
     let min_code = i32x4::splat(neon, if PINNED { -128 } else { -127 });
     let mask16 = u32x4::splat(neon, 0xffff);
     let mask8 = u16x8::splat(neon, 0xff);
+    let mut valid_mask = iscale.is_finite();
     for ((group, dst_values), dst_sum) in chunk
         .as_chunks::<16>()
         .0
@@ -552,9 +552,6 @@ pub(super) fn q8k_block<const PINNED: bool>(
                 (v3 * iscale) + magic,
             )
         };
-        if !(r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite()).all_true() {
-            return None;
-        }
         let i0 = ((r0.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
             .min(max_code);
         let i1 = ((r1.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
@@ -563,14 +560,10 @@ pub(super) fn q8k_block<const PINNED: bool>(
             .min(max_code);
         let i3 = ((r3.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
             .min(max_code);
-        if !(i0.simd_ge(min_code)
-            & i1.simd_ge(min_code)
-            & i2.simd_ge(min_code)
-            & i3.simd_ge(min_code))
-        .all_true()
-        {
-            return None;
-        }
+        valid_mask &= (r0.is_finite() & r1.is_finite())
+            & (r2.is_finite() & r3.is_finite())
+            & (i0.simd_ge(min_code) & i1.simd_ge(min_code))
+            & (i2.simd_ge(min_code) & i3.simd_ge(min_code));
         let low16 = (i0.bitcast::<u32x4<Neon>>() & mask16)
             .narrow(i1.bitcast::<u32x4<Neon>>() & mask16)
             .bitcast::<i16x8<Neon>>();
@@ -584,6 +577,9 @@ pub(super) fn q8k_block<const PINNED: bool>(
         let (sum_lo, sum_hi) = (low16 + high16).widen();
         *dst_sum = (sum_lo + sum_hi).reduce_sum() as i16;
     }
+    if !valid_mask.all_true() {
+        return None;
+    }
     Some(Ok(block))
 }
 
@@ -593,19 +589,21 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
 ) -> Option<Result<super::Q8Block>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut max_abs_vec = f32x4::splat(neon, 0.0);
+    let mut finite_mask = max_abs_vec.is_finite();
     for group in chunk.as_chunks::<16>().0 {
         let v0 = f32x4::from_slice(neon, &group[0..4]);
         let v1 = f32x4::from_slice(neon, &group[4..8]);
         let v2 = f32x4::from_slice(neon, &group[8..12]);
         let v3 = f32x4::from_slice(neon, &group[12..16]);
-        if !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
+        finite_mask &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
         max_abs_vec = max_abs_vec
             .max(v0.abs())
             .max(v1.abs())
             .max(v2.abs())
             .max(v3.abs());
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     let max_lanes = max_abs_vec.to_array();
     let maximum = max_lanes[0]
@@ -646,6 +644,7 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
     let mask16 = u32x4::splat(neon, 0xffff);
     let mask8 = u16x8::splat(neon, 0xff);
     let mut total_sum = i32x4::splat(neon, 0);
+    let mut valid_mask = iscale.is_finite();
     for (group, dst_values) in chunk
         .as_chunks::<16>()
         .0
@@ -657,25 +656,16 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
         let r1 = (f32x4::from_slice(neon, &subs[1]) * iscale) + magic;
         let r2 = (f32x4::from_slice(neon, &subs[2]) * iscale) + magic;
         let r3 = (f32x4::from_slice(neon, &subs[3]) * iscale) + magic;
-        if !(r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite()).all_true() {
-            return None;
-        }
         let i0 = (r0.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
         let i1 = (r1.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
         let i2 = (r2.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
         let i3 = (r3.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
-        if !(i0.simd_ge(min_code)
-            & i0.simd_le(max_code)
-            & i1.simd_ge(min_code)
-            & i1.simd_le(max_code)
-            & i2.simd_ge(min_code)
-            & i2.simd_le(max_code)
-            & i3.simd_ge(min_code)
-            & i3.simd_le(max_code))
-        .all_true()
-        {
-            return None;
-        }
+        valid_mask &= (r0.is_finite() & r1.is_finite())
+            & (r2.is_finite() & r3.is_finite())
+            & (i0.simd_ge(min_code) & i0.simd_le(max_code))
+            & (i1.simd_ge(min_code) & i1.simd_le(max_code))
+            & (i2.simd_ge(min_code) & i2.simd_le(max_code))
+            & (i3.simd_ge(min_code) & i3.simd_le(max_code));
         total_sum += i0 + i1 + i2 + i3;
         let low16 =
             (i0.bitcast::<u32x4<Neon>>() & mask16).narrow(i1.bitcast::<u32x4<Neon>>() & mask16);
@@ -685,6 +675,9 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
             .narrow(high16 & mask8)
             .bitcast::<i8x16<Neon>>();
         bytes.store_slice(dst_values);
+    }
+    if !valid_mask.all_true() {
+        return None;
     }
     block.sum = super::round_f16(super::integer_float(total_sum.reduce_sum()) * d);
     Some(Ok(block))
@@ -774,6 +767,72 @@ pub(super) fn round_f16_slice(values: &mut [f32]) -> bool {
         *value = super::round_f16(*value);
     }
     true
+}
+
+#[inline]
+pub(super) fn round_f16_into(input: &[f32], output: &mut Vec<f32>) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if output.len() != input.len() {
+        output.clear();
+        if let Err(err) = output.try_reserve_exact(input.len()) {
+            return Some(Err(err.into()));
+        }
+        output.resize(input.len(), 0.0);
+    }
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (in_chunks, in_tail) = input.as_chunks::<4>();
+    let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
+    for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks) {
+        let rounded = round_f16_x4(neon, f32x4::from_slice(neon, in_chunk));
+        finite_mask &= rounded.is_finite();
+        rounded.store_slice(out_chunk);
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    for (&value, out) in in_tail.iter().zip(out_tail) {
+        let rounded = super::round_f16(value);
+        if !rounded.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        *out = rounded;
+    }
+    Some(Ok(()))
+}
+
+#[inline]
+pub(super) fn round_bf16_into(input: &[f32], output: &mut Vec<f32>) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if output.len() != input.len() {
+        output.clear();
+        if let Err(err) = output.try_reserve_exact(input.len()) {
+            return Some(Err(err.into()));
+        }
+        output.resize(input.len(), 0.0);
+    }
+    let bias_base = u32x4::splat(neon, 0x7fff);
+    let one = u32x4::splat(neon, 1);
+    let mask = u32x4::splat(neon, 0xffff_0000);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (in_chunks, in_tail) = input.as_chunks::<4>();
+    let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
+    for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks) {
+        let bits = f32x4::from_slice(neon, in_chunk).bitcast::<u32x4<Neon>>();
+        let rounded = ((bits + (bias_base + ((bits >> 16) & one))) & mask).bitcast::<f32x4<Neon>>();
+        finite_mask &= rounded.is_finite();
+        rounded.store_slice(out_chunk);
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    for (&value, out) in in_tail.iter().zip(out_tail) {
+        let rounded = super::round_bf16(value);
+        if !rounded.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        *out = rounded;
+    }
+    Some(Ok(()))
 }
 
 #[inline]
@@ -1002,10 +1061,13 @@ pub(super) fn rms_norm_scale_into<const PINNED: bool>(
     output: &mut Vec<f32>,
 ) -> Option<Result<()>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    if let Err(err) = output.try_reserve_exact(input.len()) {
-        return Some(Err(err.into()));
+    if output.len() != input.len() {
+        output.clear();
+        if let Err(err) = output.try_reserve_exact(input.len()) {
+            return Some(Err(err.into()));
+        }
+        output.resize(input.len(), 0.0);
     }
-    output.resize(input.len(), 0.0);
     let scale_vec = f32x4::splat(neon, scale);
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let (in_chunks, in_tail) = input.as_chunks::<4>();
@@ -1412,30 +1474,36 @@ pub(super) fn dot_ptq1_four_rows_pinned(
     let r3 = rows[3].as_chunks::<28>().0;
     for (index, (((b0, b1), b2), b3)) in r0.iter().zip(r1).zip(r2).zip(r3).enumerate() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+        let a0 = activations[0].scale;
+        let a1 = activations[1].scale;
+        let a2 = activations[2].scale;
+        let a3 = activations[3].scale;
         let blocks = [b0, b1, b2, b3];
-        let mut decoded = [[i8x16::splat(neon, 0); 8]; 4];
-        let mut scales = [0.0_f32; 4];
         for r in 0..4 {
-            decoded[r] = decode_ptq1(neon, blocks[r]);
-            scales[r] = super::scale(&blocks[r][26..])?;
-        }
-        for (group, activation) in activations.iter().enumerate() {
-            let (v0_l, v0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
-            let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
-            let act_scale = activation.scale;
-            for r in 0..4 {
-                let floats = dot32_native_lanes_i32x4(
-                    decoded[r][group * 2],
-                    decoded[r][group * 2 + 1],
-                    v0_l,
-                    v0_h,
-                    v1_l,
-                    v1_h,
-                )
+            let block = blocks[r];
+            let row_scale = super::scale(&block[26..])?;
+            let dec = decode_ptq1(neon, block);
+            let mut lane = lanes[r];
+            let f0 = dot32_native_lanes_i32x4(dec[0], dec[1], v00_l, v00_h, v01_l, v01_h)
                 .to_float::<f32x4<Neon>>();
-                let d = f32x4::splat(neon, scales[r] * act_scale);
-                lanes[r] = floats.mul_add_precise(d, lanes[r]);
-            }
+            lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
+            let f1 = dot32_native_lanes_i32x4(dec[2], dec[3], v10_l, v10_h, v11_l, v11_h)
+                .to_float::<f32x4<Neon>>();
+            lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
+            let f2 = dot32_native_lanes_i32x4(dec[4], dec[5], v20_l, v20_h, v21_l, v21_h)
+                .to_float::<f32x4<Neon>>();
+            lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
+            let f3 = dot32_native_lanes_i32x4(dec[6], dec[7], v30_l, v30_h, v31_l, v31_h)
+                .to_float::<f32x4<Neon>>();
+            lanes[r] = f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane);
         }
     }
     let mut out = [0.0_f32; 4];
@@ -1462,30 +1530,35 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
     let chunks = rows.map(|row| row.as_chunks::<28>().0);
     for index in 0..chunks[0].len() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
-        let mut decoded = [[i8x16::splat(neon, 0); 8]; 8];
-        let mut scales = [0.0_f32; 8];
+        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+        let a0 = activations[0].scale;
+        let a1 = activations[1].scale;
+        let a2 = activations[2].scale;
+        let a3 = activations[3].scale;
         for r in 0..8 {
             let block = &chunks[r][index];
-            decoded[r] = decode_ptq1(neon, block);
-            scales[r] = super::scale(&block[26..])?;
-        }
-        for (group, activation) in activations.iter().enumerate() {
-            let (v0_l, v0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
-            let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
-            let act_scale = activation.scale;
-            for r in 0..8 {
-                let floats = dot32_native_lanes_i32x4(
-                    decoded[r][group * 2],
-                    decoded[r][group * 2 + 1],
-                    v0_l,
-                    v0_h,
-                    v1_l,
-                    v1_h,
-                )
+            let row_scale = super::scale(&block[26..])?;
+            let dec = decode_ptq1(neon, block);
+            let mut lane = lanes[r];
+            let f0 = dot32_native_lanes_i32x4(dec[0], dec[1], v00_l, v00_h, v01_l, v01_h)
                 .to_float::<f32x4<Neon>>();
-                let d = f32x4::splat(neon, scales[r] * act_scale);
-                lanes[r] = floats.mul_add_precise(d, lanes[r]);
-            }
+            lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
+            let f1 = dot32_native_lanes_i32x4(dec[2], dec[3], v10_l, v10_h, v11_l, v11_h)
+                .to_float::<f32x4<Neon>>();
+            lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
+            let f2 = dot32_native_lanes_i32x4(dec[4], dec[5], v20_l, v20_h, v21_l, v21_h)
+                .to_float::<f32x4<Neon>>();
+            lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
+            let f3 = dot32_native_lanes_i32x4(dec[6], dec[7], v30_l, v30_h, v31_l, v31_h)
+                .to_float::<f32x4<Neon>>();
+            lanes[r] = f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane);
         }
     }
     let mut out = [0.0_f32; 8];
@@ -1672,11 +1745,26 @@ fn transpose_4x4(
 fn hadamard_16_registers(
     neon: Neon,
     block: &[f32],
+    signs: Option<&[f32]>,
 ) -> ([f32x4<Neon>; 4], fearless_simd::mask32x4<Neon>) {
-    let r0 = f32x4::from_slice(neon, &block[0..4]);
-    let r1 = f32x4::from_slice(neon, &block[4..8]);
-    let r2 = f32x4::from_slice(neon, &block[8..12]);
-    let r3 = f32x4::from_slice(neon, &block[12..16]);
+    let (r0, r1, r2, r3) = signs.map_or_else(
+        || {
+            (
+                f32x4::from_slice(neon, &block[0..4]),
+                f32x4::from_slice(neon, &block[4..8]),
+                f32x4::from_slice(neon, &block[8..12]),
+                f32x4::from_slice(neon, &block[12..16]),
+            )
+        },
+        |s| {
+            (
+                f32x4::from_slice(neon, &block[0..4]) * f32x4::from_slice(neon, &s[0..4]),
+                f32x4::from_slice(neon, &block[4..8]) * f32x4::from_slice(neon, &s[4..8]),
+                f32x4::from_slice(neon, &block[8..12]) * f32x4::from_slice(neon, &s[8..12]),
+                f32x4::from_slice(neon, &block[12..16]) * f32x4::from_slice(neon, &s[12..16]),
+            )
+        },
+    );
     let finite = r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite();
     let [a0, a1, a2, a3] = transpose_4x4(r0, r1, r2, r3);
     let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
@@ -1715,94 +1803,25 @@ fn hadamard_radix4_stage(neon: Neon, values: &mut [f32], half: usize) {
     }
 }
 
-/// Evaluates the normalized Sylvester Hadamard butterfly stages in NEON `f32x4`.
-///
-/// Requires a power-of-two slice of at least four elements. Stages `half = 1..=32`
-/// are fused in registers per 64-element block when `values.len() >= 64` (or
-/// `half = 1..=8` per 16-element block when `values.len() >= 16`), subsequent
-/// stages run in radix-4 pairs (`half` and `half * 2`), and the final radix-4 or
-/// radix-2 butterfly stage is fused with normalization while preserving exact
-/// IEEE 754 addition and subtraction order.
 #[inline]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep register-fused 16/64-element and final radix-4/radix-2 normalization stages together."
-)]
-pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<()>> {
-    if values.len() < 4 {
-        return None;
-    }
-    let neon = fearless_simd::Level::baseline().as_neon()?;
-    let norm = f32x4::splat(neon, normalization);
-    let mut in_finite = f32x4::splat(neon, 0.0).is_finite();
-    let mut finite_mask = in_finite;
-    let mut half = if values.len() >= 64 {
-        let fuse_norm = values.len() == 64;
-        for block in values.as_chunks_mut::<64>().0 {
-            let (q0, f0) = hadamard_16_registers(neon, &block[0..16]);
-            let (q1, f1) = hadamard_16_registers(neon, &block[16..32]);
-            let (q2, f2) = hadamard_16_registers(neon, &block[32..48]);
-            let (q3, f3) = hadamard_16_registers(neon, &block[48..64]);
-            in_finite &= f0 & f1 & f2 & f3;
-            for i in 0..4 {
-                let b0 = q0[i] + q1[i];
-                let b1 = q0[i] - q1[i];
-                let b2 = q2[i] + q3[i];
-                let b3 = q2[i] - q3[i];
-                let (mut out0, mut out1, mut out2, mut out3) = (b0 + b2, b1 + b3, b0 - b2, b1 - b3);
-                if fuse_norm {
-                    out0 *= norm;
-                    out1 *= norm;
-                    out2 *= norm;
-                    out3 *= norm;
-                    finite_mask &=
-                        out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
-                }
-                let base = i * 4;
-                out0.store_slice(&mut block[base..base + 4]);
-                out1.store_slice(&mut block[16 + base..20 + base]);
-                out2.store_slice(&mut block[32 + base..36 + base]);
-                out3.store_slice(&mut block[48 + base..52 + base]);
-            }
-        }
-        64
-    } else if values.len() >= 16 {
-        let fuse_norm = values.len() == 16;
-        for block in values.as_chunks_mut::<16>().0 {
-            let ([mut d0, mut d1, mut d2, mut d3], f0) = hadamard_16_registers(neon, block);
-            in_finite &= f0;
-            if fuse_norm {
-                d0 *= norm;
-                d1 *= norm;
-                d2 *= norm;
-                d3 *= norm;
-                finite_mask &= d0.is_finite() & d1.is_finite() & d2.is_finite() & d3.is_finite();
-            }
-            d0.store_slice(&mut block[0..4]);
-            d1.store_slice(&mut block[4..8]);
-            d2.store_slice(&mut block[8..12]);
-            d3.store_slice(&mut block[12..16]);
-        }
-        16
-    } else {
-        for chunk in values.as_chunks_mut::<4>().0 {
-            in_finite &= f32x4::from_slice(neon, chunk).is_finite();
-            let [a0, a1, a2, a3] = *chunk;
-            let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
-            *chunk = [b0 + b2, b1 + b3, b0 - b2, b1 - b3];
-        }
-        4
-    };
+fn hadamard_finish(
+    neon: Neon,
+    values: &mut [f32],
+    mut half: usize,
+    norm: f32x4<Neon>,
+    in_finite: fearless_simd::mask32x4<Neon>,
+    mut finite_mask: fearless_simd::mask32x4<Neon>,
+) -> Result<()> {
     if !in_finite.all_true() {
-        return Some(Err(crate::invalid(
+        return Err(crate::invalid(
             "Hadamard requires a finite power-of-two block",
-        )));
+        ));
     }
     if half == values.len() && values.len() >= 16 {
         if !finite_mask.all_true() {
-            return Some(Err(crate::invalid("nonfinite kernel output")));
+            return Err(crate::invalid("nonfinite kernel output"));
         }
-        return Some(Ok(()));
+        return Ok(());
     }
     while half * 4 < values.len() {
         hadamard_radix4_stage(neon, values, half);
@@ -1863,15 +1882,221 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
         }
     }
     if !finite_mask.all_true() {
-        return Some(Err(crate::invalid("nonfinite kernel output")));
+        return Err(crate::invalid("nonfinite kernel output"));
     }
-    Some(Ok(()))
+    Ok(())
+}
+
+/// Evaluates the normalized Sylvester Hadamard butterfly stages in NEON `f32x4`.
+///
+/// Requires a power-of-two slice of at least four elements. Stages `half = 1..=32`
+/// are fused in registers per 64-element block when `values.len() >= 64` (or
+/// `half = 1..=8` per 16-element block when `values.len() >= 16`), subsequent
+/// stages run in radix-4 pairs (`half` and `half * 2`), and the final radix-4 or
+/// radix-2 butterfly stage is fused with normalization while preserving exact
+/// IEEE 754 addition and subtraction order.
+#[inline]
+pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<()>> {
+    if values.len() < 4 {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let norm = f32x4::splat(neon, normalization);
+    let mut in_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut finite_mask = in_finite;
+    let half = if values.len() >= 64 {
+        let fuse_norm = values.len() == 64;
+        for block in values.as_chunks_mut::<64>().0 {
+            let (q0, f0) = hadamard_16_registers(neon, &block[0..16], None);
+            let (q1, f1) = hadamard_16_registers(neon, &block[16..32], None);
+            let (q2, f2) = hadamard_16_registers(neon, &block[32..48], None);
+            let (q3, f3) = hadamard_16_registers(neon, &block[48..64], None);
+            in_finite &= f0 & f1 & f2 & f3;
+            for i in 0..4 {
+                let b0 = q0[i] + q1[i];
+                let b1 = q0[i] - q1[i];
+                let b2 = q2[i] + q3[i];
+                let b3 = q2[i] - q3[i];
+                let (mut out0, mut out1, mut out2, mut out3) = (b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+                if fuse_norm {
+                    out0 *= norm;
+                    out1 *= norm;
+                    out2 *= norm;
+                    out3 *= norm;
+                    finite_mask &=
+                        out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
+                }
+                let base = i * 4;
+                out0.store_slice(&mut block[base..base + 4]);
+                out1.store_slice(&mut block[16 + base..20 + base]);
+                out2.store_slice(&mut block[32 + base..36 + base]);
+                out3.store_slice(&mut block[48 + base..52 + base]);
+            }
+        }
+        64
+    } else if values.len() >= 16 {
+        let fuse_norm = values.len() == 16;
+        for block in values.as_chunks_mut::<16>().0 {
+            let ([mut d0, mut d1, mut d2, mut d3], f0) = hadamard_16_registers(neon, block, None);
+            in_finite &= f0;
+            if fuse_norm {
+                d0 *= norm;
+                d1 *= norm;
+                d2 *= norm;
+                d3 *= norm;
+                finite_mask &= d0.is_finite() & d1.is_finite() & d2.is_finite() & d3.is_finite();
+            }
+            d0.store_slice(&mut block[0..4]);
+            d1.store_slice(&mut block[4..8]);
+            d2.store_slice(&mut block[8..12]);
+            d3.store_slice(&mut block[12..16]);
+        }
+        16
+    } else {
+        for chunk in values.as_chunks_mut::<4>().0 {
+            in_finite &= f32x4::from_slice(neon, chunk).is_finite();
+            let [a0, a1, a2, a3] = *chunk;
+            let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+            *chunk = [b0 + b2, b1 + b3, b0 - b2, b1 - b3];
+        }
+        4
+    };
+    Some(hadamard_finish(
+        neon,
+        values,
+        half,
+        norm,
+        in_finite,
+        finite_mask,
+    ))
+}
+
+/// Fuses sign multiplication (or input load) with the normalized Sylvester Hadamard butterfly stages.
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep register-fused 16/64-element sign-multiplication and Hadamard stages together."
+)]
+pub(super) fn hadamard_into(
+    input: &[f32],
+    signs: Option<&[f32]>,
+    values: &mut [f32],
+    normalization: f32,
+) -> Option<Result<()>> {
+    if values.len() < 4
+        || input.len() != values.len()
+        || signs.is_some_and(|s| s.len() < values.len())
+    {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let norm = f32x4::splat(neon, normalization);
+    let mut in_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut finite_mask = in_finite;
+    let half = if values.len() >= 64 {
+        let fuse_norm = values.len() == 64;
+        for (block_idx, (in_block, out_block)) in input
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .zip(values.as_chunks_mut::<64>().0)
+            .enumerate()
+        {
+            let s_block = signs.map(|s| &s[block_idx * 64..(block_idx + 1) * 64]);
+            let (q0, f0) =
+                hadamard_16_registers(neon, &in_block[0..16], s_block.map(|s| &s[0..16]));
+            let (q1, f1) =
+                hadamard_16_registers(neon, &in_block[16..32], s_block.map(|s| &s[16..32]));
+            let (q2, f2) =
+                hadamard_16_registers(neon, &in_block[32..48], s_block.map(|s| &s[32..48]));
+            let (q3, f3) =
+                hadamard_16_registers(neon, &in_block[48..64], s_block.map(|s| &s[48..64]));
+            in_finite &= f0 & f1 & f2 & f3;
+            for i in 0..4 {
+                let b0 = q0[i] + q1[i];
+                let b1 = q0[i] - q1[i];
+                let b2 = q2[i] + q3[i];
+                let b3 = q2[i] - q3[i];
+                let (mut out0, mut out1, mut out2, mut out3) = (b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+                if fuse_norm {
+                    out0 *= norm;
+                    out1 *= norm;
+                    out2 *= norm;
+                    out3 *= norm;
+                    finite_mask &=
+                        out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
+                }
+                let base = i * 4;
+                out0.store_slice(&mut out_block[base..base + 4]);
+                out1.store_slice(&mut out_block[16 + base..20 + base]);
+                out2.store_slice(&mut out_block[32 + base..36 + base]);
+                out3.store_slice(&mut out_block[48 + base..52 + base]);
+            }
+        }
+        64
+    } else if values.len() >= 16 {
+        let fuse_norm = values.len() == 16;
+        for (block_idx, (in_block, out_block)) in input
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(values.as_chunks_mut::<16>().0)
+            .enumerate()
+        {
+            let s_block = signs.map(|s| &s[block_idx * 16..(block_idx + 1) * 16]);
+            let ([mut d0, mut d1, mut d2, mut d3], f0) =
+                hadamard_16_registers(neon, in_block, s_block);
+            in_finite &= f0;
+            if fuse_norm {
+                d0 *= norm;
+                d1 *= norm;
+                d2 *= norm;
+                d3 *= norm;
+                finite_mask &= d0.is_finite() & d1.is_finite() & d2.is_finite() & d3.is_finite();
+            }
+            d0.store_slice(&mut out_block[0..4]);
+            d1.store_slice(&mut out_block[4..8]);
+            d2.store_slice(&mut out_block[8..12]);
+            d3.store_slice(&mut out_block[12..16]);
+        }
+        16
+    } else {
+        for (chunk_idx, (in_chunk, out_chunk)) in input
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(values.as_chunks_mut::<4>().0)
+            .enumerate()
+        {
+            let v = signs.map_or_else(
+                || f32x4::from_slice(neon, in_chunk),
+                |s| {
+                    f32x4::from_slice(neon, in_chunk)
+                        * f32x4::from_slice(neon, &s[chunk_idx * 4..(chunk_idx + 1) * 4])
+                },
+            );
+            in_finite &= v.is_finite();
+            let [a0, a1, a2, a3] = v.to_array();
+            let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+            *out_chunk = [b0 + b2, b1 + b3, b0 - b2, b1 - b3];
+        }
+        4
+    };
+    Some(hadamard_finish(
+        neon,
+        values,
+        half,
+        norm,
+        in_finite,
+        finite_mask,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_ptq1_groups, hadamard,
+        hadamard_into, round_bf16_into, round_f16_into, round_f16_slice,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -2259,10 +2484,41 @@ mod tests {
             for value in &mut expected {
                 *value *= norm;
             }
+            let input_snapshot = actual.clone();
             hadamard(&mut actual, norm).ok_or("missing baseline NEON token")??;
             let actual_bits: Vec<u32> = actual.iter().copied().map(f32::to_bits).collect();
             let expected_bits: Vec<u32> = expected.iter().copied().map(f32::to_bits).collect();
             assert_eq!(actual_bits, expected_bits, "Hadamard mismatch at len={len}");
+
+            let mut into_actual = vec![0.0_f32; len];
+            hadamard_into(&input_snapshot, None, &mut into_actual, norm)
+                .ok_or("missing baseline NEON token")??;
+            let into_bits: Vec<u32> = into_actual.iter().copied().map(f32::to_bits).collect();
+            assert_eq!(
+                into_bits, expected_bits,
+                "hadamard_into(None) mismatch at len={len}"
+            );
+
+            let signs: Vec<f32> = (0..len)
+                .map(|idx| if idx % 3 == 0 { -1.0 } else { 1.0 })
+                .collect();
+            let mut signed_expected: Vec<f32> = input_snapshot
+                .iter()
+                .zip(&signs)
+                .map(|(v, s)| *v * *s)
+                .collect();
+            hadamard(&mut signed_expected, norm).ok_or("missing baseline NEON token")??;
+            let mut signed_into = vec![0.0_f32; len];
+            hadamard_into(&input_snapshot, Some(&signs), &mut signed_into, norm)
+                .ok_or("missing baseline NEON token")??;
+            let signed_expected_bits: Vec<u32> =
+                signed_expected.iter().copied().map(f32::to_bits).collect();
+            let signed_into_bits: Vec<u32> =
+                signed_into.iter().copied().map(f32::to_bits).collect();
+            assert_eq!(
+                signed_into_bits, signed_expected_bits,
+                "hadamard_into(Some(signs)) mismatch at len={len}"
+            );
 
             let mut nonfinite = vec![1.0_f32; len];
             nonfinite[len - 1] = f32::NAN;
@@ -2277,6 +2533,57 @@ mod tests {
                 hadamard(&mut overflow, norm)
                     .ok_or("missing baseline NEON token")?
                     .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simd_neon_round_into_matches_in_place_and_scalar() -> TestResult {
+        for len in [1_usize, 3, 4, 7, 16, 65, 256] {
+            let input: Vec<f32> = (0..len)
+                .map(|idx| {
+                    let s = i32::try_from((idx.wrapping_mul(73) ^ (idx >> 2)) % 251).unwrap_or(0);
+                    super::super::integer_float(s - 125) * 0.03125
+                })
+                .collect();
+            let bf16_scalar: Vec<f32> = input
+                .iter()
+                .copied()
+                .map(super::super::round_bf16)
+                .collect();
+            let mut bf16_into = vec![0.0_f32; len];
+            round_bf16_into(&input, &mut bf16_into).ok_or("missing baseline NEON token")??;
+            assert_eq!(
+                bf16_into
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<u32>>(),
+                bf16_scalar
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<u32>>(),
+                "round_bf16_into mismatch at len={len}"
+            );
+
+            let mut f16_in_place = input.clone();
+            assert!(round_f16_slice(&mut f16_in_place));
+            let mut f16_into = vec![0.0_f32; len];
+            round_f16_into(&input, &mut f16_into).ok_or("missing baseline NEON token")??;
+            assert_eq!(
+                f16_into
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<u32>>(),
+                f16_in_place
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<u32>>(),
+                "round_f16_into mismatch at len={len}"
             );
         }
         Ok(())

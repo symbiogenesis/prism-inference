@@ -1647,6 +1647,10 @@ impl MatvecScratch {
         self.prepare_input_with_quantization(tensor, input, true)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep activation contract dispatch and NEON rounding fallbacks together."
+    )]
     fn prepare_input_with_quantization(
         &mut self,
         tensor: &Tensor,
@@ -1687,21 +1691,79 @@ impl MatvecScratch {
                     q8_with_rounding::<true>(input, &mut self.q8)?;
                 }
                 ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
-                ActivationContract::F32 => fill_into(&mut self.activations, |activations| {
-                    activations.try_reserve_exact(input.len())?;
-                    activations.extend_from_slice(input);
-                    Ok(())
-                })?,
-                _ => collect_into(
-                    input.iter().map(|&value| {
-                        finite(match contract {
-                            ActivationContract::F16 => round_f16(value),
-                            ActivationContract::BF16 => round_bf16(value),
-                            _ => value,
-                        })
-                    }),
-                    &mut self.activations,
-                )?,
+                ActivationContract::F32 => {
+                    if self.activations.len() == input.len() {
+                        self.activations.copy_from_slice(input);
+                    } else {
+                        fill_into(&mut self.activations, |activations| {
+                            activations.try_reserve_exact(input.len())?;
+                            activations.extend_from_slice(input);
+                            Ok(())
+                        })?;
+                    }
+                }
+                ActivationContract::F16 => {
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    if let Some(result) = neon::round_f16_into(input, &mut self.activations) {
+                        if result.is_err() {
+                            self.activations.clear();
+                        }
+                        result?;
+                    } else {
+                        collect_into(
+                            input.iter().map(|&value| finite(round_f16(value))),
+                            &mut self.activations,
+                        )?;
+                    }
+                    #[cfg(not(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    )))]
+                    collect_into(
+                        input.iter().map(|&value| finite(round_f16(value))),
+                        &mut self.activations,
+                    )?;
+                }
+                ActivationContract::BF16 => {
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    if let Some(result) = neon::round_bf16_into(input, &mut self.activations) {
+                        if result.is_err() {
+                            self.activations.clear();
+                        }
+                        result?;
+                    } else {
+                        collect_into(
+                            input.iter().map(|&value| finite(round_bf16(value))),
+                            &mut self.activations,
+                        )?;
+                    }
+                    #[cfg(not(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    )))]
+                    collect_into(
+                        input.iter().map(|&value| finite(round_bf16(value))),
+                        &mut self.activations,
+                    )?;
+                }
             }
         } else {
             self.q8k.clear();
@@ -1911,8 +1973,13 @@ pub fn matvec_into(
     output: &mut Vec<f32>,
     scratch: &mut MatvecScratch,
 ) -> Result<()> {
-    output.clear();
-    scratch.prepare(tensor, input)?.matvec_into(tensor, output)
+    let result = scratch
+        .prepare(tensor, input)
+        .and_then(|mut prepared| prepared.matvec_into(tensor, output));
+    if result.is_err() {
+        output.clear();
+    }
+    result
 }
 
 pub(crate) fn lora_a_dot(
@@ -2031,7 +2098,10 @@ impl PreparedMatvec<'_> {
     /// results, invalid PTQ1 encodings and failed output or row allocation.
     pub fn matvec_into(&mut self, tensor: &Tensor, output: &mut Vec<f32>) -> Result<()> {
         self.scratch.reset_diagnostics();
-        let result = fill_into(output, |output| self.multiply(tensor, output));
+        let result = self.multiply(tensor, output);
+        if result.is_err() {
+            output.clear();
+        }
         self.scratch.diagnostics.succeeded = result.is_ok();
         self.scratch.statistics.record(self.scratch.diagnostics);
         result
@@ -2051,10 +2121,11 @@ impl PreparedMatvec<'_> {
             return Err(invalid("incompatible prepared matvec activation contract"));
         }
         let scratch = &mut *self.scratch;
-        output.try_reserve_exact(rows)?;
         match tensor.kind {
             F32 if columns == 1 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
+                output.clear();
+                output.try_reserve_exact(rows)?;
                 // Rank-one adapter B factors have one scalar per output row.
                 // Geometry is already checked above: stream those scalars
                 // instead of validating and preparing a row Vec for each one.
@@ -2070,9 +2141,6 @@ impl PreparedMatvec<'_> {
                 scratch.diagnostics = scratch.diagnostics.select(false);
                 // Swift's recurrent alpha/beta projections retain their
                 // binary64 scalar contract even for pinned accumulation.
-                let quad_bytes = row_bytes.saturating_mul(4);
-                let quad_count = tensor.data.len().checked_div(quad_bytes).unwrap_or(0);
-                let (quads, rem) = tensor.data.split_at(quad_count * quad_bytes);
                 #[cfg(all(
                     feature = "experimental-neon",
                     target_arch = "aarch64",
@@ -2080,19 +2148,34 @@ impl PreparedMatvec<'_> {
                     target_env = "msvc",
                     target_feature = "neon"
                 ))]
-                for quad in quads.chunks_exact(quad_bytes) {
-                    let (r0, rest) = quad.split_at(row_bytes);
-                    let (r1, rest) = rest.split_at(row_bytes);
-                    let (r2, r3) = rest.split_at(row_bytes);
-                    if let Some(res) =
-                        neon::bf16_dot_four_rows([r0, r1, r2, r3], &scratch.activations)
-                    {
-                        output.extend_from_slice(&res?);
-                    } else {
-                        for bytes in [r0, r1, r2, r3] {
-                            output.push(bf16_dot(bytes, &scratch.activations)?);
-                        }
-                    }
+                {
+                    let activations = &scratch.activations;
+                    return scratch.row_parallelism.fill_four_rows(
+                        &tensor.data,
+                        row_bytes,
+                        output,
+                        &mut scratch.row_errors,
+                        |rows| {
+                            let low = neon::bf16_dot_four_rows(
+                                [rows[0], rows[1], rows[2], rows[3]],
+                                activations,
+                            )
+                            .ok_or_else(|| invalid("missing NEON BF16 kernel"))??;
+                            let high = neon::bf16_dot_four_rows(
+                                [rows[4], rows[5], rows[6], rows[7]],
+                                activations,
+                            )
+                            .ok_or_else(|| invalid("missing NEON BF16 kernel"))??;
+                            Ok([
+                                low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3],
+                            ])
+                        },
+                        |rows| {
+                            neon::bf16_dot_four_rows(rows, activations)
+                                .ok_or_else(|| invalid("missing NEON BF16 kernel"))?
+                        },
+                        |bytes| bf16_dot(bytes, activations),
+                    );
                 }
                 #[cfg(not(all(
                     feature = "experimental-neon",
@@ -2101,15 +2184,18 @@ impl PreparedMatvec<'_> {
                     target_env = "msvc",
                     target_feature = "neon"
                 )))]
-                for bytes in quads.chunks_exact(row_bytes) {
-                    output.push(bf16_dot(bytes, &scratch.activations)?);
-                }
-                for bytes in rem.chunks_exact(row_bytes) {
-                    output.push(bf16_dot(bytes, &scratch.activations)?);
+                {
+                    output.clear();
+                    output.try_reserve_exact(rows)?;
+                    for bytes in tensor.data.chunks_exact(row_bytes) {
+                        output.push(bf16_dot(bytes, &scratch.activations)?);
+                    }
                 }
             }
             16..=23 | 29 | 34 | 35 | 39..=42 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
+                output.clear();
+                output.try_reserve_exact(rows)?;
                 for bytes in tensor.data.chunks_exact(row_bytes) {
                     output.push(dot_additional(
                         tensor.kind,
@@ -2121,6 +2207,8 @@ impl PreparedMatvec<'_> {
             }
             10..=14 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
+                output.clear();
+                output.try_reserve_exact(rows)?;
                 for bytes in tensor.data.chunks_exact(row_bytes) {
                     output.push(kquants::dot(tensor.kind, bytes, &scratch.q8k)?);
                 }
@@ -2187,12 +2275,16 @@ impl PreparedMatvec<'_> {
             }
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
+                output.clear();
+                output.try_reserve_exact(rows)?;
                 for bytes in tensor.data.chunks_exact(row_bytes) {
                     output.push(dot_legacy(tensor.kind, bytes, &scratch.q8)?);
                 }
             }
             _ => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
+                output.clear();
+                output.try_reserve_exact(rows)?;
                 for (index, _) in tensor.data.chunks_exact(row_bytes).enumerate() {
                     row_into(tensor, index, &mut scratch.row)?;
                     // Native F32/F16 projections use four FMA registers on
@@ -2480,7 +2572,7 @@ pub fn rms_norm_into(
     epsilon: f32,
     output: &mut Vec<f32>,
 ) -> Result<()> {
-    fill_into(output, |output| {
+    let result = (|| {
         let scale = rms_norm_scale(input, weight, epsilon)?;
         #[cfg(all(
             feature = "experimental-neon",
@@ -2499,7 +2591,11 @@ pub fn rms_norm_into(
                 .map(|(&value, &w)| finite(value * scale * w)),
             output,
         )
-    })
+    })();
+    if result.is_err() {
+        output.clear();
+    }
+    result
 }
 
 /// Applies the weighted RMS contract of the pinned Windows ARM64 Prism binary.
@@ -2513,7 +2609,7 @@ pub(crate) fn rms_norm_pinned_into(
     epsilon: f32,
     output: &mut Vec<f32>,
 ) -> Result<()> {
-    fill_into(output, |output| {
+    let result = (|| {
         let scale = rms_norm_scale(input, weight, epsilon)?;
         #[cfg(all(
             feature = "experimental-neon",
@@ -2532,7 +2628,11 @@ pub(crate) fn rms_norm_pinned_into(
                 .map(|(&value, &w)| finite((value * w) * scale)),
             output,
         )
-    })
+    })();
+    if result.is_err() {
+        output.clear();
+    }
+    result
 }
 
 pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
@@ -2669,6 +2769,34 @@ pub fn hadamard(values: &mut [f32]) -> Result<()> {
         *value = finite(*value * normalization)?;
     }
     Ok(())
+}
+
+pub(crate) fn hadamard_into(
+    input: &[f32],
+    signs: Option<&[f32]>,
+    output: &mut [f32],
+) -> Result<()> {
+    if !output.len().is_power_of_two() || input.len() != output.len() {
+        return Err(invalid("Hadamard requires a finite power-of-two block"));
+    }
+    let count = u32::try_from(output.len())?;
+    let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::hadamard_into(input, signs, output, normalization) {
+        return result;
+    }
+    if let Some(signs) = signs {
+        mul_slice_into(input, signs, output);
+    } else {
+        output.copy_from_slice(input);
+    }
+    hadamard(output)
 }
 
 /// Replaces finite logits by their normalized, stable exponential weights.

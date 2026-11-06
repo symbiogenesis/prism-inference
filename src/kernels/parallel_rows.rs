@@ -355,24 +355,26 @@ impl RowParallelism {
         dot: impl Fn(&[u8]) -> Result<f32> + Sync,
     ) -> Result<()> {
         errors.clear();
+        let rows = data.len() / row_bytes;
         #[cfg(not(feature = "parallel-rows"))]
-        if self.uses_pool(data.len() / row_bytes) {
+        if self.uses_pool(rows) {
             return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        if output.len() != rows {
+            output.clear();
+            output.try_reserve_exact(rows)?;
+            output.resize(rows, 0.0);
         }
         #[cfg(feature = "parallel-rows")]
         if let Some(pool) = &self.pool
-            && data.len() / row_bytes > 1
+            && rows > 1
         {
             use rayon::prelude::*;
 
-            let rows = data.len() / row_bytes;
             let task_rows = rows.div_ceil(self.workers);
             let tasks = rows.div_ceil(task_rows);
             errors.try_reserve_exact(tasks)?;
             errors.resize_with(tasks, || None);
-            // The caller reserves the exact row count fallibly before entry.
-            // At most workers disjoint output chunks borrow original weights.
-            output.resize(rows, 0.0);
             pool.install(|| {
                 output
                     .par_chunks_mut(task_rows)
@@ -398,8 +400,8 @@ impl RowParallelism {
             errors.clear();
             return failure.map_or(Ok(()), Err);
         }
-        for bytes in data.chunks_exact(row_bytes) {
-            output.push(dot(bytes)?);
+        for (value, bytes) in output.iter_mut().zip(data.chunks_exact(row_bytes)) {
+            *value = dot(bytes)?;
         }
         Ok(())
     }
@@ -431,7 +433,11 @@ impl RowParallelism {
         if self.uses_pool(rows) {
             return Err(invalid("multiple row workers require parallel-rows"));
         }
-        output.resize(rows, 0.0);
+        if output.len() != rows {
+            output.clear();
+            output.try_reserve_exact(rows)?;
+            output.resize(rows, 0.0);
+        }
         #[cfg(feature = "parallel-rows")]
         if let Some(pool) = &self.pool
             && rows > 1

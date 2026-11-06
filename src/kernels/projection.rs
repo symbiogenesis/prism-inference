@@ -146,14 +146,9 @@ impl PreparedMatvec<'_> {
         if tensors.is_empty() || tensors.len() != outputs.len() {
             return Err(invalid("mismatched projection group outputs"));
         }
-        for output in outputs.iter_mut() {
-            output.clear();
-        }
         let result = (|| {
-            let mut expected_rows = Vec::new();
-            expected_rows.try_reserve_exact(tensors.len())?;
             for &tensor in tensors {
-                let (columns, rows, _) = dimensions(tensor)?;
+                let (columns, _, _) = dimensions(tensor)?;
                 if !self.is_compatible(tensor)?
                     || tensor.kind != PQ2
                     || !columns.is_multiple_of(128)
@@ -162,7 +157,6 @@ impl PreparedMatvec<'_> {
                         "incompatible prepared projection executor activation",
                     ));
                 }
-                expected_rows.push(rows);
             }
             executor.project_f32_group(
                 tensors,
@@ -170,7 +164,8 @@ impl PreparedMatvec<'_> {
                 self.scratch.pinned_accumulation,
                 outputs,
             )?;
-            for (output, rows) in outputs.iter().zip(expected_rows) {
+            for (output, &tensor) in outputs.iter().zip(tensors) {
+                let (_, rows, _) = dimensions(tensor)?;
                 if output.len() != rows {
                     return Err(invalid("projection executor returned incomplete output"));
                 }
@@ -204,7 +199,6 @@ impl PreparedMatvec<'_> {
         output: &mut Vec<f32>,
         executor: &mut dyn Pq2ProjectionExecutor,
     ) -> Result<()> {
-        output.clear();
         let result = (|| {
             let (columns, rows, _) = dimensions(tensor)?;
             if !self.is_compatible(tensor)? {
@@ -221,6 +215,7 @@ impl PreparedMatvec<'_> {
                 )?;
             } else if tensor.kind == PQ2 && columns.is_multiple_of(256) && executor.supports(tensor)
             {
+                output.clear();
                 if !self.quantized {
                     return Err(invalid(
                         "prepared projection executor activation requires quantization",
@@ -235,6 +230,7 @@ impl PreparedMatvec<'_> {
             } else if (tensor.kind == PTQ1 || tensor.kind == PQ2 && !columns.is_multiple_of(256))
                 && executor.supports_q8(tensor)
             {
+                output.clear();
                 if !self.quantized {
                     return Err(invalid(
                         "prepared projection executor activation requires quantization",

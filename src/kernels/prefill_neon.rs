@@ -208,6 +208,27 @@ impl Block {
     }
 
     #[inline]
+    pub(super) fn dot32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [i32; 8] {
+        let w0 = self.weights[group * 4];
+        let w1 = self.weights[group * 4 + 1];
+        let w2 = self.weights[group * 4 + 2];
+        let w3 = self.weights[group * 4 + 3];
+        let sums = values.map(|token| {
+            let halves = token.as_chunks::<16>().0;
+            let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &halves[1]).widen();
+            let pairs = (w0 * l0 + w1 * h0) + (w2 * l1 + w3 * h1);
+            let (sum_low, sum_high) = pairs.widen();
+            sum_low + sum_high
+        });
+        let first = reduce4_i32x4(sums[0], sums[1], sums[2], sums[3]);
+        let second = reduce4_i32x4(sums[4], sums[5], sums[6], sums[7]);
+        [
+            first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
+        ]
+    }
+
+    #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         let halves = values.as_chunks::<16>().0;
         let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
@@ -223,6 +244,24 @@ impl Block {
 
     #[inline]
     pub(super) fn lanes32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
+        let w0 = self.weights[group * 4];
+        let w1 = self.weights[group * 4 + 1];
+        let w2 = self.weights[group * 4 + 2];
+        let w3 = self.weights[group * 4 + 3];
+        values.map(|token| {
+            let halves = token.as_chunks::<16>().0;
+            let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &halves[1]).widen();
+            let sum_01 = w0 * l0 + w2 * l1;
+            let sum_23 = w1 * h0 + w3 * h1;
+            let (lane0, lane1) = sum_01.widen();
+            let (lane2, lane3) = sum_23.widen();
+            reduce4_i32x4(lane0, lane1, lane2, lane3)
+        })
+    }
+
+    #[inline]
+    pub(super) fn lanes32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [[i32; 4]; 8] {
         let w0 = self.weights[group * 4];
         let w1 = self.weights[group * 4 + 1];
         let w2 = self.weights[group * 4 + 2];

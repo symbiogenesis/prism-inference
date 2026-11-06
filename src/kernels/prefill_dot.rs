@@ -165,6 +165,24 @@ impl Block {
     }
 
     #[inline]
+    pub(super) fn dot32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [i32; 8] {
+        match self {
+            Self::Scalar(weights) => {
+                let slice = &weights[group * 32..group * 32 + 32];
+                values.map(|token| scalar(slice, token))
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.dot32_eight(group, values),
+        }
+    }
+
+    #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         match self {
             Self::Scalar(weights) => q8_native_lanes(&weights[group * 32..group * 32 + 32], values),
@@ -194,6 +212,24 @@ impl Block {
                 target_feature = "neon"
             ))]
             Self::Neon(block) => block.lanes32_four(group, values),
+        }
+    }
+
+    #[inline]
+    pub(super) fn lanes32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [[i32; 4]; 8] {
+        match self {
+            Self::Scalar(weights) => {
+                let slice = &weights[group * 32..group * 32 + 32];
+                values.map(|token| q8_native_lanes(slice, token))
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.lanes32_eight(group, values),
         }
     }
 }
@@ -248,8 +284,10 @@ mod tests {
                     let expected_lanes = q8_native_lanes(weights, values);
                     assert_eq!(block.dot32(group, values), expected32);
                     assert_eq!(block.dot32_four(group, [values; 4]), [expected32; 4]);
+                    assert_eq!(block.dot32_eight(group, [values; 8]), [expected32; 8]);
                     assert_eq!(block.lanes32(group, values), expected_lanes);
                     assert_eq!(block.lanes32_four(group, [values; 4]), [expected_lanes; 4]);
+                    assert_eq!(block.lanes32_eight(group, [values; 8]), [expected_lanes; 8]);
                 }
             }
         }

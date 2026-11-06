@@ -482,7 +482,10 @@ fn fill_batched_chunk(
 ) -> Result<()> {
     let (octets, after_octets) = chunk.as_chunks_mut::<8>();
     let (octet_bytes, after_octet_bytes) = bytes.split_at(octets.len() * 8 * row_bytes);
-    for (out_octet, group) in octets.iter_mut().zip(octet_bytes.chunks_exact(8 * row_bytes)) {
+    for (out_octet, group) in octets
+        .iter_mut()
+        .zip(octet_bytes.chunks_exact(8 * row_bytes))
+    {
         let rows: [&[u8]; 8] =
             std::array::from_fn(|idx| &group[idx * row_bytes..(idx + 1) * row_bytes]);
         if let Ok(values) = dot_eight(rows) {

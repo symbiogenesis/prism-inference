@@ -144,7 +144,10 @@ pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 1
         p2.store_slice(&mut dst[2]);
         p3.store_slice(&mut dst[3]);
         let wide = wide_half.as_chunks_mut::<8>().0;
-        for (plane, pair) in [p0, p1, p2, p3].into_iter().zip(wide.as_chunks_mut::<2>().0) {
+        for (plane, pair) in [p0, p1, p2, p3]
+            .into_iter()
+            .zip(wide.as_chunks_mut::<2>().0)
+        {
             let (low, high) = plane.widen();
             low.store_slice(&mut pair[0]);
             high.store_slice(&mut pair[1]);
@@ -294,11 +297,8 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..4 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                even[row] += pq2_pair_sums_prewidened(
-                    (w & 3).bitcast::<i8x16<Neon>>() - 1,
-                    p0_low,
-                    p0_high,
-                );
+                even[row] +=
+                    pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
                 odd[row] += pq2_pair_sums_prewidened(
                     ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
                     p1_low,
@@ -385,11 +385,8 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..8 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                even[row] += pq2_pair_sums_prewidened(
-                    (w & 3).bitcast::<i8x16<Neon>>() - 1,
-                    p0_low,
-                    p0_high,
-                );
+                even[row] +=
+                    pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
                 odd[row] += pq2_pair_sums_prewidened(
                     ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
                     p1_low,
@@ -463,7 +460,11 @@ fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
     let mut maximum = 0.0_f32;
     let target_abs = f32x4::splat(neon, max_abs);
     for sub in chunk.as_chunks::<4>().0 {
-        if f32x4::from_slice(neon, sub).abs().simd_eq(target_abs).any_true() {
+        if f32x4::from_slice(neon, sub)
+            .abs()
+            .simd_eq(target_abs)
+            .any_true()
+        {
             for &value in sub {
                 if value.abs().to_bits() == max_abs.to_bits() {
                     maximum = value;
@@ -541,10 +542,14 @@ pub(super) fn q8k_block<const PINNED: bool>(
         if !(r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite()).all_true() {
             return None;
         }
-        let i0 = ((r0.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
-        let i1 = ((r1.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
-        let i2 = ((r2.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
-        let i3 = ((r3.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
+        let i0 = ((r0.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
+            .min(max_code);
+        let i1 = ((r1.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
+            .min(max_code);
+        let i2 = ((r2.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
+            .min(max_code);
+        let i3 = ((r3.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias)
+            .min(max_code);
         if !(i0.simd_ge(min_code)
             & i1.simd_ge(min_code)
             & i2.simd_ge(min_code)
@@ -660,11 +665,13 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
             return None;
         }
         total_sum += i0 + i1 + i2 + i3;
-        let low16 = (i0.bitcast::<u32x4<Neon>>() & mask16)
-            .narrow(i1.bitcast::<u32x4<Neon>>() & mask16);
-        let high16 = (i2.bitcast::<u32x4<Neon>>() & mask16)
-            .narrow(i3.bitcast::<u32x4<Neon>>() & mask16);
-        let bytes = (low16 & mask8).narrow(high16 & mask8).bitcast::<i8x16<Neon>>();
+        let low16 =
+            (i0.bitcast::<u32x4<Neon>>() & mask16).narrow(i1.bitcast::<u32x4<Neon>>() & mask16);
+        let high16 =
+            (i2.bitcast::<u32x4<Neon>>() & mask16).narrow(i3.bitcast::<u32x4<Neon>>() & mask16);
+        let bytes = (low16 & mask8)
+            .narrow(high16 & mask8)
+            .bitcast::<i8x16<Neon>>();
         bytes.store_slice(dst_values);
     }
     block.sum = super::round_f16(super::integer_float(total_sum.reduce_sum()) * d);
@@ -1068,11 +1075,8 @@ pub(super) fn dot_consumption_order_four(
         for row in 0..4 {
             let bytes = &packed[row].as_chunks::<16>().0[half];
             let w = u8x16::from_slice(neon, bytes);
-            even[row] += pq2_pair_sums_prewidened(
-                (w & 3).bitcast::<i8x16<Neon>>() - 1,
-                p0_low,
-                p0_high,
-            );
+            even[row] +=
+                pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
             odd[row] += pq2_pair_sums_prewidened(
                 ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
                 p1_low,
@@ -1083,11 +1087,8 @@ pub(super) fn dot_consumption_order_four(
                 p2_low,
                 p2_high,
             );
-            odd[row] += pq2_pair_sums_prewidened(
-                (w >> 6).bitcast::<i8x16<Neon>>() - 1,
-                p3_low,
-                p3_high,
-            );
+            odd[row] +=
+                pq2_pair_sums_prewidened((w >> 6).bitcast::<i8x16<Neon>>() - 1, p3_low, p3_high);
         }
     }
     std::array::from_fn(|row| pq2_reduce(even[row] + odd[row]))

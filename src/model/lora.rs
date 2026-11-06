@@ -222,7 +222,7 @@ impl RankOneAdapter {
 
     /// Number of complete admitted factor pairs.
     #[must_use]
-    pub const fn target_count(&self) -> usize {
+    pub fn target_count(&self) -> usize {
         self.factors.len()
     }
 
@@ -253,12 +253,7 @@ impl RankOneAdapter {
         let Some(factors) = self.factors.get(target).filter(|_| scale != 0.0) else {
             return Ok(());
         };
-        lora_a_dot(
-            &factors.a_values,
-            input,
-            &mut scratch.rank,
-            &scratch.matvec,
-        )?;
+        lora_a_dot(&factors.a_values, input, &mut scratch.rank, &scratch.matvec)?;
         lora_b_scale(&factors.b_values, &scratch.rank, &mut scratch.correction)?;
         self.finish(scale, output, &mut scratch.correction)
     }

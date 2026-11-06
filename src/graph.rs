@@ -1843,8 +1843,11 @@ impl Evaluation<'_, '_> {
         prepare(&mut scratch.query, g.head * g.heads)?;
         prepare(&mut scratch.gate, g.head * g.heads)?;
         for head in scratch.projected.chunks_exact_mut(2 * g.head) {
-            self.arithmetic
-                .normalize_in_place(&mut head[..g.head], &layer.query_norm, g.epsilon)?;
+            self.arithmetic.normalize_in_place(
+                &mut head[..g.head],
+                &layer.query_norm,
+                g.epsilon,
+            )?;
             scratch.query.extend_from_slice(&head[..g.head]);
             scratch.gate.extend_from_slice(&head[g.head..]);
         }
@@ -1899,8 +1902,9 @@ impl Evaluation<'_, '_> {
                         let offset = kv_head * g.head;
                         let q = &query_ref[head * g.head..(head + 1) * g.head];
                         for (pos, past) in keys.tokens().enumerate() {
-                            scores[pos] =
-                                arithmetic.attention_dot(q, &past[offset..offset + g.head])? * scale;
+                            scores[pos] = arithmetic
+                                .attention_dot(q, &past[offset..offset + g.head])?
+                                * scale;
                         }
                         scores[score_len - 1] = arithmetic
                             .attention_current_dot(q, &key_ref[offset..offset + g.head])?
@@ -1921,8 +1925,9 @@ impl Evaluation<'_, '_> {
                                 out,
                             )?;
                         }
-                        for (out, &gate) in
-                            result.iter_mut().zip(&gate_ref[head * g.head..(head + 1) * g.head])
+                        for (out, &gate) in result
+                            .iter_mut()
+                            .zip(&gate_ref[head * g.head..(head + 1) * g.head])
                         {
                             *out *= sigmoid(gate);
                         }

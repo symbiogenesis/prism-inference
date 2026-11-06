@@ -500,9 +500,7 @@ fn q8_with_contract<const PINNED: bool, const NATIVE_SCALE: bool>(
                 target_env = "msvc",
                 target_feature = "neon"
             ))]
-            if PINNED
-                && let Some(result) = neon::q8_pinned_block::<NATIVE_SCALE>(chunk)
-            {
+            if PINNED && let Some(result) = neon::q8_pinned_block::<NATIVE_SCALE>(chunk) {
                 return result;
             }
             let mut maximum = 0.0_f32;

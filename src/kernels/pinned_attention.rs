@@ -150,7 +150,10 @@ pub(crate) fn dot_f16(key: &[u16], query: &[f32]) -> Result<f32> {
     if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
         return neon::dot_f16(neon, key, query);
     }
-    dot(key.iter().copied().map(bonsai_ternary::half_to_float), query)
+    dot(
+        key.iter().copied().map(bonsai_ternary::half_to_float),
+        query,
+    )
 }
 
 /// Reduces a current F32 key row and F32 query row with the pinned four-register FMA tree.
@@ -452,7 +455,11 @@ mod tests {
             .map(half_to_float)
             .collect::<Vec<_>>();
         assert_eq!(
-            dot(value.values.iter().copied().map(half_to_float), &probabilities)?.to_bits(),
+            dot(
+                value.values.iter().copied().map(half_to_float),
+                &probabilities
+            )?
+            .to_bits(),
             value.expected
         );
         assert_eq!(

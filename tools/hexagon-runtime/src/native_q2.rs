@@ -923,9 +923,7 @@ mod tests {
                 (5120, 10_240)
             } else if name.ends_with(".attn_gate.weight") {
                 (5120, 6144)
-            } else if name.ends_with(".ssm_out.weight")
-                || name.ends_with(".attn_output.weight")
-            {
+            } else if name.ends_with(".ssm_out.weight") || name.ends_with(".attn_output.weight") {
                 (6144, 5120)
             } else if name.ends_with(".attn_q.weight") {
                 (5120, 12_288)

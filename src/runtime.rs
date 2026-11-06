@@ -772,7 +772,7 @@ impl<D: Decoder> Runtime<D> {
             .evaluate_into(token, &mut self.logits)
             .and_then(|()| {
                 if self.logits.len() != self.decoder.vocab_size()
-                    || self.logits.iter().any(|x| !x.is_finite())
+                    || !crate::kernels::is_finite_slice(&self.logits)
                 {
                     return Err(invalid("native decoder returned invalid logits"));
                 }
@@ -909,15 +909,35 @@ pub fn greedy(logits: &[f32]) -> Result<u32> {
     }
     let mut best = 0;
     let mut maximum = logits[0];
-    for (index, &value) in logits.iter().enumerate() {
-        // Validate every element even after finding an unbeatable maximum.
-        // A strict comparison retains the lowest token ID for all ties,
-        // including equal positive/negative zero values.
+    if !maximum.is_finite() {
+        return Err(invalid("greedy sampling requires nonempty finite logits"));
+    }
+    let (blocks, remainder) = logits.as_chunks::<16>();
+    for (block_index, block) in blocks.iter().enumerate() {
+        if crate::kernels::block16_all_finite_le(block, maximum) {
+            continue;
+        }
+        let base = block_index * 16;
+        for (offset, &value) in block.iter().enumerate() {
+            // Validate every element even after finding an unbeatable maximum.
+            // A strict comparison retains the lowest token ID for all ties,
+            // including equal positive/negative zero values.
+            if !value.is_finite() {
+                return Err(invalid("greedy sampling requires nonempty finite logits"));
+            }
+            if value > maximum {
+                best = base + offset;
+                maximum = value;
+            }
+        }
+    }
+    let base = blocks.len() * 16;
+    for (offset, &value) in remainder.iter().enumerate() {
         if !value.is_finite() {
             return Err(invalid("greedy sampling requires nonempty finite logits"));
         }
         if value > maximum {
-            best = index;
+            best = base + offset;
             maximum = value;
         }
     }

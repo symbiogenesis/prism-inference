@@ -822,6 +822,20 @@ pub(super) fn is_finite_slice(values: &[f32]) -> Option<bool> {
 }
 
 #[inline]
+pub(super) fn block16_all_finite_le(values: &[f32; 16], threshold: f32) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let v0 = f32x4::from_slice(neon, &values[0..4]);
+    let v1 = f32x4::from_slice(neon, &values[4..8]);
+    let v2 = f32x4::from_slice(neon, &values[8..12]);
+    let v3 = f32x4::from_slice(neon, &values[12..16]);
+    let t = f32x4::splat(neon, threshold);
+    (v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true()
+        && !(v0.simd_gt(t) | v1.simd_gt(t) | v2.simd_gt(t) | v3.simd_gt(t)).any_true()
+}
+
+#[inline]
 pub(super) fn add_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;
@@ -1762,7 +1776,7 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{dot, dot_consumption_order, dot_groups, dot_ptq1_groups};
+    use super::{block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_ptq1_groups};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -2102,5 +2116,23 @@ mod tests {
         assert_eq!(row_count, 169);
         assert_eq!(bytes.len(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn simd_neon_block16_all_finite_le_lanes_and_extremes() {
+        assert!(block16_all_finite_le(&[0.0; 16], -0.0));
+        assert!(block16_all_finite_le(&[-0.0; 16], 0.0));
+        assert!(block16_all_finite_le(&[f32::MIN; 16], f32::MAX));
+        assert!(block16_all_finite_le(&[f32::MAX; 16], f32::MAX));
+        for lane in 0..16 {
+            let mut block = [1.0_f32; 16];
+            assert!(block16_all_finite_le(&block, 1.0));
+            block[lane] = f32::from_bits(1.0_f32.to_bits() + 1);
+            assert!(!block16_all_finite_le(&block, 1.0));
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                block[lane] = bad;
+                assert!(!block16_all_finite_le(&block, f32::MAX));
+            }
+        }
     }
 }

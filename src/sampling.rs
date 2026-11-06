@@ -144,9 +144,7 @@ struct Candidate {
 
 impl Sampler for ReferenceSampler {
     fn sample(&mut self, logits: &[f32]) -> Result<u32> {
-        if logits.is_empty()
-            || logits.len() > 1_048_576
-            || logits.iter().any(|logit| !logit.is_finite())
+        if logits.is_empty() || logits.len() > 1_048_576 || !crate::kernels::is_finite_slice(logits)
         {
             return Err(invalid(
                 "reference sampling requires bounded nonempty finite logits",

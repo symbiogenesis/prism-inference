@@ -482,7 +482,32 @@ pub(super) fn top_k_logits(
         });
     }
     make_top_k_heap(backing);
-    for (index, &logit) in logits.iter().enumerate().skip(keep) {
+    let tail = &logits[keep..];
+    let (blocks, remainder) = tail.as_chunks::<16>();
+    for (block_index, block) in blocks.iter().enumerate() {
+        if crate::kernels::block16_all_finite_le(block, backing[0].logit) {
+            continue;
+        }
+        let base = keep + block_index * 16;
+        for (offset, &logit) in block.iter().enumerate() {
+            if !logit.is_finite() {
+                backing.clear();
+                return Err(invalid(
+                    "Swift sampling requires the complete finite pinned vocabulary",
+                ));
+            }
+            if logit > backing[0].logit {
+                let value = Candidate {
+                    id: i32::try_from(base + offset)?,
+                    logit,
+                    probability: 0.0,
+                };
+                adjust_heap(backing, 0, keep, value);
+            }
+        }
+    }
+    let base = keep + blocks.len() * 16;
+    for (offset, &logit) in remainder.iter().enumerate() {
         if !logit.is_finite() {
             backing.clear();
             return Err(invalid(
@@ -491,7 +516,7 @@ pub(super) fn top_k_logits(
         }
         if logit > backing[0].logit {
             let value = Candidate {
-                id: i32::try_from(index)?,
+                id: i32::try_from(base + offset)?,
                 logit,
                 probability: 0.0,
             };

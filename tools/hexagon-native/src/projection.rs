@@ -184,10 +184,15 @@ impl Q2ProjectionReport {
             && self.queue_writes_submitted == self.queue_writes_completed
             && self.operations_submitted > 0
             && self.operations_submitted == self.operations_completed
-            && self.operations_submitted
+            && (self.operations_submitted
                 == self
                     .queue_writes_submitted
                     .saturating_mul(self.batch_operations)
+                || (!self.queue.hmx_bitplane
+                    && self.batch_operations == 1
+                    && self.resident_submissions > 0
+                    && self.operations_submitted >= self.queue_writes_submitted
+                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(3)))
             && self.queue.completed_cycle()
     }
 }
@@ -222,7 +227,7 @@ pub(crate) fn request_batch(
     sequence: u64,
     batch_operations: u32,
 ) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
-    if !matches!(batch_operations, 1 | 4 | 10) {
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10) {
         return Err(Error::Contract);
     }
     let mut result = request(sequence);
@@ -237,7 +242,7 @@ pub(crate) fn response_valid(bytes: &[u8], sequence: u64) -> bool {
 }
 
 pub(crate) fn response_batch_valid(bytes: &[u8], sequence: u64, batch_operations: u32) -> bool {
-    if !matches!(batch_operations, 1 | 4 | 10)
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10)
         || sequence == 0
         || bytes.len() != compute::COMPUTE_RESPONSE_BYTES
     {
@@ -425,7 +430,17 @@ mod tests {
             &batch_req[8..24],
             &[1, 0, 0, 0, 12, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0]
         );
-        assert!(request_batch(7, 2).is_err());
+        assert!(request_batch(7, 5).is_err());
+        let two_op_req = request_batch(7, 2)?;
+        assert_eq!(
+            &two_op_req[8..24],
+            &[1, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let three_op_req = request_batch(7, 3)?;
+        assert_eq!(
+            &three_op_req[8..24],
+            &[1, 0, 0, 0, 9, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]
+        );
         put32(&mut bytes, 32, 12);
         put32(&mut bytes, 36, 4);
         assert!(response_batch_valid(&bytes, 42, 4));

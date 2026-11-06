@@ -833,6 +833,18 @@ impl Transforms {
                 } else {
                     scratch.matvec.prepare(weights[index], activation)?
                 };
+                if index == 0
+                    && N >= 2
+                    && skip_cpu_quantization
+                    && weights.iter().all(|w| {
+                        self.basis(w) == basis && prepared.is_compatible(w).unwrap_or(false)
+                    })
+                    && let Some(executor) = executor.as_deref_mut()
+                    && executor.supports_f32_group(&weights)
+                {
+                    prepared.matvec_group_with_executor(&weights, &mut outputs, executor)?;
+                    return Ok(());
+                }
                 for (candidate, (weight, output)) in
                     weights.iter().zip(outputs.iter_mut()).enumerate()
                 {

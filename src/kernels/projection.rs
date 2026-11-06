@@ -106,9 +106,88 @@ pub trait Pq2ProjectionExecutor {
     ) -> Result<()> {
         Err(invalid("projection executor does not support direct F32"))
     }
+
+    /// Opt in to batched direct `F32` activation submission for a group of
+    /// compatible sibling `PQ2_0` projections sharing one input vector.
+    fn supports_f32_group(&self, _tensors: &[&Tensor]) -> bool {
+        false
+    }
+
+    /// Execute a group of compatible `PQ2_0` projections sharing one `F32`
+    /// activation vector in a single batched executor submission.
+    ///
+    /// # Errors
+    /// Rejects unsupported groups, submission failures and invalid output.
+    fn project_f32_group(
+        &mut self,
+        _tensors: &[&Tensor],
+        _activation: &[f32],
+        _pinned: bool,
+        _outputs: &mut [&mut Vec<f32>],
+    ) -> Result<()> {
+        Err(invalid(
+            "projection executor does not support batched F32 groups",
+        ))
+    }
 }
 
 impl PreparedMatvec<'_> {
+    /// Execute a group of compatible `PQ2_0` sibling projections in a single
+    /// batched executor call when supported by `executor`.
+    ///
+    /// # Errors
+    /// Rejects incompatible preparation, executor failures or incomplete output.
+    pub fn matvec_group_with_executor(
+        &mut self,
+        tensors: &[&Tensor],
+        outputs: &mut [&mut Vec<f32>],
+        executor: &mut dyn Pq2ProjectionExecutor,
+    ) -> Result<()> {
+        if tensors.is_empty() || tensors.len() != outputs.len() {
+            return Err(invalid("mismatched projection group outputs"));
+        }
+        for output in outputs.iter_mut() {
+            output.clear();
+        }
+        let result = (|| {
+            let mut expected_rows = Vec::new();
+            expected_rows.try_reserve_exact(tensors.len())?;
+            for &tensor in tensors {
+                let (columns, rows, _) = dimensions(tensor)?;
+                if !self.is_compatible(tensor)?
+                    || tensor.kind != PQ2
+                    || !columns.is_multiple_of(128)
+                {
+                    return Err(invalid(
+                        "incompatible prepared projection executor activation",
+                    ));
+                }
+                expected_rows.push(rows);
+            }
+            executor.project_f32_group(
+                tensors,
+                self.input,
+                self.scratch.pinned_accumulation,
+                outputs,
+            )?;
+            for (output, rows) in outputs.iter().zip(expected_rows) {
+                if output.len() != rows {
+                    return Err(invalid("projection executor returned incomplete output"));
+                }
+                for &value in output.iter() {
+                    finite(value)?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
+
     /// Execute an eligible original-PQ2 projection through a scoped executor.
     ///
     /// PTQ1 and odd-block PQ2 use `Q8_0` only with an explicit executor opt-in.

@@ -599,6 +599,182 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         *output = pending;
         Ok(())
     }
+
+    fn supports_f32_group_inner(&self, tensors: &[&Tensor]) -> bool {
+        if self.failed || !matches!(tensors.len(), 2 | 3) {
+            return false;
+        }
+        let Some(cache) = &self.residency else {
+            return false;
+        };
+        let Ok((columns, _)) = native_dimensions(tensors[0]) else {
+            return false;
+        };
+        if columns > self.maximum_columns {
+            return false;
+        }
+        let mut total_output_bytes = 0_usize;
+        let mut uncached_packed_bytes = 0_usize;
+        let mut uncached_ops = 0_usize;
+        for &tensor in tensors {
+            if !self.supports_f32(tensor) {
+                return false;
+            }
+            let Ok((cols, rows)) = native_dimensions(tensor) else {
+                return false;
+            };
+            if cols != columns || rows > self.maximum_rows || !rows.is_multiple_of(32) {
+                return false;
+            }
+            let Some(out_bytes) = rows.checked_mul(4) else {
+                return false;
+            };
+            let Some(next_total_out) = total_output_bytes.checked_add(out_bytes) else {
+                return false;
+            };
+            total_output_bytes = next_total_out;
+            if cache.find(tensor).is_none() {
+                let Some(packed) = rows
+                    .checked_mul(36)
+                    .and_then(|b| b.checked_mul(columns / 128))
+                else {
+                    return false;
+                };
+                let Some(next_uncached) = uncached_packed_bytes.checked_add(packed) else {
+                    return false;
+                };
+                uncached_packed_bytes = next_uncached;
+                uncached_ops += 1;
+            }
+        }
+        if uncached_ops > 0
+            && (!cache.has_metadata_capacity(uncached_ops)
+                || uncached_packed_bytes > self.submitter.residency_capacity_bytes())
+        {
+            return false;
+        }
+        total_output_bytes
+            .checked_add(cache.reservation)
+            .is_some_and(|bytes| bytes <= self.maximum_owned_payload_bytes)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep resident group preparation, 2/3-op dispatch and output validation together."
+    )]
+    fn project_f32_group_inner(
+        &mut self,
+        tensors: &[&Tensor],
+        activation: &[f32],
+        outputs: &mut [&mut Vec<f32>],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if tensors.len() != outputs.len() || !self.supports_f32_group_inner(tensors) {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon batched projection group",
+            ));
+        }
+        let (columns, _) = native_dimensions(tensors[0])?;
+        if activation.len() != columns {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        for &value in activation {
+            finite(value)?;
+        }
+        let mut weights = Vec::new();
+        let mut indices = [0_usize; 3];
+        let mut rows_per_member = [0_usize; 3];
+        for (member, &tensor) in tensors.iter().enumerate() {
+            let (_, rows) = native_dimensions(tensor)?;
+            rows_per_member[member] = rows;
+            let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
+            let index = if let Some(idx) = cached {
+                if let Some(cache) = &mut self.residency {
+                    if cache.projections[idx].evaluated {
+                        cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
+                    } else {
+                        cache.projections[idx].evaluated = true;
+                    }
+                }
+                idx
+            } else {
+                let max_mapped_rows = rows.next_multiple_of(32);
+                let required_bytes = max_mapped_rows * 36 * (columns / 128);
+                if weights.len() < required_bytes {
+                    weights
+                        .try_reserve(required_bytes - weights.len())
+                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+                    weights.resize(required_bytes, 0_u8);
+                }
+                self.prepare_resident(tensor, &mut weights[..required_bytes], true)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?
+            };
+            indices[member] = index;
+        }
+        for (member, output) in outputs.iter_mut().enumerate() {
+            let rows = rows_per_member[member];
+            output.clear();
+            output
+                .try_reserve(rows)
+                .map_err(|_| invalid("native Q2 output allocation failed"))?;
+            output.resize(rows, f32::NAN);
+        }
+        let count_u64 = u64::try_from(tensors.len())?;
+        self.statistics.operations_attempted = self
+            .statistics
+            .operations_attempted
+            .saturating_add(count_u64);
+        self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        match outputs {
+            [out0, out1] => {
+                let h0 = &cache.handles[cache.projections[indices[0]].first_handle];
+                let h1 = &cache.handles[cache.projections[indices[1]].first_handle];
+                self.submitter.submit_resident_batch2(
+                    [h0, h1],
+                    activation,
+                    [out0.as_mut_slice(), out1.as_mut_slice()],
+                )?;
+            }
+            [out0, out1, out2] => {
+                let h0 = &cache.handles[cache.projections[indices[0]].first_handle];
+                let h1 = &cache.handles[cache.projections[indices[1]].first_handle];
+                let h2 = &cache.handles[cache.projections[indices[2]].first_handle];
+                self.submitter.submit_resident_batch3(
+                    [h0, h1, h2],
+                    activation,
+                    [
+                        out0.as_mut_slice(),
+                        out1.as_mut_slice(),
+                        out2.as_mut_slice(),
+                    ],
+                )?;
+            }
+            _ => return Err(invalid("unsupported native Q2 batch size")),
+        }
+        for output in outputs.iter() {
+            for &val in output.iter() {
+                finite(val)?;
+            }
+        }
+        self.statistics.operations_completed = self
+            .statistics
+            .operations_completed
+            .saturating_add(count_u64);
+        self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+        self.statistics.projections_completed = self
+            .statistics
+            .projections_completed
+            .saturating_add(count_u64);
+        Ok(())
+    }
 }
 
 fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
@@ -684,6 +860,30 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
         if result.is_err() {
             self.failed = true;
             output.clear();
+        }
+        result
+    }
+
+    fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
+        self.supports_f32_group_inner(tensors)
+    }
+
+    fn project_f32_group(
+        &mut self,
+        tensors: &[&Tensor],
+        activation: &[f32],
+        _pinned: bool,
+        outputs: &mut [&mut Vec<f32>],
+    ) -> Result<()> {
+        for output in outputs.iter_mut() {
+            output.clear();
+        }
+        let result = self.project_f32_group_inner(tensors, activation, outputs);
+        if result.is_err() {
+            self.failed = true;
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
         }
         result
     }
@@ -842,6 +1042,44 @@ mod tests {
             Ok(())
         }
 
+        fn submit_resident_batch2(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 2],
+            activation: &[f32],
+            outputs: [&mut [f32]; 2],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 2;
+            self.resident_calls += 2;
+            for (member, handle) in handles.into_iter().enumerate() {
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                outputs[member].fill(0.0);
+                outputs[member][0] =
+                    activation.iter().sum::<f32>() + f32::from(u8::try_from(member).unwrap_or(0));
+            }
+            Ok(())
+        }
+
+        fn submit_resident_batch3(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activation: &[f32],
+            outputs: [&mut [f32]; 3],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 3;
+            self.resident_calls += 3;
+            for (member, handle) in handles.into_iter().enumerate() {
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                outputs[member].fill(0.0);
+                outputs[member][0] =
+                    activation.iter().sum::<f32>() + f32::from(u8::try_from(member).unwrap_or(0));
+            }
+            Ok(())
+        }
+
         fn submit(
             &mut self,
             columns: usize,
@@ -943,6 +1181,88 @@ mod tests {
                     <= hexagon_native_rpc::NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES
             );
         };
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_batches_two_and_three_resident_sibling_projections_in_single_queue_writes()
+    -> Result<()> {
+        let columns = 256;
+        let blocks = columns / 128;
+        let make_tensor = |name: &str, rows: usize| {
+            let mut data = vec![0x55_u8; rows * blocks * 34];
+            for block in data.as_chunks_mut::<34>().0 {
+                block[0] = 0x00;
+                block[1] = 0x38;
+            }
+            Tensor {
+                name: name.to_owned(),
+                dimensions: vec![columns, rows],
+                kind: 142,
+                data: Arc::from(data),
+            }
+        };
+        let qkv = make_tensor("blk.0.attn_qkv.weight", 64);
+        let gate = make_tensor("blk.0.attn_gate.weight", 32);
+        let q = make_tensor("blk.3.attn_q.weight", 64);
+        let k = make_tensor("blk.3.attn_k.weight", 32);
+        let v = make_tensor("blk.3.attn_v.weight", 32);
+
+        let limits = NativeQ2ProjectionLimits::new(5120, 17_408, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(65_536)
+            .map_err(|_| invalid("residency"))?;
+        let mut submitter = MockNativeSubmitter {
+            calls: 0,
+            resident_calls: 0,
+            remaining: 100,
+            residency_bytes: 65_536,
+        };
+        let mut executor = NativeQ2Executor::new(&mut submitter, limits, 64 * 1024 * 1024)
+            .with_resident_weights(16_384)?;
+        executor.select_and_prewarm_tensors(&[
+            qkv.clone(),
+            gate.clone(),
+            q.clone(),
+            k.clone(),
+            v.clone(),
+        ])?;
+        assert!(executor.supports_f32_group(&[&qkv, &gate]));
+        assert!(executor.supports_f32_group(&[&q, &k, &v]));
+
+        let activation = vec![1.0_f32; columns];
+        let mut out0 = Vec::new();
+        let mut out1 = Vec::new();
+        let mut out2 = Vec::new();
+        executor.project_f32_group(
+            &[&qkv, &gate],
+            &activation,
+            true,
+            &mut [&mut out0, &mut out1],
+        )?;
+        assert_eq!(out0.len(), 64);
+        assert_eq!(out1.len(), 32);
+        assert_eq!(out0[0], 256.0);
+        assert_eq!(out1[0], 257.0);
+        assert_eq!(executor.queue_writes_completed(), 1);
+        assert_eq!(executor.statistics().operations_completed, 2);
+        assert_eq!(executor.statistics().projections_completed, 2);
+
+        executor.project_f32_group(
+            &[&q, &k, &v],
+            &activation,
+            true,
+            &mut [&mut out0, &mut out1, &mut out2],
+        )?;
+        assert_eq!(out0.len(), 64);
+        assert_eq!(out1.len(), 32);
+        assert_eq!(out2.len(), 32);
+        assert_eq!(out0[0], 256.0);
+        assert_eq!(out1[0], 257.0);
+        assert_eq!(out2[0], 258.0);
+        assert_eq!(executor.queue_writes_completed(), 2);
+        assert_eq!(executor.statistics().operations_completed, 5);
+        assert_eq!(executor.statistics().projections_completed, 5);
         Ok(())
     }
 }

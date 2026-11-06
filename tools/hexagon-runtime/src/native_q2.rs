@@ -451,11 +451,13 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         activation: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        output.clear();
-        output
-            .try_reserve(rows)
-            .map_err(|_| invalid("native Q2 output allocation failed"))?;
-        output.resize(rows, f32::NAN);
+        if output.len() != rows {
+            output.clear();
+            output
+                .try_reserve(rows)
+                .map_err(|_| invalid("native Q2 output allocation failed"))?;
+            output.resize(rows, f32::NAN);
+        }
         let total_blocks = columns / 128;
         if let Some(index) = resident {
             self.statistics.operations_attempted =
@@ -616,50 +618,41 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(())
     }
 
-    fn supports_f32_group_inner(&self, tensors: &[&Tensor]) -> bool {
+    fn validate_f32_group(
+        &self,
+        tensors: &[&Tensor],
+    ) -> Option<(usize, [usize; 3], [Option<usize>; 3])> {
         if self.failed || !matches!(tensors.len(), 2 | 3) {
-            return false;
+            return None;
         }
-        let Some(cache) = &self.residency else {
-            return false;
-        };
-        let Ok((columns, _)) = native_dimensions(tensors[0]) else {
-            return false;
-        };
+        let cache = self.residency.as_ref()?;
+        let (columns, _) = native_dimensions(tensors[0]).ok()?;
         if columns > self.maximum_columns {
-            return false;
+            return None;
         }
         let mut total_output_bytes = 0_usize;
         let mut uncached_packed_bytes = 0_usize;
         let mut uncached_ops = 0_usize;
-        for &tensor in tensors {
+        let mut rows_per_member = [0_usize; 3];
+        let mut cached_indices = [None; 3];
+        for (member, &tensor) in tensors.iter().enumerate() {
             if !self.supports_f32(tensor) {
-                return false;
+                return None;
             }
-            let Ok((cols, rows)) = native_dimensions(tensor) else {
-                return false;
-            };
+            let (cols, rows) = native_dimensions(tensor).ok()?;
             if cols != columns || rows > self.maximum_rows || !rows.is_multiple_of(32) {
-                return false;
+                return None;
             }
-            let Some(out_bytes) = rows.checked_mul(4) else {
-                return false;
-            };
-            let Some(next_total_out) = total_output_bytes.checked_add(out_bytes) else {
-                return false;
-            };
-            total_output_bytes = next_total_out;
-            if cache.find(tensor).is_none() {
-                let Some(packed) = rows
+            rows_per_member[member] = rows;
+            let out_bytes = rows.checked_mul(4)?;
+            total_output_bytes = total_output_bytes.checked_add(out_bytes)?;
+            let cached = cache.find(tensor);
+            cached_indices[member] = cached;
+            if cached.is_none() {
+                let packed = rows
                     .checked_mul(36)
-                    .and_then(|b| b.checked_mul(columns / 128))
-                else {
-                    return false;
-                };
-                let Some(next_uncached) = uncached_packed_bytes.checked_add(packed) else {
-                    return false;
-                };
-                uncached_packed_bytes = next_uncached;
+                    .and_then(|b| b.checked_mul(columns / 128))?;
+                uncached_packed_bytes = uncached_packed_bytes.checked_add(packed)?;
                 uncached_ops += 1;
             }
         }
@@ -667,11 +660,16 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             && (!cache.has_metadata_capacity(uncached_ops)
                 || uncached_packed_bytes > self.submitter.residency_capacity_bytes())
         {
-            return false;
+            return None;
         }
         total_output_bytes
             .checked_add(cache.reservation)
-            .is_some_and(|bytes| bytes <= self.maximum_owned_payload_bytes)
+            .filter(|&bytes| bytes <= self.maximum_owned_payload_bytes)
+            .map(|_| (columns, rows_per_member, cached_indices))
+    }
+
+    fn supports_f32_group_inner(&self, tensors: &[&Tensor]) -> bool {
+        self.validate_f32_group(tensors).is_some()
     }
 
     #[allow(
@@ -689,24 +687,26 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 "native Q2 Hexagon executor requires terminal teardown",
             ));
         }
-        if tensors.len() != outputs.len() || !self.supports_f32_group_inner(tensors) {
+        if tensors.len() != outputs.len() {
             return Err(invalid(
                 "unsupported native Q2 Hexagon batched projection group",
             ));
         }
-        let (columns, _) = native_dimensions(tensors[0])?;
+        let Some((columns, rows_per_member, cached_indices)) = self.validate_f32_group(tensors)
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon batched projection group",
+            ));
+        };
         if activation.len() != columns {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
         finite_slice(activation)?;
         let mut weights = Vec::new();
         let mut indices = [0_usize; 3];
-        let mut rows_per_member = [0_usize; 3];
         for (member, &tensor) in tensors.iter().enumerate() {
-            let (_, rows) = native_dimensions(tensor)?;
-            rows_per_member[member] = rows;
-            let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
-            let index = if let Some(idx) = cached {
+            let rows = rows_per_member[member];
+            let index = if let Some(idx) = cached_indices[member] {
                 if let Some(cache) = &mut self.residency {
                     if cache.projections[idx].evaluated {
                         cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
@@ -731,11 +731,13 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         for (member, output) in outputs.iter_mut().enumerate() {
             let rows = rows_per_member[member];
-            output.clear();
-            output
-                .try_reserve(rows)
-                .map_err(|_| invalid("native Q2 output allocation failed"))?;
-            output.resize(rows, f32::NAN);
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, f32::NAN);
+            }
         }
         let count_u64 = u64::try_from(tensors.len())?;
         self.statistics.operations_attempted = self
@@ -867,7 +869,6 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
         _pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        output.clear();
         let result = self.project_f32_inner(tensor, activation, output);
         if result.is_err() {
             self.failed = true;
@@ -887,9 +888,6 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
         _pinned: bool,
         outputs: &mut [&mut Vec<f32>],
     ) -> Result<()> {
-        for output in outputs.iter_mut() {
-            output.clear();
-        }
         let result = self.project_f32_group_inner(tensors, activation, outputs);
         if result.is_err() {
             self.failed = true;
@@ -955,7 +953,9 @@ fn pack_row_group(
         for local_block in 0..geometry.chunk_blocks {
             let offset = (row_block_base + local_block) * 34;
             let original = &tensor_data[offset..offset + 34];
-            scale(original)?;
+            if (u16::from_le_bytes([original[0], original[1]]) & 0x7c00) == 0x7c00 {
+                return Err(invalid("nonfinite Hexagon Q2 scale"));
+            }
             let tile0 = (local_block * 2) * 576;
             let tile1 = tile0 + 576;
             let scale_offset0 = tile0 + 512 + row_in_tile * 2;
@@ -970,7 +970,7 @@ fn pack_row_group(
                 packed ^= swap ^ (swap << 12);
                 let bytes = packed.to_le_bytes();
                 let tile = if pair < 2 { tile0 } else { tile1 };
-                let base = tile + (pair % 2) * 256 + row_in_tile * 4;
+                let base = tile + (pair & 1) * 256 + row_in_tile * 4;
                 group_weights[base..base + 4].copy_from_slice(&bytes[..4]);
                 group_weights[base + 128..base + 132].copy_from_slice(&bytes[4..8]);
             }

@@ -17,8 +17,10 @@ use crate::{
     projection,
 };
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static NEXT_NATIVE_REGISTRY_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Largest input-column extent (`K`) for a single 1-op native `Q2_0` projection.
 pub const NATIVE_Q2_MAX_COLUMNS: usize = Q2_PROJECTION_MAX_ROWS;
@@ -126,7 +128,7 @@ impl NativeQ2ProjectionLimits {
 /// An immutable full-`K` tiled `Q2_0` weight extent owned by one submitter's registry.
 #[derive(Clone, Debug)]
 pub struct NativeQ2WeightHandle {
-    owner: Arc<()>,
+    owner: u64,
     range: Range<usize>,
     columns: usize,
     rows: usize,
@@ -153,9 +155,9 @@ impl NativeQ2WeightHandle {
 }
 
 /// Metadata-only append-only allocator for one submitter's native `Q2_0` weight arena.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct NativeQ2WeightRegistry {
-    owner: Arc<()>,
+    owner: u64,
     capacity: usize,
     used: usize,
 }
@@ -170,7 +172,7 @@ impl NativeQ2WeightRegistry {
             return Err(Error::Contract);
         }
         Ok(Self {
-            owner: Arc::new(()),
+            owner: NEXT_NATIVE_REGISTRY_OWNER.fetch_add(1, Ordering::Relaxed),
             capacity: capacity_bytes,
             used: 0,
         })
@@ -217,7 +219,7 @@ impl NativeQ2WeightRegistry {
         }
         self.used = end;
         Ok(Some(NativeQ2WeightHandle {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner,
             range: start..end,
             columns,
             rows,
@@ -235,7 +237,7 @@ impl NativeQ2WeightRegistry {
     /// # Errors
     /// Rejects handles issued by any other registry, including earlier sessions.
     pub fn range(&self, handle: &NativeQ2WeightHandle) -> Result<Range<usize>, Error> {
-        if !Arc::ptr_eq(&self.owner, &handle.owner)
+        if self.owner != handle.owner
             || handle.range.end > self.used
             || handle.range.end > self.capacity
         {
@@ -944,7 +946,8 @@ fn write_member_descriptors(
     Ok(())
 }
 
-pub(crate) fn output_valid(bytes: &[u8]) -> bool {
+#[cfg(test)]
+fn output_valid(bytes: &[u8]) -> bool {
     const EXP_MASK: u32 = 0x7f80_0000;
     const EXP_STEP: u32 = 0x0080_0000;
     const SIGN_BIT: u32 = 0x8000_0000;
@@ -970,6 +973,43 @@ pub(crate) fn output_valid(bytes: &[u8]) -> bool {
         tail_mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
     }
     (tail_mask & SIGN_BIT) == 0
+}
+
+pub(crate) fn copy_and_validate_output(bytes: &[u8], output: &mut [f32]) -> bool {
+    const EXP_MASK: u32 = 0x7f80_0000;
+    const EXP_STEP: u32 = 0x0080_0000;
+    const SIGN_BIT: u32 = 0x8000_0000;
+
+    if output.is_empty() || bytes.len() != output.len().saturating_mul(4) {
+        output.fill(f32::NAN);
+        return false;
+    }
+    let words = bytes.as_chunks::<4>().0;
+    let (in_chunks, in_tail) = words.as_chunks::<16>();
+    let (out_chunks, out_tail) = output.as_chunks_mut::<16>();
+    for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks) {
+        let mut mask = 0_u32;
+        for (word, dst) in in_chunk.iter().zip(out_chunk) {
+            let bits = u32::from_le_bytes(*word);
+            mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
+            *dst = f32::from_bits(bits);
+        }
+        if (mask & SIGN_BIT) != 0 {
+            output.fill(f32::NAN);
+            return false;
+        }
+    }
+    let mut tail_mask = 0_u32;
+    for (word, dst) in in_tail.iter().zip(out_tail) {
+        let bits = u32::from_le_bytes(*word);
+        tail_mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
+        *dst = f32::from_bits(bits);
+    }
+    if (tail_mask & SIGN_BIT) != 0 {
+        output.fill(f32::NAN);
+        return false;
+    }
+    true
 }
 
 fn put16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -1075,6 +1115,9 @@ mod tests {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
             assert!(output_valid(&bytes));
+            let mut copied = vec![0.0_f32; len];
+            assert!(copy_and_validate_output(&bytes, &mut copied));
+            assert_eq!(copied, values);
             for pos in [0, len / 2, len - 1] {
                 values[pos] = f32::NAN;
                 assert!(!is_finite_f32_slice(&values));
@@ -1084,6 +1127,7 @@ mod tests {
                 let mut bad_bytes = bytes.clone();
                 bad_bytes[pos * 4..pos * 4 + 4].copy_from_slice(&f32::INFINITY.to_le_bytes());
                 assert!(!output_valid(&bad_bytes));
+                assert!(!copy_and_validate_output(&bad_bytes, &mut copied));
             }
         }
 

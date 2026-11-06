@@ -265,8 +265,8 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
         pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        output.clear();
         if self.faulted || !self.supports_f32(tensor) {
+            output.clear();
             return Err(invalid("unavailable explicit F32 projection placement"));
         }
         let result = self
@@ -294,10 +294,10 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
         pinned: bool,
         outputs: &mut [&mut Vec<f32>],
     ) -> Result<()> {
-        for output in outputs.iter_mut() {
-            output.clear();
-        }
         if !self.supports_f32_group(tensors) {
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
             return Err(invalid(
                 "unavailable explicit F32 group projection placement",
             ));

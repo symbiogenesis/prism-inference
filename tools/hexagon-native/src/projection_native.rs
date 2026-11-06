@@ -482,222 +482,242 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         activation: Activation<'_>,
         output: &mut [f32],
     ) -> Result<(), Error> {
-        output.fill(f32::NAN);
-        if self.failed
-            || self.report.operations_submitted >= self.limits.operations
-            || self.report.queue_writes_submitted >= self.limits.operations
-        {
-            return Err(self.fail("projection-session-bound-refused-pinned"));
-        }
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        let rows = match (weights, &activation, self.mode) {
-            (Weights::Transient(weights), Activation::Guarded(values), Mode::Guarded) => {
-                projection::validate_inputs(self.limits.rows, weights, values, output.len())
+        let result = (|| {
+            if self.failed
+                || self.report.operations_submitted >= self.limits.operations
+                || self.report.queue_writes_submitted >= self.limits.operations
+            {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
             }
-            (Weights::Transient(weights), Activation::Hmx(values), Mode::Hmx) => {
-                hmx_projection::validate_inputs(self.limits.rows, weights, values, output.len())
+            if !self.within_deadline() {
+                return Err(Error::Contract);
             }
-            (Weights::Resident(handle), Activation::Hmx(values), Mode::Hmx) => self
-                .resident_weights
-                .range(handle)
-                .and_then(|_| {
-                    hmx_projection::validate_activation(
-                        self.limits.rows,
-                        handle.rows(),
-                        values,
-                        output.len(),
-                    )
-                })
-                .map(|()| handle.rows()),
-            (
-                Weights::NativeTransient {
+            let rows = match (weights, &activation, self.mode) {
+                (Weights::Transient(weights), Activation::Guarded(values), Mode::Guarded) => {
+                    projection::validate_inputs(self.limits.rows, weights, values, output.len())
+                }
+                (Weights::Transient(weights), Activation::Hmx(values), Mode::Hmx) => {
+                    hmx_projection::validate_inputs(self.limits.rows, weights, values, output.len())
+                }
+                (Weights::Resident(handle), Activation::Hmx(values), Mode::Hmx) => self
+                    .resident_weights
+                    .range(handle)
+                    .and_then(|_| {
+                        hmx_projection::validate_activation(
+                            self.limits.rows,
+                            handle.rows(),
+                            values,
+                            output.len(),
+                        )
+                    })
+                    .map(|()| handle.rows()),
+                (
+                    Weights::NativeTransient {
+                        columns,
+                        rows,
+                        bytes,
+                    },
+                    Activation::NativeQ2(values),
+                    Mode::NativeQ2 {
+                        columns: max_columns,
+                    },
+                ) => native_q2::validate_inputs(
+                    max_columns,
+                    self.limits.rows,
                     columns,
                     rows,
                     bytes,
-                },
-                Activation::NativeQ2(values),
-                Mode::NativeQ2 {
-                    columns: max_columns,
-                },
-            ) => native_q2::validate_inputs(
-                max_columns,
-                self.limits.rows,
-                columns,
-                rows,
-                bytes,
-                values,
-                output.len(),
-            )
-            .map(|()| rows),
-            (
-                Weights::NativeResident(handle),
-                Activation::NativeQ2(values),
-                Mode::NativeQ2 {
-                    columns: max_columns,
-                },
-            ) => self
-                .native_resident_weights
-                .range(handle)
-                .and_then(|_| {
-                    native_q2::validate_activation(
-                        max_columns,
-                        self.limits.rows,
-                        handle.columns(),
-                        handle.rows(),
-                        values,
-                        output.len(),
-                    )
-                })
-                .map(|()| handle.rows()),
-            _ => Err(Error::Contract),
-        };
-        let Ok(rows) = rows else {
-            return Err(self.fail("projection-input-refused-pinned"));
-        };
-        let Ok(base) = u64::try_from(self.memory.addr()) else {
-            return Err(self.fail("projection-address-refused-pinned"));
-        };
-        let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
-            return Err(self.fail("projection-allocation-size-refused-pinned"));
-        };
-        let working_bytes = self.mode.allocation_bytes(self.limits.rows);
-        // SAFETY: the single previous operation completed and cache invalidation
-        // was validated before any allocation reuse. There is no DSP consumer
-        // before the first write and no mutable view survives this preparation.
-        let image =
-            unsafe { std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes) };
-        let active = match (weights, activation) {
-            (Weights::Transient(weights), Activation::Guarded(values)) => projection::image(
-                &mut image[..working_bytes],
-                base,
-                self.expected.fd,
-                rows,
-                weights,
-                values,
-            ),
-            (Weights::Transient(weights), Activation::Hmx(values)) => hmx_projection::image(
-                &mut image[..working_bytes],
-                base,
-                self.expected.fd,
-                rows,
-                weights,
-                values,
-            ),
-            (Weights::Resident(handle), Activation::Hmx(values)) => hmx_projection::image_resident(
-                image,
-                base,
-                self.expected.fd,
-                working_bytes,
-                handle,
-                values,
-            ),
-            (
-                Weights::NativeTransient {
-                    columns,
-                    rows: active_rows,
-                    bytes,
-                },
-                Activation::NativeQ2(values),
-            ) => native_q2::image(
-                &mut image[..working_bytes],
-                base,
-                self.expected.fd,
-                columns,
-                active_rows,
-                bytes,
-                values,
-            ),
-            (Weights::NativeResident(handle), Activation::NativeQ2(values)) => {
-                native_q2::image_resident(
-                    image,
+                    values,
+                    output.len(),
+                )
+                .map(|()| rows),
+                (
+                    Weights::NativeResident(handle),
+                    Activation::NativeQ2(values),
+                    Mode::NativeQ2 {
+                        columns: max_columns,
+                    },
+                ) => self
+                    .native_resident_weights
+                    .range(handle)
+                    .and_then(|_| {
+                        native_q2::validate_activation(
+                            max_columns,
+                            self.limits.rows,
+                            handle.columns(),
+                            handle.rows(),
+                            values,
+                            output.len(),
+                        )
+                    })
+                    .map(|()| handle.rows()),
+                _ => Err(Error::Contract),
+            };
+            let Ok(rows) = rows else {
+                return Err(self.fail("projection-input-refused-pinned"));
+            };
+            let Ok(base) = u64::try_from(self.memory.addr()) else {
+                return Err(self.fail("projection-address-refused-pinned"));
+            };
+            let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
+                return Err(self.fail("projection-allocation-size-refused-pinned"));
+            };
+            let working_bytes = self.mode.allocation_bytes(self.limits.rows);
+            // SAFETY: the single previous operation completed and cache invalidation
+            // was validated before any allocation reuse. There is no DSP consumer
+            // before the first write and no mutable view survives this preparation.
+            let image = unsafe {
+                std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
+            };
+            let active = match (weights, activation) {
+                (Weights::Transient(weights), Activation::Guarded(values)) => projection::image(
+                    &mut image[..working_bytes],
                     base,
                     self.expected.fd,
-                    working_bytes,
-                    handle,
+                    rows,
+                    weights,
                     values,
+                ),
+                (Weights::Transient(weights), Activation::Hmx(values)) => hmx_projection::image(
+                    &mut image[..working_bytes],
+                    base,
+                    self.expected.fd,
+                    rows,
+                    weights,
+                    values,
+                ),
+                (Weights::Resident(handle), Activation::Hmx(values)) => {
+                    hmx_projection::image_resident(
+                        image,
+                        base,
+                        self.expected.fd,
+                        working_bytes,
+                        handle,
+                        values,
+                    )
+                }
+                (
+                    Weights::NativeTransient {
+                        columns,
+                        rows: active_rows,
+                        bytes,
+                    },
+                    Activation::NativeQ2(values),
+                ) => native_q2::image(
+                    &mut image[..working_bytes],
+                    base,
+                    self.expected.fd,
+                    columns,
+                    active_rows,
+                    bytes,
+                    values,
+                ),
+                (Weights::NativeResident(handle), Activation::NativeQ2(values)) => {
+                    native_q2::image_resident(
+                        image,
+                        base,
+                        self.expected.fd,
+                        working_bytes,
+                        handle,
+                        values,
+                    )
+                }
+                _ => Err(Error::Contract),
+            };
+            let Ok(active) = active else {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            };
+            image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            self.report.queue.response_validated = false;
+            self.report.queue.numeric_validated = false;
+            self.report.operations_submitted += 1;
+            self.report.queue_writes_submitted += 1;
+            if matches!(weights, Weights::Resident(_) | Weights::NativeResident(_)) {
+                self.report.resident_submissions += 1;
+            }
+            self.report.queue.compute_submitted = true;
+            let sequence = u64::from(self.report.queue_writes_submitted);
+            let request = projection::request(sequence);
+            let active_descriptor_size = match (&weights, self.dirty_resident_weights) {
+                (Weights::NativeResident(_), false) => {
+                    let Ok(prefix) =
+                        u32::try_from((active.output + rows * 4).next_multiple_of(4096))
+                    else {
+                        return Err(self.fail("projection-allocation-size-refused-pinned"));
+                    };
+                    prefix.min(self.expected.size)
+                }
+                (Weights::NativeResident(_), true) => {
+                    let dirty_end =
+                        working_bytes.saturating_add(self.native_resident_weights.used_bytes());
+                    let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
+                        return Err(self.fail("projection-allocation-size-refused-pinned"));
+                    };
+                    prefix.min(self.expected.size)
+                }
+                _ => self.expected.size,
+            };
+            let mut descriptor = self.expected;
+            descriptor.size = active_descriptor_size;
+            entered(self.report, "projection-queue-write-entered", self.progress);
+            let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
+            self.report.queue.queue_write_result = Some(result);
+            if result != 0 {
+                return Err(self.fail("projection-write-refused-pinned"));
+            }
+            entered(self.report, "projection-queue-read-entered", self.progress);
+            if !self.read(sequence, 1, active_descriptor_size) {
+                return Err(Error::Contract);
+            }
+            self.dirty_resident_weights = false;
+            // SAFETY: exact correlated response validated same FD, full allocation,
+            // pointer and cache flags. No asynchronous consumer remains, and only
+            // the checked active output subsection is borrowed until copying ends.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.memory.cast::<u8>().wrapping_add(active.output),
+                    size_of_val(output),
                 )
-            }
-            _ => Err(Error::Contract),
-        };
-        let Ok(active) = active else {
-            return Err(self.fail("projection-frame-refused-pinned"));
-        };
-        image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        self.report.queue.response_validated = false;
-        self.report.queue.numeric_validated = false;
-        self.report.operations_submitted += 1;
-        self.report.queue_writes_submitted += 1;
-        if matches!(weights, Weights::Resident(_) | Weights::NativeResident(_)) {
-            self.report.resident_submissions += 1;
-        }
-        self.report.queue.compute_submitted = true;
-        let sequence = u64::from(self.report.queue_writes_submitted);
-        let request = projection::request(sequence);
-        let active_descriptor_size = match (&weights, self.dirty_resident_weights) {
-            (Weights::NativeResident(_), false) => {
-                let Ok(prefix) = u32::try_from((active.output + rows * 4).next_multiple_of(4096))
-                else {
-                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+            };
+            if matches!(self.mode, Mode::NativeQ2 { .. }) {
+                if !native_q2::copy_and_validate_output(bytes, output) {
+                    return Err(self.fail("projection-numeric-refused-pinned"));
+                }
+                if !self.within_deadline() {
+                    return Err(Error::Contract);
+                }
+            } else {
+                let output_valid = match self.mode {
+                    Mode::Guarded => projection::output_valid(bytes),
+                    Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => {
+                        hmx_projection::output_valid(bytes)
+                    }
+                    Mode::NativeQ2 { .. } => unreachable!(),
                 };
-                prefix.min(self.expected.size)
+                if !output_valid {
+                    return Err(self.fail("projection-numeric-refused-pinned"));
+                }
+                if !self.within_deadline() {
+                    return Err(Error::Contract);
+                }
+                let words = &bytes.as_chunks::<4>().0[..output.len()];
+                for (destination, value) in output.iter_mut().zip(words) {
+                    *destination = f32::from_le_bytes(*value);
+                }
             }
-            (Weights::NativeResident(_), true) => {
-                let dirty_end =
-                    working_bytes.saturating_add(self.native_resident_weights.used_bytes());
-                let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
-                    return Err(self.fail("projection-allocation-size-refused-pinned"));
-                };
-                prefix.min(self.expected.size)
-            }
-            _ => self.expected.size,
-        };
-        let mut descriptor = self.expected;
-        descriptor.size = active_descriptor_size;
-        entered(self.report, "projection-queue-write-entered", self.progress);
-        let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
-        self.report.queue.queue_write_result = Some(result);
-        if result != 0 {
-            return Err(self.fail("projection-write-refused-pinned"));
+            self.report.queue.numeric_validated = true;
+            self.report.operations_completed += 1;
+            self.report.queue_writes_completed += 1;
+            entered(self.report, "projection-operation-complete", self.progress);
+            Ok(())
+        })();
+        if result.is_err() {
+            output.fill(f32::NAN);
         }
-        entered(self.report, "projection-queue-read-entered", self.progress);
-        if !self.read(sequence, 1, active_descriptor_size) {
-            return Err(Error::Contract);
-        }
-        self.dirty_resident_weights = false;
-        // SAFETY: exact correlated response validated same FD, full allocation,
-        // pointer and cache flags. No asynchronous consumer remains, and only
-        // the checked active output subsection is borrowed until copying ends.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.memory.cast::<u8>().wrapping_add(active.output),
-                size_of_val(output),
-            )
-        };
-        let output_valid = match self.mode {
-            Mode::Guarded => projection::output_valid(bytes),
-            Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => hmx_projection::output_valid(bytes),
-            Mode::NativeQ2 { .. } => native_q2::output_valid(bytes),
-        };
-        if !output_valid {
-            return Err(self.fail("projection-numeric-refused-pinned"));
-        }
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        let words = &bytes.as_chunks::<4>().0[..output.len()];
-        for (destination, value) in output.iter_mut().zip(words) {
-            *destination = f32::from_le_bytes(*value);
-        }
-        self.report.queue.numeric_validated = true;
-        self.report.operations_completed += 1;
-        self.report.queue_writes_completed += 1;
-        entered(self.report, "projection-operation-complete", self.progress);
-        Ok(())
+        result
     }
 
     #[allow(
@@ -863,155 +883,147 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         activation: &[f32],
         mut outputs: [&mut [f32]; B],
     ) -> Result<(), Error> {
-        for output in &mut outputs {
-            output.fill(f32::NAN);
-        }
-        let Ok(batch_u32) = u32::try_from(B) else {
-            return Err(self.fail("projection-session-bound-refused-pinned"));
-        };
-        let Some(next_operations) = self
-            .report
-            .operations_submitted
-            .checked_add(batch_u32)
-            .filter(|&next| !self.failed && next <= self.limits.operations)
-        else {
-            return Err(self.fail("projection-session-bound-refused-pinned"));
-        };
-        let Some(next_writes) = self
-            .report
-            .queue_writes_submitted
-            .checked_add(1)
-            .filter(|&next| next <= self.limits.operations)
-        else {
-            return Err(self.fail("projection-session-bound-refused-pinned"));
-        };
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        let Mode::NativeQ2 {
-            columns: max_columns,
-        } = self.mode
-        else {
-            return Err(self.fail("projection-input-refused-pinned"));
-        };
-        let columns = handles[0].columns();
-        if !native_q2::is_finite_f32_slice(activation) {
-            return Err(self.fail("projection-input-refused-pinned"));
-        }
-        for (member, handle) in handles.into_iter().enumerate() {
-            if handle.columns() != columns
-                || self.native_resident_weights.range(handle).is_err()
-                || native_q2::validate_activation_dimensions(
-                    max_columns,
-                    self.limits.rows,
-                    columns,
-                    handle.rows(),
-                    activation.len(),
-                    outputs[member].len(),
-                )
-                .is_err()
-            {
+        let result = (|| {
+            let Ok(batch_u32) = u32::try_from(B) else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            let Some(next_operations) = self
+                .report
+                .operations_submitted
+                .checked_add(batch_u32)
+                .filter(|&next| !self.failed && next <= self.limits.operations)
+            else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            let Some(next_writes) = self
+                .report
+                .queue_writes_submitted
+                .checked_add(1)
+                .filter(|&next| next <= self.limits.operations)
+            else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            let Mode::NativeQ2 {
+                columns: max_columns,
+            } = self.mode
+            else {
+                return Err(self.fail("projection-input-refused-pinned"));
+            };
+            let columns = handles[0].columns();
+            if !native_q2::is_finite_f32_slice(activation) {
                 return Err(self.fail("projection-input-refused-pinned"));
             }
-        }
-        let Ok(base) = u64::try_from(self.memory.addr()) else {
-            return Err(self.fail("projection-address-refused-pinned"));
-        };
-        let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
-            return Err(self.fail("projection-allocation-size-refused-pinned"));
-        };
-        let working_bytes = self.mode.allocation_bytes(self.limits.rows);
-        // SAFETY: the single previous operation completed and cache invalidation
-        // was validated before any allocation reuse.
-        let image =
-            unsafe { std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes) };
-        let Ok(active) = native_q2::image_batch_resident::<B>(
-            image,
-            base,
-            self.expected.fd,
-            working_bytes,
-            handles,
-            activation,
-        ) else {
-            return Err(self.fail("projection-frame-refused-pinned"));
-        };
-        image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        let sequence = u64::from(next_writes);
-        let Ok(request) = projection::request_batch(sequence, batch_u32) else {
-            return Err(self.fail("projection-frame-refused-pinned"));
-        };
-        let active_descriptor_size = if self.dirty_resident_weights {
-            let dirty_end = working_bytes.saturating_add(self.native_resident_weights.used_bytes());
-            let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
+            for (member, handle) in handles.into_iter().enumerate() {
+                if handle.columns() != columns
+                    || self.native_resident_weights.range(handle).is_err()
+                    || native_q2::validate_activation_dimensions(
+                        max_columns,
+                        self.limits.rows,
+                        columns,
+                        handle.rows(),
+                        activation.len(),
+                        outputs[member].len(),
+                    )
+                    .is_err()
+                {
+                    return Err(self.fail("projection-input-refused-pinned"));
+                }
+            }
+            let Ok(base) = u64::try_from(self.memory.addr()) else {
+                return Err(self.fail("projection-address-refused-pinned"));
+            };
+            let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
                 return Err(self.fail("projection-allocation-size-refused-pinned"));
             };
-            prefix.min(self.expected.size)
-        } else {
-            let Ok(prefix) = u32::try_from(active.output_end.next_multiple_of(4096)) else {
-                return Err(self.fail("projection-allocation-size-refused-pinned"));
+            let working_bytes = self.mode.allocation_bytes(self.limits.rows);
+            // SAFETY: the single previous operation completed and cache invalidation
+            // was validated before any allocation reuse.
+            let image = unsafe {
+                std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            prefix.min(self.expected.size)
-        };
-        self.report.queue.response_validated = false;
-        self.report.queue.numeric_validated = false;
-        self.report.operations_submitted = next_operations;
-        self.report.queue_writes_submitted = next_writes;
-        self.report.resident_submissions += batch_u32;
-        self.report.queue.compute_submitted = true;
-        let mut descriptor = self.expected;
-        descriptor.size = active_descriptor_size;
-        entered(self.report, "projection-queue-write-entered", self.progress);
-        let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
-        self.report.queue.queue_write_result = Some(result);
-        if result != 0 {
-            return Err(self.fail("projection-write-refused-pinned"));
-        }
-        entered(self.report, "projection-queue-read-entered", self.progress);
-        if !self.read(sequence, batch_u32, active_descriptor_size) {
-            return Err(Error::Contract);
-        }
-        self.dirty_resident_weights = false;
-        for (member, output) in outputs.iter().enumerate() {
-            let offset = active.output_offsets[member];
-            let member_bytes = size_of_val(*output);
-            // SAFETY: exact correlated response validated same FD, active prefix,
-            // pointer, n_tensors=3*B and n_ops=B.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.memory.cast::<u8>().wrapping_add(offset),
-                    member_bytes,
-                )
+            let Ok(active) = native_q2::image_batch_resident::<B>(
+                image,
+                base,
+                self.expected.fd,
+                working_bytes,
+                handles,
+                activation,
+            ) else {
+                return Err(self.fail("projection-frame-refused-pinned"));
             };
-            if !native_q2::output_valid(bytes) {
-                return Err(self.fail("projection-numeric-refused-pinned"));
+            image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            let sequence = u64::from(next_writes);
+            let Ok(request) = projection::request_batch(sequence, batch_u32) else {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            };
+            let active_descriptor_size = if self.dirty_resident_weights {
+                let dirty_end =
+                    working_bytes.saturating_add(self.native_resident_weights.used_bytes());
+                let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            } else {
+                let Ok(prefix) = u32::try_from(active.output_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            };
+            self.report.queue.response_validated = false;
+            self.report.queue.numeric_validated = false;
+            self.report.operations_submitted = next_operations;
+            self.report.queue_writes_submitted = next_writes;
+            self.report.resident_submissions += batch_u32;
+            self.report.queue.compute_submitted = true;
+            let mut descriptor = self.expected;
+            descriptor.size = active_descriptor_size;
+            entered(self.report, "projection-queue-write-entered", self.progress);
+            let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
+            self.report.queue.queue_write_result = Some(result);
+            if result != 0 {
+                return Err(self.fail("projection-write-refused-pinned"));
+            }
+            entered(self.report, "projection-queue-read-entered", self.progress);
+            if !self.read(sequence, batch_u32, active_descriptor_size) {
+                return Err(Error::Contract);
+            }
+            self.dirty_resident_weights = false;
+            for (member, output) in outputs.iter_mut().enumerate() {
+                let offset = active.output_offsets[member];
+                let member_bytes = size_of_val(*output);
+                // SAFETY: exact correlated response validated same FD, active prefix,
+                // pointer, n_tensors=3*B and n_ops=B.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.memory.cast::<u8>().wrapping_add(offset),
+                        member_bytes,
+                    )
+                };
+                if !native_q2::copy_and_validate_output(bytes, output) {
+                    return Err(self.fail("projection-numeric-refused-pinned"));
+                }
+            }
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            self.report.queue.numeric_validated = true;
+            self.report.operations_completed = next_operations;
+            self.report.queue_writes_completed = next_writes;
+            entered(self.report, "projection-operation-complete", self.progress);
+            Ok(())
+        })();
+        if result.is_err() {
+            for output in &mut outputs {
+                output.fill(f32::NAN);
             }
         }
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        for (member, output) in outputs.iter_mut().enumerate() {
-            let offset = active.output_offsets[member];
-            let member_bytes = size_of_val(*output);
-            // SAFETY: validated above.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.memory.cast::<u8>().wrapping_add(offset),
-                    member_bytes,
-                )
-            };
-            let words = &bytes.as_chunks::<4>().0[..output.len()];
-            for (destination, value) in output.iter_mut().zip(words) {
-                *destination = f32::from_le_bytes(*value);
-            }
-        }
-        self.report.queue.numeric_validated = true;
-        self.report.operations_completed = next_operations;
-        self.report.queue_writes_completed = next_writes;
-        entered(self.report, "projection-operation-complete", self.progress);
-        Ok(())
+        result
     }
 }
 
@@ -1477,8 +1489,8 @@ impl NativeQ2Session {
             mode: Mode::NativeQ2 {
                 columns: self.columns,
             },
-            resident_weights: self.resident_weights.clone(),
-            native_resident_weights: self.native_resident_weights.clone(),
+            resident_weights: self.resident_weights,
+            native_resident_weights: self.native_resident_weights,
             dirty_resident_weights: self.dirty_resident_weights,
             work_deadline: self.work_deadline,
             progress: &mut progress,

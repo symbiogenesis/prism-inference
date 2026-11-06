@@ -13,8 +13,10 @@
 
 use crate::{Error, Q2ProjectionLimits, Q2ProjectionReport, compute, projection};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static NEXT_HMX_REGISTRY_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Fixed 2 MiB VTCM request (of 8 MiB hardware VTCM) used to derive the HMX chunks; refusal never falls back.
 pub const HMX_Q2_VTCM_REQUEST_BYTES: u32 = 2_097_152;
@@ -155,7 +157,7 @@ impl HmxQ2ProjectionLimits {
 /// lifetime, frees storage or changes its append-only contents.
 #[derive(Clone, Debug)]
 pub struct HmxQ2WeightHandle {
-    owner: Arc<()>,
+    owner: u64,
     range: Range<usize>,
     rows: usize,
 }
@@ -180,9 +182,9 @@ impl HmxQ2WeightHandle {
 /// handles. The registry stores no payload or native pointer. The submitter
 /// copies a successful reservation's bytes exactly once before exposing its
 /// handle, and never changes or frees them while the session can consume them.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct HmxQ2WeightRegistry {
-    owner: Arc<()>,
+    owner: u64,
     capacity: usize,
     used: usize,
 }
@@ -197,7 +199,7 @@ impl HmxQ2WeightRegistry {
             return Err(Error::Contract);
         }
         Ok(Self {
-            owner: Arc::new(()),
+            owner: NEXT_HMX_REGISTRY_OWNER.fetch_add(1, Ordering::Relaxed),
             capacity: capacity_bytes,
             used: 0,
         })
@@ -225,7 +227,7 @@ impl HmxQ2WeightRegistry {
         }
         self.used = end;
         Ok(Some(HmxQ2WeightHandle {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner,
             range: start..end,
             rows,
         }))
@@ -236,7 +238,7 @@ impl HmxQ2WeightRegistry {
     /// # Errors
     /// Rejects handles issued by any other registry, including earlier sessions.
     pub fn range(&self, handle: &HmxQ2WeightHandle) -> Result<Range<usize>, Error> {
-        if !Arc::ptr_eq(&self.owner, &handle.owner)
+        if self.owner != handle.owner
             || handle.range.end > self.used
             || handle.range.end > self.capacity
         {

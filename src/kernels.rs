@@ -415,6 +415,16 @@ fn q8k_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8KBloc
     }
     collect_into(
         input.as_chunks::<256>().0.iter().map(|chunk| {
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            if let Some(result) = neon::q8k_block::<PINNED>(chunk) {
+                return result;
+            }
             let mut maximum = 0.0_f32;
             for &value in chunk {
                 finite(value)?;
@@ -483,6 +493,18 @@ fn q8_with_contract<const PINNED: bool, const NATIVE_SCALE: bool>(
     }
     collect_into(
         input.as_chunks::<32>().0.iter().map(|chunk| {
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            if PINNED
+                && let Some(result) = neon::q8_pinned_block::<NATIVE_SCALE>(chunk)
+            {
+                return result;
+            }
             let mut maximum = 0.0_f32;
             for &value in chunk {
                 maximum = maximum.max(finite(value)?.abs());

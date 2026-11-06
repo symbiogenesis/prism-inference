@@ -408,6 +408,231 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
     Some(Ok(result))
 }
 
+#[inline]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Each narrowed Q8_K lane and 16-element i8 sum is bounded within i16."
+)]
+pub(super) fn q8k_block<const PINNED: bool>(
+    chunk: &[f32; 256],
+) -> Option<Result<bonsai_ternary::Q8KBlock>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut max_abs_vec = f32x4::splat(neon, 0.0);
+    for group in chunk.as_chunks::<16>().0 {
+        let v0 = f32x4::from_slice(neon, &group[0..4]);
+        let v1 = f32x4::from_slice(neon, &group[4..8]);
+        let v2 = f32x4::from_slice(neon, &group[8..12]);
+        let v3 = f32x4::from_slice(neon, &group[12..16]);
+        if !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        max_abs_vec = max_abs_vec
+            .max(v0.abs())
+            .max(v1.abs())
+            .max(v2.abs())
+            .max(v3.abs());
+    }
+    let mut max_lanes = [0.0_f32; 4];
+    max_abs_vec.store_slice(&mut max_lanes);
+    let max_abs = max_lanes[0]
+        .max(max_lanes[1])
+        .max(max_lanes[2])
+        .max(max_lanes[3]);
+    let mut block = bonsai_ternary::Q8KBlock {
+        scale: 0.0,
+        values: [0; 256],
+        sums: [0; 16],
+    };
+    if max_abs == 0.0 {
+        return Some(Ok(block));
+    }
+    let mut maximum = 0.0_f32;
+    let target_abs = f32x4::splat(neon, max_abs);
+    for sub in chunk.as_chunks::<4>().0 {
+        if f32x4::from_slice(neon, sub).abs().simd_eq(target_abs).any_true() {
+            for &value in sub {
+                if value.abs() == max_abs {
+                    maximum = value;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    let inverse_scale = -127.0 / maximum;
+    if !inverse_scale.is_finite() {
+        return Some(Err(crate::invalid("Q8_K activation scale overflow")));
+    }
+    block.scale = 1.0 / inverse_scale;
+    let iscale = f32x4::splat(neon, inverse_scale);
+    let magic = f32x4::splat(neon, 12_582_912.0);
+    let mask_mant = u32x4::splat(neon, 0x007f_ffff);
+    let bias = i32x4::splat(neon, 0x0040_0000);
+    let max_code = i32x4::splat(neon, 127);
+    let min_code = i32x4::splat(neon, if PINNED { -128 } else { -127 });
+    let mask16 = u32x4::splat(neon, 0xffff);
+    let mask8 = u16x8::splat(neon, 0xff);
+    for ((group, dst_values), dst_sum) in chunk
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(block.values.as_chunks_mut::<16>().0)
+        .zip(&mut block.sums)
+    {
+        let subs = group.as_chunks::<4>().0;
+        let v0 = f32x4::from_slice(neon, &subs[0]);
+        let v1 = f32x4::from_slice(neon, &subs[1]);
+        let v2 = f32x4::from_slice(neon, &subs[2]);
+        let v3 = f32x4::from_slice(neon, &subs[3]);
+        let (r0, r1, r2, r3) = if PINNED {
+            (
+                iscale.mul_add(v0, magic),
+                iscale.mul_add(v1, magic),
+                iscale.mul_add(v2, magic),
+                iscale.mul_add(v3, magic),
+            )
+        } else {
+            (
+                (v0 * iscale) + magic,
+                (v1 * iscale) + magic,
+                (v2 * iscale) + magic,
+                (v3 * iscale) + magic,
+            )
+        };
+        if !(r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite()).all_true() {
+            return None;
+        }
+        let i0 = ((r0.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
+        let i1 = ((r1.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
+        let i2 = ((r2.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
+        let i3 = ((r3.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias).min(max_code);
+        if !(i0.simd_ge(min_code)
+            & i1.simd_ge(min_code)
+            & i2.simd_ge(min_code)
+            & i3.simd_ge(min_code))
+        .all_true()
+        {
+            return None;
+        }
+        let low16 = (i0.bitcast::<u32x4<Neon>>() & mask16)
+            .narrow(i1.bitcast::<u32x4<Neon>>() & mask16)
+            .bitcast::<i16x8<Neon>>();
+        let high16 = (i2.bitcast::<u32x4<Neon>>() & mask16)
+            .narrow(i3.bitcast::<u32x4<Neon>>() & mask16)
+            .bitcast::<i16x8<Neon>>();
+        let bytes = (low16.bitcast::<u16x8<Neon>>() & mask8)
+            .narrow(high16.bitcast::<u16x8<Neon>>() & mask8)
+            .bitcast::<i8x16<Neon>>();
+        bytes.store_slice(dst_values);
+        let (sum_lo, sum_hi) = (low16 + high16).widen();
+        *dst_sum = (sum_lo + sum_hi).reduce_sum() as i16;
+    }
+    Some(Ok(block))
+}
+
+#[inline]
+pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
+    chunk: &[f32; 32],
+) -> Option<Result<super::Q8Block>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut max_abs_vec = f32x4::splat(neon, 0.0);
+    for group in chunk.as_chunks::<16>().0 {
+        let v0 = f32x4::from_slice(neon, &group[0..4]);
+        let v1 = f32x4::from_slice(neon, &group[4..8]);
+        let v2 = f32x4::from_slice(neon, &group[8..12]);
+        let v3 = f32x4::from_slice(neon, &group[12..16]);
+        if !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        max_abs_vec = max_abs_vec
+            .max(v0.abs())
+            .max(v1.abs())
+            .max(v2.abs())
+            .max(v3.abs());
+    }
+    let mut max_lanes = [0.0_f32; 4];
+    max_abs_vec.store_slice(&mut max_lanes);
+    let maximum = max_lanes[0]
+        .max(max_lanes[1])
+        .max(max_lanes[2])
+        .max(max_lanes[3]);
+    let d = if NATIVE_SCALE {
+        maximum * f32::from_bits(0x3c01_0204)
+    } else {
+        maximum / 127.0
+    };
+    let inverse_scale = if d == 0.0 {
+        0.0
+    } else if NATIVE_SCALE {
+        127.0 / maximum
+    } else {
+        1.0 / d
+    };
+    let scale = super::round_f16(d);
+    if !scale.is_finite() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    let mut block = super::Q8Block {
+        scale,
+        sum: 0.0,
+        values: [0; 32],
+    };
+    if inverse_scale == 0.0 {
+        block.sum = super::round_f16(0.0 * d);
+        return Some(Ok(block));
+    }
+    let iscale = f32x4::splat(neon, inverse_scale);
+    let magic = f32x4::splat(neon, 12_582_912.0);
+    let mask_mant = u32x4::splat(neon, 0x007f_ffff);
+    let bias = i32x4::splat(neon, 0x0040_0000);
+    let max_code = i32x4::splat(neon, 127);
+    let min_code = i32x4::splat(neon, -127);
+    let mask16 = u32x4::splat(neon, 0xffff);
+    let mask8 = u16x8::splat(neon, 0xff);
+    let mut total_sum = i32x4::splat(neon, 0);
+    for (group, dst_values) in chunk
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(block.values.as_chunks_mut::<16>().0)
+    {
+        let subs = group.as_chunks::<4>().0;
+        let r0 = (f32x4::from_slice(neon, &subs[0]) * iscale) + magic;
+        let r1 = (f32x4::from_slice(neon, &subs[1]) * iscale) + magic;
+        let r2 = (f32x4::from_slice(neon, &subs[2]) * iscale) + magic;
+        let r3 = (f32x4::from_slice(neon, &subs[3]) * iscale) + magic;
+        if !(r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite()).all_true() {
+            return None;
+        }
+        let i0 = (r0.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
+        let i1 = (r1.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
+        let i2 = (r2.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
+        let i3 = (r3.bitcast::<u32x4<Neon>>() & mask_mant).bitcast::<i32x4<Neon>>() - bias;
+        if !(i0.simd_ge(min_code)
+            & i0.simd_le(max_code)
+            & i1.simd_ge(min_code)
+            & i1.simd_le(max_code)
+            & i2.simd_ge(min_code)
+            & i2.simd_le(max_code)
+            & i3.simd_ge(min_code)
+            & i3.simd_le(max_code))
+        .all_true()
+        {
+            return None;
+        }
+        total_sum += i0 + i1 + i2 + i3;
+        let low16 = (i0.bitcast::<u32x4<Neon>>() & mask16)
+            .narrow(i1.bitcast::<u32x4<Neon>>() & mask16);
+        let high16 = (i2.bitcast::<u32x4<Neon>>() & mask16)
+            .narrow(i3.bitcast::<u32x4<Neon>>() & mask16);
+        let bytes = (low16 & mask8).narrow(high16 & mask8).bitcast::<i8x16<Neon>>();
+        bytes.store_slice(dst_values);
+    }
+    block.sum = super::round_f16(super::integer_float(total_sum.reduce_sum()) * d);
+    Some(Ok(block))
+}
+
 /// Consumes scoped digit-plane activations without unpack interleaves per row.
 ///
 /// Each sixteen packed bytes describe sixty-four consecutive weights. Their

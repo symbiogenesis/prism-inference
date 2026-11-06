@@ -278,8 +278,16 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
             expected,
             limits,
             mode,
-            resident_weights: HmxQ2WeightRegistry::new(resident_weight_bytes)?,
-            native_resident_weights: NativeQ2WeightRegistry::new(resident_weight_bytes)?,
+            resident_weights: HmxQ2WeightRegistry::new(if mode.is_hmx() {
+                resident_weight_bytes
+            } else {
+                0
+            })?,
+            native_resident_weights: NativeQ2WeightRegistry::new(if mode.is_native_q2() {
+                resident_weight_bytes
+            } else {
+                0
+            })?,
             work_deadline,
             progress: &mut progress,
             failed: false,

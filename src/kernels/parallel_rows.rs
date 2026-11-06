@@ -411,12 +411,17 @@ impl RowParallelism {
         target_env = "msvc",
         target_feature = "neon"
     ))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Batch eight-row, four-row, and single-row kernels without allocating a wrapper."
+    )]
     pub(super) fn fill_four_rows(
         &self,
         data: &[u8],
         row_bytes: usize,
         output: &mut Vec<f32>,
         errors: &mut Vec<Option<crate::Error>>,
+        dot_eight: impl Fn([&[u8]; 8]) -> Result<[f32; 8]> + Sync,
         dot_four: impl Fn([&[u8]; 4]) -> Result<[f32; 4]> + Sync,
         dot: impl Fn(&[u8]) -> Result<f32> + Sync,
     ) -> Result<()> {
@@ -426,6 +431,7 @@ impl RowParallelism {
         if self.uses_pool(rows) {
             return Err(invalid("multiple row workers require parallel-rows"));
         }
+        output.resize(rows, 0.0);
         #[cfg(feature = "parallel-rows")]
         if let Some(pool) = &self.pool
             && rows > 1
@@ -436,7 +442,6 @@ impl RowParallelism {
             let tasks = rows.div_ceil(task_rows);
             errors.try_reserve_exact(tasks)?;
             errors.resize_with(tasks, || None);
-            output.resize(rows, 0.0);
             pool.install(|| {
                 output
                     .par_chunks_mut(task_rows)
@@ -445,39 +450,10 @@ impl RowParallelism {
                     .for_each(|(task, (chunk, error))| {
                         let start = task * task_rows * row_bytes;
                         let bytes = &data[start..start + chunk.len() * row_bytes];
-                        let (quads, rem_out) = chunk.as_chunks_mut::<4>();
-                        let quad_bytes_len = quads.len() * 4 * row_bytes;
-                        let (quad_bytes, rem_bytes) = bytes.split_at(quad_bytes_len);
-                        for (out_quad, group) in
-                            quads.iter_mut().zip(quad_bytes.chunks_exact(4 * row_bytes))
+                        if let Err(failure) =
+                            fill_batched_chunk(bytes, row_bytes, chunk, &dot_eight, &dot_four, &dot)
                         {
-                            let r0 = &group[..row_bytes];
-                            let r1 = &group[row_bytes..2 * row_bytes];
-                            let r2 = &group[2 * row_bytes..3 * row_bytes];
-                            let r3 = &group[3 * row_bytes..4 * row_bytes];
-                            if let Ok(values) = dot_four([r0, r1, r2, r3]) {
-                                *out_quad = values;
-                            } else {
-                                for (target, row) in out_quad.iter_mut().zip([r0, r1, r2, r3]) {
-                                    match dot(row) {
-                                        Ok(result) => *target = result,
-                                        Err(failure) => {
-                                            *error = Some(failure);
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for (value, row) in rem_out.iter_mut().zip(rem_bytes.chunks_exact(row_bytes))
-                        {
-                            match dot(row) {
-                                Ok(result) => *value = result,
-                                Err(failure) => {
-                                    *error = Some(failure);
-                                    break;
-                                }
-                            }
+                            *error = Some(failure);
                         }
                     });
             });
@@ -485,24 +461,53 @@ impl RowParallelism {
             errors.clear();
             return failure.map_or(Ok(()), Err);
         }
-        let quad_bytes_len = (rows / 4) * 4 * row_bytes;
-        let (quad_bytes, rem_bytes) = data.split_at(quad_bytes_len);
-        for group in quad_bytes.chunks_exact(4 * row_bytes) {
-            let r0 = &group[..row_bytes];
-            let r1 = &group[row_bytes..2 * row_bytes];
-            let r2 = &group[2 * row_bytes..3 * row_bytes];
-            let r3 = &group[3 * row_bytes..4 * row_bytes];
-            if let Ok(values) = dot_four([r0, r1, r2, r3]) {
-                output.extend_from_slice(&values);
-            } else {
-                for row in [r0, r1, r2, r3] {
-                    output.push(dot(row)?);
-                }
+        fill_batched_chunk(data, row_bytes, output, &dot_eight, &dot_four, &dot)
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn fill_batched_chunk(
+    bytes: &[u8],
+    row_bytes: usize,
+    chunk: &mut [f32],
+    dot_eight: &impl Fn([&[u8]; 8]) -> Result<[f32; 8]>,
+    dot_four: &impl Fn([&[u8]; 4]) -> Result<[f32; 4]>,
+    dot: &impl Fn(&[u8]) -> Result<f32>,
+) -> Result<()> {
+    let (octets, after_octets) = chunk.as_chunks_mut::<8>();
+    let (octet_bytes, after_octet_bytes) = bytes.split_at(octets.len() * 8 * row_bytes);
+    for (out_octet, group) in octets.iter_mut().zip(octet_bytes.chunks_exact(8 * row_bytes)) {
+        let rows: [&[u8]; 8] =
+            std::array::from_fn(|idx| &group[idx * row_bytes..(idx + 1) * row_bytes]);
+        if let Ok(values) = dot_eight(rows) {
+            *out_octet = values;
+        } else {
+            for (target, row) in out_octet.iter_mut().zip(rows) {
+                *target = dot(row)?;
             }
         }
-        for bytes in rem_bytes.chunks_exact(row_bytes) {
-            output.push(dot(bytes)?);
-        }
-        Ok(())
     }
+    let (quads, tail_out) = after_octets.as_chunks_mut::<4>();
+    let (quad_bytes, tail_bytes) = after_octet_bytes.split_at(quads.len() * 4 * row_bytes);
+    for (out_quad, group) in quads.iter_mut().zip(quad_bytes.chunks_exact(4 * row_bytes)) {
+        let rows: [&[u8]; 4] =
+            std::array::from_fn(|idx| &group[idx * row_bytes..(idx + 1) * row_bytes]);
+        if let Ok(values) = dot_four(rows) {
+            *out_quad = values;
+        } else {
+            for (target, row) in out_quad.iter_mut().zip(rows) {
+                *target = dot(row)?;
+            }
+        }
+    }
+    for (value, row) in tail_out.iter_mut().zip(tail_bytes.chunks_exact(row_bytes)) {
+        *value = dot(row)?;
+    }
+    Ok(())
 }

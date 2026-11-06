@@ -109,18 +109,21 @@ fn pq2_pair_sums_prewidened(
 }
 
 #[inline]
-pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> [i8; 128] {
+pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 128]) {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
-        return std::array::from_fn(|index| {
+        let values = std::array::from_fn(|index| {
             source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
         });
+        return (values, values.map(i16::from));
     };
     let mut output = [0_i8; 128];
-    for (src_half, dst_half) in source
+    let mut widened = [0_i16; 128];
+    for ((src_half, dst_half), wide_half) in source
         .as_chunks::<64>()
         .0
         .iter()
         .zip(output.as_chunks_mut::<64>().0)
+        .zip(widened.as_chunks_mut::<64>().0)
     {
         let chunks = src_half.as_chunks::<16>().0;
         let v0 = i8x16::from_slice(neon, &chunks[0]);
@@ -131,13 +134,278 @@ pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> [i8; 128] {
         let o01 = v0.unzip_high(v1);
         let e23 = v2.unzip_low(v3);
         let o23 = v2.unzip_high(v3);
+        let p0 = e01.unzip_low(e23);
+        let p1 = o01.unzip_low(o23);
+        let p2 = e01.unzip_high(e23);
+        let p3 = o01.unzip_high(o23);
         let dst = dst_half.as_chunks_mut::<16>().0;
-        e01.unzip_low(e23).store_slice(&mut dst[0]);
-        o01.unzip_low(o23).store_slice(&mut dst[1]);
-        e01.unzip_high(e23).store_slice(&mut dst[2]);
-        o01.unzip_high(o23).store_slice(&mut dst[3]);
+        p0.store_slice(&mut dst[0]);
+        p1.store_slice(&mut dst[1]);
+        p2.store_slice(&mut dst[2]);
+        p3.store_slice(&mut dst[3]);
+        let wide = wide_half.as_chunks_mut::<8>().0;
+        for (plane, pair) in [p0, p1, p2, p3].into_iter().zip(wide.as_chunks_mut::<2>().0) {
+            let (low, high) = plane.widen();
+            low.store_slice(&mut pair[0]);
+            high.store_slice(&mut pair[1]);
+        }
     }
-    output
+    (output, widened)
+}
+
+#[inline]
+fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
+    let raw = u32x4::from_slice(neon, &bits.map(u32::from));
+    let sign = (raw & 0x8000) << 16;
+    let exp = (raw >> 10) & 31;
+    let mant = raw & 1023;
+    let normal_bits = sign | ((exp + 112) << 23) | (mant << 13);
+    let inf_nan_bits = sign | (u32x4::splat(neon, 255) << 23) | (mant << 13);
+    let subnormal_mag = mant.to_float::<f32x4<Neon>>() * f32x4::splat(neon, f32::from_bits(0x3380_0000));
+    let subnormal_bits = sign | subnormal_mag.bitcast::<u32x4<Neon>>();
+    let is_zero_exp = exp.simd_eq(u32x4::splat(neon, 0));
+    let is_max_exp = exp.simd_eq(u32x4::splat(neon, 31));
+    let selected = is_zero_exp.select(subnormal_bits, is_max_exp.select(inf_nan_bits, normal_bits));
+    selected.bitcast::<f32x4<Neon>>()
+}
+
+#[inline]
+const fn scale_u16(block: &[u8; 34]) -> u16 {
+    u16::from_le_bytes([block[0], block[1]])
+}
+
+#[inline]
+pub(super) fn dot_consumption_order_prewidened(packed: &[u8; 32], widened: &[i16; 128]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return packed
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(widened.as_chunks::<64>().0)
+            .map(|(bytes, values)| {
+                bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| {
+                        (0..4)
+                            .map(|digit| {
+                                (i32::from((byte >> (digit * 2)) & 3) - 1)
+                                    * i32::from(values[digit * 16 + index])
+                            })
+                            .sum::<i32>()
+                    })
+                    .sum::<i32>()
+            })
+            .sum();
+    };
+    let mut even = i16x8::splat(neon, 0);
+    let mut odd = i16x8::splat(neon, 0);
+    for (bytes, values) in packed
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(widened.as_chunks::<64>().0)
+    {
+        let w = u8x16::from_slice(neon, bytes);
+        let planes = values.as_chunks::<8>().0;
+        even += pq2_pair_sums_prewidened(
+            (w & 3).bitcast::<i8x16<Neon>>() - 1,
+            i16x8::from_slice(neon, &planes[0]),
+            i16x8::from_slice(neon, &planes[1]),
+        );
+        odd += pq2_pair_sums_prewidened(
+            ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
+            i16x8::from_slice(neon, &planes[2]),
+            i16x8::from_slice(neon, &planes[3]),
+        );
+        even += pq2_pair_sums_prewidened(
+            ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
+            i16x8::from_slice(neon, &planes[4]),
+            i16x8::from_slice(neon, &planes[5]),
+        );
+        odd += pq2_pair_sums_prewidened(
+            (w >> 6).bitcast::<i8x16<Neon>>() - 1,
+            i16x8::from_slice(neon, &planes[6]),
+            i16x8::from_slice(neon, &planes[7]),
+        );
+    }
+    pq2_reduce(even + odd)
+}
+
+#[inline]
+pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
+    rows: [&[u8]; 4],
+    input: &[super::packed_pq2::Activation],
+) -> Option<Result<[f32; 4]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let c0 = rows[0].as_chunks::<34>().0;
+    let c1 = rows[1].as_chunks::<34>().0;
+    let c2 = rows[2].as_chunks::<34>().0;
+    let c3 = rows[3].as_chunks::<34>().0;
+    let mut outputs = f32x4::splat(neon, 0.0);
+    for ((((b0, b1), b2), b3), activation) in c0.iter().zip(c1).zip(c2).zip(c3).zip(input) {
+        let row_scales = f16_bits_to_f32_x4(
+            neon,
+            [scale_u16(b0), scale_u16(b1), scale_u16(b2), scale_u16(b3)],
+        );
+        if !row_scales.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let ds = row_scales * f32x4::splat(neon, activation.scale);
+        let blocks = [b0, b1, b2, b3];
+        let mut even = [i16x8::splat(neon, 0); 4];
+        let mut odd = [i16x8::splat(neon, 0); 4];
+        for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
+            let planes = values.as_chunks::<8>().0;
+            let p0_low = i16x8::from_slice(neon, &planes[0]);
+            let p0_high = i16x8::from_slice(neon, &planes[1]);
+            let p1_low = i16x8::from_slice(neon, &planes[2]);
+            let p1_high = i16x8::from_slice(neon, &planes[3]);
+            let p2_low = i16x8::from_slice(neon, &planes[4]);
+            let p2_high = i16x8::from_slice(neon, &planes[5]);
+            let p3_low = i16x8::from_slice(neon, &planes[6]);
+            let p3_high = i16x8::from_slice(neon, &planes[7]);
+            let offset = 2 + half * 16;
+            for row in 0..4 {
+                let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
+                even[row] += pq2_pair_sums_prewidened(
+                    (w & 3).bitcast::<i8x16<Neon>>() - 1,
+                    p0_low,
+                    p0_high,
+                );
+                odd[row] += pq2_pair_sums_prewidened(
+                    ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
+                    p1_low,
+                    p1_high,
+                );
+                even[row] += pq2_pair_sums_prewidened(
+                    ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
+                    p2_low,
+                    p2_high,
+                );
+                odd[row] += pq2_pair_sums_prewidened(
+                    (w >> 6).bitcast::<i8x16<Neon>>() - 1,
+                    p3_low,
+                    p3_high,
+                );
+            }
+        }
+        let sums = i32x4::from_slice(
+            neon,
+            &std::array::from_fn::<i32, 4, _>(|row| pq2_reduce(even[row] + odd[row])),
+        )
+        .to_float::<f32x4<Neon>>();
+        outputs = if FUSED {
+            ds.mul_add(sums, outputs)
+        } else {
+            outputs + ds * sums
+        };
+    }
+    if !outputs.is_finite().all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    let mut result = [0.0_f32; 4];
+    outputs.store_slice(&mut result);
+    Some(Ok(result))
+}
+
+#[inline]
+pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
+    rows: [&[u8]; 8],
+    input: &[super::packed_pq2::Activation],
+) -> Option<Result<[f32; 8]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let chunks: [&[[u8; 34]]; 8] = rows.map(|row| row.as_chunks::<34>().0);
+    let mut out_lo = f32x4::splat(neon, 0.0);
+    let mut out_hi = f32x4::splat(neon, 0.0);
+    for (block_idx, activation) in input.iter().enumerate() {
+        let blocks: [&[u8; 34]; 8] = std::array::from_fn(|row| &chunks[row][block_idx]);
+        let scales_lo = f16_bits_to_f32_x4(
+            neon,
+            [
+                scale_u16(blocks[0]),
+                scale_u16(blocks[1]),
+                scale_u16(blocks[2]),
+                scale_u16(blocks[3]),
+            ],
+        );
+        let scales_hi = f16_bits_to_f32_x4(
+            neon,
+            [
+                scale_u16(blocks[4]),
+                scale_u16(blocks[5]),
+                scale_u16(blocks[6]),
+                scale_u16(blocks[7]),
+            ],
+        );
+        if !(scales_lo.is_finite() & scales_hi.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let act_scale = f32x4::splat(neon, activation.scale);
+        let ds_lo = scales_lo * act_scale;
+        let ds_hi = scales_hi * act_scale;
+        let mut even = [i16x8::splat(neon, 0); 8];
+        let mut odd = [i16x8::splat(neon, 0); 8];
+        for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
+            let planes = values.as_chunks::<8>().0;
+            let p0_low = i16x8::from_slice(neon, &planes[0]);
+            let p0_high = i16x8::from_slice(neon, &planes[1]);
+            let p1_low = i16x8::from_slice(neon, &planes[2]);
+            let p1_high = i16x8::from_slice(neon, &planes[3]);
+            let p2_low = i16x8::from_slice(neon, &planes[4]);
+            let p2_high = i16x8::from_slice(neon, &planes[5]);
+            let p3_low = i16x8::from_slice(neon, &planes[6]);
+            let p3_high = i16x8::from_slice(neon, &planes[7]);
+            let offset = 2 + half * 16;
+            for row in 0..8 {
+                let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
+                even[row] += pq2_pair_sums_prewidened(
+                    (w & 3).bitcast::<i8x16<Neon>>() - 1,
+                    p0_low,
+                    p0_high,
+                );
+                odd[row] += pq2_pair_sums_prewidened(
+                    ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
+                    p1_low,
+                    p1_high,
+                );
+                even[row] += pq2_pair_sums_prewidened(
+                    ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
+                    p2_low,
+                    p2_high,
+                );
+                odd[row] += pq2_pair_sums_prewidened(
+                    (w >> 6).bitcast::<i8x16<Neon>>() - 1,
+                    p3_low,
+                    p3_high,
+                );
+            }
+        }
+        let sums_lo = i32x4::from_slice(
+            neon,
+            &std::array::from_fn::<i32, 4, _>(|row| pq2_reduce(even[row] + odd[row])),
+        )
+        .to_float::<f32x4<Neon>>();
+        let sums_hi = i32x4::from_slice(
+            neon,
+            &std::array::from_fn::<i32, 4, _>(|row| pq2_reduce(even[row + 4] + odd[row + 4])),
+        )
+        .to_float::<f32x4<Neon>>();
+        if FUSED {
+            out_lo = ds_lo.mul_add(sums_lo, out_lo);
+            out_hi = ds_hi.mul_add(sums_hi, out_hi);
+        } else {
+            out_lo += ds_lo * sums_lo;
+            out_hi += ds_hi * sums_hi;
+        }
+    }
+    if !(out_lo.is_finite() & out_hi.is_finite()).all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    let mut result = [0.0_f32; 8];
+    out_lo.store_slice(&mut result[..4]);
+    out_hi.store_slice(&mut result[4..]);
+    Some(Ok(result))
 }
 
 /// Consumes scoped digit-plane activations without unpack interleaves per row.

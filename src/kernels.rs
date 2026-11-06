@@ -1756,6 +1756,13 @@ impl MatvecScratch {
             &mut self.row_errors,
             |rows| {
                 if pinned {
+                    packed_pq2::dot_eight_rows::<true>(rows, activations)
+                } else {
+                    packed_pq2::dot_eight_rows::<false>(rows, activations)
+                }
+            },
+            |rows| {
+                if pinned {
                     packed_pq2::dot_four_rows::<true>(rows, activations)
                 } else {
                     packed_pq2::dot_four_rows::<false>(rows, activations)

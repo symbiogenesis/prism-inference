@@ -52,6 +52,7 @@ const MAX_HOST_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_TOKENS: usize = 8;
 const RESIDENT_WEIGHT_BYTES: usize = 17_408 * 36 * 40;
 const RESIDENT_METADATA_BYTES: usize = 64 * 1024;
+const NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 256 * 1024;
 // Exact original-Swift geometry is independently enforced by swift::load:
 // 48 recurrent blocks, state head128, value heads48, key groups16 and conv4.
 // visit_state promotes the sixteen full-attention blocks' F16 K/V to F32.
@@ -302,7 +303,7 @@ impl Request {
         let tokens = self.tokens();
         let projections = self.projection_names();
         let max_projections = match self.execution_backend {
-            ExecutionBackend::NativeQ2 => 16,
+            ExecutionBackend::NativeQ2 => 26,
             ExecutionBackend::GuardedHvx | ExecutionBackend::HmxBitplane => {
                 if self.resident_host_weights { 2 } else { 4 }
             }
@@ -1629,8 +1630,9 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                 )
                                 .with_row_parallelism(row_parallelism)?;
                                 if request.resident_host_weights {
-                                    executor =
-                                        executor.with_resident_weights(RESIDENT_METADATA_BYTES)?;
+                                    executor = executor.with_resident_weights(
+                                        NATIVE_Q2_RESIDENT_METADATA_BYTES,
+                                    )?;
                                 }
                                 let value = compare_graph_sequence(
                                     graph,
@@ -1663,7 +1665,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                                 * u64::try_from(request.tokens().len() - 1)?
                                         && residency.weight_payload_bytes_prepared
                                             == u64::try_from(resident_weight_bytes)?
-                                        && (1..=RESIDENT_METADATA_BYTES)
+                                        && (1..=NATIVE_Q2_RESIDENT_METADATA_BYTES)
                                             .contains(&residency.metadata_payload_bytes),
                                 )?;
                                 value["hostResidency"] = json!({
@@ -2719,10 +2721,46 @@ mod tests {
             expected_resident_weight_bytes(&full_layers, ExecutionBackend::NativeQ2)?,
             212_336_640
         );
-        let mut multi_layer_req = native_req;
+        let mut multi_layer_req = native_req.clone();
         multi_layer_req["projections"] = json!(full_layers);
         multi_layer_req["maximumOperations"] = json!(39);
         serde_json::from_value::<Request>(multi_layer_req)?.limits()?;
+
+        let four_layer_block = [
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.attn_gate.weight",
+            "blk.0.ssm_out.weight",
+            "blk.1.ffn_up.weight",
+            "blk.1.ffn_gate.weight",
+            "blk.1.ffn_down.weight",
+            "blk.1.attn_qkv.weight",
+            "blk.1.attn_gate.weight",
+            "blk.1.ssm_out.weight",
+            "blk.2.ffn_up.weight",
+            "blk.2.ffn_gate.weight",
+            "blk.2.ffn_down.weight",
+            "blk.2.attn_qkv.weight",
+            "blk.2.attn_gate.weight",
+            "blk.2.ssm_out.weight",
+            "blk.3.ffn_up.weight",
+            "blk.3.ffn_gate.weight",
+            "blk.3.ffn_down.weight",
+            "blk.3.attn_q.weight",
+            "blk.3.attn_k.weight",
+            "blk.3.attn_v.weight",
+            "blk.3.attn_output.weight",
+        ];
+        assert_eq!(
+            expected_resident_weight_bytes(&four_layer_block, ExecutionBackend::NativeQ2)?,
+            427_622_400
+        );
+        let mut four_layer_req = native_req;
+        four_layer_req["projections"] = json!(four_layer_block);
+        four_layer_req["maximumOperations"] = json!(75);
+        serde_json::from_value::<Request>(four_layer_req)?.limits()?;
 
         let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
         let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];

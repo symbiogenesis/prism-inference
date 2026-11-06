@@ -288,6 +288,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
             } else {
                 0
             })?,
+            dirty_resident_weights: false,
             work_deadline,
             progress: &mut progress,
             failed: false,
@@ -348,6 +349,7 @@ struct Session<'a, P> {
     mode: Mode,
     resident_weights: HmxQ2WeightRegistry,
     native_resident_weights: NativeQ2WeightRegistry,
+    dirty_resident_weights: bool,
     work_deadline: Instant,
     progress: &'a mut P,
     failed: bool,
@@ -371,7 +373,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         false
     }
 
-    fn read(&mut self, sequence: u64, batch_operations: u32) -> bool {
+    fn read(&mut self, sequence: u64, batch_operations: u32, expected_size: u32) -> bool {
         let started = Instant::now();
         let deadline = (started + Duration::from_secs(3)).min(self.work_deadline);
         let spin_deadline = (started + Duration::from_millis(15)).min(deadline);
@@ -423,7 +425,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 && flags & 3 == 3
                 && flags & !0x1f == 0
                 && descriptor.fd == self.expected.fd
-                && descriptor.size == self.expected.size
+                && descriptor.size == expected_size
                 && descriptor.offset == self.expected.offset
                 && descriptor.flags == self.expected.flags
                 && descriptor.pointer == self.expected.pointer
@@ -628,7 +630,18 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         self.report.queue.compute_submitted = true;
         let sequence = u64::from(self.report.queue_writes_submitted);
         let request = projection::request(sequence);
+        let active_descriptor_size = match (&weights, self.dirty_resident_weights) {
+            (Weights::NativeResident(_), false) => {
+                let Ok(prefix) = u32::try_from((active.output + rows * 4).next_multiple_of(4096))
+                else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            }
+            _ => self.expected.size,
+        };
         let mut descriptor = self.expected;
+        descriptor.size = active_descriptor_size;
         entered(self.report, "projection-queue-write-entered", self.progress);
         let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
         self.report.queue.queue_write_result = Some(result);
@@ -636,9 +649,10 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return Err(self.fail("projection-write-refused-pinned"));
         }
         entered(self.report, "projection-queue-read-entered", self.progress);
-        if !self.read(sequence, 1) {
+        if !self.read(sequence, 1, active_descriptor_size) {
             return Err(Error::Contract);
         }
+        self.dirty_resident_weights = false;
         // SAFETY: exact correlated response validated same FD, full allocation,
         // pointer and cache flags. No asynchronous consumer remains, and only
         // the checked active output subsection is borrowed until copying ends.
@@ -788,9 +802,10 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return Err(self.fail("projection-write-refused-pinned"));
         }
         entered(self.report, "projection-queue-read-entered", self.progress);
-        if !self.read(sequence, batch_u32) {
+        if !self.read(sequence, batch_u32, self.expected.size) {
             return Err(Error::Contract);
         }
+        self.dirty_resident_weights = false;
         let member_bytes = rows * 32;
         let total_output_bytes = B * member_bytes;
         // SAFETY: exact correlated response validated same FD, full allocation,
@@ -914,6 +929,7 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
             )
         };
         destination.copy_from_slice(weights);
+        self.dirty_resident_weights = true;
         self.report.resident_weight_bytes_prepared += weights.len();
         self.report.resident_weight_preparations += 1;
         if !self.within_deadline() {
@@ -1054,6 +1070,7 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
             )
         };
         destination.copy_from_slice(weights);
+        self.dirty_resident_weights = true;
         self.report.resident_weight_bytes_prepared += weights.len();
         self.report.resident_weight_preparations += 1;
         if !self.within_deadline() {
@@ -1314,6 +1331,7 @@ mod tests {
                 mode: Mode::Guarded,
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
+                dirty_resident_weights: false,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -1423,6 +1441,7 @@ mod tests {
                 mode: Mode::Hmx,
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
+                dirty_resident_weights: false,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -1531,6 +1550,7 @@ mod tests {
                 mode: Mode::Hmx,
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
+                dirty_resident_weights: false,
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -1662,6 +1682,7 @@ mod tests {
                 mode: Mode::HmxBatch4,
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
+                dirty_resident_weights: false,
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -1791,6 +1812,7 @@ mod tests {
                 mode: Mode::HmxBatch10,
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
+                dirty_resident_weights: false,
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -1847,6 +1869,81 @@ mod tests {
             }
             assert_eq!(HmxQ2Submitter::remaining_operations(&session), Some(0));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resident_native_q2_scopes_queue_buffer_flush_after_initial_dirty_submission()
+    -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let mut weights = vec![0x55_u8; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let activation = [1.0_f32; 128];
+        {
+            let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+            state.writes = 0;
+            state.sequence = 0;
+            state.batch_operations = 1;
+            state.write_error = false;
+            state.stale_reply = false;
+            state.bad_numeric = false;
+            state.bad_member = None;
+        }
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 4, Duration::from_secs(4))?
+            .with_resident_weights(4096)?;
+        let mut memory = vec![0_u8; limits.allocation_bytes()];
+        let pointer = memory.as_mut_ptr().cast::<c_void>();
+        let full_size = u32::try_from(memory.len()).map_err(|_| Error::Contract)?;
+        let expected = QueueBuffer {
+            fd: 7,
+            size: full_size,
+            offset: 0,
+            flags: 0x90,
+            pointer,
+        };
+        let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+        report.queue.poisoned = true;
+        let queue_write = WriteCall::Nonblocking(write);
+        let mut progress = |_: &Q2ProjectionReport| {};
+        let mut session = Session {
+            report: &mut report,
+            queue_write: &queue_write,
+            queue_read: read,
+            queue: null_mut(),
+            memory: pointer,
+            expected,
+            limits: limits.common,
+            mode: Mode::NativeQ2 { columns: 128 },
+            resident_weights: HmxQ2WeightRegistry::new(0)?,
+            native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+            dirty_resident_weights: false,
+            work_deadline: Instant::now() + Duration::from_secs(1),
+            progress: &mut progress,
+            failed: false,
+        };
+        let handle = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights)?
+            .ok_or(Error::Contract)?;
+        assert!(session.dirty_resident_weights);
+        let mut output = [99.0_f32; 32];
+        NativeQ2Submitter::submit_resident(&mut session, &handle, &activation, &mut output)?;
+        assert_eq!(output, [7.0_f32; 32]);
+        assert!(!session.dirty_resident_weights);
+        assert_eq!(
+            STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
+            full_size
+        );
+
+        output.fill(99.0);
+        NativeQ2Submitter::submit_resident(&mut session, &handle, &activation, &mut output)?;
+        assert_eq!(output, [7.0_f32; 32]);
+        assert_eq!(
+            STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
+            4096
+        );
         Ok(())
     }
 }

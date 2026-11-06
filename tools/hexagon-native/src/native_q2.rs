@@ -28,8 +28,8 @@ pub const NATIVE_Q2_MAX_ROWS: usize = Q2_PROJECTION_MAX_ROWS;
 pub const NATIVE_Q2_MAX_WEIGHT_BYTES: usize = (Q2_PROJECTION_MAX_ROWS / 32) * (5120 / 64) * 576;
 /// Largest working host allocation for any single native `Q2_0` projection (`[5120, 17408]` or `[17408, 5120]`).
 pub const NATIVE_Q2_MAX_WORKING_BYTES: usize = layout(5120, Q2_PROJECTION_MAX_ROWS).allocation;
-/// Largest immutable host-mapped weight arena in a single native `Q2_0` session (`256 MiB`).
-pub const NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 256 * 1024 * 1024;
+/// Largest immutable host-mapped weight arena in a single native `Q2_0` session (`480 MiB`, within the `512 MiB` `rpcmem` `m-size` limit).
+pub const NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 480 * 1024 * 1024;
 /// Fixed 4 MiB VTCM request used by the 8-HVX full-`K` `Q2_0` session (`v81` hardware has 8 MiB VTCM).
 pub const NATIVE_Q2_VTCM_REQUEST_BYTES: u32 = 4 * 1024 * 1024;
 

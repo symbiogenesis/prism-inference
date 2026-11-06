@@ -121,7 +121,7 @@ impl Mode {
             Self::Hmx => hmx_projection::layout(rows).allocation,
             Self::HmxBatch4 => hmx_projection::batch_layout(rows).allocation,
             Self::HmxBatch10 => hmx_projection::batch10_layout(rows).allocation,
-            Self::NativeQ2 { columns } => native_q2::layout(columns, rows).allocation,
+            Self::NativeQ2 { columns } => native_q2::working_allocation(columns, rows),
         }
     }
 }

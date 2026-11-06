@@ -8,7 +8,10 @@
 
 use std::sync::Arc;
 
-use bonsai_prism_runtime::{kernels::Pq2ProjectionExecutor, model::Tensor};
+use bonsai_prism_runtime::{
+    kernels::{Pq2ProjectionExecutor, RowParallelism},
+    model::Tensor,
+};
 use bonsai_ternary::Q8KBlock;
 use hexagon_native_rpc::{NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle};
 
@@ -110,6 +113,7 @@ pub struct NativeQ2Executor<'a> {
     queue_writes_attempted: u64,
     queue_writes_completed: u64,
     residency: Option<ResidentCache>,
+    row_parallelism: Option<RowParallelism>,
 }
 
 impl<'a> NativeQ2Executor<'a> {
@@ -135,7 +139,23 @@ impl<'a> NativeQ2Executor<'a> {
             queue_writes_attempted: 0,
             queue_writes_completed: 0,
             residency: None,
+            row_parallelism: None,
         }
+    }
+
+    /// Configure row-parallel tile packing across an explicit private pool.
+    ///
+    /// # Errors
+    /// Rejects repeated or late configuration after any attempted operation.
+    pub fn with_row_parallelism(mut self, row_parallelism: RowParallelism) -> Result<Self> {
+        if self.row_parallelism.is_some()
+            || self.statistics.operations_attempted != 0
+            || self.failed
+        {
+            return Err(invalid("invalid native Q2 row-parallelism configuration"));
+        }
+        self.row_parallelism = Some(row_parallelism);
+        Ok(self)
     }
 
     /// Enable immutable tiled `Q2_0` weight caching in the session's resident arena.
@@ -236,13 +256,16 @@ impl<'a> NativeQ2Executor<'a> {
                 let chunk_weights = &mut weights[..mapped_rows * 36 * chunk_blocks];
                 pack_native_chunk(
                     &tensor.data,
-                    total_blocks,
-                    row_start,
-                    active_rows,
-                    block_start,
-                    chunk_blocks,
+                    ChunkGeometry {
+                        total_blocks,
+                        row_start,
+                        active_rows,
+                        block_start,
+                        chunk_blocks,
+                    },
                     chunk_weights,
-                );
+                    self.row_parallelism.as_ref(),
+                )?;
                 let handle = self
                     .submitter
                     .prepare_weights(active_cols, mapped_rows, chunk_weights)?
@@ -267,6 +290,58 @@ impl<'a> NativeQ2Executor<'a> {
         Ok(Some(cache.commit(tensor, first_handle)))
     }
 
+    fn project_single_op(
+        &mut self,
+        tensor: &Tensor,
+        columns: usize,
+        rows: usize,
+        resident: Option<usize>,
+        weights: &mut [u8],
+        activation: &[f32],
+    ) -> Result<Vec<f32>> {
+        let mut direct_out = zeroed(rows, f32::NAN)?;
+        let total_blocks = columns / 128;
+        if let Some(index) = resident {
+            self.statistics.operations_attempted =
+                self.statistics.operations_attempted.saturating_add(1);
+            self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+            let cache = self
+                .residency
+                .as_ref()
+                .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+            let handle = &cache.handles[cache.projections[index].first_handle];
+            self.submitter
+                .submit_resident(handle, activation, &mut direct_out)?;
+        } else {
+            pack_native_chunk(
+                &tensor.data,
+                ChunkGeometry {
+                    total_blocks,
+                    row_start: 0,
+                    active_rows: rows,
+                    block_start: 0,
+                    chunk_blocks: total_blocks,
+                },
+                weights,
+                self.row_parallelism.as_ref(),
+            )?;
+            self.statistics.operations_attempted =
+                self.statistics.operations_attempted.saturating_add(1);
+            self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+            self.submitter
+                .submit(columns, rows, weights, activation, &mut direct_out)?;
+        }
+        for &val in &direct_out {
+            finite(val)?;
+        }
+        self.statistics.operations_completed =
+            self.statistics.operations_completed.saturating_add(1);
+        self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+        self.statistics.projections_completed =
+            self.statistics.projections_completed.saturating_add(1);
+        Ok(direct_out)
+    }
+
     fn project_f32_inner(
         &mut self,
         tensor: &Tensor,
@@ -282,8 +357,10 @@ impl<'a> NativeQ2Executor<'a> {
         if !self.supports_f32(tensor) || activation.len() != columns {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
+        let single_op =
+            columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
         let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
-        if cached.is_none() {
+        if cached.is_none() && !single_op {
             for block in tensor.data.as_chunks::<34>().0 {
                 scale(block)?;
             }
@@ -291,7 +368,6 @@ impl<'a> NativeQ2Executor<'a> {
         for &value in activation {
             finite(value)?;
         }
-        let mut pending = zeroed(rows, 0.0_f32)?;
         let max_chunk_cols = columns.min(self.maximum_columns);
         let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
         let mut weights = if cached.is_none() {
@@ -299,7 +375,6 @@ impl<'a> NativeQ2Executor<'a> {
         } else {
             Vec::new()
         };
-        let mut chunk_output = zeroed(max_mapped_rows, 0.0_f32)?;
         let resident = if let Some(index) = cached {
             if let Some(cache) = &mut self.residency {
                 cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
@@ -308,7 +383,13 @@ impl<'a> NativeQ2Executor<'a> {
         } else {
             self.prepare_resident(tensor, &mut weights)?
         };
-        let total_blocks = columns / 128;
+        if single_op {
+            *output =
+                self.project_single_op(tensor, columns, rows, resident, &mut weights, activation)?;
+            return Ok(());
+        }
+        let mut pending = zeroed(rows, 0.0_f32)?;
+        let mut chunk_output = zeroed(max_mapped_rows, 0.0_f32)?;
         let mut operation = 0;
         for row_start in (0..rows).step_by(self.maximum_rows) {
             let active_rows = (rows - row_start).min(self.maximum_rows);
@@ -331,17 +412,20 @@ impl<'a> NativeQ2Executor<'a> {
                         .submit_resident(handle, act_slice, out_slice)?;
                 } else {
                     let chunk_blocks = active_cols / 128;
-                    let block_start = col_start / 128;
+                    let geom = ChunkGeometry {
+                        total_blocks: columns / 128,
+                        row_start,
+                        active_rows,
+                        block_start: col_start / 128,
+                        chunk_blocks,
+                    };
                     let chunk_weights = &mut weights[..mapped_rows * 36 * chunk_blocks];
                     pack_native_chunk(
                         &tensor.data,
-                        total_blocks,
-                        row_start,
-                        active_rows,
-                        block_start,
-                        chunk_blocks,
+                        geom,
                         chunk_weights,
-                    );
+                        self.row_parallelism.as_ref(),
+                    )?;
                     self.submitter.submit(
                         active_cols,
                         mapped_rows,
@@ -351,17 +435,10 @@ impl<'a> NativeQ2Executor<'a> {
                     )?;
                 }
                 operation += 1;
-                for &pad_value in &out_slice[active_rows..mapped_rows] {
-                    if finite(pad_value)? != 0.0 {
-                        return Err(invalid("Hexagon native Q2 padding output changed"));
-                    }
-                }
-                for (dst, &val) in pending[row_start..row_start + active_rows]
-                    .iter_mut()
-                    .zip(&out_slice[..active_rows])
-                {
-                    *dst = finite(*dst + finite(val)?)?;
-                }
+                accumulate_tile_output(
+                    &mut pending[row_start..row_start + active_rows],
+                    out_slice,
+                )?;
                 self.statistics.operations_completed =
                     self.statistics.operations_completed.saturating_add(1);
                 self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
@@ -372,6 +449,19 @@ impl<'a> NativeQ2Executor<'a> {
         *output = pending;
         Ok(())
     }
+}
+
+fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
+    let active_rows = dst_rows.len();
+    for &pad_value in &out_slice[active_rows..] {
+        if finite(pad_value)? != 0.0 {
+            return Err(invalid("Hexagon native Q2 padding output changed"));
+        }
+    }
+    for (dst, &val) in dst_rows.iter_mut().zip(&out_slice[..active_rows]) {
+        *dst = finite(*dst + finite(val)?)?;
+    }
+    Ok(())
 }
 
 impl Pq2ProjectionExecutor for NativeQ2Executor<'_> {
@@ -456,6 +546,15 @@ fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
     Ok((columns, rows))
 }
 
+#[derive(Clone, Copy)]
+struct ChunkGeometry {
+    total_blocks: usize,
+    row_start: usize,
+    active_rows: usize,
+    block_start: usize,
+    chunk_blocks: usize,
+}
+
 fn initialize_native_weights(weights: &mut [u8]) {
     for tile in weights.as_chunks_mut::<576>().0 {
         tile[..512].fill(0x55);
@@ -463,30 +562,29 @@ fn initialize_native_weights(weights: &mut [u8]) {
     }
 }
 
-fn pack_native_chunk(
+fn pack_row_group(
     tensor_data: &[u8],
-    total_blocks: usize,
-    row_start: usize,
-    active_rows: usize,
-    block_start: usize,
-    chunk_blocks: usize,
-    weights: &mut [u8],
-) {
-    initialize_native_weights(weights);
-    let tiles_per_row_group = chunk_blocks * 2;
-    for local_row in 0..active_rows {
-        let row_group = local_row / 32;
-        let row_in_tile = local_row % 32;
-        let row_block_base = (row_start + local_row) * total_blocks + block_start;
-        for local_block in 0..chunk_blocks {
+    geometry: ChunkGeometry,
+    row_group: usize,
+    group_weights: &mut [u8],
+) -> Result<()> {
+    initialize_native_weights(group_weights);
+    let group_row_start = row_group * 32;
+    let group_rows = geometry.active_rows.saturating_sub(group_row_start).min(32);
+    for row_in_tile in 0..group_rows {
+        let local_row = group_row_start + row_in_tile;
+        let row_block_base =
+            (geometry.row_start + local_row) * geometry.total_blocks + geometry.block_start;
+        for local_block in 0..geometry.chunk_blocks {
             let offset = (row_block_base + local_block) * 34;
             let original = &tensor_data[offset..offset + 34];
-            let tile0 = (row_group * tiles_per_row_group + local_block * 2) * 576;
+            scale(original)?;
+            let tile0 = (local_block * 2) * 576;
             let tile1 = tile0 + 576;
             let scale_offset0 = tile0 + 512 + row_in_tile * 2;
             let scale_offset1 = tile1 + 512 + row_in_tile * 2;
-            weights[scale_offset0..scale_offset0 + 2].copy_from_slice(&original[..2]);
-            weights[scale_offset1..scale_offset1 + 2].copy_from_slice(&original[..2]);
+            group_weights[scale_offset0..scale_offset0 + 2].copy_from_slice(&original[..2]);
+            group_weights[scale_offset1..scale_offset1 + 2].copy_from_slice(&original[..2]);
             for (chunk, word_bytes) in original[2..34].as_chunks::<4>().0.iter().enumerate() {
                 let mut packed = u32::from_le_bytes(*word_bytes);
                 let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc;
@@ -495,10 +593,38 @@ fn pack_native_chunk(
                 packed ^= swap ^ (swap << 12);
                 let tile = if chunk < 4 { tile0 } else { tile1 };
                 let byte = tile + (chunk % 4) * 128 + row_in_tile * 4;
-                weights[byte..byte + 4].copy_from_slice(&packed.to_le_bytes());
+                group_weights[byte..byte + 4].copy_from_slice(&packed.to_le_bytes());
             }
         }
     }
+    Ok(())
+}
+
+fn pack_native_chunk(
+    tensor_data: &[u8],
+    geometry: ChunkGeometry,
+    weights: &mut [u8],
+    row_parallelism: Option<&RowParallelism>,
+) -> Result<()> {
+    let row_group_bytes = geometry.chunk_blocks * 2 * 576;
+    if let Some(parallelism) = row_parallelism {
+        return parallelism.update_chunks(weights, row_group_bytes, |base_group, chunk| {
+            for (group_offset, group_weights) in chunk.chunks_exact_mut(row_group_bytes).enumerate()
+            {
+                pack_row_group(
+                    tensor_data,
+                    geometry,
+                    base_group + group_offset,
+                    group_weights,
+                )?;
+            }
+            Ok(())
+        });
+    }
+    for (row_group, group_weights) in weights.chunks_exact_mut(row_group_bytes).enumerate() {
+        pack_row_group(tensor_data, geometry, row_group, group_weights)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

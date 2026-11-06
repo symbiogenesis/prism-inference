@@ -136,6 +136,19 @@ mod tests {
             }
         });
         assert_eq!(error_text(err), Err("chunk-at-3".to_owned()));
+        let mut bytes = vec![0_u8; 24];
+        policy.update_chunks(&mut bytes, 4, |base_unit, chunk| {
+            for (unit_offset, unit) in chunk.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let value = u8::try_from(base_unit + unit_offset)?;
+                unit.fill(value);
+            }
+            Ok(())
+        })?;
+        for (unit, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(chunk, &[u8::try_from(unit)?; 4]);
+        }
+        assert!(policy.update_chunks(&mut bytes, 0, |_, _| Ok(())).is_err());
+        assert!(policy.update_chunks(&mut bytes, 5, |_, _| Ok(())).is_err());
         Ok(())
     }
 
@@ -205,29 +218,54 @@ impl RowParallelism {
         target: &mut [f32],
         update: impl Fn(usize, &mut [f32]) -> Result<()> + Sync,
     ) -> Result<()> {
+        self.update_chunks(target, 1, update)
+    }
+
+    /// Updates contiguous fixed-unit chunks of `target` in place across the private pool.
+    ///
+    /// Each unit has `unit_size` elements, and `update(base_unit, chunk)` receives
+    /// the starting unit index and a mutable slice whose length is a multiple of
+    /// `unit_size`.
+    ///
+    /// # Errors
+    /// Rejects a zero or non-dividing `unit_size`, unavailable `parallel-rows`
+    /// support, error-slot allocation failure, or the first chunk failure
+    /// returned by `update`.
+    pub fn update_chunks<T: Send>(
+        &self,
+        target: &mut [T],
+        unit_size: usize,
+        update: impl Fn(usize, &mut [T]) -> Result<()> + Sync,
+    ) -> Result<()> {
+        if unit_size == 0 || !target.len().is_multiple_of(unit_size) {
+            return Err(invalid(
+                "target length must be a multiple of a positive unit size",
+            ));
+        }
+        let units = target.len() / unit_size;
         #[cfg(not(feature = "parallel-rows"))]
-        if self.uses_pool(target.len()) {
+        if self.uses_pool(units) {
             return Err(invalid("multiple row workers require parallel-rows"));
         }
         #[cfg(feature = "parallel-rows")]
         if let Some(pool) = &self.pool
-            && target.len() > 1
+            && units > 1
         {
             use rayon::prelude::*;
 
-            let rows = target.len();
-            let task_rows = rows.div_ceil(self.workers);
-            let tasks = rows.div_ceil(task_rows);
+            let task_units = units.div_ceil(self.workers);
+            let task_elems = task_units * unit_size;
+            let tasks = units.div_ceil(task_units);
             let mut errors = Vec::new();
             errors.try_reserve_exact(tasks)?;
             errors.resize_with(tasks, || None);
             pool.install(|| {
                 target
-                    .par_chunks_mut(task_rows)
+                    .par_chunks_mut(task_elems)
                     .zip(errors.par_iter_mut())
                     .enumerate()
                     .for_each(|(task, (chunk, error))| {
-                        if let Err(failure) = update(task * task_rows, chunk) {
+                        if let Err(failure) = update(task * task_units, chunk) {
                             *error = Some(failure);
                         }
                     });

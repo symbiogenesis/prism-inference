@@ -12,20 +12,26 @@
 )]
 
 use crate::{
-    Error, HMX_Q2_HVX_WORKERS, HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES, HMX_Q2_POWER_MODE_BURST,
-    HMX_Q2_VTCM_REQUEST_BYTES, Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits, Q2ProjectionReport,
-    compute, hmx_projection, projection,
+    Error, HMX_Q2_HVX_WORKERS, HMX_Q2_POWER_MODE_BURST, HMX_Q2_VTCM_REQUEST_BYTES,
+    Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits, Q2ProjectionReport, compute, hmx_projection,
+    projection,
 };
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Largest input-column extent (`K`) for a single 1-op native `Q2_0` projection.
-pub const NATIVE_Q2_MAX_COLUMNS: usize = 5120;
+pub const NATIVE_Q2_MAX_COLUMNS: usize = Q2_PROJECTION_MAX_ROWS;
 /// Largest weight-row extent (`M`) for a single 1-op native `Q2_0` projection.
 pub const NATIVE_Q2_MAX_ROWS: usize = Q2_PROJECTION_MAX_ROWS;
-/// Fixed 2 MiB VTCM budget used by the 8-HVX full-`K` `Q2_0` solver.
-pub const NATIVE_Q2_VTCM_REQUEST_BYTES: u32 = HMX_Q2_VTCM_REQUEST_BYTES;
+/// Largest packed native `HTP_TYPE_Q2_0` weight payload for a single projection (`[5120, 17408]` or `[17408, 5120]`).
+pub const NATIVE_Q2_MAX_WEIGHT_BYTES: usize = (Q2_PROJECTION_MAX_ROWS / 32) * (5120 / 64) * 576;
+/// Largest working host allocation for any single native `Q2_0` projection (`[5120, 17408]` or `[17408, 5120]`).
+pub const NATIVE_Q2_MAX_WORKING_BYTES: usize = layout(5120, Q2_PROJECTION_MAX_ROWS).allocation;
+/// Largest immutable host-mapped weight arena in a single native `Q2_0` session (`256 MiB`).
+pub const NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 256 * 1024 * 1024;
+/// Fixed 4 MiB VTCM request used by the 8-HVX full-`K` `Q2_0` session (`v81` hardware has 8 MiB VTCM).
+pub const NATIVE_Q2_VTCM_REQUEST_BYTES: u32 = 4 * 1024 * 1024;
 
 /// One terminal full-`K` native `HTP_TYPE_Q2_0` session's lifetime and work bounds.
 #[derive(Clone, Copy, Debug)]
@@ -36,7 +42,7 @@ pub struct NativeQ2ProjectionLimits {
 }
 
 impl NativeQ2ProjectionLimits {
-    /// Validate 128-column multiples up to 5,120, 32-row multiples up to 17,408,
+    /// Validate 128-column multiples up to 17,408, 32-row multiples up to 17,408,
     /// at most 24,000 write attempts and a 4..=120-second session allowance.
     ///
     /// # Errors
@@ -60,9 +66,9 @@ impl NativeQ2ProjectionLimits {
     /// Reserve an optional immutable host-mapped weight arena in the same FD.
     ///
     /// # Errors
-    /// Rejects more than 64 MiB before opening a module or allocating memory.
+    /// Rejects more than 256 MiB before opening a module or allocating memory.
     pub const fn with_resident_weights(mut self, bytes: usize) -> Result<Self, Error> {
-        if bytes > HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES {
+        if bytes > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
             return Err(Error::Contract);
         }
         self.resident_weight_bytes = bytes;
@@ -90,7 +96,7 @@ impl NativeQ2ProjectionLimits {
     /// Maximum mapped host allocation, including command, activation, output and weights.
     #[must_use]
     pub const fn allocation_bytes(self) -> usize {
-        let working = layout(self.columns, self.common.rows).allocation;
+        let working = working_allocation(self.columns, self.common.rows);
         (working + self.resident_weight_bytes).next_multiple_of(4096)
     }
 
@@ -147,9 +153,9 @@ impl NativeQ2WeightRegistry {
     /// Create one independent owner with an explicitly admitted payload bound.
     ///
     /// # Errors
-    /// Rejects capacity above the 64 MiB native bound.
+    /// Rejects capacity above the 256 MiB native bound.
     pub fn new(capacity_bytes: usize) -> Result<Self, Error> {
-        if capacity_bytes > HMX_Q2_MAX_RESIDENT_WEIGHT_BYTES {
+        if capacity_bytes > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
             return Err(Error::Contract);
         }
         Ok(Self {
@@ -283,6 +289,15 @@ pub(crate) const fn layout(columns: usize, rows: usize) -> projection::Layout {
     }
 }
 
+pub(crate) const fn working_allocation(columns: usize, rows: usize) -> usize {
+    let raw = layout(columns, rows).allocation;
+    if raw > NATIVE_Q2_MAX_WORKING_BYTES {
+        NATIVE_Q2_MAX_WORKING_BYTES
+    } else {
+        raw
+    }
+}
+
 pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], Error> {
     let mut result = compute::start_wire(queue_id);
     put32(&mut result, 16, HMX_Q2_HVX_WORKERS);
@@ -300,7 +315,7 @@ pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], E
 /// Specialization of `htp_kparams_solve_matmul` (`0x1800282F0`) and
 /// `htp_kparams_solve_hvx_mv` (`0x1800322DC` + `0x180029EB0`) at pinned
 /// `19cce691` for `src0 = HTP_TYPE_Q2_0 (42)`, `src1 = F32`, `dst = F32`,
-/// `N = 1`, `n_hvx = 8` and `2 MiB` VTCM.
+/// `N = 1`, `n_hvx = 8` and `2 MiB` / `4 MiB` VTCM.
 ///
 /// Returns `(n_prefetch, src1_row_size, vtcm_size)`.
 pub(crate) fn hvx_mv_params(columns: usize, rows: usize) -> Result<(u8, u32, u32), Error> {
@@ -313,7 +328,12 @@ pub(crate) fn hvx_mv_params(columns: usize, rows: usize) -> Result<(u8, u32, u32
     {
         return Err(Error::Contract);
     }
-    let vtcm_budget = usize::try_from(NATIVE_Q2_VTCM_REQUEST_BYTES).map_err(|_| Error::Contract)?;
+    let vtcm_request = if columns > 6144 {
+        NATIVE_Q2_VTCM_REQUEST_BYTES
+    } else {
+        HMX_Q2_VTCM_REQUEST_BYTES
+    };
+    let vtcm_budget = usize::try_from(vtcm_request).map_err(|_| Error::Contract)?;
     let n_threads = usize::try_from(HMX_Q2_HVX_WORKERS).map_err(|_| Error::Contract)?;
     let k_groups = ((columns + 127) >> 5) & !3;
     let src1_row_size = k_groups * 1280;
@@ -395,6 +415,7 @@ pub(crate) fn validate_weights(
         || rows > maximum_rows
         || !rows.is_multiple_of(32)
         || weights.len() != layout(columns, rows).weights
+        || weights.len() > NATIVE_Q2_MAX_WEIGHT_BYTES
         || weights.as_chunks::<576>().0.iter().any(|tile| {
             tile[512..]
                 .as_chunks::<2>()
@@ -623,17 +644,37 @@ mod tests {
         assert_eq!(prefetch_5120, 4);
         assert_eq!(row_5120, 204_800);
         assert_eq!(vtcm_5120, 1_912_832);
-        assert!(vtcm_5120 <= NATIVE_Q2_VTCM_REQUEST_BYTES);
+        assert!(vtcm_5120 <= HMX_Q2_VTCM_REQUEST_BYTES);
+
+        let (prefetch_6144, row_6144, vtcm_6144) = hvx_mv_params(6144, 5120)?;
+        assert_eq!(prefetch_6144, 2);
+        assert_eq!(row_6144, 245_760);
+        assert_eq!(vtcm_6144, 1_249_280);
+        assert!(vtcm_6144 <= HMX_Q2_VTCM_REQUEST_BYTES);
+
+        let (prefetch_17408, row_17408, vtcm_17408) = hvx_mv_params(17_408, 5120)?;
+        assert_eq!(prefetch_17408, 2);
+        assert_eq!(row_17408, 696_320);
+        assert_eq!(vtcm_17408, 3_502_080);
+        assert!(vtcm_17408 <= NATIVE_Q2_VTCM_REQUEST_BYTES);
         Ok(())
     }
 
     #[test]
     fn native_q2_limits_and_resident_registry_validate_scales_and_extents() -> Result<(), Error> {
-        let limits = NativeQ2ProjectionLimits::new(5120, 17_408, 24_000, Duration::from_secs(60))?
-            .with_resident_weights(64 * 1024 * 1024)?;
-        assert_eq!(limits.maximum_columns(), 5120);
+        let limits =
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+                .with_resident_weights(NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES)?;
+        assert_eq!(limits.maximum_columns(), 17_408);
         assert_eq!(limits.maximum_rows(), 17_408);
-        assert_eq!(limits.resident_weight_bytes(), 64 * 1024 * 1024);
+        assert_eq!(
+            limits.resident_weight_bytes(),
+            NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES
+        );
+        assert_eq!(
+            limits.allocation_bytes(),
+            NATIVE_Q2_MAX_WORKING_BYTES + NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES
+        );
 
         let mut registry = NativeQ2WeightRegistry::new(4096)?;
         let mut weights = vec![0x55_u8; layout(128, 32).weights];

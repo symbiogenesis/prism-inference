@@ -231,18 +231,46 @@ fn require(value: bool) -> Result<()> {
     if value { Ok(()) } else { Err(reject()) }
 }
 
-fn valid_projection_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("blk.") else {
-        return false;
-    };
-    let Some((index, suffix)) = rest.split_once('.') else {
-        return false;
-    };
-    !index.is_empty()
-        && index.len() <= 2
-        && index.bytes().all(|byte| byte.is_ascii_digit())
-        && index.parse::<usize>().is_ok_and(|layer| layer < 64)
-        && matches!(suffix, "ffn_up.weight" | "ffn_gate.weight")
+fn projection_dimensions(name: &str, backend: ExecutionBackend) -> Option<(usize, usize)> {
+    let rest = name.strip_prefix("blk.")?;
+    let (index, suffix) = rest.split_once('.')?;
+    if index.is_empty() || index.len() > 2 || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let layer = index.parse::<usize>().ok().filter(|&layer| layer < 64)?;
+    let full_attention = (layer + 1).is_multiple_of(4);
+    match backend {
+        ExecutionBackend::GuardedHvx | ExecutionBackend::HmxBitplane => {
+            matches!(suffix, "ffn_up.weight" | "ffn_gate.weight").then_some((5120, 17_408))
+        }
+        ExecutionBackend::NativeQ2 => match suffix {
+            "ffn_up.weight" | "ffn_gate.weight" => Some((5120, 17_408)),
+            "ffn_down.weight" => Some((17_408, 5120)),
+            "attn_qkv.weight" if !full_attention => Some((5120, 10_240)),
+            "attn_gate.weight" if !full_attention => Some((5120, 6144)),
+            "ssm_out.weight" if !full_attention => Some((6144, 5120)),
+            "attn_q.weight" if full_attention => Some((5120, 12_288)),
+            "attn_k.weight" | "attn_v.weight" if full_attention => Some((5120, 1024)),
+            "attn_output.weight" if full_attention => Some((6144, 5120)),
+            _ => None,
+        },
+    }
+}
+
+fn expected_resident_weight_bytes(
+    projections: &[&str],
+    backend: ExecutionBackend,
+) -> Result<usize> {
+    let mut total = 0_usize;
+    for &name in projections {
+        let (columns, rows) = projection_dimensions(name, backend).ok_or_else(reject)?;
+        let bytes = (rows / 32)
+            .checked_mul(columns / 64)
+            .and_then(|tiles| tiles.checked_mul(576))
+            .ok_or_else(reject)?;
+        total = total.checked_add(bytes).ok_or_else(reject)?;
+    }
+    Ok(total)
 }
 
 impl Request {
@@ -273,9 +301,16 @@ impl Request {
     fn limits(&self) -> Result<Q2ProjectionLimits> {
         let tokens = self.tokens();
         let projections = self.projection_names();
-        let max_projections = if self.resident_host_weights { 2 } else { 4 };
+        let max_projections = match self.execution_backend {
+            ExecutionBackend::NativeQ2 => 16,
+            ExecutionBackend::GuardedHvx | ExecutionBackend::HmxBitplane => {
+                if self.resident_host_weights { 2 } else { 4 }
+            }
+        };
         let unique_projections: BTreeSet<&str> = projections.iter().copied().collect();
         let batch_ops = self.batch_operations()?;
+        let resident_bytes = expected_resident_weight_bytes(&projections, self.execution_backend)
+            .unwrap_or(usize::MAX);
         require(
             self.schema_version == 1
                 && (1..=MAX_TOKENS).contains(&tokens.len())
@@ -286,7 +321,9 @@ impl Request {
                 && (1..=max_projections).contains(&projections.len())
                 && projections.first() == Some(&PROJECTION)
                 && unique_projections.len() == projections.len()
-                && projections.iter().all(|&name| valid_projection_name(name))
+                && projections
+                    .iter()
+                    .all(|&name| projection_dimensions(name, self.execution_backend).is_some())
                 && (1..=16).contains(&self.context_limit)
                 && self.context_limit >= tokens.len()
                 && (swift::TENSOR_PAYLOAD_BYTES..=MODEL_MEMORY_LIMIT)
@@ -298,10 +335,16 @@ impl Request {
                     >= u32::try_from(tokens.len() * projections.len())?
                         * self.execution_backend.operations_per_projection()
                 && (!self.resident_host_weights
-                    || matches!(
-                        self.execution_backend,
-                        ExecutionBackend::HmxBitplane | ExecutionBackend::NativeQ2
-                    ))
+                    || match self.execution_backend {
+                        ExecutionBackend::HmxBitplane => {
+                            resident_bytes <= 2 * RESIDENT_WEIGHT_BYTES
+                        }
+                        ExecutionBackend::NativeQ2 => {
+                            resident_bytes
+                                <= hexagon_native_rpc::NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES
+                        }
+                        ExecutionBackend::GuardedHvx => false,
+                    })
                 && (batch_ops == 1
                     || (self.execution_backend == ExecutionBackend::HmxBitplane
                         && self.maximum_operations.is_multiple_of(batch_ops)))
@@ -1315,8 +1358,9 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     let (model, _) = swift::load(&request.model_path, request.model_memory_limit_bytes)?;
     let mut selected_tensors = BTreeMap::new();
     for &name in &projections {
+        let dims = projection_dimensions(name, request.execution_backend).ok_or_else(reject)?;
         let selected = model.tensors.get(name).ok_or_else(reject)?;
-        require(selected.kind == 142 && selected.dimensions == [5120, 17_408])?;
+        require(selected.kind == 142 && selected.dimensions == <[usize; 2]>::from(dims))?;
         selected_tensors.insert(name.to_owned(), selected.clone());
     }
     let shadow = shared_model(&model);
@@ -1531,10 +1575,26 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                 )
             }
             ExecutionBackend::NativeQ2 => {
-                let resident_weight_bytes = RESIDENT_WEIGHT_BYTES * projection_count;
+                let resident_weight_bytes =
+                    expected_resident_weight_bytes(&projections, request.execution_backend)
+                        .map_err(|_| Error::Contract)?;
+                let max_columns = projections
+                    .iter()
+                    .filter_map(|&name| {
+                        projection_dimensions(name, request.execution_backend).map(|(c, _)| c)
+                    })
+                    .max()
+                    .unwrap_or(5120);
+                let max_rows = projections
+                    .iter()
+                    .filter_map(|&name| {
+                        projection_dimensions(name, request.execution_backend).map(|(_, r)| r)
+                    })
+                    .max()
+                    .unwrap_or(17_408);
                 let mut native_limits = NativeQ2ProjectionLimits::new(
-                    5120,
-                    17_408,
+                    max_columns,
+                    max_rows,
                     request.maximum_operations,
                     Duration::from_secs(request.session_seconds),
                 )?;
@@ -1566,7 +1626,8 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                     &mut timed,
                                     native_limits,
                                     request.maximum_owned_payload_bytes,
-                                );
+                                )
+                                .with_row_parallelism(row_parallelism)?;
                                 if request.resident_host_weights {
                                     executor =
                                         executor.with_resident_weights(RESIDENT_METADATA_BYTES)?;
@@ -2631,13 +2692,37 @@ mod tests {
                 .limits()
                 .is_err()
         );
-        let mut wrong_batch = native_req;
+        let mut wrong_batch = native_req.clone();
         wrong_batch["batchFourOperations"] = json!(true);
         assert!(
             serde_json::from_value::<Request>(wrong_batch)?
                 .limits()
                 .is_err()
         );
+
+        let full_layers = [
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.attn_gate.weight",
+            "blk.0.ssm_out.weight",
+            "blk.3.ffn_up.weight",
+            "blk.3.ffn_gate.weight",
+            "blk.3.ffn_down.weight",
+            "blk.3.attn_q.weight",
+            "blk.3.attn_k.weight",
+            "blk.3.attn_v.weight",
+            "blk.3.attn_output.weight",
+        ];
+        assert_eq!(
+            expected_resident_weight_bytes(&full_layers, ExecutionBackend::NativeQ2)?,
+            212_336_640
+        );
+        let mut multi_layer_req = native_req;
+        multi_layer_req["projections"] = json!(full_layers);
+        multi_layer_req["maximumOperations"] = json!(39);
+        serde_json::from_value::<Request>(multi_layer_req)?.limits()?;
 
         let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
         let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];

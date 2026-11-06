@@ -643,6 +643,14 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 };
                 prefix.min(self.expected.size)
             }
+            (Weights::NativeResident(_), true) => {
+                let dirty_end =
+                    working_bytes.saturating_add(self.native_resident_weights.used_bytes());
+                let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            }
             _ => self.expected.size,
         };
         let mut descriptor = self.expected;
@@ -2156,10 +2164,11 @@ mod tests {
             state.bad_member = None;
         }
         let limits = NativeQ2ProjectionLimits::new(128, 32, 4, Duration::from_secs(4))?
-            .with_resident_weights(4096)?;
+            .with_resident_weights(16_384)?;
         let mut memory = vec![0_u8; limits.allocation_bytes()];
         let pointer = memory.as_mut_ptr().cast::<c_void>();
         let full_size = u32::try_from(memory.len()).map_err(|_| Error::Contract)?;
+        assert_eq!(full_size, 20_480);
         let expected = QueueBuffer {
             fd: 7,
             size: full_size,
@@ -2196,7 +2205,7 @@ mod tests {
         assert!(!session.dirty_resident_weights);
         assert_eq!(
             STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
-            full_size
+            8192
         );
 
         output.fill(99.0);

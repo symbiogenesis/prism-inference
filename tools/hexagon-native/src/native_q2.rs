@@ -213,6 +213,12 @@ impl NativeQ2WeightRegistry {
         }))
     }
 
+    /// Bytes of the immutable arena currently populated (including internal alignment padding).
+    #[must_use]
+    pub const fn used_bytes(&self) -> usize {
+        self.used
+    }
+
     /// Recover an owner-checked byte range inside this registry's arena.
     ///
     /// # Errors

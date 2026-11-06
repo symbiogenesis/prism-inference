@@ -319,8 +319,8 @@ pub(crate) fn image(
         return Err(Error::Contract);
     }
     bytes.fill(0);
-    let fixed = compute::q2_fixture_image(base, fd);
-    bytes[..1024].copy_from_slice(&fixed[..1024]);
+    let fixed = compute::q2_framing_header(base, fd);
+    bytes[..1024].copy_from_slice(&fixed);
     put64(
         bytes,
         8,

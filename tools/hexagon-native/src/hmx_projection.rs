@@ -771,8 +771,7 @@ fn write_single_header(
 ) -> Result<(), Error> {
     const KP: usize = 264;
     let (n_chunk, vtcm_size) = chunks(rows)?;
-    let framing = compute::q2_fixture_image(base, fd);
-    bytes.copy_from_slice(&framing[..1024]);
+    *bytes = compute::q2_framing_header(base, fd);
     put64(
         bytes,
         8,

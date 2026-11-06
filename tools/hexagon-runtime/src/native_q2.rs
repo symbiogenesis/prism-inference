@@ -21,15 +21,27 @@ use crate::{HmxResidencyStatistics, ProjectionStatistics, Result, invalid};
 /// Residency statistics for [`NativeQ2Executor`].
 pub type NativeQ2ResidencyStatistics = HmxResidencyStatistics;
 
-/// Default 13-projection multi-layer (`blk.0` recurrent + `blk.3` full-attention)
-/// Hexagon NPU `native-q2` resident placement proven faster than 4-worker NEON CPU.
-pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 13] = [
+/// Default 25-projection 4-layer (`blk.0`..=`blk.2` recurrent + `blk.3` full-attention)
+/// Hexagon NPU `native-q2` resident placement covering the full 4-layer repeating block.
+pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 25] = [
     "blk.0.ffn_up.weight",
     "blk.0.ffn_gate.weight",
     "blk.0.ffn_down.weight",
     "blk.0.attn_qkv.weight",
     "blk.0.attn_gate.weight",
     "blk.0.ssm_out.weight",
+    "blk.1.ffn_up.weight",
+    "blk.1.ffn_gate.weight",
+    "blk.1.ffn_down.weight",
+    "blk.1.attn_qkv.weight",
+    "blk.1.attn_gate.weight",
+    "blk.1.ssm_out.weight",
+    "blk.2.ffn_up.weight",
+    "blk.2.ffn_gate.weight",
+    "blk.2.ffn_down.weight",
+    "blk.2.attn_qkv.weight",
+    "blk.2.attn_gate.weight",
+    "blk.2.ssm_out.weight",
     "blk.3.ffn_up.weight",
     "blk.3.ffn_gate.weight",
     "blk.3.ffn_down.weight",
@@ -40,7 +52,7 @@ pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 13] = [
 ];
 
 /// Exact packed `HTP_TYPE_Q2_0` resident weight payload bytes for [`DEFAULT_NATIVE_Q2_PROJECTIONS`].
-pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 212_336_640;
+pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 427_622_400;
 
 /// Host metadata reservation for resident `native-q2` projection handles.
 pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 256 * 1024;
@@ -414,8 +426,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     fn project_single_op(
         &mut self,
         tensor: &Tensor,
-        columns: usize,
-        rows: usize,
+        (columns, rows): (usize, usize),
         resident: Option<usize>,
         weights: &mut [u8],
         activation: &[f32],
@@ -520,8 +531,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         if single_op {
             return self.project_single_op(
                 tensor,
-                columns,
-                rows,
+                (columns, rows),
                 resident,
                 &mut weights,
                 activation,
@@ -895,6 +905,46 @@ mod tests {
         executor.project_f32(&tensor, &activation, true, &mut output)?;
         assert_eq!(executor.residency_statistics().cache_hits, 1);
         assert_eq!(executor.statistics().operations_completed, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn default_four_layer_projection_set_matches_exact_resident_arena_budget() -> Result<()> {
+        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 25);
+        let mut total_bytes = 0_usize;
+        for name in DEFAULT_NATIVE_Q2_PROJECTIONS {
+            let (columns, rows): (usize, usize) = if name.ends_with(".ffn_up.weight")
+                || name.ends_with(".ffn_gate.weight")
+            {
+                (5120, 17_408)
+            } else if name.ends_with(".ffn_down.weight") {
+                (17_408, 5120)
+            } else if name.ends_with(".attn_qkv.weight") {
+                (5120, 10_240)
+            } else if name.ends_with(".attn_gate.weight") {
+                (5120, 6144)
+            } else if name.ends_with(".ssm_out.weight")
+                || name.ends_with(".attn_output.weight")
+            {
+                (6144, 5120)
+            } else if name.ends_with(".attn_q.weight") {
+                (5120, 12_288)
+            } else if name.ends_with(".attn_k.weight") || name.ends_with(".attn_v.weight") {
+                (5120, 1024)
+            } else {
+                return Err(invalid("unexpected projection in default resident set"));
+            };
+            let packed_bytes = rows * 36 * (columns / 128);
+            assert_eq!(packed_bytes % 128, 0);
+            total_bytes += packed_bytes;
+        }
+        assert_eq!(total_bytes, DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES);
+        const {
+            assert!(
+                DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES
+                    <= hexagon_native_rpc::NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES
+            );
+        };
         Ok(())
     }
 }

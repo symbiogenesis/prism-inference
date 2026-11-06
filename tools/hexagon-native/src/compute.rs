@@ -303,11 +303,10 @@ fn tensor(bytes: &mut [u8], offset: usize, data: u64, size: u32, ti: u16, rows: 
     }
 }
 
-/// Construct the only supported packet image before the device can see it.
-pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES] {
+fn f32_framing_header(base: u64, fd: u32) -> [u8; 1024] {
     const OP: usize = 192;
     const KP: usize = OP + 72;
-    let mut bytes = [0; COMPUTE_ALLOCATION_BYTES];
+    let mut bytes = [0; 1024];
     // One htp_buf_desc (24), three htp_tensor (56), one htp_op_desc
     // (232), one reserved htp_prof_desc (48), total minimum command 472.
     put_u64(&mut bytes, 0, base);
@@ -336,6 +335,41 @@ pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES
         put_u16(&mut bytes, OP + 220 + index * 2, u16::MAX);
     }
     put_u16(&mut bytes, OP + 220, 2);
+    bytes
+}
+
+pub(crate) fn q2_framing_header(base: u64, fd: u32) -> [u8; 1024] {
+    const OP: usize = 192;
+    const KP: usize = OP + 72;
+    let mut bytes = f32_framing_header(base, fd);
+    tensor(&mut bytes, 24, 1024, u32::from(Q2_WEIGHT_BYTES), 0, 32, 3);
+    put_u32(&mut bytes, 24 + 16, 42); // HTP_TYPE_Q2_0, WEIGHT|TILED.
+    for (index, value) in [256, 32, 1, 1].into_iter().enumerate() {
+        put_u32(&mut bytes, 24 + 24 + index * 4, value);
+    }
+    for (index, value) in [18, 72, 2304, 2304].into_iter().enumerate() {
+        put_u32(&mut bytes, 24 + 40 + index * 4, value);
+    }
+    tensor(&mut bytes, 80, 5120, 2048, 1, 2, 0);
+    put_u32(&mut bytes, 80 + 24, 256);
+    for (index, value) in [4, 1024, 2048, 2048].into_iter().enumerate() {
+        put_u32(&mut bytes, 80 + 40 + index * 4, value);
+    }
+    tensor(&mut bytes, 136, 7296, 256, 2, 2, 0);
+    bytes[KP] = 6; // HTP_MM_KERNEL_HVX_QUANT_ROW: N=2 >= one HVX thread.
+    put_u32(&mut bytes, KP + 16, 576);
+    put_u32(&mut bytes, KP + 20, Q2_VTCM_TILE_BYTES);
+    put_u32(&mut bytes, KP + 24, 10_240); // (round_up(K,128)/32)*1280 Q8_1.
+    // Pinned solver: 2*10240 activation + max(16*4*640 weight,2048 raw).
+    // N>1 has no destination scratch; the raw activation stage overlaps weights.
+    put_u32(&mut bytes, KP + 28, Q2_VTCM_BYTES);
+    bytes
+}
+
+/// Construct the only supported packet image before the device can see it.
+pub(crate) fn fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES] {
+    let mut bytes = [0; COMPUTE_ALLOCATION_BYTES];
+    bytes[..1024].copy_from_slice(&f32_framing_header(base, fd));
     for index in 0_u16..32 {
         let index_usize = usize::from(index);
         let weight = f32::from(index + 1);
@@ -409,32 +443,8 @@ const Q2_EXPECTED_DOTS: [i16; 64] = [
 ];
 
 pub(crate) fn q2_fixture_image(base: u64, fd: u32) -> [u8; COMPUTE_ALLOCATION_BYTES] {
-    const OP: usize = 192;
-    const KP: usize = OP + 72;
-    let mut bytes = fixture_image(base, fd);
-    // Remove the F32 fixture, preserving only common descriptor/op framing.
-    bytes[WEIGHT_OFFSET..].fill(0);
-    tensor(&mut bytes, 24, 1024, u32::from(Q2_WEIGHT_BYTES), 0, 32, 3);
-    put_u32(&mut bytes, 24 + 16, 42); // HTP_TYPE_Q2_0, WEIGHT|TILED.
-    for (index, value) in [256, 32, 1, 1].into_iter().enumerate() {
-        put_u32(&mut bytes, 24 + 24 + index * 4, value);
-    }
-    for (index, value) in [18, 72, 2304, 2304].into_iter().enumerate() {
-        put_u32(&mut bytes, 24 + 40 + index * 4, value);
-    }
-    tensor(&mut bytes, 80, 5120, 2048, 1, 2, 0);
-    put_u32(&mut bytes, 80 + 24, 256);
-    for (index, value) in [4, 1024, 2048, 2048].into_iter().enumerate() {
-        put_u32(&mut bytes, 80 + 40 + index * 4, value);
-    }
-    tensor(&mut bytes, 136, 7296, 256, 2, 2, 0);
-    bytes[KP] = 6; // HTP_MM_KERNEL_HVX_QUANT_ROW: N=2 >= one HVX thread.
-    put_u32(&mut bytes, KP + 16, 576);
-    put_u32(&mut bytes, KP + 20, Q2_VTCM_TILE_BYTES);
-    put_u32(&mut bytes, KP + 24, 10_240); // (round_up(K,128)/32)*1280 Q8_1.
-    // Pinned solver: 2*10240 activation + max(16*4*640 weight,2048 raw).
-    // N>1 has no destination scratch; the raw activation stage overlaps weights.
-    put_u32(&mut bytes, KP + 28, Q2_VTCM_BYTES);
+    let mut bytes = [0; COMPUTE_ALLOCATION_BYTES];
+    bytes[..1024].copy_from_slice(&q2_framing_header(base, fd));
     for row in 0_u16..32 {
         let row_index = usize::from(row);
         for block in 0..4 {

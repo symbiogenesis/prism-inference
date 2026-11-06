@@ -66,7 +66,7 @@ impl NativeQ2ProjectionLimits {
     /// Reserve an optional immutable host-mapped weight arena in the same FD.
     ///
     /// # Errors
-    /// Rejects more than 256 MiB before opening a module or allocating memory.
+    /// Rejects more than 480 MiB before opening a module or allocating memory.
     pub const fn with_resident_weights(mut self, bytes: usize) -> Result<Self, Error> {
         if bytes > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
             return Err(Error::Contract);
@@ -568,8 +568,8 @@ fn write_frame(
         return Err(Error::Contract);
     }
     let (n_prefetch, src1_row_size, vtcm_size) = hvx_mv_params(columns, rows)?;
-    let framing = compute::q2_fixture_image(base, fd);
-    bytes[..1024].copy_from_slice(&framing[..1024]);
+    let framing = compute::q2_framing_header(base, fd);
+    bytes[..1024].copy_from_slice(&framing);
     put64(
         bytes,
         8,

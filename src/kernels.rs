@@ -1859,6 +1859,100 @@ pub fn matvec_into(
     scratch.prepare(tensor, input)?.matvec_into(tensor, output)
 }
 
+pub(crate) fn lora_a_dot(
+    a_values: &[f32],
+    input: &[f32],
+    output: &mut Vec<f32>,
+    scratch: &mut MatvecScratch,
+) -> Result<()> {
+    fill_into(output, |output| {
+        if a_values.is_empty()
+            || input.len() != a_values.len()
+            || input.iter().any(|value| !value.is_finite())
+        {
+            return Err(invalid(
+                "matvec requires a matching finite activation vector",
+            ));
+        }
+        output.try_reserve_exact(1)?;
+        let value = if scratch.pinned_accumulation && a_values.len().is_multiple_of(16) {
+            pinned_gdn::dot(a_values, input)?
+        } else {
+            finite(float_dot(a_values, input))?
+        };
+        output.push(value);
+        Ok(())
+    })
+}
+
+pub(crate) fn lora_b_scale(
+    b_values: &[f32],
+    rank: &[f32],
+    correction: &mut Vec<f32>,
+) -> Result<()> {
+    fill_into(correction, |correction| {
+        let [rank] = *rank else {
+            return Err(invalid(
+                "matvec requires a matching finite activation vector",
+            ));
+        };
+        if b_values.is_empty() || !rank.is_finite() {
+            return Err(invalid(
+                "matvec requires a matching finite activation vector",
+            ));
+        }
+        correction.try_reserve_exact(b_values.len())?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(result) = neon::lora_b_scale(b_values, rank, correction) {
+            return result;
+        }
+        for &weight in b_values {
+            let weight = finite(weight)?;
+            correction.push(finite(float_dot(&[weight], &[rank]))?);
+        }
+        Ok(())
+    })
+}
+
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve the native product, scale and add as separately rounded F32 stages."
+)]
+pub(crate) fn lora_finish_in_place(
+    scale: f32,
+    output: &mut [f32],
+    correction: &mut [f32],
+) -> Result<()> {
+    if output.len() != correction.len() {
+        return Err(invalid("rank-one correction extent mismatch"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::lora_finish_in_place(scale, output, correction) {
+        return result;
+    }
+    for (&base, corr) in output.iter().zip(correction.iter_mut()) {
+        *corr *= scale;
+        *corr += base;
+        if !corr.is_finite() {
+            return Err(invalid("nonfinite rank-one correction"));
+        }
+    }
+    output.copy_from_slice(correction);
+    Ok(())
+}
+
 impl PreparedMatvec<'_> {
     /// Checks whether a tensor uses this preparation's width and activation contract.
     ///
@@ -2002,7 +2096,7 @@ impl PreparedMatvec<'_> {
                             && matches!(tensor.kind, F32 | F16)
                             && columns.is_multiple_of(16)
                         {
-                            pinned_gdn::dot_scalar(&scratch.row, &scratch.activations)?
+                            pinned_gdn::dot(&scratch.row, &scratch.activations)?
                         } else {
                             finite(float_dot(&scratch.row, &scratch.activations))?
                         },

@@ -11,7 +11,9 @@ use bonsai_gguf::MetadataValue;
 use super::{Model, Tensor};
 use crate::{
     Result, invalid,
-    kernels::{MatvecBackend, MatvecScratch, matvec_into, row_into},
+    kernels::{
+        MatvecBackend, MatvecScratch, lora_a_dot, lora_b_scale, lora_finish_in_place, row_into,
+    },
 };
 
 /// Exact approved Orca adapter file length.
@@ -25,7 +27,8 @@ const MAX_PAIRS: usize = 513;
 
 struct Factors {
     a: Tensor,
-    b: Tensor,
+    a_values: Vec<f32>,
+    b_values: Vec<f32>,
 }
 
 /// An immutable, explicitly admitted rank-one adapter for one base model.
@@ -169,23 +172,27 @@ impl RankOneAdapter {
                     [*input, 1]
                 };
                 validate_factor(a, name, &a_shape)?;
-                validate_factor(
-                    b,
-                    &format!("{target}.lora_b"),
-                    &[
-                        1,
-                        if target == "token_embd.weight" {
-                            *input
-                        } else {
-                            *output
-                        },
-                    ],
-                )?;
+                let a_values = if target == "token_embd.weight" {
+                    Vec::new()
+                } else {
+                    decode_factor(a)?
+                };
+                let b_shape = [
+                    1,
+                    if target == "token_embd.weight" {
+                        *input
+                    } else {
+                        *output
+                    },
+                ];
+                validate_factor(b, &format!("{target}.lora_b"), &b_shape)?;
+                let b_values = decode_factor(b)?;
                 factors.insert(
                     target.to_owned(),
                     Factors {
                         a: a.clone(),
-                        b: b.clone(),
+                        a_values,
+                        b_values,
                     },
                 );
             } else if let Some(target) = name.strip_suffix(".lora_b") {
@@ -215,7 +222,7 @@ impl RankOneAdapter {
 
     /// Number of complete admitted factor pairs.
     #[must_use]
-    pub fn target_count(&self) -> usize {
+    pub const fn target_count(&self) -> usize {
         self.factors.len()
     }
 
@@ -246,13 +253,13 @@ impl RankOneAdapter {
         let Some(factors) = self.factors.get(target).filter(|_| scale != 0.0) else {
             return Ok(());
         };
-        matvec_into(&factors.a, input, &mut scratch.rank, &mut scratch.matvec)?;
-        matvec_into(
-            &factors.b,
-            &scratch.rank,
-            &mut scratch.correction,
+        lora_a_dot(
+            &factors.a_values,
+            input,
+            &mut scratch.rank,
             &mut scratch.matvec,
         )?;
+        lora_b_scale(&factors.b_values, &scratch.rank, &mut scratch.correction)?;
         self.finish(scale, output, &mut scratch.correction)
     }
 
@@ -271,33 +278,12 @@ impl RankOneAdapter {
             return Ok(());
         };
         row_into(&factors.a, token, &mut scratch.rank)?;
-        matvec_into(
-            &factors.b,
-            &scratch.rank,
-            &mut scratch.correction,
-            &mut scratch.matvec,
-        )?;
+        lora_b_scale(&factors.b_values, &scratch.rank, &mut scratch.correction)?;
         self.finish(scale, output, &mut scratch.correction)
     }
 
-    #[allow(
-        clippy::suboptimal_flops,
-        reason = "Preserve the native product, scale and add as separately rounded F32 stages."
-    )]
     fn finish(&self, scale: f32, output: &mut [f32], correction: &mut [f32]) -> Result<()> {
-        if output.len() != correction.len() {
-            return Err(invalid("rank-one correction extent mismatch"));
-        }
-        let scale = scale * self.alpha;
-        for (&base, correction) in output.iter().zip(correction.iter_mut()) {
-            *correction *= scale;
-            *correction += base;
-            if !correction.is_finite() {
-                return Err(invalid("nonfinite rank-one correction"));
-            }
-        }
-        output.copy_from_slice(correction);
-        Ok(())
+        lora_finish_in_place(scale * self.alpha, output, correction)
     }
 }
 
@@ -338,6 +324,15 @@ fn validate_factor(tensor: &Tensor, name: &str, shape: &[usize]) -> Result<()> {
         return Err(invalid("invalid rank-one adapter factor"));
     }
     Ok(())
+}
+
+fn decode_factor(tensor: &Tensor) -> Result<Vec<f32>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(tensor.data.len() / 4)?;
+    for chunk in tensor.data.as_chunks::<4>().0 {
+        values.push(f32::from_le_bytes(*chunk));
+    }
+    Ok(values)
 }
 
 #[cfg(test)]

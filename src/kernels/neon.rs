@@ -633,6 +633,77 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
     Some(Ok(block))
 }
 
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product rounding and signed-zero normalization."
+)]
+pub(super) fn lora_b_scale(
+    b_values: &[f32],
+    rank: f32,
+    correction: &mut Vec<f32>,
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    correction.resize(b_values.len(), 0.0);
+    let rank_vec = f32x4::splat(neon, rank);
+    let zero_vec = f32x4::splat(neon, 0.0);
+    let (b_chunks, b_tail) = b_values.as_chunks::<4>();
+    let (c_chunks, c_tail) = correction.as_chunks_mut::<4>();
+    for (b_chunk, c_chunk) in b_chunks.iter().zip(c_chunks) {
+        let b = f32x4::from_slice(neon, b_chunk);
+        // Adding +0.0 normalizes -0.0 to +0.0 identically to f64::sum::<f64>().
+        let prod = (b * rank_vec) + zero_vec;
+        if !(b.is_finite() & prod.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        prod.store_slice(c_chunk);
+    }
+    for (&b, c) in b_tail.iter().zip(c_tail) {
+        if !b.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let prod = (b * rank) + 0.0;
+        if !prod.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        *c = prod;
+    }
+    Some(Ok(()))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 scale and base addition roundings."
+)]
+pub(super) fn lora_finish_in_place(
+    scale: f32,
+    output: &mut [f32],
+    correction: &mut [f32],
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let scale_vec = f32x4::splat(neon, scale);
+    let (out_chunks, out_tail) = output.as_chunks::<4>();
+    let (corr_chunks, corr_tail) = correction.as_chunks_mut::<4>();
+    for (base_chunk, corr_chunk) in out_chunks.iter().zip(corr_chunks) {
+        let base = f32x4::from_slice(neon, base_chunk);
+        let corr = (f32x4::from_slice(neon, corr_chunk) * scale_vec) + base;
+        if !corr.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite rank-one correction")));
+        }
+        corr.store_slice(corr_chunk);
+    }
+    for (&base, corr) in out_tail.iter().zip(corr_tail) {
+        *corr *= scale;
+        *corr += base;
+        if !corr.is_finite() {
+            return Some(Err(crate::invalid("nonfinite rank-one correction")));
+        }
+    }
+    output.copy_from_slice(correction);
+    Some(Ok(()))
+}
+
 /// Consumes scoped digit-plane activations without unpack interleaves per row.
 ///
 /// Each sixteen packed bytes describe sixty-four consecutive weights. Their

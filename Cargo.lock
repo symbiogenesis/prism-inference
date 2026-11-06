@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "bonsai-hexagon-native",
  "bonsai-hexagon-runtime",

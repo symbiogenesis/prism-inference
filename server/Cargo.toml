@@ -1,9 +1,9 @@
 [package]
 name = "prism-inference-server"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 rust-version = "1.101"
-# Exact Git dependency below is retained for GitHub binaries/source checkouts.
+# Unpublished Hexagon path dependencies below are retained for GitHub binaries/source checkouts.
 publish = false
 license = "Apache-2.0"
 repository = "https://github.com/symbiogenesis/prism-inference"
@@ -20,7 +20,7 @@ test = true
 
 
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.15" }
+bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.16" }
 http = "=1.5.0"
 httparse = "=1.10.1"
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -30,7 +30,7 @@ tokio = { version = "=1.54.1", features = ["io-util", "net", "rt", "sync", "time
 
 [target.'cfg(windows)'.dependencies]
 bonsai-windows-process = "=0.1.0"
-bonsai-windows-credentials = { git = "https://github.com/symbiogenesis/SwiftBonsai2Runner", rev = "abe04b4a8eff18388af96f0e75c8a8d180b81989" }
+bonsai-windows-credentials = "=0.1.1"
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))'.dependencies]
 bonsai-hexagon-native = { path = "../tools/hexagon-native" }

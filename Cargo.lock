@@ -124,8 +124,9 @@ version = "0.1.0"
 
 [[package]]
 name = "bonsai-windows-credentials"
-version = "0.1.0"
-source = "git+https://github.com/symbiogenesis/SwiftBonsai2Runner?rev=abe04b4a8eff18388af96f0e75c8a8d180b81989#abe04b4a8eff18388af96f0e75c8a8d180b81989"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d23fc9ebce0ceda78c2a6f5e2e7e0999d9c4b6d0ee6a2785acda78634f9394f8"
 dependencies = [
  "windows-sys",
 ]
@@ -602,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
@@ -622,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "bonsai-hexagon-native",
  "bonsai-hexagon-runtime",

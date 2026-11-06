@@ -1022,7 +1022,7 @@ pub(super) fn rms_norm_scale_into<const PINNED: bool>(
         } else {
             (v * scale_vec) * w
         };
-        finite_mask = finite_mask & out.is_finite();
+        finite_mask &= out.is_finite();
         out.store_slice(out_chunk);
     }
     if !finite_mask.all_true() {
@@ -1065,7 +1065,7 @@ pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
         } else {
             (v * scale_vec) * w
         };
-        finite_mask = finite_mask & out.is_finite();
+        finite_mask &= out.is_finite();
         out.store_slice(val_chunk);
     }
     if !finite_mask.all_true() {
@@ -1768,7 +1768,7 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
     } else {
         for chunk in values.as_chunks_mut::<4>().0 {
             let v = f32x4::from_slice(neon, chunk) * norm;
-            finite_mask = finite_mask & v.is_finite();
+            finite_mask &= v.is_finite();
             v.store_slice(chunk);
         }
     }

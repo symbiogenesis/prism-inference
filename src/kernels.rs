@@ -2291,6 +2291,19 @@ pub(crate) fn is_finite_slice(values: &[f32]) -> bool {
 }
 
 #[inline]
+#[cfg_attr(
+    not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "Scalar stub matches the runtime NEON signature."
+    )
+)]
 pub(crate) fn block16_all_finite_le(values: &[f32; 16], threshold: f32) -> bool {
     #[cfg(all(
         feature = "experimental-neon",

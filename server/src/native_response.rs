@@ -62,6 +62,10 @@ struct ContentDelta<'a> {
 struct EmptyDelta {}
 
 #[derive(Clone, Copy, Serialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "OpenAI-compatible usage payload field names."
+)]
 struct UsagePayload {
     completion_tokens: usize,
     prompt_tokens: usize,

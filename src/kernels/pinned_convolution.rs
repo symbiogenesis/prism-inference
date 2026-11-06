@@ -114,7 +114,7 @@ pub(crate) fn step_into(
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
-            finite_mask = finite_mask & out.is_finite();
+            finite_mask &= out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
             out.store_slice(m_chunk);
             *n_chunk = [
@@ -217,7 +217,7 @@ pub(crate) fn step_in_place(
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
-            finite_mask = finite_mask & out.is_finite();
+            finite_mask &= out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
             out.store_slice(m_chunk);
             *h_chunk = [
@@ -299,6 +299,10 @@ mod tests {
             .collect()
     }
 
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().copied().map(f32::to_bits).collect()
+    }
+
     #[test]
     fn pinned_convolution_matches_native_zero_partial_and_full_history() -> Result<()> {
         let bytes = include_bytes!("../../tests/fixtures/swift-convolution-native.bin");
@@ -338,8 +342,7 @@ mod tests {
             let channels = usize::try_from(word(&mut input)?)?;
             let history = usize::try_from(word(&mut input)?)?;
             let cancellation = word(&mut input)?;
-            assert!(matches!(width, 1 | 2 | 4));
-            assert!(matches!(channels, 64 | 65));
+            assert!(matches!(width, 1 | 2 | 4) && matches!(channels, 64 | 65));
             assert!(history < width && cancellation <= 1);
             let signal = values(&mut input, width * channels)?;
             let coefficients = values(&mut input, width * channels)?;
@@ -378,25 +381,16 @@ mod tests {
                 &coefficients,
                 width,
             )?;
+            let expected_bits = bits(&native);
+            assert_eq!(bits(&mixed_into), expected_bits, "step_into case {case}");
             assert_eq!(
-                mixed_into.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                native.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "step_into case {case}"
-            );
-            assert_eq!(
-                mixed_in_place
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>(),
-                native.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                bits(&mixed_in_place),
+                expected_bits,
                 "step_in_place case {case}"
             );
             assert_eq!(
-                next_history.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                in_place_history
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>(),
+                bits(&next_history),
+                bits(&in_place_history),
                 "history update case {case}"
             );
         }

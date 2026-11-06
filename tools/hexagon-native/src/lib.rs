@@ -836,6 +836,40 @@ impl NativeQ2Submitter for NativeQ2Session {
         }
     }
 
+    fn submit_resident_batch2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activation: &[f32],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_batch2(handles, activation, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activation, outputs);
+            match self.0 {}
+        }
+    }
+
+    fn submit_resident_batch3(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        outputs: [&mut [f32]; 3],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_batch3(handles, activation, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activation, outputs);
+            match self.0 {}
+        }
+    }
+
     fn submit(
         &mut self,
         columns: usize,

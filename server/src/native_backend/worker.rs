@@ -197,6 +197,13 @@ impl Drop for WorkerThreadHexagonExecutor {
     clippy::redundant_pub_crate,
     reason = "Re-exported by native_backend for native_child startup."
 )]
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "Non-ARM64 Windows stub matches the filesystem-probing ARM64 signature."
+    )
+)]
 pub(crate) fn register_hexagon_model_path(model: &std::path::Path) {
     #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
     {

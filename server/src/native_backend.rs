@@ -35,6 +35,8 @@ use tokio::{
     net::TcpListener,
     time::{Instant, sleep_until, timeout_at},
 };
+#[cfg(windows)]
+pub(super) use worker::register_hexagon_model_path;
 use worker::{Event, Input, Output, Worker};
 
 /// Value-free private child errors; keys, prompts and model diagnostics are absent.

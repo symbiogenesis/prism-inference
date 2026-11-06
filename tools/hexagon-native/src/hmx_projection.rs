@@ -180,6 +180,7 @@ impl HmxQ2WeightHandle {
 /// handles. The registry stores no payload or native pointer. The submitter
 /// copies a successful reservation's bytes exactly once before exposing its
 /// handle, and never changes or frees them while the session can consume them.
+#[derive(Clone)]
 pub struct HmxQ2WeightRegistry {
     owner: Arc<()>,
     capacity: usize,

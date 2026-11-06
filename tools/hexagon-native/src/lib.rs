@@ -724,6 +724,28 @@ impl Driver {
             Err(Error::UnsupportedPlatform)
         }
     }
+
+    /// Open a persistent full-`K` 1-op native `HTP_TYPE_Q2_0` session owned by
+    /// the returned [`NativeQ2Session`].
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms and invalid package, driver or mapping state.
+    pub fn open_native_q2_session(
+        self,
+        package_directory: &Path,
+        limits: NativeQ2ProjectionLimits,
+    ) -> Result<NativeQ2Session, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            windows::open_native_q2_session(self.inner, package_directory, limits)
+                .map(NativeQ2Session)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (self, package_directory, limits);
+            Err(Error::UnsupportedPlatform)
+        }
+    }
     /// Consume this driver in one fixed 4KiB allocation/registration/unmap probe.
     ///
     /// The documented registration call may implicitly open a domain session;
@@ -746,6 +768,90 @@ impl Driver {
         {
             let _ = self;
             Err(Error::UnsupportedPlatform)
+        }
+    }
+}
+
+/// Owned full-`K` 1-op native `HTP_TYPE_Q2_0` session that cleans up its queue,
+/// module and `FastRPC` mapping when dropped.
+pub struct NativeQ2Session(
+    #[cfg(all(windows, target_arch = "aarch64"))] windows::NativeQ2Session,
+    #[cfg(not(all(windows, target_arch = "aarch64")))] std::convert::Infallible,
+);
+
+impl NativeQ2Submitter for NativeQ2Session {
+    fn remaining_operations(&self) -> Option<u64> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.remaining_operations()
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            match self.0 {}
+        }
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.residency_capacity_bytes()
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            match self.0 {}
+        }
+    }
+
+    fn prepare_weights(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.prepare_weights(columns, rows, weights)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (columns, rows, weights);
+            match self.0 {}
+        }
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident(handle, activation, output)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handle, activation, output);
+            match self.0 {}
+        }
+    }
+
+    fn submit(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit(columns, rows, weights, activation, output)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (columns, rows, weights, activation, output);
+            match self.0 {}
         }
     }
 }

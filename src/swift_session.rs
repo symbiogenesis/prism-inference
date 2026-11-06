@@ -235,6 +235,26 @@ impl SwiftSession {
         self.runtime.decoder().row_workers()
     }
 
+    /// Cloned row-parallelism handle for external projection executors.
+    #[must_use]
+    pub fn clone_row_parallelism(&self) -> RowParallelism {
+        self.runtime.decoder().clone_row_parallelism()
+    }
+
+    /// Look up a named projection tensor in the underlying decoder graph.
+    #[must_use]
+    pub fn projection_tensor(&self, name: &str) -> Option<&crate::model::Tensor> {
+        self.runtime.decoder().projection_tensor(name)
+    }
+
+    /// Install or clear an optional persistent PQ2 projection executor.
+    pub fn set_projection_executor(
+        &mut self,
+        executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
+    ) {
+        self.runtime.set_projection_executor(executor);
+    }
+
     /// Explicit request-boundary policy; fresh recomputation remains the default.
     #[must_use]
     pub const fn prompt_reuse(&self) -> PromptReuse {

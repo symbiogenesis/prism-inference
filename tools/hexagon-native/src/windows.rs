@@ -63,6 +63,12 @@ pub(super) fn reference_hmx_q2_projection(
     clippy::redundant_pub_crate,
     reason = "Only the safe crate root consumes the native driver"
 )]
+pub(crate) use compute_native::NativeQ2Session;
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe crate root consumes the native driver"
+)]
 pub(super) fn reference_native_q2_projection(
     driver: Driver,
     package: &Path,
@@ -71,6 +77,18 @@ pub(super) fn reference_native_q2_projection(
     work: impl FnOnce(&mut dyn crate::NativeQ2Submitter) -> Result<(), Error>,
 ) -> Result<crate::NativeQ2ProjectionReport, Error> {
     compute_native::native_q2_projection(driver, package, limits, progress, work)
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Only the safe crate root consumes the native driver"
+)]
+pub(super) fn open_native_q2_session(
+    driver: Driver,
+    package: &Path,
+    limits: crate::NativeQ2ProjectionLimits,
+) -> Result<NativeQ2Session, Error> {
+    compute_native::open_native_q2_session(driver, package, limits)
 }
 
 type Handle = *mut c_void;

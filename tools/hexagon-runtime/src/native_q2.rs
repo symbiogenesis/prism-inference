@@ -21,11 +21,36 @@ use crate::{HmxResidencyStatistics, ProjectionStatistics, Result, invalid};
 /// Residency statistics for [`NativeQ2Executor`].
 pub type NativeQ2ResidencyStatistics = HmxResidencyStatistics;
 
+/// Default 13-projection multi-layer (`blk.0` recurrent + `blk.3` full-attention)
+/// Hexagon NPU `native-q2` resident placement proven faster than 4-worker NEON CPU.
+pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 13] = [
+    "blk.0.ffn_up.weight",
+    "blk.0.ffn_gate.weight",
+    "blk.0.ffn_down.weight",
+    "blk.0.attn_qkv.weight",
+    "blk.0.attn_gate.weight",
+    "blk.0.ssm_out.weight",
+    "blk.3.ffn_up.weight",
+    "blk.3.ffn_gate.weight",
+    "blk.3.ffn_down.weight",
+    "blk.3.attn_q.weight",
+    "blk.3.attn_k.weight",
+    "blk.3.attn_v.weight",
+    "blk.3.attn_output.weight",
+];
+
+/// Exact packed `HTP_TYPE_Q2_0` resident weight payload bytes for [`DEFAULT_NATIVE_Q2_PROJECTIONS`].
+pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 212_336_640;
+
+/// Host metadata reservation for resident `native-q2` projection handles.
+pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 256 * 1024;
+
 struct ResidentProjection {
     source: Arc<[u8]>,
     columns: usize,
     rows: usize,
     first_handle: usize,
+    evaluated: bool,
 }
 
 struct ResidentCache {
@@ -87,13 +112,14 @@ impl ResidentCache {
             && operations <= self.handles.capacity() - self.handles.len()
     }
 
-    fn commit(&mut self, tensor: &Tensor, first_handle: usize) -> usize {
+    fn commit(&mut self, tensor: &Tensor, first_handle: usize, evaluated: bool) -> usize {
         let index = self.projections.len();
         self.projections.push(ResidentProjection {
             source: Arc::clone(&tensor.data),
             columns: tensor.dimensions[0],
             rows: tensor.dimensions[1],
             first_handle,
+            evaluated,
         });
         self.statistics.tensors_prepared = self.statistics.tensors_prepared.saturating_add(1);
         index
@@ -102,8 +128,8 @@ impl ResidentCache {
 
 /// Full-`K` 1-op native `HTP_TYPE_Q2_0` executor using `libggml-htp-v81.so`'s
 /// signed 8-thread HVX `q2_0 x q8_1` (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`) kernel.
-pub struct NativeQ2Executor<'a> {
-    submitter: &'a mut dyn NativeQ2Submitter,
+pub struct NativeQ2Executor<S = &'static mut dyn NativeQ2Submitter> {
+    submitter: S,
     maximum_columns: usize,
     maximum_rows: usize,
     maximum_operations: u32,
@@ -114,13 +140,14 @@ pub struct NativeQ2Executor<'a> {
     queue_writes_completed: u64,
     residency: Option<ResidentCache>,
     row_parallelism: Option<RowParallelism>,
+    allowed_tensors: Option<Vec<Tensor>>,
 }
 
-impl<'a> NativeQ2Executor<'a> {
+impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     /// Bind one native `Q2_0` session and an admitted host-payload cap.
     #[must_use]
     pub const fn new(
-        submitter: &'a mut dyn NativeQ2Submitter,
+        submitter: S,
         limits: NativeQ2ProjectionLimits,
         maximum_owned_payload_bytes: usize,
     ) -> Self {
@@ -140,6 +167,7 @@ impl<'a> NativeQ2Executor<'a> {
             queue_writes_completed: 0,
             residency: None,
             row_parallelism: None,
+            allowed_tensors: None,
         }
     }
 
@@ -224,7 +252,12 @@ impl<'a> NativeQ2Executor<'a> {
             })
     }
 
-    fn prepare_resident(&mut self, tensor: &Tensor, weights: &mut [u8]) -> Result<Option<usize>> {
+    fn prepare_resident(
+        &mut self,
+        tensor: &Tensor,
+        weights: &mut [u8],
+        evaluated: bool,
+    ) -> Result<Option<usize>> {
         let Some(cache) = &mut self.residency else {
             return Ok(None);
         };
@@ -287,7 +320,79 @@ impl<'a> NativeQ2Executor<'a> {
                     .saturating_add(u64::try_from(chunk_weights.len())?);
             }
         }
-        Ok(Some(cache.commit(tensor, first_handle)))
+        Ok(Some(cache.commit(tensor, first_handle, evaluated)))
+    }
+
+    /// Pre-pack and stage a `PQ2_0` projection tensor into the session's
+    /// resident arena before token evaluation so Token 0 flushes the resident
+    /// weight arena only once on its first submission.
+    ///
+    /// # Errors
+    /// Rejects faulted executors, unsupported tensor geometry, or invalid scale headers.
+    pub fn prewarm_tensor(&mut self, tensor: &Tensor) -> Result<bool> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        let (columns, rows) = native_dimensions(tensor)?;
+        if !self.supports_f32(tensor) {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        let Some(cache) = &self.residency else {
+            return Ok(false);
+        };
+        if cache.find(tensor).is_some() {
+            return Ok(true);
+        }
+        let single_op =
+            columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
+        if !single_op {
+            for block in tensor.data.as_chunks::<34>().0 {
+                scale(block)?;
+            }
+        }
+        let max_chunk_cols = columns.min(self.maximum_columns);
+        let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
+        let mut weights = zeroed(max_mapped_rows * 36 * (max_chunk_cols / 128), 0_u8)?;
+        let result = self.prepare_resident(tensor, &mut weights, false);
+        if result.is_err() {
+            self.failed = true;
+        }
+        Ok(result?.is_some())
+    }
+
+    /// Restrict NPU execution to the supplied live model tensors and pre-warm
+    /// them into the resident weight arena when residency is enabled.
+    ///
+    /// # Errors
+    /// Rejects empty selections, unsupported tensor contracts, or failed pre-warming.
+    pub fn select_and_prewarm_tensors(&mut self, tensors: &[Tensor]) -> Result<()> {
+        if tensors.is_empty() || self.allowed_tensors.is_some() || self.failed {
+            return Err(invalid("invalid native Q2 selected tensor configuration"));
+        }
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(tensors.len())
+            .map_err(|_| invalid("native Q2 selected tensor metadata allocation failed"))?;
+        for tensor in tensors {
+            if !self.supports_f32(tensor) {
+                return Err(invalid("unsupported native Q2 selected projection tensor"));
+            }
+            selected.push(tensor.clone());
+        }
+        self.allowed_tensors = Some(selected);
+        if self.residency.is_some() {
+            for tensor in tensors {
+                if !self.prewarm_tensor(tensor)? {
+                    self.failed = true;
+                    return Err(invalid(
+                        "native Q2 resident arena exhausted during pre-warming",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn project_single_op(
@@ -342,6 +447,10 @@ impl<'a> NativeQ2Executor<'a> {
         Ok(direct_out)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep resident cache lookup, pre-warmed first-hit evaluation and fallback tiling auditable together."
+    )]
     fn project_f32_inner(
         &mut self,
         tensor: &Tensor,
@@ -377,11 +486,15 @@ impl<'a> NativeQ2Executor<'a> {
         };
         let resident = if let Some(index) = cached {
             if let Some(cache) = &mut self.residency {
-                cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
+                if cache.projections[index].evaluated {
+                    cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
+                } else {
+                    cache.projections[index].evaluated = true;
+                }
             }
             Some(index)
         } else {
-            self.prepare_resident(tensor, &mut weights)?
+            self.prepare_resident(tensor, &mut weights, true)?
         };
         if single_op {
             *output =
@@ -464,7 +577,7 @@ fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()>
     Ok(())
 }
 
-impl Pq2ProjectionExecutor for NativeQ2Executor<'_> {
+impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
     fn identity(&self) -> &'static str {
         if self.residency.is_some() {
             "hexagon-hvx-native-q2-resident-v1-experimental"
@@ -474,6 +587,9 @@ impl Pq2ProjectionExecutor for NativeQ2Executor<'_> {
     }
 
     fn operation_capacity(&self) -> Option<u64> {
+        if self.maximum_operations == u32::MAX && self.submitter.remaining_operations().is_none() {
+            return None;
+        }
         let local =
             u64::from(self.maximum_operations).saturating_sub(self.statistics.operations_attempted);
         Some(local.min(self.submitter.remaining_operations().unwrap_or(local)))
@@ -503,6 +619,16 @@ impl Pq2ProjectionExecutor for NativeQ2Executor<'_> {
     }
 
     fn supports_f32(&self, tensor: &Tensor) -> bool {
+        if let Some(allowed) = &self.allowed_tensors
+            && !allowed.iter().any(|candidate| {
+                candidate.name == tensor.name
+                    && candidate.kind == tensor.kind
+                    && candidate.dimensions == tensor.dimensions
+                    && Arc::ptr_eq(&candidate.data, &tensor.data)
+            })
+        {
+            return false;
+        }
         native_dimensions(tensor).is_ok_and(|(columns, rows)| {
             self.payload_bytes(columns, rows)
                 .is_some_and(|bytes| bytes <= self.maximum_owned_payload_bytes)

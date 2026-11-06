@@ -864,6 +864,7 @@ pub struct Qwen35 {
     position: usize,
     vocabulary: usize,
     tiled_prefill: Option<prefill::TiledPrefill>,
+    projection_executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
 }
 
 impl Qwen35 {
@@ -1398,6 +1399,7 @@ impl Qwen35 {
             position: 0,
             vocabulary,
             tiled_prefill: None,
+            projection_executor: None,
         })
     }
 
@@ -1436,6 +1438,63 @@ impl Qwen35 {
         self.workspace.projection.matvec.row_workers()
     }
 
+    /// Cloned row-parallelism handle for external projection executors.
+    #[must_use]
+    pub fn clone_row_parallelism(&self) -> RowParallelism {
+        self.workspace.projection.matvec.clone_row_parallelism()
+    }
+
+    /// Install or clear an optional persistent PQ2 projection executor.
+    pub fn set_projection_executor(
+        &mut self,
+        executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
+    ) {
+        self.projection_executor = executor;
+    }
+
+    /// Look up a named projection tensor across all decoder layers.
+    #[must_use]
+    pub fn projection_tensor(&self, name: &str) -> Option<&Tensor> {
+        for layer in &self.layers {
+            match &layer.attention {
+                Attention::Full(attention) => {
+                    for tensor in [
+                        &attention.query,
+                        &attention.key,
+                        &attention.value,
+                        &attention.output,
+                    ] {
+                        if tensor.name == name {
+                            return Some(tensor);
+                        }
+                    }
+                }
+                Attention::Recurrent(attention) => {
+                    for tensor in [
+                        &attention.qkv,
+                        &attention.gate,
+                        &attention.beta,
+                        &attention.alpha,
+                        &attention.output,
+                    ] {
+                        if tensor.name == name {
+                            return Some(tensor);
+                        }
+                    }
+                }
+            }
+            for tensor in [&layer.up, &layer.gate, &layer.down] {
+                if tensor.name == name {
+                    return Some(tensor);
+                }
+            }
+        }
+        if self.output.name == name {
+            return Some(&self.output);
+        }
+        None
+    }
+
     /// Diagnostics for the latest matrix attempt, including provisional work.
     ///
     /// This describes one projection, not every projection in a token or graph.
@@ -1462,7 +1521,19 @@ impl Qwen35 {
         reason = "Keep validation and transactional graph operation order auditable together."
     )]
     fn evaluate_token_into(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
-        self.evaluate_token_with_executor(token, logits, None)
+        const fn coerce_executor<'a>(
+            executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
+        ) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
+            &mut **executor
+        }
+        let mut executor = self.projection_executor.take();
+        let result = self.evaluate_token_with_executor(
+            token,
+            logits,
+            executor.as_mut().map(coerce_executor),
+        );
+        self.projection_executor = executor;
+        result
     }
 
     #[allow(

@@ -36,6 +36,12 @@ pub(super) fn hmx_projection(
     projection_native::run_hmx(driver, package, limits, progress, work)
 }
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Safe crate root wraps the native session handle."
+)]
+pub(crate) use projection_native::NativeQ2Session;
+
 pub(super) fn native_q2_projection(
     driver: Driver,
     package: &Path,
@@ -44,6 +50,14 @@ pub(super) fn native_q2_projection(
     work: impl FnOnce(&mut dyn crate::NativeQ2Submitter) -> Result<(), Error>,
 ) -> Result<crate::NativeQ2ProjectionReport, Error> {
     projection_native::run_native_q2(driver, package, limits, progress, work)
+}
+
+pub(super) fn open_native_q2_session(
+    driver: Driver,
+    package: &Path,
+    limits: crate::NativeQ2ProjectionLimits,
+) -> Result<NativeQ2Session, Error> {
+    projection_native::open_native_q2(driver, package, limits)
 }
 
 type Open = unsafe extern "C" fn(*const c_char, *mut u64) -> i32;

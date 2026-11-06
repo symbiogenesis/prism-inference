@@ -75,6 +75,16 @@ impl NativeQ2ProjectionLimits {
         Ok(self)
     }
 
+    /// Enable persistent service-lifetime operation without idle wall-clock expiration.
+    ///
+    /// Individual operations retain their 3-second hardware response deadline.
+    #[must_use]
+    pub const fn with_persistent_session(mut self) -> Self {
+        self.common.persistent = true;
+        self.common.operations = u32::MAX;
+        self
+    }
+
     /// Explicit opt-in immutable packed-weight payload capacity, excluding padding.
     #[must_use]
     pub const fn resident_weight_bytes(self) -> usize {
@@ -143,6 +153,7 @@ impl NativeQ2WeightHandle {
 }
 
 /// Metadata-only append-only allocator for one submitter's native `Q2_0` weight arena.
+#[derive(Clone)]
 pub struct NativeQ2WeightRegistry {
     owner: Arc<()>,
     capacity: usize,
@@ -274,6 +285,45 @@ pub trait NativeQ2Submitter {
         activation: &[f32],
         output: &mut [f32],
     ) -> Result<(), Error>;
+}
+
+impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
+    fn remaining_operations(&self) -> Option<u64> {
+        (**self).remaining_operations()
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        (**self).residency_capacity_bytes()
+    }
+
+    fn prepare_weights(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        (**self).prepare_weights(columns, rows, weights)
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        (**self).submit_resident(handle, activation, output)
+    }
+
+    fn submit(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        (**self).submit(columns, rows, weights, activation, output)
+    }
 }
 
 pub(crate) const fn layout(columns: usize, rows: usize) -> projection::Layout {

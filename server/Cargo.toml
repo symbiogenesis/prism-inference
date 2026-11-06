@@ -32,6 +32,10 @@ tokio = { version = "=1.54.1", features = ["io-util", "net", "rt", "sync", "time
 bonsai-windows-process = "=0.1.0"
 bonsai-windows-credentials = { git = "https://github.com/symbiogenesis/SwiftBonsai2Runner", rev = "abe04b4a8eff18388af96f0e75c8a8d180b81989" }
 
+[target.'cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))'.dependencies]
+bonsai-hexagon-native = { path = "../tools/hexagon-native" }
+bonsai-hexagon-runtime = { path = "../tools/hexagon-runtime" }
+
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["test-util"] }
 

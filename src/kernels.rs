@@ -10,7 +10,8 @@
 //! pinned `Q8_0` fallback for odd numbers of 128-element groups. PTQ1 uses
 //! `Q8_0` activations in groups of 32. Neither path expands a matrix to floats.
 
-use bonsai_ternary::{Q8KBlock, decode_ptq_trits, half_to_float};
+pub use bonsai_ternary::Q8KBlock;
+use bonsai_ternary::{decode_ptq_trits, half_to_float};
 
 use crate::model::Tensor;
 use crate::{Result, invalid};
@@ -2743,22 +2744,22 @@ mod tests {
         for invalid in [0x7fc1, 0x7f80, 0xff80, 0x7f7f] {
             let tensor = bf16_tensor(1, 3, &[0x3f80, invalid, 0x4000]);
             assert!(matvec_into(&tensor, &[2.0], &mut output, &mut scratch).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [0.0_f32; 0]);
             assert!(scratch.diagnostics().dispatched);
             assert!(!scratch.diagnostics().succeeded);
         }
         for invalid in [0x7fc1, 0x7f80, 0xff80] {
             let tensor = bf16_tensor(3, 1, &[0x3f80, 0x4000, invalid]);
             assert!(matvec_into(&tensor, &[1.0, 2.0, 0.0], &mut output, &mut scratch).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [0.0_f32; 0]);
         }
         let tensor = bf16_tensor(3, 1, &[0x3f80, 0x8000, 0x4000]);
         assert!(matvec_into(&tensor, &[1.0; 2], &mut output, &mut scratch).is_err());
-        assert!(output.is_empty());
+        assert_eq!(output, [0.0_f32; 0]);
         assert!(!scratch.diagnostics().dispatched);
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
             assert!(matvec_into(&tensor, &[1.0, 0.0, invalid], &mut output, &mut scratch).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [0.0_f32; 0]);
             assert!(!scratch.diagnostics().dispatched);
         }
         let mut odd_payload = bf16_tensor(3, 1, &[0x3f80, 0x4000, 0x4040]);
@@ -2771,7 +2772,7 @@ mod tests {
             odd_payload,
         ] {
             assert!(matvec_into(&malformed, &[1.0; 3], &mut output, &mut scratch).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [0.0_f32; 0]);
             assert!(!scratch.diagnostics().dispatched);
         }
         matvec_into(&tensor, &[1.0, -0.0, 2.0], &mut output, &mut scratch)?;

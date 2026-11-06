@@ -28,6 +28,7 @@ pub struct Q2ProjectionLimits {
     pub(crate) rows: usize,
     pub(crate) operations: u32,
     pub(crate) duration: Duration,
+    pub(crate) persistent: bool,
 }
 
 impl Q2ProjectionLimits {
@@ -56,6 +57,7 @@ impl Q2ProjectionLimits {
             rows,
             operations,
             duration,
+            persistent: false,
         })
     }
 

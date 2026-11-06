@@ -1633,6 +1633,13 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                                     executor = executor.with_resident_weights(
                                         NATIVE_Q2_RESIDENT_METADATA_BYTES,
                                     )?;
+                                    for &name in &projections {
+                                        let tensor = placement_model
+                                            .tensors
+                                            .get(name)
+                                            .ok_or_else(reject)?;
+                                        require(executor.prewarm_tensor(tensor)?)?;
+                                    }
                                 }
                                 let value = compare_graph_sequence(
                                     graph,
@@ -1975,7 +1982,7 @@ mod tests {
                 Ok(())
             },
         )?;
-        assert!(events.is_empty());
+        assert_eq!(events, [Value::Null; 0]);
         let result: Result<()> = cpu_stage_with_report(
             "graph-construction",
             None,
@@ -2662,6 +2669,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep native-q2 admission, multi-layer projection geometry and bounded tolerance checks together."
+    )]
     fn model_probe_native_q2_admission_and_bounded_tolerance() -> Result<()> {
         let mut native_req = request();
         native_req["tokenIds"] = json!([42, 43, 128]);

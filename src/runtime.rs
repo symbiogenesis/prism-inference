@@ -195,6 +195,23 @@ impl Runtime<crate::graph::Qwen35> {
     /// # Errors
     /// Invalid/nonfinite scales and graphs without an adapter reject before any
     /// mutation. Later failure closes admission until successful explicit reset.
+    pub fn set_projection_executor(
+        &mut self,
+        executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
+    ) {
+        self.decoder.set_projection_executor(executor);
+    }
+
+    /// Clear complete conversation state before changing a loaded adapter scale.
+    ///
+    /// This narrow operation exposes no mutable decoder access. All committed
+    /// tokens, logits and saved prefixes are discarded only after the decoder
+    /// renews its empty-state identity and checkpoint provenance. Sampler state
+    /// remains caller-owned and is not changed by this operation.
+    ///
+    /// # Errors
+    /// Invalid/nonfinite scales and graphs without an adapter reject before any
+    /// mutation. Later failure closes admission until successful explicit reset.
     pub fn reset_with_adapter_scale(&mut self, scale: f32) -> Result<()> {
         crate::model::lora::RankOneAdapter::validate_scale(scale)?;
         if self.decoder.adapter_scale().is_none() {

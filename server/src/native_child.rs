@@ -134,6 +134,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
 /// verified model loading, listener setup and backend lifecycle failures.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     let config = parse(arguments).map_err(|error| startup::at(Stage::Arguments, &error))?;
+    crate::native_backend::register_hexagon_model_path(&config.model);
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
         .map_err(|error| startup::at(Stage::Environment, &error))?;
     if bonsai_windows_process::available_memory_bytes()

@@ -298,8 +298,8 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
     };
     if !work_result
         || session_failed
-        || report.operations_completed == 0
-        || report.queue_writes_completed == 0
+        || (!limits.persistent
+            && (report.operations_completed == 0 || report.queue_writes_completed == 0))
         || report.operations_completed
             != report
                 .queue_writes_completed
@@ -310,7 +310,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         }
         return Ok(report);
     }
-    if Instant::now() >= work_deadline {
+    if !limits.persistent && Instant::now() >= work_deadline {
         report.deadline_expired = true;
         report.queue.stage = "projection-work-expired-pinned";
         return Ok(report);
@@ -365,7 +365,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
     }
 
     fn within_deadline(&mut self) -> bool {
-        if Instant::now() < self.work_deadline {
+        if self.limits.persistent || Instant::now() < self.work_deadline {
             return true;
         }
         self.report.deadline_expired = true;
@@ -375,11 +375,16 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
 
     fn read(&mut self, sequence: u64, batch_operations: u32, expected_size: u32) -> bool {
         let started = Instant::now();
-        let deadline = (started + Duration::from_secs(3)).min(self.work_deadline);
+        let op_deadline = started + Duration::from_secs(3);
+        let deadline = if self.limits.persistent {
+            op_deadline
+        } else {
+            op_deadline.min(self.work_deadline)
+        };
         let spin_deadline = (started + Duration::from_millis(15)).min(deadline);
         loop {
             if Instant::now() >= deadline {
-                if Instant::now() >= self.work_deadline {
+                if !self.limits.persistent && Instant::now() >= self.work_deadline {
                     self.report.deadline_expired = true;
                 }
                 let _ = self.fail("projection-read-expired-pinned");
@@ -1010,15 +1015,17 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
 
 impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
     fn remaining_operations(&self) -> Option<u64> {
-        Some(if self.failed {
-            0
+        if self.failed {
+            Some(0)
+        } else if self.limits.persistent {
+            None
         } else {
-            u64::from(
+            Some(u64::from(
                 self.limits
                     .operations
                     .saturating_sub(self.report.operations_submitted),
-            )
-        })
+            ))
+        }
     }
 
     fn residency_capacity_bytes(&self) -> usize {
@@ -1109,6 +1116,261 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
             Activation::NativeQ2(activation),
             output,
         )
+    }
+}
+
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "Safe crate root wraps the native session handle."
+)]
+pub(crate) struct NativeQ2Session {
+    handle: u64,
+    domain: i32,
+    calls: super::Calls,
+    fd: i32,
+    allocation_bytes: usize,
+    queue: *mut c_void,
+    memory: *mut c_void,
+    expected: QueueBuffer,
+    limits: Q2ProjectionLimits,
+    columns: usize,
+    resident_weights: HmxQ2WeightRegistry,
+    native_resident_weights: NativeQ2WeightRegistry,
+    dirty_resident_weights: bool,
+    work_deadline: Instant,
+    report: Q2ProjectionReport,
+    failed: bool,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep module open, FastRPC mapping, queue startup and session construction auditable together"
+)]
+pub(super) fn open_native_q2(
+    driver: Driver,
+    package: &Path,
+    limits: NativeQ2ProjectionLimits,
+) -> Result<NativeQ2Session, Error> {
+    let started = Instant::now();
+    let work_deadline = started
+        + limits
+            .common
+            .duration
+            .checked_sub(Duration::from_secs(3))
+            .ok_or(Error::Contract)?;
+    let mode = Mode::NativeQ2 {
+        columns: limits.columns,
+    };
+    let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0));
+    report.batch_operations = mode.batch_operations();
+    let (queue_report, opened) = open_module(
+        driver,
+        package,
+        &mut |queue| {
+            report.queue = *queue;
+        },
+        compute::ComputeFixture::GuardedQ2NoBlock,
+    )?;
+    report.queue = queue_report;
+    let (handle, domain, calls) = opened.ok_or(Error::Contract)?;
+    if !limits.common.persistent && Instant::now() >= work_deadline {
+        return Err(Error::Contract);
+    }
+    let allocation_bytes = (mode.allocation_bytes(limits.common.rows)
+        + limits.resident_weight_bytes)
+        .next_multiple_of(4096);
+    let allocator_request = i32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
+    let descriptor_size = u32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
+    // SAFETY: one explicitly bounded cached system-heap allocation, under i32 limits.
+    let memory = unsafe { (calls.alloc)(25, 1, allocator_request) };
+    if memory.is_null() || memory.addr() % 4096 != 0 {
+        return Err(Error::Contract);
+    }
+    // SAFETY: fresh, exclusive, correctly aligned allocator-owned extent.
+    unsafe {
+        std::ptr::write_bytes(memory.cast::<u8>(), 0, allocation_bytes);
+    }
+    // SAFETY: only this driver's fresh allocator-owned pointer is passed back.
+    let fd = unsafe { (calls.to_fd)(memory) };
+    let fd_u32 = u32::try_from(fd).map_err(|_| Error::Contract)?;
+    report.queue.allocation_succeeded = true;
+    // SAFETY: exact aligned pointer/FD/length and original validated effective domain.
+    let result = unsafe { (calls.map)(domain, fd, memory, 0, allocation_bytes, 2) };
+    report.queue.mapping_result = Some(result);
+    if result != 0 {
+        return Err(Error::Contract);
+    }
+    report.mapped_allocation_bytes = allocation_bytes;
+    let mut queue = null_mut();
+    // SAFETY: fixed bounded queues, no callbacks/context; exact checked public ABI.
+    let result = unsafe {
+        (calls.queue_create)(
+            domain,
+            0,
+            4096,
+            4096,
+            None,
+            None,
+            null_mut(),
+            &raw mut queue,
+        )
+    };
+    report.queue.queue_create_result = Some(result);
+    if result != 0 || queue.is_null() {
+        return Err(Error::Contract);
+    }
+    let mut queue_id = u64::MAX;
+    // SAFETY: one live driver-owned queue and poisoned writable u64 export ID.
+    let result = unsafe { (calls.queue_export)(queue, &raw mut queue_id) };
+    report.queue.queue_export_result = Some(result);
+    if result != 0 || queue_id == u64::MAX {
+        return Err(Error::Contract);
+    }
+    let mut start = native_q2::start_wire(queue_id, allocation_bytes)?;
+    let mut argument = RemoteBuffer {
+        pointer: start.as_mut_ptr().cast(),
+        bytes: start.len(),
+    };
+    // SAFETY: same independently checked 48-byte seven-argument start frame.
+    let result = unsafe { (calls.invoke)(handle, compute::START_SCALARS, &raw mut argument) };
+    report.queue.queue_start_result = Some(result);
+    if result != 0 {
+        return Err(Error::Contract);
+    }
+    let expected = QueueBuffer {
+        fd: fd_u32,
+        size: descriptor_size,
+        offset: 0,
+        flags: 0x90,
+        pointer: memory,
+    };
+    Ok(NativeQ2Session {
+        handle,
+        domain,
+        calls,
+        fd,
+        allocation_bytes,
+        queue,
+        memory,
+        expected,
+        limits: limits.common,
+        columns: limits.columns,
+        resident_weights: HmxQ2WeightRegistry::new(0)?,
+        native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes)?,
+        dirty_resident_weights: false,
+        work_deadline,
+        report,
+        failed: false,
+    })
+}
+
+impl NativeQ2Session {
+    fn with_session<R>(
+        &mut self,
+        f: impl FnOnce(&mut Session<'_, fn(&Q2ProjectionReport)>) -> R,
+    ) -> R {
+        const fn noop(_: &Q2ProjectionReport) {}
+        let mut progress: fn(&Q2ProjectionReport) = noop;
+        let mut session = Session {
+            report: &mut self.report,
+            queue_write: &self.calls.queue_write,
+            queue_read: self.calls.queue_read,
+            queue: self.queue,
+            memory: self.memory,
+            expected: self.expected,
+            limits: self.limits,
+            mode: Mode::NativeQ2 {
+                columns: self.columns,
+            },
+            resident_weights: self.resident_weights.clone(),
+            native_resident_weights: self.native_resident_weights.clone(),
+            dirty_resident_weights: self.dirty_resident_weights,
+            work_deadline: self.work_deadline,
+            progress: &mut progress,
+            failed: self.failed,
+        };
+        let out = f(&mut session);
+        self.native_resident_weights = session.native_resident_weights;
+        self.dirty_resident_weights = session.dirty_resident_weights;
+        self.failed = session.failed;
+        out
+    }
+}
+
+impl NativeQ2Submitter for NativeQ2Session {
+    fn remaining_operations(&self) -> Option<u64> {
+        if self.failed {
+            Some(0)
+        } else if self.limits.persistent {
+            None
+        } else {
+            Some(u64::from(
+                self.limits
+                    .operations
+                    .saturating_sub(self.report.operations_submitted),
+            ))
+        }
+    }
+
+    fn residency_capacity_bytes(&self) -> usize {
+        if self.failed {
+            0
+        } else {
+            self.native_resident_weights.remaining_bytes()
+        }
+    }
+
+    fn prepare_weights(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::prepare_weights(session, columns, rows, weights)
+        })
+    }
+
+    fn submit_resident(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident(session, handle, activation, output)
+        })
+    }
+
+    fn submit(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weights: &[u8],
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit(session, columns, rows, weights, activation, output)
+        })
+    }
+}
+
+impl Drop for NativeQ2Session {
+    fn drop(&mut self) {
+        if !self.failed {
+            let _ = cleanup_extent(
+                self.report.queue,
+                &self.calls.cleanup_calls(),
+                self.handle,
+                self.queue,
+                self.domain,
+                self.fd,
+                self.memory,
+                self.allocation_bytes,
+                &mut |_| {},
+            );
+        }
     }
 }
 

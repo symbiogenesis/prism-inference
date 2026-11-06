@@ -94,12 +94,16 @@ fn head(
             output[token * width + row] = value * scale;
         }
         let last = count - 1;
-        for (column, &initial) in state.iter().enumerate() {
-            let mut value = cumulative[last] * initial;
-            for (prior, &delta) in deltas[..count].iter().enumerate() {
-                value += (products[last][prior] * delta) * inputs[prior].key[column];
+        let last_cumulative = cumulative[last];
+        let matrix_row = &mut matrix[row * width..(row + 1) * width];
+        for (dst, &initial) in matrix_row.iter_mut().zip(state) {
+            *dst = last_cumulative * initial;
+        }
+        for (prior, &delta) in deltas[..count].iter().enumerate() {
+            let scaled_delta = products[last][prior] * delta;
+            for (dst, &key) in matrix_row.iter_mut().zip(inputs[prior].key) {
+                *dst += scaled_delta * key;
             }
-            matrix[row * width + column] = value;
         }
     }
     finite(matrix, "chunkwise GDN state")?;
@@ -140,6 +144,7 @@ pub(super) fn recurrent_tile(
     else {
         return Err(invalid("chunkwise GDN requires recurrent state"));
     };
+    let mut previous_weight = None;
     for (weight, outputs) in [
         (&layer.qkv, &mut tile.mixed),
         (&layer.gate, &mut tile.recurrent_gate),
@@ -154,6 +159,7 @@ pub(super) fn recurrent_tile(
             adapter,
             adapter_scale,
             adapter_scratch,
+            previous_weight,
             weight,
             &tile.normalized[..count],
             &mut outputs[..count],
@@ -161,6 +167,7 @@ pub(super) fn recurrent_tile(
             &mut tile.projector,
             check,
         )?;
+        previous_weight = Some(weight);
     }
     copy_into(history, convolution)?;
     copy_into(previous, matrix)?;
@@ -260,6 +267,7 @@ pub(super) fn recurrent_tile(
         adapter,
         adapter_scale,
         adapter_scratch,
+        None,
         &layer.output,
         &tile.attended[..count],
         &mut tile.attention[..count],

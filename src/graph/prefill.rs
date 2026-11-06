@@ -446,6 +446,7 @@ impl Qwen35 {
                 )?;
                 check()?;
             }
+            let mut previous = None;
             for (weight, output) in [(&layer.up, &mut tile.up), (&layer.gate, &mut tile.gate)] {
                 check()?;
                 project_tile(
@@ -455,6 +456,7 @@ impl Qwen35 {
                     self.adapter.as_ref(),
                     self.adapter_scale,
                     &mut self.workspace.adapter,
+                    previous,
                     weight,
                     &tile.normalized[..count],
                     &mut output[..count],
@@ -462,6 +464,7 @@ impl Qwen35 {
                     &mut tile.projector,
                     check,
                 )?;
+                previous = Some(weight);
             }
             for (up, gate) in tile.up[..count].iter_mut().zip(&tile.gate[..count]) {
                 self.arithmetic.swiglu_in_place(gate, up)?;
@@ -474,6 +477,7 @@ impl Qwen35 {
                 self.adapter.as_ref(),
                 self.adapter_scale,
                 &mut self.workspace.adapter,
+                None,
                 &layer.down,
                 &tile.up[..count],
                 &mut tile.normalized[..count],
@@ -505,6 +509,7 @@ fn project_tile(
     adapter: Option<&RankOneAdapter>,
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
+    previous: Option<&Tensor>,
     tensor: &Tensor,
     inputs: &[Vec<f32>],
     outputs: &mut [Vec<f32>],
@@ -512,15 +517,20 @@ fn project_tile(
     projector: &mut ProjectionTile,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    let activation = if transforms.basis(tensor).0 {
-        for (input, transformed) in inputs.iter().zip(transformed.iter_mut()) {
-            transforms.transform_into(tensor, input, geometry, transformed)?;
+    let basis = transforms.basis(tensor);
+    let reuse_basis = previous.is_some_and(|prev| transforms.basis(prev) == basis);
+    let activation = if basis.0 {
+        if !reuse_basis {
+            for (input, transformed) in inputs.iter().zip(transformed.iter_mut()) {
+                transforms.transform_into(tensor, input, geometry, transformed)?;
+            }
         }
         &*transformed
     } else {
         inputs
     };
-    projector.project(
+    projector.project_with_previous(
+        previous.filter(|_| reuse_basis),
         tensor,
         activation,
         outputs,

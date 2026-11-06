@@ -1,6 +1,7 @@
 //! Exact integer reductions over one decoded block shared by a prompt tile.
 
-use super::super::{MatvecBackend, pq2_values, q8_native_lanes};
+use super::super::{MatvecBackend, pq2_values, ptq1_values, q8_native_lanes};
+use crate::Result;
 
 #[cfg(all(
     feature = "experimental-neon",
@@ -26,6 +27,7 @@ pub(super) enum Block {
 }
 
 impl Block {
+    #[cfg(test)]
     #[allow(
         clippy::missing_const_for_fn,
         reason = "Only the scalar fallback is constant; retain one signature across targets and feature sets."
@@ -67,6 +69,23 @@ impl Block {
         Self::Scalar(pq2_values(&full))
     }
 
+    pub(super) fn from_ptq1(packed: &[u8; 28], backend: MatvecBackend) -> Result<Self> {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if backend != MatvecBackend::Scalar
+            && let Some(block) = neon::Block::from_ptq1(packed)
+        {
+            return Ok(Self::Neon(block));
+        }
+        let _ = backend;
+        Ok(Self::Scalar(ptq1_values(packed)?))
+    }
+
     #[inline]
     pub(super) fn dot128(&self, values: &[i8; 128]) -> i32 {
         match self {
@@ -98,6 +117,21 @@ impl Block {
     }
 
     #[inline]
+    pub(super) fn dot128_eight(&self, values: [&[i8; 128]; 8]) -> [i32; 8] {
+        match self {
+            Self::Scalar(weights) => values.map(|token| scalar(weights, token)),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.dot128_eight(values),
+        }
+    }
+
+    #[inline]
     pub(super) fn dot32(&self, group: usize, values: &[i8; 32]) -> i32 {
         match self {
             Self::Scalar(weights) => scalar(&weights[group * 32..group * 32 + 32], values),
@@ -113,6 +147,24 @@ impl Block {
     }
 
     #[inline]
+    pub(super) fn dot32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [i32; 4] {
+        match self {
+            Self::Scalar(weights) => {
+                let slice = &weights[group * 32..group * 32 + 32];
+                values.map(|token| scalar(slice, token))
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.dot32_four(group, values),
+        }
+    }
+
+    #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         match self {
             Self::Scalar(weights) => q8_native_lanes(&weights[group * 32..group * 32 + 32], values),
@@ -124,6 +176,24 @@ impl Block {
                 target_feature = "neon"
             ))]
             Self::Neon(block) => block.lanes32(group, values),
+        }
+    }
+
+    #[inline]
+    pub(super) fn lanes32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
+        match self {
+            Self::Scalar(weights) => {
+                let slice = &weights[group * 32..group * 32 + 32];
+                values.map(|token| q8_native_lanes(slice, token))
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.lanes32_four(group, values),
         }
     }
 }
@@ -171,13 +241,15 @@ mod tests {
                 let expected128 = scalar(&weights, &values);
                 assert_eq!(block.dot128(&values), expected128);
                 assert_eq!(block.dot128_four([&values; 4]), [expected128; 4]);
+                assert_eq!(block.dot128_eight([&values; 8]), [expected128; 8]);
                 for (group, values) in values.as_chunks::<32>().0.iter().enumerate() {
                     let weights = &weights[group * 32..group * 32 + 32];
-                    assert_eq!(block.dot32(group, values), scalar(weights, values));
-                    assert_eq!(
-                        block.lanes32(group, values),
-                        q8_native_lanes(weights, values)
-                    );
+                    let expected32 = scalar(weights, values);
+                    let expected_lanes = q8_native_lanes(weights, values);
+                    assert_eq!(block.dot32(group, values), expected32);
+                    assert_eq!(block.dot32_four(group, [values; 4]), [expected32; 4]);
+                    assert_eq!(block.lanes32(group, values), expected_lanes);
+                    assert_eq!(block.lanes32_four(group, [values; 4]), [expected_lanes; 4]);
                 }
             }
         }

@@ -11,8 +11,8 @@
 )]
 
 use super::{
-    MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, dimensions, finite, integer_float,
-    matvec_into, ptq1_values, scale,
+    ActivationContract, MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, dimensions,
+    finite, integer_float, matvec_into, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -50,13 +50,26 @@ impl ProjectionTile {
         self.row_parallelism = parallelism;
     }
 
+    #[cfg(test)]
+    pub(crate) fn project(
+        &mut self,
+        tensor: &Tensor,
+        inputs: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+        pinned: bool,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.project_with_previous(None, tensor, inputs, outputs, pinned, check)
+    }
+
     #[allow(
         clippy::suboptimal_flops,
         clippy::too_many_lines,
         reason = "Retain the separately rounded source arithmetic and auditable packed block order."
     )]
-    pub(crate) fn project(
+    pub(crate) fn project_with_previous(
         &mut self,
+        previous: Option<&Tensor>,
         tensor: &Tensor,
         inputs: &[Vec<f32>],
         outputs: &mut [Vec<f32>],
@@ -72,6 +85,16 @@ impl ProjectionTile {
             {
                 return Err(invalid("invalid bounded projection tile"));
             }
+            let reuse_prepared = matches!(tensor.kind, PQ2 | PTQ1)
+                && self.preparations.len() >= inputs.len()
+                && previous.is_some_and(|prev| {
+                    matches!(prev.kind, PQ2 | PTQ1)
+                        && dimensions(prev).is_ok_and(|(prev_cols, _, _)| {
+                            prev_cols == columns
+                                && ActivationContract::for_tensor(prev, prev_cols, pinned)
+                                    == ActivationContract::for_tensor(tensor, columns, pinned)
+                        })
+                });
             while self.preparations.len() < inputs.len() {
                 self.preparations.try_reserve_exact(1)?;
                 self.preparations.push(if pinned {
@@ -90,7 +113,9 @@ impl ProjectionTile {
                 // tile output, including unsupported-format fallback inputs.
                 check()?;
                 scratch.pinned_accumulation = pinned;
-                scratch.prepare_input(tensor, input)?;
+                if !reuse_prepared {
+                    scratch.prepare_input(tensor, input)?;
+                }
                 output.try_reserve_exact(rows)?;
             }
             if !matches!(tensor.kind, PQ2 | PTQ1) {
@@ -128,14 +153,51 @@ impl ProjectionTile {
                         let weights = if tensor.kind == PQ2 {
                             dot::Block::from_pq2(block[2..34].try_into()?, backend)
                         } else {
-                            dot::Block::new(ptq1_values(block)?, backend)
+                            dot::Block::from_ptq1(block.try_into()?, backend)?
                         };
                         *decoded_blocks = decoded_blocks.saturating_add(1);
                         if tensor.kind == PQ2 && columns.is_multiple_of(256) {
                             let start = (index % 2) * 128;
-                            let (chunks, rem) = preparations.as_chunks::<4>();
-                            for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                                let base = chunk_idx * 4;
+                            let (chunks8, rem8) = preparations.as_chunks::<8>();
+                            for (chunk_idx, chunk) in chunks8.iter().enumerate() {
+                                let base = chunk_idx * 8;
+                                let a0 = &chunk[0].q8k[index / 2];
+                                let a1 = &chunk[1].q8k[index / 2];
+                                let a2 = &chunk[2].q8k[index / 2];
+                                let a3 = &chunk[3].q8k[index / 2];
+                                let a4 = &chunk[4].q8k[index / 2];
+                                let a5 = &chunk[5].q8k[index / 2];
+                                let a6 = &chunk[6].q8k[index / 2];
+                                let a7 = &chunk[7].q8k[index / 2];
+                                let dots = weights.dot128_eight([
+                                    a0.values[start..start + 128].try_into()?,
+                                    a1.values[start..start + 128].try_into()?,
+                                    a2.values[start..start + 128].try_into()?,
+                                    a3.values[start..start + 128].try_into()?,
+                                    a4.values[start..start + 128].try_into()?,
+                                    a5.values[start..start + 128].try_into()?,
+                                    a6.values[start..start + 128].try_into()?,
+                                    a7.values[start..start + 128].try_into()?,
+                                ]);
+                                for (offset, (act, dot_int)) in [a0, a1, a2, a3, a4, a5, a6, a7]
+                                    .into_iter()
+                                    .zip(dots)
+                                    .enumerate()
+                                {
+                                    let d = weight_scale * act.scale;
+                                    let dot = integer_float(dot_int);
+                                    let token = base + offset;
+                                    sums[token] = if pinned {
+                                        d.mul_add(dot, sums[token])
+                                    } else {
+                                        sums[token] + d * dot
+                                    };
+                                }
+                            }
+                            let base4 = chunks8.len() * 8;
+                            let (chunks4, rem) = rem8.as_chunks::<4>();
+                            for (chunk_idx, chunk) in chunks4.iter().enumerate() {
+                                let base = base4 + chunk_idx * 4;
                                 let a0 = &chunk[0].q8k[index / 2];
                                 let a1 = &chunk[1].q8k[index / 2];
                                 let a2 = &chunk[2].q8k[index / 2];
@@ -159,7 +221,7 @@ impl ProjectionTile {
                                     };
                                 }
                             }
-                            let rem_base = chunks.len() * 4;
+                            let rem_base = base4 + chunks4.len() * 4;
                             for (offset, scratch) in rem.iter().enumerate() {
                                 let activation = &scratch.q8k[index / 2];
                                 let d = weight_scale * activation.scale;
@@ -174,29 +236,79 @@ impl ProjectionTile {
                                     sums[token] + d * dot
                                 };
                             }
-                        } else {
-                            for (token, scratch) in preparations.iter().enumerate() {
-                                let activations = &scratch.q8[index * 4..index * 4 + 4];
-                                let mut sum = 0.0;
-                                for (group, activation) in activations.iter().enumerate() {
-                                    if tensor.kind == PTQ1 && pinned {
-                                        let d = weight_scale * activation.scale;
-                                        for (lane, integer) in lanes[token]
-                                            .iter_mut()
-                                            .zip(weights.lanes32(group, &activation.values))
+                        } else if tensor.kind == PTQ1 && pinned {
+                            let (chunks4, rem) = preparations.as_chunks::<4>();
+                            for (chunk_idx, chunk) in chunks4.iter().enumerate() {
+                                let base = chunk_idx * 4;
+                                for group in 0..4 {
+                                    let a0 = &chunk[0].q8[index * 4 + group];
+                                    let a1 = &chunk[1].q8[index * 4 + group];
+                                    let a2 = &chunk[2].q8[index * 4 + group];
+                                    let a3 = &chunk[3].q8[index * 4 + group];
+                                    let group_lanes = weights.lanes32_four(
+                                        group,
+                                        [&a0.values, &a1.values, &a2.values, &a3.values],
+                                    );
+                                    for (offset, (act, integers)) in
+                                        [a0, a1, a2, a3].into_iter().zip(group_lanes).enumerate()
+                                    {
+                                        let d = weight_scale * act.scale;
+                                        for (lane, integer) in
+                                            lanes[base + offset].iter_mut().zip(integers)
                                         {
                                             *lane = integer_float(integer).mul_add(d, *lane);
                                         }
-                                    } else {
-                                        sum += activation.scale
-                                            * integer_float(
-                                                weights.dot32(group, &activation.values),
-                                            );
                                     }
                                 }
-                                if tensor.kind != PTQ1 || !pinned {
-                                    sums[token] += weight_scale * sum;
+                            }
+                            let rem_base = chunks4.len() * 4;
+                            for (offset, scratch) in rem.iter().enumerate() {
+                                let token = rem_base + offset;
+                                let activations = &scratch.q8[index * 4..index * 4 + 4];
+                                for (group, activation) in activations.iter().enumerate() {
+                                    let d = weight_scale * activation.scale;
+                                    for (lane, integer) in lanes[token]
+                                        .iter_mut()
+                                        .zip(weights.lanes32(group, &activation.values))
+                                    {
+                                        *lane = integer_float(integer).mul_add(d, *lane);
+                                    }
                                 }
+                            }
+                        } else {
+                            let (chunks4, rem) = preparations.as_chunks::<4>();
+                            for (chunk_idx, chunk) in chunks4.iter().enumerate() {
+                                let base = chunk_idx * 4;
+                                let mut chunk_sums = [0.0_f32; 4];
+                                for group in 0..4 {
+                                    let a0 = &chunk[0].q8[index * 4 + group];
+                                    let a1 = &chunk[1].q8[index * 4 + group];
+                                    let a2 = &chunk[2].q8[index * 4 + group];
+                                    let a3 = &chunk[3].q8[index * 4 + group];
+                                    let dots = weights.dot32_four(
+                                        group,
+                                        [&a0.values, &a1.values, &a2.values, &a3.values],
+                                    );
+                                    for (offset, (act, dot_int)) in
+                                        [a0, a1, a2, a3].into_iter().zip(dots).enumerate()
+                                    {
+                                        chunk_sums[offset] += act.scale * integer_float(dot_int);
+                                    }
+                                }
+                                for (offset, sum) in chunk_sums.into_iter().enumerate() {
+                                    sums[base + offset] += weight_scale * sum;
+                                }
+                            }
+                            let rem_base = chunks4.len() * 4;
+                            for (offset, scratch) in rem.iter().enumerate() {
+                                let token = rem_base + offset;
+                                let activations = &scratch.q8[index * 4..index * 4 + 4];
+                                let mut sum = 0.0;
+                                for (group, activation) in activations.iter().enumerate() {
+                                    sum += activation.scale
+                                        * integer_float(weights.dot32(group, &activation.values));
+                                }
+                                sums[token] += weight_scale * sum;
                             }
                         }
                     }

@@ -1,6 +1,33 @@
 //! Baseline NEON over one predecoded PQ2/PTQ1 block, reused across token dots.
 
-use fearless_simd::{Neon, i8x16, i16x8, prelude::*, u8x16, u16x8};
+use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8, u32x4, u64x2};
+
+#[inline]
+fn trits(packed: u8x16<Neon>) -> [i8x16<Neon>; 5] {
+    let (mut low, mut high) = packed.widen();
+    std::array::from_fn(|_| {
+        low *= 3;
+        high *= 3;
+        let digit = (low >> 8).narrow(high >> 8).bitcast::<i8x16<Neon>>() - 1;
+        low &= 255;
+        high &= 255;
+        digit
+    })
+}
+
+#[inline]
+fn join_low8(low: i8x16<Neon>, high: i8x16<Neon>) -> i8x16<Neon> {
+    low.bitcast::<u64x2<Neon>>()
+        .zip_low(high.bitcast::<u64x2<Neon>>())
+        .bitcast()
+}
+
+#[inline]
+fn reduce4_i32x4(r0: i32x4<Neon>, r1: i32x4<Neon>, r2: i32x4<Neon>, r3: i32x4<Neon>) -> [i32; 4] {
+    let p01 = r0.unzip_low(r1) + r0.unzip_high(r1);
+    let p23 = r2.unzip_low(r3) + r2.unzip_high(r3);
+    (p01.unzip_low(p23) + p01.unzip_high(p23)).to_array()
+}
 
 pub(in crate::kernels::prefill) struct Block {
     neon: Neon,
@@ -8,6 +35,7 @@ pub(in crate::kernels::prefill) struct Block {
 }
 
 impl Block {
+    #[cfg(test)]
     pub(super) fn new(weights: &[i16; 128]) -> Option<Self> {
         let neon = fearless_simd::Level::baseline().as_neon()?;
         Some(Self {
@@ -42,6 +70,44 @@ impl Block {
                 weights[half * 8 + group * 2] = low;
                 weights[half * 8 + group * 2 + 1] = high;
             }
+        }
+        Some(Self { neon, weights })
+    }
+
+    pub(super) fn from_ptq1(packed: &[u8; 28]) -> Option<Self> {
+        let neon = fearless_simd::Level::baseline().as_neon()?;
+        let first = trits(u8x16::from_slice(neon, &packed[..16]));
+        // Overlap only bytes 10..26; no load reaches the scale or exceeds the block.
+        let rest = u8x16::from_slice(neon, &packed[10..26]);
+        let middle =
+            trits(rest.swizzle_dyn([6, 7, 8, 9, 10, 11, 12, 13, 6, 7, 8, 9, 10, 11, 12, 13]));
+        let last = trits(rest.swizzle_dyn([
+            14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+        ]));
+        let tail_low: u32x4<Neon> = last[0]
+            .bitcast::<u16x8<Neon>>()
+            .zip_low(last[1].bitcast::<u16x8<Neon>>())
+            .bitcast();
+        let tail_high: u32x4<Neon> = last[2]
+            .bitcast::<u16x8<Neon>>()
+            .zip_low(last[3].bitcast::<u16x8<Neon>>())
+            .bitcast();
+        let tail = tail_low.zip_low(tail_high).bitcast();
+        let decoded = [
+            first[0],
+            first[1],
+            first[2],
+            first[3],
+            first[4],
+            join_low8(middle[0], middle[1]),
+            join_low8(middle[2], middle[3]),
+            join_low8(middle[4], tail),
+        ];
+        let mut weights = [i16x8::splat(neon, 0); 16];
+        for (group, vector) in decoded.into_iter().enumerate() {
+            let (low, high) = vector.widen();
+            weights[group * 2] = low;
+            weights[group * 2 + 1] = high;
         }
         Some(Self { neon, weights })
     }
@@ -83,13 +149,34 @@ impl Block {
         let (s1_l, s1_h) = acc[1].widen();
         let (s2_l, s2_h) = acc[2].widen();
         let (s3_l, s3_h) = acc[3].widen();
-        let r0 = s0_l + s0_h;
-        let r1 = s1_l + s1_h;
-        let r2 = s2_l + s2_h;
-        let r3 = s3_l + s3_h;
-        let p01 = r0.unzip_low(r1) + r0.unzip_high(r1);
-        let p23 = r2.unzip_low(r3) + r2.unzip_high(r3);
-        (p01.unzip_low(p23) + p01.unzip_high(p23)).to_array()
+        reduce4_i32x4(s0_l + s0_h, s1_l + s1_h, s2_l + s2_h, s3_l + s3_h)
+    }
+
+    #[inline]
+    pub(super) fn dot128_eight(&self, values: [&[i8; 128]; 8]) -> [i32; 8] {
+        let mut acc = [i16x8::splat(self.neon, 0); 8];
+        let chunks = values.map(|token| token.as_chunks::<16>().0);
+        for index in 0..8 {
+            let w_low = self.weights[index * 2];
+            let w_high = self.weights[index * 2 + 1];
+            for token in 0..8 {
+                let (low, high) = i8x16::from_slice(self.neon, &chunks[token][index]).widen();
+                acc[token] += w_low * low + w_high * high;
+            }
+        }
+        let (s0_l, s0_h) = acc[0].widen();
+        let (s1_l, s1_h) = acc[1].widen();
+        let (s2_l, s2_h) = acc[2].widen();
+        let (s3_l, s3_h) = acc[3].widen();
+        let (s4_l, s4_h) = acc[4].widen();
+        let (s5_l, s5_h) = acc[5].widen();
+        let (s6_l, s6_h) = acc[6].widen();
+        let (s7_l, s7_h) = acc[7].widen();
+        let first = reduce4_i32x4(s0_l + s0_h, s1_l + s1_h, s2_l + s2_h, s3_l + s3_h);
+        let second = reduce4_i32x4(s4_l + s4_h, s5_l + s5_h, s6_l + s6_h, s7_l + s7_h);
+        [
+            first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
+        ]
     }
 
     #[inline]
@@ -104,6 +191,23 @@ impl Block {
     }
 
     #[inline]
+    pub(super) fn dot32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [i32; 4] {
+        let w0 = self.weights[group * 4];
+        let w1 = self.weights[group * 4 + 1];
+        let w2 = self.weights[group * 4 + 2];
+        let w3 = self.weights[group * 4 + 3];
+        let sums = values.map(|token| {
+            let halves = token.as_chunks::<16>().0;
+            let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &halves[1]).widen();
+            let pairs = (w0 * l0 + w1 * h0) + (w2 * l1 + w3 * h1);
+            let (sum_low, sum_high) = pairs.widen();
+            sum_low + sum_high
+        });
+        reduce4_i32x4(sums[0], sums[1], sums[2], sums[3])
+    }
+
+    #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         let halves = values.as_chunks::<16>().0;
         let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
@@ -114,11 +218,24 @@ impl Block {
         let sum_23 = self.weights[group * 4 + 1] * h0 + self.weights[group * 4 + 3] * h1;
         let (lane0, lane1) = sum_01.widen();
         let (lane2, lane3) = sum_23.widen();
-        [
-            lane0.reduce_sum(),
-            lane1.reduce_sum(),
-            lane2.reduce_sum(),
-            lane3.reduce_sum(),
-        ]
+        reduce4_i32x4(lane0, lane1, lane2, lane3)
+    }
+
+    #[inline]
+    pub(super) fn lanes32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
+        let w0 = self.weights[group * 4];
+        let w1 = self.weights[group * 4 + 1];
+        let w2 = self.weights[group * 4 + 2];
+        let w3 = self.weights[group * 4 + 3];
+        values.map(|token| {
+            let halves = token.as_chunks::<16>().0;
+            let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &halves[1]).widen();
+            let sum_01 = w0 * l0 + w2 * l1;
+            let sum_23 = w1 * h0 + w3 * h1;
+            let (lane0, lane1) = sum_01.widen();
+            let (lane2, lane3) = sum_23.widen();
+            reduce4_i32x4(lane0, lane1, lane2, lane3)
+        })
     }
 }

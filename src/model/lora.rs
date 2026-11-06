@@ -257,7 +257,7 @@ impl RankOneAdapter {
             &factors.a_values,
             input,
             &mut scratch.rank,
-            &mut scratch.matvec,
+            &scratch.matvec,
         )?;
         lora_b_scale(&factors.b_values, &scratch.rank, &mut scratch.correction)?;
         self.finish(scale, output, &mut scratch.correction)

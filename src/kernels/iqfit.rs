@@ -303,13 +303,11 @@ pub(super) fn quantize<const N: usize>(
             let mut signs = [0_u8; 4];
             for index in 0..config.width {
                 let square = source[index] * source[index];
-                weight[index] = finite(importance.map_or_else(
-                    || {
-                        if kind == 22 {
-                            0.25 * sigma2 + square
-                        } else {
-                            square
-                        }
+                weight[index] = finite(importance.map_or(
+                    if kind == 22 {
+                        0.25 * sigma2 + square
+                    } else {
+                        square
                     },
                     |importance| {
                         importance[group * config.width + index] * (sigma2 + square).sqrt()

@@ -1863,13 +1863,10 @@ pub(crate) fn lora_a_dot(
     a_values: &[f32],
     input: &[f32],
     output: &mut Vec<f32>,
-    scratch: &mut MatvecScratch,
+    scratch: &MatvecScratch,
 ) -> Result<()> {
     fill_into(output, |output| {
-        if a_values.is_empty()
-            || input.len() != a_values.len()
-            || input.iter().any(|value| !value.is_finite())
-        {
+        if a_values.is_empty() || input.len() != a_values.len() || !is_finite_slice(input) {
             return Err(invalid(
                 "matvec requires a matching finite activation vector",
             ));
@@ -2137,6 +2134,110 @@ pub fn round_f16(value: f32) -> f32 {
     half_to_float(half_bits(value))
 }
 
+pub(crate) fn round_f16_slice(values: &mut [f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::round_f16_slice(values) {
+        return;
+    }
+    for value in values {
+        *value = round_f16(*value);
+    }
+}
+
+pub(crate) fn is_finite_slice(values: &[f32]) -> bool {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(finite) = neon::is_finite_slice(values) {
+        return finite;
+    }
+    values.iter().all(|value| value.is_finite())
+}
+
+pub(crate) fn add_slice_in_place(target: &mut [f32], other: &[f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::add_slice_in_place(target, other) {
+        return;
+    }
+    for (target, &other) in target.iter_mut().zip(other) {
+        *target += other;
+    }
+}
+
+pub(crate) fn mul_slice_in_place(target: &mut [f32], other: &[f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::mul_slice_in_place(target, other) {
+        return;
+    }
+    for (target, &other) in target.iter_mut().zip(other) {
+        *target *= other;
+    }
+}
+
+pub(crate) fn mul_slice_into(input: &[f32], signs: &[f32], output: &mut [f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::mul_slice_into(input, signs, output) {
+        return;
+    }
+    for ((out, &value), &sign) in output.iter_mut().zip(input).zip(signs) {
+        *out = value * sign;
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
+)]
+pub(crate) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::l2_norm_in_place(input, epsilon) {
+        return;
+    }
+    let squares = input
+        .iter()
+        .map(|&value| f64::from(value * value))
+        .sum::<f64>();
+    let scale = 1.0 / (squares as f32).sqrt().max(epsilon);
+    for value in input {
+        *value *= scale;
+    }
+}
+
 const fn round_bf16(value: f32) -> f32 {
     let bits = value.to_bits();
     if value.is_nan() {
@@ -2179,6 +2280,16 @@ pub fn rms_norm_into(
 ) -> Result<()> {
     fill_into(output, |output| {
         let scale = rms_norm_scale(input, weight, epsilon)?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(result) = neon::rms_norm_scale_into::<false>(input, weight, scale, output) {
+            return result;
+        }
         collect_into(
             input
                 .iter()
@@ -2202,6 +2313,16 @@ pub(crate) fn rms_norm_pinned_into(
 ) -> Result<()> {
     fill_into(output, |output| {
         let scale = rms_norm_scale(input, weight, epsilon)?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(result) = neon::rms_norm_scale_into::<true>(input, weight, scale, output) {
+            return result;
+        }
         collect_into(
             input
                 .iter()
@@ -2214,6 +2335,16 @@ pub(crate) fn rms_norm_pinned_into(
 
 pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
     let scale = rms_norm_scale(values, weight, epsilon)?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::rms_norm_scale_in_place::<false>(values, weight, scale) {
+        return result;
+    }
     for (value, &w) in values.iter_mut().zip(weight) {
         *value = finite(*value * scale * w)?;
     }
@@ -2226,6 +2357,16 @@ pub(crate) fn rms_norm_pinned_in_place(
     epsilon: f32,
 ) -> Result<()> {
     let scale = rms_norm_scale(values, weight, epsilon)?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::rms_norm_scale_in_place::<true>(values, weight, scale) {
+        return result;
+    }
     for (value, &w) in values.iter_mut().zip(weight) {
         *value = finite((*value * w) * scale)?;
     }
@@ -2244,12 +2385,40 @@ fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
         ));
     }
     let count = u32::try_from(input.len())?;
-    let mut sum = 0.0_f64;
-    for (&value, &w) in input.iter().zip(weight) {
-        finite(value)?;
-        finite(w)?;
-        sum += f64::from(value * value);
-    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    let sum = if let Some(sum) = neon::rms_norm_squares(input, weight) {
+        sum?
+    } else {
+        let mut sum = 0.0_f64;
+        for (&value, &w) in input.iter().zip(weight) {
+            finite(value)?;
+            finite(w)?;
+            sum += f64::from(value * value);
+        }
+        sum
+    };
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    let sum = {
+        let mut sum = 0.0_f64;
+        for (&value, &w) in input.iter().zip(weight) {
+            finite(value)?;
+            finite(w)?;
+            sum += f64::from(value * value);
+        }
+        sum
+    };
     let mean = (sum / f64::from(count)) as f32;
     let scale = 1.0 / (mean + epsilon).sqrt();
     if !scale.is_finite() || scale <= 0.0 {

@@ -13,9 +13,10 @@ use bonsai_ternary::half_to_float;
 
 use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place, swiglu_into};
 use crate::kernels::{
-    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism, half_bits,
-    rms_norm_in_place, rms_norm_into, rms_norm_pinned_in_place, rms_norm_pinned_into, round_f16,
-    row, row_into, silu, softmax,
+    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism,
+    add_slice_in_place, half_bits, is_finite_slice, l2_norm_in_place, mul_slice_in_place,
+    mul_slice_into, rms_norm_in_place, rms_norm_into, rms_norm_pinned_in_place,
+    rms_norm_pinned_into, round_f16_slice, row, row_into, silu, softmax,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -870,10 +871,15 @@ impl Transforms {
             }
             self.sign(transformed);
         } else if let Some(signs) = self.signs.get(&input.len()) {
-            prepare(transformed, input.len())?;
-            transformed.extend(input.iter().zip(signs).map(|(&value, &sign)| value * sign));
-            if transformed.len() < input.len() {
-                transformed.extend_from_slice(&input[transformed.len()..]);
+            zeros_into(input.len(), transformed)?;
+            let overlap = input.len().min(signs.len());
+            mul_slice_into(
+                &input[..overlap],
+                &signs[..overlap],
+                &mut transformed[..overlap],
+            );
+            if overlap < input.len() {
+                transformed[overlap..].copy_from_slice(&input[overlap..]);
             }
         } else {
             copy_into(input, transformed)?;
@@ -884,9 +890,8 @@ impl Transforms {
 
     fn sign(&self, input: &mut [f32]) {
         if let Some(signs) = self.signs.get(&input.len()) {
-            for (value, sign) in input.iter_mut().zip(signs) {
-                *value *= sign;
-            }
+            let overlap = input.len().min(signs.len());
+            mul_slice_in_place(&mut input[..overlap], &signs[..overlap]);
         }
     }
 
@@ -1859,60 +1864,72 @@ impl Evaluation<'_, '_> {
         self.arithmetic
             .attention_rope(key, g, &scratch.frequencies)?;
         // F16 K x Q converts the F32 query to F16 even with F32 precision.
-        for element in scratch
-            .query
-            .iter_mut()
-            .chain(key.iter_mut())
-            .chain(value.iter_mut())
-        {
-            *element = round_f16(*element);
-        }
+        round_f16_slice(&mut scratch.query);
+        round_f16_slice(key);
+        round_f16_slice(value);
         finite(&scratch.query, "binary16 attention query")?;
         finite(key, "binary16 key cache")?;
         finite(value, "binary16 value cache")?;
         zeros_into(g.head * g.heads, &mut scratch.attended)?;
+        let score_len = self.position + 1;
+        zeros_into(g.heads * score_len, &mut scratch.scores)?;
         let scale = 1.0 / small_float(g.head)?.sqrt();
-        for head in 0..g.heads {
-            let kv_head = head / (g.heads / g.kv_heads);
-            let offset = kv_head * g.head;
-            let q = &scratch.query[head * g.head..(head + 1) * g.head];
-            prepare(&mut scratch.scores, self.position + 1)?;
-            let scores = &mut scratch.scores;
-            for past in keys.tokens() {
-                scores.push(
-                    self.arithmetic
-                        .attention_dot(q, &past[offset..offset + g.head])?
-                        * scale,
-                );
-            }
-            scores.push(
-                self.arithmetic
-                    .attention_current_dot(q, &key[offset..offset + g.head])?
-                    * scale,
-            );
-            self.arithmetic.attention_softmax(scores)?;
-            // Nonflash V(F16) x softmax(F32) also converts its RHS to F16.
-            for probability in scores.iter_mut() {
-                *probability = round_f16(*probability);
-            }
-            let result = &mut scratch.attended[head * g.head..(head + 1) * g.head];
-            for (tile, out) in result
-                .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
-                .enumerate()
-            {
-                let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
-                self.arithmetic.attention_value_tile(
-                    values,
-                    &value[offset + dimension..offset + dimension + out.len()],
-                    offset + dimension,
-                    scores,
-                    out,
-                )?;
-            }
-        }
-        for (out, &gate) in scratch.attended.iter_mut().zip(&scratch.gate) {
-            *out *= sigmoid(gate);
-        }
+        let arithmetic = self.arithmetic;
+        let query_ref: &[f32] = &scratch.query;
+        let gate_ref: &[f32] = &scratch.gate;
+        let key_ref: &[f32] = key;
+        let value_ref: &[f32] = value;
+        let heads_per_kv = g.heads / g.kv_heads;
+        self.projection
+            .matvec
+            .row_parallelism()
+            .update_paired_chunks(
+                &mut scratch.attended,
+                g.head,
+                &mut scratch.scores,
+                score_len,
+                |base_head, attended_chunk, scores_chunk| {
+                    for (head_offset, (result, scores)) in attended_chunk
+                        .chunks_exact_mut(g.head)
+                        .zip(scores_chunk.chunks_exact_mut(score_len))
+                        .enumerate()
+                    {
+                        let head = base_head + head_offset;
+                        let kv_head = head / heads_per_kv;
+                        let offset = kv_head * g.head;
+                        let q = &query_ref[head * g.head..(head + 1) * g.head];
+                        for (pos, past) in keys.tokens().enumerate() {
+                            scores[pos] =
+                                arithmetic.attention_dot(q, &past[offset..offset + g.head])? * scale;
+                        }
+                        scores[score_len - 1] = arithmetic
+                            .attention_current_dot(q, &key_ref[offset..offset + g.head])?
+                            * scale;
+                        arithmetic.attention_softmax(scores)?;
+                        // Nonflash V(F16) x softmax(F32) also converts its RHS to F16.
+                        round_f16_slice(scores);
+                        for (tile, out) in result
+                            .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                            .enumerate()
+                        {
+                            let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
+                            arithmetic.attention_value_tile(
+                                values,
+                                &value_ref[offset + dimension..offset + dimension + out.len()],
+                                offset + dimension,
+                                scores,
+                                out,
+                            )?;
+                        }
+                        for (out, &gate) in
+                            result.iter_mut().zip(&gate_ref[head * g.head..(head + 1) * g.head])
+                        {
+                            *out *= sigmoid(gate);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         self.project_into(&layer.output, &scratch.attended, output)
     }
 
@@ -1957,21 +1974,23 @@ impl Evaluation<'_, '_> {
                 &mut scratch.alpha,
             ],
         )?;
-        copy_into(history, convolution)?;
+        let hist_width = g.convolution - 1;
+        zeros_into(history.len(), convolution)?;
         let mixed = &mut scratch.projected;
         for (channel, mixed_value) in mixed.iter_mut().enumerate() {
             let projected = *mixed_value;
-            let start = channel * (g.convolution - 1);
+            let start = channel * hist_width;
             let coefficients =
                 &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
             *mixed_value = self.arithmetic.convolution_row(
-                &history[start..start + g.convolution - 1],
+                &history[start..start + hist_width],
                 projected,
                 coefficients,
             )?;
-            if g.convolution > 1 {
-                convolution[start..start + g.convolution - 1].rotate_left(1);
-                convolution[start + g.convolution - 2] = projected;
+            if hist_width > 0 {
+                convolution[start..start + hist_width - 1]
+                    .copy_from_slice(&history[start + 1..start + hist_width]);
+                convolution[start + hist_width - 1] = projected;
             }
         }
         self.arithmetic.silu(mixed);
@@ -2644,7 +2663,7 @@ fn small_float(value: usize) -> Result<f32> {
 }
 
 fn finite(values: &[f32], operation: &str) -> Result<()> {
-    if values.iter().any(|value| !value.is_finite()) {
+    if !is_finite_slice(values) {
         return Err(invalid(format!("nonfinite values in {operation}")));
     }
     Ok(())
@@ -2678,20 +2697,8 @@ fn dot_f16(first: &[f32], second: &[u16]) -> f32 {
         .sum::<f64>() as f32
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::as_conversions,
-    reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
-)]
 fn l2_norm(input: &mut [f32], epsilon: f32) {
-    let squares = input
-        .iter()
-        .map(|&value| f64::from(value * value))
-        .sum::<f64>();
-    let scale = 1.0 / (squares as f32).sqrt().max(epsilon);
-    for value in input {
-        *value *= scale;
-    }
+    l2_norm_in_place(input, epsilon);
 }
 
 fn sigmoid(value: f32) -> f32 {
@@ -2699,9 +2706,7 @@ fn sigmoid(value: f32) -> f32 {
 }
 
 fn add(target: &mut [f32], other: &[f32]) {
-    for (target, other) in target.iter_mut().zip(other) {
-        *target += other;
-    }
+    add_slice_in_place(target, other);
 }
 
 #[allow(

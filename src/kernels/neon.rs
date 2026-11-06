@@ -154,19 +154,45 @@ pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 1
 }
 
 #[inline]
-fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
-    let raw = u32x4::from_slice(neon, &bits.map(u32::from));
+fn f16_u32x4_to_f32_x4(neon: Neon, raw: u32x4<Neon>) -> f32x4<Neon> {
     let sign = (raw & 0x8000) << 16;
     let exp = (raw >> 10) & 31;
     let mant = raw & 1023;
     let normal_bits = sign | ((exp + 112) << 23) | (mant << 13);
     let inf_nan_bits = sign | (u32x4::splat(neon, 255) << 23) | (mant << 13);
-    let subnormal_mag = mant.to_float::<f32x4<Neon>>() * f32x4::splat(neon, f32::from_bits(0x3380_0000));
+    let subnormal_mag =
+        mant.to_float::<f32x4<Neon>>() * f32x4::splat(neon, f32::from_bits(0x3380_0000));
     let subnormal_bits = sign | subnormal_mag.bitcast::<u32x4<Neon>>();
     let is_zero_exp = exp.simd_eq(u32x4::splat(neon, 0));
     let is_max_exp = exp.simd_eq(u32x4::splat(neon, 31));
     let selected = is_zero_exp.select(subnormal_bits, is_max_exp.select(inf_nan_bits, normal_bits));
     selected.bitcast::<f32x4<Neon>>()
+}
+
+#[inline]
+fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
+    f16_u32x4_to_f32_x4(neon, u32x4::from_slice(neon, &bits.map(u32::from)))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve ggml_compute_fp32_to_fp16 separate multiply/add rounding."
+)]
+fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
+    let mut base = (v.abs() * f32x4::splat(neon, f32::from_bits(0x7780_0000)))
+        * f32x4::splat(neon, f32::from_bits(0x0880_0000));
+    let bits = v.bitcast::<u32x4<Neon>>();
+    let doubled = bits + bits;
+    let exponent_bias = (doubled & 0xff00_0000).max(u32x4::splat(neon, 0x7100_0000));
+    base += ((exponent_bias >> 1) + u32x4::splat(neon, 0x0780_0000)).bitcast::<f32x4<Neon>>();
+    let rounded = base.bitcast::<u32x4<Neon>>();
+    let normal_mag = ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff);
+    let magnitude = doubled
+        .simd_gt(u32x4::splat(neon, 0xff00_0000))
+        .select(u32x4::splat(neon, 0x7e00), normal_mag);
+    let half_raw = (((bits >> 16) & 0x8000) | magnitude) & 0xffff;
+    f16_u32x4_to_f32_x4(neon, half_raw)
 }
 
 #[inline]
@@ -409,15 +435,7 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
 }
 
 #[inline]
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "Each narrowed Q8_K lane and 16-element i8 sum is bounded within i16."
-)]
-pub(super) fn q8k_block<const PINNED: bool>(
-    chunk: &[f32; 256],
-) -> Option<Result<bonsai_ternary::Q8KBlock>> {
-    let neon = fearless_simd::Level::baseline().as_neon()?;
+fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
     let mut max_abs_vec = f32x4::splat(neon, 0.0);
     for group in chunk.as_chunks::<16>().0 {
         let v0 = f32x4::from_slice(neon, &group[0..4]);
@@ -425,7 +443,7 @@ pub(super) fn q8k_block<const PINNED: bool>(
         let v2 = f32x4::from_slice(neon, &group[8..12]);
         let v3 = f32x4::from_slice(neon, &group[12..16]);
         if !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+            return Err(crate::invalid("nonfinite tensor or activation value"));
         }
         max_abs_vec = max_abs_vec
             .max(v0.abs())
@@ -439,6 +457,39 @@ pub(super) fn q8k_block<const PINNED: bool>(
         .max(max_lanes[1])
         .max(max_lanes[2])
         .max(max_lanes[3]);
+    if max_abs == 0.0 {
+        return Ok((0.0, 0.0));
+    }
+    let mut maximum = 0.0_f32;
+    let target_abs = f32x4::splat(neon, max_abs);
+    for sub in chunk.as_chunks::<4>().0 {
+        if f32x4::from_slice(neon, sub).abs().simd_eq(target_abs).any_true() {
+            for &value in sub {
+                if value.abs().to_bits() == max_abs.to_bits() {
+                    maximum = value;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    Ok((max_abs, maximum))
+}
+
+#[inline]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Each narrowed Q8_K lane and 16-element i8 sum is bounded within i16."
+)]
+pub(super) fn q8k_block<const PINNED: bool>(
+    chunk: &[f32; 256],
+) -> Option<Result<bonsai_ternary::Q8KBlock>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let (max_abs, maximum) = match max_abs_with_sign_256(neon, chunk) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
     let mut block = bonsai_ternary::Q8KBlock {
         scale: 0.0,
         values: [0; 256],
@@ -446,19 +497,6 @@ pub(super) fn q8k_block<const PINNED: bool>(
     };
     if max_abs == 0.0 {
         return Some(Ok(block));
-    }
-    let mut maximum = 0.0_f32;
-    let target_abs = f32x4::splat(neon, max_abs);
-    for sub in chunk.as_chunks::<4>().0 {
-        if f32x4::from_slice(neon, sub).abs().simd_eq(target_abs).any_true() {
-            for &value in sub {
-                if value.abs() == max_abs {
-                    maximum = value;
-                    break;
-                }
-            }
-            break;
-        }
     }
     let inverse_scale = -127.0 / maximum;
     if !inverse_scale.is_finite() {
@@ -701,6 +739,250 @@ pub(super) fn lora_finish_in_place(
         }
     }
     output.copy_from_slice(correction);
+    Some(Ok(()))
+}
+
+#[inline]
+pub(super) fn round_f16_slice(values: &mut [f32]) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        round_f16_x4(neon, f32x4::from_slice(neon, chunk)).store_slice(chunk);
+    }
+    for value in tail {
+        *value = super::round_f16(*value);
+    }
+    true
+}
+
+#[inline]
+pub(super) fn is_finite_slice(values: &[f32]) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let (groups, remainder) = values.as_chunks::<16>();
+    for group in groups {
+        let v0 = f32x4::from_slice(neon, &group[0..4]);
+        let v1 = f32x4::from_slice(neon, &group[4..8]);
+        let v2 = f32x4::from_slice(neon, &group[8..12]);
+        let v3 = f32x4::from_slice(neon, &group[12..16]);
+        if !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
+            return Some(false);
+        }
+    }
+    let (chunks, tail) = remainder.as_chunks::<4>();
+    for chunk in chunks {
+        if !f32x4::from_slice(neon, chunk).is_finite().all_true() {
+            return Some(false);
+        }
+    }
+    for &value in tail {
+        if !value.is_finite() {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+#[inline]
+pub(super) fn add_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let (t_chunks, t_tail) = target.as_chunks_mut::<4>();
+    let (o_chunks, o_tail) = other.as_chunks::<4>();
+    for (t_chunk, o_chunk) in t_chunks.iter_mut().zip(o_chunks) {
+        (f32x4::from_slice(neon, t_chunk) + f32x4::from_slice(neon, o_chunk)).store_slice(t_chunk);
+    }
+    for (t, &o) in t_tail.iter_mut().zip(o_tail) {
+        *t += o;
+    }
+    true
+}
+
+#[inline]
+pub(super) fn mul_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let (t_chunks, t_tail) = target.as_chunks_mut::<4>();
+    let (o_chunks, o_tail) = other.as_chunks::<4>();
+    for (t_chunk, o_chunk) in t_chunks.iter_mut().zip(o_chunks) {
+        (f32x4::from_slice(neon, t_chunk) * f32x4::from_slice(neon, o_chunk)).store_slice(t_chunk);
+    }
+    for (t, &o) in t_tail.iter_mut().zip(o_tail) {
+        *t *= o;
+    }
+    true
+}
+
+#[inline]
+pub(super) fn mul_slice_into(input: &[f32], signs: &[f32], output: &mut [f32]) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let (in_chunks, in_tail) = input.as_chunks::<4>();
+    let (s_chunks, s_tail) = signs.as_chunks::<4>();
+    let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
+    for ((in_chunk, s_chunk), out_chunk) in in_chunks.iter().zip(s_chunks).zip(out_chunks) {
+        (f32x4::from_slice(neon, in_chunk) * f32x4::from_slice(neon, s_chunk))
+            .store_slice(out_chunk);
+    }
+    for ((&v, &s), out) in in_tail.iter().zip(s_tail).zip(out_tail) {
+        *out = v * s;
+    }
+    true
+}
+
+#[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
+)]
+pub(super) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let mut squares = 0.0_f64;
+    let (chunks, tail) = input.as_chunks::<4>();
+    let mut sq_lanes = [0.0_f32; 4];
+    for chunk in chunks {
+        let v = f32x4::from_slice(neon, chunk);
+        (v * v).store_slice(&mut sq_lanes);
+        squares += f64::from(sq_lanes[0]);
+        squares += f64::from(sq_lanes[1]);
+        squares += f64::from(sq_lanes[2]);
+        squares += f64::from(sq_lanes[3]);
+    }
+    for &value in tail {
+        squares += f64::from(value * value);
+    }
+    let scale = 1.0 / (squares as f32).sqrt().max(epsilon);
+    let scale_vec = f32x4::splat(neon, scale);
+    let (chunks, tail) = input.as_chunks_mut::<4>();
+    for chunk in chunks {
+        (f32x4::from_slice(neon, chunk) * scale_vec).store_slice(chunk);
+    }
+    for value in tail {
+        *value *= scale;
+    }
+    true
+}
+
+#[inline]
+pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f64>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sum = 0.0_f64;
+    let (in_chunks, in_tail) = input.as_chunks::<4>();
+    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    let mut sq_lanes = [0.0_f32; 4];
+    for (in_chunk, w_chunk) in in_chunks.iter().zip(w_chunks) {
+        let v = f32x4::from_slice(neon, in_chunk);
+        let w = f32x4::from_slice(neon, w_chunk);
+        if !(v.is_finite() & w.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        (v * v).store_slice(&mut sq_lanes);
+        sum += f64::from(sq_lanes[0]);
+        sum += f64::from(sq_lanes[1]);
+        sum += f64::from(sq_lanes[2]);
+        sum += f64::from(sq_lanes[3]);
+    }
+    for (&value, &w) in in_tail.iter().zip(w_tail) {
+        if !value.is_finite() || !w.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        sum += f64::from(value * value);
+    }
+    Some(Ok(sum))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product roundings for both RMS contracts."
+)]
+pub(super) fn rms_norm_scale_into<const PINNED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    scale: f32,
+    output: &mut Vec<f32>,
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if let Err(err) = output.try_reserve_exact(input.len()) {
+        return Some(Err(err.into()));
+    }
+    output.resize(input.len(), 0.0);
+    let scale_vec = f32x4::splat(neon, scale);
+    let (in_chunks, in_tail) = input.as_chunks::<4>();
+    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
+    for ((in_chunk, w_chunk), out_chunk) in in_chunks.iter().zip(w_chunks).zip(out_chunks) {
+        let v = f32x4::from_slice(neon, in_chunk);
+        let w = f32x4::from_slice(neon, w_chunk);
+        let out = if PINNED {
+            (v * w) * scale_vec
+        } else {
+            (v * scale_vec) * w
+        };
+        if !out.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        out.store_slice(out_chunk);
+    }
+    for ((&value, &w), out) in in_tail.iter().zip(w_tail).zip(out_tail) {
+        let scaled = if PINNED {
+            (value * w) * scale
+        } else {
+            (value * scale) * w
+        };
+        if !scaled.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        *out = scaled;
+    }
+    Some(Ok(()))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product roundings for both RMS contracts."
+)]
+pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
+    values: &mut [f32],
+    weight: &[f32],
+    scale: f32,
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let scale_vec = f32x4::splat(neon, scale);
+    let (val_chunks, val_tail) = values.as_chunks_mut::<4>();
+    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    for (val_chunk, w_chunk) in val_chunks.iter_mut().zip(w_chunks) {
+        let v = f32x4::from_slice(neon, val_chunk);
+        let w = f32x4::from_slice(neon, w_chunk);
+        let out = if PINNED {
+            (v * w) * scale_vec
+        } else {
+            (v * scale_vec) * w
+        };
+        if !out.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        out.store_slice(val_chunk);
+    }
+    for (value, &w) in val_tail.iter_mut().zip(w_tail) {
+        let scaled = if PINNED {
+            (*value * w) * scale
+        } else {
+            (*value * scale) * w
+        };
+        if !scaled.is_finite() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        *value = scaled;
+    }
     Some(Ok(()))
 }
 

@@ -1109,7 +1109,7 @@ fn dot_legacy(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32> {
     clippy::cast_possible_truncation,
     reason = "The scalar reference rounds the accumulated binary64 sum to binary32."
 )]
-fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
+pub(crate) fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -1125,6 +1125,29 @@ fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
         .iter()
         .zip(input)
         .map(|(&a, &b)| f64::from(a * b))
+        .sum::<f64>() as f32
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Preserve binary32 products and binary64 accumulation when reading the binary16 cache."
+)]
+pub(crate) fn f16_dot(first: &[f32], second: &[u16]) -> f32 {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(value) = neon::f16_dot(first, second) {
+        return value;
+    }
+    first
+        .iter()
+        .zip(second)
+        .map(|(&first, &second)| f64::from(first * half_to_float(second)))
         .sum::<f64>() as f32
 }
 
@@ -2239,6 +2262,20 @@ pub(crate) fn round_f16_slice(values: &mut [f32]) {
     }
 }
 
+pub(crate) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::append_half_bits(values, output) {
+        return;
+    }
+    output.extend(values.iter().copied().map(half_bits));
+}
+
 pub(crate) fn is_finite_slice(values: &[f32]) -> bool {
     #[cfg(all(
         feature = "experimental-neon",
@@ -2298,6 +2335,42 @@ pub(crate) fn mul_slice_into(input: &[f32], signs: &[f32], output: &mut [f32]) {
     }
     for ((out, &value), &sign) in output.iter_mut().zip(input).zip(signs) {
         *out = value * sign;
+    }
+}
+
+pub(crate) fn scale_slice_into(input: &[f32], scale: f32, output: &mut [f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::scale_slice_into(input, scale, output) {
+        return;
+    }
+    for (out, &value) in output.iter_mut().zip(input) {
+        *out = scale * value;
+    }
+}
+
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 multiply and add roundings."
+)]
+pub(crate) fn add_scaled_slice_in_place(target: &mut [f32], input: &[f32], scale: f32) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::add_scaled_slice_in_place(target, input, scale) {
+        return;
+    }
+    for (target, &value) in target.iter_mut().zip(input) {
+        *target += scale * value;
     }
 }
 

@@ -31,11 +31,15 @@ pub(super) fn value_tile<'a>(
             .and_then(|row| row.get(range.start..range.end))
             .ok_or_else(|| invalid("pinned attention value row is short"))?;
         let weight = f32x4::splat(neon, weight);
-        for (sum, values) in sums[index % 16][..groups]
-            .iter_mut()
-            .zip(values.as_chunks::<4>().0)
-        {
-            let values = f32x4::load_array(neon, (*values).map(bonsai_ternary::half_to_float));
+        let (sum_pairs, sum_tail) = sums[index % 16][..groups].as_chunks_mut::<2>();
+        let (val_chunks8, val_rem) = values.as_chunks::<8>();
+        for (pair, chunk8) in sum_pairs.iter_mut().zip(val_chunks8) {
+            let (v0, v1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk8);
+            pair[0] = v0.mul_add_precise(weight, pair[0]);
+            pair[1] = v1.mul_add_precise(weight, pair[1]);
+        }
+        for (sum, values) in sum_tail.iter_mut().zip(val_rem.as_chunks::<4>().0) {
+            let values = super::super::neon::f16_bits_to_f32_x4(neon, *values);
             *sum = values.mul_add_precise(weight, *sum);
         }
     }
@@ -72,15 +76,26 @@ pub(super) fn value_tile<'a>(
 /// Reduces a validated F16 key slice and F32 query slice with four NEON FMA registers.
 pub(super) fn dot_f16(neon: Neon, key: &[u16], query: &[f32]) -> Result<f32> {
     let mut sums = [f32x4::splat(neon, 0.0); 4];
-    let key_chunks = key.as_chunks::<4>().0;
-    let query_chunks = query.as_chunks::<4>().0;
-    for (chunk, (k, q)) in key_chunks.iter().zip(query_chunks).enumerate() {
-        let acc = &mut sums[chunk % 4];
-        let kv = f32x4::load_array(neon, (*k).map(bonsai_ternary::half_to_float));
+    let (key_chunks8, key_rem) = key.as_chunks::<8>();
+    let (query_chunks8, query_rem) = query.as_chunks::<8>();
+    for (pair_idx, (k8, q8)) in key_chunks8.iter().zip(query_chunks8).enumerate() {
+        let base = (pair_idx * 2) % 4;
+        let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, k8);
+        let qv0 = f32x4::from_slice(neon, &q8[..4]);
+        let qv1 = f32x4::from_slice(neon, &q8[4..]);
+        sums[base] = kv0.mul_add_precise(qv0, sums[base]);
+        sums[base + 1] = kv1.mul_add_precise(qv1, sums[base + 1]);
+    }
+    let rem_base = key_chunks8.len() * 2;
+    let key_chunks4 = key_rem.as_chunks::<4>().0;
+    let query_chunks4 = query_rem.as_chunks::<4>().0;
+    for (offset, (k, q)) in key_chunks4.iter().zip(query_chunks4).enumerate() {
+        let acc = &mut sums[(rem_base + offset) % 4];
+        let kv = super::super::neon::f16_bits_to_f32_x4(neon, *k);
         let qv = f32x4::load_array(neon, *q);
         *acc = kv.mul_add_precise(qv, *acc);
     }
-    let vector_steps = key_chunks.len() * 4;
+    let vector_steps = key_chunks8.len() * 8 + key_chunks4.len() * 4;
     let total_steps = padded_dot_steps(query.len());
     if vector_steps == total_steps {
         let lanes = ((sums[0] + sums[2]) + (sums[1] + sums[3])).to_array();
@@ -197,7 +212,7 @@ pub(super) fn rope_with_aliasing(
 #[cfg(test)]
 mod tests {
     use bonsai_ternary::half_to_float;
-    use fearless_simd::{Neon, f32x4};
+    use fearless_simd::{Neon, f32x4, prelude::*};
 
     use super::{VALUE_TILE, value_tile};
 
@@ -254,6 +269,38 @@ mod tests {
                 .iter()
                 .all(|value| value.to_bits() == captured.native_bits)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn neon_f16_conversions_preserve_all_binary16_bit_patterns() -> crate::Result<()> {
+        let neon = fearless_simd::Level::baseline()
+            .as_neon()
+            .ok_or_else(|| crate::invalid("required attention baseline NEON token is absent"))?;
+        let all_bits: Vec<u16> = (0..=u16::MAX).collect();
+        for chunk8 in all_bits.as_chunks::<8>().0 {
+            let (v0, v1) = super::super::super::neon::f16_bits_to_f32_x8(neon, chunk8);
+            let a0 = v0.to_array();
+            let a1 = v1.to_array();
+            let c0 = super::super::super::neon::f16_bits_to_f32_x4(
+                neon,
+                [chunk8[0], chunk8[1], chunk8[2], chunk8[3]],
+            )
+            .to_array();
+            let c1 = super::super::super::neon::f16_bits_to_f32_x4(
+                neon,
+                [chunk8[4], chunk8[5], chunk8[6], chunk8[7]],
+            )
+            .to_array();
+            for lane in 0..4 {
+                let expected0 = half_to_float(chunk8[lane]).to_bits();
+                let expected1 = half_to_float(chunk8[lane + 4]).to_bits();
+                assert_eq!(a0[lane].to_bits(), expected0);
+                assert_eq!(c0[lane].to_bits(), expected0);
+                assert_eq!(a1[lane].to_bits(), expected1);
+                assert_eq!(c1[lane].to_bits(), expected1);
+            }
+        }
         Ok(())
     }
 }

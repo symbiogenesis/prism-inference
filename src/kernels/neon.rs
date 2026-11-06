@@ -188,7 +188,7 @@ pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 1
 }
 
 #[inline]
-fn f16_u32x4_to_f32_x4(neon: Neon, raw: u32x4<Neon>) -> f32x4<Neon> {
+pub(super) fn f16_u32x4_to_f32_x4(neon: Neon, raw: u32x4<Neon>) -> f32x4<Neon> {
     let sign = (raw & 0x8000) << 16;
     let exp = (raw >> 10) & 31;
     let mant = raw & 1023;
@@ -204,8 +204,20 @@ fn f16_u32x4_to_f32_x4(neon: Neon, raw: u32x4<Neon>) -> f32x4<Neon> {
 }
 
 #[inline]
-fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
+pub(super) fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
     f16_u32x4_to_f32_x4(neon, u32x4::from_slice(neon, &bits.map(u32::from)))
+}
+
+#[inline]
+pub(super) fn f16_bits_to_f32_x8(neon: Neon, bits: &[u16; 8]) -> (f32x4<Neon>, f32x4<Neon>) {
+    let raw = u16x8::from_slice(neon, bits);
+    let zero = u16x8::splat(neon, 0);
+    let low = raw.zip_low(zero).bitcast::<u32x4<Neon>>();
+    let high = raw.zip_high(zero).bitcast::<u32x4<Neon>>();
+    (
+        f16_u32x4_to_f32_x4(neon, low),
+        f16_u32x4_to_f32_x4(neon, high),
+    )
 }
 
 #[inline]
@@ -213,7 +225,7 @@ fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
     clippy::suboptimal_flops,
     reason = "Preserve ggml_compute_fp32_to_fp16 separate multiply/add rounding."
 )]
-fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
+fn half_bits_u32x4(neon: Neon, v: f32x4<Neon>) -> u32x4<Neon> {
     let mut base = (v.abs() * f32x4::splat(neon, f32::from_bits(0x7780_0000)))
         * f32x4::splat(neon, f32::from_bits(0x0880_0000));
     let bits = v.bitcast::<u32x4<Neon>>();
@@ -225,8 +237,12 @@ fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
     let magnitude = doubled
         .simd_gt(u32x4::splat(neon, 0xff00_0000))
         .select(u32x4::splat(neon, 0x7e00), normal_mag);
-    let half_raw = (((bits >> 16) & 0x8000) | magnitude) & 0xffff;
-    f16_u32x4_to_f32_x4(neon, half_raw)
+    (((bits >> 16) & 0x8000) | magnitude) & 0xffff
+}
+
+#[inline]
+fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
+    f16_u32x4_to_f32_x4(neon, half_bits_u32x4(neon, v))
 }
 
 #[inline]
@@ -762,6 +778,23 @@ pub(super) fn round_f16_slice(values: &mut [f32]) -> bool {
 }
 
 #[inline]
+pub(super) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let (chunks, tail) = values.as_chunks::<8>();
+    let mut converted = [0_u16; 8];
+    for chunk in chunks {
+        let low = half_bits_u32x4(neon, f32x4::from_slice(neon, &chunk[..4]));
+        let high = half_bits_u32x4(neon, f32x4::from_slice(neon, &chunk[4..]));
+        low.narrow(high).store_slice(&mut converted);
+        output.extend_from_slice(&converted);
+    }
+    output.extend(tail.iter().copied().map(super::half_bits));
+    true
+}
+
+#[inline]
 pub(super) fn is_finite_slice(values: &[f32]) -> Option<bool> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let (groups, remainder) = values.as_chunks::<16>();
@@ -834,6 +867,48 @@ pub(super) fn mul_slice_into(input: &[f32], signs: &[f32], output: &mut [f32]) -
     }
     for ((&v, &s), out) in in_tail.iter().zip(s_tail).zip(out_tail) {
         *out = v * s;
+    }
+    true
+}
+
+#[inline]
+pub(super) fn scale_slice_into(input: &[f32], scale: f32, output: &mut [f32]) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let count = input.len().min(output.len());
+    let scale_vec = f32x4::splat(neon, scale);
+    let (in_chunks, in_tail) = input[..count].as_chunks::<4>();
+    let (out_chunks, out_tail) = output[..count].as_chunks_mut::<4>();
+    for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks) {
+        (scale_vec * f32x4::from_slice(neon, in_chunk)).store_slice(out_chunk);
+    }
+    for (&v, out) in in_tail.iter().zip(out_tail) {
+        *out = scale * v;
+    }
+    true
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 multiply and add roundings."
+)]
+pub(super) fn add_scaled_slice_in_place(target: &mut [f32], input: &[f32], scale: f32) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let count = target.len().min(input.len());
+    let scale_vec = f32x4::splat(neon, scale);
+    let (t_chunks, t_tail) = target[..count].as_chunks_mut::<4>();
+    let (in_chunks, in_tail) = input[..count].as_chunks::<4>();
+    for (t_chunk, in_chunk) in t_chunks.iter_mut().zip(in_chunks) {
+        let t = f32x4::from_slice(neon, t_chunk);
+        let prod = scale_vec * f32x4::from_slice(neon, in_chunk);
+        (t + prod).store_slice(t_chunk);
+    }
+    for (t, &v) in t_tail.iter_mut().zip(in_tail) {
+        *t += scale * v;
     }
     true
 }
@@ -1426,6 +1501,37 @@ pub(super) fn float_dot(weights: &[f32], input: &[f32]) -> Option<f32> {
     }
     for (&w, &act) in w_rem.iter().zip(in_rem) {
         sum += f64::from(w * act);
+    }
+    Some(sum as f32)
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn f16_dot(first: &[f32], second: &[u16]) -> Option<f32> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = first.len().min(second.len());
+    let (f_chunks, f_rem) = first[..count].as_chunks::<8>();
+    let (s_chunks, s_rem) = second[..count].as_chunks::<8>();
+    let mut sum = -0.0_f64;
+    for (f_chunk, s_chunk) in f_chunks.iter().zip(s_chunks) {
+        let (s0, s1) = f16_bits_to_f32_x8(neon, s_chunk);
+        let prod0 = (f32x4::from_slice(neon, &f_chunk[..4]) * s0).to_array();
+        let prod1 = (f32x4::from_slice(neon, &f_chunk[4..]) * s1).to_array();
+        sum += f64::from(prod0[0]);
+        sum += f64::from(prod0[1]);
+        sum += f64::from(prod0[2]);
+        sum += f64::from(prod0[3]);
+        sum += f64::from(prod1[0]);
+        sum += f64::from(prod1[1]);
+        sum += f64::from(prod1[2]);
+        sum += f64::from(prod1[3]);
+    }
+    for (&f, &s) in f_rem.iter().zip(s_rem) {
+        sum += f64::from(f * super::half_to_float(s));
     }
     Some(sum as f32)
 }

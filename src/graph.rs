@@ -14,9 +14,10 @@ use bonsai_ternary::half_to_float;
 use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place, swiglu_into};
 use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism,
-    add_slice_in_place, half_bits, is_finite_slice, l2_norm_in_place, mul_slice_in_place,
-    mul_slice_into, rms_norm_in_place, rms_norm_into, rms_norm_pinned_in_place,
-    rms_norm_pinned_into, round_f16_slice, row, row_into, silu, softmax,
+    add_scaled_slice_in_place, add_slice_in_place, append_half_bits, f16_dot, float_dot,
+    is_finite_slice, l2_norm_in_place, mul_slice_in_place, mul_slice_into, rms_norm_in_place,
+    rms_norm_into, rms_norm_pinned_in_place, rms_norm_pinned_into, round_f16_slice, row, row_into,
+    scale_slice_into, silu, softmax,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -127,9 +128,7 @@ impl Arithmetic {
     ) -> Result<f32> {
         match self {
             Self::Source => {
-                for (element, &prev) in state.iter_mut().zip(previous) {
-                    *element = prev * decay;
-                }
+                scale_slice_into(previous, decay, state);
                 Ok(dot(state, key))
             }
             Self::PinnedSwift => {
@@ -272,26 +271,16 @@ impl Arithmetic {
     }
 
     #[cfg(test)]
-    #[allow(
-        clippy::suboptimal_flops,
-        reason = "Preserve the generic graph's separate multiply/add rounding."
-    )]
     fn gdn_add_scaled(self, target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
         match self {
             Self::Source => {
-                for (target, &input) in target.iter_mut().zip(input) {
-                    *target += scale * input;
-                }
+                add_scaled_slice_in_place(target, input, scale);
                 Ok(())
             }
             Self::PinnedSwift => crate::kernels::pinned_gdn::add_scaled(target, input, scale),
         }
     }
 
-    #[allow(
-        clippy::suboptimal_flops,
-        reason = "Preserve the generic graph's separate multiply/add rounding."
-    )]
     fn gdn_update_and_dot(
         self,
         target: &mut [f32],
@@ -301,12 +290,8 @@ impl Arithmetic {
     ) -> Result<f32> {
         match self {
             Self::Source => {
-                for (target_elem, &input) in target.iter_mut().zip(key) {
-                    *target_elem += scale * input;
-                    if !target_elem.is_finite() {
-                        return Err(invalid("nonfinite values in GDN state"));
-                    }
-                }
+                add_scaled_slice_in_place(target, key, scale);
+                finite(target, "GDN state")?;
                 Ok(dot(target, query))
             }
             Self::PinnedSwift => {
@@ -384,7 +369,7 @@ impl KvCache {
 
     fn append(&mut self, values: &[f32]) {
         debug_assert_eq!(values.len(), self.width);
-        self.tail.extend(values.iter().copied().map(half_bits));
+        append_half_bits(values, &mut self.tail);
         self.len += self.width;
         if self.tail.len() == self.page_elements || self.len == self.maximum {
             self.pages.push(Arc::new(std::mem::take(&mut self.tail)));
@@ -2729,32 +2714,12 @@ fn finite(values: &[f32], operation: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::as_conversions,
-    reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
-)]
 fn dot(first: &[f32], second: &[f32]) -> f32 {
-    first
-        .iter()
-        .zip(second)
-        .map(|(&first, &second)| f64::from(first * second))
-        .sum::<f64>() as f32
+    float_dot(first, second)
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::as_conversions,
-    reason = "Preserve binary32 products and binary64 accumulation when reading the binary16 cache."
-)]
 fn dot_f16(first: &[f32], second: &[u16]) -> f32 {
-    // Widen each cached operand before the binary32 multiply, then accumulate
-    // its rounded product in binary64 exactly as the former float cache did.
-    first
-        .iter()
-        .zip(second)
-        .map(|(&first, &second)| f64::from(first * half_to_float(second)))
-        .sum::<f64>() as f32
+    f16_dot(first, second)
 }
 
 fn l2_norm(input: &mut [f32], epsilon: f32) {
@@ -2822,10 +2787,11 @@ mod tests {
 
     use super::{
         Arithmetic, Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES,
-        ProjectionScratch, Transforms, append_decayed_head, copy_state, dot, dot_f16, half_bits,
+        ProjectionScratch, Transforms, append_decayed_head, copy_state, dot, dot_f16,
         half_to_float, restore_state, rope, rope_frequencies,
     };
     use crate::Result;
+    use crate::kernels::half_bits;
     use crate::model::Tensor;
 
     fn read_gdn_word(input: &mut Cursor<&[u8]>) -> Result<u32> {

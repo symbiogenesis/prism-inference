@@ -25,12 +25,25 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Resul
         for block in input {
             let scale = super::finite(block.scale)?;
             for source in block.values.as_chunks::<128>().0 {
-                output.push(Activation {
-                    scale,
-                    values: std::array::from_fn(|index| {
-                        source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
-                    }),
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                let values = super::neon::prepare_pq2_activations(source);
+                #[cfg(not(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                )))]
+                let values = std::array::from_fn(|index| {
+                    source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
                 });
+                output.push(Activation { scale, values });
             }
         }
         Ok(())
@@ -66,6 +79,67 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &[Activation]) -> 
         };
     }
     super::finite(output)
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve original per-128 scalar multiply/add or pinned FMA rounding."
+)]
+pub(super) fn dot_four_rows<const FUSED: bool>(
+    rows: [&[u8]; 4],
+    input: &[Activation],
+) -> Result<[f32; 4]> {
+    if input.is_empty()
+        || rows
+            .iter()
+            .any(|bytes| bytes.len() / 34 != input.len() || !bytes.len().is_multiple_of(34))
+    {
+        return Err(invalid("incompatible packed consumption activation extent"));
+    }
+    let mut outputs = [0.0_f32; 4];
+    let c0 = rows[0].as_chunks::<34>().0;
+    let c1 = rows[1].as_chunks::<34>().0;
+    let c2 = rows[2].as_chunks::<34>().0;
+    let c3 = rows[3].as_chunks::<34>().0;
+    for ((((b0, b1), b2), b3), activation) in c0.iter().zip(c1).zip(c2).zip(c3).zip(input) {
+        let act_scale = activation.scale;
+        let ds = [
+            super::scale(b0)? * act_scale,
+            super::scale(b1)? * act_scale,
+            super::scale(b2)? * act_scale,
+            super::scale(b3)? * act_scale,
+        ];
+        let sums = super::neon::dot_consumption_order_four(
+            [
+                b0[2..].try_into()?,
+                b1[2..].try_into()?,
+                b2[2..].try_into()?,
+                b3[2..].try_into()?,
+            ],
+            &activation.values,
+        );
+        for lane in 0..4 {
+            let sum = super::integer_float(sums[lane]);
+            outputs[lane] = if FUSED {
+                ds[lane].mul_add(sum, outputs[lane])
+            } else {
+                outputs[lane] + ds[lane] * sum
+            };
+        }
+    }
+    Ok([
+        super::finite(outputs[0])?,
+        super::finite(outputs[1])?,
+        super::finite(outputs[2])?,
+        super::finite(outputs[3])?,
+    ])
 }
 
 #[cfg(test)]
@@ -256,7 +330,7 @@ mod tests {
     #[cfg(feature = "parallel-rows")]
     #[test]
     fn packed_consumption_parallel_rows_match_scalar_for_partial_worker_tiles() -> Result<()> {
-        for rows in [1, 3, 7] {
+        for rows in [1, 3, 4, 5, 7, 8, 9, 17, 25] {
             let tensor = weights(512, rows);
             let input: Vec<_> = (0..512)
                 .map(|index| [1.5, -127.0, 0.0, -0.0, 63.5][index % 5])
@@ -297,7 +371,7 @@ mod tests {
 mod native_tests {
     use bonsai_ternary::Q8KBlock;
 
-    use super::{dot_row, prepare};
+    use super::{dot_four_rows, dot_row, prepare};
     use crate::Result;
 
     #[test]
@@ -323,11 +397,21 @@ mod native_tests {
             dot_row::<false>(&weights, &prepared)?.to_bits(),
             0xc1f9_0b02
         );
+        assert_eq!(
+            dot_four_rows::<true>([&weights; 4], &prepared)?.map(f32::to_bits),
+            [0xc1f9_0b01; 4]
+        );
+        assert_eq!(
+            dot_four_rows::<false>([&weights; 4], &prepared)?.map(f32::to_bits),
+            [0xc1f9_0b02; 4]
+        );
         assert!(dot_row::<true>(&weights[..34], &prepared).is_err());
         assert!(dot_row::<true>(&weights[..67], &prepared).is_err());
         assert!(dot_row::<true>(&[], &[]).is_err());
+        assert!(dot_four_rows::<true>([&weights[..34]; 4], &prepared).is_err());
         weights[..2].copy_from_slice(&0x7c00_u16.to_le_bytes());
         assert!(dot_row::<true>(&weights, &prepared).is_err());
+        assert!(dot_four_rows::<true>([&weights; 4], &prepared).is_err());
         Ok(())
     }
 }

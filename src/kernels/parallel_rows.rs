@@ -339,4 +339,106 @@ impl RowParallelism {
         }
         Ok(())
     }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pub(super) fn fill_four_rows(
+        &self,
+        data: &[u8],
+        row_bytes: usize,
+        output: &mut Vec<f32>,
+        errors: &mut Vec<Option<crate::Error>>,
+        dot_four: impl Fn([&[u8]; 4]) -> Result<[f32; 4]> + Sync,
+        dot: impl Fn(&[u8]) -> Result<f32> + Sync,
+    ) -> Result<()> {
+        errors.clear();
+        let rows = data.len() / row_bytes;
+        #[cfg(not(feature = "parallel-rows"))]
+        if self.uses_pool(rows) {
+            return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool
+            && rows > 1
+        {
+            use rayon::prelude::*;
+
+            let task_rows = rows.div_ceil(self.workers);
+            let tasks = rows.div_ceil(task_rows);
+            errors.try_reserve_exact(tasks)?;
+            errors.resize_with(tasks, || None);
+            output.resize(rows, 0.0);
+            pool.install(|| {
+                output
+                    .par_chunks_mut(task_rows)
+                    .zip(errors.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(task, (chunk, error))| {
+                        let start = task * task_rows * row_bytes;
+                        let bytes = &data[start..start + chunk.len() * row_bytes];
+                        let (quads, rem_out) = chunk.as_chunks_mut::<4>();
+                        let quad_bytes_len = quads.len() * 4 * row_bytes;
+                        let (quad_bytes, rem_bytes) = bytes.split_at(quad_bytes_len);
+                        for (out_quad, group) in
+                            quads.iter_mut().zip(quad_bytes.chunks_exact(4 * row_bytes))
+                        {
+                            let r0 = &group[..row_bytes];
+                            let r1 = &group[row_bytes..2 * row_bytes];
+                            let r2 = &group[2 * row_bytes..3 * row_bytes];
+                            let r3 = &group[3 * row_bytes..4 * row_bytes];
+                            if let Ok(values) = dot_four([r0, r1, r2, r3]) {
+                                *out_quad = values;
+                            } else {
+                                for (target, row) in out_quad.iter_mut().zip([r0, r1, r2, r3]) {
+                                    match dot(row) {
+                                        Ok(result) => *target = result,
+                                        Err(failure) => {
+                                            *error = Some(failure);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for (value, row) in rem_out.iter_mut().zip(rem_bytes.chunks_exact(row_bytes))
+                        {
+                            match dot(row) {
+                                Ok(result) => *value = result,
+                                Err(failure) => {
+                                    *error = Some(failure);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+            });
+            let failure = errors.iter_mut().find_map(Option::take);
+            errors.clear();
+            return failure.map_or(Ok(()), Err);
+        }
+        let quad_bytes_len = (rows / 4) * 4 * row_bytes;
+        let (quad_bytes, rem_bytes) = data.split_at(quad_bytes_len);
+        for group in quad_bytes.chunks_exact(4 * row_bytes) {
+            let r0 = &group[..row_bytes];
+            let r1 = &group[row_bytes..2 * row_bytes];
+            let r2 = &group[2 * row_bytes..3 * row_bytes];
+            let r3 = &group[3 * row_bytes..4 * row_bytes];
+            if let Ok(values) = dot_four([r0, r1, r2, r3]) {
+                output.extend_from_slice(&values);
+            } else {
+                for row in [r0, r1, r2, r3] {
+                    output.push(dot(row)?);
+                }
+            }
+        }
+        for bytes in rem_bytes.chunks_exact(row_bytes) {
+            output.push(dot(bytes)?);
+        }
+        Ok(())
+    }
 }

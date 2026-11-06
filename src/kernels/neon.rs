@@ -98,6 +98,48 @@ pub(super) fn dot(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
     pq2_reduce(even + odd)
 }
 
+#[inline]
+fn pq2_pair_sums_prewidened(
+    weights: i8x16<Neon>,
+    activation_low: i16x8<Neon>,
+    activation_high: i16x8<Neon>,
+) -> i16x8<Neon> {
+    let (weight_low, weight_high) = weights.widen();
+    weight_low * activation_low + weight_high * activation_high
+}
+
+#[inline]
+pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> [i8; 128] {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return std::array::from_fn(|index| {
+            source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
+        });
+    };
+    let mut output = [0_i8; 128];
+    for (src_half, dst_half) in source
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(output.as_chunks_mut::<64>().0)
+    {
+        let chunks = src_half.as_chunks::<16>().0;
+        let v0 = i8x16::from_slice(neon, &chunks[0]);
+        let v1 = i8x16::from_slice(neon, &chunks[1]);
+        let v2 = i8x16::from_slice(neon, &chunks[2]);
+        let v3 = i8x16::from_slice(neon, &chunks[3]);
+        let e01 = v0.unzip_low(v1);
+        let o01 = v0.unzip_high(v1);
+        let e23 = v2.unzip_low(v3);
+        let o23 = v2.unzip_high(v3);
+        let dst = dst_half.as_chunks_mut::<16>().0;
+        e01.unzip_low(e23).store_slice(&mut dst[0]);
+        o01.unzip_low(o23).store_slice(&mut dst[1]);
+        e01.unzip_high(e23).store_slice(&mut dst[2]);
+        o01.unzip_high(o23).store_slice(&mut dst[3]);
+    }
+    output
+}
+
 /// Consumes scoped digit-plane activations without unpack interleaves per row.
 ///
 /// Each sixteen packed bytes describe sixty-four consecutive weights. Their
@@ -158,6 +200,51 @@ pub(super) fn dot_consumption_order(packed: &[u8; 32], activations: &[i8; 128]) 
         );
     }
     pq2_reduce(even + odd)
+}
+
+/// Evaluates four 128-weight `PQ2` blocks against shared pre-widened activation planes.
+#[inline]
+pub(super) fn dot_consumption_order_four(
+    packed: [&[u8; 32]; 4],
+    activations: &[i8; 128],
+) -> [i32; 4] {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return packed.map(|row| dot_consumption_order(row, activations));
+    };
+    let mut even = [i16x8::splat(neon, 0); 4];
+    let mut odd = [i16x8::splat(neon, 0); 4];
+    for (half, values) in activations.as_chunks::<64>().0.iter().enumerate() {
+        let planes = values.as_chunks::<16>().0;
+        let (p0_low, p0_high) = i8x16::from_slice(neon, &planes[0]).widen();
+        let (p1_low, p1_high) = i8x16::from_slice(neon, &planes[1]).widen();
+        let (p2_low, p2_high) = i8x16::from_slice(neon, &planes[2]).widen();
+        let (p3_low, p3_high) = i8x16::from_slice(neon, &planes[3]).widen();
+        for row in 0..4 {
+            let bytes = &packed[row].as_chunks::<16>().0[half];
+            let w = u8x16::from_slice(neon, bytes);
+            even[row] += pq2_pair_sums_prewidened(
+                (w & 3).bitcast::<i8x16<Neon>>() - 1,
+                p0_low,
+                p0_high,
+            );
+            odd[row] += pq2_pair_sums_prewidened(
+                ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
+                p1_low,
+                p1_high,
+            );
+            even[row] += pq2_pair_sums_prewidened(
+                ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
+                p2_low,
+                p2_high,
+            );
+            odd[row] += pq2_pair_sums_prewidened(
+                (w >> 6).bitcast::<i8x16<Neon>>() - 1,
+                p3_low,
+                p3_high,
+            );
+        }
+    }
+    std::array::from_fn(|row| pq2_reduce(even[row] + odd[row]))
 }
 
 #[inline]

@@ -1744,14 +1744,27 @@ impl MatvecScratch {
             packed_pq2::prepare(&self.q8k, &mut self.pq2_consumption)?;
         }
         let pinned = self.pinned_accumulation;
-        self.row_parallelism
-            .fill(data, row_bytes, output, &mut self.row_errors, |bytes| {
+        let activations = &self.pq2_consumption;
+        self.row_parallelism.fill_four_rows(
+            data,
+            row_bytes,
+            output,
+            &mut self.row_errors,
+            |rows| {
                 if pinned {
-                    packed_pq2::dot_row::<true>(bytes, &self.pq2_consumption)
+                    packed_pq2::dot_four_rows::<true>(rows, activations)
                 } else {
-                    packed_pq2::dot_row::<false>(bytes, &self.pq2_consumption)
+                    packed_pq2::dot_four_rows::<false>(rows, activations)
                 }
-            })
+            },
+            |bytes| {
+                if pinned {
+                    packed_pq2::dot_row::<true>(bytes, activations)
+                } else {
+                    packed_pq2::dot_row::<false>(bytes, activations)
+                }
+            },
+        )
     }
 
     const fn select_q8_groups(&mut self) -> Q8GroupRowKernel {

@@ -303,7 +303,7 @@ impl Request {
         let tokens = self.tokens();
         let projections = self.projection_names();
         let max_projections = match self.execution_backend {
-            ExecutionBackend::NativeQ2 => 26,
+            ExecutionBackend::NativeQ2 => 28,
             ExecutionBackend::GuardedHvx | ExecutionBackend::HmxBitplane => {
                 if self.resident_host_weights { 2 } else { 4 }
             }
@@ -2768,10 +2768,21 @@ mod tests {
             expected_resident_weight_bytes(&four_layer_block, ExecutionBackend::NativeQ2)?,
             427_622_400
         );
-        let mut four_layer_req = native_req;
+        let mut four_layer_req = native_req.clone();
         four_layer_req["projections"] = json!(four_layer_block);
         four_layer_req["maximumOperations"] = json!(75);
         serde_json::from_value::<Request>(four_layer_req)?.limits()?;
+
+        let twenty_eight_proj = bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS;
+        assert_eq!(twenty_eight_proj.len(), 28);
+        assert_eq!(
+            expected_resident_weight_bytes(&twenty_eight_proj, ExecutionBackend::NativeQ2)?,
+            502_824_960
+        );
+        let mut full_arena_req = native_req;
+        full_arena_req["projections"] = json!(twenty_eight_proj);
+        full_arena_req["maximumOperations"] = json!(84);
+        serde_json::from_value::<Request>(full_arena_req)?.limits()?;
 
         let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
         let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];

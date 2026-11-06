@@ -199,8 +199,19 @@ impl NativeQ2WeightRegistry {
             rows,
             weights,
         )?;
+        self.prepare_validated(columns, rows, weights.len())
+    }
+
+    /// Reserve one immutable, 128-byte-aligned packed-weight extent whose
+    /// geometry and `FP16` scales have already been validated.
+    pub(crate) fn prepare_validated(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        weight_bytes: usize,
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
         let start = self.used.next_multiple_of(128);
-        let end = start.checked_add(weights.len()).ok_or(Error::Contract)?;
+        let end = start.checked_add(weight_bytes).ok_or(Error::Contract)?;
         if end > self.capacity {
             return Ok(None);
         }
@@ -488,12 +499,35 @@ pub(crate) fn validate_inputs(
     )
 }
 
-pub(crate) fn validate_activation(
+#[inline]
+pub(crate) fn is_finite_f32_slice(values: &[f32]) -> bool {
+    const EXP_MASK: u32 = 0x7f80_0000;
+    const EXP_STEP: u32 = 0x0080_0000;
+    const SIGN_BIT: u32 = 0x8000_0000;
+
+    let (chunks, tail) = values.as_chunks::<16>();
+    for chunk in chunks {
+        let mut mask = 0_u32;
+        for &value in chunk {
+            mask |= (value.to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
+        }
+        if (mask & SIGN_BIT) != 0 {
+            return false;
+        }
+    }
+    let mut tail_mask = 0_u32;
+    for &value in tail {
+        tail_mask |= (value.to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
+    }
+    (tail_mask & SIGN_BIT) == 0
+}
+
+pub(crate) const fn validate_activation_dimensions(
     maximum_columns: usize,
     maximum_rows: usize,
     columns: usize,
     rows: usize,
-    activation: &[f32],
+    activation_len: usize,
     outputs: usize,
 ) -> Result<(), Error> {
     if columns == 0
@@ -502,13 +536,48 @@ pub(crate) fn validate_activation(
         || rows == 0
         || rows > maximum_rows
         || !rows.is_multiple_of(32)
-        || activation.len() != columns
+        || activation_len != columns
         || outputs != rows
-        || activation.iter().any(|value| !value.is_finite())
     {
         return Err(Error::Contract);
     }
     Ok(())
+}
+
+pub(crate) fn validate_activation(
+    maximum_columns: usize,
+    maximum_rows: usize,
+    columns: usize,
+    rows: usize,
+    activation: &[f32],
+    outputs: usize,
+) -> Result<(), Error> {
+    validate_activation_dimensions(
+        maximum_columns,
+        maximum_rows,
+        columns,
+        rows,
+        activation.len(),
+        outputs,
+    )?;
+    if !is_finite_f32_slice(activation) {
+        return Err(Error::Contract);
+    }
+    Ok(())
+}
+
+#[inline]
+fn tile_scales_valid(scales: &[u8]) -> bool {
+    const EXP_MASK: u64 = 0x7c00_7c00_7c00_7c00;
+    const EXP_STEP: u64 = 0x0400_0400_0400_0400;
+    const SIGN_BITS: u64 = 0x8000_8000_8000_8000;
+
+    let mut mask = 0_u64;
+    for chunk in scales.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*chunk);
+        mask |= (word & EXP_MASK).wrapping_add(EXP_STEP);
+    }
+    (mask & SIGN_BITS) == 0
 }
 
 pub(crate) fn validate_weights(
@@ -526,13 +595,11 @@ pub(crate) fn validate_weights(
         || !rows.is_multiple_of(32)
         || weights.len() != layout(columns, rows).weights
         || weights.len() > NATIVE_Q2_MAX_WEIGHT_BYTES
-        || weights.as_chunks::<576>().0.iter().any(|tile| {
-            tile[512..]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .any(|scale| (u16::from_le_bytes(*scale) & 0x7c00) == 0x7c00)
-        })
+        || weights
+            .as_chunks::<576>()
+            .0
+            .iter()
+            .any(|tile| !tile_scales_valid(&tile[512..]))
     {
         return Err(Error::Contract);
     }
@@ -654,21 +721,23 @@ pub(crate) fn image_batch_resident<const B: usize>(
         return Err(Error::Contract);
     }
     working[..CMD_PAD].fill(0);
-    let framing = compute::q2_framing_header(base, fd);
-    working[..24].copy_from_slice(&framing[..24]);
+    put64(working, 0, base);
     put64(
         working,
         8,
         u64::try_from(allocation).map_err(|_| Error::Contract)?,
     );
+    put32(working, 20, fd);
     let operations_base = 24 + B * 3 * 56;
     for (member, handle) in handles.into_iter().enumerate() {
-        let mut single = [0_u8; 1024];
-        write_descriptors(
-            &mut single,
-            base,
-            allocation,
-            fd,
+        let ti_base = u16::try_from(member * 3).map_err(|_| Error::Contract)?;
+        let weight_desc = 24 + (member * 3) * 56;
+        let operation_desc = operations_base + member * 232;
+        write_member_descriptors(
+            working,
+            ti_base,
+            weight_desc,
+            operation_desc,
             columns,
             handle.rows,
             weight_offsets[member],
@@ -676,36 +745,19 @@ pub(crate) fn image_batch_resident<const B: usize>(
             act_offset,
             output_offsets[member],
         )?;
-        let ti_base = u16::try_from(member * 3).map_err(|_| Error::Contract)?;
-        let weight_desc = 24 + (member * 3) * 56;
-        let act_desc = weight_desc + 56;
-        let out_desc = act_desc + 56;
-        working[weight_desc..weight_desc + 56].copy_from_slice(&single[24..80]);
-        working[act_desc..act_desc + 56].copy_from_slice(&single[80..136]);
-        working[out_desc..out_desc + 56].copy_from_slice(&single[136..192]);
-        put16(working, weight_desc + 22, ti_base);
-        put16(working, act_desc + 22, ti_base + 1);
-        put16(working, out_desc + 22, ti_base + 2);
-        let operation_desc = operations_base + member * 232;
-        working[operation_desc..operation_desc + 232].copy_from_slice(&single[192..424]);
-        put16(working, operation_desc + 200, ti_base);
-        put16(working, operation_desc + 202, ti_base + 1);
-        put16(working, operation_desc + 220, ti_base + 2);
     }
     for (dst, &value) in working[act_offset..act_offset + act_bytes]
         .as_chunks_mut::<4>()
-        .0
+        .0[..activation.len()]
         .iter_mut()
         .zip(activation)
     {
         *dst = value.to_bits().to_le_bytes();
     }
-    for dst in working[output_offsets[0]..output_end]
+    working[output_offsets[0]..output_end]
         .as_chunks_mut::<4>()
         .0
-    {
-        *dst = 0x7fc0_ae51_u32.to_le_bytes();
-    }
+        .fill(0x7fc0_ae51_u32.to_le_bytes());
     Ok(BatchLayout {
         output_offsets,
         output_end,
@@ -746,18 +798,16 @@ fn write_frame(
     let out_bytes = rows * 4;
     for (dst, &value) in bytes[active.activation..active.activation + act_bytes]
         .as_chunks_mut::<4>()
-        .0
+        .0[..activation.len()]
         .iter_mut()
         .zip(activation)
     {
         *dst = value.to_bits().to_le_bytes();
     }
-    for dst in bytes[active.output..active.output + out_bytes]
+    bytes[active.output..active.output + out_bytes]
         .as_chunks_mut::<4>()
         .0
-    {
-        *dst = 0x7fc0_ae51_u32.to_le_bytes();
-    }
+        .fill(0x7fc0_ae51_u32.to_le_bytes());
     Ok(())
 }
 
@@ -777,45 +827,98 @@ fn write_descriptors(
     act_offset: usize,
     out_offset: usize,
 ) -> Result<(), Error> {
-    const KP: usize = 264;
-    let (n_prefetch, src1_row_size, vtcm_size) = hvx_mv_params(columns, rows)?;
-    let framing = compute::q2_framing_header(base, fd);
-    bytes[..1024].copy_from_slice(&framing);
+    bytes[..1024].fill(0);
+    put64(bytes, 0, base);
     put64(
         bytes,
         8,
         u64::try_from(allocation_bytes).map_err(|_| Error::Contract)?,
     );
-    put64(
+    put32(bytes, 20, fd);
+    write_member_descriptors(
         bytes,
+        0,
         24,
-        u64::try_from(weight_offset).map_err(|_| Error::Contract)?,
-    );
+        192,
+        columns,
+        rows,
+        weight_offset,
+        weight_bytes,
+        act_offset,
+        out_offset,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep member Q2_0 tensor descriptors and HVX kparams together"
+)]
+fn write_member_descriptors(
+    bytes: &mut [u8],
+    ti_base: u16,
+    weight_desc: usize,
+    op_desc: usize,
+    columns: usize,
+    rows: usize,
+    weight_offset: usize,
+    weight_bytes: usize,
+    act_offset: usize,
+    out_offset: usize,
+) -> Result<(), Error> {
+    let (n_prefetch, src1_row_size, vtcm_size) = hvx_mv_params(columns, rows)?;
     let weight_row_bytes = 36 * (columns / 128);
     let act_bytes = columns * 4;
     let out_bytes = rows * 4;
+    let act_desc = weight_desc + 56;
+    let out_desc = act_desc + 56;
+    put64(
+        bytes,
+        weight_desc,
+        u64::try_from(weight_offset).map_err(|_| Error::Contract)?,
+    );
+    put16(bytes, weight_desc + 22, ti_base);
+    put64(
+        bytes,
+        act_desc,
+        u64::try_from(act_offset).map_err(|_| Error::Contract)?,
+    );
+    put16(bytes, act_desc + 22, ti_base + 1);
+    put64(
+        bytes,
+        out_desc,
+        u64::try_from(out_offset).map_err(|_| Error::Contract)?,
+    );
+    put16(bytes, out_desc + 22, ti_base + 2);
     for (offset, value) in [
-        (32, weight_bytes),
-        (48, columns),
-        (52, rows),
-        (64, 18),
-        (68, weight_row_bytes),
-        (72, weight_bytes),
-        (76, weight_bytes),
-        (88, act_bytes),
-        (104, columns),
-        (108, 1),
-        (120, 4),
-        (124, act_bytes),
-        (128, act_bytes),
-        (132, act_bytes),
-        (144, out_bytes),
-        (160, rows),
-        (164, 1),
-        (176, 4),
-        (180, out_bytes),
-        (184, out_bytes),
-        (188, out_bytes),
+        (weight_desc + 8, weight_bytes),
+        (weight_desc + 12, 3),
+        (weight_desc + 16, 42),
+        (weight_desc + 24, columns),
+        (weight_desc + 28, rows),
+        (weight_desc + 32, 1),
+        (weight_desc + 36, 1),
+        (weight_desc + 40, 18),
+        (weight_desc + 44, weight_row_bytes),
+        (weight_desc + 48, weight_bytes),
+        (weight_desc + 52, weight_bytes),
+        (act_desc + 8, act_bytes),
+        (act_desc + 24, columns),
+        (act_desc + 28, 1),
+        (act_desc + 32, 1),
+        (act_desc + 36, 1),
+        (act_desc + 40, 4),
+        (act_desc + 44, act_bytes),
+        (act_desc + 48, act_bytes),
+        (act_desc + 52, act_bytes),
+        (out_desc + 8, out_bytes),
+        (out_desc + 24, rows),
+        (out_desc + 28, 1),
+        (out_desc + 32, 1),
+        (out_desc + 36, 1),
+        (out_desc + 40, 4),
+        (out_desc + 44, out_bytes),
+        (out_desc + 48, out_bytes),
+        (out_desc + 52, out_bytes),
     ] {
         put32(
             bytes,
@@ -823,46 +926,50 @@ fn write_descriptors(
             u32::try_from(value).map_err(|_| Error::Contract)?,
         );
     }
-    put64(
-        bytes,
-        80,
-        u64::try_from(act_offset).map_err(|_| Error::Contract)?,
-    );
-    put64(
-        bytes,
-        136,
-        u64::try_from(out_offset).map_err(|_| Error::Contract)?,
-    );
-    bytes[KP..KP + 128].fill(0);
-    bytes[KP] = 7; // HTP_MM_KERNEL_HVX_QUANT_ROW_N1 (N = 1 < n_threads = 8).
-    bytes[KP + 3] = 0;
-    bytes[KP + 4] = u8::try_from(HMX_Q2_HVX_WORKERS).map_err(|_| Error::Contract)?;
-    bytes[KP + 6] = n_prefetch;
-    for (offset, value) in [
-        (8, 0),
-        (16, 576),
-        (20, 640),
-        (24, src1_row_size),
-        (28, vtcm_size),
-        (32, 0),
-    ] {
-        put32(bytes, KP + offset, value);
+    let kp = op_desc + 72;
+    put32(bytes, op_desc, 4); // HTP_OP_MUL_MAT, no stub or fusion flags.
+    bytes[kp] = 7; // HTP_MM_KERNEL_HVX_QUANT_ROW_N1 (N = 1 < n_threads = 8).
+    bytes[kp + 4] = u8::try_from(HMX_Q2_HVX_WORKERS).map_err(|_| Error::Contract)?;
+    bytes[kp + 6] = n_prefetch;
+    for (offset, value) in [(16, 576), (20, 640), (24, src1_row_size), (28, vtcm_size)] {
+        put32(bytes, kp + offset, value);
     }
     for index in 0..5 {
-        put32(bytes, KP + 36 + index * 8, 1);
-        put32(bytes, KP + 40 + index * 8, 0);
+        put32(bytes, kp + 36 + index * 8, 1);
     }
+    bytes[op_desc + 200..op_desc + 228].fill(0xff);
+    put16(bytes, op_desc + 200, ti_base);
+    put16(bytes, op_desc + 202, ti_base + 1);
+    put16(bytes, op_desc + 220, ti_base + 2);
     Ok(())
 }
 
 pub(crate) fn output_valid(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
-        && bytes.len().is_multiple_of(4)
-        && bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|value| f32::from_le_bytes(*value).is_finite())
+    const EXP_MASK: u32 = 0x7f80_0000;
+    const EXP_STEP: u32 = 0x0080_0000;
+    const SIGN_BIT: u32 = 0x8000_0000;
+
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let words = bytes.as_chunks::<4>().0;
+    let (chunks, tail) = words.as_chunks::<16>();
+    for chunk in chunks {
+        let mut mask = 0_u32;
+        for word in chunk {
+            let bits = u32::from_le_bytes(*word);
+            mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
+        }
+        if (mask & SIGN_BIT) != 0 {
+            return false;
+        }
+    }
+    let mut tail_mask = 0_u32;
+    for word in tail {
+        let bits = u32::from_le_bytes(*word);
+        tail_mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
+    }
+    (tail_mask & SIGN_BIT) == 0
 }
 
 fn put16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -946,9 +1053,107 @@ mod tests {
         assert_eq!(handle.rows(), 32);
         assert_eq!(handle.packed_bytes(), 1152);
 
-        // NaN FP16 scale must reject.
-        weights[512..514].copy_from_slice(&0x7e00_u16.to_le_bytes());
-        assert!(registry.prepare(128, 32, &weights).is_err());
+        // NaN FP16 scale must reject in every lane of the 64-byte scale block.
+        for lane in 0..32 {
+            let mut bad = weights.clone();
+            bad[512 + lane * 2..514 + lane * 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+            assert!(registry.prepare(128, 32, &bad).is_err());
+            bad[512 + lane * 2..514 + lane * 2].copy_from_slice(&0xfc00_u16.to_le_bytes());
+            assert!(registry.prepare(128, 32, &bad).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coalesced_finiteness_and_batch_resident_descriptors_preserve_contract() -> Result<(), Error>
+    {
+        for len in [1, 15, 16, 17, 32, 128] {
+            let mut values = vec![-1.25_f32; len];
+            assert!(is_finite_f32_slice(&values));
+            let mut bytes = Vec::with_capacity(len * 4);
+            for &v in &values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            assert!(output_valid(&bytes));
+            for pos in [0, len / 2, len - 1] {
+                values[pos] = f32::NAN;
+                assert!(!is_finite_f32_slice(&values));
+                values[pos] = f32::NEG_INFINITY;
+                assert!(!is_finite_f32_slice(&values));
+                values[pos] = 0.5;
+                let mut bad_bytes = bytes.clone();
+                bad_bytes[pos * 4..pos * 4 + 4].copy_from_slice(&f32::INFINITY.to_le_bytes());
+                assert!(!output_valid(&bad_bytes));
+            }
+        }
+
+        let mut registry = NativeQ2WeightRegistry::new(16_384)?;
+        let mut weights = vec![0x55_u8; layout(128, 32).weights];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = 0x3c00_u16.to_le_bytes();
+            }
+        }
+        let h0 = registry
+            .prepare(128, 32, &weights)?
+            .ok_or(Error::Contract)?;
+        let h1 = registry
+            .prepare(128, 32, &weights)?
+            .ok_or(Error::Contract)?;
+        let arena_start = 8192;
+        let mut arena = vec![0_u8; arena_start + 4096];
+        let activation = vec![1.5_f32; 128];
+        let batch = image_batch_resident(
+            &mut arena,
+            0x1000_0000,
+            7,
+            arena_start,
+            [&h0, &h1],
+            &activation,
+        )?;
+        assert_eq!(batch.output_offsets, [2560, 2688]);
+        assert_eq!(batch.output_end, 2816);
+        assert_eq!(
+            u64::from_le_bytes(arena[0..8].try_into().map_err(|_| Error::Contract)?),
+            0x1000_0000
+        );
+        assert_eq!(
+            u32::from_le_bytes(arena[20..24].try_into().map_err(|_| Error::Contract)?),
+            7
+        );
+        // Member 1 tensor indices are 3, 4, 5 and op_desc starts at 24 + 6*56 + 232 = 592.
+        assert_eq!(
+            u16::from_le_bytes(
+                arena[24 + 3 * 56 + 22..24 + 3 * 56 + 24]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            3
+        );
+        assert_eq!(
+            u16::from_le_bytes(
+                arena[592 + 200..592 + 202]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            3
+        );
+        assert_eq!(
+            u16::from_le_bytes(
+                arena[592 + 202..592 + 204]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            4
+        );
+        assert_eq!(
+            u16::from_le_bytes(
+                arena[592 + 220..592 + 222]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            5
+        );
         Ok(())
     }
 }

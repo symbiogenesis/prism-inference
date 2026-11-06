@@ -42,6 +42,7 @@ pub struct PlacedProjectionExecutor<'a> {
     executor: &'a mut dyn Pq2ProjectionExecutor,
     selected: Vec<Selected>,
     identity: String,
+    f32_groups: bool,
     faulted: bool,
 }
 
@@ -142,8 +143,17 @@ impl<'a> PlacedProjectionExecutor<'a> {
             executor,
             selected,
             identity,
+            f32_groups: false,
             faulted: false,
         })
+    }
+
+    /// Enable or disable batched `F32` sibling-group delegation when all group
+    /// members belong to this explicit placement.
+    #[must_use]
+    pub const fn with_f32_groups(mut self, enabled: bool) -> Self {
+        self.f32_groups = enabled;
+        self
     }
 
     /// Whether any delegated operation failed and requires terminal teardown.
@@ -158,10 +168,10 @@ impl<'a> PlacedProjectionExecutor<'a> {
             .binary_search_by(|selection| selection.tensor.name.cmp(&tensor.name))
             .ok()?;
         let selection = &self.selected[index];
-        (selection.tensor.kind == tensor.kind
-            && selection.tensor.dimensions == tensor.dimensions
-            && Arc::ptr_eq(&selection.tensor.data, &tensor.data))
-        .then_some(selection)
+        (Arc::ptr_eq(&selection.tensor.data, &tensor.data)
+            && selection.tensor.kind == tensor.kind
+            && selection.tensor.dimensions == tensor.dimensions)
+            .then_some(selection)
     }
 }
 
@@ -265,6 +275,41 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
         if result.is_err() {
             self.faulted = true;
             output.clear();
+        }
+        result
+    }
+
+    fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
+        self.f32_groups
+            && !self.faulted
+            && !tensors.is_empty()
+            && tensors.iter().all(|&tensor| self.supports_f32(tensor))
+            && self.executor.supports_f32_group(tensors)
+    }
+
+    fn project_f32_group(
+        &mut self,
+        tensors: &[&Tensor],
+        activation: &[f32],
+        pinned: bool,
+        outputs: &mut [&mut Vec<f32>],
+    ) -> Result<()> {
+        for output in outputs.iter_mut() {
+            output.clear();
+        }
+        if !self.supports_f32_group(tensors) {
+            return Err(invalid(
+                "unavailable explicit F32 group projection placement",
+            ));
+        }
+        let result = self
+            .executor
+            .project_f32_group(tensors, activation, pinned, outputs);
+        if result.is_err() {
+            self.faulted = true;
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
         }
         result
     }

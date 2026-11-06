@@ -350,3 +350,99 @@ fn actual_graph_admits_only_selected_work_and_preserves_logits_and_state() -> Re
     assert!(graph.admit_work(0, 1).is_err());
     Ok(())
 }
+
+struct F32GroupExecutor {
+    calls: usize,
+    fail: bool,
+}
+
+impl Pq2ProjectionExecutor for F32GroupExecutor {
+    fn identity(&self) -> &'static str {
+        "f32-group-placement-control"
+    }
+
+    fn supports(&self, _: &Tensor) -> bool {
+        false
+    }
+
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        tensor.kind == 142
+    }
+
+    fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
+        tensors.len() == 2 && tensors.iter().all(|&t| self.supports_f32(t))
+    }
+
+    fn project(
+        &mut self,
+        _: &Tensor,
+        _: &[Q8KBlock],
+        _: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        output.clear();
+        Err(invalid("unexpected Q8_K call"))
+    }
+
+    fn project_f32_group(
+        &mut self,
+        tensors: &[&Tensor],
+        activation: &[f32],
+        _: bool,
+        outputs: &mut [&mut Vec<f32>],
+    ) -> Result<()> {
+        self.calls += 1;
+        for (member, output) in outputs.iter_mut().enumerate() {
+            output.resize(tensors[member].dimensions[1], activation[0]);
+        }
+        if self.fail {
+            return Err(invalid("group placement failure"));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn placement_f32_groups_require_explicit_opt_in_and_full_member_selection() -> Result<()> {
+    let model = model();
+    let up = &model.tensors["blk.0.ffn_up.weight"];
+    let gate = &model.tensors["blk.0.ffn_gate.weight"];
+    let ssm = &model.tensors["blk.0.ssm_out.weight"];
+
+    let mut inner = F32GroupExecutor {
+        calls: 0,
+        fail: false,
+    };
+    let placed_default = PlacedProjectionExecutor::new(
+        &mut inner,
+        &model,
+        &["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight"],
+    )?;
+    assert!(!placed_default.supports_f32_group(&[up, gate]));
+
+    let mut inner = F32GroupExecutor {
+        calls: 0,
+        fail: false,
+    };
+    let mut placed = PlacedProjectionExecutor::new(
+        &mut inner,
+        &model,
+        &["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight"],
+    )?
+    .with_f32_groups(true);
+    assert!(placed.supports_f32_group(&[up, gate]));
+    assert!(!placed.supports_f32_group(&[up, ssm]));
+
+    let mut out0 = Vec::new();
+    let mut out1 = Vec::new();
+    placed.project_f32_group(
+        &[up, gate],
+        &vec![3.5_f32; 256],
+        true,
+        &mut [&mut out0, &mut out1],
+    )?;
+    assert_eq!(out0, [3.5]);
+    assert_eq!(out1, [3.5]);
+    assert_eq!(inner.calls, 1);
+    Ok(())
+}

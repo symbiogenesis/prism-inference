@@ -24,13 +24,18 @@ Experimental native Hexagon NPU (`v81`) crates (`bonsai-hexagon-native` and
 `bonsai-hexagon-runtime`, both `publish = false`) and Windows ARM64 worker hooks
 add:
 
-- 64-bit SWAR interleave for `PQ2_0 -> HTP_TYPE_Q2_0` tile packing;
+- 64-bit SWAR interleave for `PQ2_0 -> HTP_TYPE_Q2_0` tile packing and SWAR
+  `FP16` scale validation, plus 16-lane coalesced `F32` input/output finiteness
+  verification;
 - Multi-op resident `HTP_TYPE_Q2_0` batch submission (`submit_resident_batch2`
   and `submit_resident_batch3` across `NativeQ2Submitter` and `NativeQ2Session`)
-  amortizing FastRPC queue synchronization across grouped projections;
-- Opt-in `PRISM_HEXAGON_NATIVE_Q2=1` worker-thread Hexagon `NativeQ2Executor`
-  registration and grouped `F32` projection dispatch (`supports_f32_group` and
-  `project_f32_group`) in `prism-inference-server`.
+  with direct in-place descriptor construction, amortizing FastRPC queue
+  synchronization across grouped projections;
+- 28-projection resident arena coverage (`DEFAULT_NATIVE_Q2_PROJECTIONS`,
+  `502,824,960` bytes / `99.9%` of the `480` MiB arena across `blk.0..=blk.3`
+  and `blk.4` MLP), pointer-first `O(1)` tensor eligibility checks, reusable
+  pre-warming scratch, and worker-thread Hexagon `NativeQ2Executor`
+  registration in `prism-inference-server`.
 
 ## Supported release scope
 

@@ -689,7 +689,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         if !self.within_deadline() {
             return Err(Error::Contract);
         }
-        for (destination, value) in output.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        let words = &bytes.as_chunks::<4>().0[..output.len()];
+        for (destination, value) in output.iter_mut().zip(words) {
             *destination = f32::from_le_bytes(*value);
         }
         self.report.queue.numeric_validated = true;
@@ -894,15 +895,18 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return Err(self.fail("projection-input-refused-pinned"));
         };
         let columns = handles[0].columns();
+        if !native_q2::is_finite_f32_slice(activation) {
+            return Err(self.fail("projection-input-refused-pinned"));
+        }
         for (member, handle) in handles.into_iter().enumerate() {
             if handle.columns() != columns
                 || self.native_resident_weights.range(handle).is_err()
-                || native_q2::validate_activation(
+                || native_q2::validate_activation_dimensions(
                     max_columns,
                     self.limits.rows,
                     columns,
                     handle.rows(),
-                    activation,
+                    activation.len(),
                     outputs[member].len(),
                 )
                 .is_err()
@@ -998,7 +1002,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                     member_bytes,
                 )
             };
-            for (destination, value) in output.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            let words = &bytes.as_chunks::<4>().0[..output.len()];
+            for (destination, value) in output.iter_mut().zip(words) {
                 *destination = f32::from_le_bytes(*value);
             }
         }
@@ -1227,11 +1232,15 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         {
             return Err(self.fail("projection-resident-input-refused-pinned"));
         }
-        let handle = match self.native_resident_weights.prepare(columns, rows, weights) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return Ok(None),
-            Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
-        };
+        let handle =
+            match self
+                .native_resident_weights
+                .prepare_validated(columns, rows, weights.len())
+            {
+                Ok(Some(handle)) => handle,
+                Ok(None) => return Ok(None),
+                Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
+            };
         let range = self.native_resident_weights.range(&handle)?;
         let offset = self.mode.allocation_bytes(self.limits.rows) + range.start;
         // SAFETY: this fresh append-only reservation is inside the explicitly

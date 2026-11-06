@@ -30,9 +30,10 @@ fn finite_slice(values: &[f32]) -> Result<()> {
 /// Residency statistics for [`NativeQ2Executor`].
 pub type NativeQ2ResidencyStatistics = HmxResidencyStatistics;
 
-/// Default 25-projection 4-layer (`blk.0`..=`blk.2` recurrent + `blk.3` full-attention)
-/// Hexagon NPU `native-q2` resident placement covering the full 4-layer repeating block.
-pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 25] = [
+/// Default 28-projection (`blk.0`..=`blk.2` recurrent, `blk.3` full-attention,
+/// and `blk.4` MLP) Hexagon NPU `native-q2` resident placement filling 99.9%
+/// of the 480 MiB resident weight arena.
+pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 28] = [
     "blk.0.ffn_up.weight",
     "blk.0.ffn_gate.weight",
     "blk.0.ffn_down.weight",
@@ -58,10 +59,13 @@ pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 25] = [
     "blk.3.attn_k.weight",
     "blk.3.attn_v.weight",
     "blk.3.attn_output.weight",
+    "blk.4.ffn_up.weight",
+    "blk.4.ffn_gate.weight",
+    "blk.4.ffn_down.weight",
 ];
 
 /// Exact packed `HTP_TYPE_Q2_0` resident weight payload bytes for [`DEFAULT_NATIVE_Q2_PROJECTIONS`].
-pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 427_622_400;
+pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 502_824_960;
 
 /// Host metadata reservation for resident `native-q2` projection handles.
 pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 256 * 1024;
@@ -122,9 +126,9 @@ impl ResidentCache {
 
     fn find(&self, tensor: &Tensor) -> Option<usize> {
         self.projections.iter().position(|projection| {
-            tensor.kind == 142
+            Arc::ptr_eq(&projection.source, &tensor.data)
+                && tensor.kind == 142
                 && tensor.dimensions.as_slice() == [projection.columns, projection.rows]
-                && Arc::ptr_eq(&projection.source, &tensor.data)
         })
     }
 
@@ -162,6 +166,7 @@ pub struct NativeQ2Executor<S = &'static mut dyn NativeQ2Submitter> {
     residency: Option<ResidentCache>,
     row_parallelism: Option<RowParallelism>,
     allowed_tensors: Option<Vec<Tensor>>,
+    scratch_weights: Vec<u8>,
 }
 
 impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
@@ -189,6 +194,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             residency: None,
             row_parallelism: None,
             allowed_tensors: None,
+            scratch_weights: Vec::new(),
         }
     }
 
@@ -351,8 +357,12 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     /// # Errors
     /// Rejects faulted executors, unsupported tensor geometry, or invalid scale headers.
     pub fn prewarm_tensor(&mut self, tensor: &Tensor) -> Result<bool> {
-        let mut weights = Vec::new();
-        self.prewarm_tensor_with_scratch(tensor, &mut weights)
+        let mut weights = std::mem::take(&mut self.scratch_weights);
+        let result = self.prewarm_tensor_with_scratch(tensor, &mut weights);
+        if result.is_ok() {
+            self.scratch_weights = weights;
+        }
+        result
     }
 
     fn prewarm_tensor_with_scratch(
@@ -419,7 +429,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         self.allowed_tensors = Some(selected);
         if self.residency.is_some() {
-            let mut weights = Vec::new();
+            let mut weights = std::mem::take(&mut self.scratch_weights);
             for tensor in tensors {
                 if !self.prewarm_tensor_with_scratch(tensor, &mut weights)? {
                     self.failed = true;
@@ -519,6 +529,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut weights = if cached.is_none() {
             zeroed(max_mapped_rows * 36 * (max_chunk_cols / 128), 0_u8)?
         } else {
+            self.scratch_weights = Vec::new();
             Vec::new()
         };
         let resident = if let Some(index) = cached {
@@ -835,10 +846,10 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
     fn supports_f32(&self, tensor: &Tensor) -> bool {
         if let Some(allowed) = &self.allowed_tensors
             && !allowed.iter().any(|candidate| {
-                candidate.name == tensor.name
+                Arc::ptr_eq(&candidate.data, &tensor.data)
                     && candidate.kind == tensor.kind
                     && candidate.dimensions == tensor.dimensions
-                    && Arc::ptr_eq(&candidate.data, &tensor.data)
+                    && candidate.name == tensor.name
             })
         {
             return false;
@@ -1206,7 +1217,7 @@ mod tests {
 
     #[test]
     fn default_four_layer_projection_set_matches_exact_resident_arena_budget() -> Result<()> {
-        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 25);
+        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 28);
         let mut total_bytes = 0_usize;
         for name in DEFAULT_NATIVE_Q2_PROJECTIONS {
             let (columns, rows): (usize, usize) = if name.ends_with(".ffn_up.weight")

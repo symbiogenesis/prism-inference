@@ -2,7 +2,7 @@
 
 use bonsai_ternary::Q8KBlock;
 
-use super::{PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, finite};
+use super::{PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, is_finite_slice};
 use crate::{Result, invalid, model::Tensor};
 
 /// Scoped executor for original PQ2 rows and already prepared `Q8_K` activations.
@@ -174,8 +174,8 @@ impl PreparedMatvec<'_> {
                 if output.len() != rows {
                     return Err(invalid("projection executor returned incomplete output"));
                 }
-                for &value in output.iter() {
-                    finite(value)?;
+                if !is_finite_slice(output) {
+                    return Err(invalid("non-finite value in runtime path"));
                 }
             }
             Ok(())
@@ -252,8 +252,8 @@ impl PreparedMatvec<'_> {
             if output.len() != rows {
                 return Err(invalid("projection executor returned incomplete output"));
             }
-            for &value in output.iter() {
-                finite(value)?;
+            if !is_finite_slice(output) {
+                return Err(invalid("non-finite value in runtime path"));
             }
             Ok(())
         })();

@@ -521,8 +521,29 @@ fn project_tile(
     let reuse_basis = previous.is_some_and(|prev| transforms.basis(prev) == basis);
     let activation = if basis.0 {
         if !reuse_basis {
-            for (input, transformed) in inputs.iter().zip(transformed.iter_mut()) {
-                transforms.transform_into(tensor, input, geometry, transformed)?;
+            let parallelism = projector.row_parallelism();
+            if inputs.len() > 1 && parallelism.workers() > 1 {
+                parallelism.update_chunks(transformed, 1, |base, chunk| {
+                    for (offset, target) in chunk.iter_mut().enumerate() {
+                        transforms.transform_into(
+                            tensor,
+                            &inputs[base + offset],
+                            geometry,
+                            target,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            } else {
+                for (input, transformed) in inputs.iter().zip(transformed.iter_mut()) {
+                    transforms.transform_into_with_parallelism(
+                        tensor,
+                        input,
+                        geometry,
+                        parallelism,
+                        transformed,
+                    )?;
+                }
             }
         }
         &*transformed

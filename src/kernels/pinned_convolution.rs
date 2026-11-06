@@ -60,7 +60,37 @@ fn transpose_4x4(
 ///
 /// # Errors
 /// Rejects invalid geometry or nonfinite outputs.
+#[cfg(test)]
 pub(crate) fn step_into(
+    history: &[f32],
+    mixed: &mut [f32],
+    coefficients: &[f32],
+    width: usize,
+    next_history: &mut [f32],
+) -> Result<()> {
+    step_into_inner::<false>(history, mixed, coefficients, width, next_history)
+}
+
+/// Evaluates all channels of one causal convolution step, applies pinned `SiLU`
+/// in registers before storing `mixed`, and writes updated history.
+///
+/// # Errors
+/// Rejects invalid geometry or nonfinite outputs.
+pub(crate) fn step_silu_into(
+    history: &[f32],
+    mixed: &mut [f32],
+    coefficients: &[f32],
+    width: usize,
+    next_history: &mut [f32],
+) -> Result<()> {
+    step_into_inner::<true>(history, mixed, coefficients, width, next_history)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep NEON four-channel convolution, optional SiLU fusion and scalar fallback together."
+)]
+fn step_into_inner<const SILU: bool>(
     history: &[f32],
     mixed: &mut [f32],
     coefficients: &[f32],
@@ -88,7 +118,9 @@ pub(crate) fn step_into(
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
         use fearless_simd::{f32x4, prelude::*};
-        let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+        let zero = f32x4::splat(neon, 0.0);
+        let one = f32x4::splat(neon, 1.0);
+        let mut finite_mask = zero.is_finite();
         let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
         let (h_chunks, h_rem) = history.as_chunks::<12>();
         let (n_chunks, n_rem) = next_history.as_chunks_mut::<12>();
@@ -109,14 +141,19 @@ pub(crate) fn step_into(
             let h_t1 = f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
             let h_t2 = f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
             let p = f32x4::from_slice(neon, m_chunk);
-            let mut sum = f32x4::splat(neon, 0.0);
+            let mut sum = zero;
             sum = h_t0.mul_add_precise(tap0, sum);
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
             finite_mask &= out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
-            out.store_slice(m_chunk);
+            if SILU {
+                (out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out)))
+                    .store_slice(m_chunk);
+            } else {
+                out.store_slice(m_chunk);
+            }
             *n_chunk = [
                 h_chunk[1],
                 h_chunk[2],
@@ -147,6 +184,9 @@ pub(crate) fn step_into(
             n_slice[1] = h_slice[2];
             n_slice[2] = projected;
         }
+        if SILU {
+            super::pinned_activations::silu_in_place(m_rem);
+        }
         return Ok(());
     }
     for (channel, mixed_value) in mixed.iter_mut().enumerate() {
@@ -164,6 +204,9 @@ pub(crate) fn step_into(
             next_history[start + hist_width - 1] = projected;
         }
     }
+    if SILU {
+        super::pinned_activations::silu_in_place(mixed);
+    }
     Ok(())
 }
 
@@ -171,7 +214,35 @@ pub(crate) fn step_into(
 ///
 /// # Errors
 /// Rejects invalid geometry or nonfinite outputs.
+#[cfg(test)]
 pub(crate) fn step_in_place(
+    history: &mut [f32],
+    mixed: &mut [f32],
+    coefficients: &[f32],
+    width: usize,
+) -> Result<()> {
+    step_in_place_inner::<false>(history, mixed, coefficients, width)
+}
+
+/// Evaluates all channels of one causal convolution step, applies pinned `SiLU`
+/// in registers before storing `mixed`, and updates history in place.
+///
+/// # Errors
+/// Rejects invalid geometry or nonfinite outputs.
+pub(crate) fn step_silu_in_place(
+    history: &mut [f32],
+    mixed: &mut [f32],
+    coefficients: &[f32],
+    width: usize,
+) -> Result<()> {
+    step_in_place_inner::<true>(history, mixed, coefficients, width)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep in-place NEON four-channel convolution, optional SiLU fusion and scalar fallback together."
+)]
+fn step_in_place_inner<const SILU: bool>(
     history: &mut [f32],
     mixed: &mut [f32],
     coefficients: &[f32],
@@ -197,7 +268,9 @@ pub(crate) fn step_in_place(
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
         use fearless_simd::{f32x4, prelude::*};
-        let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+        let zero = f32x4::splat(neon, 0.0);
+        let one = f32x4::splat(neon, 1.0);
+        let mut finite_mask = zero.is_finite();
         let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
         let (h_chunks, h_rem) = history.as_chunks_mut::<12>();
         let (c_chunks, c_rem) = coefficients.as_chunks::<16>();
@@ -212,14 +285,19 @@ pub(crate) fn step_in_place(
             let h_t1 = f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
             let h_t2 = f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
             let p = f32x4::from_slice(neon, m_chunk);
-            let mut sum = f32x4::splat(neon, 0.0);
+            let mut sum = zero;
             sum = h_t0.mul_add_precise(tap0, sum);
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
             finite_mask &= out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
-            out.store_slice(m_chunk);
+            if SILU {
+                (out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out)))
+                    .store_slice(m_chunk);
+            } else {
+                out.store_slice(m_chunk);
+            }
             *h_chunk = [
                 h_chunk[1],
                 h_chunk[2],
@@ -249,6 +327,9 @@ pub(crate) fn step_in_place(
             h_slice[1] = h_slice[2];
             h_slice[2] = projected;
         }
+        if SILU {
+            super::pinned_activations::silu_in_place(m_rem);
+        }
         return Ok(());
     }
     for (channel, mixed_value) in mixed.iter_mut().enumerate() {
@@ -265,6 +346,9 @@ pub(crate) fn step_in_place(
             history[start + hist_width - 1] = projected;
         }
     }
+    if SILU {
+        super::pinned_activations::silu_in_place(mixed);
+    }
     Ok(())
 }
 
@@ -276,7 +360,7 @@ mod tests {
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
-    use super::{row, step_in_place, step_into};
+    use super::{row, step_in_place, step_into, step_silu_in_place, step_silu_into};
     use crate::Result;
 
     #[derive(Deserialize)]
@@ -304,6 +388,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Verify row, step_into, step_in_place, step_silu_into and step_silu_in_place together."
+    )]
     fn pinned_convolution_matches_native_zero_partial_and_full_history() -> Result<()> {
         let bytes = include_bytes!("../../tests/fixtures/swift-convolution-native.bin");
         let capture: Capture = serde_json::from_str(include_str!(
@@ -373,6 +461,23 @@ mod tests {
                 width,
                 &mut next_history,
             )?;
+            let mut mixed_silu_into = mixed.clone();
+            let mut next_silu_history = vec![0.0; flat_history.len()];
+            step_silu_into(
+                &flat_history,
+                &mut mixed_silu_into,
+                &coefficients,
+                width,
+                &mut next_silu_history,
+            )?;
+            let mut mixed_silu_in_place = mixed.clone();
+            let mut in_place_silu_history = flat_history.clone();
+            step_silu_in_place(
+                &mut in_place_silu_history,
+                &mut mixed_silu_in_place,
+                &coefficients,
+                width,
+            )?;
             let mut mixed_in_place = mixed;
             let mut in_place_history = flat_history;
             step_in_place(
@@ -392,6 +497,29 @@ mod tests {
                 bits(&next_history),
                 bits(&in_place_history),
                 "history update case {case}"
+            );
+            let mut expected_silu = native;
+            super::super::pinned_activations::silu_in_place(&mut expected_silu);
+            let expected_silu_bits = bits(&expected_silu);
+            assert_eq!(
+                bits(&mixed_silu_into),
+                expected_silu_bits,
+                "step_silu_into case {case}"
+            );
+            assert_eq!(
+                bits(&mixed_silu_in_place),
+                expected_silu_bits,
+                "step_silu_in_place case {case}"
+            );
+            assert_eq!(
+                bits(&next_silu_history),
+                bits(&next_history),
+                "step_silu_into history case {case}"
+            );
+            assert_eq!(
+                bits(&in_place_silu_history),
+                bits(&in_place_history),
+                "step_silu_in_place history case {case}"
             );
         }
         assert_eq!(input.position(), u64::try_from(bytes.len())?);

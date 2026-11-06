@@ -753,6 +753,7 @@ impl Transforms {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "Keep scoped execution separate from CPU scratch and exact transform ownership."
     )]
     fn project_group_into_with_executor<const N: usize>(
@@ -778,7 +779,13 @@ impl Transforms {
                 }
                 let basis = self.basis(weights[index]);
                 let activation = if basis.0 {
-                    self.transform_into(weights[index], input, geometry, &mut scratch.transformed)?;
+                    self.transform_into_with_parallelism(
+                        weights[index],
+                        input,
+                        geometry,
+                        scratch.matvec.row_parallelism(),
+                        &mut scratch.transformed,
+                    )?;
                     #[cfg(test)]
                     {
                         scratch.transforms += 1;
@@ -869,18 +876,53 @@ impl Transforms {
         geometry: &Geometry,
         transformed: &mut Vec<f32>,
     ) -> Result<()> {
+        self.transform_into_with_parallelism(
+            weight,
+            input,
+            geometry,
+            &RowParallelism::default(),
+            transformed,
+        )
+    }
+
+    fn transform_into_with_parallelism(
+        &self,
+        weight: &Tensor,
+        input: &[f32],
+        geometry: &Geometry,
+        parallelism: &RowParallelism,
+        transformed: &mut Vec<f32>,
+    ) -> Result<()> {
         if self.grouped_values && weight.name.ends_with(".ssm_out.weight") {
             resize_into(input.len(), transformed)?;
             let repetitions = geometry.ssm_values / geometry.ssm_keys;
-            for key in 0..geometry.ssm_keys {
-                for repeat in 0..repetitions {
-                    let source = (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
-                    let target = (key * repetitions + repeat) * geometry.ssm_head;
-                    transformed[target..target + geometry.ssm_head]
-                        .copy_from_slice(&input[source..source + geometry.ssm_head]);
+            if let Some(signs) = self
+                .signs
+                .get(&input.len())
+                .filter(|signs| signs.len() >= input.len())
+            {
+                for key in 0..geometry.ssm_keys {
+                    for repeat in 0..repetitions {
+                        let source = (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
+                        let target = (key * repetitions + repeat) * geometry.ssm_head;
+                        mul_slice_into(
+                            &input[source..source + geometry.ssm_head],
+                            &signs[target..target + geometry.ssm_head],
+                            &mut transformed[target..target + geometry.ssm_head],
+                        );
+                    }
                 }
+            } else {
+                for key in 0..geometry.ssm_keys {
+                    for repeat in 0..repetitions {
+                        let source = (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
+                        let target = (key * repetitions + repeat) * geometry.ssm_head;
+                        transformed[target..target + geometry.ssm_head]
+                            .copy_from_slice(&input[source..source + geometry.ssm_head]);
+                    }
+                }
+                self.sign(transformed);
             }
-            self.sign(transformed);
         } else if let Some(signs) = self.signs.get(&input.len()) {
             resize_into(input.len(), transformed)?;
             let overlap = input.len().min(signs.len());
@@ -895,7 +937,7 @@ impl Transforms {
         } else {
             copy_into(input, transformed)?;
         }
-        self.rotate(transformed)?;
+        self.rotate_with_parallelism(transformed, parallelism)?;
         Ok(())
     }
 
@@ -911,6 +953,21 @@ impl Transforms {
             crate::kernels::hadamard(block)?;
         }
         Ok(())
+    }
+
+    fn rotate_with_parallelism(
+        &self,
+        input: &mut [f32],
+        parallelism: &RowParallelism,
+    ) -> Result<()> {
+        if parallelism.workers() > 1
+            && self.block >= 256
+            && input.len() >= self.block.saturating_mul(2)
+            && input.len().is_multiple_of(self.block)
+        {
+            return parallelism.update_chunks(input, self.block, |_, chunk| self.rotate(chunk));
+        }
+        self.rotate(input)
     }
 }
 
@@ -1673,7 +1730,8 @@ impl Qwen35 {
         };
         row_into(&self.embedding, token, hidden)?;
         if self.transforms.inverse_embedding {
-            self.transforms.rotate(hidden)?;
+            self.transforms
+                .rotate_with_parallelism(hidden, evaluation.projection.matvec.row_parallelism())?;
             self.transforms.sign(hidden);
         }
         if let Some(adapter) = &self.adapter {
@@ -1997,40 +2055,105 @@ impl Evaluation<'_, '_> {
             zeros_into(history.len(), convolution)?;
         }
         let mixed = &mut scratch.projected;
-        if matches!(self.arithmetic, Arithmetic::PinnedSwift) {
-            crate::kernels::pinned_convolution::step_into(
-                history,
+        let key_width = g.key_width();
+        let arithmetic = self.arithmetic;
+        let parallelism = self.projection.matvec.row_parallelism();
+        if hist_width > 0
+            && parallelism.workers() > 1
+            && mixed.len().is_multiple_of(g.ssm_head)
+            && g.ssm_head.is_multiple_of(4)
+        {
+            let head_hist = g.ssm_head * hist_width;
+            let head_coeff = g.ssm_head * g.convolution;
+            let qk_heads = (2 * key_width) / g.ssm_head;
+            parallelism.update_paired_chunks(
                 mixed,
-                &layer.convolution,
-                g.convolution,
+                g.ssm_head,
                 convolution,
+                head_hist,
+                |base_head, mixed_chunk, conv_chunk| {
+                    for (offset, (head_mixed, head_conv)) in mixed_chunk
+                        .chunks_exact_mut(g.ssm_head)
+                        .zip(conv_chunk.chunks_exact_mut(head_hist))
+                        .enumerate()
+                    {
+                        let head = base_head + offset;
+                        let h_slice = &history[head * head_hist..(head + 1) * head_hist];
+                        let c_slice =
+                            &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
+                        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                            crate::kernels::pinned_convolution::step_silu_into(
+                                h_slice,
+                                head_mixed,
+                                c_slice,
+                                g.convolution,
+                                head_conv,
+                            )?;
+                        } else {
+                            for (channel, mixed_value) in head_mixed.iter_mut().enumerate() {
+                                let projected = *mixed_value;
+                                let start = channel * hist_width;
+                                let coefficients = &c_slice
+                                    [channel * g.convolution..(channel + 1) * g.convolution];
+                                *mixed_value = arithmetic.convolution_row(
+                                    &h_slice[start..start + hist_width],
+                                    projected,
+                                    coefficients,
+                                )?;
+                                if hist_width == 3 {
+                                    head_conv[start] = h_slice[start + 1];
+                                    head_conv[start + 1] = h_slice[start + 2];
+                                    head_conv[start + 2] = projected;
+                                } else {
+                                    head_conv[start..start + hist_width - 1]
+                                        .copy_from_slice(&h_slice[start + 1..start + hist_width]);
+                                    head_conv[start + hist_width - 1] = projected;
+                                }
+                            }
+                            arithmetic.silu(head_mixed);
+                        }
+                        if head < qk_heads {
+                            l2_norm(head_mixed, g.epsilon);
+                        }
+                    }
+                    Ok(())
+                },
             )?;
         } else {
-            for (channel, mixed_value) in mixed.iter_mut().enumerate() {
-                let projected = *mixed_value;
-                let start = channel * hist_width;
-                let coefficients =
-                    &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
-                *mixed_value = self.arithmetic.convolution_row(
-                    &history[start..start + hist_width],
-                    projected,
-                    coefficients,
+            if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                crate::kernels::pinned_convolution::step_silu_into(
+                    history,
+                    mixed,
+                    &layer.convolution,
+                    g.convolution,
+                    convolution,
                 )?;
-                if hist_width == 3 {
-                    convolution[start] = history[start + 1];
-                    convolution[start + 1] = history[start + 2];
-                    convolution[start + 2] = projected;
-                } else if hist_width > 0 {
-                    convolution[start..start + hist_width - 1]
-                        .copy_from_slice(&history[start + 1..start + hist_width]);
-                    convolution[start + hist_width - 1] = projected;
+            } else {
+                for (channel, mixed_value) in mixed.iter_mut().enumerate() {
+                    let projected = *mixed_value;
+                    let start = channel * hist_width;
+                    let coefficients =
+                        &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
+                    *mixed_value = arithmetic.convolution_row(
+                        &history[start..start + hist_width],
+                        projected,
+                        coefficients,
+                    )?;
+                    if hist_width == 3 {
+                        convolution[start] = history[start + 1];
+                        convolution[start + 1] = history[start + 2];
+                        convolution[start + 2] = projected;
+                    } else if hist_width > 0 {
+                        convolution[start..start + hist_width - 1]
+                            .copy_from_slice(&history[start + 1..start + hist_width]);
+                        convolution[start + hist_width - 1] = projected;
+                    }
                 }
+                arithmetic.silu(mixed);
             }
-        }
-        self.arithmetic.silu(mixed);
-        let key_width = g.key_width();
-        for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
-            l2_norm(head, g.epsilon);
+            for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
+                l2_norm(head, g.epsilon);
+            }
         }
         resize_into(previous.len(), matrix)?;
         resize_into(g.value_width(), &mut scratch.attended)?;

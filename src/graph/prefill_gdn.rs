@@ -188,7 +188,7 @@ pub(super) fn recurrent_tile(
         check()?;
         let mixed = &mut tile.mixed[token];
         if matches!(arithmetic, Arithmetic::PinnedSwift) {
-            crate::kernels::pinned_convolution::step_in_place(
+            crate::kernels::pinned_convolution::step_silu_in_place(
                 convolution,
                 mixed,
                 &layer.convolution,
@@ -210,8 +210,8 @@ pub(super) fn recurrent_tile(
                     convolution[start + geometry.convolution - 2] = projected;
                 }
             }
+            arithmetic.silu(mixed);
         }
-        arithmetic.silu(mixed);
         for head in mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head) {
             l2_norm(head, geometry.epsilon);
         }

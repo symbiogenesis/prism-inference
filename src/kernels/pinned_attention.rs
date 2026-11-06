@@ -126,6 +126,60 @@ fn value_tile_scalar<'a>(
     Ok(())
 }
 
+/// Reduces a cached F16 key row and F32 query row with the pinned four-register FMA tree.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f16(key: &[u16], query: &[f32]) -> Result<f32> {
+    if query.is_empty() || query.len() > crate::model::swift::CONTEXT_TOKENS {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    if key.len() < query.len() {
+        return Err(invalid("pinned attention dot row is short"));
+    }
+    if key.len() > query.len() {
+        return Err(invalid("pinned attention dot row is long"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f16(neon, key, query);
+    }
+    dot(key.iter().copied().map(bonsai_ternary::half_to_float), query)
+}
+
+/// Reduces a current F32 key row and F32 query row with the pinned four-register FMA tree.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f32(key: &[f32], query: &[f32]) -> Result<f32> {
+    if query.is_empty() || query.len() > crate::model::swift::CONTEXT_TOKENS {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    if key.len() < query.len() {
+        return Err(invalid("pinned attention dot row is short"));
+    }
+    if key.len() > query.len() {
+        return Err(invalid("pinned attention dot row is long"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f32(neon, key, query);
+    }
+    dot(key.iter().copied(), query)
+}
+
 /// Reduces decoded F16 operands with the pinned four-register F32 FMA tree.
 ///
 /// Masked cache lanes are zero-filled through the native 256-token padding.
@@ -274,7 +328,7 @@ mod tests {
     use bonsai_ternary::half_to_float;
     use serde::Deserialize;
 
-    use super::{VALUE_TILE, dot, softmax, value_tile};
+    use super::{VALUE_TILE, dot, dot_f16, dot_f32, softmax, value_tile};
 
     #[derive(Deserialize)]
     struct Capture {
@@ -330,14 +384,24 @@ mod tests {
             "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab"
         );
         for case in capture.cases {
-            let first = case.first_bits.into_iter().map(f32::from_bits);
+            let first = case
+                .first_bits
+                .into_iter()
+                .map(f32::from_bits)
+                .collect::<Vec<_>>();
             let second = case
                 .second_bits
                 .into_iter()
                 .map(f32::from_bits)
                 .collect::<Vec<_>>();
             assert_eq!(
-                dot(first, &second)?.to_bits(),
+                dot(first.iter().copied(), &second)?.to_bits(),
+                case.native_bits,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                dot_f32(&first, &second)?.to_bits(),
                 case.native_bits,
                 "{}",
                 case.name
@@ -350,12 +414,22 @@ mod tests {
             .map(half_to_float)
             .collect::<Vec<_>>();
         assert_eq!(
-            dot(value.values.into_iter().map(half_to_float), &probabilities)?.to_bits(),
+            dot(value.values.iter().copied().map(half_to_float), &probabilities)?.to_bits(),
+            value.expected
+        );
+        assert_eq!(
+            dot_f16(&value.values, &probabilities)?.to_bits(),
             value.expected
         );
         assert!(dot([1.0].into_iter(), &[]).is_err());
         assert!(dot([].into_iter(), &[1.0]).is_err());
         assert!(dot([1.0, 2.0].into_iter(), &[1.0]).is_err());
+        assert!(dot_f32(&[1.0], &[]).is_err());
+        assert!(dot_f32(&[], &[1.0]).is_err());
+        assert!(dot_f32(&[1.0, 2.0], &[1.0]).is_err());
+        assert!(dot_f16(&[0x3c00], &[]).is_err());
+        assert!(dot_f16(&[], &[1.0]).is_err());
+        assert!(dot_f16(&[0x3c00, 0x4000], &[1.0]).is_err());
         Ok(())
     }
 

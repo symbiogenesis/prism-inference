@@ -2140,10 +2140,24 @@ fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
 /// # Errors
 /// Rejects zero or non-power-of-two block lengths and nonfinite input/output.
 pub fn hadamard(values: &mut [f32]) -> Result<()> {
-    if !values.len().is_power_of_two() || values.iter().any(|value| !value.is_finite()) {
+    if !values.len().is_power_of_two() {
         return Err(invalid("Hadamard requires a finite power-of-two block"));
     }
     let count = u32::try_from(values.len())?;
+    let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::hadamard(values, normalization) {
+        return result;
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(invalid("Hadamard requires a finite power-of-two block"));
+    }
     let mut half = 1;
     while half < values.len() {
         for block in values.chunks_exact_mut(half * 2) {
@@ -2157,7 +2171,6 @@ pub fn hadamard(values: &mut [f32]) -> Result<()> {
         }
         half *= 2;
     }
-    let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
     for value in values {
         *value = finite(*value * normalization)?;
     }

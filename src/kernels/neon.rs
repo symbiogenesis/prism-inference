@@ -1,6 +1,6 @@
 //! Experimental baseline NEON integer arithmetic for native PQ2/PTQ1 blocks.
 
-use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8, u32x4, u64x2};
+use fearless_simd::{Neon, f32x4, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8, u32x4, u64x2};
 
 use crate::Result;
 
@@ -407,6 +407,65 @@ pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) ->
             activations[group],
         )
     }))
+}
+
+/// Evaluates the normalized Sylvester Hadamard butterfly stages in NEON `f32x4`.
+///
+/// Requires a power-of-two slice of at least four elements. Stages `half = 1`
+/// and `half = 2` are fused per four-element vector, and all subsequent stages
+/// operate on four-lane vectors while preserving exact IEEE 754 addition and
+/// subtraction order.
+#[inline]
+pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<()>> {
+    if values.len() < 4 {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    for chunk in values.as_chunks::<4>().0 {
+        if !f32x4::from_slice(neon, chunk).is_finite().all_true() {
+            return Some(Err(crate::invalid(
+                "Hadamard requires a finite power-of-two block",
+            )));
+        }
+    }
+    for chunk in values.as_chunks_mut::<4>().0 {
+        let [a0, a1, a2, a3] = *chunk;
+        let b0 = a0 + a1;
+        let b1 = a0 - a1;
+        let b2 = a2 + a3;
+        let b3 = a2 - a3;
+        chunk[0] = b0 + b2;
+        chunk[1] = b1 + b3;
+        chunk[2] = b0 - b2;
+        chunk[3] = b1 - b3;
+    }
+    let mut half = 4;
+    while half < values.len() {
+        for block in values.chunks_exact_mut(half * 2) {
+            let (left_half, right_half) = block.split_at_mut(half);
+            for (left, right) in left_half
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(right_half.as_chunks_mut::<4>().0)
+            {
+                let l = f32x4::from_slice(neon, left);
+                let r = f32x4::from_slice(neon, right);
+                (l + r).store_slice(left);
+                (l - r).store_slice(right);
+            }
+        }
+        half *= 2;
+    }
+    let norm = f32x4::splat(neon, normalization);
+    for chunk in values.as_chunks_mut::<4>().0 {
+        let v = f32x4::from_slice(neon, chunk) * norm;
+        if !v.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite kernel output")));
+        }
+        v.store_slice(chunk);
+    }
+    Some(Ok(()))
 }
 
 #[cfg(test)]

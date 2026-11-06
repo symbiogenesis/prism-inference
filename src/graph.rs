@@ -152,16 +152,14 @@ impl Arithmetic {
     fn attention_dot(self, query: &[f32], key: &[u16]) -> Result<f32> {
         match self {
             Self::Source => Ok(dot_f16(query, key)),
-            Self::PinnedSwift => {
-                crate::kernels::pinned_attention::dot(key.iter().copied().map(half_to_float), query)
-            }
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot_f16(key, query),
         }
     }
 
     fn attention_current_dot(self, query: &[f32], key: &[f32]) -> Result<f32> {
         match self {
             Self::Source => Ok(dot(query, key)),
-            Self::PinnedSwift => crate::kernels::pinned_attention::dot(key.iter().copied(), query),
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot_f32(key, query),
         }
     }
 
@@ -536,8 +534,6 @@ struct AttentionScratch {
     projected: Vec<f32>,
     query: Vec<f32>,
     gate: Vec<f32>,
-    key_projection: Vec<f32>,
-    normalized: Vec<f32>,
     attended: Vec<f32>,
     scores: Vec<f32>,
     frequencies: Vec<(f32, f32)>,
@@ -1837,25 +1833,19 @@ impl Evaluation<'_, '_> {
         self.project_group_into(
             [&layer.query, &layer.key, &layer.value],
             input,
-            [&mut scratch.projected, &mut scratch.key_projection, value],
+            [&mut scratch.projected, key, value],
         )?;
         prepare(&mut scratch.query, g.head * g.heads)?;
         prepare(&mut scratch.gate, g.head * g.heads)?;
-        for head in scratch.projected.chunks_exact(2 * g.head) {
-            self.arithmetic.normalize(
-                &head[..g.head],
-                &layer.query_norm,
-                g.epsilon,
-                &mut scratch.normalized,
-            )?;
-            scratch.query.extend_from_slice(&scratch.normalized);
+        for head in scratch.projected.chunks_exact_mut(2 * g.head) {
+            self.arithmetic
+                .normalize_in_place(&mut head[..g.head], &layer.query_norm, g.epsilon)?;
+            scratch.query.extend_from_slice(&head[..g.head]);
             scratch.gate.extend_from_slice(&head[g.head..]);
         }
-        prepare(key, scratch.key_projection.len())?;
-        for head in scratch.key_projection.chunks_exact(g.head) {
+        for head in key.chunks_exact_mut(g.head) {
             self.arithmetic
-                .normalize(head, &layer.key_norm, g.epsilon, &mut scratch.normalized)?;
-            key.extend_from_slice(&scratch.normalized);
+                .normalize_in_place(head, &layer.key_norm, g.epsilon)?;
         }
         // Geometry and position are shared by every full-attention layer in
         // this token evaluation. Reuse the exact scalar frequencies for Q/K

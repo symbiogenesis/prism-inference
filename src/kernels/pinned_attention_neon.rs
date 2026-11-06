@@ -69,6 +69,76 @@ pub(super) fn value_tile<'a>(
     Ok(())
 }
 
+/// Reduces a validated F16 key slice and F32 query slice with four NEON FMA registers.
+pub(super) fn dot_f16(neon: Neon, key: &[u16], query: &[f32]) -> Result<f32> {
+    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    let key_chunks = key.as_chunks::<4>().0;
+    let query_chunks = query.as_chunks::<4>().0;
+    for (chunk, (k, q)) in key_chunks.iter().zip(query_chunks).enumerate() {
+        let acc = &mut sums[chunk % 4];
+        let kv = f32x4::load_array(neon, (*k).map(bonsai_ternary::half_to_float));
+        let qv = f32x4::load_array(neon, *q);
+        *acc = kv.mul_add_precise(qv, *acc);
+    }
+    let vector_steps = key_chunks.len() * 4;
+    let total_steps = padded_dot_steps(query.len());
+    if vector_steps == total_steps {
+        let lanes = ((sums[0] + sums[2]) + (sums[1] + sums[3])).to_array();
+        return super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]));
+    }
+    let mut scalar_sums = sums.map(f32x4::to_array);
+    for index in vector_steps..total_steps {
+        let (value, weight) = if index < query.len() {
+            (bonsai_ternary::half_to_float(key[index]), query[index])
+        } else {
+            (0.0, 0.0)
+        };
+        let sum = &mut scalar_sums[index % 16 / 4][index % 4];
+        *sum = value.mul_add(weight, *sum);
+    }
+    let mut lanes = [0.0; 4];
+    for (index, lane) in lanes.iter_mut().enumerate() {
+        *lane = (scalar_sums[0][index] + scalar_sums[2][index])
+            + (scalar_sums[1][index] + scalar_sums[3][index]);
+    }
+    super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+}
+
+/// Reduces a validated F32 key slice and F32 query slice with four NEON FMA registers.
+pub(super) fn dot_f32(neon: Neon, key: &[f32], query: &[f32]) -> Result<f32> {
+    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    let key_chunks = key.as_chunks::<4>().0;
+    let query_chunks = query.as_chunks::<4>().0;
+    for (chunk, (k, q)) in key_chunks.iter().zip(query_chunks).enumerate() {
+        let acc = &mut sums[chunk % 4];
+        let kv = f32x4::load_array(neon, *k);
+        let qv = f32x4::load_array(neon, *q);
+        *acc = kv.mul_add_precise(qv, *acc);
+    }
+    let vector_steps = key_chunks.len() * 4;
+    let total_steps = padded_dot_steps(query.len());
+    if vector_steps == total_steps {
+        let lanes = ((sums[0] + sums[2]) + (sums[1] + sums[3])).to_array();
+        return super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]));
+    }
+    let mut scalar_sums = sums.map(f32x4::to_array);
+    for index in vector_steps..total_steps {
+        let (value, weight) = if index < query.len() {
+            (key[index], query[index])
+        } else {
+            (0.0, 0.0)
+        };
+        let sum = &mut scalar_sums[index % 16 / 4][index % 4];
+        *sum = value.mul_add(weight, *sum);
+    }
+    let mut lanes = [0.0; 4];
+    for (index, lane) in lanes.iter_mut().enumerate() {
+        *lane = (scalar_sums[0][index] + scalar_sums[2][index])
+            + (scalar_sums[1][index] + scalar_sums[3][index]);
+    }
+    super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+}
+
 #[cfg(test)]
 mod tests {
     use bonsai_ternary::half_to_float;

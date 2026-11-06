@@ -230,8 +230,8 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) {
         return;
     };
     let Ok(limits) = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
-        5120,
-        17_408,
+        hexagon_native_rpc::NATIVE_Q2_MAX_COLUMNS,
+        hexagon_native_rpc::NATIVE_Q2_MAX_ROWS,
         24_000,
         Duration::from_secs(120),
     )

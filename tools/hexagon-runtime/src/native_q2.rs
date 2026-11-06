@@ -330,6 +330,15 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     /// # Errors
     /// Rejects faulted executors, unsupported tensor geometry, or invalid scale headers.
     pub fn prewarm_tensor(&mut self, tensor: &Tensor) -> Result<bool> {
+        let mut weights = Vec::new();
+        self.prewarm_tensor_with_scratch(tensor, &mut weights)
+    }
+
+    fn prewarm_tensor_with_scratch(
+        &mut self,
+        tensor: &Tensor,
+        weights: &mut Vec<u8>,
+    ) -> Result<bool> {
         if self.failed {
             return Err(invalid(
                 "native Q2 Hexagon executor requires terminal teardown",
@@ -354,8 +363,14 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         let max_chunk_cols = columns.min(self.maximum_columns);
         let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
-        let mut weights = zeroed(max_mapped_rows * 36 * (max_chunk_cols / 128), 0_u8)?;
-        let result = self.prepare_resident(tensor, &mut weights, false);
+        let required_bytes = max_mapped_rows * 36 * (max_chunk_cols / 128);
+        if weights.len() < required_bytes {
+            weights
+                .try_reserve(required_bytes - weights.len())
+                .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+            weights.resize(required_bytes, 0_u8);
+        }
+        let result = self.prepare_resident(tensor, &mut weights[..required_bytes], false);
         if result.is_err() {
             self.failed = true;
         }
@@ -383,8 +398,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         self.allowed_tensors = Some(selected);
         if self.residency.is_some() {
+            let mut weights = Vec::new();
             for tensor in tensors {
-                if !self.prewarm_tensor(tensor)? {
+                if !self.prewarm_tensor_with_scratch(tensor, &mut weights)? {
                     self.failed = true;
                     return Err(invalid(
                         "native Q2 resident arena exhausted during pre-warming",
@@ -403,8 +419,13 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         resident: Option<usize>,
         weights: &mut [u8],
         activation: &[f32],
-    ) -> Result<Vec<f32>> {
-        let mut direct_out = zeroed(rows, f32::NAN)?;
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        output.clear();
+        output
+            .try_reserve(rows)
+            .map_err(|_| invalid("native Q2 output allocation failed"))?;
+        output.resize(rows, f32::NAN);
         let total_blocks = columns / 128;
         if let Some(index) = resident {
             self.statistics.operations_attempted =
@@ -416,7 +437,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
             let handle = &cache.handles[cache.projections[index].first_handle];
             self.submitter
-                .submit_resident(handle, activation, &mut direct_out)?;
+                .submit_resident(handle, activation, output.as_mut_slice())?;
         } else {
             pack_native_chunk(
                 &tensor.data,
@@ -434,9 +455,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 self.statistics.operations_attempted.saturating_add(1);
             self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
             self.submitter
-                .submit(columns, rows, weights, activation, &mut direct_out)?;
+                .submit(columns, rows, weights, activation, output.as_mut_slice())?;
         }
-        for &val in &direct_out {
+        for &val in output.iter() {
             finite(val)?;
         }
         self.statistics.operations_completed =
@@ -444,7 +465,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
         self.statistics.projections_completed =
             self.statistics.projections_completed.saturating_add(1);
-        Ok(direct_out)
+        Ok(())
     }
 
     #[allow(
@@ -497,9 +518,15 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             self.prepare_resident(tensor, &mut weights, true)?
         };
         if single_op {
-            *output =
-                self.project_single_op(tensor, columns, rows, resident, &mut weights, activation)?;
-            return Ok(());
+            return self.project_single_op(
+                tensor,
+                columns,
+                rows,
+                resident,
+                &mut weights,
+                activation,
+                output,
+            );
         }
         let mut pending = zeroed(rows, 0.0_f32)?;
         let mut chunk_output = zeroed(max_mapped_rows, 0.0_f32)?;

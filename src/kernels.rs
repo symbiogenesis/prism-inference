@@ -999,6 +999,16 @@ fn dot_q8_groups_pinned<const NEON: bool>(
         }
         return dot_q8_groups(kind, bytes, input);
     }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if NEON {
+        return neon::dot_ptq1_row_pinned(bytes, input);
+    }
     let (_, block_bytes) = layout(kind)?;
     let mut lanes = [0.0_f32; 4];
     for (index, block) in bytes.chunks_exact(block_bytes).enumerate() {
@@ -1100,6 +1110,16 @@ fn dot_legacy(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32> {
     reason = "The scalar reference rounds the accumulated binary64 sum to binary32."
 )]
 fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(value) = neon::float_dot(weights, input) {
+        return value;
+    }
     // The non-SIMD ggml reference sums rounded f32 products in f64.
     weights
         .iter()
@@ -1114,6 +1134,16 @@ fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
 )]
 fn bf16_dot(bytes: &[u8], input: &[f32]) -> Result<f32> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::bf16_dot(bytes, input) {
+        return result;
+    }
     // The caller checks the complete tensor geometry before borrowing this
     // row. Consume each BF16 scalar once instead of materializing a F32 row.
     // Result's sum delegates to the same f64 Sum used by float_dot, including
@@ -1615,7 +1645,7 @@ impl MatvecScratch {
         ))]
         self.pq2_consumption.clear();
         let (columns, _, _) = dimensions(tensor)?;
-        if input.len() != columns || input.iter().any(|value| !value.is_finite()) {
+        if input.len() != columns || !is_finite_slice(input) {
             return Err(invalid(
                 "matvec requires a matching finite activation vector",
             ));
@@ -1634,6 +1664,11 @@ impl MatvecScratch {
                     q8_with_rounding::<true>(input, &mut self.q8)?;
                 }
                 ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
+                ActivationContract::F32 => fill_into(&mut self.activations, |activations| {
+                    activations.try_reserve_exact(input.len())?;
+                    activations.extend_from_slice(input);
+                    Ok(())
+                })?,
                 _ => collect_into(
                     input.iter().map(|&value| {
                         finite(match contract {
@@ -2062,6 +2097,28 @@ impl PreparedMatvec<'_> {
                 if scratch.row_parallelism.uses_pool(rows) {
                     scratch.statistics.parallel_row_operations =
                         scratch.statistics.parallel_row_operations.saturating_add(1);
+                }
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                if tensor.kind == PTQ1
+                    && scratch.pinned_accumulation
+                    && matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon)
+                {
+                    let q8 = &scratch.q8;
+                    return scratch.row_parallelism.fill_four_rows(
+                        &tensor.data,
+                        row_bytes,
+                        output,
+                        &mut scratch.row_errors,
+                        |rows| neon::dot_ptq1_eight_rows_pinned(rows, q8),
+                        |rows| neon::dot_ptq1_four_rows_pinned(rows, q8),
+                        |bytes| neon::dot_ptq1_row_pinned(bytes, q8),
+                    );
                 }
                 scratch.row_parallelism.fill(
                     &tensor.data,

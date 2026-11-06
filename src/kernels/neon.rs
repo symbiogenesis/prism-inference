@@ -25,17 +25,6 @@ fn decode(packed: u8x16<Neon>) -> [i8x16<Neon>; 4] {
 }
 
 #[inline]
-fn dot16(weights: i8x16<Neon>, activations: i8x16<Neon>) -> i32x4<Neon> {
-    let (weight_low, weight_high) = weights.widen();
-    let (activation_low, activation_high) = activations.widen();
-    // Signed widening preserves -128. Every i16 product lies in -256..=254;
-    // widening each product before addition prevents narrow accumulation.
-    let (low_low, low_high) = (weight_low * activation_low).widen();
-    let (high_low, high_high) = (weight_high * activation_high).widen();
-    low_low + low_high + high_low + high_high
-}
-
-#[inline]
 fn pq2_pair_sums(weights: i8x16<Neon>, activations: i8x16<Neon>) -> i16x8<Neon> {
     let (weight_low, weight_high) = weights.widen();
     let (activation_low, activation_high) = activations.widen();
@@ -1096,17 +1085,28 @@ pub(super) fn dot_consumption_order_four(
 
 #[inline]
 fn dot32(neon: Neon, low: i8x16<Neon>, high: i8x16<Neon>, values: &[i8; 32]) -> i32 {
-    (dot16(low, i8x16::from_slice(neon, &values[..16]))
-        + dot16(high, i8x16::from_slice(neon, &values[16..])))
-    .reduce_sum()
+    let (w0_l, w0_h) = low.widen();
+    let (w1_l, w1_h) = high.widen();
+    let (v0_l, v0_h) = i8x16::from_slice(neon, &values[..16]).widen();
+    let (v1_l, v1_h) = i8x16::from_slice(neon, &values[16..]).widen();
+    let sum = (w0_l * v0_l + w0_h * v0_h) + (w1_l * v1_l + w1_h * v1_h);
+    let (sum_l, sum_h) = sum.widen();
+    (sum_l + sum_h).reduce_sum()
 }
 
 #[inline]
-fn dot16_native_lanes(weights: i8x16<Neon>, values: i8x16<Neon>) -> [i32; 4] {
-    let (weight_low, weight_high) = weights.widen();
-    let (value_low, value_high) = values.widen();
-    let (a, b) = (weight_low * value_low).widen();
-    let (c, d) = (weight_high * value_high).widen();
+fn dot32_native_lanes_prewidened(
+    low: i8x16<Neon>,
+    high: i8x16<Neon>,
+    v0_l: i16x8<Neon>,
+    v0_h: i16x8<Neon>,
+    v1_l: i16x8<Neon>,
+    v1_h: i16x8<Neon>,
+) -> [i32; 4] {
+    let (w0_l, w0_h) = low.widen();
+    let (w1_l, w1_h) = high.widen();
+    let (a, b) = (w0_l * v0_l + w1_l * v1_l).widen();
+    let (c, d) = (w0_h * v0_h + w1_h * v1_h).widen();
     [
         a.reduce_sum(),
         b.reduce_sum(),
@@ -1122,9 +1122,9 @@ fn dot32_native_lanes(
     high: i8x16<Neon>,
     values: &[i8; 32],
 ) -> [i32; 4] {
-    let low = dot16_native_lanes(low, i8x16::from_slice(neon, &values[..16]));
-    let high = dot16_native_lanes(high, i8x16::from_slice(neon, &values[16..]));
-    std::array::from_fn(|lane| low[lane] + high[lane])
+    let (v0_l, v0_h) = i8x16::from_slice(neon, &values[..16]).widen();
+    let (v1_l, v1_h) = i8x16::from_slice(neon, &values[16..]).widen();
+    dot32_native_lanes_prewidened(low, high, v0_l, v0_h, v1_l, v1_h)
 }
 
 /// Retains four independent `Q8_0` integer sums, each bounded by 8,192.
@@ -1256,12 +1256,237 @@ pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) ->
     }))
 }
 
+#[inline]
+pub(super) fn dot_ptq1_row_pinned(bytes: &[u8], input: &[super::Q8Block]) -> Result<f32> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return super::dot_q8_groups_pinned::<false>(super::PTQ1, bytes, input);
+    };
+    let mut lanes = f32x4::splat(neon, 0.0);
+    for (index, block) in bytes.as_chunks::<28>().0.iter().enumerate() {
+        let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let decoded = decode_ptq1(neon, block);
+        let weight_scale = super::scale(&block[26..])?;
+        for (group, activation) in activations.iter().enumerate() {
+            let integers = dot32_native_lanes(
+                neon,
+                decoded[group * 2],
+                decoded[group * 2 + 1],
+                &activation.values,
+            );
+            let floats = f32x4::load_array(neon, integers.map(super::integer_float));
+            let d = f32x4::splat(neon, weight_scale * activation.scale);
+            lanes = floats.mul_add_precise(d, lanes);
+        }
+    }
+    let [l0, l1, l2, l3] = lanes.to_array();
+    super::finite((l0 + l1) + (l2 + l3))
+}
+
+#[inline]
+pub(super) fn dot_ptq1_four_rows_pinned(
+    rows: [&[u8]; 4],
+    input: &[super::Q8Block],
+) -> Result<[f32; 4]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return Ok([
+            super::dot_q8_groups_pinned::<false>(super::PTQ1, rows[0], input)?,
+            super::dot_q8_groups_pinned::<false>(super::PTQ1, rows[1], input)?,
+            super::dot_q8_groups_pinned::<false>(super::PTQ1, rows[2], input)?,
+            super::dot_q8_groups_pinned::<false>(super::PTQ1, rows[3], input)?,
+        ]);
+    };
+    let mut lanes = [f32x4::splat(neon, 0.0); 4];
+    let r0 = rows[0].as_chunks::<28>().0;
+    let r1 = rows[1].as_chunks::<28>().0;
+    let r2 = rows[2].as_chunks::<28>().0;
+    let r3 = rows[3].as_chunks::<28>().0;
+    for (index, (((b0, b1), b2), b3)) in r0.iter().zip(r1).zip(r2).zip(r3).enumerate() {
+        let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let blocks = [b0, b1, b2, b3];
+        let mut decoded = [[i8x16::splat(neon, 0); 8]; 4];
+        let mut scales = [0.0_f32; 4];
+        for r in 0..4 {
+            decoded[r] = decode_ptq1(neon, blocks[r]);
+            scales[r] = super::scale(&blocks[r][26..])?;
+        }
+        for (group, activation) in activations.iter().enumerate() {
+            let (v0_l, v0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            let act_scale = activation.scale;
+            for r in 0..4 {
+                let integers = dot32_native_lanes_prewidened(
+                    decoded[r][group * 2],
+                    decoded[r][group * 2 + 1],
+                    v0_l,
+                    v0_h,
+                    v1_l,
+                    v1_h,
+                );
+                let floats = f32x4::load_array(neon, integers.map(super::integer_float));
+                let d = f32x4::splat(neon, scales[r] * act_scale);
+                lanes[r] = floats.mul_add_precise(d, lanes[r]);
+            }
+        }
+    }
+    let mut out = [0.0_f32; 4];
+    for r in 0..4 {
+        let [l0, l1, l2, l3] = lanes[r].to_array();
+        out[r] = super::finite((l0 + l1) + (l2 + l3))?;
+    }
+    Ok(out)
+}
+
+#[inline]
+pub(super) fn dot_ptq1_eight_rows_pinned(
+    rows: [&[u8]; 8],
+    input: &[super::Q8Block],
+) -> Result<[f32; 8]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        let first = dot_ptq1_four_rows_pinned([rows[0], rows[1], rows[2], rows[3]], input)?;
+        let second = dot_ptq1_four_rows_pinned([rows[4], rows[5], rows[6], rows[7]], input)?;
+        return Ok([
+            first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
+        ]);
+    };
+    let mut lanes = [f32x4::splat(neon, 0.0); 8];
+    let chunks = rows.map(|row| row.as_chunks::<28>().0);
+    for index in 0..chunks[0].len() {
+        let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let mut decoded = [[i8x16::splat(neon, 0); 8]; 8];
+        let mut scales = [0.0_f32; 8];
+        for r in 0..8 {
+            let block = &chunks[r][index];
+            decoded[r] = decode_ptq1(neon, block);
+            scales[r] = super::scale(&block[26..])?;
+        }
+        for (group, activation) in activations.iter().enumerate() {
+            let (v0_l, v0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            let act_scale = activation.scale;
+            for r in 0..8 {
+                let integers = dot32_native_lanes_prewidened(
+                    decoded[r][group * 2],
+                    decoded[r][group * 2 + 1],
+                    v0_l,
+                    v0_h,
+                    v1_l,
+                    v1_h,
+                );
+                let floats = f32x4::load_array(neon, integers.map(super::integer_float));
+                let d = f32x4::splat(neon, scales[r] * act_scale);
+                lanes[r] = floats.mul_add_precise(d, lanes[r]);
+            }
+        }
+    }
+    let mut out = [0.0_f32; 8];
+    for r in 0..8 {
+        let [l0, l1, l2, l3] = lanes[r].to_array();
+        out[r] = super::finite((l0 + l1) + (l2 + l3))?;
+    }
+    Ok(out)
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn float_dot(weights: &[f32], input: &[f32]) -> Option<f32> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = weights.len().min(input.len());
+    let (w_chunks, w_rem) = weights[..count].as_chunks::<4>();
+    let (in_chunks, in_rem) = input[..count].as_chunks::<4>();
+    let mut sum = -0.0_f64;
+    for (w_chunk, in_chunk) in w_chunks.iter().zip(in_chunks) {
+        let prod =
+            (f32x4::from_slice(neon, w_chunk) * f32x4::from_slice(neon, in_chunk)).to_array();
+        sum += f64::from(prod[0]);
+        sum += f64::from(prod[1]);
+        sum += f64::from(prod[2]);
+        sum += f64::from(prod[3]);
+    }
+    for (&w, &act) in w_rem.iter().zip(in_rem) {
+        sum += f64::from(w * act);
+    }
+    Some(sum as f32)
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn bf16_dot(bytes: &[u8], input: &[f32]) -> Option<Result<f32>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let (b_chunks, b_rem) = bytes.as_chunks::<8>();
+    let (in_chunks, in_rem) = input.as_chunks::<4>();
+    let mut sum = -0.0_f64;
+    for (b_chunk, in_chunk) in b_chunks.iter().zip(in_chunks) {
+        let weights = f32x4::load_array(
+            neon,
+            [
+                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[0], b_chunk[1]])) << 16),
+                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[2], b_chunk[3]])) << 16),
+                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[4], b_chunk[5]])) << 16),
+                f32::from_bits(u32::from(u16::from_le_bytes([b_chunk[6], b_chunk[7]])) << 16),
+            ],
+        );
+        if !weights.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let prod = (weights * f32x4::from_slice(neon, in_chunk)).to_array();
+        sum += f64::from(prod[0]);
+        sum += f64::from(prod[1]);
+        sum += f64::from(prod[2]);
+        sum += f64::from(prod[3]);
+    }
+    for (b, &act) in b_rem.as_chunks::<2>().0.iter().zip(in_rem) {
+        match super::finite(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16)) {
+            Ok(w) => sum += f64::from(w * act),
+            Err(err) => return Some(Err(err)),
+        }
+    }
+    Some(super::finite(sum as f32))
+}
+
+#[inline]
+fn hadamard_radix4_stage(neon: Neon, values: &mut [f32], half: usize) {
+    for block in values.chunks_exact_mut(half * 4) {
+        let (first_half, second_half) = block.split_at_mut(half * 2);
+        let (q0, q1) = first_half.split_at_mut(half);
+        let (q2, q3) = second_half.split_at_mut(half);
+        for (((c0_slice, c1_slice), c2_slice), c3_slice) in q0
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(q1.as_chunks_mut::<4>().0)
+            .zip(q2.as_chunks_mut::<4>().0)
+            .zip(q3.as_chunks_mut::<4>().0)
+        {
+            let v0 = f32x4::from_slice(neon, c0_slice);
+            let v1 = f32x4::from_slice(neon, c1_slice);
+            let v2 = f32x4::from_slice(neon, c2_slice);
+            let v3 = f32x4::from_slice(neon, c3_slice);
+            let b0 = v0 + v1;
+            let b1 = v0 - v1;
+            let b2 = v2 + v3;
+            let b3 = v2 - v3;
+            (b0 + b2).store_slice(c0_slice);
+            (b1 + b3).store_slice(c1_slice);
+            (b0 - b2).store_slice(c2_slice);
+            (b1 - b3).store_slice(c3_slice);
+        }
+    }
+}
+
 /// Evaluates the normalized Sylvester Hadamard butterfly stages in NEON `f32x4`.
 ///
-/// Requires a power-of-two slice of at least four elements. Stages `half = 1`
-/// and `half = 2` are fused per four-element vector, and all subsequent stages
-/// operate on four-lane vectors while preserving exact IEEE 754 addition and
-/// subtraction order.
+/// Requires a power-of-two slice of at least four elements. Stages `half = 1, 2, 4, 8`
+/// are fused per 16-element block when `values.len() >= 16`, subsequent stages are
+/// fused in radix-4 pairs (`half` and `half * 2`), and the final butterfly stage is
+/// fused with normalization while preserving exact IEEE 754 addition and subtraction order.
 #[inline]
 pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<()>> {
     if values.len() < 4 {
@@ -1275,42 +1500,60 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
             )));
         }
     }
-    for chunk in values.as_chunks_mut::<4>().0 {
-        let [a0, a1, a2, a3] = *chunk;
-        let b0 = a0 + a1;
-        let b1 = a0 - a1;
-        let b2 = a2 + a3;
-        let b3 = a2 - a3;
-        chunk[0] = b0 + b2;
-        chunk[1] = b1 + b3;
-        chunk[2] = b0 - b2;
-        chunk[3] = b1 - b3;
-    }
-    let mut half = 4;
-    while half < values.len() {
-        for block in values.chunks_exact_mut(half * 2) {
-            let (left_half, right_half) = block.split_at_mut(half);
-            for (left, right) in left_half
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(right_half.as_chunks_mut::<4>().0)
-            {
-                let l = f32x4::from_slice(neon, left);
-                let r = f32x4::from_slice(neon, right);
-                (l + r).store_slice(left);
-                (l - r).store_slice(right);
+    let mut half = if values.len() >= 16 {
+        for block in values.as_chunks_mut::<16>().0 {
+            let mut v = [f32x4::splat(neon, 0.0); 4];
+            for (sub, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+                let [a0, a1, a2, a3] = *chunk;
+                let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+                v[sub] = f32x4::load_array(neon, [b0 + b2, b1 + b3, b0 - b2, b1 - b3]);
             }
+            let (c0, c1, c2, c3) = (v[0] + v[1], v[0] - v[1], v[2] + v[3], v[2] - v[3]);
+            (c0 + c2).store_slice(&mut block[0..4]);
+            (c1 + c3).store_slice(&mut block[4..8]);
+            (c0 - c2).store_slice(&mut block[8..12]);
+            (c1 - c3).store_slice(&mut block[12..16]);
         }
-        half *= 2;
+        16
+    } else {
+        for chunk in values.as_chunks_mut::<4>().0 {
+            let [a0, a1, a2, a3] = *chunk;
+            let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+            *chunk = [b0 + b2, b1 + b3, b0 - b2, b1 - b3];
+        }
+        4
+    };
+    while half * 2 < values.len() {
+        hadamard_radix4_stage(neon, values, half);
+        half *= 4;
     }
     let norm = f32x4::splat(neon, normalization);
-    for chunk in values.as_chunks_mut::<4>().0 {
-        let v = f32x4::from_slice(neon, chunk) * norm;
-        if !v.is_finite().all_true() {
-            return Some(Err(crate::invalid("nonfinite kernel output")));
+    if half < values.len() {
+        let (left_half, right_half) = values.split_at_mut(half);
+        for (left, right) in left_half
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(right_half.as_chunks_mut::<4>().0)
+        {
+            let l = f32x4::from_slice(neon, left);
+            let r = f32x4::from_slice(neon, right);
+            let out_l = (l + r) * norm;
+            let out_r = (l - r) * norm;
+            if !out_l.is_finite().all_true() || !out_r.is_finite().all_true() {
+                return Some(Err(crate::invalid("nonfinite kernel output")));
+            }
+            out_l.store_slice(left);
+            out_r.store_slice(right);
         }
-        v.store_slice(chunk);
+    } else {
+        for chunk in values.as_chunks_mut::<4>().0 {
+            let v = f32x4::from_slice(neon, chunk) * norm;
+            if !v.is_finite().all_true() {
+                return Some(Err(crate::invalid("nonfinite kernel output")));
+            }
+            v.store_slice(chunk);
+        }
     }
     Some(Ok(()))
 }

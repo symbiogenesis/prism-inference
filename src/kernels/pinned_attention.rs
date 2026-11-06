@@ -346,6 +346,23 @@ fn rope_with_aliasing(
     {
         return Err(invalid("invalid pinned Swift RoPE geometry or frequencies"));
     }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let (Some(neon), Ok(freq_array)) = (
+        fearless_simd::Level::baseline().as_neon(),
+        <&[(f32, f32); 32]>::try_from(frequencies),
+    ) {
+        neon::rope_with_aliasing(neon, input, freq_array, in_place);
+        if !super::is_finite_slice(input) {
+            return Err(invalid("nonfinite pinned Swift RoPE output"));
+        }
+        return Ok(());
+    }
     for head in input.chunks_exact_mut(head) {
         for (index, &(cosine, sine)) in frequencies.iter().enumerate() {
             let first = head[index];
@@ -358,7 +375,7 @@ fn rope_with_aliasing(
             head[index + rotary / 2] = second.mul_add(cosine, first * sine);
         }
     }
-    if input.iter().any(|value| !value.is_finite()) {
+    if !super::is_finite_slice(input) {
         return Err(invalid("nonfinite pinned Swift RoPE output"));
     }
     Ok(())

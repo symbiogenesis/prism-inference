@@ -139,6 +139,61 @@ pub(super) fn dot_f32(neon: Neon, key: &[f32], query: &[f32]) -> Result<f32> {
     super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
 }
 
+/// Rotates validated 256-wide Swift heads (with 64-element rotary prefix) in NEON `f32x4`.
+pub(super) fn rope_with_aliasing(
+    neon: Neon,
+    input: &mut [f32],
+    frequencies: &[(f32, f32); 32],
+    in_place: bool,
+) {
+    let cos_vecs: [f32x4<Neon>; 8] = std::array::from_fn(|chunk| {
+        let base = chunk * 4;
+        f32x4::load_array(
+            neon,
+            [
+                frequencies[base].0,
+                frequencies[base + 1].0,
+                frequencies[base + 2].0,
+                frequencies[base + 3].0,
+            ],
+        )
+    });
+    let sin_vecs: [f32x4<Neon>; 8] = std::array::from_fn(|chunk| {
+        let base = chunk * 4;
+        f32x4::load_array(
+            neon,
+            [
+                frequencies[base].1,
+                frequencies[base + 1].1,
+                frequencies[base + 2].1,
+                frequencies[base + 3].1,
+            ],
+        )
+    });
+    for head in input.as_chunks_mut::<256>().0 {
+        let (first_half, second_half) = head[..64].split_at_mut(32);
+        for (((first_chunk, second_chunk), &cos), &sin) in first_half
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(second_half.as_chunks_mut::<4>().0)
+            .zip(&cos_vecs)
+            .zip(&sin_vecs)
+        {
+            let first = f32x4::from_slice(neon, first_chunk);
+            let second = f32x4::from_slice(neon, second_chunk);
+            let rotated_first = if in_place {
+                first.mul_add_precise(cos, -(second * sin))
+            } else {
+                (-second).mul_add_precise(sin, first * cos)
+            };
+            let rotated_second = second.mul_add_precise(cos, first * sin);
+            rotated_first.store_slice(first_chunk);
+            rotated_second.store_slice(second_chunk);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bonsai_ternary::half_to_float;

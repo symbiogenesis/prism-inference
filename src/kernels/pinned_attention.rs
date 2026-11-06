@@ -238,6 +238,44 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
     }
     let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut total = 0.0_f64;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        use fearless_simd::{f32x4, prelude::*};
+        let max_vec = f32x4::splat(neon, maximum);
+        let (chunks, tail) = scores.as_chunks_mut::<4>();
+        for chunk in chunks {
+            let exp = super::pinned_activations::vector_exp_x4(
+                neon,
+                f32x4::from_slice(neon, chunk) - max_vec,
+            );
+            exp.store_slice(chunk);
+            total += f64::from((chunk[0] + chunk[1]) + (chunk[2] + chunk[3]));
+        }
+        if !tail.is_empty() {
+            let mut group = [0.0; 4];
+            for (score, output) in tail.iter_mut().zip(&mut group) {
+                *score = super::pinned_activations::vector_exp(*score - maximum);
+                *output = *score;
+            }
+            total += f64::from((group[0] + group[1]) + (group[2] + group[3]));
+        }
+        let inverse = (1.0_f64 / total) as f32;
+        let inv_vec = f32x4::splat(neon, inverse);
+        let (chunks, tail) = scores.as_chunks_mut::<4>();
+        for chunk in chunks {
+            (f32x4::from_slice(neon, chunk) * inv_vec).store_slice(chunk);
+        }
+        for score in tail {
+            *score *= inverse;
+        }
+        return Ok(());
+    }
     // Keep the final partial group's exact pairwise tree. Later physical
     // groups add only +0 to the positive total and cannot change its bits.
     for offset in (0..scores.len()).step_by(4) {

@@ -1,13 +1,22 @@
-//! Safe scalar reproduction of pinned Windows ARM64 graph activation arithmetic.
+//! Safe scalar and NEON reproduction of pinned Windows ARM64 graph activation arithmetic.
 //!
 //! Reference: Prism `73bfe6cc485554822f80c473a3c0c4f25e80f41b`,
 //! `ggml/src/ggml-cpu/vec.h` and `vec.cpp`. Upstream MIT terms are retained in
-//! `PRISM-LICENSE.txt`. This numerical path makes no optimization claim.
+//! `PRISM-LICENSE.txt`.
 
 #![allow(
     clippy::redundant_pub_crate,
     reason = "Keep graph-only activation helpers crate scoped while satisfying unreachable_pub."
 )]
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+use fearless_simd::{Neon, f32x4, prelude::*, u32x4};
 
 use crate::{Result, invalid};
 
@@ -43,6 +52,52 @@ pub(super) fn vector_exp(value: f32) -> f32 {
     }
 }
 
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+pub(super) fn vector_exp_x4(neon: Neon, value: f32x4<Neon>) -> f32x4<Neon> {
+    let magic = f32x4::splat(neon, 12_582_912.0);
+    let z = value.mul_add(f32x4::splat(neon, f32::from_bits(0x3fb8_aa3b)), magic);
+    let n = z - magic;
+    let neg_n = -n;
+    let remainder = neg_n.mul_add(f32x4::splat(neon, f32::from_bits(0x3f31_7200)), value);
+    let remainder = neg_n.mul_add(f32x4::splat(neon, f32::from_bits(0x35bf_be8e)), remainder);
+    let exponent = z.bitcast::<u32x4<Neon>>() << 23;
+    let k = (exponent + u32x4::splat(neon, 1.0_f32.to_bits())).bitcast::<f32x4<Neon>>();
+    let square = remainder * remainder;
+    let inner = f32x4::splat(neon, f32::from_bits(0x3c07_2010))
+        .mul_add(remainder, f32x4::splat(neon, f32::from_bits(0x3d2b_9f17)))
+        .mul_add(
+            square,
+            f32x4::splat(neon, f32::from_bits(0x3e2a_af33))
+                .mul_add(remainder, f32x4::splat(neon, f32::from_bits(0x3eff_fedb))),
+        );
+    let polynomial = inner.mul_add(
+        square,
+        f32x4::splat(neon, f32::from_bits(0x3f7f_fff6)) * remainder,
+    );
+    let abs_n = n.abs();
+    let gt_126 = abs_n.simd_gt(f32x4::splat(neon, 126.0));
+    if gt_126.any_true() {
+        let shift = n
+            .simd_le(f32x4::splat(neon, 0.0))
+            .select(u32x4::splat(neon, 0x8200_0000), u32x4::splat(neon, 0));
+        let s1 = (shift + u32x4::splat(neon, 0x7f00_0000)).bitcast::<f32x4<Neon>>();
+        let s2 = (exponent - shift).bitcast::<f32x4<Neon>>();
+        let scaled = abs_n
+            .simd_gt(f32x4::splat(neon, 192.0))
+            .select(s1 * s1, s2.mul_add(polynomial, s2) * s1);
+        gt_126.select(scaled, polynomial.mul_add(k, k))
+    } else {
+        polynomial.mul_add(k, k)
+    }
+}
+
 fn denominator(value: f32, vectorized: bool) -> f32 {
     1.0 + if vectorized {
         vector_exp(0.0 - value)
@@ -53,6 +108,26 @@ fn denominator(value: f32, vectorized: bool) -> f32 {
 
 /// Applies the pinned native `SiLU` row contract without allocating.
 pub(crate) fn silu_in_place(values: &mut [f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        let zero = f32x4::splat(neon, 0.0);
+        let one = f32x4::splat(neon, 1.0);
+        let (chunks, tail) = values.as_chunks_mut::<4>();
+        for chunk in chunks {
+            let v = f32x4::from_slice(neon, chunk);
+            (v / (one + vector_exp_x4(neon, zero - v))).store_slice(chunk);
+        }
+        for value in tail {
+            *value /= denominator(*value, false);
+        }
+        return;
+    }
     let vectorized = values.len() / 4 * 4;
     for (index, value) in values.iter_mut().enumerate() {
         *value /= denominator(*value, index < vectorized);
@@ -66,6 +141,29 @@ pub(crate) fn silu_in_place(values: &mut [f32]) {
 pub(crate) fn swiglu_in_place(gate: &[f32], up: &mut [f32]) -> Result<()> {
     if gate.len() != up.len() {
         return Err(invalid("pinned SwiGLU requires matching gate and up rows"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        let zero = f32x4::splat(neon, 0.0);
+        let one = f32x4::splat(neon, 1.0);
+        let (gate_chunks, gate_tail) = gate.as_chunks::<4>();
+        let (up_chunks, up_tail) = up.as_chunks_mut::<4>();
+        for (g_chunk, u_chunk) in gate_chunks.iter().zip(up_chunks) {
+            let g = f32x4::from_slice(neon, g_chunk);
+            let u = f32x4::from_slice(neon, u_chunk);
+            // The compiled pinned SwiGLU reassociates the numerator before division.
+            ((g * u) / (one + vector_exp_x4(neon, zero - g))).store_slice(u_chunk);
+        }
+        for (&gate, up) in gate_tail.iter().zip(up_tail) {
+            *up = (gate * *up) / denominator(gate, false);
+        }
+        return Ok(());
     }
     let vectorized = gate.len() / 4 * 4;
     for (index, (&gate, up)) in gate.iter().zip(up).enumerate() {
@@ -84,6 +182,29 @@ pub(crate) fn swiglu_into(gate: &[f32], up: &[f32], output: &mut [f32]) -> Resul
         return Err(invalid(
             "pinned SwiGLU requires matching input and output rows",
         ));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        let zero = f32x4::splat(neon, 0.0);
+        let one = f32x4::splat(neon, 1.0);
+        let (gate_chunks, gate_tail) = gate.as_chunks::<4>();
+        let (up_chunks, up_tail) = up.as_chunks::<4>();
+        let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
+        for ((g_chunk, u_chunk), o_chunk) in gate_chunks.iter().zip(up_chunks).zip(out_chunks) {
+            let g = f32x4::from_slice(neon, g_chunk);
+            let u = f32x4::from_slice(neon, u_chunk);
+            ((g * u) / (one + vector_exp_x4(neon, zero - g))).store_slice(o_chunk);
+        }
+        for ((&gate, &up), output) in gate_tail.iter().zip(up_tail).zip(out_tail) {
+            *output = (gate * up) / denominator(gate, false);
+        }
+        return Ok(());
     }
     let vectorized = gate.len() / 4 * 4;
     for (index, ((&gate, &up), output)) in gate.iter().zip(up).zip(output).enumerate() {

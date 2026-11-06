@@ -14,23 +14,26 @@ use crate::Result;
 pub(super) fn dot(first: &[f32], second: &[f32]) -> Option<f32> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let vectorized = first.len() / 16 * 16;
-    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
     for (first, second) in first[..vectorized]
         .as_chunks::<16>()
         .0
         .iter()
         .zip(second[..vectorized].as_chunks::<16>().0)
     {
-        for ((sum, first), second) in sums
-            .iter_mut()
-            .zip(first.as_chunks::<4>().0)
-            .zip(second.as_chunks::<4>().0)
-        {
-            *sum = f32x4::from_slice(neon, first)
-                .mul_add_precise(f32x4::from_slice(neon, second), *sum);
-        }
+        s0 = f32x4::from_slice(neon, &first[0..4])
+            .mul_add_precise(f32x4::from_slice(neon, &second[0..4]), s0);
+        s1 = f32x4::from_slice(neon, &first[4..8])
+            .mul_add_precise(f32x4::from_slice(neon, &second[4..8]), s1);
+        s2 = f32x4::from_slice(neon, &first[8..12])
+            .mul_add_precise(f32x4::from_slice(neon, &second[8..12]), s2);
+        s3 = f32x4::from_slice(neon, &first[12..16])
+            .mul_add_precise(f32x4::from_slice(neon, &second[12..16]), s3);
     }
-    let mut result = ((sums[0] + sums[2]) + (sums[1] + sums[3])).reduce_sum();
+    let mut result = ((s0 + s2) + (s1 + s3)).reduce_sum();
     for (&first, &second) in first[vectorized..].iter().zip(&second[vectorized..]) {
         result += first * second;
     }
@@ -48,24 +51,30 @@ pub(super) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Optio
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let vectorized = state.len() / 16 * 16;
     let decays = f32x4::splat(neon, decay);
-    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
     for (state, key) in state[..vectorized]
         .as_chunks_mut::<16>()
         .0
         .iter_mut()
         .zip(key[..vectorized].as_chunks::<16>().0)
     {
-        for ((sum, state), key) in sums
-            .iter_mut()
-            .zip(state.as_chunks_mut::<4>().0)
-            .zip(key.as_chunks::<4>().0)
-        {
-            let decayed = f32x4::from_slice(neon, state) * decays;
-            decayed.store_slice(state);
-            *sum = decayed.mul_add_precise(f32x4::from_slice(neon, key), *sum);
-        }
+        let d0 = f32x4::from_slice(neon, &state[0..4]) * decays;
+        let d1 = f32x4::from_slice(neon, &state[4..8]) * decays;
+        let d2 = f32x4::from_slice(neon, &state[8..12]) * decays;
+        let d3 = f32x4::from_slice(neon, &state[12..16]) * decays;
+        d0.store_slice(&mut state[0..4]);
+        d1.store_slice(&mut state[4..8]);
+        d2.store_slice(&mut state[8..12]);
+        d3.store_slice(&mut state[12..16]);
+        s0 = d0.mul_add_precise(f32x4::from_slice(neon, &key[0..4]), s0);
+        s1 = d1.mul_add_precise(f32x4::from_slice(neon, &key[4..8]), s1);
+        s2 = d2.mul_add_precise(f32x4::from_slice(neon, &key[8..12]), s2);
+        s3 = d3.mul_add_precise(f32x4::from_slice(neon, &key[12..16]), s3);
     }
-    let mut result = ((sums[0] + sums[2]) + (sums[1] + sums[3])).reduce_sum();
+    let mut result = ((s0 + s2) + (s1 + s3)).reduce_sum();
     for (state, &key) in state[vectorized..].iter_mut().zip(&key[vectorized..]) {
         *state *= decay;
         result += *state * key;
@@ -88,7 +97,10 @@ pub(super) fn decay_and_dot_from(
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let vectorized = state.len() / 16 * 16;
     let decays = f32x4::splat(neon, decay);
-    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
     for ((prev, state), key) in previous[..vectorized]
         .as_chunks::<16>()
         .0
@@ -96,18 +108,20 @@ pub(super) fn decay_and_dot_from(
         .zip(state[..vectorized].as_chunks_mut::<16>().0)
         .zip(key[..vectorized].as_chunks::<16>().0)
     {
-        for (((sum, prev), state), key) in sums
-            .iter_mut()
-            .zip(prev.as_chunks::<4>().0)
-            .zip(state.as_chunks_mut::<4>().0)
-            .zip(key.as_chunks::<4>().0)
-        {
-            let decayed = f32x4::from_slice(neon, prev) * decays;
-            decayed.store_slice(state);
-            *sum = decayed.mul_add_precise(f32x4::from_slice(neon, key), *sum);
-        }
+        let d0 = f32x4::from_slice(neon, &prev[0..4]) * decays;
+        let d1 = f32x4::from_slice(neon, &prev[4..8]) * decays;
+        let d2 = f32x4::from_slice(neon, &prev[8..12]) * decays;
+        let d3 = f32x4::from_slice(neon, &prev[12..16]) * decays;
+        d0.store_slice(&mut state[0..4]);
+        d1.store_slice(&mut state[4..8]);
+        d2.store_slice(&mut state[8..12]);
+        d3.store_slice(&mut state[12..16]);
+        s0 = d0.mul_add_precise(f32x4::from_slice(neon, &key[0..4]), s0);
+        s1 = d1.mul_add_precise(f32x4::from_slice(neon, &key[4..8]), s1);
+        s2 = d2.mul_add_precise(f32x4::from_slice(neon, &key[8..12]), s2);
+        s3 = d3.mul_add_precise(f32x4::from_slice(neon, &key[12..16]), s3);
     }
-    let mut result = ((sums[0] + sums[2]) + (sums[1] + sums[3])).reduce_sum();
+    let mut result = ((s0 + s2) + (s1 + s3)).reduce_sum();
     for ((&prev, state), &key) in previous[vectorized..]
         .iter()
         .zip(&mut state[vectorized..])
@@ -151,20 +165,35 @@ pub(super) fn update_and_dot(
 fn add_scaled_with_neon(neon: Neon, target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
     let vectorized = target.len() / 16 * 16;
     let scales = f32x4::splat(neon, scale);
-    for (target, input) in target[..vectorized]
-        .as_chunks_mut::<4>()
+    for (target_block, input_block) in target[..vectorized]
+        .as_chunks_mut::<16>()
         .0
         .iter_mut()
-        .zip(input[..vectorized].as_chunks::<4>().0)
+        .zip(input[..vectorized].as_chunks::<16>().0)
     {
-        let updated = scales.mul_add_precise(
-            f32x4::from_slice(neon, input),
-            f32x4::from_slice(neon, target),
+        let u0 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &input_block[0..4]),
+            f32x4::from_slice(neon, &target_block[0..4]),
         );
-        if updated.is_finite().all_true() {
-            updated.store_slice(target);
+        let u1 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &input_block[4..8]),
+            f32x4::from_slice(neon, &target_block[4..8]),
+        );
+        let u2 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &input_block[8..12]),
+            f32x4::from_slice(neon, &target_block[8..12]),
+        );
+        let u3 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &input_block[12..16]),
+            f32x4::from_slice(neon, &target_block[12..16]),
+        );
+        if (u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+            u0.store_slice(&mut target_block[0..4]);
+            u1.store_slice(&mut target_block[4..8]);
+            u2.store_slice(&mut target_block[8..12]);
+            u3.store_slice(&mut target_block[12..16]);
         } else {
-            for (target, &input) in target.iter_mut().zip(input) {
+            for (target, &input) in target_block.iter_mut().zip(input_block) {
                 *target = super::super::finite(scale.mul_add(input, *target))?;
             }
         }
@@ -189,7 +218,10 @@ fn update_and_dot_with_neon(
 ) -> Result<f32> {
     let vectorized = target.len() / 16 * 16;
     let scales = f32x4::splat(neon, scale);
-    let mut sums = [f32x4::splat(neon, 0.0); 4];
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
     for ((target_block, key_block), query_block) in target[..vectorized]
         .as_chunks_mut::<16>()
         .0
@@ -197,27 +229,38 @@ fn update_and_dot_with_neon(
         .zip(key[..vectorized].as_chunks::<16>().0)
         .zip(query[..vectorized].as_chunks::<16>().0)
     {
-        for (((sum, target_chunk), key_chunk), query_chunk) in sums
-            .iter_mut()
-            .zip(target_block.as_chunks_mut::<4>().0)
-            .zip(key_block.as_chunks::<4>().0)
-            .zip(query_block.as_chunks::<4>().0)
-        {
-            let updated = scales.mul_add_precise(
-                f32x4::from_slice(neon, key_chunk),
-                f32x4::from_slice(neon, target_chunk),
-            );
-            if updated.is_finite().all_true() {
-                updated.store_slice(target_chunk);
-                *sum = updated.mul_add_precise(f32x4::from_slice(neon, query_chunk), *sum);
-            } else {
-                for (target_elem, &key_elem) in target_chunk.iter_mut().zip(key_chunk) {
-                    *target_elem = super::super::finite(scale.mul_add(key_elem, *target_elem))?;
-                }
+        let u0 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &key_block[0..4]),
+            f32x4::from_slice(neon, &target_block[0..4]),
+        );
+        let u1 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &key_block[4..8]),
+            f32x4::from_slice(neon, &target_block[4..8]),
+        );
+        let u2 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &key_block[8..12]),
+            f32x4::from_slice(neon, &target_block[8..12]),
+        );
+        let u3 = scales.mul_add_precise(
+            f32x4::from_slice(neon, &key_block[12..16]),
+            f32x4::from_slice(neon, &target_block[12..16]),
+        );
+        if (u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+            u0.store_slice(&mut target_block[0..4]);
+            u1.store_slice(&mut target_block[4..8]);
+            u2.store_slice(&mut target_block[8..12]);
+            u3.store_slice(&mut target_block[12..16]);
+            s0 = u0.mul_add_precise(f32x4::from_slice(neon, &query_block[0..4]), s0);
+            s1 = u1.mul_add_precise(f32x4::from_slice(neon, &query_block[4..8]), s1);
+            s2 = u2.mul_add_precise(f32x4::from_slice(neon, &query_block[8..12]), s2);
+            s3 = u3.mul_add_precise(f32x4::from_slice(neon, &query_block[12..16]), s3);
+        } else {
+            for (target_elem, &key_elem) in target_block.iter_mut().zip(key_block) {
+                *target_elem = super::super::finite(scale.mul_add(key_elem, *target_elem))?;
             }
         }
     }
-    let mut result = ((sums[0] + sums[2]) + (sums[1] + sums[3])).reduce_sum();
+    let mut result = ((s0 + s2) + (s1 + s3)).reduce_sum();
     for ((target_elem, &key_elem), &query_elem) in target[vectorized..]
         .iter_mut()
         .zip(&key[vectorized..])

@@ -88,6 +88,7 @@ pub(crate) fn step_into(
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
         use fearless_simd::{f32x4, prelude::*};
+        let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
         let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
         let (h_chunks, h_rem) = history.as_chunks::<12>();
         let (n_chunks, n_rem) = next_history.as_chunks_mut::<12>();
@@ -113,9 +114,7 @@ pub(crate) fn step_into(
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
-            if !out.is_finite().all_true() {
-                return Err(invalid("nonfinite kernel output"));
-            }
+            finite_mask = finite_mask & out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
             out.store_slice(m_chunk);
             *n_chunk = [
@@ -132,6 +131,9 @@ pub(crate) fn step_into(
                 h_chunk[11],
                 p3,
             ];
+        }
+        if !finite_mask.all_true() {
+            return Err(invalid("nonfinite kernel output"));
         }
         for (((mixed_value, h_slice), n_slice), c_slice) in m_rem
             .iter_mut()
@@ -195,6 +197,7 @@ pub(crate) fn step_in_place(
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
         use fearless_simd::{f32x4, prelude::*};
+        let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
         let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
         let (h_chunks, h_rem) = history.as_chunks_mut::<12>();
         let (c_chunks, c_rem) = coefficients.as_chunks::<16>();
@@ -214,9 +217,7 @@ pub(crate) fn step_in_place(
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
-            if !out.is_finite().all_true() {
-                return Err(invalid("nonfinite kernel output"));
-            }
+            finite_mask = finite_mask & out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
             out.store_slice(m_chunk);
             *h_chunk = [
@@ -233,6 +234,9 @@ pub(crate) fn step_in_place(
                 h_chunk[11],
                 p3,
             ];
+        }
+        if !finite_mask.all_true() {
+            return Err(invalid("nonfinite kernel output"));
         }
         for ((mixed_value, h_slice), c_slice) in m_rem
             .iter_mut()

@@ -967,20 +967,22 @@ pub(super) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) -> bool {
 pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f64>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut sum = 0.0_f64;
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let (in_chunks, in_tail) = input.as_chunks::<4>();
     let (w_chunks, w_tail) = weight.as_chunks::<4>();
     let mut sq_lanes = [0.0_f32; 4];
     for (in_chunk, w_chunk) in in_chunks.iter().zip(w_chunks) {
         let v = f32x4::from_slice(neon, in_chunk);
         let w = f32x4::from_slice(neon, w_chunk);
-        if !(v.is_finite() & w.is_finite()).all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
+        finite_mask = finite_mask & v.is_finite() & w.is_finite();
         (v * v).store_slice(&mut sq_lanes);
         sum += f64::from(sq_lanes[0]);
         sum += f64::from(sq_lanes[1]);
         sum += f64::from(sq_lanes[2]);
         sum += f64::from(sq_lanes[3]);
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for (&value, &w) in in_tail.iter().zip(w_tail) {
         if !value.is_finite() || !w.is_finite() {
@@ -1008,6 +1010,7 @@ pub(super) fn rms_norm_scale_into<const PINNED: bool>(
     }
     output.resize(input.len(), 0.0);
     let scale_vec = f32x4::splat(neon, scale);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let (in_chunks, in_tail) = input.as_chunks::<4>();
     let (w_chunks, w_tail) = weight.as_chunks::<4>();
     let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
@@ -1019,10 +1022,11 @@ pub(super) fn rms_norm_scale_into<const PINNED: bool>(
         } else {
             (v * scale_vec) * w
         };
-        if !out.is_finite().all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
+        finite_mask = finite_mask & out.is_finite();
         out.store_slice(out_chunk);
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for ((&value, &w), out) in in_tail.iter().zip(w_tail).zip(out_tail) {
         let scaled = if PINNED {
@@ -1050,6 +1054,7 @@ pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
 ) -> Option<Result<()>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let scale_vec = f32x4::splat(neon, scale);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let (val_chunks, val_tail) = values.as_chunks_mut::<4>();
     let (w_chunks, w_tail) = weight.as_chunks::<4>();
     for (val_chunk, w_chunk) in val_chunks.iter_mut().zip(w_chunks) {
@@ -1060,10 +1065,11 @@ pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
         } else {
             (v * scale_vec) * w
         };
-        if !out.is_finite().all_true() {
-            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-        }
+        finite_mask = finite_mask & out.is_finite();
         out.store_slice(val_chunk);
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for (value, &w) in val_tail.iter_mut().zip(w_tail) {
         let scaled = if PINNED {
@@ -1707,12 +1713,10 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
         return None;
     }
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    for chunk in values.as_chunks::<4>().0 {
-        if !f32x4::from_slice(neon, chunk).is_finite().all_true() {
-            return Some(Err(crate::invalid(
-                "Hadamard requires a finite power-of-two block",
-            )));
-        }
+    if !is_finite_slice(values)? {
+        return Some(Err(crate::invalid(
+            "Hadamard requires a finite power-of-two block",
+        )));
     }
     let mut half = if values.len() >= 16 {
         for block in values.as_chunks_mut::<16>().0 {
@@ -1744,6 +1748,7 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
         half *= 4;
     }
     let norm = f32x4::splat(neon, normalization);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     if half < values.len() {
         let (left_half, right_half) = values.split_at_mut(half);
         for (left, right) in left_half
@@ -1756,20 +1761,19 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
             let r = f32x4::from_slice(neon, right);
             let out_l = (l + r) * norm;
             let out_r = (l - r) * norm;
-            if !out_l.is_finite().all_true() || !out_r.is_finite().all_true() {
-                return Some(Err(crate::invalid("nonfinite kernel output")));
-            }
+            finite_mask = finite_mask & out_l.is_finite() & out_r.is_finite();
             out_l.store_slice(left);
             out_r.store_slice(right);
         }
     } else {
         for chunk in values.as_chunks_mut::<4>().0 {
             let v = f32x4::from_slice(neon, chunk) * norm;
-            if !v.is_finite().all_true() {
-                return Some(Err(crate::invalid("nonfinite kernel output")));
-            }
+            finite_mask = finite_mask & v.is_finite();
             v.store_slice(chunk);
         }
+    }
+    if !finite_mask.all_true() {
+        return Some(Err(crate::invalid("nonfinite kernel output")));
     }
     Some(Ok(()))
 }

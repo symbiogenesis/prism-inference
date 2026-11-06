@@ -156,6 +156,31 @@ impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for WorkerThreadHexago
             executor.project_f32(tensor, activation, pinned, output)
         })
     }
+
+    fn supports_f32_group(&self, tensors: &[&bonsai_prism_runtime::model::Tensor]) -> bool {
+        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
+            slot.as_ref()
+                .is_some_and(|executor| executor.supports_f32_group(tensors))
+        })
+    }
+
+    fn project_f32_group(
+        &mut self,
+        tensors: &[&bonsai_prism_runtime::model::Tensor],
+        activation: &[f32],
+        pinned: bool,
+        outputs: &mut [&mut Vec<f32>],
+    ) -> bonsai_prism_runtime::Result<()> {
+        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+            let Some(executor) = slot.as_mut() else {
+                for output in outputs.iter_mut() {
+                    output.clear();
+                }
+                return Err(std::io::Error::other("missing worker Hexagon executor").into());
+            };
+            executor.project_f32_group(tensors, activation, pinned, outputs)
+        })
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]

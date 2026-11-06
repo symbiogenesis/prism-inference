@@ -5,13 +5,13 @@
 ## Install from source
 
 GitHub bundles and crates.io packages are separate deliveries. This guide targets
-the prepared `0.1.14` GitHub/source release. The latest registry runtime is `0.1.2`;
+the prepared `0.1.15` GitHub/source release. The latest registry runtime is `0.1.2`;
 publication of the newer source and its dependencies remains separate work.
-After the [release gates](release-0.1.14.md#installation-and-provenance) pass and
+After the [release gates](release-0.1.15.md#installation-and-provenance) pass and
 the tag is published, install its source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-10-22 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.14 prism-inference --locked
+cargo +nightly-2026-10-22 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.15 prism-inference --locked
 prism-inference --help
 ```
 
@@ -28,7 +28,7 @@ The package name is `prism-inference`; the existing Rust import path remains
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.14", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.14", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.15", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.15", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
@@ -516,7 +516,7 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.14`; the source installation and library
+The checkout prepares version `0.1.15`; the source installation and library
 examples above select its release tag. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
@@ -530,8 +530,8 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-The prepared `0.1.14` GitHub/source release preserves all older full and prerelease
-artifacts. The [release scope](release-0.1.14.md) compares it with `0.1.13`
+The prepared `0.1.15` GitHub/source release preserves all older full and prerelease
+artifacts. The [release scope](release-0.1.15.md) compares it with `0.1.14`
 and records its supported delivery, publication gates and qualification boundaries.
 Its Windows credential helper is pinned to Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
 the lockfile. The server temporarily sets `publish = false`, because a crates.io

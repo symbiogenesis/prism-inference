@@ -75,10 +75,35 @@ pub(super) fn dot_scalar(first: &[f32], second: &[f32]) -> Result<f32> {
     super::finite(result)
 }
 
+/// Scales `state` by `decay` and computes its pinned NEON F32 dot with `key` in a single pass.
+///
+/// # Errors
+/// Rejects unequal vector lengths before mutation, or a nonfinite dot result.
+pub(crate) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
+    if state.len() != key.len() {
+        return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::decay_and_dot(state, key, decay) {
+        return super::finite(result);
+    }
+    for element in state.iter_mut() {
+        *element *= decay;
+    }
+    dot_scalar(state, key)
+}
+
 /// Matches the pinned NEON scaled update, including its scalar remainder.
 ///
 /// # Errors
 /// Rejects unequal lengths before mutation, or a nonfinite updated element.
+#[cfg(test)]
 pub(crate) fn add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
     if target.len() != input.len() {
         return Err(invalid("pinned GDN update requires matching vectors"));
@@ -94,6 +119,33 @@ pub(crate) fn add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Resul
         return result;
     }
     scalar_add_scaled(target, input, scale)
+}
+
+/// Updates `target` with `scale * key` and computes its pinned NEON F32 dot with `query`.
+///
+/// # Errors
+/// Rejects unequal lengths before mutation, or a nonfinite updated element or dot result.
+pub(crate) fn update_and_dot(
+    target: &mut [f32],
+    key: &[f32],
+    scale: f32,
+    query: &[f32],
+) -> Result<f32> {
+    if target.len() != key.len() || target.len() != query.len() {
+        return Err(invalid("pinned GDN update requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::update_and_dot(target, key, scale, query) {
+        return result;
+    }
+    scalar_add_scaled(target, key, scale)?;
+    dot_scalar(target, query)
 }
 
 #[allow(
@@ -114,7 +166,7 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{add_scaled, dot, dot_scalar, scalar_add_scaled};
+    use super::{add_scaled, decay_and_dot, dot, dot_scalar, scalar_add_scaled, update_and_dot};
     use crate::Result;
 
     fn vectors(width: usize) -> (Vec<f32>, Vec<f32>) {
@@ -153,6 +205,23 @@ mod tests {
                     bits(&expected),
                     "width {width}, scale {scale}"
                 );
+                let mut decayed_expected = first.clone();
+                for elem in &mut decayed_expected {
+                    *elem *= scale;
+                }
+                let expected_dot = dot_scalar(&decayed_expected, &second)?;
+                let mut decayed_actual = first.clone();
+                let actual_dot = decay_and_dot(&mut decayed_actual, &second, scale)?;
+                assert_eq!(actual_dot.to_bits(), expected_dot.to_bits());
+                assert_eq!(bits(&decayed_actual), bits(&decayed_expected));
+
+                let mut upd_expected = first.clone();
+                scalar_add_scaled(&mut upd_expected, &second, scale)?;
+                let expected_q_dot = dot_scalar(&upd_expected, &first)?;
+                let mut upd_actual = first.clone();
+                let actual_q_dot = update_and_dot(&mut upd_actual, &second, scale, &first)?;
+                assert_eq!(actual_q_dot.to_bits(), expected_q_dot.to_bits());
+                assert_eq!(bits(&upd_actual), bits(&upd_expected));
             }
         }
         Ok(())

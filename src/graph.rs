@@ -14,7 +14,8 @@ use bonsai_ternary::half_to_float;
 use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place, swiglu_into};
 use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism, half_bits,
-    rms_norm_into, rms_norm_pinned_into, round_f16, row, row_into, silu, softmax,
+    rms_norm_in_place, rms_norm_into, rms_norm_pinned_in_place, rms_norm_pinned_into, round_f16,
+    row, row_into, silu, softmax,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -64,6 +65,13 @@ impl Arithmetic {
         }
     }
 
+    fn normalize_in_place(self, values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
+        match self {
+            Self::Source => rms_norm_in_place(values, weight, epsilon),
+            Self::PinnedSwift => rms_norm_pinned_in_place(values, weight, epsilon),
+        }
+    }
+
     fn silu(self, values: &mut [f32]) {
         match self {
             Self::Source => values.iter_mut().for_each(|value| *value = silu(*value)),
@@ -106,6 +114,18 @@ impl Arithmetic {
         match self {
             Self::Source => Ok(dot(first, second)),
             Self::PinnedSwift => crate::kernels::pinned_gdn::dot(first, second),
+        }
+    }
+
+    fn gdn_decay_and_dot(self, state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
+        match self {
+            Self::Source => {
+                for element in state.iter_mut() {
+                    *element *= decay;
+                }
+                Ok(dot(state, key))
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::decay_and_dot(state, key, decay),
         }
     }
 
@@ -244,6 +264,7 @@ impl Arithmetic {
         }
     }
 
+    #[cfg(test)]
     #[allow(
         clippy::suboptimal_flops,
         reason = "Preserve the generic graph's separate multiply/add rounding."
@@ -257,6 +278,33 @@ impl Arithmetic {
                 Ok(())
             }
             Self::PinnedSwift => crate::kernels::pinned_gdn::add_scaled(target, input, scale),
+        }
+    }
+
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Preserve the generic graph's separate multiply/add rounding."
+    )]
+    fn gdn_update_and_dot(
+        self,
+        target: &mut [f32],
+        key: &[f32],
+        scale: f32,
+        query: &[f32],
+    ) -> Result<f32> {
+        match self {
+            Self::Source => {
+                for (target_elem, &input) in target.iter_mut().zip(key) {
+                    *target_elem += scale * input;
+                    if !target_elem.is_finite() {
+                        return Err(invalid("nonfinite values in GDN state"));
+                    }
+                }
+                Ok(dot(target, query))
+            }
+            Self::PinnedSwift => {
+                crate::kernels::pinned_gdn::update_and_dot(target, key, scale, query)
+            }
         }
     }
 }
@@ -1944,48 +1992,62 @@ impl Evaluation<'_, '_> {
         copy_into(previous, matrix)?;
         zeros_into(g.value_width(), &mut scratch.attended)?;
         let scale = 1.0 / small_float(g.ssm_head)?.sqrt();
-        for head in 0..g.ssm_values {
-            // ggml repeat tiles key groups; it does not repeat each key head contiguously.
-            let key_head = head % g.ssm_keys;
-            let q = &mixed[key_head * g.ssm_head..(key_head + 1) * g.ssm_head];
-            let k =
-                &mixed[key_width + key_head * g.ssm_head..key_width + (key_head + 1) * g.ssm_head];
-            let v =
-                &mixed[2 * key_width + head * g.ssm_head..2 * key_width + (head + 1) * g.ssm_head];
-            let activation = scratch.alpha[head] + layer.time_bias[head];
-            let softplus = if activation > 20.0 {
-                activation
-            } else {
-                (1.0 + activation.exp()).ln()
-            };
-            let decay = (softplus * layer.decay[head]).exp();
-            let update = sigmoid(scratch.beta[head]);
-            let state =
-                &mut matrix[head * g.ssm_head * g.ssm_head..(head + 1) * g.ssm_head * g.ssm_head];
-            for element in state.iter_mut() {
-                *element *= decay;
-            }
-            let output = &mut scratch.attended[head * g.ssm_head..(head + 1) * g.ssm_head];
-            for ((state_row, &value), out) in state
-                .chunks_exact_mut(g.ssm_head)
-                .zip(v)
-                .zip(output.iter_mut())
-            {
-                let delta = (value - self.arithmetic.gdn_dot(state_row, k)?) * update;
-                self.arithmetic.gdn_add_scaled(state_row, k, delta)?;
-                *out = self.arithmetic.gdn_dot(state_row, q)? * scale;
-            }
-            self.arithmetic
-                .normalize(output, &layer.norm, g.epsilon, &mut scratch.normalized)?;
-            // Pinned qwen35.cpp build_norm_gated explicitly uses
-            // ggml_swiglu_split(gate, normalized), not separate SiLU/MUL nodes.
-            self.arithmetic.swiglu_into(
-                &scratch.gate[head * g.ssm_head..(head + 1) * g.ssm_head],
-                &scratch.normalized,
-                output,
+        let head_state_len = g.ssm_head * g.ssm_head;
+        let arithmetic = self.arithmetic;
+        let mixed_ref: &[f32] = mixed;
+        let alpha_ref: &[f32] = &scratch.alpha;
+        let beta_ref: &[f32] = &scratch.beta;
+        let gate_ref: &[f32] = &scratch.gate;
+        self.projection
+            .matvec
+            .row_parallelism()
+            .update_paired_chunks(
+                matrix,
+                head_state_len,
+                &mut scratch.attended,
+                g.ssm_head,
+                |base_head, state_chunk, attended_chunk| {
+                    for (offset, (state, output)) in state_chunk
+                        .chunks_exact_mut(head_state_len)
+                        .zip(attended_chunk.chunks_exact_mut(g.ssm_head))
+                        .enumerate()
+                    {
+                        let head = base_head + offset;
+                        // ggml repeat tiles key groups; it does not repeat each key head contiguously.
+                        let key_head = head % g.ssm_keys;
+                        let q = &mixed_ref[key_head * g.ssm_head..(key_head + 1) * g.ssm_head];
+                        let k = &mixed_ref[key_width + key_head * g.ssm_head
+                            ..key_width + (key_head + 1) * g.ssm_head];
+                        let v = &mixed_ref[2 * key_width + head * g.ssm_head
+                            ..2 * key_width + (head + 1) * g.ssm_head];
+                        let activation = alpha_ref[head] + layer.time_bias[head];
+                        let softplus = if activation > 20.0 {
+                            activation
+                        } else {
+                            (1.0 + activation.exp()).ln()
+                        };
+                        let decay = (softplus * layer.decay[head]).exp();
+                        let update = sigmoid(beta_ref[head]);
+                        for ((state_row, &value), out) in state
+                            .chunks_exact_mut(g.ssm_head)
+                            .zip(v)
+                            .zip(output.iter_mut())
+                        {
+                            let dot_k = arithmetic.gdn_decay_and_dot(state_row, k, decay)?;
+                            let delta = (value - dot_k) * update;
+                            *out = arithmetic.gdn_update_and_dot(state_row, k, delta, q)? * scale;
+                        }
+                        arithmetic.normalize_in_place(output, &layer.norm, g.epsilon)?;
+                        // Pinned qwen35.cpp build_norm_gated explicitly uses
+                        // ggml_swiglu_split(gate, normalized), not separate SiLU/MUL nodes.
+                        arithmetic.swiglu_in_place(
+                            &gate_ref[head * g.ssm_head..(head + 1) * g.ssm_head],
+                            output,
+                        )?;
+                    }
+                    Ok(())
+                },
             )?;
-        }
-        finite(matrix, "GDN state")?;
         finite(convolution, "convolution state")?;
         self.project_into(&layer.output, &scratch.attended, output)
     }

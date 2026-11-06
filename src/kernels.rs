@@ -1499,6 +1499,10 @@ impl MatvecScratch {
         self.row_parallelism.clone()
     }
 
+    pub(crate) const fn row_parallelism(&self) -> &RowParallelism {
+        &self.row_parallelism
+    }
+
     /// Prepares one exact activation vector for compatible sibling projections.
     ///
     /// Quantization or floating activation rounding occurs once. Compatibility
@@ -2083,6 +2087,26 @@ pub(crate) fn rms_norm_pinned_into(
             output,
         )
     })
+}
+
+pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
+    let scale = rms_norm_scale(values, weight, epsilon)?;
+    for (value, &w) in values.iter_mut().zip(weight) {
+        *value = finite(*value * scale * w)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn rms_norm_pinned_in_place(
+    values: &mut [f32],
+    weight: &[f32],
+    epsilon: f32,
+) -> Result<()> {
+    let scale = rms_norm_scale(values, weight, epsilon)?;
+    for (value, &w) in values.iter_mut().zip(weight) {
+        *value = finite((*value * w) * scale)?;
+    }
+    Ok(())
 }
 
 #[allow(

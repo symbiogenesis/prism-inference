@@ -30,6 +30,7 @@ pub(crate) fn row(history: &[f32], projected: f32, coefficients: &[f32]) -> Resu
 }
 
 #[cfg(all(
+    feature = "experimental-neon",
     target_arch = "aarch64",
     target_os = "windows",
     target_env = "msvc",
@@ -77,6 +78,7 @@ pub(crate) fn step_into(
         return Err(invalid("pinned convolution history width mismatch"));
     }
     #[cfg(all(
+        feature = "experimental-neon",
         target_arch = "aarch64",
         target_os = "windows",
         target_env = "msvc",
@@ -183,6 +185,7 @@ pub(crate) fn step_in_place(
         return Err(invalid("pinned convolution history width mismatch"));
     }
     #[cfg(all(
+        feature = "experimental-neon",
         target_arch = "aarch64",
         target_os = "windows",
         target_env = "msvc",

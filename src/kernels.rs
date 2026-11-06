@@ -2047,7 +2047,41 @@ impl PreparedMatvec<'_> {
                 scratch.diagnostics = scratch.diagnostics.select(false);
                 // Swift's recurrent alpha/beta projections retain their
                 // binary64 scalar contract even for pinned accumulation.
-                for bytes in tensor.data.chunks_exact(row_bytes) {
+                let quad_bytes = row_bytes.saturating_mul(4);
+                let quad_count = tensor.data.len().checked_div(quad_bytes).unwrap_or(0);
+                let (quads, rem) = tensor.data.split_at(quad_count * quad_bytes);
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                for quad in quads.chunks_exact(quad_bytes) {
+                    let (r0, rest) = quad.split_at(row_bytes);
+                    let (r1, rest) = rest.split_at(row_bytes);
+                    let (r2, r3) = rest.split_at(row_bytes);
+                    if let Some(res) =
+                        neon::bf16_dot_four_rows([r0, r1, r2, r3], &scratch.activations)
+                    {
+                        output.extend_from_slice(&res?);
+                    } else {
+                        for bytes in [r0, r1, r2, r3] {
+                            output.push(bf16_dot(bytes, &scratch.activations)?);
+                        }
+                    }
+                }
+                #[cfg(not(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                )))]
+                for bytes in quads.chunks_exact(row_bytes) {
+                    output.push(bf16_dot(bytes, &scratch.activations)?);
+                }
+                for bytes in rem.chunks_exact(row_bytes) {
                     output.push(bf16_dot(bytes, &scratch.activations)?);
                 }
             }

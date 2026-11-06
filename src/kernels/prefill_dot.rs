@@ -1,6 +1,6 @@
 //! Exact integer reductions over one decoded block shared by a prompt tile.
 
-use super::super::{MatvecBackend, q8_native_lanes};
+use super::super::{MatvecBackend, pq2_values, q8_native_lanes};
 
 #[cfg(all(
     feature = "experimental-neon",
@@ -46,6 +46,25 @@ impl Block {
         // Unsupported builds retain the scalar result for every request policy.
         let _ = backend;
         Self::Scalar(weights)
+    }
+
+    pub(super) fn from_pq2(packed: &[u8; 32], backend: MatvecBackend) -> Self {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if backend != MatvecBackend::Scalar
+            && let Some(block) = neon::Block::from_pq2(packed)
+        {
+            return Self::Neon(block);
+        }
+        let _ = backend;
+        let mut full = [0_u8; 34];
+        full[2..].copy_from_slice(packed);
+        Self::Scalar(pq2_values(&full))
     }
 
     #[inline]

@@ -12,7 +12,7 @@
 
 use super::{
     MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, dimensions, finite, integer_float,
-    matvec_into, pq2_values, ptq1_values, scale,
+    matvec_into, ptq1_values, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -118,11 +118,6 @@ impl ProjectionTile {
                     let mut lanes = [[0.0_f32; 4]; MAX_TILE_TOKENS];
                     let bytes = if tensor.kind == PQ2 { 34 } else { 28 };
                     for (index, block) in row.chunks_exact(bytes).enumerate() {
-                        let weights = if tensor.kind == PQ2 {
-                            pq2_values(block)
-                        } else {
-                            ptq1_values(block)?
-                        };
                         let weight_scale = if tensor.kind == PQ2 {
                             scale(block)?
                         } else {
@@ -130,7 +125,11 @@ impl ProjectionTile {
                         };
                         // Prepare one SIMD/scalar block for all tokens. This stays
                         // stack-scoped and never expands or retains a matrix.
-                        let weights = dot::Block::new(weights, backend);
+                        let weights = if tensor.kind == PQ2 {
+                            dot::Block::from_pq2(block[2..34].try_into()?, backend)
+                        } else {
+                            dot::Block::new(ptq1_values(block)?, backend)
+                        };
                         *decoded_blocks = decoded_blocks.saturating_add(1);
                         for (token, scratch) in preparations.iter().enumerate() {
                             if tensor.kind == PQ2 && columns.is_multiple_of(256) {

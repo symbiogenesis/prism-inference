@@ -615,11 +615,47 @@ fn cleanup(
     )
 }
 
+#[derive(Clone, Copy)]
+struct ExtraExtent {
+    fd: i32,
+    memory: *mut c_void,
+    allocation_bytes: usize,
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "Explicit cleanup retains one exact mapped allocation tuple and its native owners"
 )]
 fn cleanup_extent(
+    report: QueueComputeReport,
+    calls: &CleanupCalls,
+    handle: u64,
+    queue: *mut c_void,
+    domain: i32,
+    fd: i32,
+    memory: *mut c_void,
+    allocation_bytes: usize,
+    progress: &mut impl FnMut(&QueueComputeReport),
+) -> QueueComputeReport {
+    cleanup_extents(
+        report,
+        calls,
+        handle,
+        queue,
+        domain,
+        fd,
+        memory,
+        allocation_bytes,
+        &[],
+        progress,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Explicit cleanup retains one exact primary mapped allocation tuple plus optional secondary weight arenas"
+)]
+fn cleanup_extents(
     mut report: QueueComputeReport,
     calls: &CleanupCalls,
     handle: u64,
@@ -628,6 +664,7 @@ fn cleanup_extent(
     fd: i32,
     memory: *mut c_void,
     allocation_bytes: usize,
+    extra_extents: &[ExtraExtent],
     progress: &mut impl FnMut(&QueueComputeReport),
 ) -> QueueComputeReport {
     entered(&mut report, "compute-queue-stop-entered", progress);
@@ -659,6 +696,17 @@ fn cleanup_extent(
         report.stage = "compute-fd-unmap-refused-pinned";
         return report;
     }
+    for extra in extra_extents {
+        // SAFETY: each secondary weight arena was mapped in the same domain and
+        // has no active DSP consumer after queue stop and host queue close.
+        let extra_result =
+            unsafe { (calls.unmap)(domain, extra.fd, extra.memory, extra.allocation_bytes) };
+        if extra_result != 0 {
+            report.unmapping_result = Some(extra_result);
+            report.stage = "compute-fd-unmap-refused-pinned";
+            return report;
+        }
+    }
     entered(&mut report, "compute-module-close-entered", progress);
     // SAFETY: after successful stop, host queue close and explicit host FD unmap,
     // close the exact original u64 handle. No queue or operation remains active;
@@ -674,6 +722,13 @@ fn cleanup_extent(
     // establish that this exact allocation has no remaining known consumer.
     unsafe {
         (calls.free)(memory);
+    }
+    for extra in extra_extents {
+        // SAFETY: successful stop, queue close, module close and explicit FD unmap
+        // establish that each secondary weight arena has no remaining consumer.
+        unsafe {
+            (calls.free)(extra.memory);
+        }
     }
     report.free_completed = true;
     report.poisoned = false;

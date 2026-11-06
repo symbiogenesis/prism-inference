@@ -30,10 +30,79 @@ pub const NATIVE_Q2_MAX_ROWS: usize = Q2_PROJECTION_MAX_ROWS;
 pub const NATIVE_Q2_MAX_WEIGHT_BYTES: usize = (Q2_PROJECTION_MAX_ROWS / 32) * (5120 / 64) * 576;
 /// Largest working host allocation for any single native `Q2_0` projection (`[5120, 17408]` or `[17408, 5120]`).
 pub const NATIVE_Q2_MAX_WORKING_BYTES: usize = layout(5120, Q2_PROJECTION_MAX_ROWS).allocation;
-/// Largest immutable host-mapped weight arena in a single native `Q2_0` session (`480 MiB`, within the `512 MiB` `rpcmem` `m-size` limit).
-pub const NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize = 480 * 1024 * 1024;
+/// Largest immutable weight payload in a single `FastRPC` buffer (`480 MiB`, within the `512 MiB` `rpcmem` `m-size` limit).
+pub const NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES: usize = 480 * 1024 * 1024;
+/// Exact 28-projection weight step (`479.53125 MiB`, page-aligned) used when partitioning multi-arena resident weights.
+pub const NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES: usize = 502_824_960;
+/// Maximum number of host-mapped `FastRPC` weight arenas in a single native `Q2_0` session.
+pub const NATIVE_Q2_MAX_WEIGHT_ARENAS: usize = 4;
+/// Largest aggregate immutable host-mapped weight capacity across all arenas in a single native `Q2_0` session (`1,920 MiB`).
+pub const NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize =
+    NATIVE_Q2_MAX_WEIGHT_ARENAS * NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES;
 /// Fixed 4 MiB VTCM request used by the 8-HVX full-`K` `Q2_0` session (`v81` hardware has 8 MiB VTCM).
 pub const NATIVE_Q2_VTCM_REQUEST_BYTES: u32 = 4 * 1024 * 1024;
+
+pub(crate) const fn arena_capacities(
+    resident_weight_bytes: usize,
+) -> Option<([usize; NATIVE_Q2_MAX_WEIGHT_ARENAS], usize)> {
+    if resident_weight_bytes > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
+        return None;
+    }
+    if resident_weight_bytes <= NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES {
+        return Some(([resident_weight_bytes, 0, 0, 0], 1));
+    }
+    let step = if resident_weight_bytes
+        <= NATIVE_Q2_MAX_WEIGHT_ARENAS * NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+    {
+        NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+    } else {
+        NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES
+    };
+    let mut capacities = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+    let mut remaining = resident_weight_bytes;
+    let mut count = 0_usize;
+    while remaining > 0 {
+        if count >= NATIVE_Q2_MAX_WEIGHT_ARENAS {
+            return None;
+        }
+        let chunk = if remaining > NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES {
+            step
+        } else {
+            remaining
+        };
+        capacities[count] = chunk;
+        remaining -= chunk;
+        count += 1;
+    }
+    Some((capacities, count))
+}
+
+const fn arena_allocation_bytes_opt(
+    columns: usize,
+    rows: usize,
+    resident_weight_bytes: usize,
+) -> Option<([usize; NATIVE_Q2_MAX_WEIGHT_ARENAS], usize)> {
+    let Some((capacities, count)) = arena_capacities(resident_weight_bytes) else {
+        return None;
+    };
+    let working = working_allocation(columns, rows);
+    let mut allocations = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+    allocations[0] = (working + capacities[0]).next_multiple_of(4096);
+    let mut index = 1_usize;
+    while index < count {
+        allocations[index] = capacities[index].next_multiple_of(4096);
+        index += 1;
+    }
+    Some((allocations, count))
+}
+
+pub(crate) fn arena_allocation_bytes(
+    columns: usize,
+    rows: usize,
+    resident_weight_bytes: usize,
+) -> Result<([usize; NATIVE_Q2_MAX_WEIGHT_ARENAS], usize), Error> {
+    arena_allocation_bytes_opt(columns, rows, resident_weight_bytes).ok_or(Error::Contract)
+}
 
 /// One terminal full-`K` native `HTP_TYPE_Q2_0` session's lifetime and work bounds.
 #[derive(Clone, Copy, Debug)]
@@ -65,10 +134,10 @@ impl NativeQ2ProjectionLimits {
         })
     }
 
-    /// Reserve an optional immutable host-mapped weight arena in the same FD.
+    /// Reserve optional immutable host-mapped weight arenas in the session.
     ///
     /// # Errors
-    /// Rejects more than 480 MiB before opening a module or allocating memory.
+    /// Rejects more than `NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES` before opening a module or allocating memory.
     pub const fn with_resident_weights(mut self, bytes: usize) -> Result<Self, Error> {
         if bytes > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
             return Err(Error::Contract);
@@ -105,11 +174,23 @@ impl NativeQ2ProjectionLimits {
         self.common.maximum_rows()
     }
 
-    /// Maximum mapped host allocation, including command, activation, output and weights.
+    /// Maximum mapped host allocation across all session arenas, including command, activation, output and weights.
     #[must_use]
     pub const fn allocation_bytes(self) -> usize {
-        let working = working_allocation(self.columns, self.common.rows);
-        (working + self.resident_weight_bytes).next_multiple_of(4096)
+        if let Some((allocations, count)) =
+            arena_allocation_bytes_opt(self.columns, self.common.rows, self.resident_weight_bytes)
+        {
+            let mut total = 0_usize;
+            let mut index = 0_usize;
+            while index < count {
+                total += allocations[index];
+                index += 1;
+            }
+            total
+        } else {
+            let working = working_allocation(self.columns, self.common.rows);
+            (working + self.resident_weight_bytes).next_multiple_of(4096)
+        }
     }
 
     /// Maximum single-attempt writes in the complete session.
@@ -129,12 +210,19 @@ impl NativeQ2ProjectionLimits {
 #[derive(Clone, Debug)]
 pub struct NativeQ2WeightHandle {
     owner: u64,
+    arena_index: u16,
     range: Range<usize>,
     columns: usize,
     rows: usize,
 }
 
 impl NativeQ2WeightHandle {
+    /// Zero-based index of the session weight arena (`0..4`) holding this weight extent.
+    #[must_use]
+    pub const fn arena_index(&self) -> u16 {
+        self.arena_index
+    }
+
     /// Exact active input-column count (`K`), always a positive multiple of 128.
     #[must_use]
     pub const fn columns(&self) -> usize {
@@ -154,34 +242,44 @@ impl NativeQ2WeightHandle {
     }
 }
 
-/// Metadata-only append-only allocator for one submitter's native `Q2_0` weight arena.
+/// Metadata-only append-only allocator for one submitter's native `Q2_0` weight arenas.
 #[derive(Clone, Copy)]
 pub struct NativeQ2WeightRegistry {
     owner: u64,
-    capacity: usize,
-    used: usize,
+    capacities: [usize; NATIVE_Q2_MAX_WEIGHT_ARENAS],
+    used: [usize; NATIVE_Q2_MAX_WEIGHT_ARENAS],
+    arena_count: usize,
+    active_arena: usize,
+    total_used: usize,
 }
 
 impl NativeQ2WeightRegistry {
     /// Create one independent owner with an explicitly admitted payload bound.
     ///
     /// # Errors
-    /// Rejects capacity above the 256 MiB native bound.
+    /// Rejects capacity above `NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES`.
     pub fn new(capacity_bytes: usize) -> Result<Self, Error> {
-        if capacity_bytes > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
-            return Err(Error::Contract);
-        }
+        let (capacities, arena_count) = arena_capacities(capacity_bytes).ok_or(Error::Contract)?;
         Ok(Self {
             owner: NEXT_NATIVE_REGISTRY_OWNER.fetch_add(1, Ordering::Relaxed),
-            capacity: capacity_bytes,
-            used: 0,
+            capacities,
+            used: [0; NATIVE_Q2_MAX_WEIGHT_ARENAS],
+            arena_count,
+            active_arena: 0,
+            total_used: 0,
         })
     }
 
-    /// Remaining payload extent, including alignment charged by prior reservations.
+    /// Remaining payload extent from the active arena onward, including alignment charged by prior reservations.
     #[must_use]
     pub const fn remaining_bytes(&self) -> usize {
-        self.capacity - self.used
+        let mut remaining = 0_usize;
+        let mut index = self.active_arena;
+        while index < self.arena_count {
+            remaining += self.capacities[index].saturating_sub(self.used[index]);
+            index += 1;
+        }
+        remaining
     }
 
     /// Validate and reserve one immutable, 128-byte-aligned packed-weight extent.
@@ -212,24 +310,42 @@ impl NativeQ2WeightRegistry {
         rows: usize,
         weight_bytes: usize,
     ) -> Result<Option<NativeQ2WeightHandle>, Error> {
-        let start = self.used.next_multiple_of(128);
-        let end = start.checked_add(weight_bytes).ok_or(Error::Contract)?;
-        if end > self.capacity {
-            return Ok(None);
+        let mut arena_idx = self.active_arena;
+        while arena_idx < self.arena_count {
+            let start = self.used[arena_idx].next_multiple_of(128);
+            let end = start.checked_add(weight_bytes).ok_or(Error::Contract)?;
+            if end <= self.capacities[arena_idx] {
+                let arena_index = u16::try_from(arena_idx).map_err(|_| Error::Contract)?;
+                self.active_arena = arena_idx;
+                self.used[arena_idx] = end;
+                self.total_used = self.used[0] + self.used[1] + self.used[2] + self.used[3];
+                return Ok(Some(NativeQ2WeightHandle {
+                    owner: self.owner,
+                    arena_index,
+                    range: start..end,
+                    columns,
+                    rows,
+                }));
+            }
+            arena_idx += 1;
         }
-        self.used = end;
-        Ok(Some(NativeQ2WeightHandle {
-            owner: self.owner,
-            range: start..end,
-            columns,
-            rows,
-        }))
+        Ok(None)
     }
 
-    /// Bytes of the immutable arena currently populated (including internal alignment padding).
+    /// Total bytes across all immutable arenas currently populated (including internal alignment padding).
     #[must_use]
     pub const fn used_bytes(&self) -> usize {
-        self.used
+        self.total_used
+    }
+
+    /// Bytes of the specified arena (`0..4`) currently populated.
+    #[must_use]
+    pub const fn arena_used_bytes(&self, arena_index: usize) -> usize {
+        if arena_index < NATIVE_Q2_MAX_WEIGHT_ARENAS {
+            self.used[arena_index]
+        } else {
+            0
+        }
     }
 
     /// Recover an owner-checked byte range inside this registry's arena.
@@ -237,9 +353,11 @@ impl NativeQ2WeightRegistry {
     /// # Errors
     /// Rejects handles issued by any other registry, including earlier sessions.
     pub fn range(&self, handle: &NativeQ2WeightHandle) -> Result<Range<usize>, Error> {
+        let arena_idx = usize::from(handle.arena_index);
         if self.owner != handle.owner
-            || handle.range.end > self.used
-            || handle.range.end > self.capacity
+            || arena_idx >= self.arena_count
+            || handle.range.end > self.used[arena_idx]
+            || handle.range.end > self.capacities[arena_idx]
         {
             return Err(Error::Contract);
         }
@@ -637,51 +755,137 @@ pub(crate) fn image(
     Ok(active)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HtpBufferDesc {
+    pub(crate) base: u64,
+    pub(crate) size: usize,
+    pub(crate) fd: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResidentLayout {
+    pub(crate) output: usize,
+    pub(crate) n_bufs: u32,
+}
+
 pub(crate) fn image_resident(
     bytes: &mut [u8],
     base: u64,
     fd: u32,
     arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
     handle: &NativeQ2WeightHandle,
     activation: &[f32],
-) -> Result<projection::Layout, Error> {
+) -> Result<ResidentLayout, Error> {
     let allocation = bytes.len();
     let active = layout(handle.columns, handle.rows);
-    let weight_offset = arena_start
-        .checked_add(handle.range.start)
+    if handle.packed_bytes() != active.weights || activation.len() != handle.columns {
+        return Err(Error::Contract);
+    }
+    if handle.arena_index == 0 {
+        let weight_offset = arena_start
+            .checked_add(handle.range.start)
+            .ok_or(Error::Contract)?;
+        let weight_end = arena_start
+            .checked_add(handle.range.end)
+            .ok_or(Error::Contract)?;
+        if weight_end > allocation {
+            return Err(Error::Contract);
+        }
+        let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
+        write_frame(
+            working,
+            base,
+            allocation,
+            fd,
+            handle.columns,
+            handle.rows,
+            weight_offset,
+            active,
+            activation,
+        )?;
+        return Ok(ResidentLayout {
+            output: active.output,
+            n_bufs: 1,
+        });
+    }
+    let extra_idx = usize::from(handle.arena_index - 1);
+    let extra = extra_arenas
+        .get(extra_idx)
+        .copied()
         .ok_or(Error::Contract)?;
-    let weight_end = arena_start
-        .checked_add(handle.range.end)
-        .ok_or(Error::Contract)?;
-    if weight_end > allocation || handle.packed_bytes() != active.weights {
+    if handle.range.end > extra.size {
         return Err(Error::Contract);
     }
     let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
-    write_frame(
+    let act_bytes = handle.columns * 4;
+    let out_bytes = handle.rows * 4;
+    if active.output + out_bytes > working.len() {
+        return Err(Error::Contract);
+    }
+    working[..1024].fill(0);
+    put64(working, 0, base);
+    put64(
         working,
-        base,
-        allocation,
-        fd,
+        8,
+        u64::try_from(allocation).map_err(|_| Error::Contract)?,
+    );
+    put32(working, 20, fd);
+    put64(working, 24, extra.base);
+    put64(
+        working,
+        32,
+        u64::try_from(extra.size).map_err(|_| Error::Contract)?,
+    );
+    put32(working, 44, extra.fd);
+    write_member_descriptors(
+        working,
+        0,
+        1,
+        48,
+        216,
         handle.columns,
         handle.rows,
-        weight_offset,
-        active,
-        activation,
+        handle.range.start,
+        active.weights,
+        active.activation,
+        active.output,
     )?;
-    Ok(active)
+    for (dst, &value) in working[active.activation..active.activation + act_bytes]
+        .as_chunks_mut::<4>()
+        .0[..activation.len()]
+        .iter_mut()
+        .zip(activation)
+    {
+        *dst = value.to_bits().to_le_bytes();
+    }
+    working[active.output..active.output + out_bytes]
+        .as_chunks_mut::<4>()
+        .0
+        .fill(0x7fc0_ae51_u32.to_le_bytes());
+    Ok(ResidentLayout {
+        output: active.output,
+        n_bufs: 2,
+    })
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct BatchLayout<const B: usize> {
     pub(crate) output_offsets: [usize; B],
     pub(crate) output_end: usize,
+    pub(crate) n_bufs: u32,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep multi-arena batch descriptor assembly and poison region together"
+)]
 pub(crate) fn image_batch_resident<const B: usize>(
     bytes: &mut [u8],
     base: u64,
     fd: u32,
     arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
     handles: [&NativeQ2WeightHandle; B],
     activation: &[f32],
 ) -> Result<BatchLayout<B>, Error> {
@@ -698,22 +902,55 @@ pub(crate) fn image_batch_resident<const B: usize>(
     let act_bytes = columns * 4;
     let mut next_out = (act_offset + act_bytes).next_multiple_of(128);
     let mut weight_offsets = [0_usize; B];
+    let mut weight_bis = [0_u16; B];
     let mut output_offsets = [0_usize; B];
+    let mut batch_extra_arena_indices = [0_u16; B];
+    let mut batch_extra_descs = [HtpBufferDesc {
+        base: 0,
+        size: 0,
+        fd: 0,
+    }; B];
+    let mut extra_buf_count = 0_usize;
     for (member, handle) in handles.into_iter().enumerate() {
         let expected_weights = layout(columns, handle.rows).weights;
-        let start = arena_start
-            .checked_add(handle.range.start)
-            .ok_or(Error::Contract)?;
-        let end = arena_start
-            .checked_add(handle.range.end)
-            .ok_or(Error::Contract)?;
-        if handle.columns != columns
-            || end > allocation
-            || handle.packed_bytes() != expected_weights
-        {
+        if handle.columns != columns || handle.packed_bytes() != expected_weights {
             return Err(Error::Contract);
         }
-        weight_offsets[member] = start;
+        if handle.arena_index == 0 {
+            let start = arena_start
+                .checked_add(handle.range.start)
+                .ok_or(Error::Contract)?;
+            let end = arena_start
+                .checked_add(handle.range.end)
+                .ok_or(Error::Contract)?;
+            if end > allocation {
+                return Err(Error::Contract);
+            }
+            weight_offsets[member] = start;
+            weight_bis[member] = 0;
+        } else {
+            let extra_idx = usize::from(handle.arena_index - 1);
+            let extra = extra_arenas
+                .get(extra_idx)
+                .copied()
+                .ok_or(Error::Contract)?;
+            if handle.range.end > extra.size {
+                return Err(Error::Contract);
+            }
+            let bi = if let Some(pos) = batch_extra_arena_indices[..extra_buf_count]
+                .iter()
+                .position(|&idx| idx == handle.arena_index)
+            {
+                u16::try_from(pos + 1).map_err(|_| Error::Contract)?
+            } else {
+                batch_extra_arena_indices[extra_buf_count] = handle.arena_index;
+                batch_extra_descs[extra_buf_count] = extra;
+                extra_buf_count += 1;
+                u16::try_from(extra_buf_count).map_err(|_| Error::Contract)?
+            };
+            weight_offsets[member] = handle.range.start;
+            weight_bis[member] = bi;
+        }
         output_offsets[member] = next_out;
         next_out = (next_out + handle.rows * 4).next_multiple_of(128);
     }
@@ -722,6 +959,8 @@ pub(crate) fn image_batch_resident<const B: usize>(
     if output_end > working.len() {
         return Err(Error::Contract);
     }
+    let n_bufs_usize = 1 + extra_buf_count;
+    let n_bufs = u32::try_from(n_bufs_usize).map_err(|_| Error::Contract)?;
     working[..CMD_PAD].fill(0);
     put64(working, 0, base);
     put64(
@@ -730,14 +969,26 @@ pub(crate) fn image_batch_resident<const B: usize>(
         u64::try_from(allocation).map_err(|_| Error::Contract)?,
     );
     put32(working, 20, fd);
-    let operations_base = 24 + B * 3 * 56;
+    for (idx, extra) in batch_extra_descs[..extra_buf_count].iter().enumerate() {
+        let buf_offset = (idx + 1) * 24;
+        put64(working, buf_offset, extra.base);
+        put64(
+            working,
+            buf_offset + 8,
+            u64::try_from(extra.size).map_err(|_| Error::Contract)?,
+        );
+        put32(working, buf_offset + 20, extra.fd);
+    }
+    let tensors_base = n_bufs_usize * 24;
+    let operations_base = tensors_base + B * 3 * 56;
     for (member, handle) in handles.into_iter().enumerate() {
         let ti_base = u16::try_from(member * 3).map_err(|_| Error::Contract)?;
-        let weight_desc = 24 + (member * 3) * 56;
+        let weight_desc = tensors_base + (member * 3) * 56;
         let operation_desc = operations_base + member * 232;
         write_member_descriptors(
             working,
             ti_base,
+            weight_bis[member],
             weight_desc,
             operation_desc,
             columns,
@@ -763,6 +1014,7 @@ pub(crate) fn image_batch_resident<const B: usize>(
     Ok(BatchLayout {
         output_offsets,
         output_end,
+        n_bufs,
     })
 }
 
@@ -840,6 +1092,7 @@ fn write_descriptors(
     write_member_descriptors(
         bytes,
         0,
+        0,
         24,
         192,
         columns,
@@ -858,6 +1111,7 @@ fn write_descriptors(
 fn write_member_descriptors(
     bytes: &mut [u8],
     ti_base: u16,
+    weight_bi: u16,
     weight_desc: usize,
     op_desc: usize,
     columns: usize,
@@ -878,6 +1132,7 @@ fn write_member_descriptors(
         weight_desc,
         u64::try_from(weight_offset).map_err(|_| Error::Contract)?,
     );
+    put16(bytes, weight_desc + 20, weight_bi);
     put16(bytes, weight_desc + 22, ti_base);
     put64(
         bytes,
@@ -1079,6 +1334,18 @@ mod tests {
             NATIVE_Q2_MAX_WORKING_BYTES + NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES
         );
 
+        // Verify 56-projection multi-arena split (962,887,680 bytes -> [502,824,960, 460,062,720]).
+        let multi_limits =
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+                .with_resident_weights(962_887_680)?;
+        let (caps, count) = arena_capacities(962_887_680).ok_or(Error::Contract)?;
+        assert_eq!(count, 2);
+        assert_eq!(caps, [502_824_960, 460_062_720, 0, 0]);
+        assert_eq!(
+            multi_limits.allocation_bytes(),
+            NATIVE_Q2_MAX_WORKING_BYTES + 962_887_680
+        );
+
         let mut registry = NativeQ2WeightRegistry::new(4096)?;
         let mut weights = vec![0x55_u8; layout(128, 32).weights];
         for tile in weights.as_chunks_mut::<576>().0 {
@@ -1089,6 +1356,7 @@ mod tests {
         let handle = registry
             .prepare(128, 32, &weights)?
             .ok_or(Error::Contract)?;
+        assert_eq!(handle.arena_index(), 0);
         assert_eq!(handle.columns(), 128);
         assert_eq!(handle.rows(), 32);
         assert_eq!(handle.packed_bytes(), 1152);
@@ -1152,9 +1420,11 @@ mod tests {
             0x1000_0000,
             7,
             arena_start,
+            &[],
             [&h0, &h1],
             &activation,
         )?;
+        assert_eq!(batch.n_bufs, 1);
         assert_eq!(batch.output_offsets, [2560, 2688]);
         assert_eq!(batch.output_end, 2816);
         assert_eq!(
@@ -1197,6 +1467,81 @@ mod tests {
                     .map_err(|_| Error::Contract)?
             ),
             5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_arena_resident_descriptors_deduplicate_buffers_and_route_bi() -> Result<(), Error> {
+        let mut multi_reg = NativeQ2WeightRegistry::new(962_887_680)?;
+        let h_arena0 = multi_reg
+            .prepare_validated(5120, 17_408, 502_824_960)?
+            .ok_or(Error::Contract)?;
+        assert_eq!(h_arena0.arena_index(), 0);
+        let h_arena1 = multi_reg
+            .prepare_validated(128, 32, 1152)?
+            .ok_or(Error::Contract)?;
+        assert_eq!(h_arena1.arena_index(), 1);
+        assert_eq!(multi_reg.arena_used_bytes(0), 502_824_960);
+        assert_eq!(multi_reg.arena_used_bytes(1), 1152);
+        let arena_start = 4096_usize;
+        let mut arena = vec![0_u8; arena_start + 4096];
+        let activation = vec![1.0_f32; 128];
+        let extra = [HtpBufferDesc {
+            base: 0x2000_0000,
+            size: 4096,
+            fd: 9,
+        }];
+        let single_multi = image_resident(
+            &mut arena,
+            0x1000_0000,
+            7,
+            arena_start,
+            &extra,
+            &h_arena1,
+            &activation,
+        )?;
+        assert_eq!(single_multi.n_bufs, 2);
+        // bufs[1] is at 24..48, weight_desc is at 48..104 with bi = 1 at 48 + 20 = 68.
+        assert_eq!(
+            u64::from_le_bytes(arena[24..32].try_into().map_err(|_| Error::Contract)?),
+            0x2000_0000
+        );
+        assert_eq!(
+            u32::from_le_bytes(arena[44..48].try_into().map_err(|_| Error::Contract)?),
+            9
+        );
+        assert_eq!(
+            u16::from_le_bytes(arena[68..70].try_into().map_err(|_| Error::Contract)?),
+            1
+        );
+
+        let batch_multi = image_batch_resident(
+            &mut arena,
+            0x1000_0000,
+            7,
+            arena_start,
+            &extra,
+            [&h_arena1, &h_arena1],
+            &activation,
+        )?;
+        assert_eq!(batch_multi.n_bufs, 2);
+        // Both members share Arena 1 -> deduplicated into bufs[1] (bi = 1).
+        assert_eq!(
+            u16::from_le_bytes(
+                arena[48 + 20..48 + 22]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            1
+        );
+        assert_eq!(
+            u16::from_le_bytes(
+                arena[48 + 3 * 56 + 20..48 + 3 * 56 + 22]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            1
         );
         Ok(())
     }

@@ -30,10 +30,12 @@ fn finite_slice(values: &[f32]) -> Result<()> {
 /// Residency statistics for [`NativeQ2Executor`].
 pub type NativeQ2ResidencyStatistics = HmxResidencyStatistics;
 
-/// Default 28-projection (`blk.0`..=`blk.2` recurrent, `blk.3` full-attention,
-/// and `blk.4` MLP) Hexagon NPU `native-q2` resident placement filling 99.9%
-/// of the 480 MiB resident weight arena.
-pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 28] = [
+/// Default 56-projection Hexagon NPU `native-q2` multi-arena resident placement (`blk.0`..=`blk.8`).
+///
+/// Covers `blk.0`..=`blk.2` recurrent, `blk.3` full-attention, `blk.4`..=`blk.6`
+/// recurrent, `blk.7` full-attention, and `blk.8` recurrent (`962,887,680` bytes
+/// across two `<= 480` MiB `FastRPC` weight arenas).
+pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 56] = [
     "blk.0.ffn_up.weight",
     "blk.0.ffn_gate.weight",
     "blk.0.ffn_down.weight",
@@ -62,13 +64,41 @@ pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 28] = [
     "blk.4.ffn_up.weight",
     "blk.4.ffn_gate.weight",
     "blk.4.ffn_down.weight",
+    "blk.4.attn_qkv.weight",
+    "blk.4.attn_gate.weight",
+    "blk.4.ssm_out.weight",
+    "blk.5.ffn_up.weight",
+    "blk.5.ffn_gate.weight",
+    "blk.5.ffn_down.weight",
+    "blk.5.attn_qkv.weight",
+    "blk.5.attn_gate.weight",
+    "blk.5.ssm_out.weight",
+    "blk.6.ffn_up.weight",
+    "blk.6.ffn_gate.weight",
+    "blk.6.ffn_down.weight",
+    "blk.6.attn_qkv.weight",
+    "blk.6.attn_gate.weight",
+    "blk.6.ssm_out.weight",
+    "blk.7.ffn_up.weight",
+    "blk.7.ffn_gate.weight",
+    "blk.7.ffn_down.weight",
+    "blk.7.attn_q.weight",
+    "blk.7.attn_k.weight",
+    "blk.7.attn_v.weight",
+    "blk.7.attn_output.weight",
+    "blk.8.ffn_up.weight",
+    "blk.8.ffn_gate.weight",
+    "blk.8.ffn_down.weight",
+    "blk.8.attn_qkv.weight",
+    "blk.8.attn_gate.weight",
+    "blk.8.ssm_out.weight",
 ];
 
 /// Exact packed `HTP_TYPE_Q2_0` resident weight payload bytes for [`DEFAULT_NATIVE_Q2_PROJECTIONS`].
-pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 502_824_960;
+pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 962_887_680;
 
 /// Host metadata reservation for resident `native-q2` projection handles.
-pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 256 * 1024;
+pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 512 * 1024;
 
 struct ResidentProjection {
     source: Arc<[u8]>,
@@ -1217,9 +1247,11 @@ mod tests {
 
     #[test]
     fn default_four_layer_projection_set_matches_exact_resident_arena_budget() -> Result<()> {
-        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 28);
+        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 56);
         let mut total_bytes = 0_usize;
-        for name in DEFAULT_NATIVE_Q2_PROJECTIONS {
+        let mut arena0_bytes = 0_usize;
+        let mut arena1_bytes = 0_usize;
+        for (idx, name) in DEFAULT_NATIVE_Q2_PROJECTIONS.into_iter().enumerate() {
             let (columns, rows): (usize, usize) = if name.ends_with(".ffn_up.weight")
                 || name.ends_with(".ffn_gate.weight")
             {
@@ -1241,8 +1273,18 @@ mod tests {
             };
             let packed_bytes = rows * 36 * (columns / 128);
             assert_eq!(packed_bytes % 128, 0);
+            if idx < 28 {
+                arena0_bytes += packed_bytes;
+            } else {
+                arena1_bytes += packed_bytes;
+            }
             total_bytes += packed_bytes;
         }
+        assert_eq!(
+            arena0_bytes,
+            hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+        );
+        assert_eq!(arena1_bytes, 460_062_720);
         assert_eq!(total_bytes, DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES);
         const {
             assert!(

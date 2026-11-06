@@ -227,10 +227,19 @@ pub(crate) fn request_batch(
     sequence: u64,
     batch_operations: u32,
 ) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
-    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10) {
+    request_batch_buffers(sequence, batch_operations, 1)
+}
+
+pub(crate) fn request_batch_buffers(
+    sequence: u64,
+    batch_operations: u32,
+    n_bufs: u32,
+) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10) || !(1..=4).contains(&n_bufs) {
         return Err(Error::Contract);
     }
     let mut result = request(sequence);
+    put32(&mut result, 8, n_bufs);
     put32(&mut result, 12, batch_operations * 3);
     put32(&mut result, 16, batch_operations);
     Ok(result)
@@ -241,8 +250,19 @@ pub(crate) fn response_valid(bytes: &[u8], sequence: u64) -> bool {
     response_batch_valid(bytes, sequence, 1)
 }
 
+#[cfg(test)]
 pub(crate) fn response_batch_valid(bytes: &[u8], sequence: u64, batch_operations: u32) -> bool {
+    response_batch_buffers_valid(bytes, sequence, batch_operations, 1)
+}
+
+pub(crate) fn response_batch_buffers_valid(
+    bytes: &[u8],
+    sequence: u64,
+    batch_operations: u32,
+    n_bufs: u32,
+) -> bool {
     if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10)
+        || !(1..=4).contains(&n_bufs)
         || sequence == 0
         || bytes.len() != compute::COMPUTE_RESPONSE_BYTES
     {
@@ -251,9 +271,11 @@ pub(crate) fn response_batch_valid(bytes: &[u8], sequence: u64, batch_operations
     let mut fixed = [0; compute::COMPUTE_RESPONSE_BYTES];
     fixed.copy_from_slice(bytes);
     let correlated = fixed[..8] == sequence.to_le_bytes()
+        && fixed[28..32] == n_bufs.to_le_bytes()
         && fixed[32..36] == (batch_operations * 3).to_le_bytes()
         && fixed[36..40] == batch_operations.to_le_bytes();
     fixed[..8].copy_from_slice(&1_u64.to_le_bytes());
+    fixed[28..32].copy_from_slice(&1_u32.to_le_bytes());
     fixed[32..36].copy_from_slice(&3_u32.to_le_bytes());
     fixed[36..40].copy_from_slice(&1_u32.to_le_bytes());
     correlated && compute::response_valid(&fixed)
@@ -456,6 +478,18 @@ mod tests {
         put32(&mut bytes, 36, 10);
         assert!(response_batch_valid(&bytes, 42, 10));
         assert!(!response_batch_valid(&bytes, 42, 4));
+        let multi_buf_req = request_batch_buffers(11, 2, 2)?;
+        assert_eq!(
+            &multi_buf_req[8..24],
+            &[2, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(request_batch_buffers(11, 2, 0).is_err());
+        assert!(request_batch_buffers(11, 2, 5).is_err());
+        put32(&mut bytes, 28, 2);
+        put32(&mut bytes, 32, 6);
+        put32(&mut bytes, 36, 2);
+        assert!(response_batch_buffers_valid(&bytes, 42, 2, 2));
+        assert!(!response_batch_buffers_valid(&bytes, 42, 2, 1));
         Ok(())
     }
 

@@ -52,7 +52,7 @@ const MAX_HOST_PAYLOAD: usize = 64 * 1024 * 1024;
 const MAX_TOKENS: usize = 8;
 const RESIDENT_WEIGHT_BYTES: usize = 17_408 * 36 * 40;
 const RESIDENT_METADATA_BYTES: usize = 64 * 1024;
-const NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 256 * 1024;
+const NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 512 * 1024;
 // Exact original-Swift geometry is independently enforced by swift::load:
 // 48 recurrent blocks, state head128, value heads48, key groups16 and conv4.
 // visit_state promotes the sixteen full-attention blocks' F16 K/V to F32.
@@ -303,7 +303,7 @@ impl Request {
         let tokens = self.tokens();
         let projections = self.projection_names();
         let max_projections = match self.execution_backend {
-            ExecutionBackend::NativeQ2 => 28,
+            ExecutionBackend::NativeQ2 => 112,
             ExecutionBackend::GuardedHvx | ExecutionBackend::HmxBitplane => {
                 if self.resident_host_weights { 2 } else { 4 }
             }
@@ -2773,16 +2773,25 @@ mod tests {
         four_layer_req["maximumOperations"] = json!(75);
         serde_json::from_value::<Request>(four_layer_req)?.limits()?;
 
-        let twenty_eight_proj = bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS;
-        assert_eq!(twenty_eight_proj.len(), 28);
+        let default_proj = bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS;
+        assert_eq!(default_proj.len(), 56);
         assert_eq!(
-            expected_resident_weight_bytes(&twenty_eight_proj, ExecutionBackend::NativeQ2)?,
+            expected_resident_weight_bytes(&default_proj[..28], ExecutionBackend::NativeQ2)?,
             502_824_960
         );
-        let mut full_arena_req = native_req;
-        full_arena_req["projections"] = json!(twenty_eight_proj);
-        full_arena_req["maximumOperations"] = json!(84);
-        serde_json::from_value::<Request>(full_arena_req)?.limits()?;
+        assert_eq!(
+            expected_resident_weight_bytes(&default_proj, ExecutionBackend::NativeQ2)?,
+            962_887_680
+        );
+        let mut single_arena_req = native_req.clone();
+        single_arena_req["projections"] = json!(&default_proj[..28]);
+        single_arena_req["maximumOperations"] = json!(84);
+        serde_json::from_value::<Request>(single_arena_req)?.limits()?;
+
+        let mut dual_arena_req = native_req;
+        dual_arena_req["projections"] = json!(&default_proj[..]);
+        dual_arena_req["maximumOperations"] = json!(168);
+        serde_json::from_value::<Request>(dual_arena_req)?.limits()?;
 
         let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
         let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];

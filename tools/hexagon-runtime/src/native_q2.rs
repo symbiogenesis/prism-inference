@@ -931,9 +931,11 @@ fn pack_row_group(
     row_group: usize,
     group_weights: &mut [u8],
 ) -> Result<()> {
-    initialize_native_weights(group_weights);
     let group_row_start = row_group * 32;
     let group_rows = geometry.active_rows.saturating_sub(group_row_start).min(32);
+    if group_rows < 32 {
+        initialize_native_weights(group_weights);
+    }
     for row_in_tile in 0..group_rows {
         let local_row = group_row_start + row_in_tile;
         let row_block_base =
@@ -948,15 +950,17 @@ fn pack_row_group(
             let scale_offset1 = tile1 + 512 + row_in_tile * 2;
             group_weights[scale_offset0..scale_offset0 + 2].copy_from_slice(&original[..2]);
             group_weights[scale_offset1..scale_offset1 + 2].copy_from_slice(&original[..2]);
-            for (chunk, word_bytes) in original[2..34].as_chunks::<4>().0.iter().enumerate() {
-                let mut packed = u32::from_le_bytes(*word_bytes);
-                let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc;
+            for (pair, dword_bytes) in original[2..34].as_chunks::<8>().0.iter().enumerate() {
+                let mut packed = u64::from_le_bytes(*dword_bytes);
+                let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc_00cc_00cc;
                 packed ^= swap ^ (swap << 6);
-                let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0;
+                let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0_0000_f0f0;
                 packed ^= swap ^ (swap << 12);
-                let tile = if chunk < 4 { tile0 } else { tile1 };
-                let byte = tile + (chunk % 4) * 128 + row_in_tile * 4;
-                group_weights[byte..byte + 4].copy_from_slice(&packed.to_le_bytes());
+                let bytes = packed.to_le_bytes();
+                let tile = if pair < 2 { tile0 } else { tile1 };
+                let base = tile + (pair % 2) * 256 + row_in_tile * 4;
+                group_weights[base..base + 4].copy_from_slice(&bytes[..4]);
+                group_weights[base + 128..base + 132].copy_from_slice(&bytes[4..8]);
             }
         }
     }
@@ -1143,6 +1147,59 @@ mod tests {
         executor.project_f32(&tensor, &activation, true, &mut output)?;
         assert_eq!(executor.residency_statistics().cache_hits, 1);
         assert_eq!(executor.statistics().operations_completed, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pack_row_group_matches_reference_word_interleave() -> Result<()> {
+        let total_blocks = 2;
+        for active_rows in [17, 32] {
+            let mut tensor_data = vec![0_u8; 32 * total_blocks * 34];
+            for (idx, b) in tensor_data.iter_mut().enumerate() {
+                *b = u8::try_from((idx * 173 + 29) & 0xff).unwrap_or(0);
+            }
+            for block in tensor_data.as_chunks_mut::<34>().0 {
+                block[0] = 0x55;
+                block[1] = 0x35;
+            }
+            let geometry = ChunkGeometry {
+                total_blocks,
+                row_start: 0,
+                active_rows,
+                block_start: 0,
+                chunk_blocks: total_blocks,
+            };
+            let mut actual = vec![0xaa_u8; total_blocks * 2 * 576];
+            pack_row_group(&tensor_data, geometry, 0, &mut actual)?;
+
+            let mut expected = vec![0_u8; total_blocks * 2 * 576];
+            initialize_native_weights(&mut expected);
+            for row_in_tile in 0..active_rows {
+                let row_block_base = row_in_tile * total_blocks;
+                for local_block in 0..total_blocks {
+                    let offset = (row_block_base + local_block) * 34;
+                    let original = &tensor_data[offset..offset + 34];
+                    let tile0 = (local_block * 2) * 576;
+                    let tile1 = tile0 + 576;
+                    expected[tile0 + 512 + row_in_tile * 2..tile0 + 514 + row_in_tile * 2]
+                        .copy_from_slice(&original[..2]);
+                    expected[tile1 + 512 + row_in_tile * 2..tile1 + 514 + row_in_tile * 2]
+                        .copy_from_slice(&original[..2]);
+                    for (chunk, word_bytes) in original[2..34].as_chunks::<4>().0.iter().enumerate()
+                    {
+                        let mut packed = u32::from_le_bytes(*word_bytes);
+                        let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc;
+                        packed ^= swap ^ (swap << 6);
+                        let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0;
+                        packed ^= swap ^ (swap << 12);
+                        let tile = if chunk < 4 { tile0 } else { tile1 };
+                        let byte = tile + (chunk % 4) * 128 + row_in_tile * 4;
+                        expected[byte..byte + 4].copy_from_slice(&packed.to_le_bytes());
+                    }
+                }
+            }
+            assert_eq!(actual, expected);
+        }
         Ok(())
     }
 

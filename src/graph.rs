@@ -749,7 +749,37 @@ impl Transforms {
                 } else {
                     input
                 };
-                let mut prepared = scratch.matvec.prepare(weights[index], activation)?;
+                let skip_cpu_quantization = executor.as_deref().is_some_and(|exec| {
+                    let mut all_f32_supported = true;
+                    for (candidate, weight) in weights.iter().enumerate().skip(index) {
+                        if !completed[candidate]
+                            && self.basis(weight) == basis
+                            && scratch
+                                .matvec
+                                .shares_contract(weights[index], weight)
+                                .unwrap_or(false)
+                        {
+                            let supported = weight.kind == crate::kernels::PQ2
+                                && weight
+                                    .dimensions
+                                    .first()
+                                    .is_some_and(|&cols| cols.is_multiple_of(128))
+                                && exec.supports_f32(weight);
+                            if !supported {
+                                all_f32_supported = false;
+                                break;
+                            }
+                        }
+                    }
+                    all_f32_supported
+                });
+                let mut prepared = if skip_cpu_quantization {
+                    scratch
+                        .matvec
+                        .prepare_f32_executor(weights[index], activation)?
+                } else {
+                    scratch.matvec.prepare(weights[index], activation)?
+                };
                 for (candidate, (weight, output)) in
                     weights.iter().zip(outputs.iter_mut()).enumerate()
                 {
@@ -783,8 +813,8 @@ impl Transforms {
         geometry: &Geometry,
         transformed: &mut Vec<f32>,
     ) -> Result<()> {
-        copy_into(input, transformed)?;
         if self.grouped_values && weight.name.ends_with(".ssm_out.weight") {
+            zeros_into(input.len(), transformed)?;
             let repetitions = geometry.ssm_values / geometry.ssm_keys;
             for key in 0..geometry.ssm_keys {
                 for repeat in 0..repetitions {
@@ -794,8 +824,16 @@ impl Transforms {
                         .copy_from_slice(&input[source..source + geometry.ssm_head]);
                 }
             }
+            self.sign(transformed);
+        } else if let Some(signs) = self.signs.get(&input.len()) {
+            prepare(transformed, input.len())?;
+            transformed.extend(input.iter().zip(signs).map(|(&value, &sign)| value * sign));
+            if transformed.len() < input.len() {
+                transformed.extend_from_slice(&input[transformed.len()..]);
+            }
+        } else {
+            copy_into(input, transformed)?;
         }
-        self.sign(transformed);
         self.rotate(transformed)?;
         Ok(())
     }
@@ -3016,6 +3054,125 @@ mod tests {
         assert_eq!(scratch.matvec.preparation_count(), 2);
         assert_eq!(output[0], output[1]);
         assert_eq!(output[0].len(), 1);
+        Ok(())
+    }
+
+    struct F32OnlyExecutor {
+        offloaded_names: BTreeSet<String>,
+        f32_calls: usize,
+    }
+
+    impl crate::kernels::Pq2ProjectionExecutor for F32OnlyExecutor {
+        fn identity(&self) -> &'static str {
+            "f32-only-test"
+        }
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            false
+        }
+        fn supports_f32(&self, tensor: &Tensor) -> bool {
+            self.offloaded_names.contains(&tensor.name)
+        }
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[crate::kernels::Q8KBlock],
+            _pinned_accumulation: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(crate::invalid("unexpected Q8_K executor call"))
+        }
+        fn project_f32(
+            &mut self,
+            tensor: &Tensor,
+            activation: &[f32],
+            _pinned_accumulation: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            self.f32_calls += 1;
+            let mut cpu_scratch = crate::kernels::MatvecScratch::default();
+            crate::kernels::matvec_into(tensor, activation, output, &mut cpu_scratch)
+        }
+    }
+
+    #[test]
+    fn grouped_projection_skips_cpu_q8k_quantization_when_all_pq2_siblings_use_f32_executor()
+    -> Result<()> {
+        let width = 256;
+        let geometry = projection_geometry(width);
+        let qkv = projection_weight("blk.0.attn_qkv.weight", 142, width);
+        let gate = projection_weight("blk.0.attn_gate.weight", 142, width);
+        let bf16 = |name: &str, bits: u16| Tensor {
+            name: name.to_owned(),
+            dimensions: vec![width],
+            kind: 30,
+            data: Arc::from(bits.to_le_bytes().repeat(width)),
+        };
+        let (beta, alpha) = (
+            bf16("blk.0.ssm_beta.weight", 0x3f80),
+            bf16("blk.0.ssm_alpha.weight", 0x3f00),
+        );
+        let transforms = Transforms {
+            block: 4,
+            weights: BTreeSet::from([
+                qkv.name.clone(),
+                gate.name.clone(),
+                beta.name.clone(),
+                alpha.name.clone(),
+            ]),
+            inverse_embedding: false,
+            grouped_values: false,
+            signs: BTreeMap::from([(width, vec![1.0; width])]),
+        };
+        let input: Vec<f32> = (0..width)
+            .map(|index| [1.0, -0.5, 0.25, -0.125][index % 4])
+            .collect();
+
+        // 1. All PQ2 siblings offloaded via supports_f32 + BF16 siblings on CPU:
+        // Q8_K quantization is skipped completely while BF16 activations are prepared.
+        let mut executor = F32OnlyExecutor {
+            offloaded_names: BTreeSet::from([qkv.name.clone(), gate.name.clone()]),
+            f32_calls: 0,
+        };
+        let mut outputs = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut scratch = ProjectionScratch::default();
+        let mut executor_opt: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor> =
+            Some(&mut executor);
+        transforms.project_group_into_with_executor(
+            [&qkv, &gate, &beta, &alpha],
+            &input,
+            &geometry,
+            outputs.each_mut(),
+            &mut scratch,
+            &mut executor_opt,
+        )?;
+        assert_eq!(executor.f32_calls, 2);
+        assert_eq!(scratch.transforms, 2);
+        assert_eq!(scratch.matvec.preparation_count(), 2);
+        assert_eq!(scratch.matvec.statistics().matrix_successes, 2);
+
+        // 2. Partial PQ2 offload (qkv on f32 executor, gate on CPU):
+        // Q8_K quantization is performed once so the CPU sibling succeeds.
+        let mut partial_executor = F32OnlyExecutor {
+            offloaded_names: BTreeSet::from([qkv.name.clone()]),
+            f32_calls: 0,
+        };
+        let mut partial_outputs = [Vec::new(), Vec::new()];
+        let mut partial_scratch = ProjectionScratch::default();
+        let mut partial_opt: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor> =
+            Some(&mut partial_executor);
+        transforms.project_group_into_with_executor(
+            [&qkv, &gate],
+            &input,
+            &geometry,
+            partial_outputs.each_mut(),
+            &mut partial_scratch,
+            &mut partial_opt,
+        )?;
+        assert_eq!(partial_executor.f32_calls, 1);
+        assert_eq!(partial_scratch.matvec.preparation_count(), 1);
+        assert_eq!(partial_scratch.matvec.statistics().matrix_successes, 1);
+        assert_eq!(partial_outputs[0], outputs[0]);
+        assert_eq!(partial_outputs[1], outputs[1]);
         Ok(())
     }
 

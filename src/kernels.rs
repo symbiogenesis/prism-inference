@@ -72,7 +72,7 @@ const Q8_0: u32 = 8;
 const Q8_1: u32 = 9;
 const Q8_K: u32 = 15;
 const BF16: u32 = 30;
-const PQ2: u32 = 142;
+pub(crate) const PQ2: u32 = 142;
 const PTQ1: u32 = 143;
 
 fn layout(kind: u32) -> Result<(usize, usize)> {
@@ -1272,6 +1272,7 @@ impl ActivationContract {
 pub struct PreparedMatvec<'a> {
     input: &'a [f32],
     contract: ActivationContract,
+    quantized: bool,
     scratch: &'a mut MatvecScratch,
 }
 
@@ -1516,9 +1517,40 @@ impl MatvecScratch {
         tensor: &Tensor,
         input: &'a [f32],
     ) -> Result<PreparedMatvec<'a>> {
+        self.prepare_with_quantization(tensor, input, true)
+    }
+
+    /// Prepares one exact `F32` activation vector for an external `F32`
+    /// projection executor without CPU `Q8_K` or `Q8_0` quantization.
+    ///
+    /// # Errors
+    /// Rejects malformed tensor dimensions, unsupported kinds, or mismatched
+    /// or nonfinite input.
+    pub(crate) fn prepare_f32_executor<'a>(
+        &'a mut self,
+        tensor: &Tensor,
+        input: &'a [f32],
+    ) -> Result<PreparedMatvec<'a>> {
+        self.prepare_with_quantization(tensor, input, false)
+    }
+
+    pub(crate) fn shares_contract(&self, first: &Tensor, second: &Tensor) -> Result<bool> {
+        let (first_columns, _, _) = dimensions(first)?;
+        let (second_columns, _, _) = dimensions(second)?;
+        Ok(first_columns == second_columns
+            && ActivationContract::for_tensor(first, first_columns, self.pinned_accumulation)
+                == ActivationContract::for_tensor(second, second_columns, self.pinned_accumulation))
+    }
+
+    fn prepare_with_quantization<'a>(
+        &'a mut self,
+        tensor: &Tensor,
+        input: &'a [f32],
+        quantized: bool,
+    ) -> Result<PreparedMatvec<'a>> {
         self.reset_diagnostics();
         self.statistics.preparations = self.statistics.preparations.saturating_add(1);
-        let contract = match self.prepare_input(tensor, input) {
+        let contract = match self.prepare_input_with_quantization(tensor, input, quantized) {
             Ok(contract) => contract,
             Err(error) => {
                 self.statistics.preparation_failures =
@@ -1529,11 +1561,21 @@ impl MatvecScratch {
         Ok(PreparedMatvec {
             input,
             contract,
+            quantized,
             scratch: self,
         })
     }
 
     fn prepare_input(&mut self, tensor: &Tensor, input: &[f32]) -> Result<ActivationContract> {
+        self.prepare_input_with_quantization(tensor, input, true)
+    }
+
+    fn prepare_input_with_quantization(
+        &mut self,
+        tensor: &Tensor,
+        input: &[f32],
+        quantized: bool,
+    ) -> Result<ActivationContract> {
         // A new scoped preparation invalidates every rearranged activation,
         // including a preparation which fails before dispatch. Capacity alone
         // is retained; neither pointers nor prior input contents identify reuse.
@@ -1555,28 +1597,34 @@ impl MatvecScratch {
             ));
         }
         let contract = ActivationContract::for_tensor(tensor, columns, self.pinned_accumulation);
-        match contract {
-            ActivationContract::PinnedPtq1Q8 => {
-                q8_with_contract::<true, true>(input, &mut self.q8)?;
+        if quantized {
+            match contract {
+                ActivationContract::PinnedPtq1Q8 => {
+                    q8_with_contract::<true, true>(input, &mut self.q8)?;
+                }
+                ActivationContract::Q8K if self.pinned_accumulation => {
+                    q8k_with_rounding::<true>(input, &mut self.q8k)?;
+                }
+                ActivationContract::Q8K => q8k_into(input, &mut self.q8k)?,
+                ActivationContract::Q8 if self.pinned_accumulation => {
+                    q8_with_rounding::<true>(input, &mut self.q8)?;
+                }
+                ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
+                _ => collect_into(
+                    input.iter().map(|&value| {
+                        finite(match contract {
+                            ActivationContract::F16 => round_f16(value),
+                            ActivationContract::BF16 => round_bf16(value),
+                            _ => value,
+                        })
+                    }),
+                    &mut self.activations,
+                )?,
             }
-            ActivationContract::Q8K if self.pinned_accumulation => {
-                q8k_with_rounding::<true>(input, &mut self.q8k)?;
-            }
-            ActivationContract::Q8K => q8k_into(input, &mut self.q8k)?,
-            ActivationContract::Q8 if self.pinned_accumulation => {
-                q8_with_rounding::<true>(input, &mut self.q8)?;
-            }
-            ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
-            _ => collect_into(
-                input.iter().map(|&value| {
-                    finite(match contract {
-                        ActivationContract::F16 => round_f16(value),
-                        ActivationContract::BF16 => round_bf16(value),
-                        _ => value,
-                    })
-                }),
-                &mut self.activations,
-            )?,
+        } else {
+            self.q8k.clear();
+            self.q8.clear();
+            self.activations.clear();
         }
         #[cfg(test)]
         {
@@ -1802,7 +1850,8 @@ impl PreparedMatvec<'_> {
     )]
     fn multiply(&mut self, tensor: &Tensor, output: &mut Vec<f32>) -> Result<()> {
         let (columns, rows, row_bytes) = dimensions(tensor)?;
-        if columns != self.input.len()
+        if !self.quantized
+            || columns != self.input.len()
             || ActivationContract::for_tensor(tensor, columns, self.scratch.pinned_accumulation)
                 != self.contract
         {
@@ -2061,11 +2110,12 @@ pub fn hadamard(values: &mut [f32]) -> Result<()> {
     let mut half = 1;
     while half < values.len() {
         for block in values.chunks_exact_mut(half * 2) {
-            for index in 0..half {
-                let left = block[index];
-                let right = block[index + half];
-                block[index] = left + right;
-                block[index + half] = left - right;
+            let (left_half, right_half) = block.split_at_mut(half);
+            for (left, right) in left_half.iter_mut().zip(right_half) {
+                let l = *left;
+                let r = *right;
+                *left = l + r;
+                *right = l - r;
             }
         }
         half *= 2;

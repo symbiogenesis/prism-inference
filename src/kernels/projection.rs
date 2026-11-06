@@ -142,6 +142,11 @@ impl PreparedMatvec<'_> {
                 )?;
             } else if tensor.kind == PQ2 && columns.is_multiple_of(256) && executor.supports(tensor)
             {
+                if !self.quantized {
+                    return Err(invalid(
+                        "prepared projection executor activation requires quantization",
+                    ));
+                }
                 executor.project(
                     tensor,
                     &self.scratch.q8k,
@@ -151,6 +156,11 @@ impl PreparedMatvec<'_> {
             } else if (tensor.kind == PTQ1 || tensor.kind == PQ2 && !columns.is_multiple_of(256))
                 && executor.supports_q8(tensor)
             {
+                if !self.quantized {
+                    return Err(invalid(
+                        "prepared projection executor activation requires quantization",
+                    ));
+                }
                 executor.project_q8(
                     tensor,
                     &self.scratch.q8,

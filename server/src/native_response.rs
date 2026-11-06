@@ -6,7 +6,8 @@
 //! generation callback; failed or abandoned terminal writes require reset.
 
 use bonsai_prism_runtime::runtime::{Completion, Finish};
-use serde_json::{Value, json};
+use serde::Serialize;
+use std::io::Write as _;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     time::{Instant, timeout_at},
@@ -15,9 +16,98 @@ use tokio::{
 use crate::response::{CLIENT_WRITE_TIMEOUT, MAX_RESPONSE_BYTES, ResponseError};
 
 const INPUT_CHUNK_BYTES: usize = 1024;
+const INITIAL_BUFFER_CAPACITY: usize = 512;
 const THINK_END: &str = "</think>";
+const RESPONSE_ID: &str = "chatcmpl-swift";
+const MODEL_ID: &str = "Swift-Bonsai-2-PQ2_0";
+const CHUNK_OBJECT: &str = "chat.completion.chunk";
+const COMPLETION_OBJECT: &str = "chat.completion";
 const COMMON_HEADERS: &str =
     "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
+const STREAM_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+#[derive(Serialize)]
+struct StreamChunk<D> {
+    choices: [StreamChoice<D>; 1],
+    id: &'static str,
+    model: &'static str,
+    object: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsagePayload>,
+}
+
+#[derive(Serialize)]
+struct StreamChoice<D> {
+    delta: D,
+    finish_reason: Option<&'static str>,
+    index: u8,
+}
+
+#[derive(Serialize)]
+struct RoleDelta {
+    role: &'static str,
+}
+
+#[derive(Serialize)]
+struct ReasoningDelta<'a> {
+    reasoning_content: &'a str,
+}
+
+#[derive(Serialize)]
+struct ContentDelta<'a> {
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct EmptyDelta {}
+
+#[derive(Clone, Copy, Serialize)]
+struct UsagePayload {
+    completion_tokens: usize,
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct CompletionEnvelope<'a> {
+    choices: [CompletionChoice<'a>; 1],
+    id: &'static str,
+    model: &'static str,
+    object: &'static str,
+    usage: UsagePayload,
+}
+
+#[derive(Serialize)]
+struct CompletionChoice<'a> {
+    finish_reason: &'static str,
+    index: u8,
+    message: AssistantMessage<'a>,
+}
+
+#[derive(Serialize)]
+struct AssistantMessage<'a> {
+    content: &'a str,
+    reasoning_content: &'a str,
+    role: &'static str,
+}
+
+const fn stream_chunk<D>(
+    delta: D,
+    finish_reason: Option<&'static str>,
+    usage: Option<UsagePayload>,
+) -> StreamChunk<D> {
+    StreamChunk {
+        choices: [StreamChoice {
+            delta,
+            finish_reason,
+            index: 0,
+        }],
+        id: RESPONSE_ID,
+        model: MODEL_ID,
+        object: CHUNK_OBJECT,
+        usage,
+    }
+}
 
 #[derive(Default)]
 struct Segments {
@@ -98,6 +188,8 @@ pub struct NativeResponse<W> {
     sent: usize,
     parser: Reasoning,
     collected: Segments,
+    payload_buffer: Vec<u8>,
+    frame_buffer: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> NativeResponse<W> {
@@ -121,6 +213,11 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
         deadline: Instant,
         enable_thinking: bool,
     ) -> Self {
+        let capacity = if streaming {
+            INITIAL_BUFFER_CAPACITY
+        } else {
+            0
+        };
         Self {
             client,
             streaming,
@@ -130,6 +227,8 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
             sent: 0,
             parser: Reasoning::new(enable_thinking),
             collected: Segments::default(),
+            payload_buffer: Vec::with_capacity(capacity),
+            frame_buffer: Vec::with_capacity(capacity),
         }
     }
 
@@ -174,14 +273,34 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
             .prompt_tokens
             .checked_add(completion.generated_tokens)
             .ok_or(ResponseError::BodyLimit)?;
-        let usage = json!({"prompt_tokens":self.prompt_tokens,"completion_tokens":completion.generated_tokens,"total_tokens":total});
+        let usage = UsagePayload {
+            completion_tokens: completion.generated_tokens,
+            prompt_tokens: self.prompt_tokens,
+            total_tokens: total,
+        };
         if self.streaming {
             self.start_stream().await?;
-            self.frame(json!({"id":"chatcmpl-swift","object":"chat.completion.chunk","model":"Swift-Bonsai-2-PQ2_0","choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":usage})).await?;
+            self.frame(&stream_chunk(EmptyDelta {}, Some(reason), Some(usage)))
+                .await?;
             self.chunk(b"data: [DONE]\n\n").await?;
             write_group(&mut self.client, &[b"0\r\n\r\n"], self.deadline, true).await
         } else {
-            let bytes = serde_json::to_vec(&json!({"id":"chatcmpl-swift","object":"chat.completion","model":"Swift-Bonsai-2-PQ2_0","choices":[{"index":0,"message":{"role":"assistant","content":self.collected.content,"reasoning_content":self.collected.reasoning},"finish_reason":reason}],"usage":usage})).map_err(|_|ResponseError::JsonSyntax)?;
+            let bytes = serde_json::to_vec(&CompletionEnvelope {
+                choices: [CompletionChoice {
+                    finish_reason: reason,
+                    index: 0,
+                    message: AssistantMessage {
+                        content: &self.collected.content,
+                        reasoning_content: &self.collected.reasoning,
+                        role: "assistant",
+                    },
+                }],
+                id: RESPONSE_ID,
+                model: MODEL_ID,
+                object: COMPLETION_OBJECT,
+                usage,
+            })
+            .map_err(|_| ResponseError::JsonSyntax)?;
             charge(&mut self.sent, bytes.len())?;
             let head = format!(
                 "HTTP/1.1 200 OK\r\n{COMMON_HEADERS}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -199,14 +318,27 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
 
     async fn deliver(&mut self, segments: Segments) -> Result<(), ResponseError> {
         if self.streaming {
-            for (field, text) in [
-                ("reasoning_content", segments.reasoning),
-                ("content", segments.content),
-            ] {
-                if !text.is_empty() {
-                    self.start_stream().await?;
-                    self.frame(json!({"id":"chatcmpl-swift","object":"chat.completion.chunk","model":"Swift-Bonsai-2-PQ2_0","choices":[{"index":0,"delta":{field:text},"finish_reason":null}]})).await?;
-                }
+            if !segments.reasoning.is_empty() {
+                self.start_stream().await?;
+                self.frame(&stream_chunk(
+                    ReasoningDelta {
+                        reasoning_content: &segments.reasoning,
+                    },
+                    None,
+                    None,
+                ))
+                .await?;
+            }
+            if !segments.content.is_empty() {
+                self.start_stream().await?;
+                self.frame(&stream_chunk(
+                    ContentDelta {
+                        content: &segments.content,
+                    },
+                    None,
+                    None,
+                ))
+                .await?;
             }
         } else {
             let retained = self
@@ -228,29 +360,43 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
 
     async fn start_stream(&mut self) -> Result<(), ResponseError> {
         if !self.started {
-            let head = format!(
-                "HTTP/1.1 200 OK\r\n{COMMON_HEADERS}Content-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
-            );
-            write_group(&mut self.client, &[head.as_bytes()], self.deadline, false).await?;
+            write_group(&mut self.client, &[STREAM_HEAD], self.deadline, false).await?;
             self.started = true;
-            self.frame(json!({"id":"chatcmpl-swift","object":"chat.completion.chunk","model":"Swift-Bonsai-2-PQ2_0","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})).await?;
+            self.frame(&stream_chunk(RoleDelta { role: "assistant" }, None, None))
+                .await?;
         }
         Ok(())
     }
 
-    async fn frame(&mut self, value: Value) -> Result<(), ResponseError> {
-        let mut bytes = b"data: ".to_vec();
-        serde_json::to_writer(&mut bytes, &value).map_err(|_| ResponseError::JsonSyntax)?;
-        bytes.extend_from_slice(b"\n\n");
-        self.chunk(&bytes).await
+    async fn frame(&mut self, value: &impl Serialize) -> Result<(), ResponseError> {
+        self.payload_buffer.clear();
+        self.payload_buffer.extend_from_slice(b"data: ");
+        serde_json::to_writer(&mut self.payload_buffer, value)
+            .map_err(|_| ResponseError::JsonSyntax)?;
+        self.payload_buffer.extend_from_slice(b"\n\n");
+        charge(&mut self.sent, self.payload_buffer.len())?;
+        self.frame_buffer.clear();
+        let _ = write!(self.frame_buffer, "{:X}\r\n", self.payload_buffer.len());
+        self.frame_buffer.extend_from_slice(&self.payload_buffer);
+        self.frame_buffer.extend_from_slice(b"\r\n");
+        write_group(
+            &mut self.client,
+            &[&self.frame_buffer],
+            self.deadline,
+            false,
+        )
+        .await
     }
 
     async fn chunk(&mut self, bytes: &[u8]) -> Result<(), ResponseError> {
         charge(&mut self.sent, bytes.len())?;
-        let prefix = format!("{:X}\r\n", bytes.len());
+        self.frame_buffer.clear();
+        let _ = write!(self.frame_buffer, "{:X}\r\n", bytes.len());
+        self.frame_buffer.extend_from_slice(bytes);
+        self.frame_buffer.extend_from_slice(b"\r\n");
         write_group(
             &mut self.client,
-            &[prefix.as_bytes(), bytes, b"\r\n"],
+            &[&self.frame_buffer],
             self.deadline,
             false,
         )

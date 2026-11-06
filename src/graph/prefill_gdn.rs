@@ -167,19 +167,28 @@ pub(super) fn recurrent_tile(
     for token in 0..count {
         check()?;
         let mixed = &mut tile.mixed[token];
-        for (channel, value) in mixed.iter_mut().enumerate() {
-            let projected = *value;
-            let start = channel * (geometry.convolution - 1);
-            let coefficients = &layer.convolution
-                [channel * geometry.convolution..(channel + 1) * geometry.convolution];
-            *value = arithmetic.convolution_row(
-                &convolution[start..start + geometry.convolution - 1],
-                projected,
-                coefficients,
+        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            crate::kernels::pinned_convolution::step_in_place(
+                convolution,
+                mixed,
+                &layer.convolution,
+                geometry.convolution,
             )?;
-            if geometry.convolution > 1 {
-                convolution[start..start + geometry.convolution - 1].rotate_left(1);
-                convolution[start + geometry.convolution - 2] = projected;
+        } else {
+            for (channel, value) in mixed.iter_mut().enumerate() {
+                let projected = *value;
+                let start = channel * (geometry.convolution - 1);
+                let coefficients = &layer.convolution
+                    [channel * geometry.convolution..(channel + 1) * geometry.convolution];
+                *value = arithmetic.convolution_row(
+                    &convolution[start..start + geometry.convolution - 1],
+                    projected,
+                    coefficients,
+                )?;
+                if geometry.convolution > 1 {
+                    convolution[start..start + geometry.convolution - 1].rotate_left(1);
+                    convolution[start + geometry.convolution - 2] = projected;
+                }
             }
         }
         arithmetic.silu(mixed);

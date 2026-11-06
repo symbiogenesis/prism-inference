@@ -29,6 +29,238 @@ pub(crate) fn row(history: &[f32], projected: f32, coefficients: &[f32]) -> Resu
     super::finite(projected.mul_add(current, sum))
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn transpose_4x4(
+    r0: fearless_simd::f32x4<fearless_simd::Neon>,
+    r1: fearless_simd::f32x4<fearless_simd::Neon>,
+    r2: fearless_simd::f32x4<fearless_simd::Neon>,
+    r3: fearless_simd::f32x4<fearless_simd::Neon>,
+) -> [fearless_simd::f32x4<fearless_simd::Neon>; 4] {
+    use fearless_simd::prelude::*;
+    let t0 = r0.zip_low(r2);
+    let t1 = r0.zip_high(r2);
+    let t2 = r1.zip_low(r3);
+    let t3 = r1.zip_high(r3);
+    [
+        t0.zip_low(t2),
+        t0.zip_high(t2),
+        t1.zip_low(t3),
+        t1.zip_high(t3),
+    ]
+}
+
+/// Evaluates all channels of one causal convolution step and writes updated history.
+///
+/// # Errors
+/// Rejects invalid geometry or nonfinite outputs.
+pub(crate) fn step_into(
+    history: &[f32],
+    mixed: &mut [f32],
+    coefficients: &[f32],
+    width: usize,
+    next_history: &mut [f32],
+) -> Result<()> {
+    if width == 0 {
+        return Err(invalid("pinned convolution requires coefficients"));
+    }
+    let hist_width = width - 1;
+    if coefficients.len() != mixed.len().saturating_mul(width)
+        || history.len() != mixed.len().saturating_mul(hist_width)
+        || next_history.len() != history.len()
+    {
+        return Err(invalid("pinned convolution history width mismatch"));
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if width == 4
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        use fearless_simd::{f32x4, prelude::*};
+        let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
+        let (h_chunks, h_rem) = history.as_chunks::<12>();
+        let (n_chunks, n_rem) = next_history.as_chunks_mut::<12>();
+        let (c_chunks, c_rem) = coefficients.as_chunks::<16>();
+        for (((m_chunk, h_chunk), n_chunk), c_chunk) in m_chunks
+            .iter_mut()
+            .zip(h_chunks)
+            .zip(n_chunks)
+            .zip(c_chunks)
+        {
+            let [tap0, tap1, tap2, tap3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_chunk[0..4]),
+                f32x4::from_slice(neon, &c_chunk[4..8]),
+                f32x4::from_slice(neon, &c_chunk[8..12]),
+                f32x4::from_slice(neon, &c_chunk[12..16]),
+            );
+            let h_t0 = f32x4::load_array(neon, [h_chunk[0], h_chunk[3], h_chunk[6], h_chunk[9]]);
+            let h_t1 = f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
+            let h_t2 = f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
+            let p = f32x4::from_slice(neon, m_chunk);
+            let mut sum = f32x4::splat(neon, 0.0);
+            sum = h_t0.mul_add_precise(tap0, sum);
+            sum = h_t1.mul_add_precise(tap1, sum);
+            sum = h_t2.mul_add_precise(tap2, sum);
+            let out = p.mul_add_precise(tap3, sum);
+            if !out.is_finite().all_true() {
+                return Err(invalid("nonfinite kernel output"));
+            }
+            let [p0, p1, p2, p3] = *m_chunk;
+            out.store_slice(m_chunk);
+            *n_chunk = [
+                h_chunk[1],
+                h_chunk[2],
+                p0,
+                h_chunk[4],
+                h_chunk[5],
+                p1,
+                h_chunk[7],
+                h_chunk[8],
+                p2,
+                h_chunk[10],
+                h_chunk[11],
+                p3,
+            ];
+        }
+        for (((mixed_value, h_slice), n_slice), c_slice) in m_rem
+            .iter_mut()
+            .zip(h_rem.as_chunks::<3>().0)
+            .zip(n_rem.as_chunks_mut::<3>().0)
+            .zip(c_rem.as_chunks::<4>().0)
+        {
+            let projected = *mixed_value;
+            *mixed_value = row(h_slice, projected, c_slice)?;
+            n_slice[0] = h_slice[1];
+            n_slice[1] = h_slice[2];
+            n_slice[2] = projected;
+        }
+        return Ok(());
+    }
+    for (channel, mixed_value) in mixed.iter_mut().enumerate() {
+        let projected = *mixed_value;
+        let start = channel * hist_width;
+        let coeff = &coefficients[channel * width..(channel + 1) * width];
+        *mixed_value = row(&history[start..start + hist_width], projected, coeff)?;
+        if hist_width == 3 {
+            next_history[start] = history[start + 1];
+            next_history[start + 1] = history[start + 2];
+            next_history[start + 2] = projected;
+        } else if hist_width > 0 {
+            next_history[start..start + hist_width - 1]
+                .copy_from_slice(&history[start + 1..start + hist_width]);
+            next_history[start + hist_width - 1] = projected;
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates all channels of one causal convolution step and updates history in place.
+///
+/// # Errors
+/// Rejects invalid geometry or nonfinite outputs.
+pub(crate) fn step_in_place(
+    history: &mut [f32],
+    mixed: &mut [f32],
+    coefficients: &[f32],
+    width: usize,
+) -> Result<()> {
+    if width == 0 {
+        return Err(invalid("pinned convolution requires coefficients"));
+    }
+    let hist_width = width - 1;
+    if coefficients.len() != mixed.len().saturating_mul(width)
+        || history.len() != mixed.len().saturating_mul(hist_width)
+    {
+        return Err(invalid("pinned convolution history width mismatch"));
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if width == 4
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        use fearless_simd::{f32x4, prelude::*};
+        let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
+        let (h_chunks, h_rem) = history.as_chunks_mut::<12>();
+        let (c_chunks, c_rem) = coefficients.as_chunks::<16>();
+        for ((m_chunk, h_chunk), c_chunk) in m_chunks.iter_mut().zip(h_chunks).zip(c_chunks) {
+            let [tap0, tap1, tap2, tap3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_chunk[0..4]),
+                f32x4::from_slice(neon, &c_chunk[4..8]),
+                f32x4::from_slice(neon, &c_chunk[8..12]),
+                f32x4::from_slice(neon, &c_chunk[12..16]),
+            );
+            let h_t0 = f32x4::load_array(neon, [h_chunk[0], h_chunk[3], h_chunk[6], h_chunk[9]]);
+            let h_t1 = f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
+            let h_t2 = f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
+            let p = f32x4::from_slice(neon, m_chunk);
+            let mut sum = f32x4::splat(neon, 0.0);
+            sum = h_t0.mul_add_precise(tap0, sum);
+            sum = h_t1.mul_add_precise(tap1, sum);
+            sum = h_t2.mul_add_precise(tap2, sum);
+            let out = p.mul_add_precise(tap3, sum);
+            if !out.is_finite().all_true() {
+                return Err(invalid("nonfinite kernel output"));
+            }
+            let [p0, p1, p2, p3] = *m_chunk;
+            out.store_slice(m_chunk);
+            *h_chunk = [
+                h_chunk[1],
+                h_chunk[2],
+                p0,
+                h_chunk[4],
+                h_chunk[5],
+                p1,
+                h_chunk[7],
+                h_chunk[8],
+                p2,
+                h_chunk[10],
+                h_chunk[11],
+                p3,
+            ];
+        }
+        for ((mixed_value, h_slice), c_slice) in m_rem
+            .iter_mut()
+            .zip(h_rem.as_chunks_mut::<3>().0)
+            .zip(c_rem.as_chunks::<4>().0)
+        {
+            let projected = *mixed_value;
+            *mixed_value = row(h_slice, projected, c_slice)?;
+            h_slice[0] = h_slice[1];
+            h_slice[1] = h_slice[2];
+            h_slice[2] = projected;
+        }
+        return Ok(());
+    }
+    for (channel, mixed_value) in mixed.iter_mut().enumerate() {
+        let projected = *mixed_value;
+        let start = channel * hist_width;
+        let coeff = &coefficients[channel * width..(channel + 1) * width];
+        *mixed_value = row(&history[start..start + hist_width], projected, coeff)?;
+        if hist_width == 3 {
+            history[start] = history[start + 1];
+            history[start + 1] = history[start + 2];
+            history[start + 2] = projected;
+        } else if hist_width > 0 {
+            history[start..start + hist_width].rotate_left(1);
+            history[start + hist_width - 1] = projected;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -37,7 +269,7 @@ mod tests {
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
-    use super::row;
+    use super::{row, step_in_place, step_into};
     use crate::Result;
 
     #[derive(Deserialize)]
@@ -105,18 +337,61 @@ mod tests {
             let signal = values(&mut input, width * channels)?;
             let coefficients = values(&mut input, width * channels)?;
             let native = values(&mut input, channels)?;
-            for (channel, ((signal, coefficients), native)) in signal
+            let hist_width = width - 1;
+            let mut flat_history = Vec::with_capacity(channels * hist_width);
+            let mut mixed = Vec::with_capacity(channels);
+            for (channel, ((signal, coeff), &expected)) in signal
                 .chunks_exact(width)
                 .zip(coefficients.chunks_exact(width))
-                .zip(native)
+                .zip(&native)
                 .enumerate()
             {
                 assert_eq!(
-                    row(&signal[..width - 1], signal[width - 1], coefficients)?.to_bits(),
-                    native.to_bits(),
+                    row(&signal[..hist_width], signal[hist_width], coeff)?.to_bits(),
+                    expected.to_bits(),
                     "case {case}, channel {channel}"
                 );
+                flat_history.extend_from_slice(&signal[..hist_width]);
+                mixed.push(signal[hist_width]);
             }
+            let mut mixed_into = mixed.clone();
+            let mut next_history = vec![0.0; flat_history.len()];
+            step_into(
+                &flat_history,
+                &mut mixed_into,
+                &coefficients,
+                width,
+                &mut next_history,
+            )?;
+            let mut mixed_in_place = mixed;
+            let mut in_place_history = flat_history;
+            step_in_place(
+                &mut in_place_history,
+                &mut mixed_in_place,
+                &coefficients,
+                width,
+            )?;
+            assert_eq!(
+                mixed_into.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                native.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "step_into case {case}"
+            );
+            assert_eq!(
+                mixed_in_place
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                native.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "step_in_place case {case}"
+            );
+            assert_eq!(
+                next_history.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                in_place_history
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "history update case {case}"
+            );
         }
         assert_eq!(input.position(), u64::try_from(bytes.len())?);
         Ok(())

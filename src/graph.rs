@@ -803,28 +803,24 @@ impl Transforms {
                     input
                 };
                 let skip_cpu_quantization = executor.as_deref().is_some_and(|exec| {
-                    let mut all_f32_supported = true;
-                    for (candidate, weight) in weights.iter().enumerate().skip(index) {
-                        if !completed[candidate]
-                            && self.basis(weight) == basis
-                            && scratch
-                                .matvec
-                                .shares_contract(weights[index], weight)
-                                .unwrap_or(false)
-                        {
-                            let supported = weight.kind == crate::kernels::PQ2
-                                && weight
-                                    .dimensions
-                                    .first()
-                                    .is_some_and(|&cols| cols.is_multiple_of(128))
-                                && exec.supports_f32(weight);
-                            if !supported {
-                                all_f32_supported = false;
-                                break;
-                            }
-                        }
-                    }
-                    all_f32_supported
+                    weights
+                        .iter()
+                        .enumerate()
+                        .skip(index)
+                        .all(|(candidate, weight)| {
+                            completed[candidate]
+                                || self.basis(weight) != basis
+                                || !scratch
+                                    .matvec
+                                    .shares_contract(weights[index], weight)
+                                    .unwrap_or(false)
+                                || (weight.kind == crate::kernels::PQ2
+                                    && weight
+                                        .dimensions
+                                        .first()
+                                        .is_some_and(|&cols| cols.is_multiple_of(128))
+                                    && exec.supports_f32(weight))
+                        })
                 });
                 let mut prepared = if skip_cpu_quantization {
                     scratch
@@ -833,17 +829,27 @@ impl Transforms {
                 } else {
                     scratch.matvec.prepare(weights[index], activation)?
                 };
-                if index == 0
-                    && N >= 2
-                    && skip_cpu_quantization
-                    && weights.iter().all(|w| {
-                        self.basis(w) == basis && prepared.is_compatible(w).unwrap_or(false)
+                let group_len = weights[index..]
+                    .iter()
+                    .enumerate()
+                    .take_while(|&(offset, w)| {
+                        !completed[index + offset]
+                            && self.basis(w) == basis
+                            && prepared.is_compatible(w).unwrap_or(false)
                     })
+                    .count();
+                if group_len >= 2
+                    && skip_cpu_quantization
                     && let Some(executor) = executor.as_deref_mut()
-                    && executor.supports_f32_group(&weights)
+                    && executor.supports_f32_group(&weights[index..index + group_len])
                 {
-                    prepared.matvec_group_with_executor(&weights, &mut outputs, executor)?;
-                    return Ok(());
+                    prepared.matvec_group_with_executor(
+                        &weights[index..index + group_len],
+                        &mut outputs[index..index + group_len],
+                        executor,
+                    )?;
+                    completed[index..index + group_len].fill(true);
+                    continue;
                 }
                 for (candidate, (weight, output)) in
                     weights.iter().zip(outputs.iter_mut()).enumerate()
@@ -2006,24 +2012,34 @@ impl Evaluation<'_, '_> {
             zeros_into(history.len(), convolution)?;
         }
         let mixed = &mut scratch.projected;
-        for (channel, mixed_value) in mixed.iter_mut().enumerate() {
-            let projected = *mixed_value;
-            let start = channel * hist_width;
-            let coefficients =
-                &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
-            *mixed_value = self.arithmetic.convolution_row(
-                &history[start..start + hist_width],
-                projected,
-                coefficients,
+        if matches!(self.arithmetic, Arithmetic::PinnedSwift) {
+            crate::kernels::pinned_convolution::step_into(
+                history,
+                mixed,
+                &layer.convolution,
+                g.convolution,
+                convolution,
             )?;
-            if hist_width == 3 {
-                convolution[start] = history[start + 1];
-                convolution[start + 1] = history[start + 2];
-                convolution[start + 2] = projected;
-            } else if hist_width > 0 {
-                convolution[start..start + hist_width - 1]
-                    .copy_from_slice(&history[start + 1..start + hist_width]);
-                convolution[start + hist_width - 1] = projected;
+        } else {
+            for (channel, mixed_value) in mixed.iter_mut().enumerate() {
+                let projected = *mixed_value;
+                let start = channel * hist_width;
+                let coefficients =
+                    &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
+                *mixed_value = self.arithmetic.convolution_row(
+                    &history[start..start + hist_width],
+                    projected,
+                    coefficients,
+                )?;
+                if hist_width == 3 {
+                    convolution[start] = history[start + 1];
+                    convolution[start + 1] = history[start + 2];
+                    convolution[start + 2] = projected;
+                } else if hist_width > 0 {
+                    convolution[start..start + hist_width - 1]
+                        .copy_from_slice(&history[start + 1..start + hist_width]);
+                    convolution[start + hist_width - 1] = projected;
+                }
             }
         }
         self.arithmetic.silu(mixed);
@@ -3160,7 +3176,9 @@ mod tests {
 
     struct F32OnlyExecutor {
         offloaded_names: BTreeSet<String>,
+        allow_group: bool,
         f32_calls: usize,
+        f32_group_calls: usize,
     }
 
     impl crate::kernels::Pq2ProjectionExecutor for F32OnlyExecutor {
@@ -3172,6 +3190,11 @@ mod tests {
         }
         fn supports_f32(&self, tensor: &Tensor) -> bool {
             self.offloaded_names.contains(&tensor.name)
+        }
+        fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
+            self.allow_group
+                && matches!(tensors.len(), 2 | 3)
+                && tensors.iter().all(|tensor| self.supports_f32(tensor))
         }
         fn project(
             &mut self,
@@ -3192,6 +3215,20 @@ mod tests {
             self.f32_calls += 1;
             let mut cpu_scratch = crate::kernels::MatvecScratch::default();
             crate::kernels::matvec_into(tensor, activation, output, &mut cpu_scratch)
+        }
+        fn project_f32_group(
+            &mut self,
+            tensors: &[&Tensor],
+            activation: &[f32],
+            _pinned_accumulation: bool,
+            outputs: &mut [&mut Vec<f32>],
+        ) -> Result<()> {
+            self.f32_group_calls += 1;
+            let mut cpu_scratch = crate::kernels::MatvecScratch::default();
+            for (tensor, output) in tensors.iter().zip(outputs.iter_mut()) {
+                crate::kernels::matvec_into(tensor, activation, output, &mut cpu_scratch)?;
+            }
+            Ok(())
         }
     }
 
@@ -3232,7 +3269,9 @@ mod tests {
         // Q8_K quantization is skipped completely while BF16 activations are prepared.
         let mut executor = F32OnlyExecutor {
             offloaded_names: BTreeSet::from([qkv.name.clone(), gate.name.clone()]),
+            allow_group: false,
             f32_calls: 0,
+            f32_group_calls: 0,
         };
         let mut outputs = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let mut scratch = ProjectionScratch::default();
@@ -3247,6 +3286,7 @@ mod tests {
             &mut executor_opt,
         )?;
         assert_eq!(executor.f32_calls, 2);
+        assert_eq!(executor.f32_group_calls, 0);
         assert_eq!(scratch.transforms, 2);
         assert_eq!(scratch.matvec.preparation_count(), 2);
         assert_eq!(scratch.matvec.statistics().matrix_successes, 2);
@@ -3255,7 +3295,9 @@ mod tests {
         // Q8_K quantization is performed once so the CPU sibling succeeds.
         let mut partial_executor = F32OnlyExecutor {
             offloaded_names: BTreeSet::from([qkv.name.clone()]),
+            allow_group: true,
             f32_calls: 0,
+            f32_group_calls: 0,
         };
         let mut partial_outputs = [Vec::new(), Vec::new()];
         let mut partial_scratch = ProjectionScratch::default();
@@ -3270,10 +3312,78 @@ mod tests {
             &mut partial_opt,
         )?;
         assert_eq!(partial_executor.f32_calls, 1);
+        assert_eq!(partial_executor.f32_group_calls, 0);
         assert_eq!(partial_scratch.matvec.preparation_count(), 1);
         assert_eq!(partial_scratch.matvec.statistics().matrix_successes, 1);
-        assert_eq!(partial_outputs[0], outputs[0]);
-        assert_eq!(partial_outputs[1], outputs[1]);
+        assert_eq!(partial_outputs, [outputs[0].clone(), outputs[1].clone()]);
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_projection_batches_compatible_pq2_prefix_with_f32_group_executor() -> Result<()> {
+        let width = 256;
+        let geometry = projection_geometry(width);
+        let qkv = projection_weight("blk.0.attn_qkv.weight", 142, width);
+        let gate = projection_weight("blk.0.attn_gate.weight", 142, width);
+        let bf16 = |name: &str, bits: u16| Tensor {
+            name: name.to_owned(),
+            dimensions: vec![width],
+            kind: 30,
+            data: Arc::from(bits.to_le_bytes().repeat(width)),
+        };
+        let (beta, alpha) = (
+            bf16("blk.0.ssm_beta.weight", 0x3f80),
+            bf16("blk.0.ssm_alpha.weight", 0x3f00),
+        );
+        let transforms = Transforms {
+            block: 4,
+            weights: BTreeSet::from([
+                qkv.name.clone(),
+                gate.name.clone(),
+                beta.name.clone(),
+                alpha.name.clone(),
+            ]),
+            inverse_embedding: false,
+            grouped_values: false,
+            signs: BTreeMap::from([(width, vec![1.0; width])]),
+        };
+        let input: Vec<f32> = (0..width)
+            .map(|index| [1.0, -0.5, 0.25, -0.125][index % 4])
+            .collect();
+        let mut expected = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut cpu_scratch = ProjectionScratch::default();
+        transforms.project_group_into(
+            [&qkv, &gate, &beta, &alpha],
+            &input,
+            &geometry,
+            expected.each_mut(),
+            &mut cpu_scratch,
+        )?;
+
+        let mut grouped_executor = F32OnlyExecutor {
+            offloaded_names: BTreeSet::from([qkv.name.clone(), gate.name.clone()]),
+            allow_group: true,
+            f32_calls: 0,
+            f32_group_calls: 0,
+        };
+        let mut grouped_outputs = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut grouped_scratch = ProjectionScratch::default();
+        let mut grouped_opt: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor> =
+            Some(&mut grouped_executor);
+        transforms.project_group_into_with_executor(
+            [&qkv, &gate, &beta, &alpha],
+            &input,
+            &geometry,
+            grouped_outputs.each_mut(),
+            &mut grouped_scratch,
+            &mut grouped_opt,
+        )?;
+        assert_eq!(grouped_executor.f32_calls, 0);
+        assert_eq!(grouped_executor.f32_group_calls, 1);
+        assert_eq!(grouped_scratch.transforms, 2);
+        assert_eq!(grouped_scratch.matvec.preparation_count(), 2);
+        assert_eq!(grouped_scratch.matvec.statistics().matrix_successes, 2);
+        assert_eq!(grouped_outputs, expected);
         Ok(())
     }
 

@@ -1,26 +1,6 @@
 //! Baseline NEON over one predecoded PQ2/PTQ1 block, reused across token dots.
 
-use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8, u32x4, u64x2};
-
-#[inline]
-fn trits(packed: u8x16<Neon>) -> [i8x16<Neon>; 5] {
-    let (mut low, mut high) = packed.widen();
-    std::array::from_fn(|_| {
-        low *= 3;
-        high *= 3;
-        let digit = (low >> 8).narrow(high >> 8).bitcast::<i8x16<Neon>>() - 1;
-        low &= 255;
-        high &= 255;
-        digit
-    })
-}
-
-#[inline]
-fn join_low8(low: i8x16<Neon>, high: i8x16<Neon>) -> i8x16<Neon> {
-    low.bitcast::<u64x2<Neon>>()
-        .zip_low(high.bitcast::<u64x2<Neon>>())
-        .bitcast()
-}
+use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8};
 
 #[inline]
 fn reduce4_i32x4(r0: i32x4<Neon>, r1: i32x4<Neon>, r2: i32x4<Neon>, r3: i32x4<Neon>) -> [i32; 4] {
@@ -76,39 +56,7 @@ impl Block {
 
     pub(super) fn from_ptq1(packed: &[u8; 28]) -> Option<Self> {
         let neon = fearless_simd::Level::baseline().as_neon()?;
-        let first = trits(u8x16::from_slice(neon, &packed[..16]));
-        // Overlap only bytes 10..26; no load reaches the scale or exceeds the block.
-        let rest = u8x16::from_slice(neon, &packed[10..26]);
-        let middle =
-            trits(rest.swizzle_dyn([6, 7, 8, 9, 10, 11, 12, 13, 6, 7, 8, 9, 10, 11, 12, 13]));
-        let last = trits(rest.swizzle_dyn([
-            14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
-        ]));
-        let tail_low: u32x4<Neon> = last[0]
-            .bitcast::<u16x8<Neon>>()
-            .zip_low(last[1].bitcast::<u16x8<Neon>>())
-            .bitcast();
-        let tail_high: u32x4<Neon> = last[2]
-            .bitcast::<u16x8<Neon>>()
-            .zip_low(last[3].bitcast::<u16x8<Neon>>())
-            .bitcast();
-        let tail = tail_low.zip_low(tail_high).bitcast();
-        let decoded = [
-            first[0],
-            first[1],
-            first[2],
-            first[3],
-            first[4],
-            join_low8(middle[0], middle[1]),
-            join_low8(middle[2], middle[3]),
-            join_low8(middle[4], tail),
-        ];
-        let mut weights = [i16x8::splat(neon, 0); 16];
-        for (group, vector) in decoded.into_iter().enumerate() {
-            let (low, high) = vector.widen();
-            weights[group * 2] = low;
-            weights[group * 2 + 1] = high;
-        }
+        let weights = crate::kernels::neon::decode_ptq1_i16(neon, packed);
         Some(Self { neon, weights })
     }
 

@@ -1253,46 +1253,6 @@ fn dot32(neon: Neon, low: i8x16<Neon>, high: i8x16<Neon>, values: &[i8; 32]) -> 
     (sum_l + sum_h).reduce_sum()
 }
 
-#[inline]
-fn dot32_native_lanes_i32x4(
-    low: i8x16<Neon>,
-    high: i8x16<Neon>,
-    v0_l: i16x8<Neon>,
-    v0_h: i16x8<Neon>,
-    v1_l: i16x8<Neon>,
-    v1_h: i16x8<Neon>,
-) -> i32x4<Neon> {
-    let (w0_l, w0_h) = low.widen();
-    let (w1_l, w1_h) = high.widen();
-    let (a, b) = (w0_l * v0_l + w1_l * v1_l).widen();
-    let (c, d) = (w0_h * v0_h + w1_h * v1_h).widen();
-    reduce4_i32x4(a, b, c, d)
-}
-
-#[inline]
-fn dot32_native_lanes_prewidened(
-    low: i8x16<Neon>,
-    high: i8x16<Neon>,
-    v0_l: i16x8<Neon>,
-    v0_h: i16x8<Neon>,
-    v1_l: i16x8<Neon>,
-    v1_h: i16x8<Neon>,
-) -> [i32; 4] {
-    dot32_native_lanes_i32x4(low, high, v0_l, v0_h, v1_l, v1_h).to_array()
-}
-
-#[inline]
-fn dot32_native_lanes(
-    neon: Neon,
-    low: i8x16<Neon>,
-    high: i8x16<Neon>,
-    values: &[i8; 32],
-) -> [i32; 4] {
-    let (v0_l, v0_h) = i8x16::from_slice(neon, &values[..16]).widen();
-    let (v1_l, v1_h) = i8x16::from_slice(neon, &values[16..]).widen();
-    dot32_native_lanes_prewidened(low, high, v0_l, v0_h, v1_l, v1_h)
-}
-
 /// Retains four independent `Q8_0` integer sums, each bounded by 8,192.
 #[inline]
 pub(super) fn dot_groups(packed: &[u8; 32], activations: [&[i8; 32]; 4]) -> [i32; 4] {
@@ -1319,55 +1279,201 @@ pub(super) fn dot_groups(packed: &[u8; 32], activations: [&[i8; 32]; 4]) -> [i32
 }
 
 #[inline]
-fn trits(packed: u8x16<Neon>) -> [i8x16<Neon>; 5] {
-    let (mut low, mut high) = packed.widen();
-    std::array::from_fn(|_| {
-        // The native representation is a base-three fraction with denominator
-        // 256. Each product is at most 765; no u16 operation can wrap.
+const fn ptq1_scale_u16(block: &[u8; 28]) -> u16 {
+    u16::from_le_bytes([block[26], block[27]])
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "Each fractional base-3 digit is in 0..=2, so (rem >> 8) as i8 - 1 is in -1..=1."
+)]
+pub(super) const PTQ1_TAIL_EVEN_U64: [u64; 256] = {
+    let mut table = [0_u64; 256];
+    let mut byte = 0_usize;
+    while byte < 256 {
+        let mut rem = byte as u16;
+        let mut digits = [0_u8; 8];
+        let mut step = 0_usize;
+        while step < 4 {
+            rem *= 3;
+            let trit = ((rem >> 8) as i8) - 1;
+            digits[step * 2] = trit.to_ne_bytes()[0];
+            rem &= 255;
+            step += 1;
+        }
+        table[byte] = u64::from_le_bytes(digits);
+        byte += 1;
+    }
+    table
+};
+
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Passes the four 16-bit weight halves and four 16-bit activation halves in registers."
+)]
+fn dot32_w16(
+    w0_l: i16x8<Neon>,
+    w0_h: i16x8<Neon>,
+    w1_l: i16x8<Neon>,
+    w1_h: i16x8<Neon>,
+    v0_l: i16x8<Neon>,
+    v0_h: i16x8<Neon>,
+    v1_l: i16x8<Neon>,
+    v1_h: i16x8<Neon>,
+) -> i32 {
+    let sum = (w0_l * v0_l + w0_h * v0_h) + (w1_l * v1_l + w1_h * v1_h);
+    let (sum_l, sum_h) = sum.widen();
+    (sum_l + sum_h).reduce_sum()
+}
+
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Passes the four 16-bit weight halves and four 16-bit activation halves in registers."
+)]
+fn dot32_native_lanes_w16_i32x4(
+    w0_l: i16x8<Neon>,
+    w0_h: i16x8<Neon>,
+    w1_l: i16x8<Neon>,
+    w1_h: i16x8<Neon>,
+    v0_l: i16x8<Neon>,
+    v0_h: i16x8<Neon>,
+    v1_l: i16x8<Neon>,
+    v1_h: i16x8<Neon>,
+) -> i32x4<Neon> {
+    let (a, b) = (w0_l * v0_l + w1_l * v1_l).widen();
+    let (c, d) = (w0_h * v0_h + w1_h * v1_h).widen();
+    reduce4_i32x4(a, b, c, d)
+}
+
+#[inline]
+pub(in crate::kernels) fn decode_ptq1_i16(neon: Neon, packed: &[u8; 28]) -> [i16x8<Neon>; 16] {
+    let (mut low, mut high) = u8x16::from_slice(neon, &packed[..16]).widen();
+    let mut step_first = || {
         low *= 3;
         high *= 3;
-        let digit = (low >> 8).narrow(high >> 8).bitcast::<i8x16<Neon>>() - 1;
+        let d_lo = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
+        let d_hi = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
         low &= 255;
         high &= 255;
-        digit
-    })
-}
+        (d_lo, d_hi)
+    };
+    let (w0, w1) = step_first();
+    let (w2, w3) = step_first();
+    let (w4, w5) = step_first();
+    let (w6, w7) = step_first();
+    low *= 3;
+    high *= 3;
+    let w8 = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
+    let w9 = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
 
-#[inline]
-fn join_low8(low: i8x16<Neon>, high: i8x16<Neon>) -> i8x16<Neon> {
-    low.bitcast::<u64x2<Neon>>()
-        .zip_low(high.bitcast::<u64x2<Neon>>())
-        .bitcast()
-}
+    // Bytes 16..24 occupy the upper half of packed[8..24]. Widening once extracts
+    // all eight bytes into a single u16x8 without TBL swizzles or duplicate lanes.
+    let (_, mut mid) = u8x16::from_slice(neon, &packed[8..24]).widen();
+    let mut step_mid = || {
+        mid *= 3;
+        let d_mid = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
+        mid &= 255;
+        d_mid
+    };
+    let w10 = step_mid();
+    let w11 = step_mid();
+    let w12 = step_mid();
+    let w13 = step_mid();
+    mid *= 3;
+    let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
 
-#[inline]
-fn decode_ptq1(neon: Neon, packed: &[u8; 28]) -> [i8x16<Neon>; 8] {
-    let first = trits(u8x16::from_slice(neon, &packed[..16]));
-    // Overlap only bytes 10..26; no load reaches the scale or exceeds the block.
-    let rest = u8x16::from_slice(neon, &packed[10..26]);
-    let middle = trits(rest.swizzle_dyn([6, 7, 8, 9, 10, 11, 12, 13, 6, 7, 8, 9, 10, 11, 12, 13]));
-    let last = trits(rest.swizzle_dyn([
-        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
-    ]));
-    let tail_low: u32x4<Neon> = last[0]
-        .bitcast::<u16x8<Neon>>()
-        .zip_low(last[1].bitcast::<u16x8<Neon>>())
-        .bitcast();
-    let tail_high: u32x4<Neon> = last[2]
-        .bitcast::<u16x8<Neon>>()
-        .zip_low(last[3].bitcast::<u16x8<Neon>>())
-        .bitcast();
-    let tail = tail_low.zip_low(tail_high).bitcast();
+    let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
+        | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
+    let (w15, _) = u64x2::splat(neon, tail_u64).bitcast::<i8x16<Neon>>().widen();
     [
-        first[0],
-        first[1],
-        first[2],
-        first[3],
-        first[4],
-        join_low8(middle[0], middle[1]),
-        join_low8(middle[2], middle[3]),
-        join_low8(middle[4], tail),
+        w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15,
     ]
+}
+
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Streams the four 32-element PTQ1 groups against pre-widened Q8_0 activations without stack spills."
+)]
+fn accumulate_ptq1_block_pinned(
+    neon: Neon,
+    packed: &[u8; 28],
+    v00_l: i16x8<Neon>,
+    v00_h: i16x8<Neon>,
+    v01_l: i16x8<Neon>,
+    v01_h: i16x8<Neon>,
+    v10_l: i16x8<Neon>,
+    v10_h: i16x8<Neon>,
+    v11_l: i16x8<Neon>,
+    v11_h: i16x8<Neon>,
+    v20_l: i16x8<Neon>,
+    v20_h: i16x8<Neon>,
+    v21_l: i16x8<Neon>,
+    v21_h: i16x8<Neon>,
+    v30_l: i16x8<Neon>,
+    v30_h: i16x8<Neon>,
+    v31_l: i16x8<Neon>,
+    v31_h: i16x8<Neon>,
+    row_scale: f32,
+    a0: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    mut lane: f32x4<Neon>,
+) -> f32x4<Neon> {
+    let (mut low, mut high) = u8x16::from_slice(neon, &packed[..16]).widen();
+    let mut step_first = || {
+        low *= 3;
+        high *= 3;
+        let d_lo = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
+        let d_hi = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
+        low &= 255;
+        high &= 255;
+        (d_lo, d_hi)
+    };
+    let (w0, w1) = step_first();
+    let (w2, w3) = step_first();
+    let f0 = dot32_native_lanes_w16_i32x4(w0, w1, w2, w3, v00_l, v00_h, v01_l, v01_h)
+        .to_float::<f32x4<Neon>>();
+    lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
+
+    let (w4, w5) = step_first();
+    let (w6, w7) = step_first();
+    let f1 = dot32_native_lanes_w16_i32x4(w4, w5, w6, w7, v10_l, v10_h, v11_l, v11_h)
+        .to_float::<f32x4<Neon>>();
+    lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
+
+    low *= 3;
+    high *= 3;
+    let w8 = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
+    let w9 = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
+    let (_, mut mid) = u8x16::from_slice(neon, &packed[8..24]).widen();
+    let mut step_mid = || {
+        mid *= 3;
+        let d_mid = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
+        mid &= 255;
+        d_mid
+    };
+    let w10 = step_mid();
+    let w11 = step_mid();
+    let f2 = dot32_native_lanes_w16_i32x4(w8, w9, w10, w11, v20_l, v20_h, v21_l, v21_h)
+        .to_float::<f32x4<Neon>>();
+    lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
+
+    let w12 = step_mid();
+    let w13 = step_mid();
+    mid *= 3;
+    let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
+    let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
+        | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
+    let (w15, _) = u64x2::splat(neon, tail_u64).bitcast::<i8x16<Neon>>().widen();
+    let f3 = dot32_native_lanes_w16_i32x4(w12, w13, w14, w15, v30_l, v30_h, v31_l, v31_h)
+        .to_float::<f32x4<Neon>>();
+    f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane)
 }
 
 /// Keeps each native PTQ1 DOTPROD lane separate until floating accumulation.
@@ -1382,14 +1488,22 @@ pub(super) fn dot_ptq1_native_lanes(
             super::q8_native_lanes(&weights[group * 32..group * 32 + 32], activations[group])
         }));
     };
-    let decoded = decode_ptq1(neon, packed);
+    let decoded = decode_ptq1_i16(neon, packed);
     Ok(std::array::from_fn(|group| {
-        dot32_native_lanes(
-            neon,
-            decoded[group * 2],
-            decoded[group * 2 + 1],
-            activations[group],
+        let values = activations[group];
+        let (v0_l, v0_h) = i8x16::from_slice(neon, &values[..16]).widen();
+        let (v1_l, v1_h) = i8x16::from_slice(neon, &values[16..]).widen();
+        dot32_native_lanes_w16_i32x4(
+            decoded[group * 4],
+            decoded[group * 4 + 1],
+            decoded[group * 4 + 2],
+            decoded[group * 4 + 3],
+            v0_l,
+            v0_h,
+            v1_l,
+            v1_h,
         )
+        .to_array()
     }))
 }
 
@@ -1411,13 +1525,20 @@ pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) ->
                 .sum()
         }));
     };
-    let decoded = decode_ptq1(neon, packed);
+    let decoded = decode_ptq1_i16(neon, packed);
     Ok(std::array::from_fn(|group| {
-        dot32(
-            neon,
-            decoded[group * 2],
-            decoded[group * 2 + 1],
-            activations[group],
+        let values = activations[group];
+        let (v0_l, v0_h) = i8x16::from_slice(neon, &values[..16]).widen();
+        let (v1_l, v1_h) = i8x16::from_slice(neon, &values[16..]).widen();
+        dot32_w16(
+            decoded[group * 4],
+            decoded[group * 4 + 1],
+            decoded[group * 4 + 2],
+            decoded[group * 4 + 3],
+            v0_l,
+            v0_h,
+            v1_l,
+            v1_h,
         )
     }))
 }
@@ -1430,23 +1551,41 @@ pub(super) fn dot_ptq1_row_pinned(bytes: &[u8], input: &[super::Q8Block]) -> Res
     let mut lanes = f32x4::splat(neon, 0.0);
     for (index, block) in bytes.as_chunks::<28>().0.iter().enumerate() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
-        let decoded = decode_ptq1(neon, block);
         let weight_scale = super::scale(&block[26..])?;
-        for (group, activation) in activations.iter().enumerate() {
-            let (v0_l, v0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
-            let (v1_l, v1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
-            let floats = dot32_native_lanes_i32x4(
-                decoded[group * 2],
-                decoded[group * 2 + 1],
-                v0_l,
-                v0_h,
-                v1_l,
-                v1_h,
-            )
-            .to_float::<f32x4<Neon>>();
-            let d = f32x4::splat(neon, weight_scale * activation.scale);
-            lanes = floats.mul_add_precise(d, lanes);
-        }
+        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+        lanes = accumulate_ptq1_block_pinned(
+            neon,
+            block,
+            v00_l,
+            v00_h,
+            v01_l,
+            v01_h,
+            v10_l,
+            v10_h,
+            v11_l,
+            v11_h,
+            v20_l,
+            v20_h,
+            v21_l,
+            v21_h,
+            v30_l,
+            v30_h,
+            v31_l,
+            v31_h,
+            weight_scale,
+            activations[0].scale,
+            activations[1].scale,
+            activations[2].scale,
+            activations[3].scale,
+            lanes,
+        );
     }
     let [l0, l1, l2, l3] = lanes.to_array();
     super::finite((l0 + l1) + (l2 + l3))
@@ -1466,12 +1605,24 @@ pub(super) fn dot_ptq1_four_rows_pinned(
         ]);
     };
     let mut lanes = [f32x4::splat(neon, 0.0); 4];
+    let mut scales_finite = lanes[0].is_finite();
     let r0 = rows[0].as_chunks::<28>().0;
     let r1 = rows[1].as_chunks::<28>().0;
     let r2 = rows[2].as_chunks::<28>().0;
     let r3 = rows[3].as_chunks::<28>().0;
     for (index, (((b0, b1), b2), b3)) in r0.iter().zip(r1).zip(r2).zip(r3).enumerate() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let scales_vec = f16_bits_to_f32_x4(
+            neon,
+            [
+                ptq1_scale_u16(b0),
+                ptq1_scale_u16(b1),
+                ptq1_scale_u16(b2),
+                ptq1_scale_u16(b3),
+            ],
+        );
+        scales_finite &= scales_vec.is_finite();
+        let row_scales = scales_vec.to_array();
         let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
         let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
         let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
@@ -1486,23 +1637,36 @@ pub(super) fn dot_ptq1_four_rows_pinned(
         let a3 = activations[3].scale;
         let blocks = [b0, b1, b2, b3];
         for r in 0..4 {
-            let block = blocks[r];
-            let row_scale = super::scale(&block[26..])?;
-            let dec = decode_ptq1(neon, block);
-            let mut lane = lanes[r];
-            let f0 = dot32_native_lanes_i32x4(dec[0], dec[1], v00_l, v00_h, v01_l, v01_h)
-                .to_float::<f32x4<Neon>>();
-            lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
-            let f1 = dot32_native_lanes_i32x4(dec[2], dec[3], v10_l, v10_h, v11_l, v11_h)
-                .to_float::<f32x4<Neon>>();
-            lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
-            let f2 = dot32_native_lanes_i32x4(dec[4], dec[5], v20_l, v20_h, v21_l, v21_h)
-                .to_float::<f32x4<Neon>>();
-            lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
-            let f3 = dot32_native_lanes_i32x4(dec[6], dec[7], v30_l, v30_h, v31_l, v31_h)
-                .to_float::<f32x4<Neon>>();
-            lanes[r] = f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane);
+            lanes[r] = accumulate_ptq1_block_pinned(
+                neon,
+                blocks[r],
+                v00_l,
+                v00_h,
+                v01_l,
+                v01_h,
+                v10_l,
+                v10_h,
+                v11_l,
+                v11_h,
+                v20_l,
+                v20_h,
+                v21_l,
+                v21_h,
+                v30_l,
+                v30_h,
+                v31_l,
+                v31_h,
+                row_scales[r],
+                a0,
+                a1,
+                a2,
+                a3,
+                lanes[r],
+            );
         }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
     }
     let mut out = [0.0_f32; 4];
     for r in 0..4 {
@@ -1525,9 +1689,36 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
         ]);
     };
     let mut lanes = [f32x4::splat(neon, 0.0); 8];
+    let mut scales_finite = lanes[0].is_finite();
     let chunks = rows.map(|row| row.as_chunks::<28>().0);
     for index in 0..chunks[0].len() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
+        let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                ptq1_scale_u16(&chunks[0][index]),
+                ptq1_scale_u16(&chunks[1][index]),
+                ptq1_scale_u16(&chunks[2][index]),
+                ptq1_scale_u16(&chunks[3][index]),
+                ptq1_scale_u16(&chunks[4][index]),
+                ptq1_scale_u16(&chunks[5][index]),
+                ptq1_scale_u16(&chunks[6][index]),
+                ptq1_scale_u16(&chunks[7][index]),
+            ],
+        );
+        scales_finite = scales_finite & scales_lo.is_finite() & scales_hi.is_finite();
+        let scales_lo_arr = scales_lo.to_array();
+        let scales_hi_arr = scales_hi.to_array();
+        let row_scales = [
+            scales_lo_arr[0],
+            scales_lo_arr[1],
+            scales_lo_arr[2],
+            scales_lo_arr[3],
+            scales_hi_arr[0],
+            scales_hi_arr[1],
+            scales_hi_arr[2],
+            scales_hi_arr[3],
+        ];
         let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
         let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
         let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
@@ -1541,23 +1732,36 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
         let a2 = activations[2].scale;
         let a3 = activations[3].scale;
         for r in 0..8 {
-            let block = &chunks[r][index];
-            let row_scale = super::scale(&block[26..])?;
-            let dec = decode_ptq1(neon, block);
-            let mut lane = lanes[r];
-            let f0 = dot32_native_lanes_i32x4(dec[0], dec[1], v00_l, v00_h, v01_l, v01_h)
-                .to_float::<f32x4<Neon>>();
-            lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
-            let f1 = dot32_native_lanes_i32x4(dec[2], dec[3], v10_l, v10_h, v11_l, v11_h)
-                .to_float::<f32x4<Neon>>();
-            lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
-            let f2 = dot32_native_lanes_i32x4(dec[4], dec[5], v20_l, v20_h, v21_l, v21_h)
-                .to_float::<f32x4<Neon>>();
-            lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
-            let f3 = dot32_native_lanes_i32x4(dec[6], dec[7], v30_l, v30_h, v31_l, v31_h)
-                .to_float::<f32x4<Neon>>();
-            lanes[r] = f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane);
+            lanes[r] = accumulate_ptq1_block_pinned(
+                neon,
+                &chunks[r][index],
+                v00_l,
+                v00_h,
+                v01_l,
+                v01_h,
+                v10_l,
+                v10_h,
+                v11_l,
+                v11_h,
+                v20_l,
+                v20_h,
+                v21_l,
+                v21_h,
+                v30_l,
+                v30_h,
+                v31_l,
+                v31_h,
+                row_scales[r],
+                a0,
+                a1,
+                a2,
+                a3,
+                lanes[r],
+            );
         }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
     }
     let mut out = [0.0_f32; 8];
     for r in 0..8 {

@@ -241,119 +241,22 @@ impl ProjectionTile {
                                 };
                             }
                         } else if tensor.kind == PTQ1 && pinned {
-                            let (chunks8, after8) = preparations.as_chunks::<8>();
-                            for (chunk_idx, chunk) in chunks8.iter().enumerate() {
-                                let base = chunk_idx * 8;
-                                for group in 0..4 {
-                                    let acts: [&super::Q8Block; 8] =
-                                        std::array::from_fn(|t| &chunk[t].q8[index * 4 + group]);
-                                    let group_lanes =
-                                        weights.lanes32_eight(group, acts.map(|act| &act.values));
-                                    for (offset, (act, integers)) in
-                                        acts.into_iter().zip(group_lanes).enumerate()
-                                    {
-                                        let d = weight_scale * act.scale;
-                                        for (lane, integer) in
-                                            lanes[base + offset].iter_mut().zip(integers)
-                                        {
-                                            *lane = integer_float(integer).mul_add(d, *lane);
-                                        }
-                                    }
-                                }
-                            }
-                            let base4 = chunks8.len() * 8;
-                            let (chunks4, rem) = after8.as_chunks::<4>();
-                            for (chunk_idx, chunk) in chunks4.iter().enumerate() {
-                                let base = base4 + chunk_idx * 4;
-                                for group in 0..4 {
-                                    let a0 = &chunk[0].q8[index * 4 + group];
-                                    let a1 = &chunk[1].q8[index * 4 + group];
-                                    let a2 = &chunk[2].q8[index * 4 + group];
-                                    let a3 = &chunk[3].q8[index * 4 + group];
-                                    let group_lanes = weights.lanes32_four(
-                                        group,
-                                        [&a0.values, &a1.values, &a2.values, &a3.values],
-                                    );
-                                    for (offset, (act, integers)) in
-                                        [a0, a1, a2, a3].into_iter().zip(group_lanes).enumerate()
-                                    {
-                                        let d = weight_scale * act.scale;
-                                        for (lane, integer) in
-                                            lanes[base + offset].iter_mut().zip(integers)
-                                        {
-                                            *lane = integer_float(integer).mul_add(d, *lane);
-                                        }
-                                    }
-                                }
-                            }
-                            let rem_base = base4 + chunks4.len() * 4;
-                            for (offset, scratch) in rem.iter().enumerate() {
-                                let token = rem_base + offset;
-                                let activations = &scratch.q8[index * 4..index * 4 + 4];
-                                for (group, activation) in activations.iter().enumerate() {
-                                    let d = weight_scale * activation.scale;
-                                    for (lane, integer) in lanes[token]
-                                        .iter_mut()
-                                        .zip(weights.lanes32(group, &activation.values))
-                                    {
-                                        *lane = integer_float(integer).mul_add(d, *lane);
-                                    }
-                                }
+                            for (token, scratch) in preparations.iter().enumerate() {
+                                let activations = <&[super::Q8Block; 4]>::try_from(
+                                    &scratch.q8[index * 4..index * 4 + 4],
+                                )?;
+                                weights.accumulate_lanes128(
+                                    weight_scale,
+                                    activations,
+                                    &mut lanes[token],
+                                );
                             }
                         } else {
-                            let (chunks8, after8) = preparations.as_chunks::<8>();
-                            for (chunk_idx, chunk) in chunks8.iter().enumerate() {
-                                let base = chunk_idx * 8;
-                                let mut chunk_sums = [0.0_f32; 8];
-                                for group in 0..4 {
-                                    let acts: [&super::Q8Block; 8] =
-                                        std::array::from_fn(|t| &chunk[t].q8[index * 4 + group]);
-                                    let dots =
-                                        weights.dot32_eight(group, acts.map(|act| &act.values));
-                                    for (offset, (act, dot_int)) in
-                                        acts.into_iter().zip(dots).enumerate()
-                                    {
-                                        chunk_sums[offset] += act.scale * integer_float(dot_int);
-                                    }
-                                }
-                                for (offset, sum) in chunk_sums.into_iter().enumerate() {
-                                    sums[base + offset] += weight_scale * sum;
-                                }
-                            }
-                            let base4 = chunks8.len() * 8;
-                            let (chunks4, rem) = after8.as_chunks::<4>();
-                            for (chunk_idx, chunk) in chunks4.iter().enumerate() {
-                                let base = base4 + chunk_idx * 4;
-                                let mut chunk_sums = [0.0_f32; 4];
-                                for group in 0..4 {
-                                    let a0 = &chunk[0].q8[index * 4 + group];
-                                    let a1 = &chunk[1].q8[index * 4 + group];
-                                    let a2 = &chunk[2].q8[index * 4 + group];
-                                    let a3 = &chunk[3].q8[index * 4 + group];
-                                    let dots = weights.dot32_four(
-                                        group,
-                                        [&a0.values, &a1.values, &a2.values, &a3.values],
-                                    );
-                                    for (offset, (act, dot_int)) in
-                                        [a0, a1, a2, a3].into_iter().zip(dots).enumerate()
-                                    {
-                                        chunk_sums[offset] += act.scale * integer_float(dot_int);
-                                    }
-                                }
-                                for (offset, sum) in chunk_sums.into_iter().enumerate() {
-                                    sums[base + offset] += weight_scale * sum;
-                                }
-                            }
-                            let rem_base = base4 + chunks4.len() * 4;
-                            for (offset, scratch) in rem.iter().enumerate() {
-                                let token = rem_base + offset;
-                                let activations = &scratch.q8[index * 4..index * 4 + 4];
-                                let mut sum = 0.0;
-                                for (group, activation) in activations.iter().enumerate() {
-                                    sum += activation.scale
-                                        * integer_float(weights.dot32(group, &activation.values));
-                                }
-                                sums[token] += weight_scale * sum;
+                            for (token, scratch) in preparations.iter().enumerate() {
+                                let activations = <&[super::Q8Block; 4]>::try_from(
+                                    &scratch.q8[index * 4..index * 4 + 4],
+                                )?;
+                                sums[token] += weight_scale * weights.dot128_q8(activations);
                             }
                         }
                     }

@@ -1,12 +1,22 @@
 //! Baseline NEON over one predecoded PQ2/PTQ1 block, reused across token dots.
 
-use fearless_simd::{Neon, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8};
+use fearless_simd::{Neon, f32x4, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8};
+
+#[inline]
+fn reduce4_i32x4_vec(
+    r0: i32x4<Neon>,
+    r1: i32x4<Neon>,
+    r2: i32x4<Neon>,
+    r3: i32x4<Neon>,
+) -> i32x4<Neon> {
+    let p01 = r0.unzip_low(r1) + r0.unzip_high(r1);
+    let p23 = r2.unzip_low(r3) + r2.unzip_high(r3);
+    p01.unzip_low(p23) + p01.unzip_high(p23)
+}
 
 #[inline]
 fn reduce4_i32x4(r0: i32x4<Neon>, r1: i32x4<Neon>, r2: i32x4<Neon>, r3: i32x4<Neon>) -> [i32; 4] {
-    let p01 = r0.unzip_low(r1) + r0.unzip_high(r1);
-    let p23 = r2.unzip_low(r3) + r2.unzip_high(r3);
-    (p01.unzip_low(p23) + p01.unzip_high(p23)).to_array()
+    reduce4_i32x4_vec(r0, r1, r2, r3).to_array()
 }
 
 pub(in crate::kernels::prefill) struct Block {
@@ -58,6 +68,55 @@ impl Block {
         let neon = fearless_simd::Level::baseline().as_neon()?;
         let weights = crate::kernels::neon::decode_ptq1_i16(neon, packed);
         Some(Self { neon, weights })
+    }
+
+    #[inline]
+    pub(super) fn accumulate_lanes128(
+        &self,
+        weight_scale: f32,
+        activations: &[crate::kernels::Q8Block; 4],
+        lanes: &mut [f32; 4],
+    ) {
+        let mut acc = f32x4::from_slice(self.neon, lanes);
+        for (group, act) in activations.iter().enumerate() {
+            let halves = act.values.as_chunks::<16>().0;
+            let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &halves[1]).widen();
+            let sum_01 = self.weights[group * 4] * l0 + self.weights[group * 4 + 2] * l1;
+            let sum_23 = self.weights[group * 4 + 1] * h0 + self.weights[group * 4 + 3] * h1;
+            let (q0, q1) = sum_01.widen();
+            let (q2, q3) = sum_23.widen();
+            let floats = reduce4_i32x4_vec(q0, q1, q2, q3).to_float::<f32x4<Neon>>();
+            let d = f32x4::splat(self.neon, weight_scale * act.scale);
+            acc = floats.mul_add_precise(d, acc);
+        }
+        acc.store_slice(lanes);
+    }
+
+    #[inline]
+    pub(super) fn dot128_q8(&self, activations: &[crate::kernels::Q8Block; 4]) -> f32 {
+        let group_sums: [i32x4<Neon>; 4] = std::array::from_fn(|group| {
+            let halves = activations[group].values.as_chunks::<16>().0;
+            let (l0, h0) = i8x16::from_slice(self.neon, &halves[0]).widen();
+            let (l1, h1) = i8x16::from_slice(self.neon, &halves[1]).widen();
+            let pairs = (self.weights[group * 4] * l0 + self.weights[group * 4 + 1] * h0)
+                + (self.weights[group * 4 + 2] * l1 + self.weights[group * 4 + 3] * h1);
+            let (sum_low, sum_high) = pairs.widen();
+            sum_low + sum_high
+        });
+        let dots = reduce4_i32x4_vec(group_sums[0], group_sums[1], group_sums[2], group_sums[3])
+            .to_float::<f32x4<Neon>>();
+        let scales = f32x4::from_slice(
+            self.neon,
+            &[
+                activations[0].scale,
+                activations[1].scale,
+                activations[2].scale,
+                activations[3].scale,
+            ],
+        );
+        let prod = (dots * scales).to_array();
+        (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3]
     }
 
     #[inline]
@@ -127,6 +186,7 @@ impl Block {
         ]
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn dot32(&self, group: usize, values: &[i8; 32]) -> i32 {
         let halves = values.as_chunks::<16>().0;
@@ -138,6 +198,7 @@ impl Block {
         (sum_low + sum_high).reduce_sum()
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn dot32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [i32; 4] {
         let w0 = self.weights[group * 4];
@@ -155,6 +216,7 @@ impl Block {
         reduce4_i32x4(sums[0], sums[1], sums[2], sums[3])
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn dot32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [i32; 8] {
         let w0 = self.weights[group * 4];
@@ -176,6 +238,7 @@ impl Block {
         ]
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         let halves = values.as_chunks::<16>().0;
@@ -190,6 +253,7 @@ impl Block {
         reduce4_i32x4(lane0, lane1, lane2, lane3)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn lanes32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
         let w0 = self.weights[group * 4];
@@ -208,6 +272,7 @@ impl Block {
         })
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn lanes32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [[i32; 4]; 8] {
         let w0 = self.weights[group * 4];

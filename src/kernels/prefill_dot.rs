@@ -131,6 +131,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn dot32(&self, group: usize, values: &[i8; 32]) -> i32 {
         match self {
@@ -146,6 +147,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn dot32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [i32; 4] {
         match self {
@@ -164,6 +166,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn dot32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [i32; 8] {
         match self {
@@ -182,6 +185,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn lanes32(&self, group: usize, values: &[i8; 32]) -> [i32; 4] {
         match self {
@@ -197,6 +201,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn lanes32_four(&self, group: usize, values: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
         match self {
@@ -215,6 +220,7 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn lanes32_eight(&self, group: usize, values: [&[i8; 32]; 8]) -> [[i32; 4]; 8] {
         match self {
@@ -230,6 +236,66 @@ impl Block {
                 target_feature = "neon"
             ))]
             Self::Neon(block) => block.lanes32_eight(group, values),
+        }
+    }
+
+    #[inline]
+    pub(super) fn accumulate_lanes128(
+        &self,
+        weight_scale: f32,
+        activations: &[super::super::Q8Block; 4],
+        lanes: &mut [f32; 4],
+    ) {
+        match self {
+            Self::Scalar(weights) => {
+                for (group, activation) in activations.iter().enumerate() {
+                    let d = weight_scale * activation.scale;
+                    let integers = q8_native_lanes(
+                        &weights[group * 32..group * 32 + 32],
+                        &activation.values,
+                    );
+                    for (lane, integer) in lanes.iter_mut().zip(integers) {
+                        *lane = super::super::integer_float(integer).mul_add(d, *lane);
+                    }
+                }
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.accumulate_lanes128(weight_scale, activations, lanes),
+        }
+    }
+
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Preserve scalar reference multiply-then-add rounding."
+    )]
+    #[inline]
+    pub(super) fn dot128_q8(&self, activations: &[super::super::Q8Block; 4]) -> f32 {
+        match self {
+            Self::Scalar(weights) => {
+                let mut sum = 0.0;
+                for (group, activation) in activations.iter().enumerate() {
+                    sum += activation.scale
+                        * super::super::integer_float(scalar(
+                            &weights[group * 32..group * 32 + 32],
+                            &activation.values,
+                        ));
+                }
+                sum
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            Self::Neon(block) => block.dot128_q8(activations),
         }
     }
 }

@@ -2156,19 +2156,8 @@ impl PreparedMatvec<'_> {
                         output,
                         &mut scratch.row_errors,
                         |rows| {
-                            let low = neon::bf16_dot_four_rows(
-                                [rows[0], rows[1], rows[2], rows[3]],
-                                activations,
-                            )
-                            .ok_or_else(|| invalid("missing NEON BF16 kernel"))??;
-                            let high = neon::bf16_dot_four_rows(
-                                [rows[4], rows[5], rows[6], rows[7]],
-                                activations,
-                            )
-                            .ok_or_else(|| invalid("missing NEON BF16 kernel"))??;
-                            Ok([
-                                low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3],
-                            ])
+                            neon::bf16_dot_eight_rows(rows, activations)
+                                .ok_or_else(|| invalid("missing NEON BF16 kernel"))?
                         },
                         |rows| {
                             neon::bf16_dot_four_rows(rows, activations)

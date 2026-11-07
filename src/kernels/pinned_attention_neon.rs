@@ -78,6 +78,10 @@ pub(super) fn value_tile<'a>(
 /// Each cached binary16 value row is read and converted to binary32 once for all
 /// four query heads, while retaining each head's independent sixteen-lane FMA
 /// accumulator and reduction tree.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "Keep explicit 4-head and token indices aligned across fixed arrays."
+)]
 pub(super) fn value_tile_four<'a>(
     neon: Neon,
     mut past: impl Iterator<Item = &'a [u16]>,

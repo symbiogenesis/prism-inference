@@ -694,10 +694,10 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
             for (row_group, weights_half) in [(&weights_lo, 0_usize), (&weights_hi, 4_usize)] {
                 let dots = dot128_four_rows_four_tokens(neon, row_group, &acts);
-                for r in 0..4 {
+                for (r, &dot) in dots.iter().enumerate() {
                     let row = weights_half + r;
                     let d = f32x4::splat(neon, row_scales[row]) * act_scales;
-                    let dot_f32 = dots[r].to_float::<f32x4<Neon>>();
+                    let dot_f32 = dot.to_float::<f32x4<Neon>>();
                     let cur = f32x4::from_slice(neon, &sums[row][base..base + 4]);
                     let next = if pinned {
                         d.mul_add_precise(dot_f32, cur)
@@ -1018,6 +1018,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
 )]
 pub(in crate::kernels::prefill) fn dot_bf16_rows<const ROWS: usize, const TOKENS: usize>(

@@ -173,6 +173,10 @@ pub(crate) fn value_tile_four<'a>(
     value_tile_four_scalar(past, current, weights, &(offset..end), outputs)
 }
 
+#[allow(
+    clippy::needless_range_loop,
+    reason = "Keep explicit 4-head and token indices aligned across fixed arrays."
+)]
 fn value_tile_four_scalar<'a>(
     mut past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
@@ -802,12 +806,18 @@ mod tests {
         let q1: Vec<f32> = q0
             .iter()
             .enumerate()
-            .map(|(i, &x)| x * (1.0 + (i % 5) as f32 * 0.125))
+            .map(|(i, &x)| {
+                let scale = f32::from(u8::try_from(i % 5).unwrap_or(0)).mul_add(0.125, 1.0);
+                x * scale
+            })
             .collect();
         let q2: Vec<f32> = q0
             .iter()
             .enumerate()
-            .map(|(i, &x)| x * (0.75 - (i % 3) as f32 * 0.25))
+            .map(|(i, &x)| {
+                let scale = f32::from(u8::try_from(i % 3).unwrap_or(0)).mul_add(-0.25, 0.75);
+                x * scale
+            })
             .collect();
         let q3: Vec<f32> = q0.iter().copied().rev().collect();
         let key_f32: Vec<f32> = values.values.iter().copied().map(half_to_float).collect();
@@ -833,10 +843,15 @@ mod tests {
         let rows: Vec<[u16; VALUE_TILE]> = values.values[..values.values.len() - 1]
             .iter()
             .enumerate()
-            .map(|(r, &value)| std::array::from_fn(|c| value.wrapping_add(((r + c) % 7) as u16)))
+            .map(|(r, &value)| {
+                std::array::from_fn(|c| value.wrapping_add(u16::try_from((r + c) % 7).unwrap_or(0)))
+            })
             .collect();
         let current: [f32; VALUE_TILE] = std::array::from_fn(|c| {
-            half_to_float(values.values[values.values.len() - 1]) + (c as f32) * 0.03125
+            f32::from(u8::try_from(c).unwrap_or(0)).mul_add(
+                0.03125,
+                half_to_float(values.values[values.values.len() - 1]),
+            )
         });
 
         for tile_width in [VALUE_TILE, 12, 7] {

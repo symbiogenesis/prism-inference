@@ -524,7 +524,7 @@ impl Qwen35 {
                 }
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
                     check()?;
-                    let reuse = project_tile_pair(
+                    let _ = project_tile_triple(
                         &self.transforms,
                         &self.geometry,
                         self.arithmetic,
@@ -532,27 +532,10 @@ impl Qwen35 {
                         self.adapter_scale,
                         &mut self.workspace.adapter,
                         &mut self.workspace.projection.matvec,
-                        [&weights.query, &weights.key],
+                        [&weights.query, &weights.key, &weights.value],
                         &tile.normalized[..count],
                         &mut tile.mixed[..count],
                         &mut tile.recurrent_gate[..count],
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        reborrow_executor(&mut executor),
-                        check,
-                    )?;
-                    check()?;
-                    let _ = project_tile(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        reuse,
-                        &weights.value,
-                        &tile.normalized[..count],
                         &mut tile.beta[..count],
                         &mut tile.transformed[..count],
                         &mut tile.projector,
@@ -877,6 +860,129 @@ fn project_tile_pair<'a>(
         tensors[1],
         inputs,
         outputs_b,
+        transformed,
+        projector,
+        reborrow_executor(&mut executor),
+        check,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
+)]
+fn project_tile_triple<'a>(
+    transforms: &Transforms,
+    geometry: &super::Geometry,
+    arithmetic: Arithmetic,
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    tensors: [&'a Tensor; 3],
+    inputs: &[Vec<f32>],
+    outputs_a: &mut [Vec<f32>],
+    outputs_b: &mut [Vec<f32>],
+    outputs_c: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    projector: &mut ProjectionTile,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<TileReuse<'a>> {
+    if let Some(exec) = reborrow_executor(&mut executor)
+        && tensors[0].kind == 142
+        && tensors[1].kind == 142
+        && tensors[2].kind == 142
+        && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
+        && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
+        && exec.supports_f32_group(&tensors)
+    {
+        let activation = transform_tile_inputs(
+            transforms,
+            geometry,
+            tensors[0],
+            false,
+            inputs,
+            transformed,
+            projector.row_parallelism(),
+        )?;
+        check()?;
+        exec.project_f32_triple_tokens(
+            tensors,
+            activation,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+            outputs_a,
+            outputs_b,
+            outputs_c,
+        )?;
+        let rows_a = tensors[0]
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        let rows_b = tensors[1]
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        let rows_c = tensors[2]
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        for ((out_a, out_b), out_c) in outputs_a.iter().zip(outputs_b.iter()).zip(outputs_c.iter())
+        {
+            if out_a.len() != rows_a || out_b.len() != rows_b || out_c.len() != rows_c {
+                return Err(invalid("projection executor returned incomplete output"));
+            }
+            finite(out_a, "projection executor output")?;
+            finite(out_b, "projection executor output")?;
+            finite(out_c, "projection executor output")?;
+        }
+        if let Some(adapter) = adapter {
+            for (tensor, outputs) in [
+                (tensors[0], &mut *outputs_a),
+                (tensors[1], &mut *outputs_b),
+                (tensors[2], &mut *outputs_c),
+            ] {
+                for (input, output) in inputs.iter().zip(outputs) {
+                    adapter.linear(&tensor.name, input, adapter_scale, output, adapter_scratch)?;
+                }
+            }
+        }
+        return Ok(TileReuse {
+            basis: Some(tensors[2]),
+            prepared: None,
+        });
+    }
+    let reuse = project_tile_pair(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        [tensors[0], tensors[1]],
+        inputs,
+        outputs_a,
+        outputs_b,
+        transformed,
+        projector,
+        reborrow_executor(&mut executor),
+        check,
+    )?;
+    check()?;
+    project_tile(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        reuse,
+        tensors[2],
+        inputs,
+        outputs_c,
         transformed,
         projector,
         reborrow_executor(&mut executor),

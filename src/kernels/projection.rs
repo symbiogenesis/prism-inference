@@ -175,6 +175,37 @@ pub trait Pq2ProjectionExecutor {
         }
         Ok(())
     }
+
+    /// Execute a triple of compatible `PQ2_0` sibling projections across a tile of
+    /// shared `F32` token activations.
+    ///
+    /// # Errors
+    /// Rejects mismatched slice lengths, unsupported groups or submission failures.
+    fn project_f32_triple_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+        outputs_c: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if activations.len() != outputs_a.len()
+            || activations.len() != outputs_b.len()
+            || activations.len() != outputs_c.len()
+        {
+            return Err(invalid("mismatched F32 triple token projection outputs"));
+        }
+        for (((activation, out_a), out_b), out_c) in activations
+            .iter()
+            .zip(outputs_a.iter_mut())
+            .zip(outputs_b.iter_mut())
+            .zip(outputs_c.iter_mut())
+        {
+            self.project_f32_group(&tensors, activation, pinned, &mut [out_a, out_b, out_c])?;
+        }
+        Ok(())
+    }
 }
 
 impl PreparedMatvec<'_> {

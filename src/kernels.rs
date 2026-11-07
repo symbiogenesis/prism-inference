@@ -2778,8 +2778,6 @@ pub(crate) fn hadamard_into(
     if !output.len().is_power_of_two() || input.len() != output.len() {
         return Err(invalid("Hadamard requires a finite power-of-two block"));
     }
-    let count = u32::try_from(output.len())?;
-    let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -2787,8 +2785,12 @@ pub(crate) fn hadamard_into(
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    if let Some(result) = neon::hadamard_into(input, signs, output, normalization) {
-        return result;
+    {
+        let count = u32::try_from(output.len())?;
+        let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
+        if let Some(result) = neon::hadamard_into(input, signs, output, normalization) {
+            return result;
+        }
     }
     if let Some(signs) = signs {
         mul_slice_into(input, signs, output);

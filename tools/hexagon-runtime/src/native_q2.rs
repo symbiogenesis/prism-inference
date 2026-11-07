@@ -1217,6 +1217,261 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         Ok(())
     }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep 4-token and 2-token sibling triple resident dispatch and tail handling together."
+    )]
+    fn project_f32_triple_tokens_inner(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+        outputs_c: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if activations.len() != outputs_a.len()
+            || activations.len() != outputs_b.len()
+            || activations.len() != outputs_c.len()
+        {
+            return Err(invalid("mismatched F32 triple token projection outputs"));
+        }
+        if activations.is_empty() {
+            return Ok(());
+        }
+        let Some((columns, rows_per_member, cached_indices)) = self.validate_f32_group(&tensors)
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon batched projection group",
+            ));
+        };
+        for activation in activations {
+            if activation.len() != columns {
+                return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+            }
+            finite_slice(activation)?;
+        }
+        let mut weights = Vec::new();
+        for (member, &tensor) in tensors.iter().enumerate() {
+            if cached_indices[member].is_none() {
+                let rows = rows_per_member[member];
+                let max_mapped_rows = rows.next_multiple_of(32);
+                let required_bytes = max_mapped_rows * 36 * (columns / 128);
+                if weights.len() < required_bytes {
+                    weights
+                        .try_reserve(required_bytes - weights.len())
+                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+                    weights.resize(required_bytes, 0_u8);
+                }
+                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
+        }
+        let mut indices = [0_usize; 3];
+        if let Some(cache) = &mut self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                let idx = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+                let hits = if cache.projections[idx].evaluated {
+                    u64::try_from(activations.len())?
+                } else {
+                    cache.projections[idx].evaluated = true;
+                    u64::try_from(activations.len().saturating_sub(1))?
+                };
+                cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(hits);
+                indices[member] = idx;
+            }
+        }
+        for (member, outputs) in [&mut *outputs_a, &mut *outputs_b, &mut *outputs_c]
+            .into_iter()
+            .enumerate()
+        {
+            let rows = rows_per_member[member];
+            for output in outputs.iter_mut() {
+                if output.len() != rows {
+                    output.clear();
+                    output
+                        .try_reserve(rows)
+                        .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                    output.resize(rows, f32::NAN);
+                }
+            }
+        }
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let h0 = &cache.handles[cache.projections[indices[0]].first_handle];
+        let h1 = &cache.handles[cache.projections[indices[1]].first_handle];
+        let h2 = &cache.handles[cache.projections[indices[2]].first_handle];
+        let mut rem_act = activations;
+        let mut rem_a = outputs_a;
+        let mut rem_b = outputs_b;
+        let mut rem_c = outputs_c;
+        while !rem_act.is_empty() {
+            if rem_act.len() >= 4 {
+                let (act_chunk, next_act) = rem_act.split_at(4);
+                let (a_chunk, next_a) = rem_a.split_at_mut(4);
+                let (b_chunk, next_b) = rem_b.split_at_mut(4);
+                let (c_chunk, next_c) = rem_c.split_at_mut(4);
+                rem_act = next_act;
+                rem_a = next_a;
+                rem_b = next_b;
+                rem_c = next_c;
+                let [oa0, oa1, oa2, oa3] = a_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let [ob0, ob1, ob2, ob3] = b_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let [oc0, oc1, oc2, oc3] = c_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let x0 = act_chunk[0].as_slice();
+                let x1 = act_chunk[1].as_slice();
+                let x2 = act_chunk[2].as_slice();
+                let x3 = act_chunk[3].as_slice();
+                for (handles, acts, outs) in [
+                    (
+                        [h0, h1, h2, h0],
+                        [x0, x0, x0, x1],
+                        [
+                            oa0.as_mut_slice(),
+                            ob0.as_mut_slice(),
+                            oc0.as_mut_slice(),
+                            oa1.as_mut_slice(),
+                        ],
+                    ),
+                    (
+                        [h1, h2, h0, h1],
+                        [x1, x1, x2, x2],
+                        [
+                            ob1.as_mut_slice(),
+                            oc1.as_mut_slice(),
+                            oa2.as_mut_slice(),
+                            ob2.as_mut_slice(),
+                        ],
+                    ),
+                    (
+                        [h2, h0, h1, h2],
+                        [x2, x3, x3, x3],
+                        [
+                            oc2.as_mut_slice(),
+                            oa3.as_mut_slice(),
+                            ob3.as_mut_slice(),
+                            oc3.as_mut_slice(),
+                        ],
+                    ),
+                ] {
+                    self.statistics.operations_attempted =
+                        self.statistics.operations_attempted.saturating_add(4);
+                    self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                    let [o0, o1, o2, o3] = outs;
+                    self.submitter
+                        .submit_resident_multi4(handles, acts, [o0, o1, o2, o3])?;
+                    finite_slice(o0)?;
+                    finite_slice(o1)?;
+                    finite_slice(o2)?;
+                    finite_slice(o3)?;
+                    self.statistics.operations_completed =
+                        self.statistics.operations_completed.saturating_add(4);
+                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                    self.statistics.projections_completed =
+                        self.statistics.projections_completed.saturating_add(4);
+                }
+            } else if rem_act.len() >= 2 {
+                let (act_chunk, next_act) = rem_act.split_at(2);
+                let (a_chunk, next_a) = rem_a.split_at_mut(2);
+                let (b_chunk, next_b) = rem_b.split_at_mut(2);
+                let (c_chunk, next_c) = rem_c.split_at_mut(2);
+                rem_act = next_act;
+                rem_a = next_a;
+                rem_b = next_b;
+                rem_c = next_c;
+                let [oa0, oa1] = a_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let [ob0, ob1] = b_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let [oc0, oc1] = c_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let x0 = act_chunk[0].as_slice();
+                let x1 = act_chunk[1].as_slice();
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(4);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_multi4(
+                    [h0, h1, h2, h0],
+                    [x0, x0, x0, x1],
+                    [
+                        oa0.as_mut_slice(),
+                        ob0.as_mut_slice(),
+                        oc0.as_mut_slice(),
+                        oa1.as_mut_slice(),
+                    ],
+                )?;
+                finite_slice(oa0)?;
+                finite_slice(ob0)?;
+                finite_slice(oc0)?;
+                finite_slice(oa1)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(4);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(4);
+
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(2);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_batch2(
+                    [h1, h2],
+                    x1,
+                    [ob1.as_mut_slice(), oc1.as_mut_slice()],
+                )?;
+                finite_slice(ob1)?;
+                finite_slice(oc1)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(2);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(2);
+            } else {
+                let x0 = rem_act[0].as_slice();
+                let oa0 = &mut rem_a[0];
+                let ob0 = &mut rem_b[0];
+                let oc0 = &mut rem_c[0];
+                rem_act = &[];
+                rem_a = &mut [];
+                rem_b = &mut [];
+                rem_c = &mut [];
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(3);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_batch3(
+                    [h0, h1, h2],
+                    x0,
+                    [oa0.as_mut_slice(), ob0.as_mut_slice(), oc0.as_mut_slice()],
+                )?;
+                finite_slice(oa0)?;
+                finite_slice(ob0)?;
+                finite_slice(oc0)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(3);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(3);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
@@ -1368,6 +1623,37 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
                 output.clear();
             }
             for output in outputs_b.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
+
+    fn project_f32_triple_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        _pinned: bool,
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+        outputs_c: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let result = self.project_f32_triple_tokens_inner(
+            tensors,
+            activations,
+            outputs_a,
+            outputs_b,
+            outputs_c,
+        );
+        if result.is_err() {
+            self.failed = true;
+            for output in outputs_a.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_b.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_c.iter_mut() {
                 output.clear();
             }
         }
@@ -1864,6 +2150,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep single-token and multi-token 2/3-sibling batching assertions together."
+    )]
     fn native_q2_batches_two_and_three_resident_sibling_projections_in_single_queue_writes()
     -> Result<()> {
         let columns = 256;
@@ -1971,6 +2261,34 @@ mod tests {
         assert_eq!(outs_a[0][0], 256.0);
         assert_eq!(outs_a[3][0], 1027.0);
         assert_eq!(outs_a[4][0], 1280.0);
+
+        let mut outs_c = vec![Vec::new(); 5];
+        executor.project_f32_triple_tokens(
+            [&q, &k, &v],
+            &acts,
+            true,
+            &mut outs_a,
+            &mut outs_b,
+            &mut outs_c,
+        )?;
+        // 5 tokens * 3 projections = 15 ops across 4 queue writes (4 + 4 + 4 + 3).
+        assert_eq!(executor.queue_writes_completed(), 11);
+        assert_eq!(executor.statistics().operations_completed, 35);
+        assert_eq!(outs_a[0][0], 256.0);
+        assert_eq!(outs_b[0][0], 257.0);
+        assert_eq!(outs_c[0][0], 258.0);
+        assert_eq!(outs_a[1][0], 515.0);
+        assert_eq!(outs_b[1][0], 512.0);
+        assert_eq!(outs_c[1][0], 513.0);
+        assert_eq!(outs_a[2][0], 770.0);
+        assert_eq!(outs_b[2][0], 771.0);
+        assert_eq!(outs_c[2][0], 768.0);
+        assert_eq!(outs_a[3][0], 1025.0);
+        assert_eq!(outs_b[3][0], 1026.0);
+        assert_eq!(outs_c[3][0], 1027.0);
+        assert_eq!(outs_a[4][0], 1280.0);
+        assert_eq!(outs_b[4][0], 1281.0);
+        assert_eq!(outs_c[4][0], 1282.0);
         Ok(())
     }
 }

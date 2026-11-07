@@ -126,6 +126,116 @@ fn value_tile_scalar<'a>(
     Ok(())
 }
 
+/// Reduces adjacent value channels across four query heads sharing the same KV head.
+///
+/// Each cached value row is read and converted from FP16 once per four query heads,
+/// while preserving each head's independent 16-lane temporal FMA accumulator and
+/// reduction tree.
+///
+/// # Errors
+/// Rejects invalid tile/row geometry, unequal token counts and nonfinite results.
+pub(crate) fn value_tile_four<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: [&[f32]; 4],
+    offset: usize,
+    outputs: [&mut [f32]; 4],
+) -> Result<()> {
+    let out_len = outputs[0].len();
+    let weight_len = weights[0].len();
+    if out_len == 0
+        || out_len > VALUE_TILE
+        || current.len() != out_len
+        || weight_len == 0
+        || weight_len > crate::model::swift::CONTEXT_TOKENS
+        || outputs.iter().any(|out| out.len() != out_len)
+        || weights.iter().any(|w| w.len() != weight_len)
+    {
+        return Err(invalid("invalid pinned attention value tile"));
+    }
+    let end = offset
+        .checked_add(out_len)
+        .ok_or_else(|| invalid("pinned attention value offset overflow"))?;
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if out_len.is_multiple_of(4)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return neon::value_tile_four(neon, past, current, weights, &(offset..end), outputs);
+    }
+
+    value_tile_four_scalar(past, current, weights, &(offset..end), outputs)
+}
+
+fn value_tile_four_scalar<'a>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: [&[f32]; 4],
+    range: &std::ops::Range<usize>,
+    outputs: [&mut [f32]; 4],
+) -> Result<()> {
+    let out_len = outputs[0].len();
+    let weight_len = weights[0].len();
+    let mut sums = [[[[0.0_f32; 4]; 4]; VALUE_TILE]; 4];
+    let last = weight_len - 1;
+    for index in 0..last {
+        let values = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let r = index % 16 / 4;
+        let c = index % 4;
+        for (channel, &value) in values.iter().enumerate() {
+            let decoded = bonsai_ternary::half_to_float(value);
+            for h in 0..4 {
+                let lane = &mut sums[h][channel][r][c];
+                *lane = decoded.mul_add(weights[h][index], *lane);
+            }
+        }
+    }
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last_r = last % 16 / 4;
+    let last_c = last % 4;
+    for (channel, &value) in current.iter().enumerate() {
+        for h in 0..4 {
+            let lane = &mut sums[h][channel][last_r][last_c];
+            *lane = value.mul_add(weights[h][last], *lane);
+        }
+    }
+    for index in weight_len..padded_dot_steps(weight_len) {
+        let r = index % 16 / 4;
+        let c = index % 4;
+        for h in 0..4 {
+            for sum in &mut sums[h][..out_len] {
+                let lane = &mut sum[r][c];
+                *lane = 0.0_f32.mul_add(0.0, *lane);
+            }
+        }
+    }
+    let mut staged = [[0.0_f32; VALUE_TILE]; 4];
+    for h in 0..4 {
+        for (out, sum) in staged[h][..out_len].iter_mut().zip(&sums[h][..out_len]) {
+            let mut lanes = [0.0; 4];
+            for (index, lane) in lanes.iter_mut().enumerate() {
+                *lane = (sum[0][index] + sum[2][index]) + (sum[1][index] + sum[3][index]);
+            }
+            *out = super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+    }
+    for (output, stage) in outputs.into_iter().zip(&staged) {
+        output.copy_from_slice(&stage[..out_len]);
+    }
+    Ok(())
+}
+
 /// Reduces a cached F16 key row and F32 query row with the pinned four-register FMA tree.
 ///
 /// # Errors
@@ -181,6 +291,90 @@ pub(crate) fn dot_f32(key: &[f32], query: &[f32]) -> Result<f32> {
         return neon::dot_f32(neon, key, query);
     }
     dot(key.iter().copied(), query)
+}
+
+/// Reduces a cached F16 key row against four F32 query rows sharing the same KV head.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f16_four(key: &[u16], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
+    let len = queries[0].len();
+    if len == 0
+        || len > crate::model::swift::CONTEXT_TOKENS
+        || queries.iter().any(|q| q.len() != len)
+    {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    if key.len() < len {
+        return Err(invalid("pinned attention dot row is short"));
+    }
+    if key.len() > len {
+        return Err(invalid("pinned attention dot row is long"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f16_four(neon, key, queries);
+    }
+    Ok([
+        dot(
+            key.iter().copied().map(bonsai_ternary::half_to_float),
+            queries[0],
+        )?,
+        dot(
+            key.iter().copied().map(bonsai_ternary::half_to_float),
+            queries[1],
+        )?,
+        dot(
+            key.iter().copied().map(bonsai_ternary::half_to_float),
+            queries[2],
+        )?,
+        dot(
+            key.iter().copied().map(bonsai_ternary::half_to_float),
+            queries[3],
+        )?,
+    ])
+}
+
+/// Reduces a current F32 key row against four F32 query rows sharing the same KV head.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f32_four(key: &[f32], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
+    let len = queries[0].len();
+    if len == 0
+        || len > crate::model::swift::CONTEXT_TOKENS
+        || queries.iter().any(|q| q.len() != len)
+    {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    if key.len() < len {
+        return Err(invalid("pinned attention dot row is short"));
+    }
+    if key.len() > len {
+        return Err(invalid("pinned attention dot row is long"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f32_four(neon, key, queries);
+    }
+    Ok([
+        dot(key.iter().copied(), queries[0])?,
+        dot(key.iter().copied(), queries[1])?,
+        dot(key.iter().copied(), queries[2])?,
+        dot(key.iter().copied(), queries[3])?,
+    ])
 }
 
 /// Reduces decoded F16 operands with the pinned four-register F32 FMA tree.
@@ -386,7 +580,10 @@ mod tests {
     use bonsai_ternary::half_to_float;
     use serde::Deserialize;
 
-    use super::{VALUE_TILE, dot, dot_f16, dot_f32, softmax, value_tile};
+    use super::{
+        VALUE_TILE, dot, dot_f16, dot_f16_four, dot_f32, dot_f32_four, softmax, value_tile,
+        value_tile_four,
+    };
 
     #[derive(Deserialize)]
     struct Capture {
@@ -586,6 +783,100 @@ mod tests {
             invalid.map(f32::to_bits),
             [1.0_f32.to_bits(), f32::INFINITY.to_bits()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_four_head_dot_and_value_tile_match_single_head_bits_and_visit_rows_once()
+    -> crate::Result<()> {
+        let capture: Capture = serde_json::from_str(include_str!(
+            "../../tests/fixtures/swift-attention-dot.json"
+        ))?;
+        let values = capture.weighted_value;
+        let q0: Vec<f32> = values
+            .probabilities
+            .iter()
+            .copied()
+            .map(half_to_float)
+            .collect();
+        let q1: Vec<f32> = q0
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| x * (1.0 + (i % 5) as f32 * 0.125))
+            .collect();
+        let q2: Vec<f32> = q0
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| x * (0.75 - (i % 3) as f32 * 0.25))
+            .collect();
+        let q3: Vec<f32> = q0.iter().copied().rev().collect();
+        let key_f32: Vec<f32> = values.values.iter().copied().map(half_to_float).collect();
+
+        let expected_f16 = [
+            dot_f16(&values.values, &q0)?.to_bits(),
+            dot_f16(&values.values, &q1)?.to_bits(),
+            dot_f16(&values.values, &q2)?.to_bits(),
+            dot_f16(&values.values, &q3)?.to_bits(),
+        ];
+        let actual_f16 = dot_f16_four(&values.values, [&q0, &q1, &q2, &q3])?.map(f32::to_bits);
+        assert_eq!(actual_f16, expected_f16);
+
+        let expected_f32 = [
+            dot_f32(&key_f32, &q0)?.to_bits(),
+            dot_f32(&key_f32, &q1)?.to_bits(),
+            dot_f32(&key_f32, &q2)?.to_bits(),
+            dot_f32(&key_f32, &q3)?.to_bits(),
+        ];
+        let actual_f32 = dot_f32_four(&key_f32, [&q0, &q1, &q2, &q3])?.map(f32::to_bits);
+        assert_eq!(actual_f32, expected_f32);
+
+        let rows: Vec<[u16; VALUE_TILE]> = values.values[..values.values.len() - 1]
+            .iter()
+            .enumerate()
+            .map(|(r, &value)| std::array::from_fn(|c| value.wrapping_add(((r + c) % 7) as u16)))
+            .collect();
+        let current: [f32; VALUE_TILE] = std::array::from_fn(|c| {
+            half_to_float(values.values[values.values.len() - 1]) + (c as f32) * 0.03125
+        });
+
+        for tile_width in [VALUE_TILE, 12, 7] {
+            let mut single = [[0.0_f32; VALUE_TILE]; 4];
+            for (h, weights) in [&q0, &q1, &q2, &q3].into_iter().enumerate() {
+                value_tile(
+                    rows.iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    &current[..tile_width],
+                    weights,
+                    0,
+                    &mut single[h][..tile_width],
+                )?;
+            }
+
+            let visits = std::cell::Cell::new(0);
+            let past = rows.iter().map(<[u16; VALUE_TILE]>::as_slice).inspect(|_| {
+                visits.set(visits.get() + 1);
+            });
+            let mut out0 = vec![f32::NAN; tile_width];
+            let mut out1 = vec![f32::NAN; tile_width];
+            let mut out2 = vec![f32::NAN; tile_width];
+            let mut out3 = vec![f32::NAN; tile_width];
+            value_tile_four(
+                past,
+                &current[..tile_width],
+                [&q0, &q1, &q2, &q3],
+                0,
+                [&mut out0, &mut out1, &mut out2, &mut out3],
+            )?;
+            assert_eq!(visits.get(), rows.len());
+            for (actual, expected) in [&out0, &out1, &out2, &out3].into_iter().zip(&single) {
+                let actual_bits: Vec<u32> = actual.iter().copied().map(f32::to_bits).collect();
+                let expected_bits: Vec<u32> = expected[..tile_width]
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect();
+                assert_eq!(actual_bits, expected_bits, "tile_width={tile_width}");
+            }
+        }
         Ok(())
     }
 }

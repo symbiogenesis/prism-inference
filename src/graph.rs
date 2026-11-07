@@ -190,6 +190,20 @@ impl Arithmetic {
         }
     }
 
+    fn attention_dot_four(self, queries: [&[f32]; 4], key: &[u16]) -> Result<[f32; 4]> {
+        match self {
+            Self::Source => Ok(queries.map(|query| dot_f16(query, key))),
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot_f16_four(key, queries),
+        }
+    }
+
+    fn attention_current_dot_four(self, queries: [&[f32]; 4], key: &[f32]) -> Result<[f32; 4]> {
+        match self {
+            Self::Source => Ok(queries.map(|query| dot(query, key))),
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot_f32_four(key, queries),
+        }
+    }
+
     fn attention_softmax(self, scores: &mut [f32]) -> Result<()> {
         match self {
             Self::Source => softmax(scores),
@@ -285,6 +299,57 @@ impl Arithmetic {
                 probabilities,
                 offset,
                 output,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "Preserve each channel's binary64 sum and final binary32 rounding."
+    )]
+    fn attention_value_tile_four(
+        self,
+        values: &KvCache,
+        current: &[f32],
+        offset: usize,
+        probabilities: [&[f32]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> Result<()> {
+        match self {
+            Self::Source => {
+                let zero = std::iter::empty::<f64>().sum::<f64>();
+                let out_len = outputs[0].len();
+                let mut sums = [[zero; crate::kernels::pinned_attention::VALUE_TILE]; 4];
+                for (pos, past) in values.tokens().enumerate() {
+                    let row = &past[offset..offset + out_len];
+                    for (channel, &value) in row.iter().enumerate() {
+                        let decoded = half_to_float(value);
+                        for h in 0..4 {
+                            sums[h][channel] += f64::from(probabilities[h][pos] * decoded);
+                        }
+                    }
+                }
+                let last = probabilities[0].len() - 1;
+                for (output, (prob_row, sum_row)) in outputs
+                    .into_iter()
+                    .zip(probabilities.into_iter().zip(&sums))
+                {
+                    let probability = prob_row[last];
+                    for ((out, &sum), &value) in
+                        output.iter_mut().zip(&sum_row[..out_len]).zip(current)
+                    {
+                        *out = (sum + f64::from(probability * value)) as f32;
+                    }
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four(
+                values.tokens(),
+                current,
+                probabilities,
+                offset,
+                outputs,
             ),
         }
     }
@@ -2111,14 +2176,80 @@ impl Evaluation<'_, '_> {
                 scores_scratch,
                 score_len,
                 |base_head, attended_chunk, scores_chunk| {
-                    for (head_offset, (result, scores)) in attended_chunk
-                        .chunks_exact_mut(g.head)
-                        .zip(scores_chunk.chunks_exact_mut(score_len))
-                        .enumerate()
-                    {
+                    let chunk_heads = attended_chunk.len() / g.head;
+                    let mut head_offset = 0;
+                    while head_offset < chunk_heads {
                         let head = base_head + head_offset;
                         let kv_head = head / heads_per_kv;
                         let offset = kv_head * g.head;
+                        if head_offset + 4 <= chunk_heads && kv_head == (head + 3) / heads_per_kv {
+                            let (r01, r23) = attended_chunk
+                                [head_offset * g.head..(head_offset + 4) * g.head]
+                                .split_at_mut(2 * g.head);
+                            let (r0, r1) = r01.split_at_mut(g.head);
+                            let (r2, r3) = r23.split_at_mut(g.head);
+                            let (s01, s23) = scores_chunk
+                                [head_offset * score_len..(head_offset + 4) * score_len]
+                                .split_at_mut(2 * score_len);
+                            let (s0, s1) = s01.split_at_mut(score_len);
+                            let (s2, s3) = s23.split_at_mut(score_len);
+                            let queries = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[h * g.head..(h + 1) * g.head]
+                            });
+                            for (pos, past) in keys.tokens().enumerate() {
+                                let dots = arithmetic
+                                    .attention_dot_four(queries, &past[offset..offset + g.head])?;
+                                s0[pos] = dots[0] * scale;
+                                s1[pos] = dots[1] * scale;
+                                s2[pos] = dots[2] * scale;
+                                s3[pos] = dots[3] * scale;
+                            }
+                            let current_dots = arithmetic.attention_current_dot_four(
+                                queries,
+                                &key_ref[offset..offset + g.head],
+                            )?;
+                            s0[score_len - 1] = current_dots[0] * scale;
+                            s1[score_len - 1] = current_dots[1] * scale;
+                            s2[score_len - 1] = current_dots[2] * scale;
+                            s3[score_len - 1] = current_dots[3] * scale;
+                            for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
+                                arithmetic.attention_softmax(scores)?;
+                                round_f16_slice(scores);
+                            }
+                            let probs: [&[f32]; 4] = [s0, s1, s2, s3];
+                            for (tile, (((out0, out1), out2), out3)) in r0
+                                .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                                .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                                .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                                .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                                .enumerate()
+                            {
+                                let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
+                                arithmetic.attention_value_tile_four(
+                                    values,
+                                    &value_ref[offset + dimension..offset + dimension + out0.len()],
+                                    offset + dimension,
+                                    probs,
+                                    [out0, out1, out2, out3],
+                                )?;
+                            }
+                            for (i, result) in [r0, r1, r2, r3].into_iter().enumerate() {
+                                let h = head + i;
+                                for (out, &gate) in result
+                                    .iter_mut()
+                                    .zip(&gate_ref[h * g.head..(h + 1) * g.head])
+                                {
+                                    *out *= sigmoid(gate);
+                                }
+                            }
+                            head_offset += 4;
+                            continue;
+                        }
+                        let result =
+                            &mut attended_chunk[head_offset * g.head..(head_offset + 1) * g.head];
+                        let scores = &mut scores_chunk
+                            [head_offset * score_len..(head_offset + 1) * score_len];
                         let q = &query_ref[head * g.head..(head + 1) * g.head];
                         for (pos, past) in keys.tokens().enumerate() {
                             scores[pos] = arithmetic
@@ -2150,6 +2281,7 @@ impl Evaluation<'_, '_> {
                         {
                             *out *= sigmoid(gate);
                         }
+                        head_offset += 1;
                     }
                     Ok(())
                 },

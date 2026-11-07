@@ -73,6 +73,84 @@ pub(super) fn value_tile<'a>(
     Ok(())
 }
 
+/// Consumes a validated tile across four query heads sharing the same KV head.
+///
+/// Each cached binary16 value row is read and converted to binary32 once for all
+/// four query heads, while retaining each head's independent sixteen-lane FMA
+/// accumulator and reduction tree.
+pub(super) fn value_tile_four<'a>(
+    neon: Neon,
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: [&[f32]; 4],
+    range: &std::ops::Range<usize>,
+    outputs: [&mut [f32]; 4],
+) -> Result<()> {
+    let zero = f32x4::splat(neon, 0.0);
+    let mut sums = [[[zero; VALUE_TILE / 4]; 16]; 4];
+    let groups = outputs[0].len() / 4;
+    let token_count = weights[0].len();
+    let last = token_count - 1;
+    for index in 0..last {
+        let values = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let lane = index % 16;
+        let ws: [f32x4<Neon>; 4] = std::array::from_fn(|h| f32x4::splat(neon, weights[h][index]));
+        let (val_chunks8, val_rem) = values.as_chunks::<8>();
+        for (pair_idx, chunk8) in val_chunks8.iter().enumerate() {
+            let (v0, v1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk8);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            for h in 0..4 {
+                sums[h][lane][g0] = v0.mul_add_precise(ws[h], sums[h][lane][g0]);
+                sums[h][lane][g1] = v1.mul_add_precise(ws[h], sums[h][lane][g1]);
+            }
+        }
+        let rem_base = val_chunks8.len() * 2;
+        for (rem_idx, vals4) in val_rem.as_chunks::<4>().0.iter().enumerate() {
+            let v = super::super::neon::f16_bits_to_f32_x4(neon, *vals4);
+            let g = rem_base + rem_idx;
+            for h in 0..4 {
+                sums[h][lane][g] = v.mul_add_precise(ws[h], sums[h][lane][g]);
+            }
+        }
+    }
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last_lane = last % 16;
+    let ws: [f32x4<Neon>; 4] = std::array::from_fn(|h| f32x4::splat(neon, weights[h][last]));
+    for (g, values) in current.as_chunks::<4>().0.iter().enumerate() {
+        let v = f32x4::load_array(neon, *values);
+        for h in 0..4 {
+            sums[h][last_lane][g] = v.mul_add_precise(ws[h], sums[h][last_lane][g]);
+        }
+    }
+    for index in token_count..padded_dot_steps(token_count) {
+        let lane = index % 16;
+        for head_sums in &mut sums {
+            for sum in &mut head_sums[lane][..groups] {
+                *sum = zero.mul_add_precise(zero, *sum);
+            }
+        }
+    }
+    for (h, output) in outputs.into_iter().enumerate() {
+        for (group, out) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
+                (sums[h][lane][group] + sums[h][8 + lane][group])
+                    + (sums[h][4 + lane][group] + sums[h][12 + lane][group])
+            });
+            let result = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])).to_array();
+            for (out, value) in out.iter_mut().zip(result) {
+                *out = super::super::finite(value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reduces a validated F16 key slice and F32 query slice with four NEON FMA registers.
 pub(super) fn dot_f16(neon: Neon, key: &[u16], query: &[f32]) -> Result<f32> {
     let mut sums = [f32x4::splat(neon, 0.0); 4];
@@ -152,6 +230,111 @@ pub(super) fn dot_f32(neon: Neon, key: &[f32], query: &[f32]) -> Result<f32> {
             + (scalar_sums[1][index] + scalar_sums[3][index]);
     }
     super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+}
+
+/// Reduces one validated F16 key slice against four F32 query slices sharing the same KV head.
+pub(super) fn dot_f16_four(neon: Neon, key: &[u16], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
+    let mut sums = [[f32x4::splat(neon, 0.0); 4]; 4];
+    let (key_chunks8, key_rem) = key.as_chunks::<8>();
+    let q_chunks8 = queries.map(|q| q.as_chunks::<8>().0);
+    let q_rems = queries.map(|q| q.as_chunks::<8>().1);
+    for (pair_idx, k8) in key_chunks8.iter().enumerate() {
+        let base = (pair_idx * 2) % 4;
+        let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, k8);
+        for h in 0..4 {
+            let q8 = &q_chunks8[h][pair_idx];
+            let qv0 = f32x4::from_slice(neon, &q8[..4]);
+            let qv1 = f32x4::from_slice(neon, &q8[4..]);
+            sums[h][base] = kv0.mul_add_precise(qv0, sums[h][base]);
+            sums[h][base + 1] = kv1.mul_add_precise(qv1, sums[h][base + 1]);
+        }
+    }
+    let rem_base = key_chunks8.len() * 2;
+    let key_chunks4 = key_rem.as_chunks::<4>().0;
+    let q_chunks4 = q_rems.map(|r| r.as_chunks::<4>().0);
+    for (offset, k) in key_chunks4.iter().enumerate() {
+        let lane = (rem_base + offset) % 4;
+        let kv = super::super::neon::f16_bits_to_f32_x4(neon, *k);
+        for h in 0..4 {
+            let qv = f32x4::load_array(neon, q_chunks4[h][offset]);
+            sums[h][lane] = kv.mul_add_precise(qv, sums[h][lane]);
+        }
+    }
+    let len = queries[0].len();
+    let vector_steps = key_chunks8.len() * 8 + key_chunks4.len() * 4;
+    let total_steps = padded_dot_steps(len);
+    let mut out = [0.0_f32; 4];
+    if vector_steps == total_steps {
+        for h in 0..4 {
+            let lanes = ((sums[h][0] + sums[h][2]) + (sums[h][1] + sums[h][3])).to_array();
+            out[h] = super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+        return Ok(out);
+    }
+    for h in 0..4 {
+        let mut scalar_sums = sums[h].map(f32x4::to_array);
+        for index in vector_steps..total_steps {
+            let (value, weight) = if index < len {
+                (bonsai_ternary::half_to_float(key[index]), queries[h][index])
+            } else {
+                (0.0, 0.0)
+            };
+            let sum = &mut scalar_sums[index % 16 / 4][index % 4];
+            *sum = value.mul_add(weight, *sum);
+        }
+        let mut lanes = [0.0; 4];
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            *lane = (scalar_sums[0][index] + scalar_sums[2][index])
+                + (scalar_sums[1][index] + scalar_sums[3][index]);
+        }
+        out[h] = super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+    }
+    Ok(out)
+}
+
+/// Reduces one validated F32 key slice against four F32 query slices sharing the same KV head.
+pub(super) fn dot_f32_four(neon: Neon, key: &[f32], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
+    let mut sums = [[f32x4::splat(neon, 0.0); 4]; 4];
+    let key_chunks = key.as_chunks::<4>().0;
+    let q_chunks = queries.map(|q| q.as_chunks::<4>().0);
+    for (chunk, k) in key_chunks.iter().enumerate() {
+        let lane = chunk % 4;
+        let kv = f32x4::load_array(neon, *k);
+        for h in 0..4 {
+            let qv = f32x4::load_array(neon, q_chunks[h][chunk]);
+            sums[h][lane] = kv.mul_add_precise(qv, sums[h][lane]);
+        }
+    }
+    let len = queries[0].len();
+    let vector_steps = key_chunks.len() * 4;
+    let total_steps = padded_dot_steps(len);
+    let mut out = [0.0_f32; 4];
+    if vector_steps == total_steps {
+        for h in 0..4 {
+            let lanes = ((sums[h][0] + sums[h][2]) + (sums[h][1] + sums[h][3])).to_array();
+            out[h] = super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+        return Ok(out);
+    }
+    for h in 0..4 {
+        let mut scalar_sums = sums[h].map(f32x4::to_array);
+        for index in vector_steps..total_steps {
+            let (value, weight) = if index < len {
+                (key[index], queries[h][index])
+            } else {
+                (0.0, 0.0)
+            };
+            let sum = &mut scalar_sums[index % 16 / 4][index % 4];
+            *sum = value.mul_add(weight, *sum);
+        }
+        let mut lanes = [0.0; 4];
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            *lane = (scalar_sums[0][index] + scalar_sums[2][index])
+                + (scalar_sums[1][index] + scalar_sums[3][index]);
+        }
+        out[h] = super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+    }
+    Ok(out)
 }
 
 /// Rotates validated 256-wide Swift heads (with 64-element rotary prefix) in NEON `f32x4`.

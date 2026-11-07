@@ -17,6 +17,12 @@ use crate::{MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
 #[path = "prefill_gdn.rs"]
 mod gdn;
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct TileReuse<'a> {
+    basis: Option<&'a Tensor>,
+    prepared: Option<&'a Tensor>,
+}
+
 const fn reborrow_executor<'a, 'b: 'a>(
     executor: &'a mut Option<&'b mut dyn crate::kernels::Pq2ProjectionExecutor>,
 ) -> Option<&'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a)> {
@@ -147,7 +153,9 @@ impl Qwen35 {
             .embedding
             .max(self.geometry.feed_forward)
             .max(self.geometry.convolution_width())
-            .max(self.geometry.value_width());
+            .max(self.geometry.value_width())
+            .max(self.geometry.query_gate_width())
+            .max(self.geometry.kv_width());
         checked_product(&[tokens, width, 80])?
             .checked_add(checked_product(&[tokens, 2048])?)
             // The four fixed 32x32 coefficient/product tables and their small
@@ -190,7 +198,9 @@ impl Qwen35 {
                 .embedding
                 .max(self.geometry.feed_forward)
                 .max(self.geometry.convolution_width())
-                .max(self.geometry.value_width()),
+                .max(self.geometry.value_width())
+                .max(self.geometry.query_gate_width())
+                .max(self.geometry.kv_width()),
             required,
             self.requested_backend(),
             self.workspace.projection.matvec.clone_row_parallelism(),
@@ -357,128 +367,288 @@ impl Qwen35 {
             .zip(&mut self.state)
             .zip(&mut self.workspace.deltas)
         {
-            for (hidden, normalized) in tile.hidden[..count]
-                .iter()
-                .zip(&mut tile.normalized[..count])
-            {
-                self.arithmetic.normalize(
-                    hidden,
-                    &layer.norm,
-                    self.geometry.epsilon,
-                    normalized,
+            if count > 1 && tile.projector.row_parallelism().workers() > 1 {
+                let hidden_ref = &tile.hidden[..count];
+                let arithmetic = self.arithmetic;
+                let norm = &layer.norm;
+                let epsilon = self.geometry.epsilon;
+                tile.projector.row_parallelism().update_chunks(
+                    &mut tile.normalized[..count],
+                    1,
+                    |base_tok, chunk| {
+                        for (offset, normalized) in chunk.iter_mut().enumerate() {
+                            arithmetic.normalize(
+                                &hidden_ref[base_tok + offset],
+                                norm,
+                                epsilon,
+                                normalized,
+                            )?;
+                        }
+                        Ok(())
+                    },
                 )?;
-            }
-            let chunked = if let (true, Attention::Recurrent(weights)) =
-                (tile.chunkwise_gdn, &layer.attention)
-            {
-                gdn::recurrent_tile(
-                    weights,
-                    state,
-                    delta,
-                    &self.geometry,
-                    self.arithmetic,
-                    &self.transforms,
-                    self.adapter.as_ref(),
-                    self.adapter_scale,
-                    &mut self.workspace.adapter,
-                    &mut self.workspace.projection.matvec,
-                    count,
-                    check,
-                    tile,
-                    reborrow_executor(&mut executor),
-                )?;
-                true
             } else {
-                false
-            };
+                for (hidden, normalized) in tile.hidden[..count]
+                    .iter()
+                    .zip(&mut tile.normalized[..count])
+                {
+                    self.arithmetic.normalize(
+                        hidden,
+                        &layer.norm,
+                        self.geometry.epsilon,
+                        normalized,
+                    )?;
+                }
+            }
+            match (&layer.attention, &mut *state) {
+                (Attention::Recurrent(weights), _) if tile.chunkwise_gdn => {
+                    gdn::recurrent_tile(
+                        weights,
+                        state,
+                        delta,
+                        &self.geometry,
+                        self.arithmetic,
+                        &self.transforms,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        count,
+                        check,
+                        tile,
+                        reborrow_executor(&mut executor),
+                    )?;
+                }
+                (
+                    Attention::Recurrent(weights),
+                    LayerState::Recurrent {
+                        convolution,
+                        matrix,
+                    },
+                ) => {
+                    check()?;
+                    let mut reuse = project_tile_pair(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        [&weights.qkv, &weights.gate],
+                        &tile.normalized[..count],
+                        &mut tile.mixed[..count],
+                        &mut tile.recurrent_gate[..count],
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        reborrow_executor(&mut executor),
+                        check,
+                    )?;
+                    for (weight, outputs) in [
+                        (&weights.beta, &mut tile.beta),
+                        (&weights.alpha, &mut tile.alpha),
+                    ] {
+                        check()?;
+                        reuse = project_tile(
+                            &self.transforms,
+                            &self.geometry,
+                            self.arithmetic,
+                            self.adapter.as_ref(),
+                            self.adapter_scale,
+                            &mut self.workspace.adapter,
+                            &mut self.workspace.projection.matvec,
+                            reuse,
+                            weight,
+                            &tile.normalized[..count],
+                            &mut outputs[..count],
+                            &mut tile.transformed[..count],
+                            &mut tile.projector,
+                            reborrow_executor(&mut executor),
+                            check,
+                        )?;
+                    }
+                    for index in 0..count {
+                        check()?;
+                        let evaluation = Evaluation {
+                            geometry: &self.geometry,
+                            arithmetic: self.arithmetic,
+                            transforms: &self.transforms,
+                            position: base + index,
+                            frequencies_ready: false,
+                            projection: &mut self.workspace.projection,
+                            adapter: self.adapter.as_ref(),
+                            adapter_scale: self.adapter_scale,
+                            adapter_scratch: &mut self.workspace.adapter,
+                            executor: None,
+                        };
+                        evaluation.recurrent_attention_state(
+                            weights,
+                            &mut tile.mixed[index],
+                            &tile.recurrent_gate[index],
+                            &tile.beta[index],
+                            &tile.alpha[index],
+                            convolution,
+                            matrix,
+                            delta,
+                            &mut tile.attended[index],
+                        )?;
+                        let LayerDelta::Recurrent {
+                            convolution: next,
+                            matrix: next_matrix,
+                        } = &mut *delta
+                        else {
+                            return Err(invalid("CPU tiled prefill delta mismatch"));
+                        };
+                        std::mem::swap(convolution, next);
+                        std::mem::swap(matrix, next_matrix);
+                        check()?;
+                    }
+                    check()?;
+                    let _ = project_tile(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        TileReuse::default(),
+                        &weights.output,
+                        &tile.attended[..count],
+                        &mut tile.attention[..count],
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        reborrow_executor(&mut executor),
+                        check,
+                    )?;
+                }
+                (Attention::Full(weights), LayerState::Full { keys, values }) => {
+                    check()?;
+                    let reuse = project_tile_pair(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        [&weights.query, &weights.key],
+                        &tile.normalized[..count],
+                        &mut tile.mixed[..count],
+                        &mut tile.recurrent_gate[..count],
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        reborrow_executor(&mut executor),
+                        check,
+                    )?;
+                    check()?;
+                    let _ = project_tile(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        reuse,
+                        &weights.value,
+                        &tile.normalized[..count],
+                        &mut tile.beta[..count],
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        reborrow_executor(&mut executor),
+                        check,
+                    )?;
+                    for index in 0..count {
+                        check()?;
+                        let mut evaluation = Evaluation {
+                            geometry: &self.geometry,
+                            arithmetic: self.arithmetic,
+                            transforms: &self.transforms,
+                            position: base + index,
+                            frequencies_ready: false,
+                            projection: &mut self.workspace.projection,
+                            adapter: self.adapter.as_ref(),
+                            adapter_scale: self.adapter_scale,
+                            adapter_scratch: &mut self.workspace.adapter,
+                            executor: None,
+                        };
+                        evaluation.full_attention_state(
+                            weights,
+                            &tile.mixed[index],
+                            &mut tile.recurrent_gate[index],
+                            &mut tile.beta[index],
+                            keys,
+                            values,
+                            &mut self.workspace.attention_scratch.query,
+                            &mut self.workspace.attention_scratch.gate,
+                            &mut self.workspace.attention_scratch.scores,
+                            &mut self.workspace.attention_scratch.frequencies,
+                            &mut tile.attended[index],
+                        )?;
+                        keys.reserve_append()?;
+                        values.reserve_append()?;
+                        keys.append(&tile.recurrent_gate[index]);
+                        values.append(&tile.beta[index]);
+                        check()?;
+                    }
+                    check()?;
+                    let _ = project_tile(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        TileReuse::default(),
+                        &weights.output,
+                        &tile.attended[..count],
+                        &mut tile.attention[..count],
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        reborrow_executor(&mut executor),
+                        check,
+                    )?;
+                }
+                _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
+            }
             for index in 0..count {
                 check()?;
-                let hidden = &mut tile.hidden[index];
-                let normalized = &mut tile.normalized[index];
-                if chunked {
-                    add(hidden, &tile.attention[index]);
+                add(&mut tile.hidden[index], &tile.attention[index]);
+            }
+            if count > 1 && tile.projector.row_parallelism().workers() > 1 {
+                let hidden_ref = &tile.hidden[..count];
+                let arithmetic = self.arithmetic;
+                let post_norm = &layer.post_norm;
+                let epsilon = self.geometry.epsilon;
+                tile.projector.row_parallelism().update_chunks(
+                    &mut tile.normalized[..count],
+                    1,
+                    |base_tok, chunk| {
+                        for (offset, normalized) in chunk.iter_mut().enumerate() {
+                            arithmetic.normalize(
+                                &hidden_ref[base_tok + offset],
+                                post_norm,
+                                epsilon,
+                                normalized,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                for (hidden, normalized) in tile.hidden[..count]
+                    .iter()
+                    .zip(&mut tile.normalized[..count])
+                {
                     self.arithmetic.normalize(
                         hidden,
                         &layer.post_norm,
                         self.geometry.epsilon,
                         normalized,
                     )?;
-                    check()?;
-                    continue;
                 }
-                let mut evaluation = Evaluation {
-                    geometry: &self.geometry,
-                    arithmetic: self.arithmetic,
-                    transforms: &self.transforms,
-                    position: base + index,
-                    frequencies_ready: false,
-                    projection: &mut self.workspace.projection,
-                    adapter: self.adapter.as_ref(),
-                    adapter_scale: self.adapter_scale,
-                    adapter_scratch: &mut self.workspace.adapter,
-                    executor: reborrow_executor(&mut executor),
-                };
-                match (&layer.attention, &mut *state) {
-                    (Attention::Full(weights), LayerState::Full { keys, values }) => {
-                        evaluation.full_attention(
-                            weights,
-                            normalized,
-                            keys,
-                            values,
-                            &mut self.workspace.attention_scratch,
-                            delta,
-                            &mut self.workspace.attention,
-                        )?;
-                    }
-                    (
-                        Attention::Recurrent(weights),
-                        LayerState::Recurrent {
-                            convolution,
-                            matrix,
-                        },
-                    ) => {
-                        evaluation.recurrent_attention(
-                            weights,
-                            normalized,
-                            convolution,
-                            matrix,
-                            &mut self.workspace.attention_scratch,
-                            delta,
-                            &mut self.workspace.attention,
-                        )?;
-                    }
-                    _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
-                }
-                match (&mut *state, &mut *delta) {
-                    (LayerState::Full { keys, values }, LayerDelta::Full { key, value }) => {
-                        keys.reserve_append()?;
-                        values.reserve_append()?;
-                        keys.append(key);
-                        values.append(value);
-                    }
-                    (
-                        LayerState::Recurrent {
-                            convolution,
-                            matrix,
-                        },
-                        LayerDelta::Recurrent {
-                            convolution: next,
-                            matrix: next_matrix,
-                        },
-                    ) => {
-                        std::mem::swap(convolution, next);
-                        std::mem::swap(matrix, next_matrix);
-                    }
-                    _ => return Err(invalid("CPU tiled prefill delta mismatch")),
-                }
-                add(hidden, &self.workspace.attention);
-                self.arithmetic.normalize(
-                    hidden,
-                    &layer.post_norm,
-                    self.geometry.epsilon,
-                    normalized,
-                )?;
-                check()?;
             }
             check()?;
             let _ = project_tile_pair(
@@ -498,15 +668,30 @@ impl Qwen35 {
                 reborrow_executor(&mut executor),
                 check,
             )?;
-            for (up, gate) in tile.up[..count].iter_mut().zip(&tile.gate[..count]) {
-                self.arithmetic.swiglu_in_place_with_parallelism(
-                    gate,
-                    up,
-                    tile.projector.row_parallelism(),
+            if count > 1 && tile.projector.row_parallelism().workers() > 1 {
+                let gate_ref = &tile.gate[..count];
+                let arithmetic = self.arithmetic;
+                tile.projector.row_parallelism().update_chunks(
+                    &mut tile.up[..count],
+                    1,
+                    |base_tok, chunk| {
+                        for (offset, up) in chunk.iter_mut().enumerate() {
+                            arithmetic.swiglu_in_place(&gate_ref[base_tok + offset], up)?;
+                        }
+                        Ok(())
+                    },
                 )?;
+            } else {
+                for (up, gate) in tile.up[..count].iter_mut().zip(&tile.gate[..count]) {
+                    self.arithmetic.swiglu_in_place_with_parallelism(
+                        gate,
+                        up,
+                        tile.projector.row_parallelism(),
+                    )?;
+                }
             }
             check()?;
-            project_tile(
+            let _ = project_tile(
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
@@ -514,7 +699,7 @@ impl Qwen35 {
                 self.adapter_scale,
                 &mut self.workspace.adapter,
                 &mut self.workspace.projection.matvec,
-                None,
+                TileReuse::default(),
                 &layer.down,
                 &tile.up[..count],
                 &mut tile.normalized[..count],
@@ -598,7 +783,7 @@ fn project_tile_pair<'a>(
     projector: &mut ProjectionTile,
     mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     check: &dyn Fn() -> Result<()>,
-) -> Result<Option<&'a Tensor>> {
+) -> Result<TileReuse<'a>> {
     if let Some(exec) = reborrow_executor(&mut executor)
         && tensors[0].kind == 142
         && tensors[1].kind == 142
@@ -657,9 +842,12 @@ fn project_tile_pair<'a>(
                 )?;
             }
         }
-        return Ok(None);
+        return Ok(TileReuse {
+            basis: Some(tensors[1]),
+            prepared: None,
+        });
     }
-    project_tile(
+    let reuse = project_tile(
         transforms,
         geometry,
         arithmetic,
@@ -667,7 +855,7 @@ fn project_tile_pair<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
-        None,
+        TileReuse::default(),
         tensors[0],
         inputs,
         outputs_a,
@@ -685,7 +873,7 @@ fn project_tile_pair<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
-        Some(tensors[0]),
+        reuse,
         tensors[1],
         inputs,
         outputs_b,
@@ -693,15 +881,14 @@ fn project_tile_pair<'a>(
         projector,
         reborrow_executor(&mut executor),
         check,
-    )?;
-    Ok(Some(tensors[1]))
+    )
 }
 
 #[allow(
     clippy::too_many_arguments,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
 )]
-fn project_tile(
+fn project_tile<'a>(
     transforms: &Transforms,
     geometry: &super::Geometry,
     arithmetic: Arithmetic,
@@ -709,17 +896,23 @@ fn project_tile(
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
-    previous: Option<&Tensor>,
-    tensor: &Tensor,
+    previous: TileReuse<'a>,
+    tensor: &'a Tensor,
     inputs: &[Vec<f32>],
     outputs: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &mut ProjectionTile,
     mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     check: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+) -> Result<TileReuse<'a>> {
     let basis = transforms.basis(tensor);
-    let reuse_basis = previous.is_some_and(|prev| transforms.basis(prev) == basis);
+    let reuse_basis = previous
+        .basis
+        .is_some_and(|prev| transforms.basis(prev) == basis);
+    let reuse_prepared = reuse_basis
+        && previous
+            .prepared
+            .is_some_and(|prev| transforms.basis(prev) == basis);
     let activation = transform_tile_inputs(
         transforms,
         geometry,
@@ -729,7 +922,7 @@ fn project_tile(
         transformed,
         projector.row_parallelism(),
     )?;
-    if let Some(exec) = reborrow_executor(&mut executor) {
+    let prepared = if let Some(exec) = reborrow_executor(&mut executor) {
         let cols = tensor.dimensions.first().copied().unwrap_or(0);
         let rows = tensor
             .dimensions
@@ -749,6 +942,7 @@ fn project_tile(
                 }
                 finite(out, "projection executor output")?;
             }
+            None
         } else if (tensor.kind == 142 && cols.is_multiple_of(256) && exec.supports(tensor))
             || ((tensor.kind == 143 || (tensor.kind == 142 && !cols.is_multiple_of(256)))
                 && exec.supports_q8(tensor))
@@ -759,30 +953,36 @@ fn project_tile(
                     .prepare(tensor, input)?
                     .matvec_with_executor(tensor, output, exec)?;
             }
+            None
         } else {
             projector.project_with_previous(
-                previous.filter(|_| reuse_basis),
+                previous.prepared.filter(|_| reuse_prepared),
                 tensor,
                 activation,
                 outputs,
                 matches!(arithmetic, Arithmetic::PinnedSwift),
                 check,
             )?;
+            Some(tensor)
         }
     } else {
         projector.project_with_previous(
-            previous.filter(|_| reuse_basis),
+            previous.prepared.filter(|_| reuse_prepared),
             tensor,
             activation,
             outputs,
             matches!(arithmetic, Arithmetic::PinnedSwift),
             check,
         )?;
-    }
+        Some(tensor)
+    };
     if let Some(adapter) = adapter {
         for (input, output) in inputs.iter().zip(outputs) {
             adapter.linear(&tensor.name, input, adapter_scale, output, adapter_scratch)?;
         }
     }
-    Ok(())
+    Ok(TileReuse {
+        basis: Some(tensor),
+        prepared,
+    })
 }

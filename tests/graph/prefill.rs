@@ -319,3 +319,106 @@ fn tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance
     }
     Ok(())
 }
+
+#[test]
+fn tiled_prefill_batches_packed_attention_and_recurrent_projections() -> Result<()> {
+    let packed_tensor = |name: &str, cols: usize, rows: usize, kind: u32| -> Result<Tensor> {
+        let mut block = [0x66_u8; 34];
+        block[..2].copy_from_slice(&0x2800_u16.to_le_bytes());
+        let bytes = if kind == 143 {
+            bonsai_ternary::pack_ptq(&block)?.to_vec()
+        } else {
+            block.to_vec()
+        };
+        Ok(Tensor {
+            name: name.to_owned(),
+            dimensions: vec![cols, rows],
+            kind,
+            data: Arc::from(bytes.repeat((cols / 128) * rows)),
+        })
+    };
+    for recurrent in [false, true] {
+        for kind in [142_u32, 143] {
+            let build = || -> Result<Qwen35> {
+                let mut model = fixture(recurrent);
+                for (key, val) in [
+                    ("qwen35.embedding_length", 128_u64),
+                    ("qwen35.feed_forward_length", 128),
+                    ("qwen35.attention.key_length", 128),
+                    ("qwen35.attention.value_length", 128),
+                    ("qwen35.ssm.state_size", 128),
+                    ("qwen35.ssm.inner_size", 128),
+                ] {
+                    model
+                        .metadata
+                        .insert(key.to_owned(), MetadataValue::from(val));
+                }
+                let f32_insert = |model: &mut Model, name: &str, dims: &[usize], fill: f32| {
+                    let count = dims.iter().product();
+                    model
+                        .tensors
+                        .insert(name.to_owned(), weight(name, dims, &vec![fill; count]));
+                };
+                f32_insert(&mut model, "token_embd.weight", &[128, 2], 0.125);
+                f32_insert(&mut model, "output.weight", &[128, 2], 0.125);
+                f32_insert(&mut model, "output_norm.weight", &[128], 1.0);
+                f32_insert(&mut model, "blk.0.attn_norm.weight", &[128], 1.0);
+                f32_insert(&mut model, "blk.0.post_attention_norm.weight", &[128], 1.0);
+                for name in [
+                    "blk.0.ffn_up.weight",
+                    "blk.0.ffn_gate.weight",
+                    "blk.0.ffn_down.weight",
+                ] {
+                    model
+                        .tensors
+                        .insert(name.to_owned(), packed_tensor(name, 128, 128, kind)?);
+                }
+                if recurrent {
+                    for (name, rows) in [
+                        ("blk.0.attn_qkv.weight", 384),
+                        ("blk.0.attn_gate.weight", 128),
+                        ("blk.0.ssm_out.weight", 128),
+                    ] {
+                        model
+                            .tensors
+                            .insert(name.to_owned(), packed_tensor(name, 128, rows, kind)?);
+                    }
+                    f32_insert(&mut model, "blk.0.ssm_conv1d.weight", &[2, 384], 0.25);
+                    f32_insert(&mut model, "blk.0.ssm_beta.weight", &[128, 1], 0.0625);
+                    f32_insert(&mut model, "blk.0.ssm_alpha.weight", &[128, 1], -0.0625);
+                    f32_insert(&mut model, "blk.0.ssm_norm.weight", &[128], 1.0);
+                } else {
+                    for (name, rows) in [
+                        ("blk.0.attn_q.weight", 256),
+                        ("blk.0.attn_k.weight", 128),
+                        ("blk.0.attn_v.weight", 128),
+                        ("blk.0.attn_output.weight", 128),
+                    ] {
+                        model
+                            .tensors
+                            .insert(name.to_owned(), packed_tensor(name, 128, rows, kind)?);
+                    }
+                    f32_insert(&mut model, "blk.0.attn_q_norm.weight", &[128], 1.0);
+                    f32_insert(&mut model, "blk.0.attn_k_norm.weight", &[128], 1.0);
+                }
+                Qwen35::new(model, 16)
+            };
+            let mut expected = build()?;
+            let base = build()?;
+            let reserve = base.tiled_prefill_scratch_bytes(8)?;
+            let mut actual = base.with_tiled_prefill(8, reserve)?;
+            let prompt = [0, 1, 1, 0, 1, 0, 0, 1, 0];
+            for token in prompt {
+                expected.ingest(token)?;
+            }
+            actual.ingest_block(&prompt, &|| Ok(()))?;
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+            assert_eq!(actual.evaluate(1)?, expected.evaluate(1)?);
+            let stats = actual.tiled_prefill_statistics();
+            assert_eq!(stats.completed_tiles, 2);
+            assert_eq!(stats.completed_tokens, 9);
+            assert_eq!(stats.packed_projections, if recurrent { 12 } else { 14 });
+        }
+    }
+    Ok(())
+}

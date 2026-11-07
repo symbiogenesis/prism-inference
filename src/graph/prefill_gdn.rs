@@ -1,6 +1,6 @@
 //! Opt-in bounded triangular GDN chunks; no cumulative-decay division.
 
-use super::{TiledPrefill, project_tile, project_tile_pair, reborrow_executor};
+use super::{TileReuse, TiledPrefill, project_tile, project_tile_pair, reborrow_executor};
 use crate::graph::{
     Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms, copy_into,
     finite, l2_norm, resize_into, sigmoid, small_float,
@@ -182,7 +182,7 @@ pub(super) fn recurrent_tile(
         (&layer.alpha, &mut tile.alpha),
     ] {
         check()?;
-        project_tile(
+        previous_weight = project_tile(
             transforms,
             geometry,
             arithmetic,
@@ -199,10 +199,10 @@ pub(super) fn recurrent_tile(
             reborrow_executor(&mut executor),
             check,
         )?;
-        previous_weight = Some(weight);
     }
     copy_into(history, convolution)?;
     resize_into(previous.len(), matrix)?;
+    let parallelize_post_conv = tile.projector.row_parallelism().workers() > 1 && count > 1;
     for token in 0..count {
         check()?;
         let mixed = &mut tile.mixed[token];
@@ -231,21 +231,55 @@ pub(super) fn recurrent_tile(
             }
             arithmetic.silu(mixed);
         }
-        for head in mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head) {
-            l2_norm(head, geometry.epsilon);
-        }
         resize_into(geometry.value_width(), &mut tile.attended[token])?;
-        for head in 0..geometry.ssm_values {
-            let activation = tile.alpha[token][head] + layer.time_bias[head];
-            let softplus = if activation > 20.0 {
-                activation
-            } else {
-                (1.0 + activation.exp()).ln()
-            };
-            tile.alpha[token][head] = (softplus * layer.decay[head]).exp();
-            tile.beta[token][head] = sigmoid(tile.beta[token][head]);
+        if !parallelize_post_conv {
+            for head in mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head) {
+                l2_norm(head, geometry.epsilon);
+            }
+            for head in 0..geometry.ssm_values {
+                let activation = tile.alpha[token][head] + layer.time_bias[head];
+                let softplus = if activation > 20.0 {
+                    activation
+                } else {
+                    (1.0 + activation.exp()).ln()
+                };
+                tile.alpha[token][head] = (softplus * layer.decay[head]).exp();
+                tile.beta[token][head] = sigmoid(tile.beta[token][head]);
+            }
         }
         check()?;
+    }
+    if parallelize_post_conv {
+        tile.projector.row_parallelism().update_paired_chunks(
+            &mut tile.mixed[..count],
+            1,
+            &mut tile.alpha[..count],
+            1,
+            |_, mixed_chunk, alpha_chunk| {
+                for (mixed, alpha) in mixed_chunk.iter_mut().zip(alpha_chunk.iter_mut()) {
+                    for head in
+                        mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head)
+                    {
+                        l2_norm(head, geometry.epsilon);
+                    }
+                    for head in 0..geometry.ssm_values {
+                        let activation = alpha[head] + layer.time_bias[head];
+                        let softplus = if activation > 20.0 {
+                            activation
+                        } else {
+                            (1.0 + activation.exp()).ln()
+                        };
+                        alpha[head] = (softplus * layer.decay[head]).exp();
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        for beta in &mut tile.beta[..count] {
+            for value in beta.iter_mut().take(geometry.ssm_values) {
+                *value = sigmoid(*value);
+            }
+        }
     }
     let width = geometry.ssm_head;
     if tile.projector.row_parallelism().workers() > 1 && geometry.ssm_values > 1 {
@@ -363,7 +397,7 @@ pub(super) fn recurrent_tile(
         }
     }
     check()?;
-    project_tile(
+    let _ = project_tile(
         transforms,
         geometry,
         arithmetic,
@@ -371,7 +405,7 @@ pub(super) fn recurrent_tile(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
-        None,
+        TileReuse::default(),
         &layer.output,
         &tile.attended[..count],
         &mut tile.attention[..count],

@@ -458,6 +458,14 @@ impl Geometry {
     const fn convolution_width(&self) -> usize {
         2 * self.key_width() + self.value_width()
     }
+
+    const fn query_gate_width(&self) -> usize {
+        2 * self.head * self.heads
+    }
+
+    const fn kv_width(&self) -> usize {
+        self.head * self.kv_heads
+    }
 }
 
 struct FullAttention {
@@ -1976,11 +1984,7 @@ impl Evaluation<'_, '_> {
 
     #[allow(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
-        clippy::suboptimal_flops,
-        clippy::cast_possible_truncation,
-        clippy::as_conversions,
-        reason = "Preserve scalar nonflash F16 matmul inputs and binary64 accumulation rounded to binary32."
+        reason = "Separate immutable committed state from reusable transactional scratch."
     )]
     fn full_attention(
         &mut self,
@@ -1995,32 +1999,69 @@ impl Evaluation<'_, '_> {
         let LayerDelta::Full { key, value } = delta else {
             return Err(invalid("decoder full-attention delta kind mismatch"));
         };
-        let g = self.geometry;
         self.project_group_into(
             [&layer.query, &layer.key, &layer.value],
             input,
             [&mut scratch.projected, key, value],
         )?;
+        self.full_attention_state(
+            layer,
+            &scratch.projected,
+            key,
+            value,
+            keys,
+            values,
+            &mut scratch.query,
+            &mut scratch.gate,
+            &mut scratch.scores,
+            &mut scratch.frequencies,
+            &mut scratch.attended,
+        )?;
+        self.project_into(&layer.output, &scratch.attended, output)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::suboptimal_flops,
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "Preserve scalar nonflash F16 matmul inputs and binary64 accumulation rounded to binary32."
+    )]
+    fn full_attention_state(
+        &mut self,
+        layer: &FullAttention,
+        projected: &[f32],
+        key: &mut [f32],
+        value: &mut [f32],
+        keys: &KvCache,
+        values: &KvCache,
+        query_scratch: &mut Vec<f32>,
+        gate_scratch: &mut Vec<f32>,
+        scores_scratch: &mut Vec<f32>,
+        frequencies_scratch: &mut Vec<(f32, f32)>,
+        attended: &mut Vec<f32>,
+    ) -> Result<()> {
+        let g = self.geometry;
         // Geometry and position are shared by every full-attention layer in
         // this token evaluation. Reuse the exact scalar frequencies for Q/K
         // and subsequent layers; the flag resets for every evaluation attempt.
         if !self.frequencies_ready {
-            rope_frequencies(g, self.position, &mut scratch.frequencies)?;
+            rope_frequencies(g, self.position, frequencies_scratch)?;
             self.frequencies_ready = true;
         }
-        resize_into(g.head * g.heads, &mut scratch.query)?;
-        resize_into(g.head * g.heads, &mut scratch.gate)?;
+        resize_into(g.head * g.heads, query_scratch)?;
+        resize_into(g.head * g.heads, gate_scratch)?;
         let arithmetic = self.arithmetic;
-        let projected: &[f32] = &scratch.projected;
         let query_norm: &[f32] = &layer.query_norm;
-        let frequencies: &[(f32, f32)] = &scratch.frequencies;
+        let frequencies: &[(f32, f32)] = frequencies_scratch;
         self.projection
             .matvec
             .row_parallelism()
             .update_paired_chunks(
-                &mut scratch.query,
+                query_scratch,
                 g.head,
-                &mut scratch.gate,
+                gate_scratch,
                 g.head,
                 |base_head, query_chunk, gate_chunk| {
                     for (head_offset, (query_head, gate_head)) in query_chunk
@@ -2045,19 +2086,19 @@ impl Evaluation<'_, '_> {
                 .normalize_in_place(head, &layer.key_norm, g.epsilon)?;
         }
         self.arithmetic
-            .attention_rope(key, g, &scratch.frequencies)?;
+            .attention_rope(key, g, frequencies_scratch)?;
         round_f16_slice(key);
         round_f16_slice(value);
-        finite(&scratch.query, "binary16 attention query")?;
+        finite(query_scratch, "binary16 attention query")?;
         finite(key, "binary16 key cache")?;
         finite(value, "binary16 value cache")?;
-        resize_into(g.head * g.heads, &mut scratch.attended)?;
+        resize_into(g.head * g.heads, attended)?;
         let score_len = self.position + 1;
-        resize_into(g.heads * score_len, &mut scratch.scores)?;
+        resize_into(g.heads * score_len, scores_scratch)?;
         let scale = 1.0 / small_float(g.head)?.sqrt();
         let arithmetic = self.arithmetic;
-        let query_ref: &[f32] = &scratch.query;
-        let gate_ref: &[f32] = &scratch.gate;
+        let query_ref: &[f32] = query_scratch;
+        let gate_ref: &[f32] = gate_scratch;
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
         let heads_per_kv = g.heads / g.kv_heads;
@@ -2065,9 +2106,9 @@ impl Evaluation<'_, '_> {
             .matvec
             .row_parallelism()
             .update_paired_chunks(
-                &mut scratch.attended,
+                attended,
                 g.head,
-                &mut scratch.scores,
+                scores_scratch,
                 score_len,
                 |base_head, attended_chunk, scores_chunk| {
                     for (head_offset, (result, scores)) in attended_chunk
@@ -2112,7 +2153,44 @@ impl Evaluation<'_, '_> {
                     }
                     Ok(())
                 },
-            )?;
+            )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Separate immutable committed state from reusable transactional scratch."
+    )]
+    fn recurrent_attention(
+        &mut self,
+        layer: &RecurrentAttention,
+        input: &[f32],
+        history: &[f32],
+        previous: &[f32],
+        scratch: &mut AttentionScratch,
+        delta: &mut LayerDelta,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.project_group_into(
+            [&layer.qkv, &layer.gate, &layer.beta, &layer.alpha],
+            input,
+            [
+                &mut scratch.projected,
+                &mut scratch.gate,
+                &mut scratch.beta,
+                &mut scratch.alpha,
+            ],
+        )?;
+        self.recurrent_attention_state(
+            layer,
+            &mut scratch.projected,
+            &scratch.gate,
+            &scratch.beta,
+            &scratch.alpha,
+            history,
+            previous,
+            delta,
+            &mut scratch.attended,
+        )?;
         self.project_into(&layer.output, &scratch.attended, output)
     }
 
@@ -2129,15 +2207,17 @@ impl Evaluation<'_, '_> {
         clippy::too_many_arguments,
         reason = "Separate immutable committed state from reusable transactional scratch."
     )]
-    fn recurrent_attention(
-        &mut self,
+    fn recurrent_attention_state(
+        &self,
         layer: &RecurrentAttention,
-        input: &[f32],
+        mixed: &mut [f32],
+        gate_ref: &[f32],
+        beta_ref: &[f32],
+        alpha_ref: &[f32],
         history: &[f32],
         previous: &[f32],
-        scratch: &mut AttentionScratch,
         delta: &mut LayerDelta,
-        output: &mut Vec<f32>,
+        attended: &mut Vec<f32>,
     ) -> Result<()> {
         let LayerDelta::Recurrent {
             convolution,
@@ -2147,23 +2227,12 @@ impl Evaluation<'_, '_> {
             return Err(invalid("decoder recurrent-attention delta kind mismatch"));
         };
         let g = self.geometry;
-        self.project_group_into(
-            [&layer.qkv, &layer.gate, &layer.beta, &layer.alpha],
-            input,
-            [
-                &mut scratch.projected,
-                &mut scratch.gate,
-                &mut scratch.beta,
-                &mut scratch.alpha,
-            ],
-        )?;
         let hist_width = g.convolution - 1;
         if hist_width > 0 {
             resize_into(history.len(), convolution)?;
         } else {
             zeros_into(history.len(), convolution)?;
         }
-        let mixed = &mut scratch.projected;
         let key_width = g.key_width();
         let arithmetic = self.arithmetic;
         let parallelism = self.projection.matvec.row_parallelism();
@@ -2265,21 +2334,18 @@ impl Evaluation<'_, '_> {
             }
         }
         resize_into(previous.len(), matrix)?;
-        resize_into(g.value_width(), &mut scratch.attended)?;
+        resize_into(g.value_width(), attended)?;
         let scale = 1.0 / small_float(g.ssm_head)?.sqrt();
         let head_state_len = g.ssm_head * g.ssm_head;
         let arithmetic = self.arithmetic;
         let mixed_ref: &[f32] = mixed;
-        let alpha_ref: &[f32] = &scratch.alpha;
-        let beta_ref: &[f32] = &scratch.beta;
-        let gate_ref: &[f32] = &scratch.gate;
         self.projection
             .matvec
             .row_parallelism()
             .update_paired_chunks(
                 matrix,
                 head_state_len,
-                &mut scratch.attended,
+                attended,
                 g.ssm_head,
                 |base_head, state_chunk, attended_chunk| {
                     for (offset, (state, output)) in state_chunk
@@ -2327,8 +2393,7 @@ impl Evaluation<'_, '_> {
                     Ok(())
                 },
             )?;
-        finite(convolution, "convolution state")?;
-        self.project_into(&layer.output, &scratch.attended, output)
+        finite(convolution, "convolution state")
     }
 }
 

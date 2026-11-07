@@ -2240,18 +2240,28 @@ impl PreparedMatvec<'_> {
                     target_feature = "neon"
                 ))]
                 if tensor.kind == PTQ1
-                    && scratch.pinned_accumulation
                     && matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon)
                 {
                     let q8 = &scratch.q8;
+                    if scratch.pinned_accumulation {
+                        return scratch.row_parallelism.fill_four_rows(
+                            &tensor.data,
+                            row_bytes,
+                            output,
+                            &mut scratch.row_errors,
+                            |rows| neon::dot_ptq1_eight_rows_pinned(rows, q8),
+                            |rows| neon::dot_ptq1_four_rows_pinned(rows, q8),
+                            |bytes| neon::dot_ptq1_row_pinned(bytes, q8),
+                        );
+                    }
                     return scratch.row_parallelism.fill_four_rows(
                         &tensor.data,
                         row_bytes,
                         output,
                         &mut scratch.row_errors,
-                        |rows| neon::dot_ptq1_eight_rows_pinned(rows, q8),
-                        |rows| neon::dot_ptq1_four_rows_pinned(rows, q8),
-                        |bytes| neon::dot_ptq1_row_pinned(bytes, q8),
+                        |rows| neon::dot_ptq1_eight_rows_source(rows, q8),
+                        |rows| neon::dot_ptq1_four_rows_source(rows, q8),
+                        |bytes| neon::dot_ptq1_row_source(bytes, q8),
                     );
                 }
                 scratch.row_parallelism.fill(

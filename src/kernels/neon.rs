@@ -88,26 +88,32 @@ pub(super) fn dot(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
 }
 
 #[inline]
-fn pq2_pair_sums_prewidened(
-    weights: i8x16<Neon>,
-    activation_low: i16x8<Neon>,
-    activation_high: i16x8<Neon>,
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Passes the eight pre-widened activation planes directly in NEON registers."
+)]
+fn pq2_half_unsigned_sum(
+    w: u8x16<Neon>,
+    p0_low: i16x8<Neon>,
+    p0_high: i16x8<Neon>,
+    p1_low: i16x8<Neon>,
+    p1_high: i16x8<Neon>,
+    p2_low: i16x8<Neon>,
+    p2_high: i16x8<Neon>,
+    p3_low: i16x8<Neon>,
+    p3_high: i16x8<Neon>,
 ) -> i16x8<Neon> {
-    let (weight_low, weight_high) = weights.widen();
-    weight_low * activation_low + weight_high * activation_high
-}
-
-#[inline]
-fn pq2_unsigned_pair_sums_prewidened(
-    codes: u8x16<Neon>,
-    activation_low: i16x8<Neon>,
-    activation_high: i16x8<Neon>,
-) -> i16x8<Neon> {
-    // Each byte of `codes` is in 0..=3, so bitcasting to i8x16 before widening
-    // produces exact unsigned two-bit codes 0..=3 in i16x8. Across all eight
-    // planes (16 products per lane), each i16 lane is bounded by -6144..=6096.
-    let (weight_low, weight_high) = codes.bitcast::<i8x16<Neon>>().widen();
-    weight_low * activation_low + weight_high * activation_high
+    // Widen the sixteen packed bytes once to u16x8 (0..=255), then extract all
+    // four unsigned two-bit planes in 16-bit registers. Across both halves
+    // (16 products per lane), each i16 lane is bounded by -6144..=6096.
+    let (u_low, u_high) = w.widen();
+    let w_low = u_low.bitcast::<i16x8<Neon>>();
+    let w_high = u_high.bitcast::<i16x8<Neon>>();
+    let s0 = (w_low & 3) * p0_low + (w_high & 3) * p0_high;
+    let s1 = ((w_low >> 2) & 3) * p1_low + ((w_high >> 2) & 3) * p1_high;
+    let s2 = ((w_low >> 4) & 3) * p2_low + ((w_high >> 4) & 3) * p2_high;
+    let s3 = (w_low >> 6) * p3_low + (w_high >> 6) * p3_high;
+    (s0 + s1) + (s2 + s3)
 }
 
 #[inline]
@@ -287,23 +293,14 @@ pub(super) fn dot_consumption_order_prewidened(
     {
         let w = u8x16::from_slice(neon, bytes);
         let planes = values.as_chunks::<8>().0;
-        acc += pq2_unsigned_pair_sums_prewidened(
-            w & 3,
+        acc += pq2_half_unsigned_sum(
+            w,
             i16x8::from_slice(neon, &planes[0]),
             i16x8::from_slice(neon, &planes[1]),
-        );
-        acc += pq2_unsigned_pair_sums_prewidened(
-            (w >> 2) & 3,
             i16x8::from_slice(neon, &planes[2]),
             i16x8::from_slice(neon, &planes[3]),
-        );
-        acc += pq2_unsigned_pair_sums_prewidened(
-            (w >> 4) & 3,
             i16x8::from_slice(neon, &planes[4]),
             i16x8::from_slice(neon, &planes[5]),
-        );
-        acc += pq2_unsigned_pair_sums_prewidened(
-            w >> 6,
             i16x8::from_slice(neon, &planes[6]),
             i16x8::from_slice(neon, &planes[7]),
         );
@@ -345,11 +342,9 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..4 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                let s0 = pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
-                let s1 = pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
-                let s2 = pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
-                let s3 = pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
-                acc[row] += (s0 + s1) + (s2 + s3);
+                acc[row] += pq2_half_unsigned_sum(
+                    w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
+                );
             }
         }
         let sums = (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3])
@@ -412,11 +407,9 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             let offset = 2 + half * 16;
             for row in 0..8 {
                 let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                let s0 = pq2_unsigned_pair_sums_prewidened(w & 3, p0_low, p0_high);
-                let s1 = pq2_unsigned_pair_sums_prewidened((w >> 2) & 3, p1_low, p1_high);
-                let s2 = pq2_unsigned_pair_sums_prewidened((w >> 4) & 3, p2_low, p2_high);
-                let s3 = pq2_unsigned_pair_sums_prewidened(w >> 6, p3_low, p3_high);
-                acc[row] += (s0 + s1) + (s2 + s3);
+                acc[row] += pq2_half_unsigned_sum(
+                    w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
+                );
             }
         }
         let act_sum = i32x4::splat(neon, activation.sum);
@@ -1144,6 +1137,32 @@ pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
     Some(Ok(()))
 }
 
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Passes the eight pre-widened activation planes directly in NEON registers."
+)]
+fn pq2_half_signed_sum(
+    w: u8x16<Neon>,
+    p0_low: i16x8<Neon>,
+    p0_high: i16x8<Neon>,
+    p1_low: i16x8<Neon>,
+    p1_high: i16x8<Neon>,
+    p2_low: i16x8<Neon>,
+    p2_high: i16x8<Neon>,
+    p3_low: i16x8<Neon>,
+    p3_high: i16x8<Neon>,
+) -> i16x8<Neon> {
+    let (u_low, u_high) = w.widen();
+    let w_low = u_low.bitcast::<i16x8<Neon>>();
+    let w_high = u_high.bitcast::<i16x8<Neon>>();
+    let s0 = ((w_low & 3) - 1) * p0_low + ((w_high & 3) - 1) * p0_high;
+    let s1 = (((w_low >> 2) & 3) - 1) * p1_low + (((w_high >> 2) & 3) - 1) * p1_high;
+    let s2 = (((w_low >> 4) & 3) - 1) * p2_low + (((w_high >> 4) & 3) - 1) * p2_high;
+    let s3 = ((w_low >> 6) - 1) * p3_low + ((w_high >> 6) - 1) * p3_high;
+    (s0 + s1) + (s2 + s3)
+}
+
 /// Consumes scoped digit-plane activations without unpack interleaves per row.
 ///
 /// Each sixteen packed bytes describe sixty-four consecutive weights. Their
@@ -1176,34 +1195,24 @@ pub(super) fn dot_consumption_order(packed: &[u8; 32], activations: &[i8; 128]) 
             })
             .sum();
     };
-    let mut even = i16x8::splat(neon, 0);
-    let mut odd = i16x8::splat(neon, 0);
+    let mut acc = i16x8::splat(neon, 0);
     for (bytes, values) in packed
         .as_chunks::<16>()
         .0
         .iter()
         .zip(activations.as_chunks::<64>().0)
     {
-        let packed = u8x16::from_slice(neon, bytes);
+        let w = u8x16::from_slice(neon, bytes);
         let planes = values.as_chunks::<16>().0;
-        even += pq2_pair_sums(
-            (packed & 3).bitcast::<i8x16<Neon>>() - 1,
-            i8x16::from_slice(neon, &planes[0]),
-        );
-        odd += pq2_pair_sums(
-            ((packed >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
-            i8x16::from_slice(neon, &planes[1]),
-        );
-        even += pq2_pair_sums(
-            ((packed >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
-            i8x16::from_slice(neon, &planes[2]),
-        );
-        odd += pq2_pair_sums(
-            (packed >> 6).bitcast::<i8x16<Neon>>() - 1,
-            i8x16::from_slice(neon, &planes[3]),
+        let (p0_low, p0_high) = i8x16::from_slice(neon, &planes[0]).widen();
+        let (p1_low, p1_high) = i8x16::from_slice(neon, &planes[1]).widen();
+        let (p2_low, p2_high) = i8x16::from_slice(neon, &planes[2]).widen();
+        let (p3_low, p3_high) = i8x16::from_slice(neon, &planes[3]).widen();
+        acc += pq2_half_signed_sum(
+            w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
         );
     }
-    pq2_reduce(even + odd)
+    pq2_reduce(acc)
 }
 
 /// Evaluates four 128-weight `PQ2` blocks against shared pre-widened activation planes.
@@ -1225,20 +1234,9 @@ pub(super) fn dot_consumption_order_four(
         for row in 0..4 {
             let bytes = &packed[row].as_chunks::<16>().0[half];
             let w = u8x16::from_slice(neon, bytes);
-            acc[row] +=
-                pq2_pair_sums_prewidened((w & 3).bitcast::<i8x16<Neon>>() - 1, p0_low, p0_high);
-            acc[row] += pq2_pair_sums_prewidened(
-                ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1,
-                p1_low,
-                p1_high,
+            acc[row] += pq2_half_signed_sum(
+                w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
             );
-            acc[row] += pq2_pair_sums_prewidened(
-                ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1,
-                p2_low,
-                p2_high,
-            );
-            acc[row] +=
-                pq2_pair_sums_prewidened((w >> 6).bitcast::<i8x16<Neon>>() - 1, p3_low, p3_high);
         }
     }
     reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3]).to_array()

@@ -24,22 +24,13 @@ Experimental native Hexagon NPU (`v81`) crates (`bonsai-hexagon-native` and
 `bonsai-hexagon-runtime`, both `publish = false`) and Windows ARM64 worker hooks
 add:
 
-- 64-bit SWAR interleave for `PQ2_0 -> HTP_TYPE_Q2_0` tile packing and SWAR
-  `FP16` scale validation, plus 16-lane coalesced `F32` input/output finiteness
-  verification;
-- Multi-op resident `HTP_TYPE_Q2_0` batch submission (`submit_resident_batch2`,
-  `submit_resident_batch3`, and `submit_resident_multi2..4` across
-  `NativeQ2Submitter` and `NativeQ2Session`) with direct in-place descriptor
-  construction and pointer-deduplicated multi-token/pair activation staging,
-  amortizing FastRPC queue synchronization across grouped projections and tiled
-  prefill batches (`project_f32_tokens` and `project_f32_pair_tokens`);
-- 112-projection multi-arena resident coverage (`DEFAULT_NATIVE_Q2_PROJECTIONS`,
-  `1,925,775,360` bytes / `1,836.56` MiB across four alternating `<= 480` MiB
-  `FastRPC` weight arenas covering all 18 initial layers `blk.0..=blk.17` via
-  `req.n_bufs > 1` and `tensor.bi > 0`), `O(1)` address-range + binary-search
-  tensor eligibility and resident cache lookups, reusable pre-warming scratch,
-  and worker-thread Hexagon `NativeQ2Executor` registration in
-  `prism-inference-server`.
+- 64-bit SWAR interleave for `PQ2_0 -> HTP_TYPE_Q2_0` tile packing;
+- Multi-op resident `HTP_TYPE_Q2_0` batch submission (`submit_resident_batch2`
+  and `submit_resident_batch3` across `NativeQ2Submitter` and `NativeQ2Session`)
+  amortizing FastRPC queue synchronization across grouped projections;
+- Opt-in `PRISM_HEXAGON_NATIVE_Q2=1` worker-thread Hexagon `NativeQ2Executor`
+  registration and grouped `F32` projection dispatch (`supports_f32_group` and
+  `project_f32_group`) in `prism-inference-server`.
 
 ## Supported release scope
 

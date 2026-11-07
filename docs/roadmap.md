@@ -14,8 +14,8 @@ worker, private HTTP server, GGUF tooling, ternary codecs and native storage
 overlay. SwiftBonsai consumes a prebuilt server inside its guarded Windows Job;
 ordinary SwiftBonsai builds do not compile this runtime.
 
-The [0.1.17 release scope](release-0.1.17.md) compares the prepared CPU release
-with `0.1.16`. Binary delivery, crates.io publication and
+The [0.1.18 release scope](release-0.1.18.md) compares the prepared CPU release
+with `0.1.17`. Binary delivery, crates.io publication and
 application-default promotion have separate requirements. Original PQ2, one row
 worker and fresh per-request state remain the service defaults. PTQ1, approved
 rank-one adapters, parallel row workers and latest-prefix reuse require explicit

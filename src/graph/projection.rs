@@ -241,4 +241,13 @@ impl Decoder for ProjectedQwen35<'_> {
     fn ingest(&mut self, token: u32) -> Result<()> {
         self.evaluate_token(token, None)
     }
+    fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
+        self.available()?;
+        self.admit_work(tokens.len(), 0)?;
+        let result =
+            self.decoder
+                .ingest_prefill_block_with_executor(tokens, check, Some(self.executor));
+        self.faulted = result.is_err();
+        result
+    }
 }

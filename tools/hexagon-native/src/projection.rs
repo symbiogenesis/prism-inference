@@ -192,7 +192,7 @@ impl Q2ProjectionReport {
                     && self.batch_operations == 1
                     && self.resident_submissions > 0
                     && self.operations_submitted >= self.queue_writes_submitted
-                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(3)))
+                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(4)))
             && self.queue.completed_cycle()
     }
 }

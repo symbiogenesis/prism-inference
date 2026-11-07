@@ -2774,24 +2774,33 @@ mod tests {
         serde_json::from_value::<Request>(four_layer_req)?.limits()?;
 
         let default_proj = bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS;
-        assert_eq!(default_proj.len(), 56);
+        assert_eq!(default_proj.len(), 112);
         assert_eq!(
             expected_resident_weight_bytes(&default_proj[..28], ExecutionBackend::NativeQ2)?,
             502_824_960
         );
         assert_eq!(
-            expected_resident_weight_bytes(&default_proj, ExecutionBackend::NativeQ2)?,
+            expected_resident_weight_bytes(&default_proj[..56], ExecutionBackend::NativeQ2)?,
             962_887_680
+        );
+        assert_eq!(
+            expected_resident_weight_bytes(&default_proj, ExecutionBackend::NativeQ2)?,
+            1_925_775_360
         );
         let mut single_arena_req = native_req.clone();
         single_arena_req["projections"] = json!(&default_proj[..28]);
         single_arena_req["maximumOperations"] = json!(84);
         serde_json::from_value::<Request>(single_arena_req)?.limits()?;
 
-        let mut dual_arena_req = native_req;
-        dual_arena_req["projections"] = json!(&default_proj[..]);
+        let mut dual_arena_req = native_req.clone();
+        dual_arena_req["projections"] = json!(&default_proj[..56]);
         dual_arena_req["maximumOperations"] = json!(168);
         serde_json::from_value::<Request>(dual_arena_req)?.limits()?;
+
+        let mut quad_arena_req = native_req;
+        quad_arena_req["projections"] = json!(&default_proj[..]);
+        quad_arena_req["maximumOperations"] = json!(336);
+        serde_json::from_value::<Request>(quad_arena_req)?.limits()?;
 
         let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
         let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];

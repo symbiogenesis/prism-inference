@@ -991,7 +991,7 @@ impl Transforms {
             let signs = self.signs.get(&input.len()).map(Vec::as_slice);
             if parallelism.workers() > 1
                 && self.block >= 256
-                && input.len() >= self.block.saturating_mul(2)
+                && input.len() >= self.block.saturating_mul(16)
             {
                 return parallelism.update_chunks(transformed, self.block, |base_block, chunk| {
                     for (local_idx, out_block) in chunk.chunks_exact_mut(self.block).enumerate() {
@@ -1049,7 +1049,7 @@ impl Transforms {
     ) -> Result<()> {
         if parallelism.workers() > 1
             && self.block >= 256
-            && input.len() >= self.block.saturating_mul(2)
+            && input.len() >= self.block.saturating_mul(16)
             && input.len().is_multiple_of(self.block)
         {
             return parallelism.update_chunks(input, self.block, |_, chunk| self.rotate(chunk));

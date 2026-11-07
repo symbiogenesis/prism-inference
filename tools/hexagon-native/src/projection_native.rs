@@ -1078,14 +1078,23 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep resident native-Q2 multi-op validation, scoped flush size and output publication together"
-    )]
     fn submit_native_resident_batch<const B: usize>(
         &mut self,
         handles: [&NativeQ2WeightHandle; B],
         activation: &[f32],
+        outputs: [&mut [f32]; B],
+    ) -> Result<(), Error> {
+        self.submit_native_resident_multi::<B>(handles, [activation; B], outputs)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep resident native-Q2 multi-op validation, scoped flush size and output publication together"
+    )]
+    fn submit_native_resident_multi<const B: usize>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; B],
+        activations: [&[f32]; B],
         mut outputs: [&mut [f32]; B],
     ) -> Result<(), Error> {
         let result = (|| {
@@ -1118,10 +1127,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 return Err(self.fail("projection-input-refused-pinned"));
             };
             let columns = handles[0].columns();
-            if !native_q2::is_finite_f32_slice(activation) {
-                return Err(self.fail("projection-input-refused-pinned"));
-            }
             for (member, handle) in handles.into_iter().enumerate() {
+                let activation = activations[member];
                 if handle.columns() != columns
                     || self.native_resident_weights.range(handle).is_err()
                     || native_q2::validate_activation_dimensions(
@@ -1134,6 +1141,11 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                     )
                     .is_err()
                 {
+                    return Err(self.fail("projection-input-refused-pinned"));
+                }
+                let shared_prev = (0..member)
+                    .any(|idx| std::ptr::eq(activations[idx].as_ptr(), activation.as_ptr()));
+                if !shared_prev && !native_q2::is_finite_f32_slice(activation) {
                     return Err(self.fail("projection-input-refused-pinned"));
                 }
                 self.flush_extra_arena(handle.arena_index())?;
@@ -1151,14 +1163,14 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             let image = unsafe {
                 std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            let Ok(active) = native_q2::image_batch_resident::<B>(
+            let Ok(active) = native_q2::image_multi_resident::<B>(
                 image,
                 base,
                 self.expected.fd,
                 working_bytes,
                 &extra_descs[..self.extra_arena_count],
                 handles,
-                activation,
+                activations,
             ) else {
                 return Err(self.fail("projection-frame-refused-pinned"));
             };
@@ -1533,6 +1545,33 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         self.submit_native_resident_batch::<3>(handles, activation, outputs)
     }
 
+    fn submit_resident_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        self.submit_native_resident_multi::<2>(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi3(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 3],
+        outputs: [&mut [f32]; 3],
+    ) -> Result<(), Error> {
+        self.submit_native_resident_multi::<3>(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi4(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 4],
+        activations: [&[f32]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> Result<(), Error> {
+        self.submit_native_resident_multi::<4>(handles, activations, outputs)
+    }
+
     fn submit(
         &mut self,
         columns: usize,
@@ -1846,6 +1885,39 @@ impl NativeQ2Submitter for NativeQ2Session {
     ) -> Result<(), Error> {
         self.with_session(|session| {
             NativeQ2Submitter::submit_resident_batch3(session, handles, activation, outputs)
+        })
+    }
+
+    fn submit_resident_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident_multi2(session, handles, activations, outputs)
+        })
+    }
+
+    fn submit_resident_multi3(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 3],
+        outputs: [&mut [f32]; 3],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident_multi3(session, handles, activations, outputs)
+        })
+    }
+
+    fn submit_resident_multi4(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 4],
+        activations: [&[f32]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident_multi4(session, handles, activations, outputs)
         })
     }
 
@@ -2950,6 +3022,87 @@ mod tests {
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.n_bufs, 2);
         assert_eq!(session.report.operations_completed, 3);
         assert_eq!(session.report.queue_writes_completed, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn resident_native_q2_multi4_executes_four_operations_in_single_queue_write()
+    -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let mut weights_32 = vec![0x55_u8; 1152];
+        for tile in weights_32.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = [0, 0x3c];
+            }
+        }
+        let act0 = [1.0_f32; 128];
+        let act1 = [2.0_f32; 128];
+        {
+            let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+            state.writes = 0;
+            state.sequence = 0;
+            state.batch_operations = 1;
+            state.n_bufs = 1;
+            state.write_error = false;
+            state.stale_reply = false;
+            state.bad_numeric = false;
+            state.bad_member = None;
+        }
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 6, Duration::from_secs(4))?
+            .with_resident_weights(4096)?;
+        let mut memory = vec![0_u8; limits.allocation_bytes()];
+        let pointer = memory.as_mut_ptr().cast::<c_void>();
+        let expected = QueueBuffer {
+            fd: 7,
+            size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+            offset: 0,
+            flags: 0x90,
+            pointer,
+        };
+        let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+        report.queue.poisoned = true;
+        let queue_write = WriteCall::Nonblocking(write);
+        let mut progress = |_: &Q2ProjectionReport| {};
+        let mut session = Session {
+            report: &mut report,
+            queue_write: &queue_write,
+            queue_read: read,
+            queue: null_mut(),
+            memory: pointer,
+            expected,
+            extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+            extra_arena_count: 0,
+            mapper: None,
+            limits: limits.common,
+            mode: Mode::NativeQ2 { columns: 128 },
+            resident_weights: HmxQ2WeightRegistry::new(0)?,
+            native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes())?,
+            dirty_resident_weights: false,
+            work_deadline: Instant::now() + Duration::from_secs(1),
+            progress: &mut progress,
+            failed: false,
+        };
+        let h_a = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights_32)?
+            .ok_or(Error::Contract)?;
+        let h_b = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights_32)?
+            .ok_or(Error::Contract)?;
+        let mut out0 = [99.0_f32; 32];
+        let mut out1 = [99.0_f32; 32];
+        let mut out2 = [99.0_f32; 32];
+        let mut out3 = [99.0_f32; 32];
+        NativeQ2Submitter::submit_resident_multi4(
+            &mut session,
+            [&h_a, &h_b, &h_a, &h_b],
+            [&act0, &act0, &act1, &act1],
+            [&mut out0, &mut out1, &mut out2, &mut out3],
+        )?;
+        assert_eq!(out0, [7.0_f32; 32]);
+        assert_eq!(out1, [8.0_f32; 32]);
+        assert_eq!(out2, [9.0_f32; 32]);
+        assert_eq!(out3, [10.0_f32; 32]);
+        assert_eq!(session.report.operations_completed, 4);
+        assert_eq!(session.report.queue_writes_completed, 1);
+        assert_eq!(session.report.resident_submissions, 4);
         Ok(())
     }
 }

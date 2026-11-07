@@ -30,12 +30,11 @@ fn finite_slice(values: &[f32]) -> Result<()> {
 /// Residency statistics for [`NativeQ2Executor`].
 pub type NativeQ2ResidencyStatistics = HmxResidencyStatistics;
 
-/// Default 56-projection Hexagon NPU `native-q2` multi-arena resident placement (`blk.0`..=`blk.8`).
+/// Default 112-projection Hexagon NPU `native-q2` multi-arena resident placement (`blk.0`..=`blk.17`).
 ///
-/// Covers `blk.0`..=`blk.2` recurrent, `blk.3` full-attention, `blk.4`..=`blk.6`
-/// recurrent, `blk.7` full-attention, and `blk.8` recurrent (`962,887,680` bytes
-/// across two `<= 480` MiB `FastRPC` weight arenas).
-pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 56] = [
+/// Covers 18 layers (14 recurrent GDN layers and 4 full-attention layers,
+/// `1,925,775,360` bytes across four `<= 480` MiB `FastRPC` weight arenas).
+pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 112] = [
     "blk.0.ffn_up.weight",
     "blk.0.ffn_gate.weight",
     "blk.0.ffn_down.weight",
@@ -92,10 +91,66 @@ pub const DEFAULT_NATIVE_Q2_PROJECTIONS: [&str; 56] = [
     "blk.8.attn_qkv.weight",
     "blk.8.attn_gate.weight",
     "blk.8.ssm_out.weight",
+    "blk.9.ffn_up.weight",
+    "blk.9.ffn_gate.weight",
+    "blk.9.ffn_down.weight",
+    "blk.9.attn_qkv.weight",
+    "blk.9.attn_gate.weight",
+    "blk.9.ssm_out.weight",
+    "blk.10.ffn_up.weight",
+    "blk.10.ffn_gate.weight",
+    "blk.10.ffn_down.weight",
+    "blk.10.attn_qkv.weight",
+    "blk.10.attn_gate.weight",
+    "blk.10.ssm_out.weight",
+    "blk.11.ffn_up.weight",
+    "blk.11.ffn_gate.weight",
+    "blk.11.ffn_down.weight",
+    "blk.11.attn_q.weight",
+    "blk.11.attn_k.weight",
+    "blk.11.attn_v.weight",
+    "blk.11.attn_output.weight",
+    "blk.12.ffn_up.weight",
+    "blk.12.ffn_gate.weight",
+    "blk.12.ffn_down.weight",
+    "blk.12.attn_qkv.weight",
+    "blk.12.attn_gate.weight",
+    "blk.12.ssm_out.weight",
+    "blk.13.ffn_up.weight",
+    "blk.13.ffn_gate.weight",
+    "blk.13.ffn_down.weight",
+    "blk.13.attn_qkv.weight",
+    "blk.13.attn_gate.weight",
+    "blk.13.ssm_out.weight",
+    "blk.14.ffn_up.weight",
+    "blk.14.ffn_gate.weight",
+    "blk.14.ffn_down.weight",
+    "blk.14.attn_qkv.weight",
+    "blk.14.attn_gate.weight",
+    "blk.14.ssm_out.weight",
+    "blk.15.ffn_up.weight",
+    "blk.15.ffn_gate.weight",
+    "blk.15.ffn_down.weight",
+    "blk.15.attn_q.weight",
+    "blk.15.attn_k.weight",
+    "blk.15.attn_v.weight",
+    "blk.15.attn_output.weight",
+    "blk.16.ffn_up.weight",
+    "blk.16.ffn_gate.weight",
+    "blk.16.ffn_down.weight",
+    "blk.16.attn_qkv.weight",
+    "blk.16.attn_gate.weight",
+    "blk.16.ssm_out.weight",
+    "blk.17.ffn_up.weight",
+    "blk.17.ffn_gate.weight",
+    "blk.17.ffn_down.weight",
+    "blk.17.attn_qkv.weight",
+    "blk.17.attn_gate.weight",
+    "blk.17.ssm_out.weight",
 ];
 
 /// Exact packed `HTP_TYPE_Q2_0` resident weight payload bytes for [`DEFAULT_NATIVE_Q2_PROJECTIONS`].
-pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 962_887_680;
+pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 1_925_775_360;
 
 /// Host metadata reservation for resident `native-q2` projection handles.
 pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 512 * 1024;
@@ -155,11 +210,16 @@ impl ResidentCache {
     }
 
     fn find(&self, tensor: &Tensor) -> Option<usize> {
-        self.projections.iter().position(|projection| {
-            Arc::ptr_eq(&projection.source, &tensor.data)
-                && tensor.kind == 142
-                && tensor.dimensions.as_slice() == [projection.columns, projection.rows]
-        })
+        let addr = tensor.data.as_ptr().addr();
+        let index = self
+            .projections
+            .binary_search_by_key(&addr, |projection| projection.source.as_ptr().addr())
+            .ok()?;
+        let projection = &self.projections[index];
+        (Arc::ptr_eq(&projection.source, &tensor.data)
+            && tensor.kind == 142
+            && tensor.dimensions.as_slice() == [projection.columns, projection.rows])
+        .then_some(index)
     }
 
     const fn has_metadata_capacity(&self, operations: usize) -> bool {
@@ -168,14 +228,21 @@ impl ResidentCache {
     }
 
     fn commit(&mut self, tensor: &Tensor, first_handle: usize, evaluated: bool) -> usize {
-        let index = self.projections.len();
-        self.projections.push(ResidentProjection {
-            source: Arc::clone(&tensor.data),
-            columns: tensor.dimensions[0],
-            rows: tensor.dimensions[1],
-            first_handle,
-            evaluated,
-        });
+        let addr = tensor.data.as_ptr().addr();
+        let index = self
+            .projections
+            .binary_search_by_key(&addr, |projection| projection.source.as_ptr().addr())
+            .unwrap_or_else(|pos| pos);
+        self.projections.insert(
+            index,
+            ResidentProjection {
+                source: Arc::clone(&tensor.data),
+                columns: tensor.dimensions[0],
+                rows: tensor.dimensions[1],
+                first_handle,
+                evaluated,
+            },
+        );
         self.statistics.tensors_prepared = self.statistics.tensors_prepared.saturating_add(1);
         index
     }
@@ -196,6 +263,7 @@ pub struct NativeQ2Executor<S = &'static mut dyn NativeQ2Submitter> {
     residency: Option<ResidentCache>,
     row_parallelism: Option<RowParallelism>,
     allowed_tensors: Option<Vec<Tensor>>,
+    allowed_addr_range: (usize, usize),
     scratch_weights: Vec<u8>,
 }
 
@@ -224,6 +292,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             residency: None,
             row_parallelism: None,
             allowed_tensors: None,
+            allowed_addr_range: (0, 0),
             scratch_weights: Vec::new(),
         }
     }
@@ -457,6 +526,14 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             }
             selected.push(tensor.clone());
         }
+        selected.sort_by_key(|tensor| tensor.data.as_ptr().addr());
+        let min_addr = selected
+            .first()
+            .map_or(0, |tensor| tensor.data.as_ptr().addr());
+        let max_addr = selected
+            .last()
+            .map_or(0, |tensor| tensor.data.as_ptr().addr());
+        self.allowed_addr_range = (min_addr, max_addr);
         self.allowed_tensors = Some(selected);
         if self.residency.is_some() {
             let mut weights = std::mem::take(&mut self.scratch_weights);
@@ -734,6 +811,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         finite_slice(activation)?;
         let mut weights = Vec::new();
         let mut indices = [0_usize; 3];
+        let mut any_prepared = false;
         for (member, &tensor) in tensors.iter().enumerate() {
             let rows = rows_per_member[member];
             let index = if let Some(idx) = cached_indices[member] {
@@ -746,6 +824,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 }
                 idx
             } else {
+                any_prepared = true;
                 let max_mapped_rows = rows.next_multiple_of(32);
                 let required_bytes = max_mapped_rows * 36 * (columns / 128);
                 if weights.len() < required_bytes {
@@ -758,6 +837,13 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?
             };
             indices[member] = index;
+        }
+        if any_prepared && let Some(cache) = &self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                indices[member] = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
         }
         for (member, output) in outputs.iter_mut().enumerate() {
             let rows = rows_per_member[member];
@@ -819,6 +905,318 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             .saturating_add(count_u64);
         Ok(())
     }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep multi-token 4/3/2/1-op resident dispatch and fallback together."
+    )]
+    fn project_f32_tokens_inner(
+        &mut self,
+        tensor: &Tensor,
+        activations: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if activations.len() != outputs.len() {
+            return Err(invalid("mismatched F32 token projection outputs"));
+        }
+        if activations.is_empty() {
+            return Ok(());
+        }
+        let (columns, rows) = native_dimensions(tensor)?;
+        if !self.supports_f32(tensor) {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        let single_op =
+            columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
+        let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
+        if !single_op || (cached.is_none() && self.residency.is_none()) {
+            for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
+                self.project_f32_inner(tensor, activation, output)?;
+            }
+            return Ok(());
+        }
+        for activation in activations {
+            if activation.len() != columns {
+                return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+            }
+            finite_slice(activation)?;
+        }
+        let resident_index = if let Some(idx) = cached {
+            idx
+        } else {
+            let max_mapped_rows = rows.next_multiple_of(32);
+            let required_bytes = max_mapped_rows * 36 * (columns / 128);
+            let mut weights = zeroed(required_bytes, 0_u8)?;
+            let Some(idx) = self.prepare_resident(tensor, &mut weights, false)? else {
+                for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
+                    self.project_f32_inner(tensor, activation, output)?;
+                }
+                return Ok(());
+            };
+            idx
+        };
+        if let Some(cache) = &mut self.residency {
+            let hits = if cache.projections[resident_index].evaluated {
+                u64::try_from(activations.len())?
+            } else {
+                cache.projections[resident_index].evaluated = true;
+                u64::try_from(activations.len().saturating_sub(1))?
+            };
+            cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(hits);
+        }
+        for output in outputs.iter_mut() {
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, f32::NAN);
+            }
+        }
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let handle = &cache.handles[cache.projections[resident_index].first_handle];
+        let mut rem_act = activations;
+        let mut rem_out = outputs;
+        while !rem_act.is_empty() {
+            let chunk_len = rem_act.len().min(4);
+            let (act_chunk, next_act) = rem_act.split_at(chunk_len);
+            let (out_chunk, next_out) = rem_out.split_at_mut(chunk_len);
+            rem_act = next_act;
+            rem_out = next_out;
+            let chunk_u64 = u64::try_from(chunk_len)?;
+            self.statistics.operations_attempted = self
+                .statistics
+                .operations_attempted
+                .saturating_add(chunk_u64);
+            self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+            match out_chunk {
+                [o0, o1, o2, o3] => {
+                    self.submitter.submit_resident_multi4(
+                        [handle, handle, handle, handle],
+                        [
+                            act_chunk[0].as_slice(),
+                            act_chunk[1].as_slice(),
+                            act_chunk[2].as_slice(),
+                            act_chunk[3].as_slice(),
+                        ],
+                        [
+                            o0.as_mut_slice(),
+                            o1.as_mut_slice(),
+                            o2.as_mut_slice(),
+                            o3.as_mut_slice(),
+                        ],
+                    )?;
+                }
+                [o0, o1, o2] => {
+                    self.submitter.submit_resident_multi3(
+                        [handle, handle, handle],
+                        [
+                            act_chunk[0].as_slice(),
+                            act_chunk[1].as_slice(),
+                            act_chunk[2].as_slice(),
+                        ],
+                        [o0.as_mut_slice(), o1.as_mut_slice(), o2.as_mut_slice()],
+                    )?;
+                }
+                [o0, o1] => {
+                    self.submitter.submit_resident_multi2(
+                        [handle, handle],
+                        [act_chunk[0].as_slice(), act_chunk[1].as_slice()],
+                        [o0.as_mut_slice(), o1.as_mut_slice()],
+                    )?;
+                }
+                [o0] => {
+                    self.submitter.submit_resident(
+                        handle,
+                        act_chunk[0].as_slice(),
+                        o0.as_mut_slice(),
+                    )?;
+                }
+                _ => return Err(invalid("unexpected token batch chunk size")),
+            }
+            for output in out_chunk.iter() {
+                finite_slice(output)?;
+            }
+            self.statistics.operations_completed = self
+                .statistics
+                .operations_completed
+                .saturating_add(chunk_u64);
+            self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+            self.statistics.projections_completed = self
+                .statistics
+                .projections_completed
+                .saturating_add(chunk_u64);
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep 2-token sibling pair 4-op resident dispatch and odd-tail handling together."
+    )]
+    fn project_f32_pair_tokens_inner(
+        &mut self,
+        tensors: [&Tensor; 2],
+        activations: &[Vec<f32>],
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if activations.len() != outputs_a.len() || activations.len() != outputs_b.len() {
+            return Err(invalid("mismatched F32 pair token projection outputs"));
+        }
+        if activations.is_empty() {
+            return Ok(());
+        }
+        let Some((columns, rows_per_member, cached_indices)) = self.validate_f32_group(&tensors)
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon batched projection group",
+            ));
+        };
+        for activation in activations {
+            if activation.len() != columns {
+                return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+            }
+            finite_slice(activation)?;
+        }
+        let mut weights = Vec::new();
+        for (member, &tensor) in tensors.iter().enumerate() {
+            if cached_indices[member].is_none() {
+                let rows = rows_per_member[member];
+                let max_mapped_rows = rows.next_multiple_of(32);
+                let required_bytes = max_mapped_rows * 36 * (columns / 128);
+                if weights.len() < required_bytes {
+                    weights
+                        .try_reserve(required_bytes - weights.len())
+                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+                    weights.resize(required_bytes, 0_u8);
+                }
+                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
+        }
+        let mut indices = [0_usize; 2];
+        if let Some(cache) = &mut self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                let idx = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+                let hits = if cache.projections[idx].evaluated {
+                    u64::try_from(activations.len())?
+                } else {
+                    cache.projections[idx].evaluated = true;
+                    u64::try_from(activations.len().saturating_sub(1))?
+                };
+                cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(hits);
+                indices[member] = idx;
+            }
+        }
+        for output in outputs_a.iter_mut() {
+            let rows = rows_per_member[0];
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, f32::NAN);
+            }
+        }
+        for output in outputs_b.iter_mut() {
+            let rows = rows_per_member[1];
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, f32::NAN);
+            }
+        }
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let h0 = &cache.handles[cache.projections[indices[0]].first_handle];
+        let h1 = &cache.handles[cache.projections[indices[1]].first_handle];
+        let mut rem_act = activations;
+        let mut rem_a = outputs_a;
+        let mut rem_b = outputs_b;
+        while !rem_act.is_empty() {
+            if rem_act.len() >= 2 {
+                let (act_chunk, next_act) = rem_act.split_at(2);
+                let (a_chunk, next_a) = rem_a.split_at_mut(2);
+                let (b_chunk, next_b) = rem_b.split_at_mut(2);
+                rem_act = next_act;
+                rem_a = next_a;
+                rem_b = next_b;
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(4);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                let [oa0, oa1] = a_chunk else {
+                    return Err(invalid("unexpected pair token slice"));
+                };
+                let [ob0, ob1] = b_chunk else {
+                    return Err(invalid("unexpected pair token slice"));
+                };
+                let a0 = act_chunk[0].as_slice();
+                let a1 = act_chunk[1].as_slice();
+                self.submitter.submit_resident_multi4(
+                    [h0, h1, h0, h1],
+                    [a0, a0, a1, a1],
+                    [
+                        oa0.as_mut_slice(),
+                        ob0.as_mut_slice(),
+                        oa1.as_mut_slice(),
+                        ob1.as_mut_slice(),
+                    ],
+                )?;
+                finite_slice(oa0)?;
+                finite_slice(ob0)?;
+                finite_slice(oa1)?;
+                finite_slice(ob1)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(4);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(4);
+            } else {
+                let a0 = rem_act[0].as_slice();
+                let oa0 = &mut rem_a[0];
+                let ob0 = &mut rem_b[0];
+                rem_act = &[];
+                rem_a = &mut [];
+                rem_b = &mut [];
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(2);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_batch2(
+                    [h0, h1],
+                    a0,
+                    [oa0.as_mut_slice(), ob0.as_mut_slice()],
+                )?;
+                finite_slice(oa0)?;
+                finite_slice(ob0)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(2);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(2);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
@@ -876,15 +1274,25 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
     }
 
     fn supports_f32(&self, tensor: &Tensor) -> bool {
-        if let Some(allowed) = &self.allowed_tensors
-            && !allowed.iter().any(|candidate| {
-                Arc::ptr_eq(&candidate.data, &tensor.data)
-                    && candidate.kind == tensor.kind
-                    && candidate.dimensions == tensor.dimensions
-                    && candidate.name == tensor.name
-            })
-        {
-            return false;
+        if let Some(allowed) = &self.allowed_tensors {
+            let addr = tensor.data.as_ptr().addr();
+            let (min_addr, max_addr) = self.allowed_addr_range;
+            if addr < min_addr || addr > max_addr {
+                return false;
+            }
+            let Ok(idx) =
+                allowed.binary_search_by_key(&addr, |candidate| candidate.data.as_ptr().addr())
+            else {
+                return false;
+            };
+            let candidate = &allowed[idx];
+            if !Arc::ptr_eq(&candidate.data, &tensor.data)
+                || candidate.kind != tensor.kind
+                || candidate.dimensions != tensor.dimensions
+                || candidate.name != tensor.name
+            {
+                return false;
+            }
         }
         native_dimensions(tensor).is_ok_and(|(columns, rows)| {
             self.payload_bytes(columns, rows)
@@ -922,6 +1330,44 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
         if result.is_err() {
             self.failed = true;
             for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
+
+    fn project_f32_tokens(
+        &mut self,
+        tensor: &Tensor,
+        activations: &[Vec<f32>],
+        _pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let result = self.project_f32_tokens_inner(tensor, activations, outputs);
+        if result.is_err() {
+            self.failed = true;
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
+
+    fn project_f32_pair_tokens(
+        &mut self,
+        tensors: [&Tensor; 2],
+        activations: &[Vec<f32>],
+        _pinned: bool,
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let result = self.project_f32_pair_tokens_inner(tensors, activations, outputs_a, outputs_b);
+        if result.is_err() {
+            self.failed = true;
+            for output in outputs_a.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_b.iter_mut() {
                 output.clear();
             }
         }
@@ -971,39 +1417,90 @@ fn pack_row_group(
     row_group: usize,
     group_weights: &mut [u8],
 ) -> Result<()> {
+    #[inline]
+    const fn permute_q2_dword(bytes: [u8; 8]) -> [u8; 8] {
+        let mut packed = u64::from_le_bytes(bytes);
+        let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc_00cc_00cc;
+        packed ^= swap ^ (swap << 6);
+        let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0_0000_f0f0;
+        packed ^= swap ^ (swap << 12);
+        packed.to_le_bytes()
+    }
+
     let group_row_start = row_group * 32;
     let group_rows = geometry.active_rows.saturating_sub(group_row_start).min(32);
     if group_rows < 32 {
         initialize_native_weights(group_weights);
     }
+    let tile_pairs = group_weights.as_chunks_mut::<1152>().0;
     for row_in_tile in 0..group_rows {
         let local_row = group_row_start + row_in_tile;
         let row_block_base =
             (geometry.row_start + local_row) * geometry.total_blocks + geometry.block_start;
-        for local_block in 0..geometry.chunk_blocks {
-            let offset = (row_block_base + local_block) * 34;
-            let original = &tensor_data[offset..offset + 34];
+        let row_blocks = tensor_data
+            [row_block_base * 34..(row_block_base + geometry.chunk_blocks) * 34]
+            .as_chunks::<34>()
+            .0;
+        let scale_pos0 = 512 + row_in_tile * 2;
+        let scale_pos1 = 576 + 512 + row_in_tile * 2;
+        let q_pos0 = row_in_tile * 4;
+        let q_pos1 = 256 + row_in_tile * 4;
+        let q_pos2 = 576 + row_in_tile * 4;
+        let q_pos3 = 576 + 256 + row_in_tile * 4;
+        for (original, pair_buf) in row_blocks.iter().zip(tile_pairs.iter_mut()) {
             if (u16::from_le_bytes([original[0], original[1]]) & 0x7c00) == 0x7c00 {
                 return Err(invalid("nonfinite Hexagon Q2 scale"));
             }
-            let tile0 = (local_block * 2) * 576;
-            let tile1 = tile0 + 576;
-            let scale_offset0 = tile0 + 512 + row_in_tile * 2;
-            let scale_offset1 = tile1 + 512 + row_in_tile * 2;
-            group_weights[scale_offset0..scale_offset0 + 2].copy_from_slice(&original[..2]);
-            group_weights[scale_offset1..scale_offset1 + 2].copy_from_slice(&original[..2]);
-            for (pair, dword_bytes) in original[2..34].as_chunks::<8>().0.iter().enumerate() {
-                let mut packed = u64::from_le_bytes(*dword_bytes);
-                let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc_00cc_00cc;
-                packed ^= swap ^ (swap << 6);
-                let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0_0000_f0f0;
-                packed ^= swap ^ (swap << 12);
-                let bytes = packed.to_le_bytes();
-                let tile = if pair < 2 { tile0 } else { tile1 };
-                let base = tile + (pair & 1) * 256 + row_in_tile * 4;
-                group_weights[base..base + 4].copy_from_slice(&bytes[..4]);
-                group_weights[base + 128..base + 132].copy_from_slice(&bytes[4..8]);
-            }
+            pair_buf[scale_pos0..scale_pos0 + 2].copy_from_slice(&original[..2]);
+            pair_buf[scale_pos1..scale_pos1 + 2].copy_from_slice(&original[..2]);
+            let b0 = permute_q2_dword([
+                original[2],
+                original[3],
+                original[4],
+                original[5],
+                original[6],
+                original[7],
+                original[8],
+                original[9],
+            ]);
+            let b1 = permute_q2_dword([
+                original[10],
+                original[11],
+                original[12],
+                original[13],
+                original[14],
+                original[15],
+                original[16],
+                original[17],
+            ]);
+            let b2 = permute_q2_dword([
+                original[18],
+                original[19],
+                original[20],
+                original[21],
+                original[22],
+                original[23],
+                original[24],
+                original[25],
+            ]);
+            let b3 = permute_q2_dword([
+                original[26],
+                original[27],
+                original[28],
+                original[29],
+                original[30],
+                original[31],
+                original[32],
+                original[33],
+            ]);
+            pair_buf[q_pos0..q_pos0 + 4].copy_from_slice(&b0[..4]);
+            pair_buf[q_pos0 + 128..q_pos0 + 132].copy_from_slice(&b0[4..8]);
+            pair_buf[q_pos1..q_pos1 + 4].copy_from_slice(&b1[..4]);
+            pair_buf[q_pos1 + 128..q_pos1 + 132].copy_from_slice(&b1[4..8]);
+            pair_buf[q_pos2..q_pos2 + 4].copy_from_slice(&b2[..4]);
+            pair_buf[q_pos2 + 128..q_pos2 + 132].copy_from_slice(&b2[4..8]);
+            pair_buf[q_pos3..q_pos3 + 4].copy_from_slice(&b3[..4]);
+            pair_buf[q_pos3 + 128..q_pos3 + 132].copy_from_slice(&b3[4..8]);
         }
     }
     Ok(())
@@ -1116,6 +1613,66 @@ mod tests {
             self.calls += 3;
             self.resident_calls += 3;
             for (member, handle) in handles.into_iter().enumerate() {
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                outputs[member].fill(0.0);
+                outputs[member][0] =
+                    activation.iter().sum::<f32>() + f32::from(u8::try_from(member).unwrap_or(0));
+            }
+            Ok(())
+        }
+
+        fn submit_resident_multi2(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 2],
+            activations: [&[f32]; 2],
+            outputs: [&mut [f32]; 2],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 2;
+            self.resident_calls += 2;
+            for (member, handle) in handles.into_iter().enumerate() {
+                let activation = activations[member];
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                outputs[member].fill(0.0);
+                outputs[member][0] =
+                    activation.iter().sum::<f32>() + f32::from(u8::try_from(member).unwrap_or(0));
+            }
+            Ok(())
+        }
+
+        fn submit_resident_multi3(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activations: [&[f32]; 3],
+            outputs: [&mut [f32]; 3],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 3;
+            self.resident_calls += 3;
+            for (member, handle) in handles.into_iter().enumerate() {
+                let activation = activations[member];
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                outputs[member].fill(0.0);
+                outputs[member][0] =
+                    activation.iter().sum::<f32>() + f32::from(u8::try_from(member).unwrap_or(0));
+            }
+            Ok(())
+        }
+
+        fn submit_resident_multi4(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 4],
+            activations: [&[f32]; 4],
+            outputs: [&mut [f32]; 4],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 4;
+            self.resident_calls += 4;
+            for (member, handle) in handles.into_iter().enumerate() {
+                let activation = activations[member];
                 if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
                     return Err(hexagon_native_rpc::Error::Contract);
                 }
@@ -1247,10 +1804,14 @@ mod tests {
 
     #[test]
     fn default_four_layer_projection_set_matches_exact_resident_arena_budget() -> Result<()> {
-        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 56);
+        assert_eq!(DEFAULT_NATIVE_Q2_PROJECTIONS.len(), 112);
         let mut total_bytes = 0_usize;
-        let mut arena0_bytes = 0_usize;
-        let mut arena1_bytes = 0_usize;
+        let mut arena_bytes = [0_usize; 4];
+        let mut registry = hexagon_native_rpc::NativeQ2WeightRegistry::new(
+            DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES,
+        )
+        .map_err(|_| invalid("registry"))?;
+        let scratch = vec![0_u8; 17_408 * 36 * (5120 / 128)];
         for (idx, name) in DEFAULT_NATIVE_Q2_PROJECTIONS.into_iter().enumerate() {
             let (columns, rows): (usize, usize) = if name.ends_with(".ffn_up.weight")
                 || name.ends_with(".ffn_gate.weight")
@@ -1273,18 +1834,25 @@ mod tests {
             };
             let packed_bytes = rows * 36 * (columns / 128);
             assert_eq!(packed_bytes % 128, 0);
-            if idx < 28 {
-                arena0_bytes += packed_bytes;
-            } else {
-                arena1_bytes += packed_bytes;
-            }
+            let handle = registry
+                .prepare(columns, rows, &scratch[..packed_bytes])
+                .map_err(|_| invalid("prepare"))?
+                .ok_or_else(|| invalid("arena exhausted before 112 projections"))?;
+            let expected_arena = u16::try_from(idx / 28).unwrap_or(0);
+            assert_eq!(handle.arena_index(), expected_arena);
+            arena_bytes[idx / 28] += packed_bytes;
             total_bytes += packed_bytes;
         }
+        assert_eq!(registry.remaining_bytes(), 0);
         assert_eq!(
-            arena0_bytes,
-            hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+            arena_bytes,
+            [
+                hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES,
+                hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES,
+                hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES,
+                hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES,
+            ]
         );
-        assert_eq!(arena1_bytes, 460_062_720);
         assert_eq!(total_bytes, DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES);
         const {
             assert!(
@@ -1374,6 +1942,35 @@ mod tests {
         assert_eq!(executor.queue_writes_completed(), 2);
         assert_eq!(executor.statistics().operations_completed, 5);
         assert_eq!(executor.statistics().projections_completed, 5);
+
+        // Multi-token pair and single-projection batching via 4-op submissions.
+        let acts = vec![
+            vec![1.0_f32; columns],
+            vec![2.0_f32; columns],
+            vec![3.0_f32; columns],
+            vec![4.0_f32; columns],
+            vec![5.0_f32; columns],
+        ];
+        let mut outs_a = vec![Vec::new(); 5];
+        let mut outs_b = vec![Vec::new(); 5];
+        executor.project_f32_pair_tokens([&qkv, &gate], &acts, true, &mut outs_a, &mut outs_b)?;
+        // 5 tokens * 2 projections = 10 ops across 3 queue writes (4 + 4 + 2).
+        assert_eq!(executor.queue_writes_completed(), 5);
+        assert_eq!(executor.statistics().operations_completed, 15);
+        assert_eq!(outs_a[0][0], 256.0);
+        assert_eq!(outs_b[0][0], 257.0);
+        assert_eq!(outs_a[1][0], 514.0);
+        assert_eq!(outs_b[1][0], 515.0);
+        assert_eq!(outs_a[4][0], 1280.0);
+        assert_eq!(outs_b[4][0], 1281.0);
+
+        executor.project_f32_tokens(&q, &acts, true, &mut outs_a)?;
+        // 5 tokens * 1 projection = 5 ops across 2 queue writes (4 + 1).
+        assert_eq!(executor.queue_writes_completed(), 7);
+        assert_eq!(executor.statistics().operations_completed, 20);
+        assert_eq!(outs_a[0][0], 256.0);
+        assert_eq!(outs_a[3][0], 1027.0);
+        assert_eq!(outs_a[4][0], 1280.0);
         Ok(())
     }
 }

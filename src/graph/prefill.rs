@@ -12,10 +12,19 @@ use crate::kernels::{
 };
 use crate::model::Tensor;
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
-use crate::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
+use crate::{MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
 
 #[path = "prefill_gdn.rs"]
 mod gdn;
+
+const fn reborrow_executor<'a, 'b: 'a>(
+    executor: &'a mut Option<&'b mut dyn crate::kernels::Pq2ProjectionExecutor>,
+) -> Option<&'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a)> {
+    match executor {
+        Some(exec) => Some(*exec),
+        None => None,
+    }
+}
 
 /// Lifetime counters for explicitly selected CPU tiled prompt ingestion.
 ///
@@ -246,6 +255,27 @@ impl Qwen35 {
         tokens: &[u32],
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        const fn coerce_executor<'a>(
+            executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
+        ) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
+            &mut **executor
+        }
+        let mut executor = self.projection_executor.take();
+        let result = self.ingest_prefill_block_with_executor(
+            tokens,
+            check,
+            executor.as_mut().map(coerce_executor),
+        );
+        self.projection_executor = executor;
+        result
+    }
+
+    pub(super) fn ingest_prefill_block_with_executor(
+        &mut self,
+        tokens: &[u32],
+        check: &dyn Fn() -> Result<()>,
+        mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    ) -> Result<()> {
         if tokens.is_empty()
             || tokens.len() > MAX_PREFILL_BLOCK_TOKENS
             || tokens
@@ -265,7 +295,7 @@ impl Qwen35 {
         let Some(mut tile) = self.tiled_prefill.take() else {
             for &token in tokens {
                 check()?;
-                self.ingest(token)?;
+                self.evaluate_token_with_executor(token, None, reborrow_executor(&mut executor))?;
                 check()?;
             }
             return Ok(());
@@ -273,7 +303,7 @@ impl Qwen35 {
         let result = (|| {
             for tokens in tokens.chunks(tile.tokens) {
                 check()?;
-                self.ingest_cpu_tile(tokens, check, &mut tile)?;
+                self.ingest_cpu_tile(tokens, check, &mut tile, reborrow_executor(&mut executor))?;
                 tile.statistics.completed_tiles = tile.statistics.completed_tiles.saturating_add(1);
                 tile.statistics.completed_tokens = tile
                     .statistics
@@ -296,6 +326,7 @@ impl Qwen35 {
         tokens: &[u32],
         check: &dyn Fn() -> Result<()>,
         tile: &mut TiledPrefill,
+        mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
         let count = tokens.len();
         let base = self.position;
@@ -350,9 +381,11 @@ impl Qwen35 {
                     self.adapter.as_ref(),
                     self.adapter_scale,
                     &mut self.workspace.adapter,
+                    &mut self.workspace.projection.matvec,
                     count,
                     check,
                     tile,
+                    reborrow_executor(&mut executor),
                 )?;
                 true
             } else {
@@ -383,7 +416,7 @@ impl Qwen35 {
                     adapter: self.adapter.as_ref(),
                     adapter_scale: self.adapter_scale,
                     adapter_scratch: &mut self.workspace.adapter,
-                    executor: None,
+                    executor: reborrow_executor(&mut executor),
                 };
                 match (&layer.attention, &mut *state) {
                     (Attention::Full(weights), LayerState::Full { keys, values }) => {
@@ -447,26 +480,24 @@ impl Qwen35 {
                 )?;
                 check()?;
             }
-            let mut previous = None;
-            for (weight, output) in [(&layer.up, &mut tile.up), (&layer.gate, &mut tile.gate)] {
-                check()?;
-                project_tile(
-                    &self.transforms,
-                    &self.geometry,
-                    self.arithmetic,
-                    self.adapter.as_ref(),
-                    self.adapter_scale,
-                    &mut self.workspace.adapter,
-                    previous,
-                    weight,
-                    &tile.normalized[..count],
-                    &mut output[..count],
-                    &mut tile.transformed[..count],
-                    &mut tile.projector,
-                    check,
-                )?;
-                previous = Some(weight);
-            }
+            check()?;
+            let _ = project_tile_pair(
+                &self.transforms,
+                &self.geometry,
+                self.arithmetic,
+                self.adapter.as_ref(),
+                self.adapter_scale,
+                &mut self.workspace.adapter,
+                &mut self.workspace.projection.matvec,
+                [&layer.up, &layer.gate],
+                &tile.normalized[..count],
+                &mut tile.up[..count],
+                &mut tile.gate[..count],
+                &mut tile.transformed[..count],
+                &mut tile.projector,
+                reborrow_executor(&mut executor),
+                check,
+            )?;
             for (up, gate) in tile.up[..count].iter_mut().zip(&tile.gate[..count]) {
                 self.arithmetic.swiglu_in_place_with_parallelism(
                     gate,
@@ -482,12 +513,14 @@ impl Qwen35 {
                 self.adapter.as_ref(),
                 self.adapter_scale,
                 &mut self.workspace.adapter,
+                &mut self.workspace.projection.matvec,
                 None,
                 &layer.down,
                 &tile.up[..count],
                 &mut tile.normalized[..count],
                 &mut tile.transformed[..count],
                 &mut tile.projector,
+                reborrow_executor(&mut executor),
                 check,
             )?;
             for (hidden, output) in tile.hidden[..count]
@@ -503,30 +536,18 @@ impl Qwen35 {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
-)]
-fn project_tile(
+fn transform_tile_inputs<'a>(
     transforms: &Transforms,
     geometry: &super::Geometry,
-    arithmetic: Arithmetic,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
-    adapter_scratch: &mut AdapterScratch,
-    previous: Option<&Tensor>,
     tensor: &Tensor,
-    inputs: &[Vec<f32>],
-    outputs: &mut [Vec<f32>],
-    transformed: &mut [Vec<f32>],
-    projector: &mut ProjectionTile,
-    check: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+    reuse_basis: bool,
+    inputs: &'a [Vec<f32>],
+    transformed: &'a mut [Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<&'a [Vec<f32>]> {
     let basis = transforms.basis(tensor);
-    let reuse_basis = previous.is_some_and(|prev| transforms.basis(prev) == basis);
-    let activation = if basis.0 {
+    if basis.0 {
         if !reuse_basis {
-            let parallelism = projector.row_parallelism();
             if inputs.len() > 1 && parallelism.workers() > 1 {
                 parallelism.update_chunks(transformed, 1, |base, chunk| {
                     for (offset, target) in chunk.iter_mut().enumerate() {
@@ -551,18 +572,213 @@ fn project_tile(
                 }
             }
         }
-        &*transformed
+        Ok(&*transformed)
     } else {
-        inputs
-    };
-    projector.project_with_previous(
-        previous.filter(|_| reuse_basis),
-        tensor,
-        activation,
-        outputs,
-        matches!(arithmetic, Arithmetic::PinnedSwift),
+        Ok(inputs)
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
+)]
+fn project_tile_pair<'a>(
+    transforms: &Transforms,
+    geometry: &super::Geometry,
+    arithmetic: Arithmetic,
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    tensors: [&'a Tensor; 2],
+    inputs: &[Vec<f32>],
+    outputs_a: &mut [Vec<f32>],
+    outputs_b: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    projector: &mut ProjectionTile,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Option<&'a Tensor>> {
+    if let Some(exec) = reborrow_executor(&mut executor)
+        && tensors[0].kind == 142
+        && tensors[1].kind == 142
+        && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
+        && exec.supports_f32_group(&tensors)
+    {
+        let activation = transform_tile_inputs(
+            transforms,
+            geometry,
+            tensors[0],
+            false,
+            inputs,
+            transformed,
+            projector.row_parallelism(),
+        )?;
+        check()?;
+        exec.project_f32_pair_tokens(
+            tensors,
+            activation,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+            outputs_a,
+            outputs_b,
+        )?;
+        let rows_a = tensors[0]
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        let rows_b = tensors[1]
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        for (out_a, out_b) in outputs_a.iter().zip(outputs_b.iter()) {
+            if out_a.len() != rows_a || out_b.len() != rows_b {
+                return Err(invalid("projection executor returned incomplete output"));
+            }
+            finite(out_a, "projection executor output")?;
+            finite(out_b, "projection executor output")?;
+        }
+        if let Some(adapter) = adapter {
+            for (input, output) in inputs.iter().zip(outputs_a) {
+                adapter.linear(
+                    &tensors[0].name,
+                    input,
+                    adapter_scale,
+                    output,
+                    adapter_scratch,
+                )?;
+            }
+            for (input, output) in inputs.iter().zip(outputs_b) {
+                adapter.linear(
+                    &tensors[1].name,
+                    input,
+                    adapter_scale,
+                    output,
+                    adapter_scratch,
+                )?;
+            }
+        }
+        return Ok(None);
+    }
+    project_tile(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        None,
+        tensors[0],
+        inputs,
+        outputs_a,
+        transformed,
+        projector,
+        reborrow_executor(&mut executor),
         check,
     )?;
+    check()?;
+    project_tile(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        Some(tensors[0]),
+        tensors[1],
+        inputs,
+        outputs_b,
+        transformed,
+        projector,
+        reborrow_executor(&mut executor),
+        check,
+    )?;
+    Ok(Some(tensors[1]))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
+)]
+fn project_tile(
+    transforms: &Transforms,
+    geometry: &super::Geometry,
+    arithmetic: Arithmetic,
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous: Option<&Tensor>,
+    tensor: &Tensor,
+    inputs: &[Vec<f32>],
+    outputs: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    projector: &mut ProjectionTile,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let basis = transforms.basis(tensor);
+    let reuse_basis = previous.is_some_and(|prev| transforms.basis(prev) == basis);
+    let activation = transform_tile_inputs(
+        transforms,
+        geometry,
+        tensor,
+        reuse_basis,
+        inputs,
+        transformed,
+        projector.row_parallelism(),
+    )?;
+    if let Some(exec) = reborrow_executor(&mut executor) {
+        let cols = tensor.dimensions.first().copied().unwrap_or(0);
+        let rows = tensor
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        if tensor.kind == 142 && cols.is_multiple_of(128) && exec.supports_f32(tensor) {
+            check()?;
+            exec.project_f32_tokens(
+                tensor,
+                activation,
+                matches!(arithmetic, Arithmetic::PinnedSwift),
+                outputs,
+            )?;
+            for out in outputs.iter() {
+                if out.len() != rows {
+                    return Err(invalid("projection executor returned incomplete output"));
+                }
+                finite(out, "projection executor output")?;
+            }
+        } else if (tensor.kind == 142 && cols.is_multiple_of(256) && exec.supports(tensor))
+            || ((tensor.kind == 143 || (tensor.kind == 142 && !cols.is_multiple_of(256)))
+                && exec.supports_q8(tensor))
+        {
+            for (input, output) in activation.iter().zip(outputs.iter_mut()) {
+                check()?;
+                projection_scratch
+                    .prepare(tensor, input)?
+                    .matvec_with_executor(tensor, output, exec)?;
+            }
+        } else {
+            projector.project_with_previous(
+                previous.filter(|_| reuse_basis),
+                tensor,
+                activation,
+                outputs,
+                matches!(arithmetic, Arithmetic::PinnedSwift),
+                check,
+            )?;
+        }
+    } else {
+        projector.project_with_previous(
+            previous.filter(|_| reuse_basis),
+            tensor,
+            activation,
+            outputs,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+            check,
+        )?;
+    }
     if let Some(adapter) = adapter {
         for (input, output) in inputs.iter().zip(outputs) {
             adapter.linear(&tensor.name, input, adapter_scale, output, adapter_scratch)?;

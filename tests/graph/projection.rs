@@ -12,6 +12,7 @@ struct ReferenceExecutor {
     fail: Rc<Cell<bool>>,
     malformed: bool,
     q8: bool,
+    f32_direct: bool,
 }
 
 impl Pq2ProjectionExecutor for ReferenceExecutor {
@@ -24,6 +25,29 @@ impl Pq2ProjectionExecutor for ReferenceExecutor {
 
     fn supports_q8(&self, _: &Tensor) -> bool {
         self.q8
+    }
+
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        self.f32_direct && tensor.kind == 142
+    }
+
+    fn project_f32(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        _fused: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.calls.set(self.calls.get() + 1);
+        output.clear();
+        if self.fail.get() {
+            return Err(std::io::Error::other("synthetic submitted F32 loss").into());
+        }
+        let mut scratch =
+            bonsai_prism_runtime::kernels::MatvecScratch::with_backend(MatvecBackend::Scalar);
+        scratch
+            .prepare(tensor, activation)?
+            .matvec_into(tensor, output)
     }
 
     #[allow(
@@ -151,6 +175,7 @@ fn executor() -> (ReferenceExecutor, Rc<Cell<usize>>, Rc<Cell<bool>>) {
             fail: fail.clone(),
             malformed: false,
             q8: false,
+            f32_direct: false,
         },
         calls,
         fail,
@@ -313,5 +338,35 @@ fn projection_scope_restores_its_original_cpu_state_and_rejects_foreign_graph() 
     assert!(graph.restore(&foreign).is_err());
     assert_eq!(graph_bits(graph.decoder())?, before);
     assert!(!graph.is_faulted());
+    Ok(())
+}
+
+#[test]
+fn tiled_prefill_projection_scope_dispatches_pq2_projections_and_preserves_state_bits() -> Result<()>
+{
+    let prompt = [0, 1, 1, 0, 1, 0, 0, 1, 0];
+    for recurrent in [false, true] {
+        for f32_direct in [false, true] {
+            let build = || -> Result<Qwen35> {
+                let model = backend_fixture(recurrent, 142, 256)?;
+                let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                rank_one_graph(model, factors, 1.3)
+            };
+            let mut expected = build()?;
+            for token in prompt {
+                expected.ingest(token)?;
+            }
+            let base = build()?;
+            let reserve = base.tiled_prefill_scratch_bytes(8)?;
+            let tiled = base.with_tiled_prefill(8, reserve)?;
+            let (mut executor, calls, _) = executor();
+            executor.f32_direct = f32_direct;
+            let mut graph = tiled.with_projection_executor(&mut executor)?;
+            graph.ingest_block(&prompt, &|| Ok(()))?;
+            assert_eq!(calls.get(), prompt.len());
+            assert_eq!(graph_bits(graph.decoder())?, graph_bits(&expected)?);
+            assert_eq!(graph.evaluate(1)?, expected.evaluate(1)?);
+        }
+    }
     Ok(())
 }

@@ -250,10 +250,8 @@ impl Block {
             Self::Scalar(weights) => {
                 for (group, activation) in activations.iter().enumerate() {
                     let d = weight_scale * activation.scale;
-                    let integers = q8_native_lanes(
-                        &weights[group * 32..group * 32 + 32],
-                        &activation.values,
-                    );
+                    let integers =
+                        q8_native_lanes(&weights[group * 32..group * 32 + 32], &activation.values);
                     for (lane, integer) in lanes.iter_mut().zip(integers) {
                         *lane = super::super::integer_float(integer).mul_add(d, *lane);
                     }

@@ -1388,7 +1388,9 @@ pub(in crate::kernels) fn decode_ptq1_i16(neon: Neon, packed: &[u8; 28]) -> [i16
 
     let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
         | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
-    let (w15, _) = u64x2::splat(neon, tail_u64).bitcast::<i8x16<Neon>>().widen();
+    let (w15, _) = u64x2::splat(neon, tail_u64)
+        .bitcast::<i8x16<Neon>>()
+        .widen();
     [
         w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15,
     ]
@@ -1470,7 +1472,9 @@ fn accumulate_ptq1_block_pinned(
     let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
     let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
         | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
-    let (w15, _) = u64x2::splat(neon, tail_u64).bitcast::<i8x16<Neon>>().widen();
+    let (w15, _) = u64x2::splat(neon, tail_u64)
+        .bitcast::<i8x16<Neon>>()
+        .widen();
     let f3 = dot32_native_lanes_w16_i32x4(w12, w13, w14, w15, v30_l, v30_h, v31_l, v31_h)
         .to_float::<f32x4<Neon>>();
     f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane)
@@ -1842,7 +1846,9 @@ fn accumulate_ptq1_block_source(
     let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
     let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
         | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
-    let (w15, _) = u64x2::splat(neon, tail_u64).bitcast::<i8x16<Neon>>().widen();
+    let (w15, _) = u64x2::splat(neon, tail_u64)
+        .bitcast::<i8x16<Neon>>()
+        .widen();
     let (g3_l, g3_h) = ((w12 * v30_l + w13 * v30_h) + (w14 * v31_l + w15 * v31_h)).widen();
     let s3 = g3_l + g3_h;
 

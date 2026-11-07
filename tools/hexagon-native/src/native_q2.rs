@@ -32,8 +32,10 @@ pub const NATIVE_Q2_MAX_WEIGHT_BYTES: usize = (Q2_PROJECTION_MAX_ROWS / 32) * (5
 pub const NATIVE_Q2_MAX_WORKING_BYTES: usize = layout(5120, Q2_PROJECTION_MAX_ROWS).allocation;
 /// Largest immutable weight payload in a single `FastRPC` buffer (`480 MiB`, within the `512 MiB` `rpcmem` `m-size` limit).
 pub const NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES: usize = 480 * 1024 * 1024;
-/// Exact 28-projection weight step (`479.53125 MiB`, page-aligned) used when partitioning multi-arena resident weights.
+/// Exact even-arena 28-projection weight step (`479.53125 MiB`, page-aligned) used when partitioning multi-arena resident weights.
 pub const NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES: usize = 502_824_960;
+/// Exact odd-arena 28-projection weight step (`438.75 MiB`, page-aligned) completing each 56-projection (9-layer) pair.
+pub const NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES: usize = 460_062_720;
 /// Maximum number of host-mapped `FastRPC` weight arenas in a single native `Q2_0` session.
 pub const NATIVE_Q2_MAX_WEIGHT_ARENAS: usize = 4;
 /// Largest aggregate immutable host-mapped weight capacity across all arenas in a single native `Q2_0` session (`1,920 MiB`).
@@ -51,13 +53,9 @@ pub(crate) const fn arena_capacities(
     if resident_weight_bytes <= NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES {
         return Some(([resident_weight_bytes, 0, 0, 0], 1));
     }
-    let step = if resident_weight_bytes
-        <= NATIVE_Q2_MAX_WEIGHT_ARENAS * NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
-    {
-        NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
-    } else {
-        NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES
-    };
+    let use_alternating_steps = resident_weight_bytes
+        <= (NATIVE_Q2_MAX_WEIGHT_ARENAS / 2)
+            * (NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES + NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES);
     let mut capacities = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
     let mut remaining = resident_weight_bytes;
     let mut count = 0_usize;
@@ -65,11 +63,16 @@ pub(crate) const fn arena_capacities(
         if count >= NATIVE_Q2_MAX_WEIGHT_ARENAS {
             return None;
         }
-        let chunk = if remaining > NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES {
-            step
+        let step = if use_alternating_steps {
+            if count.is_multiple_of(2) {
+                NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+            } else {
+                NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
+            }
         } else {
-            remaining
+            NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES
         };
+        let chunk = if remaining > step { step } else { remaining };
         capacities[count] = chunk;
         remaining -= chunk;
         count += 1;
@@ -444,6 +447,60 @@ pub trait NativeQ2Submitter {
         Err(Error::Contract)
     }
 
+    /// Submit two resident `HTP_TYPE_Q2_0` projections with per-operation `F32`
+    /// activation vectors in a single 2-op DSP queue submission.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched input columns or
+    /// submission failures reject and close the session with no CPU replay.
+    fn submit_resident_multi2(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 2],
+        _activations: [&[f32]; 2],
+        mut outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        for output in &mut outputs {
+            output.fill(f32::NAN);
+        }
+        Err(Error::Contract)
+    }
+
+    /// Submit three resident `HTP_TYPE_Q2_0` projections with per-operation `F32`
+    /// activation vectors in a single 3-op DSP queue submission.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched input columns or
+    /// submission failures reject and close the session with no CPU replay.
+    fn submit_resident_multi3(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 3],
+        _activations: [&[f32]; 3],
+        mut outputs: [&mut [f32]; 3],
+    ) -> Result<(), Error> {
+        for output in &mut outputs {
+            output.fill(f32::NAN);
+        }
+        Err(Error::Contract)
+    }
+
+    /// Submit four resident `HTP_TYPE_Q2_0` projections with per-operation `F32`
+    /// activation vectors in a single 4-op DSP queue submission.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched input columns or
+    /// submission failures reject and close the session with no CPU replay.
+    fn submit_resident_multi4(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 4],
+        _activations: [&[f32]; 4],
+        mut outputs: [&mut [f32]; 4],
+    ) -> Result<(), Error> {
+        for output in &mut outputs {
+            output.fill(f32::NAN);
+        }
+        Err(Error::Contract)
+    }
+
     /// Submit tiled `HTP_TYPE_Q2_0` weights (`[columns, rows]`) and one `F32`
     /// activation vector (`[columns]`) in a single DSP operation.
     ///
@@ -503,6 +560,33 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         outputs: [&mut [f32]; 3],
     ) -> Result<(), Error> {
         (**self).submit_resident_batch3(handles, activation, outputs)
+    }
+
+    fn submit_resident_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_multi2(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi3(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 3],
+        outputs: [&mut [f32]; 3],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_multi3(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi4(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 4],
+        activations: [&[f32]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_multi4(handles, activations, outputs)
     }
 
     fn submit(
@@ -626,16 +710,29 @@ pub(crate) fn is_finite_f32_slice(values: &[f32]) -> bool {
     const SIGN_BIT: u32 = 0x8000_0000;
 
     let (chunks, tail) = values.as_chunks::<16>();
+    let mut m0 = 0_u32;
+    let mut m1 = 0_u32;
+    let mut m2 = 0_u32;
+    let mut m3 = 0_u32;
     for chunk in chunks {
-        let mut mask = 0_u32;
-        for &value in chunk {
-            mask |= (value.to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
-        }
-        if (mask & SIGN_BIT) != 0 {
-            return false;
-        }
+        m0 |= (chunk[0].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[1].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[2].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[3].to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
+        m1 |= (chunk[4].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[5].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[6].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[7].to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
+        m2 |= (chunk[8].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[9].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[10].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[11].to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
+        m3 |= (chunk[12].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[13].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[14].to_bits() & EXP_MASK).wrapping_add(EXP_STEP)
+            | (chunk[15].to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
     }
-    let mut tail_mask = 0_u32;
+    let mut tail_mask = (m0 | m1) | (m2 | m3);
     for &value in tail {
         tail_mask |= (value.to_bits() & EXP_MASK).wrapping_add(EXP_STEP);
     }
@@ -876,10 +973,7 @@ pub(crate) struct BatchLayout<const B: usize> {
     pub(crate) n_bufs: u32,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep multi-arena batch descriptor assembly and poison region together"
-)]
+#[cfg(test)]
 pub(crate) fn image_batch_resident<const B: usize>(
     bytes: &mut [u8],
     base: u64,
@@ -889,18 +983,58 @@ pub(crate) fn image_batch_resident<const B: usize>(
     handles: [&NativeQ2WeightHandle; B],
     activation: &[f32],
 ) -> Result<BatchLayout<B>, Error> {
-    const CMD_PAD: usize = 2048;
     if !matches!(B, 2 | 3) {
+        return Err(Error::Contract);
+    }
+    image_multi_resident(
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        handles,
+        [activation; B],
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep multi-arena batch descriptor assembly and poison region together"
+)]
+pub(crate) fn image_multi_resident<const B: usize>(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    handles: [&NativeQ2WeightHandle; B],
+    activations: [&[f32]; B],
+) -> Result<BatchLayout<B>, Error> {
+    const CMD_PAD: usize = 2048;
+    if !matches!(B, 2..=4) {
         return Err(Error::Contract);
     }
     let allocation = bytes.len();
     let columns = handles[0].columns;
-    if activation.len() != columns {
-        return Err(Error::Contract);
-    }
-    let act_offset = CMD_PAD;
     let act_bytes = columns * 4;
-    let mut next_out = (act_offset + act_bytes).next_multiple_of(128);
+    let mut next_offset = CMD_PAD;
+    let mut act_offsets = [0_usize; B];
+    let mut act_copy_member = [false; B];
+    for (member, &activation) in activations.iter().enumerate() {
+        if activation.len() != columns {
+            return Err(Error::Contract);
+        }
+        if let Some(prev) =
+            (0..member).find(|&idx| std::ptr::eq(activations[idx].as_ptr(), activation.as_ptr()))
+        {
+            act_offsets[member] = act_offsets[prev];
+        } else {
+            act_offsets[member] = next_offset;
+            act_copy_member[member] = true;
+            next_offset = (next_offset + act_bytes).next_multiple_of(128);
+        }
+    }
+    let mut next_out = next_offset;
     let mut weight_offsets = [0_usize; B];
     let mut weight_bis = [0_u16; B];
     let mut output_offsets = [0_usize; B];
@@ -995,17 +1129,23 @@ pub(crate) fn image_batch_resident<const B: usize>(
             handle.rows,
             weight_offsets[member],
             layout(columns, handle.rows).weights,
-            act_offset,
+            act_offsets[member],
             output_offsets[member],
         )?;
     }
-    for (dst, &value) in working[act_offset..act_offset + act_bytes]
-        .as_chunks_mut::<4>()
-        .0[..activation.len()]
-        .iter_mut()
-        .zip(activation)
-    {
-        *dst = value.to_bits().to_le_bytes();
+    for (member, &activation) in activations.iter().enumerate() {
+        if !act_copy_member[member] {
+            continue;
+        }
+        let act_offset = act_offsets[member];
+        for (dst, &value) in working[act_offset..act_offset + act_bytes]
+            .as_chunks_mut::<4>()
+            .0[..activation.len()]
+            .iter_mut()
+            .zip(activation)
+        {
+            *dst = value.to_bits().to_le_bytes();
+        }
     }
     working[output_offsets[0]..output_end]
         .as_chunks_mut::<4>()
@@ -1242,19 +1382,35 @@ pub(crate) fn copy_and_validate_output(bytes: &[u8], output: &mut [f32]) -> bool
     let words = bytes.as_chunks::<4>().0;
     let (in_chunks, in_tail) = words.as_chunks::<16>();
     let (out_chunks, out_tail) = output.as_chunks_mut::<16>();
+    let mut m0 = 0_u32;
+    let mut m1 = 0_u32;
+    let mut m2 = 0_u32;
+    let mut m3 = 0_u32;
     for (in_chunk, out_chunk) in in_chunks.iter().zip(out_chunks) {
-        let mut mask = 0_u32;
-        for (word, dst) in in_chunk.iter().zip(out_chunk) {
-            let bits = u32::from_le_bytes(*word);
-            mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
-            *dst = f32::from_bits(bits);
+        let mut local0 = 0_u32;
+        let mut local1 = 0_u32;
+        let mut local2 = 0_u32;
+        let mut local3 = 0_u32;
+        for i in 0..4 {
+            let b0 = u32::from_le_bytes(in_chunk[i]);
+            let b1 = u32::from_le_bytes(in_chunk[i + 4]);
+            let b2 = u32::from_le_bytes(in_chunk[i + 8]);
+            let b3 = u32::from_le_bytes(in_chunk[i + 12]);
+            local0 |= (b0 & EXP_MASK).wrapping_add(EXP_STEP);
+            local1 |= (b1 & EXP_MASK).wrapping_add(EXP_STEP);
+            local2 |= (b2 & EXP_MASK).wrapping_add(EXP_STEP);
+            local3 |= (b3 & EXP_MASK).wrapping_add(EXP_STEP);
+            out_chunk[i] = f32::from_bits(b0);
+            out_chunk[i + 4] = f32::from_bits(b1);
+            out_chunk[i + 8] = f32::from_bits(b2);
+            out_chunk[i + 12] = f32::from_bits(b3);
         }
-        if (mask & SIGN_BIT) != 0 {
-            output.fill(f32::NAN);
-            return false;
-        }
+        m0 |= local0;
+        m1 |= local1;
+        m2 |= local2;
+        m3 |= local3;
     }
-    let mut tail_mask = 0_u32;
+    let mut tail_mask = (m0 | m1) | (m2 | m3);
     for (word, dst) in in_tail.iter().zip(out_tail) {
         let bits = u32::from_le_bytes(*word);
         tail_mask |= (bits & EXP_MASK).wrapping_add(EXP_STEP);
@@ -1344,6 +1500,21 @@ mod tests {
         assert_eq!(
             multi_limits.allocation_bytes(),
             NATIVE_Q2_MAX_WORKING_BYTES + 962_887_680
+        );
+
+        // Verify 112-projection 4-arena split (1,925,775,360 bytes -> alternating [502,824,960, 460,062,720, 502,824,960, 460,062,720]).
+        let quad_limits =
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+                .with_resident_weights(1_925_775_360)?;
+        let (quad_caps, quad_count) = arena_capacities(1_925_775_360).ok_or(Error::Contract)?;
+        assert_eq!(quad_count, 4);
+        assert_eq!(
+            quad_caps,
+            [502_824_960, 460_062_720, 502_824_960, 460_062_720]
+        );
+        assert_eq!(
+            quad_limits.allocation_bytes(),
+            NATIVE_Q2_MAX_WORKING_BYTES + 1_925_775_360
         );
 
         let mut registry = NativeQ2WeightRegistry::new(4096)?;
@@ -1543,6 +1714,21 @@ mod tests {
             ),
             1
         );
+
+        let act1 = vec![2.5_f32; 128];
+        let multi4 = image_multi_resident(
+            &mut arena,
+            0x1000_0000,
+            7,
+            arena_start,
+            &extra,
+            [&h_arena1, &h_arena1, &h_arena1, &h_arena1],
+            [&activation, &activation, &act1, &act1],
+        )?;
+        assert_eq!(multi4.n_bufs, 2);
+        // Two unique 512-byte activations at 2048 and 2560; 4 outputs at 3072, 3200, 3328, 3456.
+        assert_eq!(multi4.output_offsets, [3072, 3200, 3328, 3456]);
+        assert_eq!(multi4.output_end, 3584);
         Ok(())
     }
 }

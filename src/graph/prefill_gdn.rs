@@ -1,6 +1,6 @@
 //! Opt-in bounded triangular GDN chunks; no cumulative-decay division.
 
-use super::{TiledPrefill, project_tile};
+use super::{TiledPrefill, project_tile, project_tile_pair, reborrow_executor};
 use crate::graph::{
     Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms, copy_into,
     finite, l2_norm, resize_into, sigmoid, small_float,
@@ -140,9 +140,11 @@ pub(super) fn recurrent_tile(
     adapter: Option<&RankOneAdapter>,
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
     count: usize,
     check: &dyn Fn() -> Result<()>,
     tile: &mut TiledPrefill,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
 ) -> Result<()> {
     let (
         LayerState::Recurrent {
@@ -157,10 +159,25 @@ pub(super) fn recurrent_tile(
     else {
         return Err(invalid("chunkwise GDN requires recurrent state"));
     };
-    let mut previous_weight = None;
+    check()?;
+    let mut previous_weight = project_tile_pair(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        [&layer.qkv, &layer.gate],
+        &tile.normalized[..count],
+        &mut tile.mixed[..count],
+        &mut tile.recurrent_gate[..count],
+        &mut tile.transformed[..count],
+        &mut tile.projector,
+        reborrow_executor(&mut executor),
+        check,
+    )?;
     for (weight, outputs) in [
-        (&layer.qkv, &mut tile.mixed),
-        (&layer.gate, &mut tile.recurrent_gate),
         (&layer.beta, &mut tile.beta),
         (&layer.alpha, &mut tile.alpha),
     ] {
@@ -172,12 +189,14 @@ pub(super) fn recurrent_tile(
             adapter,
             adapter_scale,
             adapter_scratch,
+            projection_scratch,
             previous_weight,
             weight,
             &tile.normalized[..count],
             &mut outputs[..count],
             &mut tile.transformed[..count],
             &mut tile.projector,
+            reborrow_executor(&mut executor),
             check,
         )?;
         previous_weight = Some(weight);
@@ -351,12 +370,14 @@ pub(super) fn recurrent_tile(
         adapter,
         adapter_scale,
         adapter_scratch,
+        projection_scratch,
         None,
         &layer.output,
         &tile.attended[..count],
         &mut tile.attention[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
+        reborrow_executor(&mut executor),
         check,
     )?;
     finite(convolution, "chunkwise convolution state")?;

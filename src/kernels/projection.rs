@@ -129,6 +129,52 @@ pub trait Pq2ProjectionExecutor {
             "projection executor does not support batched F32 groups",
         ))
     }
+
+    /// Execute a single `PQ2_0` projection across a tile of `F32` token activations.
+    ///
+    /// # Errors
+    /// Rejects mismatched slice lengths, unsupported arithmetic or submission failures.
+    fn project_f32_tokens(
+        &mut self,
+        tensor: &Tensor,
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if activations.len() != outputs.len() {
+            return Err(invalid("mismatched F32 token projection outputs"));
+        }
+        for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
+            self.project_f32(tensor, activation, pinned, output)?;
+        }
+        Ok(())
+    }
+
+    /// Execute a pair of compatible `PQ2_0` sibling projections across a tile of
+    /// shared `F32` token activations.
+    ///
+    /// # Errors
+    /// Rejects mismatched slice lengths, unsupported groups or submission failures.
+    fn project_f32_pair_tokens(
+        &mut self,
+        tensors: [&Tensor; 2],
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if activations.len() != outputs_a.len() || activations.len() != outputs_b.len() {
+            return Err(invalid("mismatched F32 pair token projection outputs"));
+        }
+        for ((activation, out_a), out_b) in activations
+            .iter()
+            .zip(outputs_a.iter_mut())
+            .zip(outputs_b.iter_mut())
+        {
+            self.project_f32_group(&tensors, activation, pinned, &mut [out_a, out_b])?;
+        }
+        Ok(())
+    }
 }
 
 impl PreparedMatvec<'_> {

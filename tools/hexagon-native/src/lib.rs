@@ -38,11 +38,11 @@ pub use htp_ops::{
     solve_unary_kparams,
 };
 pub use native_q2::{
-    NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES, NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES, NATIVE_Q2_MAX_COLUMNS,
-    NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES, NATIVE_Q2_MAX_ROWS, NATIVE_Q2_MAX_WEIGHT_ARENAS,
-    NATIVE_Q2_MAX_WEIGHT_BYTES, NATIVE_Q2_MAX_WORKING_BYTES, NATIVE_Q2_VTCM_REQUEST_BYTES,
-    NativeQ2ProjectionLimits, NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2WeightHandle,
-    NativeQ2WeightRegistry,
+    NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES, NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES,
+    NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES, NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES,
+    NATIVE_Q2_MAX_ROWS, NATIVE_Q2_MAX_WEIGHT_ARENAS, NATIVE_Q2_MAX_WEIGHT_BYTES,
+    NATIVE_Q2_MAX_WORKING_BYTES, NATIVE_Q2_VTCM_REQUEST_BYTES, NativeQ2ProjectionLimits,
+    NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2WeightHandle, NativeQ2WeightRegistry,
 };
 pub use power::{PowerStatus, power_status};
 pub use projection::{
@@ -867,6 +867,57 @@ impl NativeQ2Submitter for NativeQ2Session {
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {
             let _ = (handles, activation, outputs);
+            match self.0 {}
+        }
+    }
+
+    fn submit_resident_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_multi2(handles, activations, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activations, outputs);
+            match self.0 {}
+        }
+    }
+
+    fn submit_resident_multi3(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 3],
+        outputs: [&mut [f32]; 3],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_multi3(handles, activations, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activations, outputs);
+            match self.0 {}
+        }
+    }
+
+    fn submit_resident_multi4(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 4],
+        activations: [&[f32]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> Result<(), Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_multi4(handles, activations, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activations, outputs);
             match self.0 {}
         }
     }

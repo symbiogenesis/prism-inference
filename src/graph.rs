@@ -93,6 +93,25 @@ impl Arithmetic {
         }
     }
 
+    fn swiglu_in_place_with_parallelism(
+        self,
+        gate: &[f32],
+        up: &mut [f32],
+        parallelism: &RowParallelism,
+    ) -> Result<()> {
+        if gate.len() != up.len() {
+            return Err(invalid("SwiGLU requires equal gate and up vector lengths"));
+        }
+        if up.len() >= 1024 && parallelism.workers() > 1 {
+            return parallelism.update_chunks(up, 256, |chunk_idx, up_chunk| {
+                let start = chunk_idx * 256;
+                let gate_chunk = &gate[start..start + up_chunk.len()];
+                self.swiglu_in_place(gate_chunk, up_chunk)
+            });
+        }
+        self.swiglu_in_place(gate, up)
+    }
+
     fn swiglu_into(self, gate: &[f32], up: &[f32], output: &mut [f32]) -> Result<()> {
         match self {
             Self::Source => {
@@ -1854,7 +1873,11 @@ impl Qwen35 {
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
             evaluation.project_group_into([&layer.up, &layer.gate], normalized, [up, gate])?;
-            self.arithmetic.swiglu_in_place(gate, up)?;
+            self.arithmetic.swiglu_in_place_with_parallelism(
+                gate,
+                up,
+                evaluation.projection.matvec.row_parallelism(),
+            )?;
             evaluation.project_into(&layer.down, up, attention)?;
             add(hidden, attention);
             finite(hidden, "decoder layer output")?;

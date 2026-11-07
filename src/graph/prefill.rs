@@ -303,7 +303,8 @@ impl Qwen35 {
             check()?;
             row_into(&self.embedding, usize::try_from(*token)?, hidden)?;
             if self.transforms.inverse_embedding {
-                self.transforms.rotate(hidden)?;
+                self.transforms
+                    .rotate_with_parallelism(hidden, tile.projector.row_parallelism())?;
                 self.transforms.sign(hidden);
             }
             if let Some(adapter) = &self.adapter {
@@ -467,7 +468,11 @@ impl Qwen35 {
                 previous = Some(weight);
             }
             for (up, gate) in tile.up[..count].iter_mut().zip(&tile.gate[..count]) {
-                self.arithmetic.swiglu_in_place(gate, up)?;
+                self.arithmetic.swiglu_in_place_with_parallelism(
+                    gate,
+                    up,
+                    tile.projector.row_parallelism(),
+                )?;
             }
             check()?;
             project_tile(

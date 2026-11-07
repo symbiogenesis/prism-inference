@@ -298,6 +298,50 @@ impl Block {
     }
 }
 
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "Retain one signature across targets and feature sets."
+)]
+pub(super) fn dot_four_rows<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[super::super::MatvecScratch],
+    kind: u32,
+    columns: usize,
+    pinned: bool,
+    backend: MatvecBackend,
+    decoded_blocks: &mut u64,
+) -> Option<Result<[[f32; TOKENS]; 4]>> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if backend != MatvecBackend::Scalar {
+        if kind == super::super::PQ2 && columns.is_multiple_of(256) {
+            return neon::dot_pq2_four_rows(rows, preparations, pinned, decoded_blocks);
+        }
+        return neon::dot_q8_four_rows(
+            rows,
+            preparations,
+            kind == super::super::PTQ1,
+            pinned,
+            decoded_blocks,
+        );
+    }
+    let _ = (
+        rows,
+        preparations,
+        kind,
+        columns,
+        pinned,
+        backend,
+        decoded_blocks,
+    );
+    None
+}
+
 fn scalar(weights: &[i16], values: &[i8]) -> i32 {
     weights
         .iter()

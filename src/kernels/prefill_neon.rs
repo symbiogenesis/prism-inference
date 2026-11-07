@@ -38,30 +38,10 @@ impl Block {
 
     pub(super) fn from_pq2(packed: &[u8; 32]) -> Option<Self> {
         let neon = fearless_simd::Level::baseline().as_neon()?;
-        let mut weights = [i16x8::splat(neon, 0); 16];
-        for (half, bytes) in packed.as_chunks::<16>().0.iter().enumerate() {
-            let raw = u8x16::from_slice(neon, bytes);
-            let a = raw & 3;
-            let b = (raw >> 2) & 3;
-            let c = (raw >> 4) & 3;
-            let d = raw >> 6;
-            let ab_low: u16x8<Neon> = a.zip_low(b).bitcast();
-            let ab_high: u16x8<Neon> = a.zip_high(b).bitcast();
-            let cd_low: u16x8<Neon> = c.zip_low(d).bitcast();
-            let cd_high: u16x8<Neon> = c.zip_high(d).bitcast();
-            let decoded = [
-                ab_low.zip_low(cd_low).bitcast::<i8x16<Neon>>() - 1,
-                ab_low.zip_high(cd_low).bitcast::<i8x16<Neon>>() - 1,
-                ab_high.zip_low(cd_high).bitcast::<i8x16<Neon>>() - 1,
-                ab_high.zip_high(cd_high).bitcast::<i8x16<Neon>>() - 1,
-            ];
-            for (group, vector) in decoded.into_iter().enumerate() {
-                let (low, high) = vector.widen();
-                weights[half * 8 + group * 2] = low;
-                weights[half * 8 + group * 2 + 1] = high;
-            }
-        }
-        Some(Self { neon, weights })
+        Some(Self {
+            neon,
+            weights: decode_pq2_sequential(neon, packed),
+        })
     }
 
     pub(super) fn from_ptq1(packed: &[u8; 28]) -> Option<Self> {
@@ -290,4 +270,417 @@ impl Block {
             reduce4_i32x4(lane0, lane1, lane2, lane3)
         })
     }
+}
+
+#[inline]
+fn decode_pq2_sequential(neon: Neon, packed: &[u8; 32]) -> [i16x8<Neon>; 16] {
+    let mut weights = [i16x8::splat(neon, 0); 16];
+    for (half, bytes) in packed.as_chunks::<16>().0.iter().enumerate() {
+        let raw = u8x16::from_slice(neon, bytes);
+        let a = raw & 3;
+        let b = (raw >> 2) & 3;
+        let c = (raw >> 4) & 3;
+        let d = raw >> 6;
+        let ab_low: u16x8<Neon> = a.zip_low(b).bitcast();
+        let ab_high: u16x8<Neon> = a.zip_high(b).bitcast();
+        let cd_low: u16x8<Neon> = c.zip_low(d).bitcast();
+        let cd_high: u16x8<Neon> = c.zip_high(d).bitcast();
+        let decoded = [
+            ab_low.zip_low(cd_low).bitcast::<i8x16<Neon>>() - 1,
+            ab_low.zip_high(cd_low).bitcast::<i8x16<Neon>>() - 1,
+            ab_high.zip_low(cd_high).bitcast::<i8x16<Neon>>() - 1,
+            ab_high.zip_high(cd_high).bitcast::<i8x16<Neon>>() - 1,
+        ];
+        for (group, vector) in decoded.into_iter().enumerate() {
+            let (low, high) = vector.widen();
+            weights[half * 8 + group * 2] = low;
+            weights[half * 8 + group * 2 + 1] = high;
+        }
+    }
+    weights
+}
+
+#[inline]
+fn decode_pq2_unsigned(neon: Neon, packed: &[u8; 32]) -> [i16x8<Neon>; 16] {
+    let mut weights = [i16x8::splat(neon, 0); 16];
+    let mask = u8x16::splat(neon, 0x03);
+    for (half, bytes) in packed.as_chunks::<16>().0.iter().enumerate() {
+        let w = u8x16::from_slice(neon, bytes);
+        let (q0_low, q0_high) = (w & mask).widen();
+        let (q1_low, q1_high) = ((w >> 2) & mask).widen();
+        let (q2_low, q2_high) = ((w >> 4) & mask).widen();
+        let (q3_low, q3_high) = (w >> 6).widen();
+        let base = half * 8;
+        weights[base] = q0_low.bitcast();
+        weights[base + 1] = q0_high.bitcast();
+        weights[base + 2] = q1_low.bitcast();
+        weights[base + 3] = q1_high.bitcast();
+        weights[base + 4] = q2_low.bitcast();
+        weights[base + 5] = q2_high.bitcast();
+        weights[base + 6] = q3_low.bitcast();
+        weights[base + 7] = q3_high.bitcast();
+    }
+    weights
+}
+
+struct Pq2Activation {
+    planes: [i16x8<Neon>; 16],
+    sum128: i32,
+}
+
+#[inline]
+fn prepare_pq2_activation(neon: Neon, values: &[i8; 128]) -> Pq2Activation {
+    let mut planes = [i16x8::splat(neon, 0); 16];
+    let mut sum_acc = i16x8::splat(neon, 0);
+    for (half, bytes) in values.as_chunks::<64>().0.iter().enumerate() {
+        let chunks = bytes.as_chunks::<16>().0;
+        let c0 = i8x16::from_slice(neon, &chunks[0]);
+        let c1 = i8x16::from_slice(neon, &chunks[1]);
+        let c2 = i8x16::from_slice(neon, &chunks[2]);
+        let c3 = i8x16::from_slice(neon, &chunks[3]);
+        let e01 = c0.unzip_low(c1);
+        let o01 = c0.unzip_high(c1);
+        let e23 = c2.unzip_low(c3);
+        let o23 = c2.unzip_high(c3);
+        let p0 = e01.unzip_low(e23);
+        let p1 = o01.unzip_low(o23);
+        let p2 = e01.unzip_high(e23);
+        let p3 = o01.unzip_high(o23);
+        let (p0_low, p0_high) = p0.widen();
+        let (p1_low, p1_high) = p1.widen();
+        let (p2_low, p2_high) = p2.widen();
+        let (p3_low, p3_high) = p3.widen();
+        let base = half * 8;
+        planes[base] = p0_low;
+        planes[base + 1] = p0_high;
+        planes[base + 2] = p1_low;
+        planes[base + 3] = p1_high;
+        planes[base + 4] = p2_low;
+        planes[base + 5] = p2_high;
+        planes[base + 6] = p3_low;
+        planes[base + 7] = p3_high;
+        sum_acc +=
+            ((p0_low + p0_high) + (p1_low + p1_high)) + ((p2_low + p2_high) + (p3_low + p3_high));
+    }
+    let (sum_low, sum_high) = sum_acc.widen();
+    Pq2Activation {
+        planes,
+        sum128: (sum_low + sum_high).reduce_sum(),
+    }
+}
+
+#[inline]
+fn dot128_four_rows_four_tokens(
+    neon: Neon,
+    weights: &[[i16x8<Neon>; 16]; 4],
+    acts: &[Pq2Activation; 4],
+) -> [i32x4<Neon>; 4] {
+    let mut acc00 = i16x8::splat(neon, 0);
+    let mut acc01 = i16x8::splat(neon, 0);
+    let mut acc02 = i16x8::splat(neon, 0);
+    let mut acc03 = i16x8::splat(neon, 0);
+    let mut acc10 = i16x8::splat(neon, 0);
+    let mut acc11 = i16x8::splat(neon, 0);
+    let mut acc12 = i16x8::splat(neon, 0);
+    let mut acc13 = i16x8::splat(neon, 0);
+    let mut acc20 = i16x8::splat(neon, 0);
+    let mut acc21 = i16x8::splat(neon, 0);
+    let mut acc22 = i16x8::splat(neon, 0);
+    let mut acc23 = i16x8::splat(neon, 0);
+    let mut acc30 = i16x8::splat(neon, 0);
+    let mut acc31 = i16x8::splat(neon, 0);
+    let mut acc32 = i16x8::splat(neon, 0);
+    let mut acc33 = i16x8::splat(neon, 0);
+    for k in 0..16 {
+        let w0 = weights[0][k];
+        let w1 = weights[1][k];
+        let w2 = weights[2][k];
+        let w3 = weights[3][k];
+        let a0 = acts[0].planes[k];
+        let a1 = acts[1].planes[k];
+        let a2 = acts[2].planes[k];
+        let a3 = acts[3].planes[k];
+        acc00 += w0 * a0;
+        acc01 += w0 * a1;
+        acc02 += w0 * a2;
+        acc03 += w0 * a3;
+        acc10 += w1 * a0;
+        acc11 += w1 * a1;
+        acc12 += w1 * a2;
+        acc13 += w1 * a3;
+        acc20 += w2 * a0;
+        acc21 += w2 * a1;
+        acc22 += w2 * a2;
+        acc23 += w2 * a3;
+        acc30 += w3 * a0;
+        acc31 += w3 * a1;
+        acc32 += w3 * a2;
+        acc33 += w3 * a3;
+    }
+    let sums = i32x4::from_slice(
+        neon,
+        &[
+            acts[0].sum128,
+            acts[1].sum128,
+            acts[2].sum128,
+            acts[3].sum128,
+        ],
+    );
+    let reduce_row = |c0: i16x8<Neon>, c1: i16x8<Neon>, c2: i16x8<Neon>, c3: i16x8<Neon>| {
+        let (l0, h0) = c0.widen();
+        let (l1, h1) = c1.widen();
+        let (l2, h2) = c2.widen();
+        let (l3, h3) = c3.widen();
+        reduce4_i32x4_vec(l0 + h0, l1 + h1, l2 + h2, l3 + h3) - sums
+    };
+    [
+        reduce_row(acc00, acc01, acc02, acc03),
+        reduce_row(acc10, acc11, acc12, acc13),
+        reduce_row(acc20, acc21, acc22, acc23),
+        reduce_row(acc30, acc31, acc32, acc33),
+    ]
+}
+
+#[inline]
+fn dot128_four_rows_one_token(
+    neon: Neon,
+    weights: &[[i16x8<Neon>; 16]; 4],
+    act: &Pq2Activation,
+) -> [i32; 4] {
+    let mut acc0 = i16x8::splat(neon, 0);
+    let mut acc1 = i16x8::splat(neon, 0);
+    let mut acc2 = i16x8::splat(neon, 0);
+    let mut acc3 = i16x8::splat(neon, 0);
+    for k in 0..16 {
+        let a = act.planes[k];
+        acc0 += weights[0][k] * a;
+        acc1 += weights[1][k] * a;
+        acc2 += weights[2][k] * a;
+        acc3 += weights[3][k] * a;
+    }
+    let (l0, h0) = acc0.widen();
+    let (l1, h1) = acc1.widen();
+    let (l2, h2) = acc2.widen();
+    let (l3, h3) = acc3.widen();
+    let sums = i32x4::splat(neon, act.sum128);
+    (reduce4_i32x4_vec(l0 + h0, l1 + h1, l2 + h2, l3 + h3) - sums).to_array()
+}
+
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::too_many_lines,
+    reason = "Preserve separately rounded source arithmetic and four-row × four-token register blocking."
+)]
+pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[crate::kernels::MatvecScratch],
+    pinned: bool,
+    decoded_blocks: &mut u64,
+) -> Option<crate::Result<[[f32; TOKENS]; 4]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sums = [[0.0_f32; TOKENS]; 4];
+    let r0 = rows[0].as_chunks::<34>().0;
+    let r1 = rows[1].as_chunks::<34>().0;
+    let r2 = rows[2].as_chunks::<34>().0;
+    let r3 = rows[3].as_chunks::<34>().0;
+    for (index, (((b0, b1), b2), b3)) in r0.iter().zip(r1).zip(r2).zip(r3).enumerate() {
+        let scales_vec = crate::kernels::neon::f16_bits_to_f32_x4(
+            neon,
+            [
+                u16::from_le_bytes([b0[0], b0[1]]),
+                u16::from_le_bytes([b1[0], b1[1]]),
+                u16::from_le_bytes([b2[0], b2[1]]),
+                u16::from_le_bytes([b3[0], b3[1]]),
+            ],
+        );
+        if !scales_vec.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let row_scales = scales_vec.to_array();
+        *decoded_blocks = decoded_blocks.saturating_add(4);
+        let weights = [
+            decode_pq2_unsigned(neon, b0[2..34].try_into().ok()?),
+            decode_pq2_unsigned(neon, b1[2..34].try_into().ok()?),
+            decode_pq2_unsigned(neon, b2[2..34].try_into().ok()?),
+            decode_pq2_unsigned(neon, b3[2..34].try_into().ok()?),
+        ];
+        let start = (index % 2) * 128;
+        let q8k_idx = index / 2;
+        let (chunks4, rem4) = preparations.as_chunks::<4>();
+        for (chunk_idx, chunk) in chunks4.iter().enumerate() {
+            let base = chunk_idx * 4;
+            let a0 = &chunk[0].q8k[q8k_idx];
+            let a1 = &chunk[1].q8k[q8k_idx];
+            let a2 = &chunk[2].q8k[q8k_idx];
+            let a3 = &chunk[3].q8k[q8k_idx];
+            let acts = [
+                prepare_pq2_activation(neon, a0.values[start..start + 128].try_into().ok()?),
+                prepare_pq2_activation(neon, a1.values[start..start + 128].try_into().ok()?),
+                prepare_pq2_activation(neon, a2.values[start..start + 128].try_into().ok()?),
+                prepare_pq2_activation(neon, a3.values[start..start + 128].try_into().ok()?),
+            ];
+            let dots = dot128_four_rows_four_tokens(neon, &weights, &acts);
+            let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+            for r in 0..4 {
+                let d = f32x4::splat(neon, row_scales[r]) * act_scales;
+                let dot_f32 = dots[r].to_float::<f32x4<Neon>>();
+                let cur = f32x4::from_slice(neon, &sums[r][base..base + 4]);
+                let next = if pinned {
+                    d.mul_add_precise(dot_f32, cur)
+                } else {
+                    cur + d * dot_f32
+                };
+                next.store_slice(&mut sums[r][base..base + 4]);
+            }
+        }
+        let rem_base = chunks4.len() * 4;
+        for (offset, scratch) in rem4.iter().enumerate() {
+            let token = rem_base + offset;
+            let act_block = &scratch.q8k[q8k_idx];
+            let act =
+                prepare_pq2_activation(neon, act_block.values[start..start + 128].try_into().ok()?);
+            let dots = dot128_four_rows_one_token(neon, &weights, &act);
+            for r in 0..4 {
+                let d = row_scales[r] * act_block.scale;
+                let dot_f32 = crate::kernels::integer_float(dots[r]);
+                sums[r][token] = if pinned {
+                    d.mul_add(dot_f32, sums[r][token])
+                } else {
+                    sums[r][token] + d * dot_f32
+                };
+            }
+        }
+    }
+    for row_sums in &mut sums {
+        for sum in row_sums.iter_mut().take(preparations.len()) {
+            if let Err(err) = crate::kernels::finite(*sum) {
+                return Some(Err(err));
+            }
+        }
+    }
+    Some(Ok(sums))
+}
+
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::too_many_lines,
+    reason = "Preserve separately rounded source arithmetic and four-row Q8 activation sharing."
+)]
+pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[crate::kernels::MatvecScratch],
+    is_ptq1: bool,
+    pinned: bool,
+    decoded_blocks: &mut u64,
+) -> Option<crate::Result<[[f32; TOKENS]; 4]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sums = [[0.0_f32; TOKENS]; 4];
+    let mut lanes = [[[0.0_f32; 4]; TOKENS]; 4];
+    let block_bytes = if is_ptq1 { 28 } else { 34 };
+    let r0 = rows[0].chunks_exact(block_bytes);
+    let r1 = rows[1].chunks_exact(block_bytes);
+    let r2 = rows[2].chunks_exact(block_bytes);
+    let r3 = rows[3].chunks_exact(block_bytes);
+    for (index, (((b0, b1), b2), b3)) in r0.zip(r1).zip(r2).zip(r3).enumerate() {
+        let scale_offset = if is_ptq1 { 26 } else { 0 };
+        let scales_vec = crate::kernels::neon::f16_bits_to_f32_x4(
+            neon,
+            [
+                u16::from_le_bytes([b0[scale_offset], b0[scale_offset + 1]]),
+                u16::from_le_bytes([b1[scale_offset], b1[scale_offset + 1]]),
+                u16::from_le_bytes([b2[scale_offset], b2[scale_offset + 1]]),
+                u16::from_le_bytes([b3[scale_offset], b3[scale_offset + 1]]),
+            ],
+        );
+        if !scales_vec.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let row_scales = scales_vec.to_array();
+        *decoded_blocks = decoded_blocks.saturating_add(4);
+        let weights = if is_ptq1 {
+            [
+                crate::kernels::neon::decode_ptq1_i16(neon, b0.try_into().ok()?),
+                crate::kernels::neon::decode_ptq1_i16(neon, b1.try_into().ok()?),
+                crate::kernels::neon::decode_ptq1_i16(neon, b2.try_into().ok()?),
+                crate::kernels::neon::decode_ptq1_i16(neon, b3.try_into().ok()?),
+            ]
+        } else {
+            [
+                decode_pq2_sequential(neon, b0[2..34].try_into().ok()?),
+                decode_pq2_sequential(neon, b1[2..34].try_into().ok()?),
+                decode_pq2_sequential(neon, b2[2..34].try_into().ok()?),
+                decode_pq2_sequential(neon, b3[2..34].try_into().ok()?),
+            ]
+        };
+        for (token, scratch) in preparations.iter().enumerate() {
+            let activations =
+                <&[crate::kernels::Q8Block; 4]>::try_from(&scratch.q8[index * 4..index * 4 + 4])
+                    .ok()?;
+            let act_groups: [_; 4] = std::array::from_fn(|group| {
+                let halves = activations[group].values.as_chunks::<16>().0;
+                let (l0, h0) = i8x16::from_slice(neon, &halves[0]).widen();
+                let (l1, h1) = i8x16::from_slice(neon, &halves[1]).widen();
+                (l0, h0, l1, h1)
+            });
+            if is_ptq1 && pinned {
+                for r in 0..4 {
+                    let mut acc = f32x4::from_slice(neon, &lanes[r][token]);
+                    for (group, &(l0, h0, l1, h1)) in act_groups.iter().enumerate() {
+                        let sum_01 = weights[r][group * 4] * l0 + weights[r][group * 4 + 2] * l1;
+                        let sum_23 =
+                            weights[r][group * 4 + 1] * h0 + weights[r][group * 4 + 3] * h1;
+                        let (q0, q1) = sum_01.widen();
+                        let (q2, q3) = sum_23.widen();
+                        let floats = reduce4_i32x4_vec(q0, q1, q2, q3).to_float::<f32x4<Neon>>();
+                        let d = f32x4::splat(neon, row_scales[r] * activations[group].scale);
+                        acc = floats.mul_add_precise(d, acc);
+                    }
+                    acc.store_slice(&mut lanes[r][token]);
+                }
+            } else {
+                let act_scales = f32x4::from_slice(
+                    neon,
+                    &[
+                        activations[0].scale,
+                        activations[1].scale,
+                        activations[2].scale,
+                        activations[3].scale,
+                    ],
+                );
+                for r in 0..4 {
+                    let group_sums: [i32x4<Neon>; 4] = std::array::from_fn(|group| {
+                        let (l0, h0, l1, h1) = act_groups[group];
+                        let pairs = (weights[r][group * 4] * l0 + weights[r][group * 4 + 1] * h0)
+                            + (weights[r][group * 4 + 2] * l1 + weights[r][group * 4 + 3] * h1);
+                        let (sum_low, sum_high) = pairs.widen();
+                        sum_low + sum_high
+                    });
+                    let dots = reduce4_i32x4_vec(
+                        group_sums[0],
+                        group_sums[1],
+                        group_sums[2],
+                        group_sums[3],
+                    )
+                    .to_float::<f32x4<Neon>>();
+                    let prod = (dots * act_scales).to_array();
+                    let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                    sums[r][token] += row_scales[r] * dot_sum;
+                }
+            }
+        }
+    }
+    for r in 0..4 {
+        for (sum, lane) in sums[r].iter_mut().zip(lanes[r]).take(preparations.len()) {
+            let value = if is_ptq1 && pinned {
+                (lane[0] + lane[1]) + (lane[2] + lane[3])
+            } else {
+                *sum
+            };
+            match crate::kernels::finite(value) {
+                Ok(checked) => *sum = checked,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+    Some(Ok(sums))
 }

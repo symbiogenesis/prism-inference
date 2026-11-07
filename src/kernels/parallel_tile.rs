@@ -31,6 +31,7 @@ impl Drop for Completion<'_> {
 impl RowParallelism {
     /// Fill disjoint token-major row slices without duplicating weight decoding.
     /// The callback stays on its calling thread and needs neither `Send` nor `Sync`.
+    #[cfg(all(test, feature = "parallel-rows"))]
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -142,6 +143,211 @@ impl RowParallelism {
             return check();
         }
         for row in data.chunks_exact(row_bytes) {
+            check()?;
+            let values = dot(row, decoded_blocks)?;
+            for (output, value) in outputs.iter_mut().zip(values) {
+                output.push(value);
+            }
+        }
+        check()
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Keep scoped borrows, four-row batching, joined cancellation and bounded stack task storage together."
+    )]
+    pub(in crate::kernels) fn fill_tile_four_rows<const TOKENS: usize>(
+        &self,
+        data: &[u8],
+        row_bytes: usize,
+        outputs: &mut [Vec<f32>],
+        decoded_blocks: &mut u64,
+        check: &dyn Fn() -> Result<()>,
+        dot_four: impl Fn([&[u8]; 4], &mut u64) -> Result<[[f32; TOKENS]; 4]> + Sync,
+        dot: impl Fn(&[u8], &mut u64) -> Result<[f32; TOKENS]> + Sync,
+    ) -> Result<()> {
+        if outputs.is_empty()
+            || outputs.len() > TOKENS
+            || row_bytes == 0
+            || !data.len().is_multiple_of(row_bytes)
+        {
+            return Err(invalid("invalid tile row geometry"));
+        }
+        let rows = data.len() / row_bytes;
+        #[cfg(not(feature = "parallel-rows"))]
+        if self.uses_pool(rows) {
+            return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool
+            && self.uses_pool(rows)
+        {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::time::Duration;
+
+            let task_rows = rows.div_ceil(self.workers());
+            let task_count = rows.div_ceil(task_rows);
+            let mut tasks: [Task<'_, TOKENS>; MAX_ROW_WORKERS] = std::array::from_fn(|_| Task {
+                outputs: std::array::from_fn(|_| -> &mut [f32] { &mut [] }),
+                error: None,
+                decoded_blocks: 0,
+            });
+            for (token, output) in outputs.iter_mut().enumerate() {
+                output.resize(rows, 0.0);
+                for (task, chunk) in tasks.iter_mut().zip(output.chunks_mut(task_rows)) {
+                    task.outputs[token] = chunk;
+                }
+            }
+            let caller = std::thread::current();
+            let remaining = AtomicUsize::new(task_count);
+            let cancelled = AtomicBool::new(false);
+            let mut cancellation = None;
+            pool.in_place_scope(|scope| {
+                for (index, task) in tasks[..task_count].iter_mut().enumerate() {
+                    let start = index * task_rows * row_bytes;
+                    let bytes = &data[start..start + task.outputs[0].len() * row_bytes];
+                    let dot_four = &dot_four;
+                    let dot = &dot;
+                    let remaining = &remaining;
+                    let cancelled = &cancelled;
+                    let caller = &caller;
+                    scope.spawn(move |_| {
+                        let _completion = Completion { remaining, caller };
+                        let group_bytes = row_bytes * 4;
+                        let mut row = 0;
+                        let mut chunks = bytes.chunks_exact(group_bytes);
+                        for chunk in chunks.by_ref() {
+                            if cancelled.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let r0 = &chunk[..row_bytes];
+                            let r1 = &chunk[row_bytes..row_bytes * 2];
+                            let r2 = &chunk[row_bytes * 2..row_bytes * 3];
+                            let r3 = &chunk[row_bytes * 3..];
+                            let before_blocks = task.decoded_blocks;
+                            if let Ok(rows4) = dot_four([r0, r1, r2, r3], &mut task.decoded_blocks)
+                            {
+                                for (tok, output) in task.outputs.iter_mut().enumerate() {
+                                    if !output.is_empty() {
+                                        output[row] = rows4[0][tok];
+                                        output[row + 1] = rows4[1][tok];
+                                        output[row + 2] = rows4[2][tok];
+                                        output[row + 3] = rows4[3][tok];
+                                    }
+                                }
+                                row += 4;
+                            } else {
+                                task.decoded_blocks = before_blocks;
+                                for single in [r0, r1, r2, r3] {
+                                    if cancelled.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    match dot(single, &mut task.decoded_blocks) {
+                                        Ok(values) => {
+                                            for (output, value) in
+                                                task.outputs.iter_mut().zip(values)
+                                            {
+                                                if !output.is_empty() {
+                                                    output[row] = value;
+                                                }
+                                            }
+                                            row += 1;
+                                        }
+                                        Err(error) => {
+                                            task.error = Some(error);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if task.error.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
+                            for single in chunks.remainder().chunks_exact(row_bytes) {
+                                if cancelled.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                match dot(single, &mut task.decoded_blocks) {
+                                    Ok(values) => {
+                                        for (output, value) in task.outputs.iter_mut().zip(values) {
+                                            if !output.is_empty() {
+                                                output[row] = value;
+                                            }
+                                        }
+                                        row += 1;
+                                    }
+                                    Err(error) => {
+                                        task.error = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                while remaining.load(Ordering::Acquire) != 0 {
+                    if cancellation.is_none()
+                        && let Err(error) = check()
+                    {
+                        cancellation = Some(error);
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    std::thread::park_timeout(Duration::from_millis(1));
+                }
+            });
+            for task in &tasks[..task_count] {
+                *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
+            }
+            if let Some(error) = cancellation {
+                return Err(error);
+            }
+            if let Some(error) = tasks.iter_mut().find_map(|task| task.error.take()) {
+                return Err(error);
+            }
+            return check();
+        }
+        let group_bytes = row_bytes * 4;
+        let mut chunks = data.chunks_exact(group_bytes);
+        for chunk in chunks.by_ref() {
+            let r0 = &chunk[..row_bytes];
+            let r1 = &chunk[row_bytes..row_bytes * 2];
+            let r2 = &chunk[row_bytes * 2..row_bytes * 3];
+            let r3 = &chunk[row_bytes * 3..];
+            let before_blocks = *decoded_blocks;
+            for completed in 0..4 {
+                if let Err(error) = check() {
+                    for single in &[r0, r1, r2, r3][..completed] {
+                        let values = dot(single, decoded_blocks)?;
+                        for (output, value) in outputs.iter_mut().zip(values) {
+                            output.push(value);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+            if let Ok(rows4) = dot_four([r0, r1, r2, r3], decoded_blocks) {
+                for (tok, output) in outputs.iter_mut().enumerate() {
+                    output.extend_from_slice(&[
+                        rows4[0][tok],
+                        rows4[1][tok],
+                        rows4[2][tok],
+                        rows4[3][tok],
+                    ]);
+                }
+            } else {
+                *decoded_blocks = before_blocks;
+                for single in [r0, r1, r2, r3] {
+                    let values = dot(single, decoded_blocks)?;
+                    for (output, value) in outputs.iter_mut().zip(values) {
+                        output.push(value);
+                    }
+                }
+            }
+        }
+        for row in chunks.remainder().chunks_exact(row_bytes) {
             check()?;
             let values = dot(row, decoded_blocks)?;
             for (output, value) in outputs.iter_mut().zip(values) {

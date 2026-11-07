@@ -17,6 +17,7 @@ struct Input<'a> {
     beta: f32,
 }
 
+#[cfg(test)]
 fn head(
     arithmetic: Arithmetic,
     previous: &[f32],
@@ -35,7 +36,34 @@ fn head(
             .ok_or_else(|| invalid("GDN chunk output overflow"))?,
         output,
     )?;
-    head_into(arithmetic, previous, inputs, matrix, output)
+    head_into(arithmetic, previous, inputs, None, matrix, output)
+}
+
+const KEY_DOT_STRIDE: usize = 2 * 32 * 32;
+
+fn fill_key_head_dots(
+    arithmetic: Arithmetic,
+    mixed: &[Vec<f32>],
+    key_width: usize,
+    width: usize,
+    key_head: usize,
+    dots: &mut [f32],
+) -> Result<()> {
+    let q_range = key_head * width..(key_head + 1) * width;
+    let k_range = key_width + key_head * width..key_width + (key_head + 1) * width;
+    for (token, token_mixed) in mixed.iter().enumerate() {
+        let row_base = token * 32;
+        let query_token = &token_mixed[q_range.clone()];
+        let key_token = &token_mixed[k_range.clone()];
+        for (prior, prior_mixed) in mixed[..=token].iter().enumerate() {
+            let key_prior = &prior_mixed[k_range.clone()];
+            dots[row_base + prior] = arithmetic.gdn_dot(key_prior, query_token)?;
+            if prior < token {
+                dots[1024 + row_base + prior] = arithmetic.gdn_dot(key_prior, key_token)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -47,6 +75,7 @@ fn head_into(
     arithmetic: Arithmetic,
     previous: &[f32],
     inputs: &[Input<'_>],
+    key_dots: Option<&[f32]>,
     matrix: &mut [f32],
     output: &mut [f32],
 ) -> Result<()> {
@@ -86,12 +115,23 @@ fn head_into(
         for prior in (0..token).rev() {
             products[token][prior] = products[token][prior + 1] * inputs[prior + 1].decay;
         }
-        for prior in 0..=token {
-            cross_query[token][prior] = products[token][prior]
-                * arithmetic.gdn_dot(inputs[prior].key, inputs[token].query)?;
-            if prior < token {
-                cross_key[token][prior] = products[token][prior]
-                    * arithmetic.gdn_dot(inputs[prior].key, inputs[token].key)?;
+        if let Some(dots) = key_dots {
+            let row_base = token * 32;
+            for prior in 0..=token {
+                cross_query[token][prior] = products[token][prior] * dots[row_base + prior];
+                if prior < token {
+                    cross_key[token][prior] =
+                        products[token][prior] * dots[1024 + row_base + prior];
+                }
+            }
+        } else {
+            for prior in 0..=token {
+                cross_query[token][prior] = products[token][prior]
+                    * arithmetic.gdn_dot(inputs[prior].key, inputs[token].query)?;
+                if prior < token {
+                    cross_key[token][prior] = products[token][prior]
+                        * arithmetic.gdn_dot(inputs[prior].key, inputs[token].key)?;
+                }
             }
         }
     }
@@ -202,11 +242,66 @@ pub(super) fn recurrent_tile(
     }
     copy_into(history, convolution)?;
     resize_into(previous.len(), matrix)?;
+    let hist_width = geometry.convolution - 1;
+    let parallelize_conv = hist_width > 0
+        && tile.projector.row_parallelism().workers() > 1
+        && geometry
+            .convolution_width()
+            .is_multiple_of(geometry.ssm_head)
+        && geometry.ssm_head.is_multiple_of(4);
     let parallelize_post_conv = tile.projector.row_parallelism().workers() > 1 && count > 1;
     for token in 0..count {
         check()?;
         let mixed = &mut tile.mixed[token];
-        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+        if parallelize_conv {
+            let head_hist = geometry.ssm_head * hist_width;
+            let head_coeff = geometry.ssm_head * geometry.convolution;
+            let qk_heads = (2 * geometry.key_width()) / geometry.ssm_head;
+            tile.projector.row_parallelism().update_paired_chunks(
+                mixed,
+                geometry.ssm_head,
+                convolution,
+                head_hist,
+                |base_head, mixed_chunk, conv_chunk| {
+                    for (offset, (head_mixed, head_conv)) in mixed_chunk
+                        .chunks_exact_mut(geometry.ssm_head)
+                        .zip(conv_chunk.chunks_exact_mut(head_hist))
+                        .enumerate()
+                    {
+                        let head = base_head + offset;
+                        let c_slice =
+                            &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
+                        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                            crate::kernels::pinned_convolution::step_silu_in_place(
+                                head_conv,
+                                head_mixed,
+                                c_slice,
+                                geometry.convolution,
+                            )?;
+                        } else {
+                            for (channel, value) in head_mixed.iter_mut().enumerate() {
+                                let projected = *value;
+                                let start = channel * hist_width;
+                                let coefficients = &c_slice[channel * geometry.convolution
+                                    ..(channel + 1) * geometry.convolution];
+                                *value = arithmetic.convolution_row(
+                                    &head_conv[start..start + hist_width],
+                                    projected,
+                                    coefficients,
+                                )?;
+                                head_conv[start..start + hist_width].rotate_left(1);
+                                head_conv[start + hist_width - 1] = projected;
+                            }
+                            arithmetic.silu(head_mixed);
+                        }
+                        if head < qk_heads {
+                            l2_norm(head_mixed, geometry.epsilon);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        } else if matches!(arithmetic, Arithmetic::PinnedSwift) {
             crate::kernels::pinned_convolution::step_silu_in_place(
                 convolution,
                 mixed,
@@ -216,25 +311,27 @@ pub(super) fn recurrent_tile(
         } else {
             for (channel, value) in mixed.iter_mut().enumerate() {
                 let projected = *value;
-                let start = channel * (geometry.convolution - 1);
+                let start = channel * hist_width;
                 let coefficients = &layer.convolution
                     [channel * geometry.convolution..(channel + 1) * geometry.convolution];
                 *value = arithmetic.convolution_row(
-                    &convolution[start..start + geometry.convolution - 1],
+                    &convolution[start..start + hist_width],
                     projected,
                     coefficients,
                 )?;
                 if geometry.convolution > 1 {
-                    convolution[start..start + geometry.convolution - 1].rotate_left(1);
-                    convolution[start + geometry.convolution - 2] = projected;
+                    convolution[start..start + hist_width].rotate_left(1);
+                    convolution[start + hist_width - 1] = projected;
                 }
             }
             arithmetic.silu(mixed);
         }
         resize_into(geometry.value_width(), &mut tile.attended[token])?;
         if !parallelize_post_conv {
-            for head in mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head) {
-                l2_norm(head, geometry.epsilon);
+            if !parallelize_conv {
+                for head in mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head) {
+                    l2_norm(head, geometry.epsilon);
+                }
             }
             for head in 0..geometry.ssm_values {
                 let activation = tile.alpha[token][head] + layer.time_bias[head];
@@ -250,18 +347,29 @@ pub(super) fn recurrent_tile(
         check()?;
     }
     if parallelize_post_conv {
+        if !parallelize_conv {
+            tile.projector.row_parallelism().update_chunks(
+                &mut tile.mixed[..count],
+                1,
+                |_, mixed_chunk| {
+                    for mixed in mixed_chunk {
+                        for head in
+                            mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head)
+                        {
+                            l2_norm(head, geometry.epsilon);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
         tile.projector.row_parallelism().update_paired_chunks(
-            &mut tile.mixed[..count],
-            1,
             &mut tile.alpha[..count],
             1,
-            |_, mixed_chunk, alpha_chunk| {
-                for (mixed, alpha) in mixed_chunk.iter_mut().zip(alpha_chunk.iter_mut()) {
-                    for head in
-                        mixed[..2 * geometry.key_width()].chunks_exact_mut(geometry.ssm_head)
-                    {
-                        l2_norm(head, geometry.epsilon);
-                    }
+            &mut tile.beta[..count],
+            1,
+            |_, alpha_chunk, beta_chunk| {
+                for (alpha, beta) in alpha_chunk.iter_mut().zip(beta_chunk.iter_mut()) {
                     for head in 0..geometry.ssm_values {
                         let activation = alpha[head] + layer.time_bias[head];
                         let softplus = if activation > 20.0 {
@@ -270,39 +378,74 @@ pub(super) fn recurrent_tile(
                             (1.0 + activation.exp()).ln()
                         };
                         alpha[head] = (softplus * layer.decay[head]).exp();
+                        beta[head] = sigmoid(beta[head]);
                     }
                 }
                 Ok(())
             },
         )?;
-        for beta in &mut tile.beta[..count] {
-            for value in beta.iter_mut().take(geometry.ssm_values) {
-                *value = sigmoid(*value);
-            }
-        }
     }
     let width = geometry.ssm_head;
+    let use_shared_key_dots = count <= 32
+        && width > 0
+        && geometry.ssm_values > geometry.ssm_keys
+        && geometry.ssm_keys > 0;
+    if use_shared_key_dots {
+        resize_into(geometry.ssm_keys * KEY_DOT_STRIDE, &mut tile.gdn_key_dots)?;
+        let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
+        let key_width = geometry.key_width();
+        tile.projector.row_parallelism().update_chunks(
+            &mut tile.gdn_key_dots,
+            KEY_DOT_STRIDE,
+            |base_key, chunk| {
+                for (offset, dots) in chunk
+                    .as_chunks_mut::<KEY_DOT_STRIDE>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    fill_key_head_dots(
+                        arithmetic,
+                        mixed_ref,
+                        key_width,
+                        width,
+                        base_key + offset,
+                        dots,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+    }
     if tile.projector.row_parallelism().workers() > 1 && geometry.ssm_values > 1 {
         for _ in 0..geometry.ssm_values {
             check()?;
         }
         let head_state_len = width * width;
         let head_out_len = count * width;
-        let mut head_outputs = Vec::new();
-        resize_into(geometry.ssm_values * head_out_len, &mut head_outputs)?;
+        resize_into(
+            geometry.ssm_values * head_out_len,
+            &mut tile.gdn_head_outputs,
+        )?;
         let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
         let alpha_ref: &[Vec<f32>] = &tile.alpha[..count];
         let beta_ref: &[Vec<f32>] = &tile.beta[..count];
         let gate_ref: &[Vec<f32>] = &tile.recurrent_gate[..count];
         let prev_ref: &[f32] = previous;
+        let key_dots_ref: &[f32] = &tile.gdn_key_dots;
         tile.projector.row_parallelism().update_paired_chunks(
             matrix,
             head_state_len,
-            &mut head_outputs,
+            &mut tile.gdn_head_outputs,
             head_out_len,
             |base_head, matrix_chunk, out_chunk| {
-                let mut inputs = Vec::new();
-                inputs.try_reserve_exact(count)?;
+                let mut inputs: [Input<'_>; 32] = std::array::from_fn(|_| Input {
+                    query: &[],
+                    key: &[],
+                    value: &[],
+                    decay: 0.0,
+                    beta: 0.0,
+                });
                 for (offset, (head_matrix, head_out)) in matrix_chunk
                     .chunks_exact_mut(head_state_len)
                     .zip(out_chunk.chunks_exact_mut(head_out_len))
@@ -310,10 +453,9 @@ pub(super) fn recurrent_tile(
                 {
                     let head_index = base_head + offset;
                     let key_head = head_index % geometry.ssm_keys;
-                    inputs.clear();
-                    for token in 0..count {
+                    for (token, slot) in inputs[..count].iter_mut().enumerate() {
                         let mixed = &mixed_ref[token];
-                        inputs.push(Input {
+                        *slot = Input {
                             query: &mixed[key_head * width..(key_head + 1) * width],
                             key: &mixed[geometry.key_width() + key_head * width
                                 ..geometry.key_width() + (key_head + 1) * width],
@@ -321,11 +463,21 @@ pub(super) fn recurrent_tile(
                                 ..2 * geometry.key_width() + (head_index + 1) * width],
                             decay: alpha_ref[token][head_index],
                             beta: beta_ref[token][head_index],
-                        });
+                        };
                     }
                     let prev_head =
                         &prev_ref[head_index * head_state_len..(head_index + 1) * head_state_len];
-                    head_into(arithmetic, prev_head, &inputs, head_matrix, head_out)?;
+                    let head_dots = use_shared_key_dots.then(|| {
+                        &key_dots_ref[key_head * KEY_DOT_STRIDE..(key_head + 1) * KEY_DOT_STRIDE]
+                    });
+                    head_into(
+                        arithmetic,
+                        prev_head,
+                        &inputs[..count],
+                        head_dots,
+                        head_matrix,
+                        head_out,
+                    )?;
                     for token in 0..count {
                         let token_out = &mut head_out[token * width..(token + 1) * width];
                         arithmetic.normalize_in_place(token_out, &layer.norm, geometry.epsilon)?;
@@ -340,7 +492,7 @@ pub(super) fn recurrent_tile(
         )?;
         for head_index in 0..geometry.ssm_values {
             let head_out =
-                &head_outputs[head_index * head_out_len..(head_index + 1) * head_out_len];
+                &tile.gdn_head_outputs[head_index * head_out_len..(head_index + 1) * head_out_len];
             for token in 0..count {
                 tile.attended[token][head_index * width..(head_index + 1) * width]
                     .copy_from_slice(&head_out[token * width..(token + 1) * width]);
@@ -351,17 +503,22 @@ pub(super) fn recurrent_tile(
             .chunkwise_gdn_heads
             .saturating_add(u64::try_from(geometry.ssm_values)?);
     } else {
-        let mut inputs = Vec::new();
-        inputs.try_reserve_exact(count)?;
-        let mut output = Vec::new();
+        let mut inputs: [Input<'_>; 32] = std::array::from_fn(|_| Input {
+            query: &[],
+            key: &[],
+            value: &[],
+            decay: 0.0,
+            beta: 0.0,
+        });
+        let head_out_len = count * width;
+        resize_into(head_out_len, &mut tile.gdn_head_outputs)?;
         let mut normalized = Vec::new();
         for head_index in 0..geometry.ssm_values {
             check()?;
-            inputs.clear();
             let key_head = head_index % geometry.ssm_keys;
-            for token in 0..count {
+            for (token, slot) in inputs[..count].iter_mut().enumerate() {
                 let mixed = &tile.mixed[token];
-                inputs.push(Input {
+                *slot = Input {
                     query: &mixed[key_head * width..(key_head + 1) * width],
                     key: &mixed[geometry.key_width() + key_head * width
                         ..geometry.key_width() + (key_head + 1) * width],
@@ -369,19 +526,23 @@ pub(super) fn recurrent_tile(
                         ..2 * geometry.key_width() + (head_index + 1) * width],
                     decay: tile.alpha[token][head_index],
                     beta: tile.beta[token][head_index],
-                });
+                };
             }
             let range = head_index * width * width..(head_index + 1) * width * width;
-            head(
+            let head_dots = use_shared_key_dots.then(|| {
+                &tile.gdn_key_dots[key_head * KEY_DOT_STRIDE..(key_head + 1) * KEY_DOT_STRIDE]
+            });
+            head_into(
                 arithmetic,
                 &previous[range.clone()],
-                &inputs,
+                &inputs[..count],
+                head_dots,
                 &mut matrix[range],
-                &mut output,
+                &mut tile.gdn_head_outputs,
             )?;
             for token in 0..count {
                 arithmetic.normalize(
-                    &output[token * width..(token + 1) * width],
+                    &tile.gdn_head_outputs[token * width..(token + 1) * width],
                     &layer.norm,
                     geometry.epsilon,
                     &mut normalized,

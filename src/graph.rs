@@ -2146,14 +2146,22 @@ impl Evaluation<'_, '_> {
                     Ok(())
                 },
             )?;
-        for head in key.chunks_exact_mut(g.head) {
-            self.arithmetic
-                .normalize_in_place(head, &layer.key_norm, g.epsilon)?;
-        }
-        self.arithmetic
-            .attention_rope(key, g, frequencies_scratch)?;
-        round_f16_slice(key);
-        round_f16_slice(value);
+        let key_norm: &[f32] = &layer.key_norm;
+        self.projection
+            .matvec
+            .row_parallelism()
+            .update_paired_chunks(key, g.head, value, g.head, |_, key_chunk, value_chunk| {
+                for (key_head, value_head) in key_chunk
+                    .chunks_exact_mut(g.head)
+                    .zip(value_chunk.chunks_exact_mut(g.head))
+                {
+                    arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
+                    arithmetic.attention_rope(key_head, g, frequencies)?;
+                    round_f16_slice(key_head);
+                    round_f16_slice(value_head);
+                }
+                Ok(())
+            })?;
         finite(query_scratch, "binary16 attention query")?;
         finite(key, "binary16 key cache")?;
         finite(value, "binary16 value cache")?;

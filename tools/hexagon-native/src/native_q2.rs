@@ -37,8 +37,8 @@ pub const NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES: usize = 502_824_960;
 /// Exact odd-arena 28-projection weight step (`438.75 MiB`, page-aligned) completing each 56-projection (9-layer) pair.
 pub const NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES: usize = 460_062_720;
 /// Maximum number of host-mapped `FastRPC` weight arenas in a single native `Q2_0` session.
-pub const NATIVE_Q2_MAX_WEIGHT_ARENAS: usize = 4;
-/// Largest aggregate immutable host-mapped weight capacity across all arenas in a single native `Q2_0` session (`1,920 MiB`).
+pub const NATIVE_Q2_MAX_WEIGHT_ARENAS: usize = 6;
+/// Largest aggregate immutable host-mapped weight capacity across all arenas in a single native `Q2_0` session (`2,880 MiB`).
 pub const NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES: usize =
     NATIVE_Q2_MAX_WEIGHT_ARENAS * NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES;
 /// Fixed 4 MiB VTCM request used by the 8-HVX full-`K` `Q2_0` session (`v81` hardware has 8 MiB VTCM).
@@ -51,7 +51,9 @@ pub(crate) const fn arena_capacities(
         return None;
     }
     if resident_weight_bytes <= NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES {
-        return Some(([resident_weight_bytes, 0, 0, 0], 1));
+        let mut capacities = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+        capacities[0] = resident_weight_bytes;
+        return Some((capacities, 1));
     }
     let use_alternating_steps = resident_weight_bytes
         <= (NATIVE_Q2_MAX_WEIGHT_ARENAS / 2)
@@ -1496,7 +1498,7 @@ mod tests {
                 .with_resident_weights(962_887_680)?;
         let (caps, count) = arena_capacities(962_887_680).ok_or(Error::Contract)?;
         assert_eq!(count, 2);
-        assert_eq!(caps, [502_824_960, 460_062_720, 0, 0]);
+        assert_eq!(caps, [502_824_960, 460_062_720, 0, 0, 0, 0]);
         assert_eq!(
             multi_limits.allocation_bytes(),
             NATIVE_Q2_MAX_WORKING_BYTES + 962_887_680
@@ -1510,11 +1512,33 @@ mod tests {
         assert_eq!(quad_count, 4);
         assert_eq!(
             quad_caps,
-            [502_824_960, 460_062_720, 502_824_960, 460_062_720]
+            [502_824_960, 460_062_720, 502_824_960, 460_062_720, 0, 0]
         );
         assert_eq!(
             quad_limits.allocation_bytes(),
             NATIVE_Q2_MAX_WORKING_BYTES + 1_925_775_360
+        );
+
+        // Verify 168-projection 6-arena split (2,888,663,040 bytes -> alternating 6-arena steps).
+        let six_limits =
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+                .with_resident_weights(2_888_663_040)?;
+        let (six_caps, six_count) = arena_capacities(2_888_663_040).ok_or(Error::Contract)?;
+        assert_eq!(six_count, 6);
+        assert_eq!(
+            six_caps,
+            [
+                502_824_960,
+                460_062_720,
+                502_824_960,
+                460_062_720,
+                502_824_960,
+                460_062_720
+            ]
+        );
+        assert_eq!(
+            six_limits.allocation_bytes(),
+            NATIVE_Q2_MAX_WORKING_BYTES + 2_888_663_040
         );
 
         let mut registry = NativeQ2WeightRegistry::new(4096)?;

@@ -303,7 +303,9 @@ impl Request {
         let tokens = self.tokens();
         let projections = self.projection_names();
         let max_projections = match self.execution_backend {
-            ExecutionBackend::NativeQ2 => 112,
+            ExecutionBackend::NativeQ2 => {
+                bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS.len()
+            }
             ExecutionBackend::GuardedHvx | ExecutionBackend::HmxBitplane => {
                 if self.resident_host_weights { 2 } else { 4 }
             }
@@ -2774,7 +2776,7 @@ mod tests {
         serde_json::from_value::<Request>(four_layer_req)?.limits()?;
 
         let default_proj = bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS;
-        assert_eq!(default_proj.len(), 112);
+        assert_eq!(default_proj.len(), 168);
         assert_eq!(
             expected_resident_weight_bytes(&default_proj[..28], ExecutionBackend::NativeQ2)?,
             502_824_960
@@ -2784,8 +2786,12 @@ mod tests {
             962_887_680
         );
         assert_eq!(
-            expected_resident_weight_bytes(&default_proj, ExecutionBackend::NativeQ2)?,
+            expected_resident_weight_bytes(&default_proj[..112], ExecutionBackend::NativeQ2)?,
             1_925_775_360
+        );
+        assert_eq!(
+            expected_resident_weight_bytes(&default_proj, ExecutionBackend::NativeQ2)?,
+            2_888_663_040
         );
         let mut single_arena_req = native_req.clone();
         single_arena_req["projections"] = json!(&default_proj[..28]);
@@ -2797,10 +2803,15 @@ mod tests {
         dual_arena_req["maximumOperations"] = json!(168);
         serde_json::from_value::<Request>(dual_arena_req)?.limits()?;
 
-        let mut quad_arena_req = native_req;
-        quad_arena_req["projections"] = json!(&default_proj[..]);
+        let mut quad_arena_req = native_req.clone();
+        quad_arena_req["projections"] = json!(&default_proj[..112]);
         quad_arena_req["maximumOperations"] = json!(336);
         serde_json::from_value::<Request>(quad_arena_req)?.limits()?;
+
+        let mut six_arena_req = native_req;
+        six_arena_req["projections"] = json!(&default_proj[..]);
+        six_arena_req["maximumOperations"] = json!(504);
+        serde_json::from_value::<Request>(six_arena_req)?.limits()?;
 
         let expected = [1.0_f32, 2.0, 3.0, 10.0, 5.0, 4.0];
         let actual = [1.01_f32, 1.99, 3.02, 9.98, 5.01, 3.99];

@@ -376,6 +376,52 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
         }
         result
     }
+
+    fn project_f32_triple_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+        outputs_c: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if !self.supports_f32_group(&tensors) {
+            for output in outputs_a.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_b.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_c.iter_mut() {
+                output.clear();
+            }
+            return Err(invalid(
+                "unavailable explicit F32 group projection placement",
+            ));
+        }
+        let result = self.executor.project_f32_triple_tokens(
+            tensors,
+            activations,
+            pinned,
+            outputs_a,
+            outputs_b,
+            outputs_c,
+        );
+        if result.is_err() {
+            self.faulted = true;
+            for output in outputs_a.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_b.iter_mut() {
+                output.clear();
+            }
+            for output in outputs_c.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]

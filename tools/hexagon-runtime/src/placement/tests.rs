@@ -370,7 +370,7 @@ impl Pq2ProjectionExecutor for F32GroupExecutor {
     }
 
     fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
-        tensors.len() == 2 && tensors.iter().all(|&t| self.supports_f32(t))
+        matches!(tensors.len(), 2 | 3) && tensors.iter().all(|&t| self.supports_f32(t))
     }
 
     fn project(
@@ -397,6 +397,27 @@ impl Pq2ProjectionExecutor for F32GroupExecutor {
         }
         if self.fail {
             return Err(invalid("group placement failure"));
+        }
+        Ok(())
+    }
+
+    fn project_f32_triple_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        _: bool,
+        outputs_a: &mut [Vec<f32>],
+        outputs_b: &mut [Vec<f32>],
+        outputs_c: &mut [Vec<f32>],
+    ) -> Result<()> {
+        self.calls += 1;
+        for (tok, activation) in activations.iter().enumerate() {
+            outputs_a[tok].resize(tensors[0].dimensions[1], activation[0]);
+            outputs_b[tok].resize(tensors[1].dimensions[1], activation[0] + 1.0);
+            outputs_c[tok].resize(tensors[2].dimensions[1], activation[0] + 2.0);
+        }
+        if self.fail {
+            return Err(invalid("triple token placement failure"));
         }
         Ok(())
     }
@@ -443,6 +464,36 @@ fn placement_f32_groups_require_explicit_opt_in_and_full_member_selection() -> R
     )?;
     assert_eq!(out0, [3.5]);
     assert_eq!(out1, [3.5]);
+    assert_eq!(inner.calls, 1);
+
+    let mut inner = F32GroupExecutor {
+        calls: 0,
+        fail: false,
+    };
+    let mut placed_triple = PlacedProjectionExecutor::new(
+        &mut inner,
+        &model,
+        &[
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ssm_out.weight",
+        ],
+    )?
+    .with_f32_groups(true);
+    let mut tri_a = vec![Vec::new(), Vec::new()];
+    let mut tri_b = vec![Vec::new(), Vec::new()];
+    let mut tri_c = vec![Vec::new(), Vec::new()];
+    placed_triple.project_f32_triple_tokens(
+        [up, gate, ssm],
+        &[vec![2.0_f32; 256], vec![5.0_f32; 256]],
+        true,
+        &mut tri_a,
+        &mut tri_b,
+        &mut tri_c,
+    )?;
+    assert_eq!(tri_a, [vec![2.0], vec![5.0]]);
+    assert_eq!(tri_b, [vec![3.0], vec![6.0]]);
+    assert_eq!(tri_c, [vec![4.0], vec![7.0]]);
     assert_eq!(inner.calls, 1);
     Ok(())
 }

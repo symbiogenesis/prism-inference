@@ -209,19 +209,13 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         report.queue.stage = "projection-initialization-expired-pinned";
         return Ok(report);
     }
-    let (arena_allocations, arena_count) = match mode {
-        Mode::NativeQ2 { columns } => {
-            native_q2::arena_allocation_bytes(columns, limits.rows, resident_weight_bytes)?
-        }
-        _ => (
-            [
-                (mode.allocation_bytes(limits.rows) + resident_weight_bytes).next_multiple_of(4096),
-                0,
-                0,
-                0,
-            ],
-            1,
-        ),
+    let (arena_allocations, arena_count) = if let Mode::NativeQ2 { columns } = mode {
+        native_q2::arena_allocation_bytes(columns, limits.rows, resident_weight_bytes)?
+    } else {
+        let mut allocations = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+        allocations[0] =
+            (mode.allocation_bytes(limits.rows) + resident_weight_bytes).next_multiple_of(4096);
+        (allocations, 1)
     };
     let allocation_bytes = arena_allocations[0];
     let allocator_request = i32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
@@ -409,7 +403,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
                 .saturating_mul(report.batch_operations)
             && !(mode.is_native_q2()
                 && report.operations_completed >= report.queue_writes_completed
-                && report.operations_completed <= report.queue_writes_completed.saturating_mul(3)))
+                && report.operations_completed <= report.queue_writes_completed.saturating_mul(4)))
     {
         if !session_failed {
             report.queue.stage = "projection-caller-rejected-pinned";

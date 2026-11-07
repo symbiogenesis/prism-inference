@@ -758,7 +758,7 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
 ) -> Option<crate::Result<[[f32; TOKENS]; 4]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut sums = [[0.0_f32; TOKENS]; 4];
-    let mut lanes = [[[0.0_f32; 4]; TOKENS]; 4];
+    let mut lanes = [[f32x4::splat(neon, 0.0); TOKENS]; 4];
     let block_bytes = if is_ptq1 { 28 } else { 34 };
     let r0 = rows[0].chunks_exact(block_bytes);
     let r1 = rows[1].chunks_exact(block_bytes);
@@ -795,7 +795,99 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
                 decode_pq2_sequential(neon, b3[2..34].try_into().ok()?),
             ]
         };
-        for (token, scratch) in preparations.iter().enumerate() {
+        let mut token = 0;
+        while token + 4 <= preparations.len() {
+            let acts: [&[crate::kernels::Q8Block; 4]; 4] = [
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token + 1].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token + 2].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token + 3].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+            ];
+            if is_ptq1 && pinned {
+                for group in 0..4 {
+                    let act_group: [_; 4] = std::array::from_fn(|t| {
+                        let halves = acts[t][group].values.as_chunks::<16>().0;
+                        let (l0, h0) = i8x16::from_slice(neon, &halves[0]).widen();
+                        let (l1, h1) = i8x16::from_slice(neon, &halves[1]).widen();
+                        (l0, h0, l1, h1, acts[t][group].scale)
+                    });
+                    for r in 0..4 {
+                        let w0 = weights[r][group * 4];
+                        let w1 = weights[r][group * 4 + 1];
+                        let w2 = weights[r][group * 4 + 2];
+                        let w3 = weights[r][group * 4 + 3];
+                        let rs = row_scales[r];
+                        for (t, &(l0, h0, l1, h1, scale)) in act_group.iter().enumerate() {
+                            let sum_01 = w0 * l0 + w2 * l1;
+                            let sum_23 = w1 * h0 + w3 * h1;
+                            let (q0, q1) = sum_01.widen();
+                            let (q2, q3) = sum_23.widen();
+                            let floats =
+                                reduce4_i32x4_vec(q0, q1, q2, q3).to_float::<f32x4<Neon>>();
+                            let d = f32x4::splat(neon, rs * scale);
+                            lanes[r][token + t] = floats.mul_add_precise(d, lanes[r][token + t]);
+                        }
+                    }
+                }
+            } else {
+                let mut group_sums = [[[i32x4::splat(neon, 0); 4]; 4]; 4];
+                for group in 0..4 {
+                    let act_group: [_; 4] = std::array::from_fn(|t| {
+                        let halves = acts[t][group].values.as_chunks::<16>().0;
+                        let (l0, h0) = i8x16::from_slice(neon, &halves[0]).widen();
+                        let (l1, h1) = i8x16::from_slice(neon, &halves[1]).widen();
+                        (l0, h0, l1, h1)
+                    });
+                    for r in 0..4 {
+                        let w0 = weights[r][group * 4];
+                        let w1 = weights[r][group * 4 + 1];
+                        let w2 = weights[r][group * 4 + 2];
+                        let w3 = weights[r][group * 4 + 3];
+                        for (t, &(l0, h0, l1, h1)) in act_group.iter().enumerate() {
+                            let pairs = (w0 * l0 + w1 * h0) + (w2 * l1 + w3 * h1);
+                            let (sum_low, sum_high) = pairs.widen();
+                            group_sums[r][t][group] = sum_low + sum_high;
+                        }
+                    }
+                }
+                let act_scales: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
+                    f32x4::from_slice(
+                        neon,
+                        &[
+                            acts[t][0].scale,
+                            acts[t][1].scale,
+                            acts[t][2].scale,
+                            acts[t][3].scale,
+                        ],
+                    )
+                });
+                for r in 0..4 {
+                    let rs = row_scales[r];
+                    for t in 0..4 {
+                        let gs = group_sums[r][t];
+                        let dots =
+                            reduce4_i32x4_vec(gs[0], gs[1], gs[2], gs[3]).to_float::<f32x4<Neon>>();
+                        let prod = (dots * act_scales[t]).to_array();
+                        let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                        sums[r][token + t] += rs * dot_sum;
+                    }
+                }
+            }
+            token += 4;
+        }
+        for (token, scratch) in preparations.iter().enumerate().skip(token) {
             let activations =
                 <&[crate::kernels::Q8Block; 4]>::try_from(&scratch.q8[index * 4..index * 4 + 4])
                     .ok()?;
@@ -807,7 +899,7 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
             });
             if is_ptq1 && pinned {
                 for r in 0..4 {
-                    let mut acc = f32x4::from_slice(neon, &lanes[r][token]);
+                    let mut acc = lanes[r][token];
                     for (group, &(l0, h0, l1, h1)) in act_groups.iter().enumerate() {
                         let sum_01 = weights[r][group * 4] * l0 + weights[r][group * 4 + 2] * l1;
                         let sum_23 =
@@ -818,7 +910,7 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
                         let d = f32x4::splat(neon, row_scales[r] * activations[group].scale);
                         acc = floats.mul_add_precise(d, acc);
                     }
-                    acc.store_slice(&mut lanes[r][token]);
+                    lanes[r][token] = acc;
                 }
             } else {
                 let act_scales = f32x4::from_slice(
@@ -853,8 +945,9 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
         }
     }
     for r in 0..4 {
-        for (sum, lane) in sums[r].iter_mut().zip(lanes[r]).take(preparations.len()) {
+        for (sum, lane_vec) in sums[r].iter_mut().zip(lanes[r]).take(preparations.len()) {
             let value = if is_ptq1 && pinned {
+                let lane = lane_vec.to_array();
                 (lane[0] + lane[1]) + (lane[2] + lane[3])
             } else {
                 *sum
@@ -882,7 +975,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
 ) -> Option<crate::Result<[[f32; TOKENS]; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut sums = [[0.0_f32; TOKENS]; 8];
-    let mut lanes = [[[0.0_f32; 4]; TOKENS]; 8];
+    let mut lanes = [[f32x4::splat(neon, 0.0); TOKENS]; 8];
     let block_bytes = if is_ptq1 { 28 } else { 34 };
     let scale_offset = if is_ptq1 { 26 } else { 0 };
     let block_count = rows[0].len() / block_bytes;
@@ -942,7 +1035,99 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
                 decode_pq2_sequential(neon, blocks[7][2..34].try_into().ok()?),
             ]
         };
-        for (token, scratch) in preparations.iter().enumerate() {
+        let mut token = 0;
+        while token + 4 <= preparations.len() {
+            let acts: [&[crate::kernels::Q8Block; 4]; 4] = [
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token + 1].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token + 2].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+                <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &preparations[token + 3].q8[index * 4..index * 4 + 4],
+                )
+                .ok()?,
+            ];
+            if is_ptq1 && pinned {
+                for group in 0..4 {
+                    let act_group: [_; 4] = std::array::from_fn(|t| {
+                        let halves = acts[t][group].values.as_chunks::<16>().0;
+                        let (l0, h0) = i8x16::from_slice(neon, &halves[0]).widen();
+                        let (l1, h1) = i8x16::from_slice(neon, &halves[1]).widen();
+                        (l0, h0, l1, h1, acts[t][group].scale)
+                    });
+                    for r in 0..8 {
+                        let w0 = weights[r][group * 4];
+                        let w1 = weights[r][group * 4 + 1];
+                        let w2 = weights[r][group * 4 + 2];
+                        let w3 = weights[r][group * 4 + 3];
+                        let rs = row_scales[r];
+                        for (t, &(l0, h0, l1, h1, scale)) in act_group.iter().enumerate() {
+                            let sum_01 = w0 * l0 + w2 * l1;
+                            let sum_23 = w1 * h0 + w3 * h1;
+                            let (q0, q1) = sum_01.widen();
+                            let (q2, q3) = sum_23.widen();
+                            let floats =
+                                reduce4_i32x4_vec(q0, q1, q2, q3).to_float::<f32x4<Neon>>();
+                            let d = f32x4::splat(neon, rs * scale);
+                            lanes[r][token + t] = floats.mul_add_precise(d, lanes[r][token + t]);
+                        }
+                    }
+                }
+            } else {
+                let mut group_sums = [[[i32x4::splat(neon, 0); 4]; 4]; 8];
+                for group in 0..4 {
+                    let act_group: [_; 4] = std::array::from_fn(|t| {
+                        let halves = acts[t][group].values.as_chunks::<16>().0;
+                        let (l0, h0) = i8x16::from_slice(neon, &halves[0]).widen();
+                        let (l1, h1) = i8x16::from_slice(neon, &halves[1]).widen();
+                        (l0, h0, l1, h1)
+                    });
+                    for r in 0..8 {
+                        let w0 = weights[r][group * 4];
+                        let w1 = weights[r][group * 4 + 1];
+                        let w2 = weights[r][group * 4 + 2];
+                        let w3 = weights[r][group * 4 + 3];
+                        for (t, &(l0, h0, l1, h1)) in act_group.iter().enumerate() {
+                            let pairs = (w0 * l0 + w1 * h0) + (w2 * l1 + w3 * h1);
+                            let (sum_low, sum_high) = pairs.widen();
+                            group_sums[r][t][group] = sum_low + sum_high;
+                        }
+                    }
+                }
+                let act_scales: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
+                    f32x4::from_slice(
+                        neon,
+                        &[
+                            acts[t][0].scale,
+                            acts[t][1].scale,
+                            acts[t][2].scale,
+                            acts[t][3].scale,
+                        ],
+                    )
+                });
+                for r in 0..8 {
+                    let rs = row_scales[r];
+                    for t in 0..4 {
+                        let gs = group_sums[r][t];
+                        let dots =
+                            reduce4_i32x4_vec(gs[0], gs[1], gs[2], gs[3]).to_float::<f32x4<Neon>>();
+                        let prod = (dots * act_scales[t]).to_array();
+                        let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                        sums[r][token + t] += rs * dot_sum;
+                    }
+                }
+            }
+            token += 4;
+        }
+        for (token, scratch) in preparations.iter().enumerate().skip(token) {
             let activations =
                 <&[crate::kernels::Q8Block; 4]>::try_from(&scratch.q8[index * 4..index * 4 + 4])
                     .ok()?;
@@ -954,7 +1139,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
             });
             if is_ptq1 && pinned {
                 for r in 0..8 {
-                    let mut acc = f32x4::from_slice(neon, &lanes[r][token]);
+                    let mut acc = lanes[r][token];
                     for (group, &(l0, h0, l1, h1)) in act_groups.iter().enumerate() {
                         let sum_01 = weights[r][group * 4] * l0 + weights[r][group * 4 + 2] * l1;
                         let sum_23 =
@@ -965,7 +1150,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
                         let d = f32x4::splat(neon, row_scales[r] * activations[group].scale);
                         acc = floats.mul_add_precise(d, acc);
                     }
-                    acc.store_slice(&mut lanes[r][token]);
+                    lanes[r][token] = acc;
                 }
             } else {
                 let act_scales = f32x4::from_slice(
@@ -1000,8 +1185,9 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
         }
     }
     for r in 0..8 {
-        for (sum, lane) in sums[r].iter_mut().zip(lanes[r]).take(preparations.len()) {
+        for (sum, lane_vec) in sums[r].iter_mut().zip(lanes[r]).take(preparations.len()) {
             let value = if is_ptq1 && pinned {
+                let lane = lane_vec.to_array();
                 (lane[0] + lane[1]) + (lane[2] + lane[3])
             } else {
                 *sum

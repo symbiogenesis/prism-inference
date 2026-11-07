@@ -11,8 +11,8 @@
 )]
 
 use super::{
-    ActivationContract, MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, dimensions,
-    finite, integer_float, matvec_into, scale,
+    ActivationContract, BF16, MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, bf16_dot,
+    dimensions, finite, integer_float, matvec_into, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -89,10 +89,10 @@ impl ProjectionTile {
             {
                 return Err(invalid("invalid bounded projection tile"));
             }
-            let reuse_prepared = matches!(tensor.kind, PQ2 | PTQ1)
+            let reuse_prepared = matches!(tensor.kind, PQ2 | PTQ1 | BF16)
                 && self.preparations.len() >= inputs.len()
                 && previous.is_some_and(|prev| {
-                    matches!(prev.kind, PQ2 | PTQ1)
+                    matches!(prev.kind, PQ2 | PTQ1 | BF16)
                         && dimensions(prev).is_ok_and(|(prev_cols, _, _)| {
                             prev_cols == columns
                                 && ActivationContract::for_tensor(prev, prev_cols, pinned)
@@ -107,6 +107,7 @@ impl ProjectionTile {
                     MatvecScratch::with_backend(self.backend)
                 });
             }
+            let parallel_prepare = !reuse_prepared && self.row_parallelism.uses_pool(inputs.len());
             for ((scratch, input), output) in self
                 .preparations
                 .iter_mut()
@@ -117,10 +118,74 @@ impl ProjectionTile {
                 // tile output, including unsupported-format fallback inputs.
                 check()?;
                 scratch.pinned_accumulation = pinned;
-                if !reuse_prepared {
+                if !reuse_prepared && !parallel_prepare {
                     scratch.prepare_input(tensor, input)?;
                 }
                 output.try_reserve_exact(rows)?;
+            }
+            if parallel_prepare {
+                self.row_parallelism.update_chunks(
+                    &mut self.preparations[..inputs.len()],
+                    1,
+                    |base, chunk| {
+                        for (offset, scratch) in chunk.iter_mut().enumerate() {
+                            scratch.prepare_input(tensor, &inputs[base + offset])?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            if tensor.kind == BF16 {
+                let backend = self.backend;
+                let preparations = &self.preparations[..inputs.len()];
+                let mut unused_blocks = 0_u64;
+                let dot_bf16_one = |row: &[u8], _: &mut u64| -> Result<[f32; MAX_TILE_TOKENS]> {
+                    let mut sums = [0.0_f32; MAX_TILE_TOKENS];
+                    for (sum, scratch) in sums.iter_mut().zip(preparations) {
+                        *sum = bf16_dot(row, &scratch.activations)?;
+                    }
+                    Ok(sums)
+                };
+                return self.row_parallelism.fill_tile_four_rows(
+                    &tensor.data,
+                    block_bytes,
+                    outputs,
+                    &mut unused_blocks,
+                    check,
+                    |rows8, decoded| {
+                        if let Some(res) = dot::dot_bf16_eight_rows::<MAX_TILE_TOKENS>(
+                            rows8,
+                            preparations,
+                            backend,
+                        ) {
+                            return res;
+                        }
+                        Ok([
+                            dot_bf16_one(rows8[0], decoded)?,
+                            dot_bf16_one(rows8[1], decoded)?,
+                            dot_bf16_one(rows8[2], decoded)?,
+                            dot_bf16_one(rows8[3], decoded)?,
+                            dot_bf16_one(rows8[4], decoded)?,
+                            dot_bf16_one(rows8[5], decoded)?,
+                            dot_bf16_one(rows8[6], decoded)?,
+                            dot_bf16_one(rows8[7], decoded)?,
+                        ])
+                    },
+                    |rows4, decoded| {
+                        if let Some(res) =
+                            dot::dot_bf16_four_rows::<MAX_TILE_TOKENS>(rows4, preparations, backend)
+                        {
+                            return res;
+                        }
+                        Ok([
+                            dot_bf16_one(rows4[0], decoded)?,
+                            dot_bf16_one(rows4[1], decoded)?,
+                            dot_bf16_one(rows4[2], decoded)?,
+                            dot_bf16_one(rows4[3], decoded)?,
+                        ])
+                    },
+                    dot_bf16_one,
+                );
             }
             if !matches!(tensor.kind, PQ2 | PTQ1) {
                 for ((input, output), scratch) in inputs
@@ -271,6 +336,29 @@ impl ProjectionTile {
                 outputs,
                 &mut self.decoded_blocks,
                 check,
+                |rows8, decoded_blocks| {
+                    if let Some(res) = dot::dot_eight_rows::<MAX_TILE_TOKENS>(
+                        rows8,
+                        preparations,
+                        tensor.kind,
+                        columns,
+                        pinned,
+                        backend,
+                        decoded_blocks,
+                    ) {
+                        return res;
+                    }
+                    Ok([
+                        dot_one(rows8[0], decoded_blocks)?,
+                        dot_one(rows8[1], decoded_blocks)?,
+                        dot_one(rows8[2], decoded_blocks)?,
+                        dot_one(rows8[3], decoded_blocks)?,
+                        dot_one(rows8[4], decoded_blocks)?,
+                        dot_one(rows8[5], decoded_blocks)?,
+                        dot_one(rows8[6], decoded_blocks)?,
+                        dot_one(rows8[7], decoded_blocks)?,
+                    ])
+                },
                 |rows4, decoded_blocks| {
                     if let Some(res) = dot::dot_four_rows::<MAX_TILE_TOKENS>(
                         rows4,
@@ -543,10 +631,10 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "Cover 4-row PQ2/PTQ1 GEMM groups, remainder rows and mid-group error/cancel recovery together."
+        reason = "Cover 8-row and 4-row PQ2/PTQ1 GEMM groups, remainder rows and mid-group error/cancel recovery together."
     )]
     fn tiled_four_row_gemm_matches_scalar_and_recovers_mid_group_failure() -> Result<()> {
-        let rows = 9_usize;
+        let rows = 13_usize;
         for (kind, columns) in [(PQ2, 256_usize), (PQ2, 384), (PTQ1, 256)] {
             let blocks_per_row = columns / 128;
             let mut data = Vec::new();
@@ -616,7 +704,7 @@ mod tests {
                     }
                 }
             }
-            // Verify mid-4-row-group cancellation and mid-group bad scale rewind.
+            // Verify mid-8-row-group cancellation and mid-group bad scale rewind.
             let inputs = vec![vec![1.25; columns]; 8];
             let mut output = vec![vec![1.0]; 8];
             let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
@@ -624,9 +712,9 @@ mod tests {
             assert!(
                 tile.project(&tensor, &inputs, &mut output, true, &|| {
                     calls.set(calls.get() + 1);
-                    // Eight preparations + row 0 ok + cancel at row 1 inside first 4-row group.
+                    // Eight preparations + row 0 ok + cancel at row 1 inside first 8-row group.
                     if calls.get() == 10 {
-                        Err(invalid("cancel inside 4-row group"))
+                        Err(invalid("cancel inside 8-row group"))
                     } else {
                         Ok(())
                     }
@@ -638,7 +726,7 @@ mod tests {
 
             let block_bytes = if kind == PTQ1 { 28 } else { 34 };
             let mut bad = tensor.data.to_vec();
-            // Corrupt row 2 (third row inside the first 4-row group).
+            // Corrupt row 2 (third row inside the first 8-row group).
             let offset = (2 * blocks_per_row) * block_bytes + if kind == PTQ1 { 26 } else { 0 };
             bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
             let bad_tensor = Tensor {
@@ -653,6 +741,79 @@ mod tests {
             );
             assert_eq!(bad_tile.decoded_blocks, u64::try_from(2 * blocks_per_row)?);
             assert!(output.iter().all(Vec::is_empty));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_bf16_gemm_matches_scalar_and_reuses_prepared_activations() -> Result<()> {
+        let columns = 20_usize;
+        let rows = 13_usize;
+        let mut data = Vec::with_capacity(columns * rows * 2);
+        for row in 0..rows {
+            for col in 0..columns {
+                let bits = u16::try_from(0x3c00_usize + ((row * 5 + col * 3) % 64) * 4)?;
+                data.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let tensor = Tensor {
+            name: "tile-bf16-gemm".into(),
+            dimensions: vec![columns, rows],
+            kind: BF16,
+            data: Arc::from(data),
+        };
+        let inputs: Vec<Vec<f32>> = (0..8)
+            .map(|token| {
+                (0..columns)
+                    .map(|idx| [1.25, -3.5, 0.0, -0.0, 7.125, -0.375][(idx + token) % 6])
+                    .collect()
+            })
+            .collect();
+        let expected: Vec<Vec<u32>> = inputs
+            .iter()
+            .map(|input| {
+                let mut scratch = MatvecScratch::with_backend(MatvecBackend::Scalar);
+                let mut out = Vec::new();
+                matvec_into(&tensor, input, &mut out, &mut scratch)?;
+                Ok(out.into_iter().map(f32::to_bits).collect())
+            })
+            .collect::<Result<_>>()?;
+        for backend in [
+            MatvecBackend::Scalar,
+            MatvecBackend::Auto,
+            MatvecBackend::ExperimentalNeon,
+        ] {
+            let mut tile = ProjectionTile::with_backend(backend);
+            #[cfg(feature = "parallel-rows")]
+            tile.set_row_parallelism(RowParallelism::new(2)?);
+            let mut actual = vec![Vec::new(); inputs.len()];
+            tile.project(&tensor, &inputs, &mut actual, true, &|| Ok(()))?;
+            assert_eq!(tile.packed_projections, 0);
+            assert_eq!(tile.decoded_blocks, 0);
+            let actual_bits: Vec<Vec<u32>> = actual
+                .iter()
+                .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                .collect();
+            assert_eq!(actual_bits, expected);
+            let preps_before: Vec<usize> = tile
+                .preparations
+                .iter()
+                .map(MatvecScratch::preparation_count)
+                .collect();
+            tile.project_with_previous(
+                Some(&tensor),
+                &tensor,
+                &inputs,
+                &mut actual,
+                true,
+                &|| Ok(()),
+            )?;
+            let preps_after: Vec<usize> = tile
+                .preparations
+                .iter()
+                .map(MatvecScratch::preparation_count)
+                .collect();
+            assert_eq!(preps_after, preps_before);
         }
         Ok(())
     }

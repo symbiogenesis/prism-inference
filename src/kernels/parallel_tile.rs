@@ -155,7 +155,7 @@ impl RowParallelism {
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "Keep scoped borrows, four-row batching, joined cancellation and bounded stack task storage together."
+        reason = "Keep scoped borrows, eight/four-row batching, joined cancellation and bounded stack task storage together."
     )]
     pub(in crate::kernels) fn fill_tile_four_rows<const TOKENS: usize>(
         &self,
@@ -164,6 +164,7 @@ impl RowParallelism {
         outputs: &mut [Vec<f32>],
         decoded_blocks: &mut u64,
         check: &dyn Fn() -> Result<()>,
+        dot_eight: impl Fn([&[u8]; 8], &mut u64) -> Result<[[f32; TOKENS]; 8]> + Sync,
         dot_four: impl Fn([&[u8]; 4], &mut u64) -> Result<[[f32; TOKENS]; 4]> + Sync,
         dot: impl Fn(&[u8], &mut u64) -> Result<[f32; TOKENS]> + Sync,
     ) -> Result<()> {
@@ -207,6 +208,7 @@ impl RowParallelism {
                 for (index, task) in tasks[..task_count].iter_mut().enumerate() {
                     let start = index * task_rows * row_bytes;
                     let bytes = &data[start..start + task.outputs[0].len() * row_bytes];
+                    let dot_eight = &dot_eight;
                     let dot_four = &dot_four;
                     let dot = &dot;
                     let remaining = &remaining;
@@ -214,32 +216,28 @@ impl RowParallelism {
                     let caller = &caller;
                     scope.spawn(move |_| {
                         let _completion = Completion { remaining, caller };
-                        let group_bytes = row_bytes * 4;
                         let mut row = 0;
-                        let mut chunks = bytes.chunks_exact(group_bytes);
-                        for chunk in chunks.by_ref() {
+                        let mut chunks8 = bytes.chunks_exact(row_bytes * 8);
+                        for chunk in chunks8.by_ref() {
                             if cancelled.load(Ordering::Acquire) {
                                 break;
                             }
-                            let r0 = &chunk[..row_bytes];
-                            let r1 = &chunk[row_bytes..row_bytes * 2];
-                            let r2 = &chunk[row_bytes * 2..row_bytes * 3];
-                            let r3 = &chunk[row_bytes * 3..];
+                            let rows8: [&[u8]; 8] = std::array::from_fn(|idx| {
+                                &chunk[idx * row_bytes..(idx + 1) * row_bytes]
+                            });
                             let before_blocks = task.decoded_blocks;
-                            if let Ok(rows4) = dot_four([r0, r1, r2, r3], &mut task.decoded_blocks)
-                            {
+                            if let Ok(out8) = dot_eight(rows8, &mut task.decoded_blocks) {
                                 for (tok, output) in task.outputs.iter_mut().enumerate() {
                                     if !output.is_empty() {
-                                        output[row] = rows4[0][tok];
-                                        output[row + 1] = rows4[1][tok];
-                                        output[row + 2] = rows4[2][tok];
-                                        output[row + 3] = rows4[3][tok];
+                                        for r in 0..8 {
+                                            output[row + r] = out8[r][tok];
+                                        }
                                     }
                                 }
-                                row += 4;
+                                row += 8;
                             } else {
                                 task.decoded_blocks = before_blocks;
-                                for single in [r0, r1, r2, r3] {
+                                for single in rows8 {
                                     if cancelled.load(Ordering::Acquire) {
                                         break;
                                     }
@@ -265,8 +263,60 @@ impl RowParallelism {
                                 }
                             }
                         }
+                        let mut chunks4 = chunks8.remainder().chunks_exact(row_bytes * 4);
                         if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
-                            for single in chunks.remainder().chunks_exact(row_bytes) {
+                            for chunk in chunks4.by_ref() {
+                                if cancelled.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let r0 = &chunk[..row_bytes];
+                                let r1 = &chunk[row_bytes..row_bytes * 2];
+                                let r2 = &chunk[row_bytes * 2..row_bytes * 3];
+                                let r3 = &chunk[row_bytes * 3..];
+                                let before_blocks = task.decoded_blocks;
+                                if let Ok(rows4) =
+                                    dot_four([r0, r1, r2, r3], &mut task.decoded_blocks)
+                                {
+                                    for (tok, output) in task.outputs.iter_mut().enumerate() {
+                                        if !output.is_empty() {
+                                            output[row] = rows4[0][tok];
+                                            output[row + 1] = rows4[1][tok];
+                                            output[row + 2] = rows4[2][tok];
+                                            output[row + 3] = rows4[3][tok];
+                                        }
+                                    }
+                                    row += 4;
+                                } else {
+                                    task.decoded_blocks = before_blocks;
+                                    for single in [r0, r1, r2, r3] {
+                                        if cancelled.load(Ordering::Acquire) {
+                                            break;
+                                        }
+                                        match dot(single, &mut task.decoded_blocks) {
+                                            Ok(values) => {
+                                                for (output, value) in
+                                                    task.outputs.iter_mut().zip(values)
+                                                {
+                                                    if !output.is_empty() {
+                                                        output[row] = value;
+                                                    }
+                                                }
+                                                row += 1;
+                                            }
+                                            Err(error) => {
+                                                task.error = Some(error);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if task.error.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
+                            for single in chunks4.remainder().chunks_exact(row_bytes) {
                                 if cancelled.load(Ordering::Acquire) {
                                     break;
                                 }
@@ -309,9 +359,47 @@ impl RowParallelism {
             }
             return check();
         }
-        let group_bytes = row_bytes * 4;
-        let mut chunks = data.chunks_exact(group_bytes);
-        for chunk in chunks.by_ref() {
+        let mut chunks8 = data.chunks_exact(row_bytes * 8);
+        for chunk in chunks8.by_ref() {
+            let rows8: [&[u8]; 8] =
+                std::array::from_fn(|idx| &chunk[idx * row_bytes..(idx + 1) * row_bytes]);
+            let before_blocks = *decoded_blocks;
+            for completed in 0..8 {
+                if let Err(error) = check() {
+                    for single in &rows8[..completed] {
+                        let values = dot(single, decoded_blocks)?;
+                        for (output, value) in outputs.iter_mut().zip(values) {
+                            output.push(value);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+            if let Ok(out8) = dot_eight(rows8, decoded_blocks) {
+                for (tok, output) in outputs.iter_mut().enumerate() {
+                    output.extend_from_slice(&[
+                        out8[0][tok],
+                        out8[1][tok],
+                        out8[2][tok],
+                        out8[3][tok],
+                        out8[4][tok],
+                        out8[5][tok],
+                        out8[6][tok],
+                        out8[7][tok],
+                    ]);
+                }
+            } else {
+                *decoded_blocks = before_blocks;
+                for single in rows8 {
+                    let values = dot(single, decoded_blocks)?;
+                    for (output, value) in outputs.iter_mut().zip(values) {
+                        output.push(value);
+                    }
+                }
+            }
+        }
+        let mut chunks4 = chunks8.remainder().chunks_exact(row_bytes * 4);
+        for chunk in chunks4.by_ref() {
             let r0 = &chunk[..row_bytes];
             let r1 = &chunk[row_bytes..row_bytes * 2];
             let r2 = &chunk[row_bytes * 2..row_bytes * 3];
@@ -347,7 +435,7 @@ impl RowParallelism {
                 }
             }
         }
-        for row in chunks.remainder().chunks_exact(row_bytes) {
+        for row in chunks4.remainder().chunks_exact(row_bytes) {
             check()?;
             let values = dot(row, decoded_blocks)?;
             for (output, value) in outputs.iter_mut().zip(values) {

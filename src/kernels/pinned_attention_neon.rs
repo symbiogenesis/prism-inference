@@ -296,6 +296,75 @@ pub(super) fn dot_f16_four(neon: Neon, key: &[u16], queries: [&[f32]; 4]) -> Res
     Ok(out)
 }
 
+#[inline]
+fn dot_f16_two_keys_four_queries(
+    neon: Neon,
+    keys: [&[u16]; 2],
+    queries: [&[f32]; 4],
+) -> Result<[[f32; 4]; 2]> {
+    let len = queries[0].len();
+    let total_steps = padded_dot_steps(len);
+    let (k0_chunks8, k0_rem) = keys[0].as_chunks::<8>();
+    let (k1_chunks8, _) = keys[1].as_chunks::<8>();
+    let vector_steps = k0_chunks8.len() * 8;
+    if vector_steps != total_steps || !k0_rem.is_empty() {
+        return Ok([
+            dot_f16_four(neon, keys[0], queries)?,
+            dot_f16_four(neon, keys[1], queries)?,
+        ]);
+    }
+    let q_chunks8 = queries.map(|q| q.as_chunks::<8>().0);
+    let mut s0 = [[f32x4::splat(neon, 0.0); 4]; 2];
+    let mut s1 = [[f32x4::splat(neon, 0.0); 4]; 2];
+    for pair_idx in (0..k0_chunks8.len()).step_by(2) {
+        let (k0_v0, k0_v1) = super::super::neon::f16_bits_to_f32_x8(neon, &k0_chunks8[pair_idx]);
+        let (k1_v0, k1_v1) = super::super::neon::f16_bits_to_f32_x8(neon, &k1_chunks8[pair_idx]);
+        for h in 0..4 {
+            let q8 = &q_chunks8[h][pair_idx];
+            let qv0 = f32x4::from_slice(neon, &q8[..4]);
+            let qv1 = f32x4::from_slice(neon, &q8[4..]);
+            s0[0][h] = k0_v0.mul_add_precise(qv0, s0[0][h]);
+            s1[0][h] = k0_v1.mul_add_precise(qv1, s1[0][h]);
+            s0[1][h] = k1_v0.mul_add_precise(qv0, s0[1][h]);
+            s1[1][h] = k1_v1.mul_add_precise(qv1, s1[1][h]);
+        }
+    }
+    let mut s2 = [[f32x4::splat(neon, 0.0); 4]; 2];
+    let mut s3 = [[f32x4::splat(neon, 0.0); 4]; 2];
+    for pair_idx in (1..k0_chunks8.len()).step_by(2) {
+        let (k0_v0, k0_v1) = super::super::neon::f16_bits_to_f32_x8(neon, &k0_chunks8[pair_idx]);
+        let (k1_v0, k1_v1) = super::super::neon::f16_bits_to_f32_x8(neon, &k1_chunks8[pair_idx]);
+        for h in 0..4 {
+            let q8 = &q_chunks8[h][pair_idx];
+            let qv0 = f32x4::from_slice(neon, &q8[..4]);
+            let qv1 = f32x4::from_slice(neon, &q8[4..]);
+            s2[0][h] = k0_v0.mul_add_precise(qv0, s2[0][h]);
+            s3[0][h] = k0_v1.mul_add_precise(qv1, s3[0][h]);
+            s2[1][h] = k1_v0.mul_add_precise(qv0, s2[1][h]);
+            s3[1][h] = k1_v1.mul_add_precise(qv1, s3[1][h]);
+        }
+    }
+    let mut out = [[0.0_f32; 4]; 2];
+    for k in 0..2 {
+        for h in 0..4 {
+            let lanes = ((s0[k][h] + s2[k][h]) + (s1[k][h] + s3[k][h])).to_array();
+            out[k][h] = super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+    }
+    Ok(out)
+}
+
+/// Reduces four validated F16 key slices against four F32 query slices sharing the same KV head.
+pub(super) fn dot_f16_four_keys_four_queries(
+    neon: Neon,
+    keys: [&[u16]; 4],
+    queries: [&[f32]; 4],
+) -> Result<[[f32; 4]; 4]> {
+    let [r0, r1] = dot_f16_two_keys_four_queries(neon, [keys[0], keys[1]], queries)?;
+    let [r2, r3] = dot_f16_two_keys_four_queries(neon, [keys[2], keys[3]], queries)?;
+    Ok([r0, r1, r2, r3])
+}
+
 /// Reduces one validated F32 key slice against four F32 query slices sharing the same KV head.
 pub(super) fn dot_f32_four(neon: Neon, key: &[f32], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
     let mut sums = [[f32x4::splat(neon, 0.0); 4]; 4];

@@ -345,6 +345,47 @@ pub(crate) fn dot_f16_four(key: &[u16], queries: [&[f32]; 4]) -> Result<[f32; 4]
     ])
 }
 
+/// Reduces four cached F16 key rows against four F32 query rows sharing the same KV head.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f16_four_keys_four_queries(
+    keys: [&[u16]; 4],
+    queries: [&[f32]; 4],
+) -> Result<[[f32; 4]; 4]> {
+    let len = queries[0].len();
+    if len == 0
+        || len > crate::model::swift::CONTEXT_TOKENS
+        || queries.iter().any(|q| q.len() != len)
+    {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    for key in keys {
+        if key.len() < len {
+            return Err(invalid("pinned attention dot row is short"));
+        }
+        if key.len() > len {
+            return Err(invalid("pinned attention dot row is long"));
+        }
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f16_four_keys_four_queries(neon, keys, queries);
+    }
+    Ok([
+        dot_f16_four(keys[0], queries)?,
+        dot_f16_four(keys[1], queries)?,
+        dot_f16_four(keys[2], queries)?,
+        dot_f16_four(keys[3], queries)?,
+    ])
+}
+
 /// Reduces a current F32 key row against four F32 query rows sharing the same KV head.
 ///
 /// # Errors

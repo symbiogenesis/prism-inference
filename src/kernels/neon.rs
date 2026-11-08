@@ -4364,6 +4364,7 @@ mod tests {
                     1e-6,
                     block,
                     sign_opt,
+                    &super::super::RowParallelism::default(),
                     &mut fused_norm,
                     &mut fused_rot,
                 )?;
@@ -4389,6 +4390,7 @@ mod tests {
                     1e-6,
                     block,
                     sign_opt,
+                    &super::super::RowParallelism::default(),
                     &mut fused_norm,
                     &mut fused_rot,
                 )?;

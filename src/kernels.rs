@@ -2920,12 +2920,79 @@ pub(crate) fn hadamard_into(
     hadamard(output)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Block slice helper passes explicit RMSNorm scale, optional Hadamard signs and output slices."
+)]
+fn rms_norm_hadamard_blocks_into<const PINNED: bool>(
+    base_block: usize,
+    input: &[f32],
+    weight: &[f32],
+    scale: f32,
+    signs: Option<&[f32]>,
+    block: usize,
+    norm_chunk: &mut [f32],
+    rot_chunk: &mut [f32],
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    normalization: f32,
+) -> Result<()> {
+    for (local_idx, (norm_block, rot_block)) in norm_chunk
+        .chunks_exact_mut(block)
+        .zip(rot_chunk.chunks_exact_mut(block))
+        .enumerate()
+    {
+        let offset = (base_block + local_idx) * block;
+        let in_block = &input[offset..offset + block];
+        let w_block = &weight[offset..offset + block];
+        let sign_block = signs.map(|s| &s[offset..offset + block]);
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(res) = neon::rms_norm_hadamard_block_into::<PINNED>(
+            in_block,
+            w_block,
+            scale,
+            sign_block,
+            norm_block,
+            rot_block,
+            normalization,
+        ) {
+            res?;
+            continue;
+        }
+        for ((n_dst, &val), &w) in norm_block.iter_mut().zip(in_block).zip(w_block) {
+            *n_dst = finite(if PINNED {
+                (val * w) * scale
+            } else {
+                (val * scale) * w
+            })?;
+        }
+        hadamard_into(norm_block, sign_block, rot_block)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Fused RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
+)]
 pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
     input: &[f32],
     weight: &[f32],
     epsilon: f32,
     block: usize,
     signs: Option<&[f32]>,
+    parallelism: &RowParallelism,
     norm_out: &mut Vec<f32>,
     rotated_out: &mut Vec<f32>,
 ) -> Result<()> {
@@ -2958,15 +3025,43 @@ pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
             let count = u32::try_from(block)?;
             1.0 / integer_float(i32::try_from(count)?).sqrt()
         };
-        for (block_idx, (norm_block, rot_block)) in norm_out
-            .chunks_exact_mut(block)
-            .zip(rotated_out.chunks_exact_mut(block))
-            .enumerate()
-        {
-            let offset = block_idx * block;
-            let in_block = &input[offset..offset + block];
-            let w_block = &weight[offset..offset + block];
-            let sign_block = signs.map(|s| &s[offset..offset + block]);
+        if parallelism.workers() > 1 && block >= 256 && input.len() >= block.saturating_mul(4) {
+            return parallelism.update_paired_chunks(
+                norm_out,
+                block,
+                rotated_out,
+                block,
+                |base_block, norm_chunk, rot_chunk| {
+                    rms_norm_hadamard_blocks_into::<PINNED>(
+                        base_block,
+                        input,
+                        weight,
+                        scale,
+                        signs,
+                        block,
+                        norm_chunk,
+                        rot_chunk,
+                        #[cfg(all(
+                            feature = "experimental-neon",
+                            target_arch = "aarch64",
+                            target_os = "windows",
+                            target_env = "msvc",
+                            target_feature = "neon"
+                        ))]
+                        normalization,
+                    )
+                },
+            );
+        }
+        rms_norm_hadamard_blocks_into::<PINNED>(
+            0,
+            input,
+            weight,
+            scale,
+            signs,
+            block,
+            norm_out,
+            rotated_out,
             #[cfg(all(
                 feature = "experimental-neon",
                 target_arch = "aarch64",
@@ -2974,28 +3069,8 @@ pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
                 target_env = "msvc",
                 target_feature = "neon"
             ))]
-            if let Some(res) = neon::rms_norm_hadamard_block_into::<PINNED>(
-                in_block,
-                w_block,
-                scale,
-                sign_block,
-                norm_block,
-                rot_block,
-                normalization,
-            ) {
-                res?;
-                continue;
-            }
-            for ((n_dst, &val), &w) in norm_block.iter_mut().zip(in_block).zip(w_block) {
-                *n_dst = finite(if PINNED {
-                    (val * w) * scale
-                } else {
-                    (val * scale) * w
-                })?;
-            }
-            hadamard_into(norm_block, sign_block, rot_block)?;
-        }
-        Ok(())
+            normalization,
+        )
     })();
     if result.is_err() {
         norm_out.clear();

@@ -999,21 +999,16 @@ impl<D: Decoder> Runtime<D> {
             for &candidate in draft {
                 check()?;
                 let expected = greedy(&self.logits)?;
-                let step_state = self.decoder.checkpoint()?;
-                let step_logits = copy(&self.logits)?;
-                let step_tokens_len = self.tokens.len();
-                self.evaluate(candidate, &check)?;
-                stats.target_evaluations += 1;
                 if candidate == expected {
+                    self.evaluate(candidate, &check)?;
+                    stats.target_evaluations += 1;
                     stats.draft_tokens_accepted += 1;
                     committed.push(candidate);
                 } else {
-                    // Candidate diverged from greedy target verification: restore
-                    // recurrent GDN + KV state to the pre-step checkpoint and
-                    // advance with the exact target correction token.
-                    self.decoder.restore(&step_state)?;
-                    self.tokens.truncate(step_tokens_len);
-                    self.logits = step_logits;
+                    // Candidate diverged from greedy target verification before mutating
+                    // the committed GDN + KV state: skip the rejected forward pass and
+                    // per-step GDN checkpoint clone, and advance directly with the exact
+                    // target correction token.
                     stats.rollback_restores += 1;
                     self.evaluate(expected, &check)?;
                     stats.target_evaluations += 1;

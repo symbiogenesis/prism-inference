@@ -279,9 +279,246 @@ pub fn verify_stochastic_step(
     Ok((false, selected))
 }
 
+/// Default 5-layer target hidden-state tap indices for `DFlash2` ternary block-diffusion
+/// drafting on 64-layer `Qwen3.5-27B` (`Cyronius/Qwen3.8-27B-DFlash2-Bonsai2-ternary`).
+pub const DFLASH2_DEFAULT_TAP_LAYERS: [usize; 5] = [2, 17, 32, 47, 63];
+
+/// Validated configuration for `DFlash2` ternary block-diffusion speculative drafting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DFlash2DraftConfig {
+    /// Strictly ascending target decoder layer indices tapped to condition the drafter.
+    pub tap_layers: [usize; 5],
+    /// Number of draft tokens proposed in parallel per block-diffusion step (`1..=MAX_SPECULATIVE_DRAFT_TOKENS`).
+    pub block_tokens: usize,
+    /// Number of lightweight ternary cross-attention drafter layers (`1..=16`).
+    pub drafter_layers: usize,
+}
+
+impl Default for DFlash2DraftConfig {
+    fn default() -> Self {
+        Self {
+            tap_layers: DFLASH2_DEFAULT_TAP_LAYERS,
+            block_tokens: 4,
+            drafter_layers: 5,
+        }
+    }
+}
+
+impl DFlash2DraftConfig {
+    /// Construct and validate a `DFlash2` block-diffusion drafter configuration against `target_layers`.
+    ///
+    /// # Errors
+    /// Rejects non-ascending or out-of-range tap layer indices, zero or oversized `block_tokens`,
+    /// or `drafter_layers` outside `1..=16`.
+    pub fn new(
+        tap_layers: [usize; 5],
+        block_tokens: usize,
+        drafter_layers: usize,
+        target_layers: usize,
+    ) -> Result<Self> {
+        let config = Self {
+            tap_layers,
+            block_tokens,
+            drafter_layers,
+        };
+        config.validate(target_layers)?;
+        Ok(config)
+    }
+
+    /// Validate that all tap indices lie in `0..target_layers` in strictly ascending order
+    /// and that `block_tokens` and `drafter_layers` are within contract limits.
+    ///
+    /// # Errors
+    /// Rejects invalid tap ordering, out-of-bounds layer indices, or invalid block/layer counts.
+    pub fn validate(&self, target_layers: usize) -> Result<()> {
+        if self.block_tokens == 0
+            || self.block_tokens > MAX_SPECULATIVE_DRAFT_TOKENS
+            || self.drafter_layers == 0
+            || self.drafter_layers > 16
+            || self.tap_layers.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.tap_layers[4] >= target_layers
+        {
+            return Err(invalid("invalid DFlash2 block-diffusion draft configuration"));
+        }
+        Ok(())
+    }
+}
+
+/// Projected per-token Gated `DeltaNet` (`GDN`) vectors captured during batched target
+/// verification for `Rollback-by-Replay` state commitment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GdnVerifyStepTape {
+    /// Post-conv, L2-normalized keys (`key_heads * key_dim`).
+    pub keys: Vec<f32>,
+    /// Post-conv, L2-normalized queries (`key_heads * key_dim`).
+    pub queries: Vec<f32>,
+    /// Post-conv values (`value_heads * value_dim`).
+    pub values: Vec<f32>,
+    /// Per-value-head exponential decay factors (`value_heads`).
+    pub decays: Vec<f32>,
+    /// Per-value-head sigmoid update gates (`value_heads`).
+    pub betas: Vec<f32>,
+}
+
+/// Lightweight per-layer verification tape (`~164 KiB` for 8 tokens vs `3.117 MiB` full GDN state)
+/// enabling `Rollback-by-Replay` when a speculative draft block is partially accepted.
+///
+/// Instead of cloning and restoring `149.625 MiB` of 48-layer GDN state across draft branches
+/// or running a second full forward pass, the accepted prefix `0..accepted_steps` is replayed
+/// directly into the base GDN state in-place with `0 ULP` bit-for-bit parity.
+#[derive(Clone, Debug)]
+pub struct GdnVerifyTape {
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    steps: Vec<GdnVerifyStepTape>,
+}
+
+impl GdnVerifyTape {
+    /// Create a bounded GDN verification tape for a recurrent layer's head and channel geometry.
+    ///
+    /// # Errors
+    /// Rejects zero dimensions, `value_heads % key_heads != 0`, or `max_steps > MAX_SPECULATIVE_DRAFT_TOKENS`.
+    pub fn new(
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        max_steps: usize,
+    ) -> Result<Self> {
+        if key_heads == 0
+            || value_heads == 0
+            || key_dim == 0
+            || value_dim == 0
+            || !value_heads.is_multiple_of(key_heads)
+            || max_steps == 0
+            || max_steps > MAX_SPECULATIVE_DRAFT_TOKENS
+        {
+            return Err(invalid("invalid GDN verification tape geometry"));
+        }
+        let mut steps = Vec::new();
+        steps.try_reserve_exact(max_steps)?;
+        Ok(Self {
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            steps,
+        })
+    }
+
+    /// Number of recorded draft verification steps currently stored in the tape.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Whether no draft verification steps are currently recorded.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Clear all recorded steps while retaining allocated step capacity.
+    pub fn clear(&mut self) {
+        self.steps.clear();
+    }
+
+    /// Record one token's projected post-conv/post-L2-norm GDN inputs into the verification tape.
+    ///
+    /// # Errors
+    /// Rejects capacity overflow (`>= MAX_SPECULATIVE_DRAFT_TOKENS`), mismatched slice lengths,
+    /// or non-finite values.
+    pub fn record_step(
+        &mut self,
+        keys: &[f32],
+        queries: &[f32],
+        values: &[f32],
+        decays: &[f32],
+        betas: &[f32],
+    ) -> Result<()> {
+        if self.steps.len() >= MAX_SPECULATIVE_DRAFT_TOKENS {
+            return Err(invalid("GDN verification tape exceeded max draft steps"));
+        }
+        let expected_kq = self
+            .key_heads
+            .checked_mul(self.key_dim)
+            .ok_or_else(|| invalid("GDN key dimension overflow"))?;
+        let expected_v = self
+            .value_heads
+            .checked_mul(self.value_dim)
+            .ok_or_else(|| invalid("GDN value dimension overflow"))?;
+        if keys.len() != expected_kq
+            || queries.len() != expected_kq
+            || values.len() != expected_v
+            || decays.len() != self.value_heads
+            || betas.len() != self.value_heads
+            || !crate::kernels::is_finite_slice(keys)
+            || !crate::kernels::is_finite_slice(queries)
+            || !crate::kernels::is_finite_slice(values)
+            || !crate::kernels::is_finite_slice(decays)
+            || !crate::kernels::is_finite_slice(betas)
+        {
+            return Err(invalid("invalid or nonfinite GDN verification step slice"));
+        }
+        self.steps.push(GdnVerifyStepTape {
+            keys: keys.to_vec(),
+            queries: queries.to_vec(),
+            values: values.to_vec(),
+            decays: decays.to_vec(),
+            betas: betas.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Replay the first `accepted_steps` recorded tokens into `base_state` in-place
+    /// using the pinned NEON/scalar GDN recurrent rule (`0 ULP` parity with sequential steps).
+    ///
+    /// # Errors
+    /// Rejects `accepted_steps > self.steps.len()`, mismatched `base_state` length,
+    /// or non-finite recurrent state updates.
+    pub fn replay_accepted_prefix(
+        &self,
+        base_state: &mut [f32],
+        accepted_steps: usize,
+    ) -> Result<()> {
+        let expected_state = self
+            .value_heads
+            .checked_mul(self.value_dim)
+            .and_then(|rows| rows.checked_mul(self.key_dim))
+            .ok_or_else(|| invalid("GDN state dimension overflow"))?;
+        if accepted_steps > self.steps.len() || base_state.len() != expected_state {
+            return Err(invalid("invalid GDN verification tape replay bounds"));
+        }
+        let group = self.value_heads / self.key_heads;
+        let head_stride = self.value_dim * self.key_dim;
+        for step in &self.steps[..accepted_steps] {
+            for v_head in 0..self.value_heads {
+                let k_head = v_head / group;
+                let key = &step.keys[k_head * self.key_dim..(k_head + 1) * self.key_dim];
+                let query = &step.queries[k_head * self.key_dim..(k_head + 1) * self.key_dim];
+                let v_slice = &step.values[v_head * self.value_dim..(v_head + 1) * self.value_dim];
+                let decay = step.decays[v_head];
+                let beta = step.betas[v_head];
+                let state_head = &mut base_state[v_head * head_stride..(v_head + 1) * head_stride];
+                for (row_idx, &v_elem) in v_slice.iter().enumerate() {
+                    let row_state =
+                        &mut state_head[row_idx * self.key_dim..(row_idx + 1) * self.key_dim];
+                    crate::kernels::pinned_gdn::step_row_in_place(
+                        row_state, key, query, decay, v_elem, beta,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, GdnVerifyTape,
         MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixDrafter,
         mtp_first_decode_fits, verify_stochastic_step,
     };
@@ -362,6 +599,80 @@ mod tests {
         };
         assert!((stats.acceptance_rate() - 0.75).abs() <= 1e-12);
         assert_eq!(SpeculativeStats::default().acceptance_rate(), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn dflash2_draft_config_validates_tap_layers_and_block_bounds() -> Result<()> {
+        let cfg = DFlash2DraftConfig::default();
+        cfg.validate(64)?;
+        assert_eq!(cfg.tap_layers, DFLASH2_DEFAULT_TAP_LAYERS);
+        assert!(DFlash2DraftConfig::new([2, 17, 17, 47, 63], 4, 5, 64).is_err());
+        assert!(DFlash2DraftConfig::new([2, 17, 32, 47, 64], 4, 5, 64).is_err());
+        assert!(DFlash2DraftConfig::new(DFLASH2_DEFAULT_TAP_LAYERS, 0, 5, 64).is_err());
+        assert!(DFlash2DraftConfig::new(DFLASH2_DEFAULT_TAP_LAYERS, 9, 5, 64).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gdn_verify_tape_replay_matches_sequential_step_zero_ulp() -> Result<()> {
+        let key_heads = 2;
+        let value_heads = 4;
+        let key_dim = 16;
+        let value_dim = 8;
+        let state_len = value_heads * value_dim * key_dim;
+        let mut sequential_state: Vec<f32> = (0..state_len)
+            .map(|i| (f32::from(u16::try_from(i).unwrap_or(0)) - 128.0) * 0.005)
+            .collect();
+        let mut replay_state = sequential_state.clone();
+        let mut tape = GdnVerifyTape::new(key_heads, value_heads, key_dim, value_dim, 4)?;
+        assert!(tape.is_empty());
+
+        for step_idx in 0..4_u8 {
+            let s = f32::from(step_idx) + 1.0;
+            let keys: Vec<f32> = (0..key_heads * key_dim)
+                .map(|i| f32::from(u8::try_from(i).unwrap_or(0)).mul_add(0.03, s * 0.1))
+                .collect();
+            let queries: Vec<f32> = (0..key_heads * key_dim)
+                .map(|i| f32::from(u8::try_from(i).unwrap_or(0)).mul_add(-0.02, s * 0.05))
+                .collect();
+            let values: Vec<f32> = (0..value_heads * value_dim)
+                .map(|i| f32::from(u8::try_from(i).unwrap_or(0)).mul_add(0.04, -(s * 0.07)))
+                .collect();
+            let decays = vec![0.92_f32, 0.88, 0.95, 0.90];
+            let betas = vec![0.25_f32, 0.30, 0.20, 0.35];
+            tape.record_step(&keys, &queries, &values, &decays, &betas)?;
+
+            // Advance sequential_state for only the first 2 accepted steps.
+            if step_idx < 2 {
+                let group = value_heads / key_heads;
+                let head_stride = value_dim * key_dim;
+                for v_head in 0..value_heads {
+                    let k_head = v_head / group;
+                    let key = &keys[k_head * key_dim..(k_head + 1) * key_dim];
+                    let query = &queries[k_head * key_dim..(k_head + 1) * key_dim];
+                    let v_slice = &values[v_head * value_dim..(v_head + 1) * value_dim];
+                    let state_head =
+                        &mut sequential_state[v_head * head_stride..(v_head + 1) * head_stride];
+                    for (row_idx, &v_elem) in v_slice.iter().enumerate() {
+                        let row_state = &mut state_head[row_idx * key_dim..(row_idx + 1) * key_dim];
+                        crate::kernels::pinned_gdn::step_row_in_place(
+                            row_state,
+                            key,
+                            query,
+                            decays[v_head],
+                            v_elem,
+                            betas[v_head],
+                        )?;
+                    }
+                }
+            }
+        }
+        assert_eq!(tape.len(), 4);
+        tape.replay_accepted_prefix(&mut replay_state, 2)?;
+        for (lhs, rhs) in replay_state.iter().zip(&sequential_state) {
+            assert_eq!(lhs.to_bits(), rhs.to_bits());
+        }
         Ok(())
     }
 }

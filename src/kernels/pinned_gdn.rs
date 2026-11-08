@@ -198,6 +198,69 @@ pub(crate) fn update_and_dot(
     dot_scalar(target, query)
 }
 
+/// Fuses `decay_and_dot_from(previous, state, key, decay)` and
+/// `update_and_dot(state, key, (value - dot_k) * beta, query)` into a single write to `state`.
+///
+/// # Errors
+/// Rejects unequal vector lengths before mutation, or a nonfinite updated element or dot result.
+pub(crate) fn step_row_from(
+    previous: &[f32],
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Result<f32> {
+    if previous.len() != state.len() || state.len() != key.len() || state.len() != query.len() {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::step_row_from(previous, state, key, query, decay, value, beta) {
+        return result;
+    }
+    let dot_k = decay_and_dot_from(previous, state, key, decay)?;
+    let delta = (value - dot_k) * beta;
+    update_and_dot(state, key, delta, query)
+}
+
+/// Fuses in-place `decay_and_dot(state, key, decay)` and
+/// `update_and_dot(state, key, (value - dot_k) * beta, query)` into a single read and single write of `state`.
+///
+/// # Errors
+/// Rejects unequal vector lengths before mutation, or a nonfinite updated element or dot result.
+pub(crate) fn step_row_in_place(
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Result<f32> {
+    if state.len() != key.len() || state.len() != query.len() {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) = neon::step_row_in_place(state, key, query, decay, value, beta) {
+        return result;
+    }
+    let dot_k = decay_and_dot(state, key, decay)?;
+    let delta = (value - dot_k) * beta;
+    update_and_dot(state, key, delta, query)
+}
+
 #[allow(
     clippy::suboptimal_flops,
     reason = "Keep the scalar oracle's exact multiply/add remainder rounding."
@@ -218,7 +281,7 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 mod tests {
     use super::{
         add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_pair, dot_scalar,
-        scalar_add_scaled, update_and_dot,
+        scalar_add_scaled, step_row_from, step_row_in_place, update_and_dot,
     };
     use crate::Result;
 
@@ -282,6 +345,38 @@ mod tests {
                 let actual_q_dot = update_and_dot(&mut upd_actual, &second, scale, &first)?;
                 assert_eq!(actual_q_dot.to_bits(), expected_q_dot.to_bits());
                 assert_eq!(bits(&upd_actual), bits(&upd_expected));
+
+                let value = 0.75_f32;
+                let beta = 0.625_f32;
+                let mut step_ref_state = vec![f32::NAN; width];
+                let ref_dot_k = decay_and_dot_from(&first, &mut step_ref_state, &second, scale)?;
+                let ref_delta = (value - ref_dot_k) * beta;
+                let ref_out = update_and_dot(&mut step_ref_state, &second, ref_delta, &first)?;
+
+                let mut step_from_state = vec![f32::NAN; width];
+                let from_out = step_row_from(
+                    &first,
+                    &mut step_from_state,
+                    &second,
+                    &first,
+                    scale,
+                    value,
+                    beta,
+                )?;
+                assert_eq!(from_out.to_bits(), ref_out.to_bits());
+                assert_eq!(bits(&step_from_state), bits(&step_ref_state));
+
+                let mut step_in_place_state = first.clone();
+                let in_place_out = step_row_in_place(
+                    &mut step_in_place_state,
+                    &second,
+                    &first,
+                    scale,
+                    value,
+                    beta,
+                )?;
+                assert_eq!(in_place_out.to_bits(), ref_out.to_bits());
+                assert_eq!(bits(&step_in_place_state), bits(&step_ref_state));
             }
         }
         Ok(())

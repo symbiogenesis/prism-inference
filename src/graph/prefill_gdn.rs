@@ -110,16 +110,24 @@ fn exact_head_into(
         .enumerate()
         .zip(matrix.chunks_exact_mut(width))
     {
-        let first_dot_k =
-            arithmetic.gdn_decay_and_dot_from(prev_row, state_row, first.key, first.decay)?;
-        let first_delta = (first.value[row] - first_dot_k) * first.beta;
-        output[row] =
-            arithmetic.gdn_update_and_dot(state_row, first.key, first_delta, first.query)? * scale;
+        output[row] = arithmetic.gdn_step_row_from(
+            prev_row,
+            state_row,
+            first.key,
+            first.query,
+            first.decay,
+            first.value[row],
+            first.beta,
+        )? * scale;
         for (token, input) in inputs.iter().enumerate().skip(1) {
-            let dot_k = arithmetic.gdn_decay_and_dot(state_row, input.key, input.decay)?;
-            let delta = (input.value[row] - dot_k) * input.beta;
-            output[token * width + row] =
-                arithmetic.gdn_update_and_dot(state_row, input.key, delta, input.query)? * scale;
+            output[token * width + row] = arithmetic.gdn_step_row_in_place(
+                state_row,
+                input.key,
+                input.query,
+                input.decay,
+                input.value[row],
+                input.beta,
+            )? * scale;
         }
     }
     Ok(())

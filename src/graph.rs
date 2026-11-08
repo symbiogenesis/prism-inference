@@ -403,6 +403,53 @@ impl Arithmetic {
             }
         }
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep immutable previous state, mutable state output and scalar GDN step parameters explicit."
+    )]
+    fn gdn_step_row_from(
+        self,
+        previous: &[f32],
+        state: &mut [f32],
+        key: &[f32],
+        query: &[f32],
+        decay: f32,
+        value: f32,
+        beta: f32,
+    ) -> Result<f32> {
+        match self {
+            Self::Source => {
+                let dot_k = self.gdn_decay_and_dot_from(previous, state, key, decay)?;
+                let delta = (value - dot_k) * beta;
+                self.gdn_update_and_dot(state, key, delta, query)
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::step_row_from(
+                previous, state, key, query, decay, value, beta,
+            ),
+        }
+    }
+
+    fn gdn_step_row_in_place(
+        self,
+        state: &mut [f32],
+        key: &[f32],
+        query: &[f32],
+        decay: f32,
+        value: f32,
+        beta: f32,
+    ) -> Result<f32> {
+        match self {
+            Self::Source => {
+                let dot_k = self.gdn_decay_and_dot(state, key, decay)?;
+                let delta = (value - dot_k) * beta;
+                self.gdn_update_and_dot(state, key, delta, query)
+            }
+            Self::PinnedSwift => {
+                crate::kernels::pinned_gdn::step_row_in_place(state, key, query, decay, value, beta)
+            }
+        }
+    }
 }
 const MAX_LAYERS: usize = 256;
 const KV_PAGE_TOKENS: usize = 64;
@@ -2585,10 +2632,9 @@ impl Evaluation<'_, '_> {
                             .zip(v)
                             .zip(output.iter_mut())
                         {
-                            let dot_k =
-                                arithmetic.gdn_decay_and_dot_from(prev_row, state_row, k, decay)?;
-                            let delta = (value - dot_k) * update;
-                            *out = arithmetic.gdn_update_and_dot(state_row, k, delta, q)? * scale;
+                            *out = arithmetic.gdn_step_row_from(
+                                prev_row, state_row, k, q, decay, value, update,
+                            )? * scale;
                         }
                         arithmetic.normalize_in_place(output, &layer.norm, g.epsilon)?;
                         // Pinned qwen35.cpp build_norm_gated explicitly uses

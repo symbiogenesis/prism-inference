@@ -322,3 +322,242 @@ fn update_and_dot_with_neon(
     }
     super::super::finite(result)
 }
+
+/// Fuses `decay_and_dot_from` and `update_and_dot` into a single write to `state`
+/// when `state.len() <= 256` and `state.len().is_multiple_of(16)`, keeping the
+/// decayed row in a register/L1 array across both dot-product passes.
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::suboptimal_flops,
+    reason = "Keep two-pass fused NEON GDN row step and exact partial-mutation fallback together."
+)]
+pub(super) fn step_row_from(
+    previous: &[f32],
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Option<Result<f32>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let width = state.len();
+    if width == 0 || width > 256 || !width.is_multiple_of(16) {
+        return None;
+    }
+    let blocks = width / 16;
+    let decays = f32x4::splat(neon, decay);
+    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; 16];
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
+    for (b, (prev_block, key_block)) in previous
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(key.as_chunks::<16>().0)
+        .enumerate()
+    {
+        let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
+        let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
+        let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
+        let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
+        decayed[b] = [d0, d1, d2, d3];
+        s0 = d0.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), s0);
+        s1 = d1.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), s1);
+        s2 = d2.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), s2);
+        s3 = d3.mul_add_precise(f32x4::from_slice(neon, &key_block[12..16]), s3);
+    }
+    let dot_k = match super::super::finite(((s0 + s2) + (s1 + s3)).reduce_sum()) {
+        Ok(val) => val,
+        Err(err) => {
+            for (b, state_block) in state.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                let [d0, d1, d2, d3] = decayed[b];
+                d0.store_slice(&mut state_block[0..4]);
+                d1.store_slice(&mut state_block[4..8]);
+                d2.store_slice(&mut state_block[8..12]);
+                d3.store_slice(&mut state_block[12..16]);
+            }
+            return Some(Err(err));
+        }
+    };
+    let delta = (value - dot_k) * beta;
+    let scales = f32x4::splat(neon, delta);
+    let mut q0 = f32x4::splat(neon, 0.0);
+    let mut q1 = f32x4::splat(neon, 0.0);
+    let mut q2 = f32x4::splat(neon, 0.0);
+    let mut q3 = f32x4::splat(neon, 0.0);
+    for (b, ((state_block, key_block), query_block)) in state
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(key.as_chunks::<16>().0)
+        .zip(query.as_chunks::<16>().0)
+        .enumerate()
+    {
+        let [d0, d1, d2, d3] = decayed[b];
+        let u0 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), d0);
+        let u1 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), d1);
+        let u2 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), d2);
+        let u3 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[12..16]), d3);
+        if (u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+            u0.store_slice(&mut state_block[0..4]);
+            u1.store_slice(&mut state_block[4..8]);
+            u2.store_slice(&mut state_block[8..12]);
+            u3.store_slice(&mut state_block[12..16]);
+            q0 = u0.mul_add_precise(f32x4::from_slice(neon, &query_block[0..4]), q0);
+            q1 = u1.mul_add_precise(f32x4::from_slice(neon, &query_block[4..8]), q1);
+            q2 = u2.mul_add_precise(f32x4::from_slice(neon, &query_block[8..12]), q2);
+            q3 = u3.mul_add_precise(f32x4::from_slice(neon, &query_block[12..16]), q3);
+        } else {
+            d0.store_slice(&mut state_block[0..4]);
+            d1.store_slice(&mut state_block[4..8]);
+            d2.store_slice(&mut state_block[8..12]);
+            d3.store_slice(&mut state_block[12..16]);
+            for (target_elem, &key_elem) in state_block.iter_mut().zip(key_block) {
+                match super::super::finite(delta.mul_add(key_elem, *target_elem)) {
+                    Ok(updated) => *target_elem = updated,
+                    Err(err) => {
+                        for (rem_b, rem_state) in state
+                            .as_chunks_mut::<16>()
+                            .0
+                            .iter_mut()
+                            .enumerate()
+                            .take(blocks)
+                            .skip(b + 1)
+                        {
+                            let [rd0, rd1, rd2, rd3] = decayed[rem_b];
+                            rd0.store_slice(&mut rem_state[0..4]);
+                            rd1.store_slice(&mut rem_state[4..8]);
+                            rd2.store_slice(&mut rem_state[8..12]);
+                            rd3.store_slice(&mut rem_state[12..16]);
+                        }
+                        return Some(Err(err));
+                    }
+                }
+            }
+        }
+    }
+    Some(super::super::finite(((q0 + q2) + (q1 + q3)).reduce_sum()))
+}
+
+/// Fuses in-place `decay_and_dot` and `update_and_dot` into a single read and single write of `state`
+/// when `state.len() <= 256` and `state.len().is_multiple_of(16)`.
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    clippy::suboptimal_flops,
+    reason = "Keep two-pass fused in-place NEON GDN row step and exact partial-mutation fallback together."
+)]
+pub(super) fn step_row_in_place(
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Option<Result<f32>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let width = state.len();
+    if width == 0 || width > 256 || !width.is_multiple_of(16) {
+        return None;
+    }
+    let blocks = width / 16;
+    let decays = f32x4::splat(neon, decay);
+    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; 16];
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
+    for (b, (state_block, key_block)) in state
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(key.as_chunks::<16>().0)
+        .enumerate()
+    {
+        let d0 = f32x4::from_slice(neon, &state_block[0..4]) * decays;
+        let d1 = f32x4::from_slice(neon, &state_block[4..8]) * decays;
+        let d2 = f32x4::from_slice(neon, &state_block[8..12]) * decays;
+        let d3 = f32x4::from_slice(neon, &state_block[12..16]) * decays;
+        decayed[b] = [d0, d1, d2, d3];
+        s0 = d0.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), s0);
+        s1 = d1.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), s1);
+        s2 = d2.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), s2);
+        s3 = d3.mul_add_precise(f32x4::from_slice(neon, &key_block[12..16]), s3);
+    }
+    let dot_k = match super::super::finite(((s0 + s2) + (s1 + s3)).reduce_sum()) {
+        Ok(val) => val,
+        Err(err) => {
+            for (b, state_block) in state.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                let [d0, d1, d2, d3] = decayed[b];
+                d0.store_slice(&mut state_block[0..4]);
+                d1.store_slice(&mut state_block[4..8]);
+                d2.store_slice(&mut state_block[8..12]);
+                d3.store_slice(&mut state_block[12..16]);
+            }
+            return Some(Err(err));
+        }
+    };
+    let delta = (value - dot_k) * beta;
+    let scales = f32x4::splat(neon, delta);
+    let mut q0 = f32x4::splat(neon, 0.0);
+    let mut q1 = f32x4::splat(neon, 0.0);
+    let mut q2 = f32x4::splat(neon, 0.0);
+    let mut q3 = f32x4::splat(neon, 0.0);
+    for (b, ((state_block, key_block), query_block)) in state
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(key.as_chunks::<16>().0)
+        .zip(query.as_chunks::<16>().0)
+        .enumerate()
+    {
+        let [d0, d1, d2, d3] = decayed[b];
+        let u0 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), d0);
+        let u1 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), d1);
+        let u2 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), d2);
+        let u3 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[12..16]), d3);
+        if (u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+            u0.store_slice(&mut state_block[0..4]);
+            u1.store_slice(&mut state_block[4..8]);
+            u2.store_slice(&mut state_block[8..12]);
+            u3.store_slice(&mut state_block[12..16]);
+            q0 = u0.mul_add_precise(f32x4::from_slice(neon, &query_block[0..4]), q0);
+            q1 = u1.mul_add_precise(f32x4::from_slice(neon, &query_block[4..8]), q1);
+            q2 = u2.mul_add_precise(f32x4::from_slice(neon, &query_block[8..12]), q2);
+            q3 = u3.mul_add_precise(f32x4::from_slice(neon, &query_block[12..16]), q3);
+        } else {
+            d0.store_slice(&mut state_block[0..4]);
+            d1.store_slice(&mut state_block[4..8]);
+            d2.store_slice(&mut state_block[8..12]);
+            d3.store_slice(&mut state_block[12..16]);
+            for (target_elem, &key_elem) in state_block.iter_mut().zip(key_block) {
+                match super::super::finite(delta.mul_add(key_elem, *target_elem)) {
+                    Ok(updated) => *target_elem = updated,
+                    Err(err) => {
+                        for (rem_b, rem_state) in state
+                            .as_chunks_mut::<16>()
+                            .0
+                            .iter_mut()
+                            .enumerate()
+                            .take(blocks)
+                            .skip(b + 1)
+                        {
+                            let [rd0, rd1, rd2, rd3] = decayed[rem_b];
+                            rd0.store_slice(&mut rem_state[0..4]);
+                            rd1.store_slice(&mut rem_state[4..8]);
+                            rd2.store_slice(&mut rem_state[8..12]);
+                            rd3.store_slice(&mut rem_state[12..16]);
+                        }
+                        return Some(Err(err));
+                    }
+                }
+            }
+        }
+    }
+    Some(super::super::finite(((q0 + q2) + (q1 + q3)).reduce_sum()))
+}

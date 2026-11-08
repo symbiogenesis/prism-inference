@@ -18,7 +18,11 @@ pub use native_q2::{
 mod q8;
 pub use q8::HmxQ8Executor;
 mod placement;
-pub use placement::{AcceleratorTarget, AdrenoQ2KernelKind, HeterogeneousLayerAssignment, HeterogeneousPlacementPlan, HybridPrefillSchedule, HybridPrefillStep, PlacedProjectionExecutor, plan_hybrid_prefill_pipeline, plan_three_processor_placement};
+pub use placement::{
+    AcceleratorTarget, AdrenoQ2KernelKind, HeterogeneousLayerAssignment,
+    HeterogeneousPlacementPlan, HybridPrefillSchedule, HybridPrefillStep, PlacedProjectionExecutor,
+    plan_hybrid_prefill_pipeline, plan_three_processor_placement,
+};
 
 type Result<T> = bonsai_prism_runtime::Result<T>;
 

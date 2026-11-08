@@ -91,12 +91,7 @@ pub fn decode_ptq1_trits_i8(packed: &[u8; 28]) -> [[i8; 16]; 8] {
 /// `lane[l] = sum_{k=0..4} (w0[4*l+k]*a0[4*l+k] + w1[4*l+k]*a1[4*l+k])`.
 #[inline]
 #[must_use]
-pub fn dot32_s8_lanes(
-    w0: &[i8; 16],
-    w1: &[i8; 16],
-    a0: &[i8; 16],
-    a1: &[i8; 16],
-) -> [i32; 4] {
+pub fn dot32_s8_lanes(w0: &[i8; 16], w1: &[i8; 16], a0: &[i8; 16], a1: &[i8; 16]) -> [i32; 4] {
     #[cfg(target_arch = "aarch64")]
     if let Some(lanes) = aarch64::dot32_s8_lanes(w0, w1, a0, a1) {
         return lanes;
@@ -254,12 +249,7 @@ pub fn dot_q8_0_block(weights: &[u8; 32], activations: &[i8; 32]) -> i32 {
 /// ARMv8.2-A `I8MM` (`SMMLA`) when available, or `SDOT`/scalar fallback.
 #[inline]
 #[must_use]
-pub fn smmla_q8_0_2x2(
-    r0: &[u8; 32],
-    r1: &[u8; 32],
-    c0: &[i8; 32],
-    c1: &[i8; 32],
-) -> [[i32; 2]; 2] {
+pub fn smmla_q8_0_2x2(r0: &[u8; 32], r1: &[u8; 32], c0: &[i8; 32], c1: &[i8; 32]) -> [[i32; 2]; 2] {
     #[cfg(target_arch = "aarch64")]
     if let Some(tile) = aarch64::smmla_q8_0_2x2(r0, r1, c0, c1) {
         return tile;

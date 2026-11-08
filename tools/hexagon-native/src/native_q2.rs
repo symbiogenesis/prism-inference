@@ -1756,7 +1756,8 @@ pub(crate) fn image_ffn_full_chain_resident(
     }
     if let Some(block_size) = hadamard_block_size {
         let block_usize = usize::try_from(block_size).map_err(|_| Error::Contract)?;
-        if block_size < 32 || !block_size.is_power_of_two() || !ffn_dim.is_multiple_of(block_usize) {
+        if block_size < 32 || !block_size.is_power_of_two() || !ffn_dim.is_multiple_of(block_usize)
+        {
             return Err(Error::Contract);
         }
     }
@@ -1850,12 +1851,10 @@ pub(crate) fn image_ffn_full_chain_resident(
 
     let n_bufs_usize = 1 + extra_buf_count;
     let n_bufs = u32::try_from(n_bufs_usize).map_err(|_| Error::Contract)?;
-    let n_tensors_usize = 12
-        + usize::from(hadamard_block_size.is_some()) * 2
-        + usize::from(residual.is_some()) * 3;
-    let n_ops_usize = 4
-        + usize::from(hadamard_block_size.is_some())
-        + usize::from(residual.is_some());
+    let n_tensors_usize =
+        12 + usize::from(hadamard_block_size.is_some()) * 2 + usize::from(residual.is_some()) * 3;
+    let n_ops_usize =
+        4 + usize::from(hadamard_block_size.is_some()) + usize::from(residual.is_some());
     let tensors_base = n_bufs_usize * 24;
     let ops_base = tensors_base + n_tensors_usize * 56;
     if ops_base + n_ops_usize * 232 > cmd_pad {
@@ -1933,7 +1932,15 @@ pub(crate) fn image_ffn_full_chain_resident(
         (7_u16, up_out_offset),
         (8_u16, swiglu_out_offset),
     ] {
-        write_f32_2d_tensor_desc(working, tensors_base, ti, buf_off, ffn_bytes, glu_cols, glu_rows)?;
+        write_f32_2d_tensor_desc(
+            working,
+            tensors_base,
+            ti,
+            buf_off,
+            ffn_bytes,
+            glu_cols,
+            glu_rows,
+        )?;
     }
     let glu_op_desc = ops_base + 2 * 232;
     let glu_flags = if vtcm_chain {
@@ -1943,7 +1950,11 @@ pub(crate) fn image_ffn_full_chain_resident(
     } else {
         crate::htp_ops::HtpOpPassFlags::NONE
     };
-    put32(working, glu_op_desc, crate::htp_ops::HtpOpCode::GluSwiglu.id());
+    put32(
+        working,
+        glu_op_desc,
+        crate::htp_ops::HtpOpCode::GluSwiglu.id(),
+    );
     put32(working, glu_op_desc + 4, glu_flags.bits());
     working[glu_op_desc + 72..glu_op_desc + 84].copy_from_slice(&glu_kp);
     working[glu_op_desc + 200..glu_op_desc + 228].fill(0xff);
@@ -1989,7 +2000,11 @@ pub(crate) fn image_ffn_full_chain_resident(
         } else {
             crate::htp_ops::HtpOpPassFlags::NONE
         };
-        put32(working, had_op_desc, crate::htp_ops::HtpOpCode::Hadamard.id());
+        put32(
+            working,
+            had_op_desc,
+            crate::htp_ops::HtpOpCode::Hadamard.id(),
+        );
         put32(working, had_op_desc + 4, had_flags.bits());
         working[had_op_desc + 72..had_op_desc + 136].copy_from_slice(&had_kp);
         working[had_op_desc + 200..had_op_desc + 228].fill(0xff);

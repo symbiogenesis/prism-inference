@@ -548,15 +548,16 @@ fn tiled_prefill_parallel_grouped_kv_and_head_major_recurrent_match_single_token
 fn last_layer_prefill_narrowing_preserves_state_and_skips_unused_final_projections() -> Result<()> {
     let make_four_layer = || {
         let mut four_layer = paged_hybrid_fixture();
-        four_layer.metadata.insert(
-            "qwen35.block_count".to_owned(),
-            MetadataValue::from(4_u64),
-        );
+        four_layer
+            .metadata
+            .insert("qwen35.block_count".to_owned(), MetadataValue::from(4_u64));
         four_layer.metadata.insert(
             "qwen35.attention.recurrent_layers".to_owned(),
             MetadataValue::from(vec![true, true, true, false]),
         );
-        four_layer.tensors.retain(|name, _| !name.starts_with("blk."));
+        four_layer
+            .tensors
+            .retain(|name, _| !name.starts_with("blk."));
         let rec_tensors = fixture(true).tensors;
         let full_tensors = fixture(false).tensors;
         for blk in 0..4 {

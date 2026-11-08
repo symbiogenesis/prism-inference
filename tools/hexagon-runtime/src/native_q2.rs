@@ -1979,13 +1979,8 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         adapter_b: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        let result = self.project_f32_with_rank1_adapter_inner(
-            tensor,
-            activation,
-            adapter_a,
-            adapter_b,
-            output,
-        );
+        let result = self
+            .project_f32_with_rank1_adapter_inner(tensor, activation, adapter_a, adapter_b, output);
         if result.is_err() {
             self.failed = true;
             output.clear();
@@ -2094,7 +2089,10 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         if let Some(block_size) = hadamard_block_size {
             let block_usize = usize::try_from(block_size)?;
-            if block_size < 32 || !block_size.is_power_of_two() || !ffn_dim.is_multiple_of(block_usize) {
+            if block_size < 32
+                || !block_size.is_power_of_two()
+                || !ffn_dim.is_multiple_of(block_usize)
+            {
                 return Err(invalid("invalid FFN chain Hadamard block size"));
             }
         }
@@ -2138,9 +2136,8 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 .map_err(|_| invalid("native Q2 output allocation failed"))?;
             output.resize(hidden, f32::NAN);
         }
-        let op_count = 4_u64
-            + u64::from(hadamard_block_size.is_some())
-            + u64::from(residual.is_some());
+        let op_count =
+            4_u64 + u64::from(hadamard_block_size.is_some()) + u64::from(residual.is_some());
         self.statistics.operations_attempted = self
             .statistics
             .operations_attempted
@@ -2748,9 +2745,8 @@ mod tests {
             hadamard_block_size: Option<u32>,
             output: &mut [f32],
         ) -> std::result::Result<(), hexagon_native_rpc::Error> {
-            let ops = 4_u64
-                + u64::from(hadamard_block_size.is_some())
-                + u64::from(residual.is_some());
+            let ops =
+                4_u64 + u64::from(hadamard_block_size.is_some()) + u64::from(residual.is_some());
             self.calls += ops;
             self.resident_calls += 3;
             let [gate, up, down] = handles;
@@ -3236,15 +3232,30 @@ mod tests {
         assert_eq!(schedule.steps[3].cpu_microbatch, Some(2));
         assert_eq!(schedule.steps[3].cpu_token_range, 16..20);
 
-        let het = crate::plan_three_processor_placement(64, 27, 37, 4, crate::AcceleratorTarget::AdrenoGpuOpenCl)?;
+        let het = crate::plan_three_processor_placement(
+            64,
+            27,
+            37,
+            4,
+            crate::AcceleratorTarget::AdrenoGpuOpenCl,
+        )?;
         assert_eq!(het.npu_layers, 27);
         assert_eq!(het.gpu_layers, 37);
         assert_eq!(het.cpu_layers, 0);
         assert_eq!(het.npu_q2_projections, 168);
         assert_eq!(het.gpu_q2_projections, 232);
-        assert_eq!(het.layers[0].projection_target, crate::AcceleratorTarget::HexagonNpu);
-        assert_eq!(het.layers[27].projection_target, crate::AcceleratorTarget::AdrenoGpuOpenCl);
-        assert_eq!(het.layers[27].adreno_fwht_kernel, Some(crate::AdrenoQ2KernelKind::FwhtLocalMem1024));
+        assert_eq!(
+            het.layers[0].projection_target,
+            crate::AcceleratorTarget::HexagonNpu
+        );
+        assert_eq!(
+            het.layers[27].projection_target,
+            crate::AcceleratorTarget::AdrenoGpuOpenCl
+        );
+        assert_eq!(
+            het.layers[27].adreno_fwht_kernel,
+            Some(crate::AdrenoQ2KernelKind::FwhtLocalMem1024)
+        );
         Ok(())
     }
 }

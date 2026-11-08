@@ -159,13 +159,13 @@ fn sdot32_vec(w0: int8x16_t, w1: int8x16_t, a0: int8x16_t, a1: int8x16_t) -> int
 }
 
 #[target_feature(enable = "neon,dotprod")]
-fn dot32_s8_lanes_dotprod(
-    w0: &[i8; 16],
-    w1: &[i8; 16],
-    a0: &[i8; 16],
-    a1: &[i8; 16],
-) -> [i32; 4] {
-    let acc = sdot32_vec(load_s8x16(w0), load_s8x16(w1), load_s8x16(a0), load_s8x16(a1));
+fn dot32_s8_lanes_dotprod(w0: &[i8; 16], w1: &[i8; 16], a0: &[i8; 16], a1: &[i8; 16]) -> [i32; 4] {
+    let acc = sdot32_vec(
+        load_s8x16(w0),
+        load_s8x16(w1),
+        load_s8x16(a0),
+        load_s8x16(a1),
+    );
     let mut out = [0_i32; 4];
     store_s32x4(acc, &mut out);
     out
@@ -173,7 +173,12 @@ fn dot32_s8_lanes_dotprod(
 
 #[target_feature(enable = "neon,dotprod")]
 fn dot32_s8_sum_dotprod(w0: &[i8; 16], w1: &[i8; 16], a0: &[i8; 16], a1: &[i8; 16]) -> i32 {
-    let acc = sdot32_vec(load_s8x16(w0), load_s8x16(w1), load_s8x16(a0), load_s8x16(a1));
+    let acc = sdot32_vec(
+        load_s8x16(w0),
+        load_s8x16(w1),
+        load_s8x16(a0),
+        load_s8x16(a1),
+    );
     vaddvq_s32(acc)
 }
 
@@ -206,10 +211,7 @@ pub(super) fn dot32_s8_sum(
 }
 
 #[target_feature(enable = "neon,dotprod")]
-fn dot_ptq1_block_lanes_dotprod(
-    packed: &[u8; 28],
-    activations: [&[i8; 32]; 4],
-) -> [[i32; 4]; 4] {
+fn dot_ptq1_block_lanes_dotprod(packed: &[u8; 28], activations: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
     let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(packed);
     let pairs = [(t0, t1), (t2, t3), (t4, t5), (t6, t7)];
     let mut out = [[0_i32; 4]; 4];

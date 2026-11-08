@@ -2,12 +2,12 @@
 
 use std::{fmt::Write, sync::Arc};
 
+use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, Q8Block},
     model::{Model, Tensor},
 };
 use bonsai_ternary::Q8KBlock;
-use bonsai_native_hash::Hasher;
 
 use crate::{Result, invalid};
 
@@ -535,7 +535,9 @@ pub fn plan_hybrid_prefill_pipeline(
         || microbatch_tokens == 0
         || microbatch_tokens > 64
     {
-        return Err(invalid("invalid hybrid NPU+CPU prefill pipeline parameters"));
+        return Err(invalid(
+            "invalid hybrid NPU+CPU prefill pipeline parameters",
+        ));
     }
     let microbatch_count = prompt_tokens.div_ceil(microbatch_tokens);
     let step_count = microbatch_count + 1;
@@ -653,14 +655,18 @@ pub fn plan_three_processor_placement(
 ) -> Result<HeterogeneousPlacementPlan> {
     if total_layers == 0
         || full_attention_interval == 0
-        || npu_layers.checked_add(gpu_layers).is_none_or(|sum| sum > total_layers)
+        || npu_layers
+            .checked_add(gpu_layers)
+            .is_none_or(|sum| sum > total_layers)
         || (gpu_layers > 0
             && !matches!(
                 gpu_backend,
                 AcceleratorTarget::AdrenoGpuOpenCl | AcceleratorTarget::AdrenoGpuVulkan
             ))
     {
-        return Err(invalid("invalid 3-processor heterogeneous placement parameters"));
+        return Err(invalid(
+            "invalid 3-processor heterogeneous placement parameters",
+        ));
     }
     let cpu_layers = total_layers - (npu_layers + gpu_layers);
     let mut layers = Vec::new();

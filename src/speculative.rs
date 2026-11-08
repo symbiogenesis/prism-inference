@@ -338,7 +338,9 @@ impl DFlash2DraftConfig {
             || self.tap_layers.windows(2).any(|pair| pair[0] >= pair[1])
             || self.tap_layers[4] >= target_layers
         {
-            return Err(invalid("invalid DFlash2 block-diffusion draft configuration"));
+            return Err(invalid(
+                "invalid DFlash2 block-diffusion draft configuration",
+            ));
         }
         Ok(())
     }

@@ -1629,8 +1629,24 @@ fn accumulate_ptq1_block_pinned(
     a3: f32,
     mut lane: f32x4<Neon>,
 ) -> f32x4<Neon> {
-    let [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15] =
-        decode_ptq1_i16(neon, packed);
+    let [
+        w0,
+        w1,
+        w2,
+        w3,
+        w4,
+        w5,
+        w6,
+        w7,
+        w8,
+        w9,
+        w10,
+        w11,
+        w12,
+        w13,
+        w14,
+        w15,
+    ] = decode_ptq1_i16(neon, packed);
     let f0 = dot32_native_lanes_w16_i32x4(w0, w1, w2, w3, v00_l, v00_h, v01_l, v01_h)
         .to_float::<f32x4<Neon>>();
     lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
@@ -2076,8 +2092,24 @@ fn accumulate_ptq1_block_source(
     act_scales: f32x4<Neon>,
     output: f32,
 ) -> f32 {
-    let [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15] =
-        decode_ptq1_i16(neon, packed);
+    let [
+        w0,
+        w1,
+        w2,
+        w3,
+        w4,
+        w5,
+        w6,
+        w7,
+        w8,
+        w9,
+        w10,
+        w11,
+        w12,
+        w13,
+        w14,
+        w15,
+    ] = decode_ptq1_i16(neon, packed);
     let (g0_l, g0_h) = ((w0 * v00_l + w1 * v00_h) + (w2 * v01_l + w3 * v01_h)).widen();
     let s0 = g0_l + g0_h;
     let (g1_l, g1_h) = ((w4 * v10_l + w5 * v10_h) + (w6 * v11_l + w7 * v11_h)).widen();
@@ -2442,8 +2474,10 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
         if use_dotprod {
             for r in 0..4 {
                 let [_, _, ref weights @ ..] = *blocks[r];
-                let sum =
-                    super::integer_float(bonsai_neon_dot::dot_q8_0_block(weights, &activation.values));
+                let sum = super::integer_float(bonsai_neon_dot::dot_q8_0_block(
+                    weights,
+                    &activation.values,
+                ));
                 outputs[r] += (row_scales[r] * activation.scale) * sum;
             }
         } else {
@@ -2514,8 +2548,10 @@ pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
         if use_dotprod {
             for r in 0..8 {
                 let [_, _, ref weights @ ..] = chunks[r][index];
-                let sum =
-                    super::integer_float(bonsai_neon_dot::dot_q8_0_block(weights, &activation.values));
+                let sum = super::integer_float(bonsai_neon_dot::dot_q8_0_block(
+                    weights,
+                    &activation.values,
+                ));
                 outputs[r] += (row_scales[r] * activation.scale) * sum;
             }
         } else {
@@ -2679,7 +2715,8 @@ pub(super) fn dot_q8_0_tile_row<const TOKENS: usize>(
             while t + 2 <= token_count {
                 let a0 = &preparations[t].q8[index];
                 let a1 = &preparations[t + 1].q8[index];
-                let tile = bonsai_neon_dot::smmla_q8_0_2x2(weights, weights, &a0.values, &a1.values);
+                let tile =
+                    bonsai_neon_dot::smmla_q8_0_2x2(weights, weights, &a0.values, &a1.values);
                 sums[t] += (weight_scale * a0.scale) * super::integer_float(tile[0][0]);
                 sums[t + 1] += (weight_scale * a1.scale) * super::integer_float(tile[0][1]);
                 t += 2;
@@ -3356,7 +3393,11 @@ fn hadamard_16_registers_rms_norm<const PINNED: bool>(
     let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
     let [v0, v1, v2, v3] = transpose_4x4(b0 + b2, b1 + b3, b0 - b2, b1 - b3);
     let (c0, c1, c2, c3) = (v0 + v1, v0 - v1, v2 + v3, v2 - v3);
-    ([c0 + c2, c1 + c3, c0 - c2, c1 - c3], norm_finite, had_finite)
+    (
+        [c0 + c2, c1 + c3, c0 - c2, c1 - c3],
+        norm_finite,
+        had_finite,
+    )
 }
 
 /// Fuses weighted `RMSNorm` scaling, optional sign multiplication, and normalized

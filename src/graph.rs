@@ -993,10 +993,7 @@ impl Transforms {
         self.block >= 16
             && self.block.is_power_of_two()
             && len.is_multiple_of(self.block)
-            && self
-                .signs
-                .get(&len)
-                .is_none_or(|signs| signs.len() >= len)
+            && self.signs.get(&len).is_none_or(|signs| signs.len() >= len)
     }
 
     // The fixed-size group borrows one exact input slice for its whole scope.
@@ -2732,7 +2729,11 @@ impl Evaluation<'_, '_> {
         self.project_group_into(
             [&layer.qkv, &layer.beta, &layer.alpha],
             input,
-            [&mut scratch.projected, &mut scratch.beta, &mut scratch.alpha],
+            [
+                &mut scratch.projected,
+                &mut scratch.beta,
+                &mut scratch.alpha,
+            ],
         )?;
         resize_into(self.geometry.value_width(), &mut scratch.gate)?;
         self.recurrent_attention_state(

@@ -143,7 +143,12 @@ struct Candidate {
 }
 
 fn worse_candidate(left: &Candidate, right: &Candidate) -> bool {
-    right.logit.partial_cmp(&left.logit).unwrap_or(std::cmp::Ordering::Equal).then_with(|| left.token.cmp(&right.token)).is_gt()
+    right
+        .logit
+        .partial_cmp(&left.logit)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.token.cmp(&right.token))
+        .is_gt()
 }
 
 fn sift_down_worst(heap: &mut [Candidate], mut index: usize) {

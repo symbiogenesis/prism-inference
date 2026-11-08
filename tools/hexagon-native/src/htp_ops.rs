@@ -261,7 +261,10 @@ pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u
     let n_chunks = total_elems.div_ceil(target);
     let n_threads = n_chunks.clamp(1, HMX_Q2_HVX_WORKERS);
     let chunk_bytes = (target * 4).next_multiple_of(128);
-    let row_bytes = columns.checked_mul(4).ok_or(Error::Contract)?.next_multiple_of(128);
+    let row_bytes = columns
+        .checked_mul(4)
+        .ok_or(Error::Contract)?
+        .next_multiple_of(128);
     if requires_dma64_stride(u64::from(row_bytes)) {
         return Err(Error::Contract);
     }
@@ -345,8 +348,12 @@ mod tests {
             u32::from_le_bytes([mul_kp[8], mul_kp[9], mul_kp[10], mul_kp[11]]),
             8
         );
-        assert!(!requires_dma64_stride(u64::from(HTP_DMA32_MAX_STRIDE_BYTES)));
-        assert!(requires_dma64_stride(u64::from(HTP_DMA32_MAX_STRIDE_BYTES) + 1));
+        assert!(!requires_dma64_stride(u64::from(
+            HTP_DMA32_MAX_STRIDE_BYTES
+        )));
+        assert!(requires_dma64_stride(
+            u64::from(HTP_DMA32_MAX_STRIDE_BYTES) + 1
+        ));
         assert!(solve_binary_kparams(HtpOpCode::Add, 4_194_304, 1).is_err());
         Ok(())
     }

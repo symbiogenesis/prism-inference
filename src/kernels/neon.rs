@@ -2478,6 +2478,86 @@ pub(super) fn dot_q4_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
     Ok(outputs)
 }
 
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub(super) fn dot_q8_0_tile_row<const TOKENS: usize>(
+    row: &[u8],
+    preparations: &[super::MatvecScratch],
+) -> Option<Result<[f32; TOKENS]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sums = [0.0_f32; TOKENS];
+    for (index, block) in row.as_chunks::<34>().0.iter().enumerate() {
+        let weight_scale = match super::scale(block) {
+            Ok(s) => s,
+            Err(err) => return Some(Err(err)),
+        };
+        let (w0_l, w0_h) = u8x16::from_slice(neon, &block[2..18])
+            .bitcast::<i8x16<Neon>>()
+            .widen();
+        let (w1_l, w1_h) = u8x16::from_slice(neon, &block[18..34])
+            .bitcast::<i8x16<Neon>>()
+            .widen();
+        for (sum, scratch) in sums.iter_mut().zip(preparations) {
+            let activation = &scratch.q8[index];
+            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            let (p00_l, p00_h) = (w0_l * a0_l).widen();
+            let (p01_l, p01_h) = (w0_h * a0_h).widen();
+            let (p10_l, p10_h) = (w1_l * a1_l).widen();
+            let (p11_l, p11_h) = (w1_h * a1_h).widen();
+            let int_dot = ((p00_l + p00_h) + (p01_l + p01_h) + (p10_l + p10_h) + (p11_l + p11_h))
+                .reduce_sum();
+            *sum += (weight_scale * activation.scale) * super::integer_float(int_dot);
+        }
+    }
+    for sum in sums.iter_mut().take(preparations.len()) {
+        match super::finite(*sum) {
+            Ok(v) => *sum = v,
+            Err(err) => return Some(Err(err)),
+        }
+    }
+    Some(Ok(sums))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub(super) fn dot_q4_0_tile_row<const TOKENS: usize>(
+    row: &[u8],
+    preparations: &[super::MatvecScratch],
+) -> Option<Result<[f32; TOKENS]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sums = [0.0_f32; TOKENS];
+    for (index, block) in row.as_chunks::<18>().0.iter().enumerate() {
+        let weight_scale = match super::scale(block) {
+            Ok(s) => s,
+            Err(err) => return Some(Err(err)),
+        };
+        let raw = u8x16::from_slice(neon, &block[2..18]);
+        let (w0_l, w0_h) = ((raw & 15).bitcast::<i8x16<Neon>>() - 8).widen();
+        let (w1_l, w1_h) = ((raw >> 4).bitcast::<i8x16<Neon>>() - 8).widen();
+        for (sum, scratch) in sums.iter_mut().zip(preparations) {
+            let activation = &scratch.q8[index];
+            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            let pairs = (w0_l * a0_l + w0_h * a0_h) + (w1_l * a1_l + w1_h * a1_h);
+            *sum += (weight_scale * activation.scale) * super::integer_float(pq2_reduce(pairs));
+        }
+    }
+    for sum in sums.iter_mut().take(preparations.len()) {
+        match super::finite(*sum) {
+            Ok(v) => *sum = v,
+            Err(err) => return Some(Err(err)),
+        }
+    }
+    Some(Ok(sums))
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,

@@ -31,7 +31,6 @@ impl Drop for Completion<'_> {
 impl RowParallelism {
     /// Fill disjoint token-major row slices without duplicating weight decoding.
     /// The callback stays on its calling thread and needs neither `Send` nor `Sync`.
-    #[cfg(all(test, feature = "parallel-rows"))]
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,

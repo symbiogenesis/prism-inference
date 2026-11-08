@@ -11,8 +11,9 @@
 )]
 
 use super::{
-    ActivationContract, BF16, MatvecBackend, MatvecScratch, PQ2, PTQ1, RowParallelism, bf16_dot,
-    dimensions, finite, integer_float, matvec_into, scale,
+    ActivationContract, BF16, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0, Q5_1,
+    Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite, integer_float,
+    kquants, matvec_into, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -21,6 +22,62 @@ mod dot;
 
 pub(crate) const MAX_TILE_TOKENS: usize = 32;
 pub(crate) const ROW_TASK_SCRATCH_BYTES: usize = 16 * 1024;
+
+const fn supports_tiled_rows(kind: u32) -> bool {
+    matches!(
+        kind,
+        PQ2 | PTQ1
+            | BF16
+            | Q4_0
+            | Q4_1
+            | Q5_0
+            | Q5_1
+            | Q8_0
+            | 10..=14
+            | 16..=23
+            | 29
+            | 34
+            | 35
+            | 39..=42
+    )
+}
+
+fn dot_quantized_tile_row(
+    kind: u32,
+    row: &[u8],
+    preparations: &[MatvecScratch],
+    backend: MatvecBackend,
+) -> Result<[f32; MAX_TILE_TOKENS]> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if backend != MatvecBackend::Scalar {
+        if kind == Q8_0
+            && let Some(res) = super::neon::dot_q8_0_tile_row::<MAX_TILE_TOKENS>(row, preparations)
+        {
+            return res;
+        }
+        if kind == Q4_0
+            && let Some(res) = super::neon::dot_q4_0_tile_row::<MAX_TILE_TOKENS>(row, preparations)
+        {
+            return res;
+        }
+    }
+    let _ = backend;
+    let mut sums = [0.0_f32; MAX_TILE_TOKENS];
+    for (sum, scratch) in sums.iter_mut().zip(preparations) {
+        *sum = match kind {
+            Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 => dot_legacy(kind, row, &scratch.q8)?,
+            10..=14 => kquants::dot(kind, row, &scratch.q8k)?,
+            _ => dot_additional(kind, row, &scratch.q8, &scratch.q8k)?,
+        };
+    }
+    Ok(sums)
+}
 
 #[derive(Default)]
 pub(crate) struct ProjectionTile {
@@ -89,10 +146,10 @@ impl ProjectionTile {
             {
                 return Err(invalid("invalid bounded projection tile"));
             }
-            let reuse_prepared = matches!(tensor.kind, PQ2 | PTQ1 | BF16)
+            let reuse_prepared = supports_tiled_rows(tensor.kind)
                 && self.preparations.len() >= inputs.len()
                 && previous.is_some_and(|prev| {
-                    matches!(prev.kind, PQ2 | PTQ1 | BF16)
+                    supports_tiled_rows(prev.kind)
                         && dimensions(prev).is_ok_and(|(prev_cols, _, _)| {
                             prev_cols == columns
                                 && ActivationContract::for_tensor(prev, prev_cols, pinned)
@@ -185,6 +242,22 @@ impl ProjectionTile {
                         ])
                     },
                     dot_bf16_one,
+                );
+            }
+            if matches!(
+                tensor.kind,
+                Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | 10..=14 | 16..=23 | 29 | 34 | 35 | 39..=42
+            ) {
+                let backend = self.backend;
+                let preparations = &self.preparations[..inputs.len()];
+                let mut unused_blocks = 0_u64;
+                return self.row_parallelism.fill_tile(
+                    &tensor.data,
+                    block_bytes,
+                    outputs,
+                    &mut unused_blocks,
+                    check,
+                    |row, _| dot_quantized_tile_row(tensor.kind, row, preparations, backend),
                 );
             }
             if !matches!(tensor.kind, PQ2 | PTQ1) {
@@ -814,6 +887,84 @@ mod tests {
                 .map(MatvecScratch::preparation_count)
                 .collect();
             assert_eq!(preps_after, preps_before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_quantized_projections_match_scalar_and_reuse_prepared_activations() -> Result<()> {
+        let columns = 256_usize;
+        let rows = 11_usize;
+        let inputs: Vec<Vec<f32>> = (0..8)
+            .map(|token| {
+                (0..columns)
+                    .map(|idx| [1.25, -3.5, 0.0, -0.0, 7.125, -0.375][(idx + token) % 6])
+                    .collect()
+            })
+            .collect();
+        for kind in [Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, 12, 14, 34, 35, 39, 41, 42] {
+            let mut data = Vec::new();
+            for row in 0..rows {
+                let row_f32: Vec<f32> = (0..columns)
+                    .map(|col| {
+                        let s = (row * 17 + col * 11) % 31;
+                        (f32::from(u8::try_from(s).unwrap_or(0)) - 15.0) * 0.125
+                    })
+                    .collect();
+                data.extend_from_slice(&super::super::quantize_row(kind, &row_f32)?);
+            }
+            let tensor = Tensor {
+                name: format!("tile-quant-{kind}"),
+                dimensions: vec![columns, rows],
+                kind,
+                data: Arc::from(data),
+            };
+            let expected: Vec<Vec<u32>> = inputs
+                .iter()
+                .map(|input| {
+                    let mut scratch = MatvecScratch::with_backend(MatvecBackend::Scalar);
+                    let mut out = Vec::new();
+                    matvec_into(&tensor, input, &mut out, &mut scratch)?;
+                    Ok(out.into_iter().map(f32::to_bits).collect())
+                })
+                .collect::<Result<_>>()?;
+            for backend in [
+                MatvecBackend::Scalar,
+                MatvecBackend::Auto,
+                MatvecBackend::ExperimentalNeon,
+            ] {
+                let mut tile = ProjectionTile::with_backend(backend);
+                #[cfg(feature = "parallel-rows")]
+                tile.set_row_parallelism(RowParallelism::new(2)?);
+                let mut actual = vec![Vec::new(); inputs.len()];
+                tile.project(&tensor, &inputs, &mut actual, true, &|| Ok(()))?;
+                assert_eq!(tile.packed_projections, 0);
+                assert_eq!(tile.decoded_blocks, 0);
+                let actual_bits: Vec<Vec<u32>> = actual
+                    .iter()
+                    .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                    .collect();
+                assert_eq!(actual_bits, expected, "mismatch for kind={kind}");
+                let preps_before: Vec<usize> = tile
+                    .preparations
+                    .iter()
+                    .map(MatvecScratch::preparation_count)
+                    .collect();
+                tile.project_with_previous(
+                    Some(&tensor),
+                    &tensor,
+                    &inputs,
+                    &mut actual,
+                    true,
+                    &|| Ok(()),
+                )?;
+                let preps_after: Vec<usize> = tile
+                    .preparations
+                    .iter()
+                    .map(MatvecScratch::preparation_count)
+                    .collect();
+                assert_eq!(preps_after, preps_before, "prep not reused for kind={kind}");
+            }
         }
         Ok(())
     }

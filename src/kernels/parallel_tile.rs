@@ -22,9 +22,44 @@ struct Completion<'a> {
 #[cfg(feature = "parallel-rows")]
 impl Drop for Completion<'_> {
     fn drop(&mut self) {
-        self.remaining
-            .fetch_sub(1, std::sync::atomic::Ordering::Release);
-        self.caller.unpark();
+        if self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.caller.unpark();
+        }
+    }
+}
+
+#[cfg(feature = "parallel-rows")]
+fn wait_for_tile_tasks(
+    remaining: &std::sync::atomic::AtomicUsize,
+    cancelled: &std::sync::atomic::AtomicBool,
+    cancellation: &mut Option<crate::Error>,
+    check: &dyn Fn() -> Result<()>,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const SPIN_ITERS: usize = 64;
+
+    while remaining.load(Ordering::Acquire) != 0 {
+        if cancellation.is_none()
+            && let Err(error) = check()
+        {
+            *cancellation = Some(error);
+            cancelled.store(true, Ordering::Release);
+        }
+        for _ in 0..SPIN_ITERS {
+            if remaining.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        if remaining.load(Ordering::Acquire) != 0 {
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
     }
 }
 
@@ -62,7 +97,6 @@ impl RowParallelism {
             && self.uses_pool(rows)
         {
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-            use std::time::Duration;
 
             let task_rows = rows.div_ceil(self.workers());
             let task_count = rows.div_ceil(task_rows);
@@ -118,15 +152,7 @@ impl RowParallelism {
                         }
                     });
                 }
-                while remaining.load(Ordering::Acquire) != 0 {
-                    if cancellation.is_none()
-                        && let Err(error) = check()
-                    {
-                        cancellation = Some(error);
-                        cancelled.store(true, Ordering::Release);
-                    }
-                    std::thread::park_timeout(Duration::from_millis(1));
-                }
+                wait_for_tile_tasks(&remaining, &cancelled, &mut cancellation, check);
             });
             for task in &tasks[..task_count] {
                 *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
@@ -184,7 +210,6 @@ impl RowParallelism {
             && self.uses_pool(rows)
         {
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-            use std::time::Duration;
 
             let task_rows = rows.div_ceil(self.workers());
             let task_count = rows.div_ceil(task_rows);
@@ -337,15 +362,7 @@ impl RowParallelism {
                         }
                     });
                 }
-                while remaining.load(Ordering::Acquire) != 0 {
-                    if cancellation.is_none()
-                        && let Err(error) = check()
-                    {
-                        cancellation = Some(error);
-                        cancelled.store(true, Ordering::Release);
-                    }
-                    std::thread::park_timeout(Duration::from_millis(1));
-                }
+                wait_for_tile_tasks(&remaining, &cancelled, &mut cancellation, check);
             });
             for task in &tasks[..task_count] {
                 *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);

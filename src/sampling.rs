@@ -142,10 +142,165 @@ struct Candidate {
     weight: f64,
 }
 
+fn worse_candidate(left: &Candidate, right: &Candidate) -> bool {
+    right.logit.partial_cmp(&left.logit).unwrap_or(std::cmp::Ordering::Equal).then_with(|| left.token.cmp(&right.token)).is_gt()
+}
+
+fn sift_down_worst(heap: &mut [Candidate], mut index: usize) {
+    let len = heap.len();
+    while let Some(left) = index.checked_mul(2).and_then(|v| v.checked_add(1)) {
+        if left >= len {
+            break;
+        }
+        let right = left + 1;
+        let worst_child = if right < len && worse_candidate(&heap[right], &heap[left]) {
+            right
+        } else {
+            left
+        };
+        if !worse_candidate(&heap[worst_child], &heap[index]) {
+            break;
+        }
+        heap.swap(index, worst_child);
+        index = worst_child;
+    }
+}
+
+/// Computes a conservative lower-bound logit cutoff for large-`k` top-`k` pre-filtering
+/// using a 16-bucket histogram over finite logits.
+///
+/// Clamps negative bucket indices to `0..=15` and ignores non-finite values at any
+/// position (porting the `ik_llama.cpp` PR `#2857` bucketed top-k fixes).
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "Bucket index is explicitly clamped to 0..=15 before usize/f64 conversion."
+)]
+pub(crate) fn bucketed_top_k_cutoff(logits: &[f32], keep: usize) -> Option<f32> {
+    if keep == 0 || keep >= logits.len() {
+        return None;
+    }
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    for &logit in logits {
+        if logit.is_finite() {
+            if logit < min_val {
+                min_val = logit;
+            }
+            if logit > max_val {
+                max_val = logit;
+            }
+        }
+    }
+    if !min_val.is_finite() || !max_val.is_finite() || max_val <= min_val {
+        return None;
+    }
+    let range = f64::from(max_val) - f64::from(min_val);
+    if !range.is_finite() || range <= 0.0 {
+        return None;
+    }
+    let scale = 16.0 / range;
+    let min_f64 = f64::from(min_val);
+    let mut counts = [0_usize; 16];
+    for &logit in logits {
+        if logit.is_finite() {
+            let raw = ((f64::from(logit) - min_f64) * scale).floor() as isize;
+            let idx = raw.clamp(0, 15) as usize;
+            counts[idx] += 1;
+        }
+    }
+    let mut accumulated = 0_usize;
+    for bucket in (0_usize..16).rev() {
+        accumulated += counts[bucket];
+        if accumulated >= keep {
+            if bucket <= 1 {
+                return None;
+            }
+            let cutoff = min_f64 + ((bucket - 1) as f64) / scale;
+            return Some(cutoff as f32);
+        }
+    }
+    None
+}
+
+fn populate_streaming_top_k(
+    logits: &[f32],
+    keep: usize,
+    candidates: &mut Vec<Candidate>,
+) -> Result<()> {
+    candidates.clear();
+    if candidates.capacity() < keep {
+        candidates.try_reserve_exact(keep - candidates.len())?;
+    }
+    let initial = keep.min(logits.len());
+    for (index, &logit) in logits[..initial].iter().enumerate() {
+        if !logit.is_finite() {
+            candidates.clear();
+            return Err(invalid(
+                "reference sampling requires bounded nonempty finite logits",
+            ));
+        }
+        candidates.push(Candidate {
+            token: u32::try_from(index)?,
+            logit,
+            weight: 0.0,
+        });
+    }
+    if logits.len() <= keep {
+        return Ok(());
+    }
+    for parent in (0..keep / 2).rev() {
+        sift_down_worst(candidates, parent);
+    }
+    let tail = &logits[keep..];
+    let (blocks, remainder) = tail.as_chunks::<16>();
+    for (block_index, block) in blocks.iter().enumerate() {
+        if crate::kernels::block16_all_finite_le(block, candidates[0].logit) {
+            continue;
+        }
+        let base = keep + block_index * 16;
+        for (offset, &logit) in block.iter().enumerate() {
+            if !logit.is_finite() {
+                candidates.clear();
+                return Err(invalid(
+                    "reference sampling requires bounded nonempty finite logits",
+                ));
+            }
+            if logit > candidates[0].logit {
+                candidates[0] = Candidate {
+                    token: u32::try_from(base + offset)?,
+                    logit,
+                    weight: 0.0,
+                };
+                sift_down_worst(candidates, 0);
+            }
+        }
+    }
+    let base = keep + blocks.len() * 16;
+    for (offset, &logit) in remainder.iter().enumerate() {
+        if !logit.is_finite() {
+            candidates.clear();
+            return Err(invalid(
+                "reference sampling requires bounded nonempty finite logits",
+            ));
+        }
+        if logit > candidates[0].logit {
+            candidates[0] = Candidate {
+                token: u32::try_from(base + offset)?,
+                logit,
+                weight: 0.0,
+            };
+            sift_down_worst(candidates, 0);
+        }
+    }
+    Ok(())
+}
+
 impl Sampler for ReferenceSampler {
     fn sample(&mut self, logits: &[f32]) -> Result<u32> {
-        if logits.is_empty() || logits.len() > 1_048_576 || !crate::kernels::is_finite_slice(logits)
-        {
+        if logits.is_empty() || logits.len() > 1_048_576 {
             return Err(invalid(
                 "reference sampling requires bounded nonempty finite logits",
             ));
@@ -153,15 +308,6 @@ impl Sampler for ReferenceSampler {
         // Computing a prospective draw does not advance state on any failure.
         let (next_state, draw) = self.next_draw();
         let candidates = &mut self.candidates;
-        candidates.clear();
-        candidates.try_reserve_exact(logits.len())?;
-        for (index, &logit) in logits.iter().enumerate() {
-            candidates.push(Candidate {
-                token: u32::try_from(index)?,
-                logit,
-                weight: 0.0,
-            });
-        }
         let rank = |left: &Candidate, right: &Candidate| {
             // Validation excludes incomparable values; partial_cmp treats both
             // signs of zero as equal, so token ID also breaks that exact tie.
@@ -171,12 +317,57 @@ impl Sampler for ReferenceSampler {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.token.cmp(&right.token))
         };
-        if self.options.top_k != 0 && self.options.top_k < candidates.len() {
-            // Partition in linear time, then rank only the admitted prefix.
-            // The token tie-breaker makes its membership identical to a full
-            // sort, including at an equal-logit top-k boundary.
-            candidates.select_nth_unstable_by(self.options.top_k, rank);
-            candidates.truncate(self.options.top_k);
+        if self.options.top_k != 0 && self.options.top_k <= 128 {
+            populate_streaming_top_k(logits, self.options.top_k, candidates)?;
+        } else {
+            if !crate::kernels::is_finite_slice(logits) {
+                return Err(invalid(
+                    "reference sampling requires bounded nonempty finite logits",
+                ));
+            }
+            candidates.clear();
+            candidates.try_reserve_exact(logits.len())?;
+            let cutoff = if self.options.top_k != 0 && self.options.top_k * 4 < logits.len() {
+                bucketed_top_k_cutoff(logits, self.options.top_k)
+            } else {
+                None
+            };
+            if let Some(min_logit) = cutoff {
+                for (index, &logit) in logits.iter().enumerate() {
+                    if logit >= min_logit {
+                        candidates.push(Candidate {
+                            token: u32::try_from(index)?,
+                            logit,
+                            weight: 0.0,
+                        });
+                    }
+                }
+                if candidates.len() < self.options.top_k {
+                    candidates.clear();
+                    for (index, &logit) in logits.iter().enumerate() {
+                        candidates.push(Candidate {
+                            token: u32::try_from(index)?,
+                            logit,
+                            weight: 0.0,
+                        });
+                    }
+                }
+            } else {
+                for (index, &logit) in logits.iter().enumerate() {
+                    candidates.push(Candidate {
+                        token: u32::try_from(index)?,
+                        logit,
+                        weight: 0.0,
+                    });
+                }
+            }
+            if self.options.top_k != 0 && self.options.top_k < candidates.len() {
+                // Partition in linear time, then rank only the admitted prefix.
+                // The token tie-breaker makes its membership identical to a full
+                // sort, including at an equal-logit top-k boundary.
+                candidates.select_nth_unstable_by(self.options.top_k, rank);
+                candidates.truncate(self.options.top_k);
+            }
         }
         candidates.sort_unstable_by(rank);
         let maximum = f64::from(candidates[0].logit);
@@ -244,5 +435,74 @@ mod tests {
         assert_eq!(sampler.candidates.as_ptr(), allocation);
         assert_eq!(sampler.sample(&[0.0; 257])?, control.sample(&[0.0; 257])?);
         Ok(())
+    }
+
+    #[test]
+    fn streaming_and_bucketed_top_k_match_exhaustive_rank_across_ties_and_extremes()
+    -> crate::Result<()> {
+        let logits: Vec<f32> = (0..4096_u32)
+            .map(|i| {
+                if i % 17 == 0 {
+                    -0.0
+                } else if i % 13 == 0 {
+                    0.0
+                } else {
+                    let bits = i.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f32::from_bits(bits & 0xbf7f_ffff)
+                }
+            })
+            .collect();
+        for top_k in [1_usize, 7, 20, 128, 256] {
+            let mut sampler = ReferenceSampler::new(
+                Sampling {
+                    temperature: 0.8,
+                    top_k,
+                    top_p: 0.95,
+                },
+                12345,
+            )?;
+            let _ = sampler.sample(&logits)?;
+            let mut full: Vec<super::Candidate> = logits
+                .iter()
+                .enumerate()
+                .map(|(idx, &logit)| super::Candidate {
+                    token: u32::try_from(idx).unwrap_or(0),
+                    logit,
+                    weight: 0.0,
+                })
+                .collect();
+            full.sort_unstable_by(|left, right| {
+                right
+                    .logit
+                    .partial_cmp(&left.logit)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.token.cmp(&right.token))
+            });
+            full.truncate(top_k);
+            assert_eq!(sampler.candidates.len(), top_k);
+            for (actual, expected) in sampler.candidates.iter().zip(&full) {
+                assert_eq!(actual.token, expected.token);
+                assert_eq!(actual.logit.to_bits(), expected.logit.to_bits());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bucketed_top_k_cutoff_clamps_negative_buckets_and_handles_non_tail_infinities() {
+        let mut logits = vec![-10.0_f32; 1024];
+        logits[0] = f32::NEG_INFINITY;
+        logits[511] = f32::NEG_INFINITY;
+        for (idx, dst) in logits[100..132].iter_mut().enumerate() {
+            *dst = f32::from(u8::try_from(idx).unwrap_or(0));
+        }
+        let cutoff = super::bucketed_top_k_cutoff(&logits, 16);
+        assert!(cutoff.is_some());
+        let threshold = cutoff.unwrap_or(f32::INFINITY);
+        let surviving = logits
+            .iter()
+            .filter(|&&v| v.is_finite() && v >= threshold)
+            .count();
+        assert!(surviving >= 16);
     }
 }

@@ -5,6 +5,8 @@ on:
     paths-ignore:
       - '*.md'
       - 'docs/**'
+      - '.rumdl.toml'
+      - '.github/workflows/markdown.yml'
       - 'server/**'
       - 'tools/rust-trial/**'
       - 'tools/conformance-policy/**'

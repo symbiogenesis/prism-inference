@@ -157,11 +157,10 @@ cargo +nightly-2026-10-22-aarch64-pc-windows-msvc test --locked --offline --rele
     --test runtime edited_turns_restore_complete_recurrent_prefix_and_failed_stream_rolls_back -- --exact
 ```
 
-The [R0–R7 roadmap](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/native-rust-engine.md) still requires profiling,
-full-model logits/states/tokens, complete tokenizer/template and Prism sampler/RNG parity,
-adapter numerical/service qualification, broader process/OS ownership qualification, SIMD/Adreno support and device
-correctness/TPS/quality/security acceptance. Full suites and every benchmark
-remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
+The [R0–R7 roadmap](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/native-rust-engine.md) still requires profiling, full-model logits/states/tokens, complete
+tokenizer/template and Prism sampler/RNG parity, adapter numerical/service qualification, broader
+process/OS ownership qualification, SIMD/Adreno support and device correctness/TPS/quality/security
+acceptance. Full suites and every benchmark remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
 
 ### Owner-device budgets
 
@@ -208,6 +207,9 @@ diagnoses one named source without replacing the complete gate.
 
 The [standards workflow](../.github/workflows/standards.yml) owns PowerShell and
 embedded-C# analysis; Rust-only pushes do not start it. The
+[Markdown standards workflow](../.github/workflows/markdown.yml) runs `rumdl`
+against [`.rumdl.toml`](../.rumdl.toml) when Markdown files or linter settings
+change. The
 [compiler acceptance workflow](../.github/workflows/rust-nightly.yml) compares
 isolated stable/nightly language probes and preserves the fail-closed
 `compatibility` check. It runs when probe inputs change or on manual dispatch.
@@ -248,6 +250,7 @@ another 156,893,184 bytes (149.625 MiB) of transient recurrent/convolution paylo
 during restore. It is a storage-lifetime bound, not a measured decrease in process
 peak RAM or admission requirements. Focused ownership, staging-failure and frozen
 hybrid-state recovery regressions cover the change.
+
 ## Bounded actual-model correctness captures
 
 Build the `swift_model_check` example explicitly from the external working lane.
@@ -482,6 +485,7 @@ current Runner development budget: 11,230,294,016 available physical bytes versu
 unchanged. The earlier failed full-model comparison therefore remains the latest
 numerical verdict. No PTQ1 default, service selection or admission reduction is
 qualified by these operator fixtures.
+
 ### PTQ1 activation preparation repair
 
 A later one-token Rust recheck completed under a separate diagnostic envelope:
@@ -506,6 +510,7 @@ but exhausted its native session lifetime in concurrent ordinary partition 3.
 That partition now runs adapters serially; the other ordinary partitions retain
 their prior concurrency. Source coverage, inputs, assertions and deadlines stay
 unchanged. CI on the final combined revision is handed to the owner for monitoring.
+
 ## Release bundles and compatibility
 
 Manual Foundation dispatch and shared or packaging-input changes build five
@@ -530,22 +535,19 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-The prepared `0.1.19` GitHub/source release preserves all older full and prerelease
-artifacts. The [release scope](release-0.1.19.md) compares it with `0.1.18`
-and records its supported delivery, publication gates and qualification boundaries.
-Its Windows credential helper is pinned to Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in
-the lockfile. The server temporarily sets `publish = false`, because a crates.io
-package cannot preserve that Git-only dependency and substituting registry
-`0.1.0` would omit the required read APIs. Checked GitHub bundles and exact source
-checkouts are the supported delivery paths for this server candidate. A reviewed
-helper registry release and server publication remain separate pending work.
-The hosted [Source package workflow](../.github/workflows/source-package.yml)
-verifies normalized Cargo archives together before registry publication on
-Windows ARM64, Windows x64 and Linux ARM64. A separate application consumes the
-extracted runtime, GGUF and hash archives and runs model-free public API checks
-with scalar, default and parallel-row features. Its receipt retains archive
-digests, source identity, consumer lockfile and executed commands. This checks
-source delivery independently of building inside the original workspace.
+The prepared `0.1.19` GitHub/source release preserves all older full and prerelease artifacts. The
+[release scope](release-0.1.19.md) compares it with `0.1.18` and records its supported delivery, publication gates and
+qualification boundaries. Its Windows credential helper is pinned to Runner revision
+`abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in the lockfile. The server
+temporarily sets `publish = false`, because a crates.io package cannot preserve that Git-only
+dependency and substituting registry `0.1.0` would omit the required read APIs. Checked GitHub
+bundles and exact source checkouts are the supported delivery paths for this server candidate. A
+reviewed helper registry release and server publication remain separate pending work. The hosted
+[Source package workflow](../.github/workflows/source-package.yml) verifies normalized Cargo archives together before registry publication on
+Windows ARM64, Windows x64 and Linux ARM64. A separate application consumes the extracted runtime,
+GGUF and hash archives and runs model-free public API checks with scalar, default and parallel-row
+features. Its receipt retains archive digests, source identity, consumer lockfile and executed
+commands. This checks source delivery independently of building inside the original workspace.
 
 The new native hashing implementation needs `bonsai-native-hash` `0.1.0`
 published first, followed by `bonsai-gguf` `0.1.1` and the runtime. The runtime's

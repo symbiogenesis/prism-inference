@@ -72,15 +72,14 @@ From a new external native working directory, use the absolute executable path:
 & $qualifier --use-repacked-ptq1 --rank-one-adapter $approvedAdapter 1.3 forward $currentPtq1 $ptq1NonzeroEvidence neon '248045'
 ```
 
-Every path variable must contain an expanded absolute path; evidence directories must
-already exist and be distinct. The adapter must be the exact approved file.
-`load` also accepts the prefix; `inspect`, relative adapter paths, unresolved
-environment tokens and invalid scales reject. The example remains a source
-correctness tool and is not added to release bundles or ordinary service launch.
-It reports the selected representation/base hash, adapter hash, target count and scale bits and retains existing
-create-new logits, complete logical KV/recurrent/convolution snapshots, raw
-greedy IDs and evidence-byte bounds. It produces no timing or benchmark verdict.
-No full-model adapter capture was performed as part of the implementation.
+Every path variable must contain an expanded absolute path; evidence directories must already exist
+and be distinct. The adapter must be the exact approved file. `load` also accepts the prefix;
+`inspect`, relative adapter paths, unresolved environment tokens and invalid scales reject. The
+example remains a source correctness tool and is not added to release bundles or ordinary service
+launch. It reports the selected representation/base hash, adapter hash, target count and scale bits
+and retains existing create-new logits, complete logical KV/recurrent/convolution snapshots, raw
+greedy IDs and evidence-byte bounds. It produces no timing or benchmark verdict. No full-model
+adapter capture was performed as part of the implementation.
 
 Before adapter qualification, compare the same approved artifacts against pinned
 native execution at loaded scale zero and intended nonzero scales. Establish

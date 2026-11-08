@@ -120,7 +120,7 @@ unchanged, and receipts identify the patch and resulting source. All architectur
 save/load assertions remain required; this reference is qualified with the
 recorded production correction.
 The original Llama-BPE roundtrip also exposes inherited punctuation cleanup:
-token 24268 decodes from ` !$` to `!$`, then retokenizes into two tokens. The
+token 24268 decodes from `!$` to `!$`, then retokenizes into two tokens. The
 explicit [Llama 3 decoding correction](https://github.com/symbiogenesis/prism-inference/blob/main/tools/prism/upstream/patches/llama3-cleanup.patch)
 preserves bytes for the canonical `llama3`, `llama-v3` and `llama-bpe` metadata
 names, following the publisher's tokenizer. Other pretokenizer aliases retain
@@ -318,17 +318,15 @@ Seventy Windows-applicable source contracts currently have safe Rust adapters in
   acceptance tracing and source highlight behavior. Its zero fixed source
   assertions are explicit; 119 independent source grammar vectors add regression
   coverage. A CI-only diagnostic accepts grammar and input paths.
-- Both tokenizer roundtrip sources traverse every token and the entire original
-  Unicode domain in two SPM and seven explicitly selected BPE fixtures. The
-  [versioned acceptance inputs](https://github.com/symbiogenesis/prism-inference/blob/main/tools/prism/upstream/BPE-ACCEPTANCE.md)
-  preserve both optional-flag branches, including the corrected original
-  Llama-BPE input with `--ignore-merges`; other named variants remain
-  available as diagnostics with their actual verdicts. Per fixture this retains 456,703 Unicode calls and
-  456,702 equality predicates, source exceptions, worker strides and shared stop.
-  The BPE rewrite restores the source's intended invalid-UTF-8 skip with safe
-  Rust validation: the pinned native decoder consumes errors that the original
-  test expected to catch. Skip counts and this correction are reported explicitly;
-  every valid token piece and original Unicode predicate remain required.
+- Both tokenizer roundtrip sources traverse every token and the entire original Unicode domain in
+  two SPM and seven explicitly selected BPE fixtures. The [versioned acceptance inputs](https://github.com/symbiogenesis/prism-inference/blob/main/tools/prism/upstream/BPE-ACCEPTANCE.md) preserve
+  both optional-flag branches, including the corrected original Llama-BPE input with
+  `--ignore-merges`; other named variants remain available as diagnostics with their actual
+  verdicts. Per fixture this retains 456,703 Unicode calls and 456,702 equality predicates, source
+  exceptions, worker strides and shared stop. The BPE rewrite restores the source's intended
+  invalid-UTF-8 skip with safe Rust validation: the pinned native decoder consumes errors that the
+  original test expected to catch. Skip counts and this correction are reported explicitly; every
+  valid token piece and original Unicode predicate remain required.
 - `test-c.c`: the empty C main is retired. A C17 adapter includes the actual
   public header and exposes raw ABI layouts to seven additional Rust guards.
   The original contract is compile-only with zero behavioral assertions.
@@ -598,5 +596,6 @@ absolute paths outside Git:
     -Case Pq2RowShapes -Generator 'Visual Studio 18 2026' -NativePlatform x64
 ```
 
-The x64 C++ control can run under Windows ARM64 emulation; this is correctness
-evidence and makes no target-device performance claim. Hosted acceptance uses native Windows ARM64. For Linux or a configured compiler environment, use `Ninja`.
+The x64 C++ control can run under Windows ARM64 emulation; this is correctness evidence and makes no
+target-device performance claim. Hosted acceptance uses native Windows ARM64. For Linux or a
+configured compiler environment, use `Ninja`.

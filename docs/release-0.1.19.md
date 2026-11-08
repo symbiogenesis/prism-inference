@@ -27,7 +27,7 @@ CPU inference efficiency, kernel and tiled-prefill additions include:
 - Parallel chunkwise GDN prefill causal short-convolution, shared 16-key-head
   `(K·Q, K·K)` triangular dot-matrix precomputation with zero per-layer heap
   allocations, single-dispatch head-major multi-token GDN causal short-convolution
-  + `SiLU` + Q/K `l2_norm` (`conv_head_major`), L1-resident row-major exact GDN
+  - `SiLU` + Q/K `l2_norm` (`conv_head_major`), L1-resident row-major exact GDN
   recurrent tiled prefill (`exact_head_into` using `gdn_decay_and_dot`), and
   paired NEON GDN dot kernels (`pinned_gdn::dot_pair`).
 

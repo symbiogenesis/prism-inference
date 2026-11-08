@@ -1,8 +1,15 @@
 # Prism inference private server
 
-The independently built prism-inference-server executable supplies the same strict private HTTP contract used by SwiftBonsai's guarded development launcher. The owner verifies executable and model bytes before launch and retains process/Job ownership, the fixed memory limit, authenticated readiness and listener-PID checks.
+The independently built prism-inference-server executable supplies the same strict private HTTP
+contract used by SwiftBonsai's guarded development launcher. The owner verifies executable and model
+bytes before launch and retains process/Job ownership, the fixed memory limit, authenticated
+readiness and listener-PID checks.
 
-The server loads the selected exact Swift artifact before binding numeric IPv4 loopback. PQ2 without an adapter remains the default. Explicit `--use-repacked-ptq1` selects only the verified current-weight export; `--abliterate-lora <absolute-path>` loads only the approved rank-one adapter. These options preserve the existing process admission and do not qualify full-model parity, creative quality, device performance or lower memory limits.
+The server loads the selected exact Swift artifact before binding numeric IPv4 loopback. PQ2 without
+an adapter remains the default. Explicit `--use-repacked-ptq1` selects only the verified
+current-weight export; `--abliterate-lora <absolute-path>` loads only the approved rank-one adapter.
+These options preserve the existing process admission and do not qualify full-model parity, creative
+quality, device performance or lower memory limits.
 
 Read-only model, adapter and key validation uses the credential helper pinned to
 Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`. Inside an actual Windows

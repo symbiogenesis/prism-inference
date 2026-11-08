@@ -22,7 +22,7 @@ would introduce a nightly dependency without simplifying its current logic.
 ## Production pattern audit
 
 The audit found one useful Polonius refactor in the broker's
-[`BackendBody`](../../src/broker/src/backend.rs). Its shared `poll_available`
+[`BackendBody`](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/src/broker/src/backend.rs). Its shared `poll_available`
 helper lends buffered bytes on success and closes the reader on I/O failure,
 EOF or deadline expiry. Polonius tracks the successful borrow separately from
 the failure branches that mutate the owner. This centralizes checks previously
@@ -86,4 +86,4 @@ source hashes and verdicts. Native Prism linking remains in Foundation.
 
 `-Mode Compatibility -PackageGroup Runtime` or `Broker` selects formatting,
 Release Clippy/documentation locally; the default checks all packages. Full
-correctness still requires hosted `-FullTests`. See [validation](../../docs/validation.md).
+correctness still requires hosted `-FullTests`. See [validation](../../docs/build-and-validation.md).

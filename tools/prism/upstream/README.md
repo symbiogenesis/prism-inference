@@ -49,14 +49,13 @@ The current ports preserve all seventy Windows-applicable source contracts from
 - The binary32 arithmetic proof runs only in CI and is explicitly independent
   of engine APIs. The manual grammar validator preserves its zero fixed source
   assertions; independent grammar vectors provide additional regression checks.
-- Both tokenizer roundtrip sources retain every vocabulary token and the entire
-  source Unicode domain across two SPM and seven selected BPE fixtures. The
-  [versioned input selection](BPE-ACCEPTANCE.md) preserves both flag branches;
-  original incompatible variants remain explicit diagnostics. Rust owns exclusions, exceptions, worker strides,
-  stop policy and comparisons; native batches contain supplied inputs only.
-  Safe Rust restores BPE's intended malformed-UTF-8 skip because the pinned
-  decoder consumes its own exceptions. Reports count the corrected skips;
-  valid token pieces and all Unicode comparisons remain required.
+- Both tokenizer roundtrip sources retain every vocabulary token and the entire source Unicode
+  domain across two SPM and seven selected BPE fixtures. The [versioned input selection](BPE-ACCEPTANCE.md) preserves
+  both flag branches; original incompatible variants remain explicit diagnostics. Rust owns
+  exclusions, exceptions, worker strides, stop policy and comparisons; native batches contain
+  supplied inputs only. Safe Rust restores BPE's intended malformed-UTF-8 skip because the pinned
+  decoder consumes its own exceptions. Reports count the corrected skips; valid token pieces and all
+  Unicode comparisons remain required.
 - `tests/test-c.c`: compile-only C17 public-header coverage via raw native ABI
   observations and additional Rust layout guards; no C test main remains.
 - `tests/test-chat-analysis.cpp`: all37 diagnostic templates and render/stat
@@ -76,7 +75,6 @@ The current ports preserve all seventy Windows-applicable source contracts from
   a separate CI-only `--diagnostic` configuration.
 - `tests/test-chat-auto-parser.cpp`: all seventeen groups, including 524
   executed conditions, the source quote normalizer and 42 role templates.
-
 - `tests/test-pq2-row-shapes.cpp`: all 15 shapes, `K` in
   `{128,256,384,512,640}`, `M=4`, `N` in `{1,4,16}`, and the original
   `rel_rms(computed, dequantized-reference) < 0.05` assertion. The frozen
@@ -146,12 +144,11 @@ The current ports preserve all seventy Windows-applicable source contracts from
 Unicode, MTP, Jinja, MTMD and grammar use a [common bridge](common/PROTOCOL.md).
 The Rust runtime has no equivalent production APIs; their Rust results fail.
 
-The Rust GGML bridge and separate common native bridge contain only serialization, input validation and production
-Prism calls. It does not include upstream test sources or contain generators,
-references, expected values, assertions or tolerances. The C++ fixture exporters
-and original source files are no longer compiled as tests. The original importer
-and replay build were removed after all33 Rust-owned contracts, including GGUF,
-passed [native Windows ARM64 CI](https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40120815419).
+The Rust GGML bridge and separate common native bridge contain only serialization, input validation
+and production Prism calls. It does not include upstream test sources or contain generators,
+references, expected values, assertions or tolerances. The C++ fixture exporters and original source
+files are no longer compiled as tests. The original importer and replay build were removed after
+all33 Rust-owned contracts, including GGUF, passed [native Windows ARM64 CI](https://github.com/symbiogenesis/SwiftBonsai2/actions/runs/40120815419).
 
 The immutable source archive is unchanged. The pinned saver omits
 DSpark metadata and global tensors. The reference applies explicit,

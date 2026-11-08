@@ -1,0 +1,92 @@
+#:schema https://raw.githubusercontent.com/rvben/rumdl/main/rumdl.schema.json
+
+[global]
+flavor = "standard"
+line-length = 100
+respect-gitignore = true
+cache = false
+exclude = [
+    ".git",
+    ".rumdl_cache",
+    "target",
+]
+extend-enable = [
+    "MD060",
+    "MD070",
+    "MD072",
+    "MD073",
+    "MD080",
+    "MD082",
+    "MD083",
+    "MD084",
+    "MD085",
+    "MD087",
+    "MD088",
+    "MD089",
+    "MD090",
+    "MD091",
+    "MD095",
+]
+
+[per-file-ignores]
+"AGENTS.md" = ["MD025"]
+"README.md" = ["MD033", "MD041"]
+"tests/fixtures/*.md" = ["MD041"]
+"tests/upstream_prism/INPUTS.md" = ["MD041"]
+
+[MD003]
+style = "atx"
+
+[MD004]
+style = "dash"
+
+[MD007]
+indent = 2
+style = "fixed"
+
+[MD009]
+strict = true
+
+[MD013]
+line-length = 100
+code-blocks = false
+code-spans = true
+tables = false
+headings = false
+ignore-link-urls = true
+
+[MD029]
+style = "ordered"
+
+[MD035]
+style = "---"
+
+[MD040]
+style = "consistent"
+unknown-language-action = "error"
+custom-languages = ["rust,no_run", "rust,ignore"]
+
+[MD046]
+style = "fenced"
+
+[MD048]
+style = "backtick"
+
+[MD049]
+style = "asterisk"
+
+[MD050]
+style = "asterisk"
+
+[MD051]
+anchor-style = "github"
+
+[MD055]
+style = "leading-and-trailing"
+
+[MD060]
+enabled = true
+style = "compact"
+
+[MD082]
+allow-parent-headings = true

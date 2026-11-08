@@ -48,12 +48,12 @@ or expanded model copy is required. The fourfold row duplication reduces the
 original-row tile capacity to the native limit divided by four. This exact
 composition is an experimental compatibility path, not an efficiency claim.
 
-The graph applies the existing Hadamard/sign/grouped transformations before
-projection and the existing approved rank-one adapter corrections afterward.
-Embedding, attention, GDN, convolution, sampling and complete committed state
-remain in their original Rust graph. PTQ1 and odd-block PQ2/Q8_0 use the configured
-CPU implementation unless the executor explicitly opts in. Any submitted error clears provisional output and permanently
-closes the executor and scoped decoder; no failed work is replayed on CPU.
+The graph applies the existing Hadamard/sign/grouped transformations before projection and the
+existing approved rank-one adapter corrections afterward. Embedding, attention, GDN, convolution,
+sampling and complete committed state remain in their original Rust graph. PTQ1 and odd-block
+PQ2/Q8_0 use the configured CPU implementation unless the executor explicitly opts in. Any submitted
+error clears provisional output and permanently closes the executor and scoped decoder; no failed
+work is replayed on CPU.
 
 Use `Qwen35::with_projection_executor` inside
 `Driver::reference_q2_projection` or `Driver::reference_hmx_q2_projection`'s work

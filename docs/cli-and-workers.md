@@ -146,12 +146,12 @@ construction nor these synthetic checks establish full-model parity.
 
 ## Persistent token worker
 
-The default `cli` feature also builds `bonsai-token-worker`; `--help` lists its
-startup contract. Every setting is required: absolute `--model`, verified
-`--bytes`/`--sha256`, `--memory-bytes`, `--context`, `--reserved-output-tokens`,
-`--special-input literal|parse`, `--insert-special none|model` and
-`--max-frame-bytes` (1 through 1,048,576). Run it from an explicit external
-system-temp working directory, using the [checkout build commands](build-and-validation.md#build-a-checkout). `cargo run` still selects the original token driver by default.
+The default `cli` feature also builds `bonsai-token-worker`; `--help` lists its startup contract.
+Every setting is required: absolute `--model`, verified `--bytes`/`--sha256`, `--memory-bytes`,
+`--context`, `--reserved-output-tokens`, `--special-input literal|parse`,
+`--insert-special none|model` and `--max-frame-bytes` (1 through 1,048,576). Run it from an explicit
+external system-temp working directory, using the [checkout build commands](build-and-validation.md#build-a-checkout). `cargo run` still
+selects the original token driver by default.
 
 Read the flushed `type: "ready"` record before sending input. It identifies
 protocol `bonsai-token-worker-v1`, the verified model SHA-256, vocabulary and all

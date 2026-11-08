@@ -60,18 +60,16 @@ the comparisons and the native explicit cleanup cycle have succeeded. Progress
 lines carry no completed model output. Runner must also establish exit and an
 empty owned Job before accepting or publishing the result.
 
-The result binds request/model identities, selected placement, operation counts,
-integer comparison count, per-token `tokenComparisons` and per-arm endpoint power
-snapshots. `tokenId` retains the first requested token and the top-level
-logits/state digests describe the final token. Each `tokenComparisons` entry
-binds its zero-based `index`, `tokenId`, both bitwise equality flags and both
-digests. `nativeCleanup` retains individual cleanup return codes and
-`nativeResources` retains mapped allocation and available domain metadata.
-The HMX control marker describes the requested signed path; effective HMX
-placement and granted VTCM remain unknown. Unknown power remains explicit; equal endpoints establish no
-uninterrupted stability. This is a correctness capture with
-`profileEligible:false` and `performanceMeasured:false`, including when it
-passes. No default backend or service admission changes.
+The result binds request/model identities, selected placement, operation counts, integer comparison
+count, per-token `tokenComparisons` and per-arm endpoint power snapshots. `tokenId` retains the
+first requested token and the top-level logits/state digests describe the final token. Each
+`tokenComparisons` entry binds its zero-based `index`, `tokenId`, both bitwise equality flags and
+both digests. `nativeCleanup` retains individual cleanup return codes and `nativeResources` retains
+mapped allocation and available domain metadata. The HMX control marker describes the requested
+signed path; effective HMX placement and granted VTCM remain unknown. Unknown power remains
+explicit; equal endpoints establish no uninterrupted stability. This is a correctness capture with
+`profileEligible:false` and `performanceMeasured:false`, including when it passes. No default
+backend or service admission changes.
 
 `--inspect` reports the system driver path without loading it. `--self-test`
 checks model-free cap boundaries without loading a model or device. Full-model

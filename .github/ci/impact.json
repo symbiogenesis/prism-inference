@@ -7,7 +7,7 @@
     "scripts/Bonsai.Rust.psm1", "scripts/Bonsai.Common.psm1", "scripts/Bonsai.Native.psm1",
     "tests/Test-Rust.ps1", "tests/Bonsai.TestSupport.psm1", "config/rust-packages.psd1"
   ],
-  "ignored": ["*.md", "docs/**", ".gitignore"],
+  "ignored": ["*.md", "docs/**", ".gitignore", ".rumdl.toml", ".github/workflows/markdown.yml"],
   "package_paths": {
     "prism-inference": ["src/**", "tests/**/*.rs", "tests/fixtures/**", "tests/upstream_prism/**", "examples/**"],
     "bonsai-prism": [

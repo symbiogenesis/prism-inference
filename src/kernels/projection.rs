@@ -254,9 +254,125 @@ pub trait Pq2ProjectionExecutor {
         }
         Ok(())
     }
+
+    /// Opt in to a full intra-layer FFN chain (`[ffn_gate, ffn_up, ffn_down]` +
+    /// `SwiGLU` + optional `Hadamard` + optional residual `ADD`) in a single
+    /// executor submission with intermediate residency chaining.
+    fn supports_f32_ffn_chain(&self, _tensors: [&Tensor; 3]) -> bool {
+        false
+    }
+
+    /// Execute a full intra-layer FFN chain (`[ffn_gate, ffn_up, ffn_down]` +
+    /// `SwiGLU(gate(x), up(x))` + optional `Hadamard` + optional `residual` add)
+    /// in a single executor submission.
+    ///
+    /// # Errors
+    /// Rejects unsupported chains, submission failures and invalid output.
+    fn project_f32_ffn_chain(
+        &mut self,
+        _tensors: [&Tensor; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(invalid(
+            "projection executor does not support fused F32 FFN chain",
+        ))
+    }
+
+    /// Execute a full intra-layer FFN chain across a tile of `F32` token activations.
+    ///
+    /// # Errors
+    /// Rejects mismatched slice lengths, unsupported chains or submission failures.
+    fn project_f32_ffn_chain_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+        hadamard_block_size: Option<u32>,
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if activations.len() != outputs.len()
+            || residuals.is_some_and(|res| res.len() != activations.len())
+        {
+            return Err(invalid("mismatched F32 FFN chain token projection outputs"));
+        }
+        for (tok, (activation, output)) in activations.iter().zip(outputs.iter_mut()).enumerate() {
+            let residual = residuals.map(|res| res[tok].as_slice());
+            self.project_f32_ffn_chain(
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                pinned,
+                output,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl PreparedMatvec<'_> {
+    /// Execute a full intra-layer FFN chain (`[gate, up, down]` + `SwiGLU` +
+    /// optional `Hadamard` + optional `residual` add) in a single executor call
+    /// when supported by `executor`.
+    ///
+    /// # Errors
+    /// Rejects incompatible preparation, executor failures or incomplete output.
+    pub fn matvec_ffn_chain_with_executor(
+        &mut self,
+        tensors: [&Tensor; 3],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut Vec<f32>,
+        executor: &mut dyn Pq2ProjectionExecutor,
+    ) -> Result<()> {
+        let result = (|| {
+            let [gate, up, down] = tensors;
+            let (gate_cols, gate_rows, _) = dimensions(gate)?;
+            let (up_cols, up_rows, _) = dimensions(up)?;
+            let (down_cols, down_rows, _) = dimensions(down)?;
+            if !self.is_compatible(gate)?
+                || !self.is_compatible(up)?
+                || gate.kind != PQ2
+                || up.kind != PQ2
+                || down.kind != PQ2
+                || gate_cols != up_cols
+                || gate_rows != up_rows
+                || down_cols != gate_rows
+                || down_rows != gate_cols
+                || !gate_cols.is_multiple_of(128)
+                || !down_cols.is_multiple_of(128)
+                || residual.is_some_and(|res| res.len() != down_rows || !is_finite_slice(res))
+            {
+                return Err(invalid(
+                    "incompatible prepared projection executor activation",
+                ));
+            }
+            executor.project_f32_ffn_chain(
+                tensors,
+                self.input,
+                residual,
+                hadamard_block_size,
+                self.scratch.pinned_accumulation,
+                output,
+            )?;
+            if output.len() != down_rows {
+                return Err(invalid("projection executor returned incomplete output"));
+            }
+            if !is_finite_slice(output) {
+                return Err(invalid("non-finite value in runtime path"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            output.clear();
+        }
+        result
+    }
     /// Execute a fused `ffn_gate` + `ffn_up` + `SwiGLU` chain in a single
     /// executor call when supported by `executor`.
     ///

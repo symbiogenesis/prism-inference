@@ -67,11 +67,20 @@ impl Work {
             }
             if decoder.adapter.is_none()
                 && decoder.transforms.basis(&layer.gate) == decoder.transforms.basis(&layer.up)
-                && executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up)
             {
-                extra_hidden = extra_hidden
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("projection work count overflow"))?;
+                if let Some(hadamard_block) =
+                    decoder.transforms.ffn_chain_hadamard_block_for(&layer.down)
+                    && executor.supports_f32_ffn_chain([&layer.gate, &layer.up, &layer.down])
+                {
+                    let extra = 2_u64 + u64::from(hadamard_block.is_some());
+                    extra_hidden = extra_hidden
+                        .checked_add(extra)
+                        .ok_or_else(|| invalid("projection work count overflow"))?;
+                } else if executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up) {
+                    extra_hidden = extra_hidden
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("projection work count overflow"))?;
+                }
             }
         }
         work.hidden = work

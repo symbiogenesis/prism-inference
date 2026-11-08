@@ -1802,6 +1802,25 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             .is_some_and(|(_, rows, _)| rows[0] == rows[1])
     }
 
+    fn supports_f32_ffn_chain_inner(&self, tensors: [&Tensor; 3]) -> bool {
+        let [gate, up, down] = tensors;
+        let Some((hidden, gate_up_rows, _)) = self.validate_f32_group(&[gate, up]) else {
+            return false;
+        };
+        let ffn_dim = gate_up_rows[0];
+        if gate_up_rows[1] != ffn_dim || !self.supports_f32(down) {
+            return false;
+        }
+        let Ok((down_cols, down_rows)) = native_dimensions(down) else {
+            return false;
+        };
+        down_cols == ffn_dim
+            && down_rows == hidden
+            && down_cols <= self.maximum_columns
+            && down_rows <= self.maximum_rows
+            && down_rows.is_multiple_of(32)
+    }
+
     /// Execute a fused `ffn_gate` + `ffn_up` + `HTP_OP_GLU_SWIGLU` chain across
     /// a tile of `F32` token activations, batching pairs of tokens into 6-op
     /// DSP queue submissions with per-token VTCM intermediate residency.
@@ -2379,6 +2398,29 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
         outputs: &mut [Vec<f32>],
     ) -> Result<()> {
         Self::project_f32_ffn_swiglu_tokens(self, gate, up, activations, outputs)
+    }
+
+    fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
+        self.supports_f32_ffn_chain_inner(tensors)
+    }
+
+    fn project_f32_ffn_chain(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Self::project_f32_ffn_chain(
+            self,
+            tensors,
+            activation,
+            residual,
+            hadamard_block_size,
+            output,
+        )
     }
 }
 
@@ -3191,11 +3233,17 @@ mod tests {
         let ffn_down_128 = make_tensor("blk.0.ffn_down_128.weight", columns);
         let residual = vec![10.0_f32; columns];
         let mut chain_out = Vec::new();
-        ffn_executor.project_f32_ffn_chain(
+        assert!(Pq2ProjectionExecutor::supports_f32_ffn_chain(
+            &ffn_executor,
+            [&ffn_gate_128, &ffn_up_128, &ffn_down_128]
+        ));
+        Pq2ProjectionExecutor::project_f32_ffn_chain(
+            &mut ffn_executor,
             [&ffn_gate_128, &ffn_up_128, &ffn_down_128],
             &activation,
             Some(&residual),
             Some(64),
+            true,
             &mut chain_out,
         )?;
         assert_eq!(chain_out.len(), columns);

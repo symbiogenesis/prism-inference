@@ -421,6 +421,29 @@ impl Pq2ProjectionExecutor for F32GroupExecutor {
         }
         Ok(())
     }
+
+    fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
+        tensors.iter().all(|&t| self.supports_f32(t))
+    }
+
+    fn project_f32_ffn_chain(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        _: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.calls += 1;
+        let res_val = residual.and_then(|r| r.first().copied()).unwrap_or(0.0);
+        let had_val = f32::from(u16::try_from(hadamard_block_size.unwrap_or(0)).unwrap_or(0));
+        output.resize(tensors[2].dimensions[1], activation[0] + res_val + had_val);
+        if self.fail {
+            return Err(invalid("ffn chain placement failure"));
+        }
+        Ok(())
+    }
 }
 
 #[test]
@@ -494,6 +517,18 @@ fn placement_f32_groups_require_explicit_opt_in_and_full_member_selection() -> R
     assert_eq!(tri_a, [vec![2.0], vec![5.0]]);
     assert_eq!(tri_b, [vec![3.0], vec![6.0]]);
     assert_eq!(tri_c, [vec![4.0], vec![7.0]]);
-    assert_eq!(inner.calls, 1);
+
+    assert!(placed_triple.supports_f32_ffn_chain([gate, up, ssm]));
+    let mut chain_out = Vec::new();
+    placed_triple.project_f32_ffn_chain(
+        [gate, up, ssm],
+        &vec![2.0_f32; 256],
+        Some(&[10.0_f32]),
+        Some(64),
+        true,
+        &mut chain_out,
+    )?;
+    assert_eq!(chain_out, [76.0]);
+    assert_eq!(inner.calls, 2);
     Ok(())
 }

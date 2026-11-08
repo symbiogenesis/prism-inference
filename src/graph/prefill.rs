@@ -592,48 +592,72 @@ impl Qwen35 {
                 }
             }
             check()?;
-            project_tile_ffn_swiglu(
+            if try_project_tile_ffn_chain(
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
                 self.adapter.as_ref(),
-                self.adapter_scale,
-                &mut self.workspace.adapter,
-                &mut self.workspace.projection.matvec,
-                &layer.gate,
-                &layer.up,
+                [&layer.gate, &layer.up, &layer.down],
                 &tile.normalized[..count],
-                &mut tile.gate[..count],
-                &mut tile.up[..count],
+                Some(&tile.hidden[..count]),
+                &mut tile.attention[..count],
                 &mut tile.transformed[..count],
-                &mut tile.projector,
+                &tile.projector,
                 reborrow_executor(&mut executor),
                 check,
-            )?;
-            check()?;
-            let _ = project_tile(
-                &self.transforms,
-                &self.geometry,
-                self.arithmetic,
-                self.adapter.as_ref(),
-                self.adapter_scale,
-                &mut self.workspace.adapter,
-                &mut self.workspace.projection.matvec,
-                TileReuse::default(),
-                &layer.down,
-                &tile.up[..count],
-                &mut tile.normalized[..count],
-                &mut tile.transformed[..count],
-                &mut tile.projector,
-                reborrow_executor(&mut executor),
-                check,
-            )?;
-            for (hidden, output) in tile.hidden[..count]
-                .iter_mut()
-                .zip(&tile.normalized[..count])
-            {
-                add(hidden, output);
-                finite(hidden, "CPU tiled decoder layer output")?;
+            )? {
+                for (hidden, output) in tile.hidden[..count]
+                    .iter_mut()
+                    .zip(&mut tile.attention[..count])
+                {
+                    std::mem::swap(hidden, output);
+                    finite(hidden, "CPU tiled decoder layer output")?;
+                }
+            } else {
+                let ffn_reuse = project_tile_ffn_swiglu(
+                    &self.transforms,
+                    &self.geometry,
+                    self.arithmetic,
+                    self.adapter.as_ref(),
+                    self.adapter_scale,
+                    &mut self.workspace.adapter,
+                    &mut self.workspace.projection.matvec,
+                    &layer.gate,
+                    &layer.up,
+                    &layer.down,
+                    &tile.normalized[..count],
+                    &mut tile.gate[..count],
+                    &mut tile.up[..count],
+                    &mut tile.transformed[..count],
+                    &mut tile.projector,
+                    reborrow_executor(&mut executor),
+                    check,
+                )?;
+                check()?;
+                let _ = project_tile(
+                    &self.transforms,
+                    &self.geometry,
+                    self.arithmetic,
+                    self.adapter.as_ref(),
+                    self.adapter_scale,
+                    &mut self.workspace.adapter,
+                    &mut self.workspace.projection.matvec,
+                    ffn_reuse,
+                    &layer.down,
+                    &tile.up[..count],
+                    &mut tile.normalized[..count],
+                    &mut tile.transformed[..count],
+                    &mut tile.projector,
+                    reborrow_executor(&mut executor),
+                    check,
+                )?;
+                for (hidden, output) in tile.hidden[..count]
+                    .iter_mut()
+                    .zip(&tile.normalized[..count])
+                {
+                    add(hidden, output);
+                    finite(hidden, "CPU tiled decoder layer output")?;
+                }
             }
             check()?;
         }
@@ -905,13 +929,43 @@ fn full_attention_tile(
                 let kv_head = head / heads_per_kv;
                 let offset = kv_head * g.head;
                 if head + 4 <= g.heads && kv_head == (head + 3) / heads_per_kv {
-                    for (pos, past) in key_cache
-                        .tokens()
-                        .take(base + base_tok + chunk_tokens.saturating_sub(1))
-                        .enumerate()
-                    {
-                        let past_key = &past[offset..offset + g.head];
-                        let first_t = (pos + 1).saturating_sub(base + base_tok);
+                    let shared_prefix_len = base + base_tok;
+                    let total_past = shared_prefix_len + chunk_tokens.saturating_sub(1);
+                    let mut past_iter = key_cache.tokens().take(total_past).enumerate();
+                    while let Some((pos0, p0)) = past_iter.next() {
+                        if pos0 + 4 <= shared_prefix_len
+                            && let Some((_, p1)) = past_iter.next()
+                            && let Some((_, p2)) = past_iter.next()
+                            && let Some((_, p3)) = past_iter.next()
+                        {
+                            let keys4 = [
+                                &p0[offset..offset + g.head],
+                                &p1[offset..offset + g.head],
+                                &p2[offset..offset + g.head],
+                                &p3[offset..offset + g.head],
+                            ];
+                            for t in 0..chunk_tokens {
+                                let tok = base_tok + t;
+                                let queries = std::array::from_fn(|i| {
+                                    let h = head + i;
+                                    &query_ref[tok][h * g.head..(h + 1) * g.head]
+                                });
+                                let dots4 = arithmetic
+                                    .attention_dot_four_keys_four_queries(queries, keys4)?;
+                                let tok_scores = &mut scores_chunk
+                                    [t * token_score_stride..(t + 1) * token_score_stride];
+                                for (k_off, dots) in dots4.into_iter().enumerate() {
+                                    let pos = pos0 + k_off;
+                                    tok_scores[pos] = dots[0] * scale;
+                                    tok_scores[max_score_len + pos] = dots[1] * scale;
+                                    tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                                    tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                                }
+                            }
+                            continue;
+                        }
+                        let past_key = &p0[offset..offset + g.head];
+                        let first_t = (pos0 + 1).saturating_sub(shared_prefix_len);
                         for t in first_t..chunk_tokens {
                             let tok = base_tok + t;
                             let queries = std::array::from_fn(|i| {
@@ -921,10 +975,10 @@ fn full_attention_tile(
                             let dots = arithmetic.attention_dot_four(queries, past_key)?;
                             let tok_scores = &mut scores_chunk
                                 [t * token_score_stride..(t + 1) * token_score_stride];
-                            tok_scores[pos] = dots[0] * scale;
-                            tok_scores[max_score_len + pos] = dots[1] * scale;
-                            tok_scores[2 * max_score_len + pos] = dots[2] * scale;
-                            tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                            tok_scores[pos0] = dots[0] * scale;
+                            tok_scores[max_score_len + pos0] = dots[1] * scale;
+                            tok_scores[2 * max_score_len + pos0] = dots[2] * scale;
+                            tok_scores[3 * max_score_len + pos0] = dots[3] * scale;
                         }
                     }
                     for (t, attended_tok) in attended_chunk.iter_mut().enumerate() {
@@ -1209,9 +1263,77 @@ fn project_tile_pair<'a>(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "Keep exact transforms, residual chaining and bounded tile storage explicit."
+)]
+fn try_project_tile_ffn_chain(
+    transforms: &Transforms,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    adapter: Option<&RankOneAdapter>,
+    tensors: [&Tensor; 3],
+    inputs: &[Vec<f32>],
+    residuals: Option<&[Vec<f32>]>,
+    outputs: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    projector: &ProjectionTile,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<bool> {
+    let [gate, up, down] = tensors;
+    let Some(hadamard_block) = transforms.ffn_chain_hadamard_block_for(down) else {
+        return Ok(false);
+    };
+    if adapter.is_some()
+        || gate.kind != 142
+        || up.kind != 142
+        || down.kind != 142
+        || transforms.basis(gate) != transforms.basis(up)
+    {
+        return Ok(false);
+    }
+    let Some(exec) = reborrow_executor(&mut executor) else {
+        return Ok(false);
+    };
+    if !exec.supports_f32_ffn_chain(tensors) {
+        return Ok(false);
+    }
+    let activation = transform_tile_inputs(
+        transforms,
+        geometry,
+        gate,
+        false,
+        inputs,
+        transformed,
+        projector.row_parallelism(),
+    )?;
+    check()?;
+    exec.project_f32_ffn_chain_tokens(
+        tensors,
+        activation,
+        residuals,
+        hadamard_block,
+        matches!(arithmetic, Arithmetic::PinnedSwift),
+        outputs,
+    )?;
+    let rows = down
+        .dimensions
+        .get(1..)
+        .map_or(0, |dims| dims.iter().product::<usize>());
+    for out in outputs.iter() {
+        if out.len() != rows {
+            return Err(invalid("projection executor returned incomplete output"));
+        }
+        finite(out, "projection executor output")?;
+    }
+    Ok(true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
 )]
-fn project_tile_ffn_swiglu(
+fn project_tile_ffn_swiglu<'a>(
     transforms: &Transforms,
     geometry: &Geometry,
     arithmetic: Arithmetic,
@@ -1221,6 +1343,7 @@ fn project_tile_ffn_swiglu(
     projection_scratch: &mut crate::kernels::MatvecScratch,
     gate: &Tensor,
     up: &Tensor,
+    down: &'a Tensor,
     inputs: &[Vec<f32>],
     gate_outputs: &mut [Vec<f32>],
     up_outputs: &mut [Vec<f32>],
@@ -1228,7 +1351,7 @@ fn project_tile_ffn_swiglu(
     projector: &mut ProjectionTile,
     mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     check: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+) -> Result<TileReuse<'a>> {
     if adapter.is_none()
         && let Some(exec) = reborrow_executor(&mut executor)
         && gate.kind == 142
@@ -1263,7 +1386,7 @@ fn project_tile_ffn_swiglu(
             }
             finite(out, "projection executor output")?;
         }
-        return Ok(());
+        return Ok(TileReuse::default());
     }
     let _ = project_tile_pair(
         transforms,
@@ -1283,16 +1406,80 @@ fn project_tile_ffn_swiglu(
         check,
     )?;
     let count = inputs.len();
+    let up_len = up_outputs.first().map_or(0, Vec::len);
+    if adapter.is_none()
+        && up_len > 0
+        && transforms.basis(down) == (true, false)
+        && transforms.can_block_hadamard(up_len)
+        && down.dimensions.first().copied() == Some(up_len)
+    {
+        let signs = transforms.signs.get(&up_len).map(Vec::as_slice);
+        let block = transforms.block;
+        let fused_ok = if count > 1 && projector.row_parallelism().workers() > 1 {
+            let gate_ref = &gate_outputs[..count];
+            let up_ref = &up_outputs[..count];
+            let single_worker = RowParallelism::default();
+            projector
+                .row_parallelism()
+                .update_chunks(&mut transformed[..count], 1, |base_tok, chunk| {
+                    for (offset, target) in chunk.iter_mut().enumerate() {
+                        let tok = base_tok + offset;
+                        arithmetic.swiglu_hadamard_read_into_with_parallelism(
+                            &gate_ref[tok],
+                            &up_ref[tok],
+                            block,
+                            signs,
+                            &single_worker,
+                            target,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .is_ok()
+        } else {
+            let parallelism = projector.row_parallelism();
+            let mut ok = true;
+            for ((up_out, gate_out), target) in up_outputs[..count]
+                .iter()
+                .zip(&gate_outputs[..count])
+                .zip(&mut transformed[..count])
+            {
+                if arithmetic
+                    .swiglu_hadamard_read_into_with_parallelism(
+                        gate_out,
+                        up_out,
+                        block,
+                        signs,
+                        parallelism,
+                        target,
+                    )
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        };
+        if fused_ok {
+            return Ok(TileReuse {
+                basis: Some(down),
+                prepared: None,
+            });
+        }
+    }
     if count > 1 && projector.row_parallelism().workers() > 1 {
         let gate_ref = &gate_outputs[..count];
-        projector
-            .row_parallelism()
-            .update_chunks(&mut up_outputs[..count], 1, |base_tok, chunk| {
+        projector.row_parallelism().update_chunks(
+            &mut up_outputs[..count],
+            1,
+            |base_tok, chunk| {
                 for (offset, up_out) in chunk.iter_mut().enumerate() {
                     arithmetic.swiglu_in_place(&gate_ref[base_tok + offset], up_out)?;
                 }
                 Ok(())
-            })
+            },
+        )?;
     } else {
         for (up_out, gate_out) in up_outputs[..count].iter_mut().zip(&gate_outputs[..count]) {
             arithmetic.swiglu_in_place_with_parallelism(
@@ -1301,8 +1488,8 @@ fn project_tile_ffn_swiglu(
                 projector.row_parallelism(),
             )?;
         }
-        Ok(())
     }
+    Ok(TileReuse::default())
 }
 
 #[allow(

@@ -78,7 +78,7 @@ establish full-model parity, throughput or complete device qualification.
 | Tokenization and chat | Broaden inputs/templates beyond the pinned Swift prompt-byte and tokenizer-ID captures |
 | Sampling | Broaden qualification beyond the pinned Swift MT19937 sampler/RNG captures |
 | Adapters | Qualify the explicit [rank-one execution and private-service path](rank-one-adapter.md) against native residual writers, scale-zero/nonzero logits/state, intended grouped SSM basis, scale changes and actual-target lifecycle; JSONL workers remain adapter-free |
-| CPU execution | Profile allocation, prefill, checkpoint and packed-kernel behavior; qualify further SIMD paths |
+| CPU execution | Profile allocation, prefill, checkpoint and packed-kernel behavior; qualify the `I8MM`/`SDOT` `4×4`/`8×8` `PQ2_0` prefill tiles, `4×4` `F16` attention scoring, parallel `RMSNorm + Sign*FWHT`, fused prefill `SwiGLU + Sign*FWHT`, and end-to-end intra-layer FFN VTCM chain (`project_f32_ffn_chain`) |
 | Other accelerators | Investigate Adreno and additional backends after their execution and ownership contracts are established |
 | Application ownership | Complete broader process/OS, daily-service and device lifecycle qualification |
 | Device acceptance | Retain correctness, tokens/second, memory, quality and security evidence on the intended hardware |

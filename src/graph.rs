@@ -135,6 +135,7 @@ impl Arithmetic {
         epsilon: f32,
         block: usize,
         signs: Option<&[f32]>,
+        parallelism: &RowParallelism,
         norm_out: &mut Vec<f32>,
         rotated_out: &mut Vec<f32>,
     ) -> Result<()> {
@@ -145,6 +146,7 @@ impl Arithmetic {
                 epsilon,
                 block,
                 signs,
+                parallelism,
                 norm_out,
                 rotated_out,
             ),
@@ -154,6 +156,7 @@ impl Arithmetic {
                 epsilon,
                 block,
                 signs,
+                parallelism,
                 norm_out,
                 rotated_out,
             ),
@@ -305,6 +308,19 @@ impl Arithmetic {
         match self {
             Self::Source => Ok(queries.map(|query| dot_f16(query, key))),
             Self::PinnedSwift => crate::kernels::pinned_attention::dot_f16_four(key, queries),
+        }
+    }
+
+    fn attention_dot_four_keys_four_queries(
+        self,
+        queries: [&[f32]; 4],
+        keys: [&[u16]; 4],
+    ) -> Result<[[f32; 4]; 4]> {
+        match self {
+            Self::Source => Ok(keys.map(|key| queries.map(|query| dot_f16(query, key)))),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_attention::dot_f16_four_keys_four_queries(keys, queries)
+            }
         }
     }
 
@@ -994,6 +1010,32 @@ impl Transforms {
             && self.block.is_power_of_two()
             && len.is_multiple_of(self.block)
             && self.signs.get(&len).is_none_or(|signs| signs.len() >= len)
+    }
+
+    #[allow(
+        clippy::option_option,
+        reason = "Outer Option indicates whether the FFN chain is eligible; inner Option<u32> carries the optional down-projection Hadamard block size."
+    )]
+    pub(super) fn ffn_chain_hadamard_block_for(&self, down_weight: &Tensor) -> Option<Option<u32>> {
+        let (rotated, grouped) = self.basis(down_weight);
+        if !rotated {
+            return Some(None);
+        }
+        if grouped {
+            return None;
+        }
+        let len = down_weight.dimensions.first().copied()?;
+        if !self.can_block_hadamard(len) || self.block < 32 {
+            return None;
+        }
+        if self.signs.get(&len).is_some_and(|signs| {
+            signs[..len]
+                .iter()
+                .any(|&s| s.to_bits() != 1.0_f32.to_bits())
+        }) {
+            return None;
+        }
+        u32::try_from(self.block).ok().map(Some)
     }
 
     // The fixed-size group borrows one exact input slice for its whole scope.
@@ -2177,16 +2219,27 @@ impl Qwen35 {
             // exact FFN operations while reusing their high-water allocations.
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
-            evaluation.project_ffn_swiglu_into(
+            if evaluation.try_project_ffn_chain_into(
                 &layer.gate,
                 &layer.up,
                 &layer.down,
                 normalized,
-                gate,
-                up,
-            )?;
-            evaluation.project_into(&layer.down, up, attention)?;
-            add(hidden, attention);
+                Some(hidden.as_slice()),
+                attention,
+            )? {
+                std::mem::swap(hidden, attention);
+            } else {
+                evaluation.project_ffn_swiglu_into(
+                    &layer.gate,
+                    &layer.up,
+                    &layer.down,
+                    normalized,
+                    gate,
+                    up,
+                )?;
+                evaluation.project_into(&layer.down, up, attention)?;
+                add(hidden, attention);
+            }
             finite(hidden, "decoder layer output")?;
         }
         if let Some(logits) = logits {
@@ -2289,6 +2342,7 @@ impl Evaluation<'_, '_> {
             && first_target.dimensions.first().copied() == Some(input.len())
         {
             let signs = self.transforms.signs.get(&input.len()).map(Vec::as_slice);
+            let parallelism = self.projection.matvec.clone_row_parallelism();
             if self
                 .arithmetic
                 .normalize_hadamard_into(
@@ -2297,6 +2351,7 @@ impl Evaluation<'_, '_> {
                     self.geometry.epsilon,
                     self.transforms.block,
                     signs,
+                    &parallelism,
                     output,
                     &mut self.projection.transformed,
                 )
@@ -2308,6 +2363,68 @@ impl Evaluation<'_, '_> {
         }
         self.arithmetic
             .normalize(input, weight, self.geometry.epsilon, output)
+    }
+
+    fn try_project_ffn_chain_into(
+        &mut self,
+        gate_weight: &Tensor,
+        up_weight: &Tensor,
+        down_weight: &Tensor,
+        input: &[f32],
+        residual: Option<&[f32]>,
+        output: &mut Vec<f32>,
+    ) -> Result<bool> {
+        let Some(hadamard_block) = self.transforms.ffn_chain_hadamard_block_for(down_weight) else {
+            return Ok(false);
+        };
+        let tensors = [gate_weight, up_weight, down_weight];
+        if self.adapter.is_some()
+            || self.transforms.basis(gate_weight) != self.transforms.basis(up_weight)
+            || !self
+                .executor
+                .as_deref()
+                .is_some_and(|exec| exec.supports_f32_ffn_chain(tensors))
+        {
+            return Ok(false);
+        }
+        let pre_transformed = self.projection.pre_transformed_len.take();
+        let basis = self.transforms.basis(gate_weight);
+        let activation = if basis.0 {
+            if basis.1
+                || pre_transformed != Some(input.len())
+                || self.projection.transformed.len() != input.len()
+            {
+                self.transforms.transform_into_with_parallelism(
+                    gate_weight,
+                    input,
+                    self.geometry,
+                    self.projection.matvec.row_parallelism(),
+                    &mut self.projection.transformed,
+                )?;
+            }
+            #[cfg(test)]
+            {
+                self.projection.transforms += 1;
+            }
+            self.projection.transformed.as_slice()
+        } else {
+            input
+        };
+        let mut prepared = self
+            .projection
+            .matvec
+            .prepare_f32_executor(gate_weight, activation)?;
+        if let Some(executor) = self.executor.as_deref_mut() {
+            prepared.matvec_ffn_chain_with_executor(
+                tensors,
+                residual,
+                hadamard_block,
+                output,
+                executor,
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn project_ffn_swiglu_into(
@@ -2588,13 +2705,66 @@ impl Evaluation<'_, '_> {
                                 let h = head + i;
                                 &query_ref[h * g.head..(h + 1) * g.head]
                             });
-                            for (pos, past) in keys.tokens().enumerate() {
-                                let dots = arithmetic
-                                    .attention_dot_four(queries, &past[offset..offset + g.head])?;
-                                s0[pos] = dots[0] * scale;
-                                s1[pos] = dots[1] * scale;
-                                s2[pos] = dots[2] * scale;
-                                s3[pos] = dots[3] * scale;
+                            let mut past_iter = keys.tokens().enumerate();
+                            while let Some((pos0, p0)) = past_iter.next() {
+                                if let Some((_, p1)) = past_iter.next() {
+                                    if let Some((_, p2)) = past_iter.next() {
+                                        if let Some((_, p3)) = past_iter.next() {
+                                            let dots4 = arithmetic
+                                                .attention_dot_four_keys_four_queries(
+                                                    queries,
+                                                    [
+                                                        &p0[offset..offset + g.head],
+                                                        &p1[offset..offset + g.head],
+                                                        &p2[offset..offset + g.head],
+                                                        &p3[offset..offset + g.head],
+                                                    ],
+                                                )?;
+                                            for (k_off, dots) in dots4.into_iter().enumerate() {
+                                                let pos = pos0 + k_off;
+                                                s0[pos] = dots[0] * scale;
+                                                s1[pos] = dots[1] * scale;
+                                                s2[pos] = dots[2] * scale;
+                                                s3[pos] = dots[3] * scale;
+                                            }
+                                        } else {
+                                            for (k_off, past) in
+                                                [p0, p1, p2].into_iter().enumerate()
+                                            {
+                                                let pos = pos0 + k_off;
+                                                let dots = arithmetic.attention_dot_four(
+                                                    queries,
+                                                    &past[offset..offset + g.head],
+                                                )?;
+                                                s0[pos] = dots[0] * scale;
+                                                s1[pos] = dots[1] * scale;
+                                                s2[pos] = dots[2] * scale;
+                                                s3[pos] = dots[3] * scale;
+                                            }
+                                        }
+                                    } else {
+                                        for (k_off, past) in [p0, p1].into_iter().enumerate() {
+                                            let pos = pos0 + k_off;
+                                            let dots = arithmetic.attention_dot_four(
+                                                queries,
+                                                &past[offset..offset + g.head],
+                                            )?;
+                                            s0[pos] = dots[0] * scale;
+                                            s1[pos] = dots[1] * scale;
+                                            s2[pos] = dots[2] * scale;
+                                            s3[pos] = dots[3] * scale;
+                                        }
+                                    }
+                                } else {
+                                    let dots = arithmetic.attention_dot_four(
+                                        queries,
+                                        &p0[offset..offset + g.head],
+                                    )?;
+                                    s0[pos0] = dots[0] * scale;
+                                    s1[pos0] = dots[1] * scale;
+                                    s2[pos0] = dots[2] * scale;
+                                    s3[pos0] = dots[3] * scale;
+                                }
                             }
                             let current_dots = arithmetic.attention_current_dot_four(
                                 queries,

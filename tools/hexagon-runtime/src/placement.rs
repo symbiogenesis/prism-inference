@@ -482,6 +482,77 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
         }
         result
     }
+
+    fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
+        self.f32_groups
+            && !self.faulted
+            && tensors.iter().all(|&tensor| self.supports_f32(tensor))
+            && self.executor.supports_f32_ffn_chain(tensors)
+    }
+
+    fn project_f32_ffn_chain(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        if !self.supports_f32_ffn_chain(tensors) {
+            output.clear();
+            return Err(invalid(
+                "unavailable explicit F32 FFN chain projection placement",
+            ));
+        }
+        let result = self.executor.project_f32_ffn_chain(
+            tensors,
+            activation,
+            residual,
+            hadamard_block_size,
+            pinned,
+            output,
+        );
+        if result.is_err() {
+            self.faulted = true;
+            output.clear();
+        }
+        result
+    }
+
+    fn project_f32_ffn_chain_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+        hadamard_block_size: Option<u32>,
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if !self.supports_f32_ffn_chain(tensors) {
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+            return Err(invalid(
+                "unavailable explicit F32 FFN chain projection placement",
+            ));
+        }
+        let result = self.executor.project_f32_ffn_chain_tokens(
+            tensors,
+            activations,
+            residuals,
+            hadamard_block_size,
+            pinned,
+            outputs,
+        );
+        if result.is_err() {
+            self.faulted = true;
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
 }
 
 /// One double-buffered pipeline step in a 2-stage Hexagon NPU + CPU prefill schedule.

@@ -290,6 +290,96 @@ pub fn smmla_dot32_2x2(
     ]
 }
 
+#[inline]
+fn dot_pq2_sequential_scalar(
+    packed: &[u8; 32],
+    activation: &[i8; 128],
+    activation_sum: i32,
+) -> i32 {
+    let unsigned_sum: i32 = packed
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(activation.as_chunks::<64>().0)
+        .map(|(bytes, values)| {
+            bytes
+                .iter()
+                .enumerate()
+                .map(|(index, &byte)| {
+                    (0..4)
+                        .map(|digit| {
+                            i32::from((byte >> (digit * 2)) & 3)
+                                * i32::from(values[index * 4 + digit])
+                        })
+                        .sum::<i32>()
+                })
+                .sum::<i32>()
+        })
+        .sum();
+    unsigned_sum - activation_sum
+}
+
+/// Computes four 128-element `PQ2_0` row dot products against one sequential
+/// `Q8_K` 128-element activation slice and its precomputed `activation_sum`.
+#[inline]
+#[must_use]
+pub fn dot_pq2_four_rows_one_token(
+    packed: [&[u8; 32]; 4],
+    activation: &[i8; 128],
+    activation_sum: i32,
+) -> [i32; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(sums) = aarch64::dot_pq2_four_rows_one_token(packed, activation, activation_sum) {
+        return sums;
+    }
+    packed.map(|row| dot_pq2_sequential_scalar(row, activation, activation_sum))
+}
+
+/// Computes a 4-row by 4-token 128-element `PQ2_0` dot tile against sequential
+/// `Q8_K` 128-element activation slices and their precomputed `activation_sums`
+/// using ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available.
+#[inline]
+#[must_use]
+pub fn dot_pq2_four_rows_four_tokens(
+    packed: [&[u8; 32]; 4],
+    activations: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::dot_pq2_four_rows_four_tokens(packed, activations, activation_sums)
+    {
+        return tile;
+    }
+    packed.map(|row| {
+        std::array::from_fn(|tok| {
+            dot_pq2_sequential_scalar(row, activations[tok], activation_sums[tok])
+        })
+    })
+}
+
+/// Computes an 8-row by 8-token 128-element `PQ2_0` dot tile against sequential
+/// `Q8_K` 128-element activation slices and their precomputed `activation_sums`
+/// using ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available.
+#[inline]
+#[must_use]
+pub fn dot_pq2_eight_rows_eight_tokens(
+    packed: [&[u8; 32]; 8],
+    activations: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) =
+        aarch64::dot_pq2_eight_rows_eight_tokens(packed, activations, activation_sums)
+    {
+        return tile;
+    }
+    packed.map(|row| {
+        std::array::from_fn(|tok| {
+            dot_pq2_sequential_scalar(row, activations[tok], activation_sums[tok])
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +451,49 @@ mod tests {
         assert_eq!(tile[0][1], ref_dot(&r0, &c1));
         assert_eq!(tile[1][0], ref_dot(&r1, &c0));
         assert_eq!(tile[1][1], ref_dot(&r1, &c1));
+    }
+
+    #[test]
+    fn pq2_multi_row_multi_token_tiles_match_scalar_reference() {
+        let rows: [[u8; 32]; 8] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| {
+                r.to_le_bytes()[0]
+                    .wrapping_mul(37)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(73))
+                    .wrapping_add(19)
+            })
+        });
+        let acts: [[i8; 128]; 8] = std::array::from_fn(|t| {
+            std::array::from_fn(|i| {
+                i8::from_ne_bytes([t.to_le_bytes()[0]
+                    .wrapping_mul(59)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(107))
+                    .wrapping_add(5)])
+            })
+        });
+        let sums: [i32; 8] = std::array::from_fn(|t| acts[t].iter().map(|&v| i32::from(v)).sum());
+        let row_refs8: [&[u8; 32]; 8] = std::array::from_fn(|r| &rows[r]);
+        let act_refs8: [&[i8; 128]; 8] = std::array::from_fn(|t| &acts[t]);
+        let tile8 = dot_pq2_eight_rows_eight_tokens(row_refs8, act_refs8, sums);
+        for r in 0..8 {
+            for t in 0..8 {
+                let expected = dot_pq2_sequential_scalar(&rows[r], &acts[t], sums[t]);
+                assert_eq!(tile8[r][t], expected, "mismatch at 8x8 r={r}, t={t}");
+            }
+        }
+        let row_refs4: [&[u8; 32]; 4] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+        let act_refs4: [&[i8; 128]; 4] = [&acts[0], &acts[1], &acts[2], &acts[3]];
+        let sums4 = [sums[0], sums[1], sums[2], sums[3]];
+        let tile4 = dot_pq2_four_rows_four_tokens(row_refs4, act_refs4, sums4);
+        for r in 0..4 {
+            assert_eq!(
+                tile4[r],
+                [tile8[r][0], tile8[r][1], tile8[r][2], tile8[r][3]]
+            );
+        }
+        let col0 = dot_pq2_four_rows_one_token(row_refs4, &acts[0], sums[0]);
+        for r in 0..4 {
+            assert_eq!(col0[r], tile8[r][0]);
+        }
     }
 }

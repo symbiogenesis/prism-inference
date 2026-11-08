@@ -5,9 +5,10 @@
 
 use core::arch::aarch64::{
     int8x16_t, int32x4_t, uint8x8_t, uint8x16_t, vaddq_s32, vaddvq_s32, vandq_u8, vcgeq_u8,
-    vcltq_u8, vcombine_s8, vcombine_u8, vdotq_s32, vdupq_n_s32, vdupq_n_u8, vget_high_s8,
-    vget_low_s8, vld1_u8, vld1q_s8, vld1q_u8, vmulq_u8, vpaddlq_s8, vpaddlq_s16,
-    vreinterpretq_s8_u8, vshrq_n_u8, vst1q_s8, vst1q_s32, vsubq_s8, vuzp1q_s32, vuzp2q_s32,
+    vcltq_u8, vcombine_s8, vcombine_s32, vcombine_u8, vdotq_s32, vdupq_n_s32, vdupq_n_u8,
+    vget_high_s8, vget_high_s32, vget_low_s8, vget_low_s32, vld1_u8, vld1q_s8, vld1q_s32, vld1q_u8,
+    vmulq_u8, vpaddlq_s8, vpaddlq_s16, vreinterpretq_s8_u8, vshrq_n_u8, vst1q_s8, vst1q_s32,
+    vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp1q_s32, vuzp2q_s8, vuzp2q_s32,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -76,6 +77,13 @@ fn load_s8x16(bytes: &[i8; 16]) -> int8x16_t {
 fn store_s8x16(vec: int8x16_t, out: &mut [i8; 16]) {
     // SAFETY: `out` is a valid mutable 16-byte `i8` array reference and `vst1q_s8` requires no alignment.
     unsafe { vst1q_s8(out.as_mut_ptr(), vec) };
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_s32x4(values: &[i32; 4]) -> int32x4_t {
+    // SAFETY: `values` is a valid 4-element `i32` array reference and `vld1q_s32` requires no alignment.
+    unsafe { vld1q_s32(values.as_ptr()) }
 }
 
 #[inline]
@@ -511,4 +519,381 @@ pub(super) fn smmla_dot32_2x2(
     }
     // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
     Some(unsafe { smmla_dot32_2x2_i8mm(r0, r1, c0, c1) })
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn unpack_pq2_unsigned_s8(packed: &[u8; 32]) -> [int8x16_t; 8] {
+    let halves = packed.as_chunks::<16>().0;
+    let mask = vdupq_n_u8(3);
+    let w_lo = load_u8x16(&halves[0]);
+    let w_hi = load_u8x16(&halves[1]);
+    [
+        vreinterpretq_s8_u8(vandq_u8(w_lo, mask)),
+        vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<2>(w_lo), mask)),
+        vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<4>(w_lo), mask)),
+        vreinterpretq_s8_u8(vshrq_n_u8::<6>(w_lo)),
+        vreinterpretq_s8_u8(vandq_u8(w_hi, mask)),
+        vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<2>(w_hi), mask)),
+        vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<4>(w_hi), mask)),
+        vreinterpretq_s8_u8(vshrq_n_u8::<6>(w_hi)),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn deinterleave_pq2_planes_s8(values: &[i8; 128]) -> [int8x16_t; 8] {
+    let chunks = values.as_chunks::<16>().0;
+    let c0 = load_s8x16(&chunks[0]);
+    let c1 = load_s8x16(&chunks[1]);
+    let c2 = load_s8x16(&chunks[2]);
+    let c3 = load_s8x16(&chunks[3]);
+    let e01 = vuzp1q_s8(c0, c1);
+    let o01 = vuzp2q_s8(c0, c1);
+    let e23 = vuzp1q_s8(c2, c3);
+    let o23 = vuzp2q_s8(c2, c3);
+
+    let c4 = load_s8x16(&chunks[4]);
+    let c5 = load_s8x16(&chunks[5]);
+    let c6 = load_s8x16(&chunks[6]);
+    let c7 = load_s8x16(&chunks[7]);
+    let e45 = vuzp1q_s8(c4, c5);
+    let o45 = vuzp2q_s8(c4, c5);
+    let e67 = vuzp1q_s8(c6, c7);
+    let o67 = vuzp2q_s8(c6, c7);
+
+    [
+        vuzp1q_s8(e01, e23),
+        vuzp1q_s8(o01, o23),
+        vuzp2q_s8(e01, e23),
+        vuzp2q_s8(o01, o23),
+        vuzp1q_s8(e45, e67),
+        vuzp1q_s8(o45, o67),
+        vuzp2q_s8(e45, e67),
+        vuzp2q_s8(o45, o67),
+    ]
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_four_rows_one_token_dotprod(
+    packed: [&[u8; 32]; 4],
+    activation: &[i8; 128],
+    activation_sum: i32,
+) -> [i32; 4] {
+    let planes = deinterleave_pq2_planes_s8(activation);
+    let mut acc = [vdupq_n_s32(0); 4];
+    for (row_idx, row_bytes) in packed.into_iter().enumerate() {
+        let weights = unpack_pq2_unsigned_s8(row_bytes);
+        for (w, p) in weights.into_iter().zip(planes) {
+            acc[row_idx] = vdotq_s32(acc[row_idx], w, p);
+        }
+    }
+    let reduced = vsubq_s32(
+        reduce4_s32x4(acc[0], acc[1], acc[2], acc[3]),
+        vdupq_n_s32(activation_sum),
+    );
+    let mut out = [0_i32; 4];
+    store_s32x4(reduced, &mut out);
+    out
+}
+
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn dot_pq2_4x4_tile_i8mm(
+    weights: &[[int8x16_t; 8]; 4],
+    acts: &[[int8x16_t; 8]; 4],
+    sums_vec: int32x4_t,
+) -> [[i32; 4]; 4] {
+    let mut acc00 = vdupq_n_s32(0);
+    let mut acc01 = vdupq_n_s32(0);
+    let mut acc10 = vdupq_n_s32(0);
+    let mut acc11 = vdupq_n_s32(0);
+    for k in 0..8 {
+        let w0 = weights[0][k];
+        let w1 = weights[1][k];
+        let w2 = weights[2][k];
+        let w3 = weights[3][k];
+        let a0 = acts[0][k];
+        let a1 = acts[1][k];
+        let a2 = acts[2][k];
+        let a3 = acts[3][k];
+
+        let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+        let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+        let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+        let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+
+        let a01_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+        let a01_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+        let a23_lo = vcombine_s8(vget_low_s8(a2), vget_low_s8(a3));
+        let a23_hi = vcombine_s8(vget_high_s8(a2), vget_high_s8(a3));
+
+        acc00 = smmla_s32(smmla_s32(acc00, w01_lo, a01_lo), w01_hi, a01_hi);
+        acc01 = smmla_s32(smmla_s32(acc01, w01_lo, a23_lo), w01_hi, a23_hi);
+        acc10 = smmla_s32(smmla_s32(acc10, w23_lo, a01_lo), w23_hi, a01_hi);
+        acc11 = smmla_s32(smmla_s32(acc11, w23_lo, a23_lo), w23_hi, a23_hi);
+    }
+    let r0 = vsubq_s32(
+        vcombine_s32(vget_low_s32(acc00), vget_low_s32(acc01)),
+        sums_vec,
+    );
+    let r1 = vsubq_s32(
+        vcombine_s32(vget_high_s32(acc00), vget_high_s32(acc01)),
+        sums_vec,
+    );
+    let r2 = vsubq_s32(
+        vcombine_s32(vget_low_s32(acc10), vget_low_s32(acc11)),
+        sums_vec,
+    );
+    let r3 = vsubq_s32(
+        vcombine_s32(vget_high_s32(acc10), vget_high_s32(acc11)),
+        sums_vec,
+    );
+    let mut out = [[0_i32; 4]; 4];
+    store_s32x4(r0, &mut out[0]);
+    store_s32x4(r1, &mut out[1]);
+    store_s32x4(r2, &mut out[2]);
+    store_s32x4(r3, &mut out[3]);
+    out
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_4x4_tile_dotprod(
+    weights: &[[int8x16_t; 8]; 4],
+    acts: &[[int8x16_t; 8]; 4],
+    sums_vec: int32x4_t,
+) -> [[i32; 4]; 4] {
+    let mut acc = [[vdupq_n_s32(0); 4]; 4];
+    for k in 0..8 {
+        let a0 = acts[0][k];
+        let a1 = acts[1][k];
+        let a2 = acts[2][k];
+        let a3 = acts[3][k];
+        for r in 0..4 {
+            let w = weights[r][k];
+            acc[r][0] = vdotq_s32(acc[r][0], w, a0);
+            acc[r][1] = vdotq_s32(acc[r][1], w, a1);
+            acc[r][2] = vdotq_s32(acc[r][2], w, a2);
+            acc[r][3] = vdotq_s32(acc[r][3], w, a3);
+        }
+    }
+    let mut out = [[0_i32; 4]; 4];
+    for r in 0..4 {
+        let reduced = vsubq_s32(
+            reduce4_s32x4(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
+            sums_vec,
+        );
+        store_s32x4(reduced, &mut out[r]);
+    }
+    out
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn dot_pq2_four_rows_four_tokens_i8mm(
+    packed: [&[u8; 32]; 4],
+    activations: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    let weights = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let acts = [
+        deinterleave_pq2_planes_s8(activations[0]),
+        deinterleave_pq2_planes_s8(activations[1]),
+        deinterleave_pq2_planes_s8(activations[2]),
+        deinterleave_pq2_planes_s8(activations[3]),
+    ];
+    dot_pq2_4x4_tile_i8mm(&weights, &acts, load_s32x4(&activation_sums))
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_four_rows_four_tokens_dotprod(
+    packed: [&[u8; 32]; 4],
+    activations: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    let weights = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let acts = [
+        deinterleave_pq2_planes_s8(activations[0]),
+        deinterleave_pq2_planes_s8(activations[1]),
+        deinterleave_pq2_planes_s8(activations[2]),
+        deinterleave_pq2_planes_s8(activations[3]),
+    ];
+    dot_pq2_4x4_tile_dotprod(&weights, &acts, load_s32x4(&activation_sums))
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn dot_pq2_eight_rows_eight_tokens_i8mm(
+    packed: [&[u8; 32]; 8],
+    activations: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    let weights_lo = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let weights_hi = [
+        unpack_pq2_unsigned_s8(packed[4]),
+        unpack_pq2_unsigned_s8(packed[5]),
+        unpack_pq2_unsigned_s8(packed[6]),
+        unpack_pq2_unsigned_s8(packed[7]),
+    ];
+    let acts_lo = [
+        deinterleave_pq2_planes_s8(activations[0]),
+        deinterleave_pq2_planes_s8(activations[1]),
+        deinterleave_pq2_planes_s8(activations[2]),
+        deinterleave_pq2_planes_s8(activations[3]),
+    ];
+    let acts_hi = [
+        deinterleave_pq2_planes_s8(activations[4]),
+        deinterleave_pq2_planes_s8(activations[5]),
+        deinterleave_pq2_planes_s8(activations[6]),
+        deinterleave_pq2_planes_s8(activations[7]),
+    ];
+    let sums_lo = load_s32x4(&[
+        activation_sums[0],
+        activation_sums[1],
+        activation_sums[2],
+        activation_sums[3],
+    ]);
+    let sums_hi = load_s32x4(&[
+        activation_sums[4],
+        activation_sums[5],
+        activation_sums[6],
+        activation_sums[7],
+    ]);
+    let q00 = dot_pq2_4x4_tile_i8mm(&weights_lo, &acts_lo, sums_lo);
+    let q01 = dot_pq2_4x4_tile_i8mm(&weights_lo, &acts_hi, sums_hi);
+    let q10 = dot_pq2_4x4_tile_i8mm(&weights_hi, &acts_lo, sums_lo);
+    let q11 = dot_pq2_4x4_tile_i8mm(&weights_hi, &acts_hi, sums_hi);
+    let mut out = [[0_i32; 8]; 8];
+    for r in 0..4 {
+        out[r][..4].copy_from_slice(&q00[r]);
+        out[r][4..].copy_from_slice(&q01[r]);
+        out[r + 4][..4].copy_from_slice(&q10[r]);
+        out[r + 4][4..].copy_from_slice(&q11[r]);
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_eight_rows_eight_tokens_dotprod(
+    packed: [&[u8; 32]; 8],
+    activations: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    let weights_lo = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let weights_hi = [
+        unpack_pq2_unsigned_s8(packed[4]),
+        unpack_pq2_unsigned_s8(packed[5]),
+        unpack_pq2_unsigned_s8(packed[6]),
+        unpack_pq2_unsigned_s8(packed[7]),
+    ];
+    let acts_lo = [
+        deinterleave_pq2_planes_s8(activations[0]),
+        deinterleave_pq2_planes_s8(activations[1]),
+        deinterleave_pq2_planes_s8(activations[2]),
+        deinterleave_pq2_planes_s8(activations[3]),
+    ];
+    let acts_hi = [
+        deinterleave_pq2_planes_s8(activations[4]),
+        deinterleave_pq2_planes_s8(activations[5]),
+        deinterleave_pq2_planes_s8(activations[6]),
+        deinterleave_pq2_planes_s8(activations[7]),
+    ];
+    let sums_lo = load_s32x4(&[
+        activation_sums[0],
+        activation_sums[1],
+        activation_sums[2],
+        activation_sums[3],
+    ]);
+    let sums_hi = load_s32x4(&[
+        activation_sums[4],
+        activation_sums[5],
+        activation_sums[6],
+        activation_sums[7],
+    ]);
+    let q00 = dot_pq2_4x4_tile_dotprod(&weights_lo, &acts_lo, sums_lo);
+    let q01 = dot_pq2_4x4_tile_dotprod(&weights_lo, &acts_hi, sums_hi);
+    let q10 = dot_pq2_4x4_tile_dotprod(&weights_hi, &acts_lo, sums_lo);
+    let q11 = dot_pq2_4x4_tile_dotprod(&weights_hi, &acts_hi, sums_hi);
+    let mut out = [[0_i32; 8]; 8];
+    for r in 0..4 {
+        out[r][..4].copy_from_slice(&q00[r]);
+        out[r][4..].copy_from_slice(&q01[r]);
+        out[r + 4][..4].copy_from_slice(&q10[r]);
+        out[r + 4][4..].copy_from_slice(&q11[r]);
+    }
+    out
+}
+
+#[inline]
+pub(super) fn dot_pq2_four_rows_one_token(
+    packed: [&[u8; 32]; 4],
+    activation: &[i8; 128],
+    activation_sum: i32,
+) -> Option<[i32; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_pq2_four_rows_one_token_dotprod(packed, activation, activation_sum) })
+}
+
+#[inline]
+pub(super) fn dot_pq2_four_rows_four_tokens(
+    packed: [&[u8; 32]; 4],
+    activations: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> Option<[[i32; 4]; 4]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_four_rows_four_tokens_i8mm(packed, activations, activation_sums)
+        });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_four_rows_four_tokens_dotprod(packed, activations, activation_sums)
+        });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn dot_pq2_eight_rows_eight_tokens(
+    packed: [&[u8; 32]; 8],
+    activations: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> Option<[[i32; 8]; 8]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_eight_rows_eight_tokens_i8mm(packed, activations, activation_sums)
+        });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_eight_rows_eight_tokens_dotprod(packed, activations, activation_sums)
+        });
+    }
+    None
 }

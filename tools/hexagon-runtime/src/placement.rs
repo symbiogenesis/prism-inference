@@ -7,7 +7,7 @@ use bonsai_prism_runtime::{
     model::{Model, Tensor},
 };
 use bonsai_ternary::Q8KBlock;
-use sha2::{Digest, Sha256};
+use bonsai_native_hash::Hasher;
 
 use crate::{Result, invalid};
 
@@ -119,24 +119,24 @@ impl<'a> PlacedProjectionExecutor<'a> {
         {
             return Err(invalid("duplicate explicit projection placement tensor"));
         }
-        let mut digest = Sha256::new();
-        digest.update(b"prism-explicit-projection-placement-v1\0");
+        let mut digest = Hasher::new()?;
+        digest.update(b"prism-explicit-projection-placement-v1\0")?;
         hash_bytes(&mut digest, executor.identity().as_bytes())?;
         hash_bytes(&mut digest, model.identity.as_bytes())?;
         for selection in &selected {
             let tensor = &selection.tensor;
             hash_bytes(&mut digest, tensor.name.as_bytes())?;
-            digest.update(tensor.kind.to_le_bytes());
+            digest.update(&tensor.kind.to_le_bytes())?;
             for &dimension in &tensor.dimensions {
-                digest.update(u64::try_from(dimension)?.to_le_bytes());
+                digest.update(&u64::try_from(dimension)?.to_le_bytes())?;
             }
-            digest.update([u8::from(selection.operations.is_some())]);
-            digest.update(selection.operations.unwrap_or(0).to_le_bytes());
+            digest.update(&[u8::from(selection.operations.is_some())])?;
+            digest.update(&selection.operations.unwrap_or(0).to_le_bytes())?;
         }
         let mut identity = String::new();
         identity.try_reserve_exact(96)?;
         identity.push_str("hexagon-explicit-placement-v1:");
-        for byte in digest.finalize() {
+        for byte in digest.finish()? {
             write!(&mut identity, "{byte:02x}")?;
         }
         Ok(Self {
@@ -181,9 +181,9 @@ fn valid_identity(identity: &str) -> bool {
         && identity.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-fn hash_bytes(digest: &mut Sha256, bytes: &[u8]) -> Result<()> {
-    digest.update(u64::try_from(bytes.len())?.to_le_bytes());
-    digest.update(bytes);
+fn hash_bytes(digest: &mut Hasher, bytes: &[u8]) -> Result<()> {
+    digest.update(&u64::try_from(bytes.len())?.to_le_bytes())?;
+    digest.update(bytes)?;
     Ok(())
 }
 
@@ -564,6 +564,175 @@ pub fn plan_hybrid_prefill_pipeline(
         microbatch_tokens,
         microbatch_count,
         steps,
+    })
+}
+
+/// Target compute unit for a projection group in a 3-processor heterogeneous placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceleratorTarget {
+    /// Hexagon v81 NPU (`libggml-htp-v81.so` signed HVX `HTP_TYPE_Q2_0` + `HTP_OP_HADAMARD`).
+    HexagonNpu,
+    /// Adreno X2-90 / X1-85 `OpenCL` `Q2_0` + local-memory `fwht.cl` (`1024`-element block).
+    AdrenoGpuOpenCl,
+    /// Adreno X2-90 / X1-85 Vulkan `Q2_0` + shared-memory `hadamard.comp` (`up to 8192`).
+    AdrenoGpuVulkan,
+    /// Oryon CPU (ARMv8.2-A `dotprod` / `i8mm` + NEON recurrent GDN, KV cache, and `LoRA` adapters).
+    OryonCpu,
+}
+
+/// Adreno GPU `Q2_0` / `FWHT` kernel family selected for a projection stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdrenoQ2KernelKind {
+    /// Batch-1 decode 4-row GEMV (`mul_mv_q2_0_f32_4x_flat.cl`, 64-lane subgroup shuffles).
+    DecodeGemv4xFlat,
+    /// Batch-1 decode 8-row GEMV (`N_DST = 8` for `M >= 16384` `ffn_gate`/`ffn_up`).
+    DecodeGemv8xFlat,
+    /// Multi-token prefill 4-column GEMV (`gemv_noshuffle.cl`).
+    PrefillGemvNoShuffle4Col,
+    /// `OpenCL` local-memory Fast Walsh-Hadamard transform (`fwht.cl`, `32..=1024`).
+    FwhtLocalMem1024,
+    /// Vulkan shared-memory Fast Walsh-Hadamard transform (`hadamard.comp`, `32..=8192`).
+    FwhtVulkan8192,
+}
+
+/// Per-layer assignment in a 3-processor heterogeneous placement plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeterogeneousLayerAssignment {
+    /// Zero-based decoder layer index (`0..total_layers`).
+    pub layer_index: usize,
+    /// Whether this layer is a full-attention layer (`7` `Q2_0` projections) or recurrent GDN (`6` `Q2_0` projections).
+    pub is_full_attention: bool,
+    /// Compute processor assigned to this layer's `Q2_0` linear projections and `FWHT` basis transforms.
+    pub projection_target: AcceleratorTarget,
+    /// Number of `Q2_0` linear projections in this layer (`6` or `7`).
+    pub q2_projection_count: usize,
+    /// Primary Adreno decode kernel when `projection_target` is an Adreno GPU backend.
+    pub adreno_decode_kernel: Option<AdrenoQ2KernelKind>,
+    /// Primary Adreno prefill kernel when `projection_target` is an Adreno GPU backend.
+    pub adreno_prefill_kernel: Option<AdrenoQ2KernelKind>,
+    /// Primary Adreno `FWHT` kernel when `projection_target` is an Adreno GPU backend.
+    pub adreno_fwht_kernel: Option<AdrenoQ2KernelKind>,
+}
+
+/// Complete 3-processor heterogeneous placement plan across Hexagon NPU (`blk.0..npu_layers`),
+/// Adreno GPU (`blk.npu_layers..npu_layers + gpu_layers`), and Oryon CPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeterogeneousPlacementPlan {
+    /// Stable hardware-hashed placement identity (`heterogeneous-3proc-placement-v1:<sha256>`).
+    pub identity: String,
+    /// Total decoder layers in the model.
+    pub total_layers: usize,
+    /// Number of layers assigned to Hexagon NPU (`blk.0..npu_layers`).
+    pub npu_layers: usize,
+    /// Number of layers assigned to Adreno GPU (`blk.npu_layers..npu_layers + gpu_layers`).
+    pub gpu_layers: usize,
+    /// Number of layers whose projections remain on Oryon CPU.
+    pub cpu_layers: usize,
+    /// Total `Q2_0` projections assigned to Hexagon NPU (`168` for `blk.0..=26` on Qwen3.5-27B).
+    pub npu_q2_projections: usize,
+    /// Total `Q2_0` projections assigned to Adreno GPU (`232` for `blk.27..=63` on Qwen3.5-27B).
+    pub gpu_q2_projections: usize,
+    /// Total `Q2_0` projections remaining on Oryon CPU.
+    pub cpu_q2_projections: usize,
+    /// Per-layer placement descriptors.
+    pub layers: Vec<HeterogeneousLayerAssignment>,
+}
+
+/// Build a validated 3-processor heterogeneous placement plan across Hexagon NPU,
+/// Adreno GPU (`OpenCL` or `Vulkan` `Q2_0` + `FWHT`), and Oryon CPU.
+///
+/// # Errors
+/// Rejects zero `total_layers`, `full_attention_interval == 0`, `npu_layers + gpu_layers > total_layers`,
+/// or non-GPU `gpu_backend` when `gpu_layers > 0`.
+pub fn plan_three_processor_placement(
+    total_layers: usize,
+    npu_layers: usize,
+    gpu_layers: usize,
+    full_attention_interval: usize,
+    gpu_backend: AcceleratorTarget,
+) -> Result<HeterogeneousPlacementPlan> {
+    if total_layers == 0
+        || full_attention_interval == 0
+        || npu_layers.checked_add(gpu_layers).is_none_or(|sum| sum > total_layers)
+        || (gpu_layers > 0
+            && !matches!(
+                gpu_backend,
+                AcceleratorTarget::AdrenoGpuOpenCl | AcceleratorTarget::AdrenoGpuVulkan
+            ))
+    {
+        return Err(invalid("invalid 3-processor heterogeneous placement parameters"));
+    }
+    let cpu_layers = total_layers - (npu_layers + gpu_layers);
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(total_layers)
+        .map_err(|_| invalid("heterogeneous placement layer allocation failed"))?;
+    let mut npu_q2_projections = 0_usize;
+    let mut gpu_q2_projections = 0_usize;
+    let mut cpu_q2_projections = 0_usize;
+    let mut digest = Hasher::new()?;
+    digest.update(b"prism-heterogeneous-3proc-placement-v1\0")?;
+
+    for layer_index in 0..total_layers {
+        let is_full_attention = (layer_index + 1).is_multiple_of(full_attention_interval);
+        let q2_projection_count = if is_full_attention { 7 } else { 6 };
+        let (projection_target, adreno_decode_kernel, adreno_prefill_kernel, adreno_fwht_kernel) =
+            if layer_index < npu_layers {
+                npu_q2_projections += q2_projection_count;
+                (AcceleratorTarget::HexagonNpu, None, None, None)
+            } else if layer_index < npu_layers + gpu_layers {
+                gpu_q2_projections += q2_projection_count;
+                let fwht = if gpu_backend == AcceleratorTarget::AdrenoGpuVulkan {
+                    AdrenoQ2KernelKind::FwhtVulkan8192
+                } else {
+                    AdrenoQ2KernelKind::FwhtLocalMem1024
+                };
+                (
+                    gpu_backend,
+                    Some(AdrenoQ2KernelKind::DecodeGemv8xFlat),
+                    Some(AdrenoQ2KernelKind::PrefillGemvNoShuffle4Col),
+                    Some(fwht),
+                )
+            } else {
+                cpu_q2_projections += q2_projection_count;
+                (AcceleratorTarget::OryonCpu, None, None, None)
+            };
+        let target_tag: u8 = match projection_target {
+            AcceleratorTarget::HexagonNpu => 1,
+            AcceleratorTarget::AdrenoGpuOpenCl => 2,
+            AcceleratorTarget::AdrenoGpuVulkan => 3,
+            AcceleratorTarget::OryonCpu => 4,
+        };
+        digest.update(&u64::try_from(layer_index)?.to_le_bytes())?;
+        digest.update(&[target_tag, u8::from(is_full_attention)])?;
+        layers.push(HeterogeneousLayerAssignment {
+            layer_index,
+            is_full_attention,
+            projection_target,
+            q2_projection_count,
+            adreno_decode_kernel,
+            adreno_prefill_kernel,
+            adreno_fwht_kernel,
+        });
+    }
+
+    let mut identity = String::new();
+    identity.try_reserve_exact(103)?;
+    identity.push_str("heterogeneous-3proc-placement-v1:");
+    for byte in digest.finish()? {
+        write!(&mut identity, "{byte:02x}")?;
+    }
+
+    Ok(HeterogeneousPlacementPlan {
+        identity,
+        total_layers,
+        npu_layers,
+        gpu_layers,
+        cpu_layers,
+        npu_q2_projections,
+        gpu_q2_projections,
+        cpu_q2_projections,
+        layers,
     })
 }
 

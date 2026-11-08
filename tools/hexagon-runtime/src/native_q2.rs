@@ -3235,6 +3235,16 @@ mod tests {
         assert_eq!(schedule.steps[3].npu_microbatch, None);
         assert_eq!(schedule.steps[3].cpu_microbatch, Some(2));
         assert_eq!(schedule.steps[3].cpu_token_range, 16..20);
+
+        let het = crate::plan_three_processor_placement(64, 27, 37, 4, crate::AcceleratorTarget::AdrenoGpuOpenCl)?;
+        assert_eq!(het.npu_layers, 27);
+        assert_eq!(het.gpu_layers, 37);
+        assert_eq!(het.cpu_layers, 0);
+        assert_eq!(het.npu_q2_projections, 168);
+        assert_eq!(het.gpu_q2_projections, 232);
+        assert_eq!(het.layers[0].projection_target, crate::AcceleratorTarget::HexagonNpu);
+        assert_eq!(het.layers[27].projection_target, crate::AcceleratorTarget::AdrenoGpuOpenCl);
+        assert_eq!(het.layers[27].adreno_fwht_kernel, Some(crate::AdrenoQ2KernelKind::FwhtLocalMem1024));
         Ok(())
     }
 }

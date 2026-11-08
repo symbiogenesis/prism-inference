@@ -91,6 +91,7 @@ version = "0.1.0"
 dependencies = [
  "bonsai-gguf",
  "bonsai-hexagon-native",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "bonsai-windows-process",
  "prism-inference",

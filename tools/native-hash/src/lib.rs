@@ -74,3 +74,44 @@ pub fn hash_reader(
     }
     hash.finish()
 }
+
+/// Incremental SHA-256 digest state backed by Windows CNG (`Win32_Security_Cryptography`).
+///
+/// Uses hardware `ARMv8` SHA-2 instructions on Windows and the audited portable baseline elsewhere.
+pub struct Hasher(Sha256);
+
+impl Hasher {
+    /// Open a new incremental SHA-256 hash state.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the operating system cryptographic provider fails to initialize.
+    pub fn new() -> io::Result<Self> {
+        Ok(Self(Sha256::new()?))
+    }
+
+    /// Feed a contiguous slice of bytes into the SHA-256 digest state.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the cryptographic provider rejects the update.
+    pub fn update(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.update(bytes)
+    }
+
+    /// Finalize the SHA-256 digest and return the 32-byte hash.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the cryptographic provider fails to finalize.
+    pub fn finish(self) -> io::Result<[u8; 32]> {
+        self.0.finish()
+    }
+}
+
+/// Compute the 32-byte SHA-256 digest of an in-memory byte slice using [`Hasher`].
+///
+/// # Errors
+/// Returns an I/O error if the cryptographic provider fails.
+pub fn hash_bytes(bytes: &[u8]) -> io::Result<[u8; 32]> {
+    let mut hasher = Hasher::new()?;
+    hasher.update(bytes)?;
+    hasher.finish()
+}

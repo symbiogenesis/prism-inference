@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-gguf"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bonsai-native-hash",
  "bonsai-ternary",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-native-hash"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sha2",
  "windows-sys",
@@ -129,9 +129,9 @@ version = "0.1.1"
 
 [[package]]
 name = "bonsai-windows-credentials"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68f4da6f88acf5f1d6a9a31be1f3323b146dee3816d88f9faa08e1ec6c13e034"
+checksum = "5721bf40f115d5c8ab23bab34bf0cf189af4a0f8d780fb263bacddebcc1610df"
 dependencies = [
  "windows-sys",
 ]
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "bonsai-hexagon-native",
  "bonsai-hexagon-runtime",

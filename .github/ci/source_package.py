@@ -15,7 +15,7 @@ import tarfile
 import tomllib
 
 
-PACKAGES = ("bonsai-native-hash", "bonsai-gguf", "prism-inference")
+PACKAGES = ("bonsai-native-hash", "bonsai-neon-dot", "bonsai-gguf", "prism-inference")
 
 CONSUMER = """use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, RowParallelism},
@@ -63,7 +63,10 @@ def main():
         str(root / "Cargo.toml"), "--registry", "crates-io", "--locked", *selection,
     )
     versions = {
-        "bonsai-native-hash": tomllib.loads((root / "Cargo.toml").read_text())[
+        "bonsai-native-hash": tomllib.loads((root / "tools/native-hash/Cargo.toml").read_text())[
+            "package"
+        ]["version"],
+        "bonsai-neon-dot": tomllib.loads((root / "Cargo.toml").read_text())[
             "workspace"
         ]["package"]["version"],
         "bonsai-gguf": tomllib.loads((root / "tools/gguf/Cargo.toml").read_text())[
@@ -102,6 +105,7 @@ def main():
     runtime = f"../archives/prism-inference-{versions['prism-inference']}"
     gguf = f"../archives/bonsai-gguf-{versions['bonsai-gguf']}"
     native_hash = f"../archives/bonsai-native-hash-{versions['bonsai-native-hash']}"
+    neon_dot = f"../archives/bonsai-neon-dot-{versions['bonsai-neon-dot']}"
     (consumer / "Cargo.toml").write_text(
         f'''[package]
 name = "prism-package-consumer"
@@ -119,6 +123,7 @@ bonsai-prism-runtime = {{ package = "prism-inference", path = "{runtime}", defau
 [patch.crates-io]
 bonsai-gguf = {{ path = "{gguf}" }}
 bonsai-native-hash = {{ path = "{native_hash}" }}
+bonsai-neon-dot = {{ path = "{neon_dot}" }}
 ''',
         encoding="utf-8",
     )

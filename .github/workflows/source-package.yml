@@ -11,6 +11,7 @@ on:
       - 'tests/**'
       - 'tools/gguf/**'
       - 'tools/native-hash/**'
+      - 'tools/neon-dot/**'
       - 'tools/prism/**'
       - 'tools/ternary/**'
       - '.github/actions/rust-toolchain/**'

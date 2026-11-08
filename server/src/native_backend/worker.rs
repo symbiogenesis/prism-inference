@@ -254,6 +254,65 @@ impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for WorkerThreadHexago
             )
         })
     }
+
+    fn supports_f32_ffn_swiglu(
+        &self,
+        gate: &bonsai_prism_runtime::model::Tensor,
+        up: &bonsai_prism_runtime::model::Tensor,
+    ) -> bool {
+        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
+            slot.as_ref().is_some_and(|executor| {
+                bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_swiglu(
+                    executor, gate, up,
+                )
+            })
+        })
+    }
+
+    fn project_f32_ffn_swiglu(
+        &mut self,
+        gate: &bonsai_prism_runtime::model::Tensor,
+        up: &bonsai_prism_runtime::model::Tensor,
+        activation: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> bonsai_prism_runtime::Result<()> {
+        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+            let Some(executor) = slot.as_mut() else {
+                output.clear();
+                return Err(std::io::Error::other("missing worker Hexagon executor").into());
+            };
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_swiglu(
+                executor, gate, up, activation, pinned, output,
+            )
+        })
+    }
+
+    fn project_f32_ffn_swiglu_tokens(
+        &mut self,
+        gate: &bonsai_prism_runtime::model::Tensor,
+        up: &bonsai_prism_runtime::model::Tensor,
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> bonsai_prism_runtime::Result<()> {
+        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+            let Some(executor) = slot.as_mut() else {
+                for output in outputs.iter_mut() {
+                    output.clear();
+                }
+                return Err(std::io::Error::other("missing worker Hexagon executor").into());
+            };
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_swiglu_tokens(
+                executor,
+                gate,
+                up,
+                activations,
+                pinned,
+                outputs,
+            )
+        })
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]

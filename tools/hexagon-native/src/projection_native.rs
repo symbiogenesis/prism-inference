@@ -1391,6 +1391,168 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         }
         result
     }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep resident fused 2-token 6-op FFN SwiGLU validation, scoped flush size and output publication together"
+    )]
+    fn submit_native_resident_ffn_swiglu_multi2(
+        &mut self,
+        gate_handle: &NativeQ2WeightHandle,
+        up_handle: &NativeQ2WeightHandle,
+        activations: [&[f32]; 2],
+        mut outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        let result = (|| {
+            let batch_u32 = 6_u32;
+            let Some(next_operations) = self
+                .report
+                .operations_submitted
+                .checked_add(batch_u32)
+                .filter(|&next| !self.failed && next <= self.limits.operations)
+            else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            let Some(next_writes) = self
+                .report
+                .queue_writes_submitted
+                .checked_add(1)
+                .filter(|&next| next <= self.limits.operations)
+            else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            let Mode::NativeQ2 {
+                columns: max_columns,
+            } = self.mode
+            else {
+                return Err(self.fail("projection-input-refused-pinned"));
+            };
+            let columns = gate_handle.columns();
+            let rows = gate_handle.rows();
+            if up_handle.columns() != columns
+                || up_handle.rows() != rows
+                || self.native_resident_weights.range(gate_handle).is_err()
+                || self.native_resident_weights.range(up_handle).is_err()
+            {
+                return Err(self.fail("projection-input-refused-pinned"));
+            }
+            for token in 0..2 {
+                if native_q2::validate_activation(
+                    max_columns,
+                    self.limits.rows,
+                    columns,
+                    rows,
+                    activations[token],
+                    outputs[token].len(),
+                )
+                .is_err()
+                {
+                    return Err(self.fail("projection-input-refused-pinned"));
+                }
+            }
+            self.flush_extra_arena(gate_handle.arena_index())?;
+            self.flush_extra_arena(up_handle.arena_index())?;
+            let extra_descs = self.extra_buffer_descs()?;
+            let Ok(base) = u64::try_from(self.memory.addr()) else {
+                return Err(self.fail("projection-address-refused-pinned"));
+            };
+            let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
+                return Err(self.fail("projection-allocation-size-refused-pinned"));
+            };
+            let working_bytes = self.mode.allocation_bytes(self.limits.rows);
+            // SAFETY: the single previous operation completed and cache invalidation
+            // was validated before any allocation reuse.
+            let image = unsafe {
+                std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
+            };
+            let Ok(active) = native_q2::image_ffn_swiglu_multi2_resident(
+                image,
+                base,
+                self.expected.fd,
+                working_bytes,
+                &extra_descs[..self.extra_arena_count],
+                gate_handle,
+                up_handle,
+                activations,
+            ) else {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            };
+            image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            let sequence = u64::from(next_writes);
+            let Ok(request) = projection::request_batch_buffers(sequence, batch_u32, active.n_bufs)
+            else {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            };
+            let active_descriptor_size = if self.dirty_resident_weights {
+                let dirty_end =
+                    working_bytes.saturating_add(self.native_resident_weights.arena_used_bytes(0));
+                let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            } else {
+                let Ok(prefix) = u32::try_from(active.output_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            };
+            self.report.queue.response_validated = false;
+            self.report.queue.numeric_validated = false;
+            self.report.operations_submitted = next_operations;
+            self.report.queue_writes_submitted = next_writes;
+            self.report.resident_submissions += 4;
+            self.report.queue.compute_submitted = true;
+            let mut descriptor = self.expected;
+            descriptor.size = active_descriptor_size;
+            entered(self.report, "projection-queue-write-entered", self.progress);
+            let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
+            self.report.queue.queue_write_result = Some(result);
+            if result != 0 {
+                return Err(self.fail("projection-write-refused-pinned"));
+            }
+            entered(self.report, "projection-queue-read-entered", self.progress);
+            if !self.read(sequence, batch_u32, active.n_bufs, active_descriptor_size) {
+                return Err(Error::Contract);
+            }
+            self.dirty_resident_weights = false;
+            for (token, output) in outputs.iter_mut().enumerate() {
+                let member_bytes = size_of_val(*output);
+                // SAFETY: exact correlated response validated same FD, active prefix,
+                // pointer, n_tensors=18 and n_ops=6.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.memory
+                            .cast::<u8>()
+                            .wrapping_add(active.output_offsets[token]),
+                        member_bytes,
+                    )
+                };
+                if !native_q2::copy_and_validate_output(bytes, output) {
+                    return Err(self.fail("projection-numeric-refused-pinned"));
+                }
+            }
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            self.report.queue.numeric_validated = true;
+            self.report.operations_completed = next_operations;
+            self.report.queue_writes_completed = next_writes;
+            entered(self.report, "projection-operation-complete", self.progress);
+            Ok(())
+        })();
+        if result.is_err() {
+            for output in &mut outputs {
+                output.fill(f32::NAN);
+            }
+        }
+        result
+    }
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> GuardedQ2Submitter for Session<'_, P> {
@@ -1734,6 +1896,16 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         output: &mut [f32],
     ) -> Result<(), Error> {
         self.submit_native_resident_ffn_swiglu(gate_handle, up_handle, activation, output)
+    }
+
+    fn submit_resident_ffn_swiglu_multi2(
+        &mut self,
+        gate_handle: &NativeQ2WeightHandle,
+        up_handle: &NativeQ2WeightHandle,
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        self.submit_native_resident_ffn_swiglu_multi2(gate_handle, up_handle, activations, outputs)
     }
 
     fn submit(
@@ -2110,6 +2282,24 @@ impl NativeQ2Submitter for NativeQ2Session {
                 up_handle,
                 activation,
                 output,
+            )
+        })
+    }
+
+    fn submit_resident_ffn_swiglu_multi2(
+        &mut self,
+        gate_handle: &NativeQ2WeightHandle,
+        up_handle: &NativeQ2WeightHandle,
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident_ffn_swiglu_multi2(
+                session,
+                gate_handle,
+                up_handle,
+                activations,
+                outputs,
             )
         })
     }
@@ -3241,7 +3431,7 @@ mod tests {
             state.bad_numeric = false;
             state.bad_member = None;
         }
-        let limits = NativeQ2ProjectionLimits::new(128, 32, 6, Duration::from_secs(4))?
+        let limits = NativeQ2ProjectionLimits::new(256, 32, 12, Duration::from_secs(4))?
             .with_resident_weights(4096)?;
         let mut memory = vec![0_u8; limits.allocation_bytes()];
         let pointer = memory.as_mut_ptr().cast::<c_void>();
@@ -3267,7 +3457,7 @@ mod tests {
             extra_arena_count: 0,
             mapper: None,
             limits: limits.common,
-            mode: Mode::NativeQ2 { columns: 128 },
+            mode: Mode::NativeQ2 { columns: 256 },
             resident_weights: HmxQ2WeightRegistry::new(0)?,
             native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes())?,
             dirty_resident_weights: false,
@@ -3296,6 +3486,22 @@ mod tests {
         assert_eq!(session.report.operations_completed, 4);
         assert_eq!(session.report.queue_writes_completed, 1);
         assert_eq!(session.report.resident_submissions, 4);
+
+        let mut swiglu0 = [99.0_f32; 32];
+        let mut swiglu1 = [99.0_f32; 32];
+        NativeQ2Submitter::submit_resident_ffn_swiglu_multi2(
+            &mut session,
+            &h_a,
+            &h_b,
+            [&act0, &act1],
+            [&mut swiglu0, &mut swiglu1],
+        )?;
+        // Token 0 GluSwiglu is Op 2 (tensor 8 -> 7.0 + 2.0 = 9.0); Token 1 GluSwiglu is Op 5 (tensor 17 -> 7.0 + 5.0 = 12.0).
+        assert_eq!(swiglu0, [9.0_f32; 32]);
+        assert_eq!(swiglu1, [12.0_f32; 32]);
+        assert_eq!(session.report.operations_completed, 10);
+        assert_eq!(session.report.queue_writes_completed, 2);
+        assert_eq!(session.report.resident_submissions, 8);
         Ok(())
     }
 }

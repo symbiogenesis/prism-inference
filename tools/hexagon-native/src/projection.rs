@@ -235,7 +235,7 @@ pub(crate) fn request_batch_buffers(
     batch_operations: u32,
     n_bufs: u32,
 ) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
-    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 8 | 10)
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 6 | 8 | 10)
         || !(1..=6).contains(&n_bufs)
         || n_bufs > batch_operations + 1
     {
@@ -264,7 +264,7 @@ pub(crate) fn response_batch_buffers_valid(
     batch_operations: u32,
     n_bufs: u32,
 ) -> bool {
-    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 8 | 10)
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 6 | 8 | 10)
         || !(1..=6).contains(&n_bufs)
         || n_bufs > batch_operations + 1
         || sequence == 0

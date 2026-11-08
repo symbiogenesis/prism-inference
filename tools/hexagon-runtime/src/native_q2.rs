@@ -1796,6 +1796,174 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             self.statistics.projections_completed.saturating_add(2);
         Ok(())
     }
+
+    fn supports_f32_ffn_swiglu_inner(&self, gate: &Tensor, up: &Tensor) -> bool {
+        self.validate_f32_group(&[gate, up])
+            .is_some_and(|(_, rows, _)| rows[0] == rows[1])
+    }
+
+    /// Execute a fused `ffn_gate` + `ffn_up` + `HTP_OP_GLU_SWIGLU` chain across
+    /// a tile of `F32` token activations, batching pairs of tokens into 6-op
+    /// DSP queue submissions with per-token VTCM intermediate residency.
+    ///
+    /// # Errors
+    /// Rejects non-resident or mismatched tensors, non-finite inputs/outputs or
+    /// failed submissions, closing the executor on any failure.
+    pub fn project_f32_ffn_swiglu_tokens(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activations: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let result = self.project_f32_ffn_swiglu_tokens_inner(gate, up, activations, outputs);
+        if result.is_err() {
+            self.failed = true;
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep 2-token 6-op fused FFN SwiGLU resident dispatch and odd-tail handling together."
+    )]
+    fn project_f32_ffn_swiglu_tokens_inner(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activations: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if activations.len() != outputs.len() {
+            return Err(invalid(
+                "mismatched F32 FFN SwiGLU token projection outputs",
+            ));
+        }
+        if activations.is_empty() {
+            return Ok(());
+        }
+        let tensors = [gate, up];
+        let Some((columns, rows_per_member, cached_indices)) = self.validate_f32_group(&tensors)
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon fused FFN SwiGLU projection group",
+            ));
+        };
+        let rows = rows_per_member[0];
+        if rows_per_member[1] != rows {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        for activation in activations {
+            if activation.len() != columns {
+                return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+            }
+            finite_slice(activation)?;
+        }
+        let mut weights = Vec::new();
+        for (member, &tensor) in tensors.iter().enumerate() {
+            if cached_indices[member].is_none() {
+                let max_mapped_rows = rows.next_multiple_of(32);
+                let required_bytes = max_mapped_rows * 36 * (columns / 128);
+                if weights.len() < required_bytes {
+                    weights
+                        .try_reserve(required_bytes - weights.len())
+                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+                    weights.resize(required_bytes, 0_u8);
+                }
+                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
+        }
+        let mut indices = [0_usize; 2];
+        if let Some(cache) = &mut self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                let idx = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+                let hits = if cache.projections[idx].evaluated {
+                    u64::try_from(activations.len())?
+                } else {
+                    cache.projections[idx].evaluated = true;
+                    u64::try_from(activations.len().saturating_sub(1))?
+                };
+                cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(hits);
+                indices[member] = idx;
+            }
+        }
+        for output in outputs.iter_mut() {
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, f32::NAN);
+            }
+        }
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let gate_handle = &cache.handles[cache.projections[indices[0]].first_handle];
+        let up_handle = &cache.handles[cache.projections[indices[1]].first_handle];
+        let mut rem_act = activations;
+        let mut rem_out = outputs;
+        while !rem_act.is_empty() {
+            if rem_act.len() >= 2 {
+                let (act_chunk, next_act) = rem_act.split_at(2);
+                let (out_chunk, next_out) = rem_out.split_at_mut(2);
+                rem_act = next_act;
+                rem_out = next_out;
+                let [o0, o1] = out_chunk else {
+                    return Err(invalid("unexpected FFN SwiGLU token slice"));
+                };
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(6);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_ffn_swiglu_multi2(
+                    gate_handle,
+                    up_handle,
+                    [act_chunk[0].as_slice(), act_chunk[1].as_slice()],
+                    [o0.as_mut_slice(), o1.as_mut_slice()],
+                )?;
+                finite_slice(o0)?;
+                finite_slice(o1)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(6);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(4);
+            } else {
+                let a0 = rem_act[0].as_slice();
+                let o0 = &mut rem_out[0];
+                rem_act = &[];
+                rem_out = &mut [];
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(3);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_ffn_swiglu(
+                    gate_handle,
+                    up_handle,
+                    a0,
+                    o0.as_mut_slice(),
+                )?;
+                finite_slice(o0)?;
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(3);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(2);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
@@ -1983,6 +2151,32 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
         }
         result
     }
+
+    fn supports_f32_ffn_swiglu(&self, gate: &Tensor, up: &Tensor) -> bool {
+        self.supports_f32_ffn_swiglu_inner(gate, up)
+    }
+
+    fn project_f32_ffn_swiglu(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activation: &[f32],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Self::project_f32_ffn_swiglu(self, gate, up, activation, output)
+    }
+
+    fn project_f32_ffn_swiglu_tokens(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activations: &[Vec<f32>],
+        _pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        Self::project_f32_ffn_swiglu_tokens(self, gate, up, activations, outputs)
+    }
 }
 
 fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
@@ -2155,6 +2349,11 @@ mod tests {
         residency_bytes: usize,
     }
 
+    #[allow(
+        clippy::suspicious_operation_groupings,
+        clippy::suboptimal_flops,
+        reason = "Test mock compares handle geometry against activation/output slice lengths."
+    )]
     impl NativeQ2Submitter for MockNativeSubmitter {
         fn remaining_operations(&self) -> Option<u64> {
             Some(self.remaining.saturating_sub(self.calls))
@@ -2332,6 +2531,33 @@ mod tests {
             let sum = activation.iter().sum::<f32>();
             output.fill(0.0);
             output[0] = sum * 2.0;
+            Ok(())
+        }
+
+        fn submit_resident_ffn_swiglu_multi2(
+            &mut self,
+            gate_handle: &NativeQ2WeightHandle,
+            up_handle: &NativeQ2WeightHandle,
+            activations: [&[f32]; 2],
+            outputs: [&mut [f32]; 2],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 6;
+            self.resident_calls += 4;
+            if gate_handle.columns() != up_handle.columns()
+                || gate_handle.rows() != up_handle.rows()
+            {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            for token in 0..2 {
+                if activations[token].len() != gate_handle.columns()
+                    || outputs[token].len() != gate_handle.rows()
+                {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                let sum = activations[token].iter().sum::<f32>();
+                outputs[token].fill(0.0);
+                outputs[token][0] = sum * 2.0 + f32::from(u8::try_from(token).unwrap_or(0));
+            }
             Ok(())
         }
 
@@ -2520,6 +2746,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        clippy::similar_names,
         reason = "Keep single-token and multi-token 2/3-sibling batching assertions together."
     )]
     fn native_q2_batches_two_and_three_resident_sibling_projections_in_single_queue_writes()
@@ -2704,6 +2931,28 @@ mod tests {
         assert_eq!(ffn_executor.queue_writes_completed(), 1);
         assert_eq!(ffn_executor.statistics().operations_completed, 3);
         assert_eq!(ffn_executor.statistics().projections_completed, 2);
+
+        let mut swiglu_outs = vec![Vec::new(); 5];
+        assert!(Pq2ProjectionExecutor::supports_f32_ffn_swiglu(
+            &ffn_executor,
+            &ffn_gate,
+            &ffn_up
+        ));
+        Pq2ProjectionExecutor::project_f32_ffn_swiglu_tokens(
+            &mut ffn_executor,
+            &ffn_gate,
+            &ffn_up,
+            &acts,
+            true,
+            &mut swiglu_outs,
+        )?;
+        // 5 tokens = two 2-token 6-op submissions + one 1-token 3-op submission = 15 ops across 3 queue writes.
+        assert_eq!(ffn_executor.queue_writes_completed(), 4);
+        assert_eq!(ffn_executor.statistics().operations_completed, 18);
+        assert_eq!(ffn_executor.statistics().projections_completed, 12);
+        assert_eq!(swiglu_outs[0][0], 512.0);
+        assert_eq!(swiglu_outs[1][0], 1025.0);
+        assert_eq!(swiglu_outs[4][0], 2560.0);
         Ok(())
     }
 }

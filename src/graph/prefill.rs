@@ -532,7 +532,7 @@ impl Qwen35 {
                 }
             }
             check()?;
-            let _ = project_tile_pair(
+            project_tile_ffn_swiglu(
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
@@ -540,37 +540,16 @@ impl Qwen35 {
                 self.adapter_scale,
                 &mut self.workspace.adapter,
                 &mut self.workspace.projection.matvec,
-                [&layer.up, &layer.gate],
+                &layer.gate,
+                &layer.up,
                 &tile.normalized[..count],
-                &mut tile.up[..count],
                 &mut tile.gate[..count],
+                &mut tile.up[..count],
                 &mut tile.transformed[..count],
                 &mut tile.projector,
                 reborrow_executor(&mut executor),
                 check,
             )?;
-            if count > 1 && tile.projector.row_parallelism().workers() > 1 {
-                let gate_ref = &tile.gate[..count];
-                let arithmetic = self.arithmetic;
-                tile.projector.row_parallelism().update_chunks(
-                    &mut tile.up[..count],
-                    1,
-                    |base_tok, chunk| {
-                        for (offset, up) in chunk.iter_mut().enumerate() {
-                            arithmetic.swiglu_in_place(&gate_ref[base_tok + offset], up)?;
-                        }
-                        Ok(())
-                    },
-                )?;
-            } else {
-                for (up, gate) in tile.up[..count].iter_mut().zip(&tile.gate[..count]) {
-                    self.arithmetic.swiglu_in_place_with_parallelism(
-                        gate,
-                        up,
-                        tile.projector.row_parallelism(),
-                    )?;
-                }
-            }
             check()?;
             let _ = project_tile(
                 &self.transforms,
@@ -1083,6 +1062,104 @@ fn project_tile_pair<'a>(
         reborrow_executor(&mut executor),
         check,
     )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
+)]
+fn project_tile_ffn_swiglu(
+    transforms: &Transforms,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    gate: &Tensor,
+    up: &Tensor,
+    inputs: &[Vec<f32>],
+    gate_outputs: &mut [Vec<f32>],
+    up_outputs: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    projector: &mut ProjectionTile,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    if adapter.is_none()
+        && let Some(exec) = reborrow_executor(&mut executor)
+        && gate.kind == 142
+        && up.kind == 142
+        && transforms.basis(gate) == transforms.basis(up)
+        && exec.supports_f32_ffn_swiglu(gate, up)
+    {
+        let activation = transform_tile_inputs(
+            transforms,
+            geometry,
+            gate,
+            false,
+            inputs,
+            transformed,
+            projector.row_parallelism(),
+        )?;
+        check()?;
+        exec.project_f32_ffn_swiglu_tokens(
+            gate,
+            up,
+            activation,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+            up_outputs,
+        )?;
+        let rows = up
+            .dimensions
+            .get(1..)
+            .map_or(0, |dims| dims.iter().product::<usize>());
+        for out in up_outputs.iter() {
+            if out.len() != rows {
+                return Err(invalid("projection executor returned incomplete output"));
+            }
+            finite(out, "projection executor output")?;
+        }
+        return Ok(());
+    }
+    let _ = project_tile_pair(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        [up, gate],
+        inputs,
+        up_outputs,
+        gate_outputs,
+        transformed,
+        projector,
+        executor,
+        check,
+    )?;
+    let count = inputs.len();
+    if count > 1 && projector.row_parallelism().workers() > 1 {
+        let gate_ref = &gate_outputs[..count];
+        projector
+            .row_parallelism()
+            .update_chunks(&mut up_outputs[..count], 1, |base_tok, chunk| {
+                for (offset, up_out) in chunk.iter_mut().enumerate() {
+                    arithmetic.swiglu_in_place(&gate_ref[base_tok + offset], up_out)?;
+                }
+                Ok(())
+            })
+    } else {
+        for (up_out, gate_out) in up_outputs[..count].iter_mut().zip(&gate_outputs[..count]) {
+            arithmetic.swiglu_in_place_with_parallelism(
+                gate_out,
+                up_out,
+                projector.row_parallelism(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[allow(

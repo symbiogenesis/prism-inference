@@ -422,6 +422,66 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
         }
         result
     }
+
+    fn supports_f32_ffn_swiglu(&self, gate: &Tensor, up: &Tensor) -> bool {
+        self.f32_groups
+            && !self.faulted
+            && self.supports_f32(gate)
+            && self.supports_f32(up)
+            && self.executor.supports_f32_ffn_swiglu(gate, up)
+    }
+
+    fn project_f32_ffn_swiglu(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activation: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        if !self.supports_f32_ffn_swiglu(gate, up) {
+            output.clear();
+            return Err(invalid(
+                "unavailable explicit F32 FFN SwiGLU projection placement",
+            ));
+        }
+        let result = self
+            .executor
+            .project_f32_ffn_swiglu(gate, up, activation, pinned, output);
+        if result.is_err() {
+            self.faulted = true;
+            output.clear();
+        }
+        result
+    }
+
+    fn project_f32_ffn_swiglu_tokens(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if !self.supports_f32_ffn_swiglu(gate, up) {
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+            return Err(invalid(
+                "unavailable explicit F32 FFN SwiGLU projection placement",
+            ));
+        }
+        let result =
+            self.executor
+                .project_f32_ffn_swiglu_tokens(gate, up, activations, pinned, outputs);
+        if result.is_err() {
+            self.faulted = true;
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]

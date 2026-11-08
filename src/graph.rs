@@ -1965,12 +1965,7 @@ impl Qwen35 {
             // exact FFN operations while reusing their high-water allocations.
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
-            evaluation.project_group_into([&layer.up, &layer.gate], normalized, [up, gate])?;
-            self.arithmetic.swiglu_in_place_with_parallelism(
-                gate,
-                up,
-                evaluation.projection.matvec.row_parallelism(),
-            )?;
+            evaluation.project_ffn_swiglu_into(&layer.gate, &layer.up, normalized, gate, up)?;
             evaluation.project_into(&layer.down, up, attention)?;
             add(hidden, attention);
             finite(hidden, "decoder layer output")?;
@@ -2065,6 +2060,59 @@ impl Evaluation<'_, '_> {
         output: &mut Vec<f32>,
     ) -> Result<()> {
         self.project_group_into([tensor], input, [output])
+    }
+
+    fn project_ffn_swiglu_into(
+        &mut self,
+        gate_weight: &Tensor,
+        up_weight: &Tensor,
+        input: &[f32],
+        gate: &mut Vec<f32>,
+        up: &mut Vec<f32>,
+    ) -> Result<()> {
+        if self.adapter.is_none()
+            && self.transforms.basis(gate_weight) == self.transforms.basis(up_weight)
+            && self
+                .executor
+                .as_deref()
+                .is_some_and(|exec| exec.supports_f32_ffn_swiglu(gate_weight, up_weight))
+        {
+            let basis = self.transforms.basis(gate_weight);
+            let activation = if basis.0 {
+                self.transforms.transform_into_with_parallelism(
+                    gate_weight,
+                    input,
+                    self.geometry,
+                    self.projection.matvec.row_parallelism(),
+                    &mut self.projection.transformed,
+                )?;
+                #[cfg(test)]
+                {
+                    self.projection.transforms += 1;
+                }
+                self.projection.transformed.as_slice()
+            } else {
+                input
+            };
+            let mut prepared = self
+                .projection
+                .matvec
+                .prepare_f32_executor(gate_weight, activation)?;
+            if let Some(executor) = self.executor.as_deref_mut() {
+                return prepared.matvec_ffn_swiglu_with_executor(
+                    gate_weight,
+                    up_weight,
+                    up,
+                    executor,
+                );
+            }
+        }
+        self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
+        self.arithmetic.swiglu_in_place_with_parallelism(
+            gate,
+            up,
+            self.projection.matvec.row_parallelism(),
+        )
     }
 
     #[allow(

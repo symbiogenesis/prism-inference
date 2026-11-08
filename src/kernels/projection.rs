@@ -206,9 +206,104 @@ pub trait Pq2ProjectionExecutor {
         }
         Ok(())
     }
+
+    /// Opt in to a fused `ffn_gate` + `ffn_up` + `SwiGLU` submission for a pair
+    /// of compatible `PQ2_0` FFN projections sharing one `F32` activation vector.
+    fn supports_f32_ffn_swiglu(&self, _gate: &Tensor, _up: &Tensor) -> bool {
+        false
+    }
+
+    /// Execute a fused `ffn_gate` + `ffn_up` + `SwiGLU(gate(x), up(x))` chain
+    /// in a single executor submission.
+    ///
+    /// # Errors
+    /// Rejects unsupported fusion, submission failures and invalid output.
+    fn project_f32_ffn_swiglu(
+        &mut self,
+        _gate: &Tensor,
+        _up: &Tensor,
+        _activation: &[f32],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(invalid(
+            "projection executor does not support fused F32 FFN SwiGLU",
+        ))
+    }
+
+    /// Execute a fused `ffn_gate` + `ffn_up` + `SwiGLU(gate(x), up(x))` chain
+    /// across a tile of `F32` token activations.
+    ///
+    /// # Errors
+    /// Rejects mismatched slice lengths, unsupported fusion or submission failures.
+    fn project_f32_ffn_swiglu_tokens(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activations: &[Vec<f32>],
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if activations.len() != outputs.len() {
+            return Err(invalid(
+                "mismatched F32 FFN SwiGLU token projection outputs",
+            ));
+        }
+        for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
+            self.project_f32_ffn_swiglu(gate, up, activation, pinned, output)?;
+        }
+        Ok(())
+    }
 }
 
 impl PreparedMatvec<'_> {
+    /// Execute a fused `ffn_gate` + `ffn_up` + `SwiGLU` chain in a single
+    /// executor call when supported by `executor`.
+    ///
+    /// # Errors
+    /// Rejects incompatible preparation, executor failures or incomplete output.
+    pub fn matvec_ffn_swiglu_with_executor(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        output: &mut Vec<f32>,
+        executor: &mut dyn Pq2ProjectionExecutor,
+    ) -> Result<()> {
+        let result = (|| {
+            let (gate_cols, gate_rows, _) = dimensions(gate)?;
+            let (up_cols, up_rows, _) = dimensions(up)?;
+            if !self.is_compatible(gate)?
+                || !self.is_compatible(up)?
+                || gate.kind != PQ2
+                || up.kind != PQ2
+                || gate_cols != up_cols
+                || gate_rows != up_rows
+                || !gate_cols.is_multiple_of(128)
+            {
+                return Err(invalid(
+                    "incompatible prepared projection executor activation",
+                ));
+            }
+            executor.project_f32_ffn_swiglu(
+                gate,
+                up,
+                self.input,
+                self.scratch.pinned_accumulation,
+                output,
+            )?;
+            if output.len() != gate_rows {
+                return Err(invalid("projection executor returned incomplete output"));
+            }
+            if !is_finite_slice(output) {
+                return Err(invalid("non-finite value in runtime path"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            output.clear();
+        }
+        result
+    }
     /// Execute a group of compatible `PQ2_0` sibling projections in a single
     /// batched executor call when supported by `executor`.
     ///

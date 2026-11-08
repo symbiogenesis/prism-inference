@@ -30,6 +30,7 @@ impl Work {
             return Ok(None);
         }
         let mut work = Self::default();
+        let mut extra_hidden = 0_u64;
         let mut add = |tensor: &Tensor| -> Result<()> {
             work.hidden = work
                 .hidden
@@ -64,7 +65,19 @@ impl Work {
             for tensor in [&layer.up, &layer.gate, &layer.down] {
                 add(tensor)?;
             }
+            if decoder.adapter.is_none()
+                && decoder.transforms.basis(&layer.gate) == decoder.transforms.basis(&layer.up)
+                && executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up)
+            {
+                extra_hidden = extra_hidden
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("projection work count overflow"))?;
+            }
         }
+        work.hidden = work
+            .hidden
+            .checked_add(extra_hidden)
+            .ok_or_else(|| invalid("projection work count overflow"))?;
         work.output = projection_operations(executor, &decoder.output)?;
         Ok(Some(work))
     }

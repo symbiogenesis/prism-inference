@@ -253,6 +253,31 @@ pub(super) fn dot(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32> {
     }
     let mut result = 0.0;
     for (block, activation) in bytes.chunks_exact(size).zip(input) {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        let integer = if kind == Q4_1 {
+            integer_float(super::neon::dot_q4_1_block(
+                block[4..20].try_into()?,
+                &activation.values,
+            ))
+        } else {
+            integer_float(super::neon::dot_i16_block(
+                &codes(kind, block),
+                &activation.values,
+            ))
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        )))]
         let integer = super::dot_integer(&codes(kind, block), &activation.values);
         let mut value = (scale(block)? * activation.scale) * integer;
         if kind != Q5_0 {

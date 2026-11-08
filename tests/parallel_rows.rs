@@ -177,4 +177,45 @@ mod enabled {
         assert_eq!(output, Vec::<f32>::new());
         Ok(())
     }
+
+    #[test]
+    fn parallel_rows_preserve_legacy_kquant_and_additional_quant_matvecs() -> Result<()> {
+        use bonsai_prism_runtime::kernels::quantize_row;
+
+        let policy = RowParallelism::new(3)?;
+        let width = 256;
+        let rows = 19;
+        let input: Vec<f32> = (0..width)
+            .map(|index| [0.0, -0.0, 1.5, -2.5, 63.5, -127.0][index % 6])
+            .collect();
+        for kind in [2_u32, 3, 6, 7, 8, 12, 14, 34, 35, 39, 41, 42] {
+            let mut data = Vec::new();
+            for row in 0..rows {
+                let row_f32: Vec<f32> = (0..width)
+                    .map(|col| {
+                        let s = (row * 17 + col * 11) % 31;
+                        (f32::from(u8::try_from(s).unwrap_or(0)) - 15.0) * 0.125
+                    })
+                    .collect();
+                data.extend_from_slice(&quantize_row(kind, &row_f32)?);
+            }
+            let tensor = Tensor {
+                name: format!("parallel-quant-{kind}"),
+                dimensions: vec![width, rows],
+                kind,
+                data: Arc::from(data),
+            };
+            for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                let mut serial = MatvecScratch::with_backend(backend);
+                let mut parallel = MatvecScratch::with_backend(backend);
+                parallel.set_row_parallelism(policy.clone());
+                let mut expected = Vec::new();
+                let mut actual = Vec::new();
+                matvec_into(&tensor, &input, &mut expected, &mut serial)?;
+                matvec_into(&tensor, &input, &mut actual, &mut parallel)?;
+                assert_bits(&actual, &expected);
+            }
+        }
+        Ok(())
+    }
 }

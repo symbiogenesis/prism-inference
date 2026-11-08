@@ -1145,14 +1145,42 @@ fn dot_legacy(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32> {
     let (_, block_bytes) = layout(kind)?;
     let mut output = 0.0;
     for (block, activation) in bytes.chunks_exact(block_bytes).zip(input) {
-        let values: [i16; 32] = std::array::from_fn(|index| {
-            if kind == Q4_0 {
-                i16::from((block[2 + index % 16] >> (4 * (index / 16))) & 15) - 8
-            } else {
-                i16::from(i8::from_ne_bytes([block[2 + index]]))
-            }
-        });
-        output += (scale(block)? * activation.scale) * dot_integer(&values, &activation.values);
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        let integer = if kind == Q4_0 {
+            integer_float(neon::dot_q4_0_block(
+                block[2..18].try_into()?,
+                &activation.values,
+            ))
+        } else {
+            integer_float(neon::dot_q8_0_block(
+                block[2..34].try_into()?,
+                &activation.values,
+            ))
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        )))]
+        let integer = {
+            let values: [i16; 32] = std::array::from_fn(|index| {
+                if kind == Q4_0 {
+                    i16::from((block[2 + index % 16] >> (4 * (index / 16))) & 15) - 8
+                } else {
+                    i16::from(i8::from_ne_bytes([block[2 + index]]))
+                }
+            });
+            dot_integer(&values, &activation.values)
+        };
+        output += (scale(block)? * activation.scale) * integer;
     }
     finite(output)
 }
@@ -2227,33 +2255,38 @@ impl PreparedMatvec<'_> {
                     target_feature = "neon"
                 )))]
                 {
-                    output.clear();
-                    output.try_reserve_exact(rows)?;
-                    for bytes in tensor.data.chunks_exact(row_bytes) {
-                        output.push(bf16_dot(bytes, &scratch.activations)?);
-                    }
+                    let activations = &scratch.activations;
+                    scratch.row_parallelism.fill(
+                        &tensor.data,
+                        row_bytes,
+                        output,
+                        &mut scratch.row_errors,
+                        |bytes| bf16_dot(bytes, activations),
+                    )?;
                 }
             }
             16..=23 | 29 | 34 | 35 | 39..=42 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
-                output.clear();
-                output.try_reserve_exact(rows)?;
-                for bytes in tensor.data.chunks_exact(row_bytes) {
-                    output.push(dot_additional(
-                        tensor.kind,
-                        bytes,
-                        &scratch.q8,
-                        &scratch.q8k,
-                    )?);
-                }
+                let q8 = &scratch.q8;
+                let q8k = &scratch.q8k;
+                scratch.row_parallelism.fill(
+                    &tensor.data,
+                    row_bytes,
+                    output,
+                    &mut scratch.row_errors,
+                    |bytes| dot_additional(tensor.kind, bytes, q8, q8k),
+                )?;
             }
             10..=14 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
-                output.clear();
-                output.try_reserve_exact(rows)?;
-                for bytes in tensor.data.chunks_exact(row_bytes) {
-                    output.push(kquants::dot(tensor.kind, bytes, &scratch.q8k)?);
-                }
+                let q8k = &scratch.q8k;
+                scratch.row_parallelism.fill(
+                    &tensor.data,
+                    row_bytes,
+                    output,
+                    &mut scratch.row_errors,
+                    |bytes| kquants::dot(tensor.kind, bytes, q8k),
+                )?;
             }
             PQ2 if columns.is_multiple_of(256) => {
                 let dot = scratch.select_pq2();
@@ -2327,11 +2360,45 @@ impl PreparedMatvec<'_> {
             }
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
-                output.clear();
-                output.try_reserve_exact(rows)?;
-                for bytes in tensor.data.chunks_exact(row_bytes) {
-                    output.push(dot_legacy(tensor.kind, bytes, &scratch.q8)?);
+                let q8 = &scratch.q8;
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                if matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon) {
+                    if tensor.kind == Q8_0 {
+                        return scratch.row_parallelism.fill_four_rows(
+                            &tensor.data,
+                            row_bytes,
+                            output,
+                            &mut scratch.row_errors,
+                            |rows| neon::dot_q8_0_eight_rows(rows, q8),
+                            |rows| neon::dot_q8_0_four_rows(rows, q8),
+                            |bytes| dot_legacy(Q8_0, bytes, q8),
+                        );
+                    }
+                    if tensor.kind == Q4_0 {
+                        return scratch.row_parallelism.fill_four_rows(
+                            &tensor.data,
+                            row_bytes,
+                            output,
+                            &mut scratch.row_errors,
+                            |rows| neon::dot_q4_0_eight_rows(rows, q8),
+                            |rows| neon::dot_q4_0_four_rows(rows, q8),
+                            |bytes| dot_legacy(Q4_0, bytes, q8),
+                        );
+                    }
                 }
+                scratch.row_parallelism.fill(
+                    &tensor.data,
+                    row_bytes,
+                    output,
+                    &mut scratch.row_errors,
+                    |bytes| dot_legacy(tensor.kind, bytes, q8),
+                )?;
             }
             _ => {
                 scratch.diagnostics = scratch.diagnostics.select(false);

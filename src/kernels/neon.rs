@@ -132,6 +132,120 @@ pub(super) fn dot_tq2_block(packed: &[u8; 64], activations: &[i8; 256]) -> i32 {
 }
 
 #[inline]
+fn dot_q8_0_block_preloaded(
+    neon: Neon,
+    weights: &[u8; 32],
+    a0_l: i16x8<Neon>,
+    a0_h: i16x8<Neon>,
+    a1_l: i16x8<Neon>,
+    a1_h: i16x8<Neon>,
+) -> i32 {
+    let (w0_l, w0_h) = u8x16::from_slice(neon, &weights[..16])
+        .bitcast::<i8x16<Neon>>()
+        .widen();
+    let (w1_l, w1_h) = u8x16::from_slice(neon, &weights[16..])
+        .bitcast::<i8x16<Neon>>()
+        .widen();
+    let (p00_l, p00_h) = (w0_l * a0_l).widen();
+    let (p01_l, p01_h) = (w0_h * a0_h).widen();
+    let (p10_l, p10_h) = (w1_l * a1_l).widen();
+    let (p11_l, p11_h) = (w1_h * a1_h).widen();
+    ((p00_l + p00_h) + (p01_l + p01_h) + (p10_l + p10_h) + (p11_l + p11_h)).reduce_sum()
+}
+
+/// Computes the exact 32-element integer dot product of a `Q8_0` weight block
+/// against a 32-element `Q8_0` activation slice.
+#[inline]
+pub(super) fn dot_q8_0_block(weights: &[u8; 32], activations: &[i8; 32]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return weights
+            .iter()
+            .zip(activations)
+            .map(|(&w, &a)| i32::from(i8::from_ne_bytes([w])) * i32::from(a))
+            .sum();
+    };
+    let (a0_l, a0_h) = i8x16::from_slice(neon, &activations[..16]).widen();
+    let (a1_l, a1_h) = i8x16::from_slice(neon, &activations[16..]).widen();
+    dot_q8_0_block_preloaded(neon, weights, a0_l, a0_h, a1_l, a1_h)
+}
+
+#[inline]
+fn dot_q4_0_block_preloaded(
+    neon: Neon,
+    packed: &[u8; 16],
+    a0_l: i16x8<Neon>,
+    a0_h: i16x8<Neon>,
+    a1_l: i16x8<Neon>,
+    a1_h: i16x8<Neon>,
+) -> i32 {
+    let raw = u8x16::from_slice(neon, packed);
+    let (w0_l, w0_h) = ((raw & 15).bitcast::<i8x16<Neon>>() - 8).widen();
+    let (w1_l, w1_h) = ((raw >> 4).bitcast::<i8x16<Neon>>() - 8).widen();
+    let pairs = (w0_l * a0_l + w0_h * a0_h) + (w1_l * a1_l + w1_h * a1_h);
+    pq2_reduce(pairs)
+}
+
+/// Computes the exact 32-element integer dot product of a 16-byte `Q4_0` nibble
+/// payload against a 32-element `Q8_0` activation slice.
+#[inline]
+pub(super) fn dot_q4_0_block(packed: &[u8; 16], activations: &[i8; 32]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return (0..32)
+            .map(|index| {
+                let w = i32::from((packed[index % 16] >> (4 * (index / 16))) & 15) - 8;
+                w * i32::from(activations[index])
+            })
+            .sum();
+    };
+    let (a0_l, a0_h) = i8x16::from_slice(neon, &activations[..16]).widen();
+    let (a1_l, a1_h) = i8x16::from_slice(neon, &activations[16..]).widen();
+    dot_q4_0_block_preloaded(neon, packed, a0_l, a0_h, a1_l, a1_h)
+}
+
+/// Computes the exact 32-element integer dot product of a 16-byte `Q4_1` nibble
+/// payload against a 32-element `Q8_1` activation slice.
+#[inline]
+pub(super) fn dot_q4_1_block(packed: &[u8; 16], activations: &[i8; 32]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return (0..32)
+            .map(|index| {
+                let w = i32::from((packed[index % 16] >> (4 * (index / 16))) & 15);
+                w * i32::from(activations[index])
+            })
+            .sum();
+    };
+    let raw = u8x16::from_slice(neon, packed);
+    let (w0_l, w0_h) = (raw & 15).bitcast::<i8x16<Neon>>().widen();
+    let (w1_l, w1_h) = (raw >> 4).bitcast::<i8x16<Neon>>().widen();
+    let (a0_l, a0_h) = i8x16::from_slice(neon, &activations[..16]).widen();
+    let (a1_l, a1_h) = i8x16::from_slice(neon, &activations[16..]).widen();
+    let pairs = (w0_l * a0_l + w0_h * a0_h) + (w1_l * a1_l + w1_h * a1_h);
+    pq2_reduce(pairs)
+}
+
+/// Computes the exact 32-element integer dot product of a decoded 5-bit `i16`
+/// weight block against a 32-element `Q8` activation slice.
+#[inline]
+pub(super) fn dot_i16_block(weights: &[i16; 32], activations: &[i8; 32]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return weights
+            .iter()
+            .zip(activations)
+            .map(|(&w, &a)| i32::from(w) * i32::from(a))
+            .sum();
+    };
+    let (a0_l, a0_h) = i8x16::from_slice(neon, &activations[..16]).widen();
+    let (a1_l, a1_h) = i8x16::from_slice(neon, &activations[16..]).widen();
+    let (p0_l, p0_h) = (i16x8::from_slice(neon, &weights[..8]) * a0_l
+        + i16x8::from_slice(neon, &weights[8..16]) * a0_h)
+        .widen();
+    let (p1_l, p1_h) = (i16x8::from_slice(neon, &weights[16..24]) * a1_l
+        + i16x8::from_slice(neon, &weights[24..]) * a1_h)
+        .widen();
+    ((p0_l + p0_h) + (p1_l + p1_h)).reduce_sum()
+}
+
+#[inline]
 #[allow(
     clippy::too_many_arguments,
     reason = "Passes the eight pre-widened activation planes directly in NEON registers."
@@ -2134,6 +2248,236 @@ pub(super) fn dot_ptq1_eight_rows_source(
     Ok(outputs)
 }
 
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> Result<[f32; 4]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return Ok([
+            super::dot_legacy(super::Q8_0, rows[0], input)?,
+            super::dot_legacy(super::Q8_0, rows[1], input)?,
+            super::dot_legacy(super::Q8_0, rows[2], input)?,
+            super::dot_legacy(super::Q8_0, rows[3], input)?,
+        ]);
+    };
+    let mut outputs = [0.0_f32; 4];
+    let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let chunks = rows.map(|row| row.as_chunks::<34>().0);
+    for (index, activation) in input.iter().enumerate() {
+        let b0 = &chunks[0][index];
+        let b1 = &chunks[1][index];
+        let b2 = &chunks[2][index];
+        let b3 = &chunks[3][index];
+        let scales_vec = f16_bits_to_f32_x4(
+            neon,
+            [
+                u16::from_le_bytes([b0[0], b0[1]]),
+                u16::from_le_bytes([b1[0], b1[1]]),
+                u16::from_le_bytes([b2[0], b2[1]]),
+                u16::from_le_bytes([b3[0], b3[1]]),
+            ],
+        );
+        scales_finite &= scales_vec.is_finite();
+        let row_scales = scales_vec.to_array();
+        let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+        let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+        let blocks = [b0, b1, b2, b3];
+        for r in 0..4 {
+            let weights: &[u8; 32] = blocks[r][2..34].try_into()?;
+            let sum = super::integer_float(dot_q8_0_block_preloaded(
+                neon, weights, a0_l, a0_h, a1_l, a1_h,
+            ));
+            outputs[r] += (row_scales[r] * activation.scale) * sum;
+        }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    for out in &mut outputs {
+        *out = super::finite(*out)?;
+    }
+    Ok(outputs)
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) -> Result<[f32; 8]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        let first = dot_q8_0_four_rows([rows[0], rows[1], rows[2], rows[3]], input)?;
+        let second = dot_q8_0_four_rows([rows[4], rows[5], rows[6], rows[7]], input)?;
+        return Ok([
+            first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
+        ]);
+    };
+    let mut outputs = [0.0_f32; 8];
+    let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let chunks = rows.map(|row| row.as_chunks::<34>().0);
+    for (index, activation) in input.iter().enumerate() {
+        let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                u16::from_le_bytes([chunks[0][index][0], chunks[0][index][1]]),
+                u16::from_le_bytes([chunks[1][index][0], chunks[1][index][1]]),
+                u16::from_le_bytes([chunks[2][index][0], chunks[2][index][1]]),
+                u16::from_le_bytes([chunks[3][index][0], chunks[3][index][1]]),
+                u16::from_le_bytes([chunks[4][index][0], chunks[4][index][1]]),
+                u16::from_le_bytes([chunks[5][index][0], chunks[5][index][1]]),
+                u16::from_le_bytes([chunks[6][index][0], chunks[6][index][1]]),
+                u16::from_le_bytes([chunks[7][index][0], chunks[7][index][1]]),
+            ],
+        );
+        scales_finite = scales_finite & scales_lo.is_finite() & scales_hi.is_finite();
+        let scales_lo_arr = scales_lo.to_array();
+        let scales_hi_arr = scales_hi.to_array();
+        let row_scales = [
+            scales_lo_arr[0],
+            scales_lo_arr[1],
+            scales_lo_arr[2],
+            scales_lo_arr[3],
+            scales_hi_arr[0],
+            scales_hi_arr[1],
+            scales_hi_arr[2],
+            scales_hi_arr[3],
+        ];
+        let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+        let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+        for r in 0..8 {
+            let weights: &[u8; 32] = chunks[r][index][2..34].try_into()?;
+            let sum = super::integer_float(dot_q8_0_block_preloaded(
+                neon, weights, a0_l, a0_h, a1_l, a1_h,
+            ));
+            outputs[r] += (row_scales[r] * activation.scale) * sum;
+        }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    for out in &mut outputs {
+        *out = super::finite(*out)?;
+    }
+    Ok(outputs)
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub(super) fn dot_q4_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> Result<[f32; 4]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return Ok([
+            super::dot_legacy(super::Q4_0, rows[0], input)?,
+            super::dot_legacy(super::Q4_0, rows[1], input)?,
+            super::dot_legacy(super::Q4_0, rows[2], input)?,
+            super::dot_legacy(super::Q4_0, rows[3], input)?,
+        ]);
+    };
+    let mut outputs = [0.0_f32; 4];
+    let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let chunks = rows.map(|row| row.as_chunks::<18>().0);
+    for (index, activation) in input.iter().enumerate() {
+        let b0 = &chunks[0][index];
+        let b1 = &chunks[1][index];
+        let b2 = &chunks[2][index];
+        let b3 = &chunks[3][index];
+        let scales_vec = f16_bits_to_f32_x4(
+            neon,
+            [
+                u16::from_le_bytes([b0[0], b0[1]]),
+                u16::from_le_bytes([b1[0], b1[1]]),
+                u16::from_le_bytes([b2[0], b2[1]]),
+                u16::from_le_bytes([b3[0], b3[1]]),
+            ],
+        );
+        scales_finite &= scales_vec.is_finite();
+        let row_scales = scales_vec.to_array();
+        let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+        let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+        let blocks = [b0, b1, b2, b3];
+        for r in 0..4 {
+            let packed: &[u8; 16] = blocks[r][2..18].try_into()?;
+            let sum = super::integer_float(dot_q4_0_block_preloaded(
+                neon, packed, a0_l, a0_h, a1_l, a1_h,
+            ));
+            outputs[r] += (row_scales[r] * activation.scale) * sum;
+        }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    for out in &mut outputs {
+        *out = super::finite(*out)?;
+    }
+    Ok(outputs)
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub(super) fn dot_q4_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) -> Result<[f32; 8]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        let first = dot_q4_0_four_rows([rows[0], rows[1], rows[2], rows[3]], input)?;
+        let second = dot_q4_0_four_rows([rows[4], rows[5], rows[6], rows[7]], input)?;
+        return Ok([
+            first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
+        ]);
+    };
+    let mut outputs = [0.0_f32; 8];
+    let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let chunks = rows.map(|row| row.as_chunks::<18>().0);
+    for (index, activation) in input.iter().enumerate() {
+        let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                u16::from_le_bytes([chunks[0][index][0], chunks[0][index][1]]),
+                u16::from_le_bytes([chunks[1][index][0], chunks[1][index][1]]),
+                u16::from_le_bytes([chunks[2][index][0], chunks[2][index][1]]),
+                u16::from_le_bytes([chunks[3][index][0], chunks[3][index][1]]),
+                u16::from_le_bytes([chunks[4][index][0], chunks[4][index][1]]),
+                u16::from_le_bytes([chunks[5][index][0], chunks[5][index][1]]),
+                u16::from_le_bytes([chunks[6][index][0], chunks[6][index][1]]),
+                u16::from_le_bytes([chunks[7][index][0], chunks[7][index][1]]),
+            ],
+        );
+        scales_finite = scales_finite & scales_lo.is_finite() & scales_hi.is_finite();
+        let scales_lo_arr = scales_lo.to_array();
+        let scales_hi_arr = scales_hi.to_array();
+        let row_scales = [
+            scales_lo_arr[0],
+            scales_lo_arr[1],
+            scales_lo_arr[2],
+            scales_lo_arr[3],
+            scales_hi_arr[0],
+            scales_hi_arr[1],
+            scales_hi_arr[2],
+            scales_hi_arr[3],
+        ];
+        let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+        let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+        for r in 0..8 {
+            let packed: &[u8; 16] = chunks[r][index][2..18].try_into()?;
+            let sum = super::integer_float(dot_q4_0_block_preloaded(
+                neon, packed, a0_l, a0_h, a1_l, a1_h,
+            ));
+            outputs[r] += (row_scales[r] * activation.scale) * sum;
+        }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    for out in &mut outputs {
+        *out = super::finite(*out)?;
+    }
+    Ok(outputs)
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -2673,8 +3017,10 @@ pub(super) fn hadamard_into(
 #[cfg(test)]
 mod tests {
     use super::{
-        block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_ptq1_groups, hadamard,
-        hadamard_into, round_bf16_into, round_f16_into, round_f16_slice,
+        block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_i16_block,
+        dot_ptq1_groups, dot_q4_0_block, dot_q4_0_eight_rows, dot_q4_0_four_rows, dot_q4_1_block,
+        dot_q8_0_block, dot_q8_0_eight_rows, dot_q8_0_four_rows, hadamard, hadamard_into,
+        round_bf16_into, round_f16_into, round_f16_slice,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -3163,6 +3509,131 @@ mod tests {
                     .collect::<Vec<u32>>(),
                 "round_f16_into mismatch at len={len}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Cover Q8_0, Q4_0, Q4_1, and i16 block dots plus 4/8-row NEON batching together."
+    )]
+    fn simd_neon_q8_0_and_q4_0_block_and_multirow_parity() -> TestResult {
+        for value in [i8::MIN, -127, -1, 0, 1, i8::MAX] {
+            let activations = [value; 32];
+            for byte in [0_u8, 1, 0x7f, 0x80, 0xfe, 0xff] {
+                let w8 = [byte; 32];
+                let expected_q8: i32 = w8
+                    .iter()
+                    .zip(activations)
+                    .map(|(&w, a)| i32::from(i8::from_ne_bytes([w])) * i32::from(a))
+                    .sum();
+                assert_eq!(dot_q8_0_block(&w8, &activations), expected_q8);
+
+                let w4 = [byte; 16];
+                let expected_q4_0: i32 = (0..32)
+                    .map(|idx| {
+                        (i32::from((w4[idx % 16] >> (4 * (idx / 16))) & 15) - 8)
+                            * i32::from(activations[idx])
+                    })
+                    .sum();
+                assert_eq!(dot_q4_0_block(&w4, &activations), expected_q4_0);
+
+                let expected_q4_1: i32 = (0..32)
+                    .map(|idx| {
+                        i32::from((w4[idx % 16] >> (4 * (idx / 16))) & 15)
+                            * i32::from(activations[idx])
+                    })
+                    .sum();
+                assert_eq!(dot_q4_1_block(&w4, &activations), expected_q4_1);
+            }
+            let w5: [i16; 32] =
+                std::array::from_fn(|idx| i16::try_from((idx * 7) % 32).unwrap_or(0) - 16);
+            let expected_i16: i32 = w5
+                .iter()
+                .zip(activations)
+                .map(|(&w, a)| i32::from(w) * i32::from(a))
+                .sum();
+            assert_eq!(dot_i16_block(&w5, &activations), expected_i16);
+        }
+
+        let input_blocks = [
+            super::super::Q8Block {
+                scale: 0.25,
+                sum: 0.0,
+                values: std::array::from_fn(|idx| {
+                    i8::from_ne_bytes([idx.to_le_bytes()[0].wrapping_mul(37).wrapping_add(5)])
+                }),
+            },
+            super::super::Q8Block {
+                scale: -0.125,
+                sum: 0.0,
+                values: std::array::from_fn(|idx| {
+                    i8::from_ne_bytes([idx.to_le_bytes()[0].wrapping_mul(73).wrapping_add(19)])
+                }),
+            },
+        ];
+
+        let q8_rows: Vec<Vec<u8>> = (0_u8..8)
+            .map(|r| {
+                let mut row = Vec::new();
+                for b in 0_u8..2 {
+                    let scale = [0x3400_u16, 0xb400, 0x3800, 0x3c00][usize::from(r + b) % 4];
+                    row.extend_from_slice(&scale.to_le_bytes());
+                    for idx in 0_u8..32 {
+                        row.push(
+                            r.wrapping_mul(17)
+                                .wrapping_add(b.wrapping_mul(31))
+                                .wrapping_add(idx.wrapping_mul(9)),
+                        );
+                    }
+                }
+                row
+            })
+            .collect();
+        let q8_refs: [&[u8]; 8] = std::array::from_fn(|r| q8_rows[r].as_slice());
+        let q8_four = dot_q8_0_four_rows(
+            [q8_refs[0], q8_refs[1], q8_refs[2], q8_refs[3]],
+            &input_blocks,
+        )?;
+        let q8_eight = dot_q8_0_eight_rows(q8_refs, &input_blocks)?;
+        for r in 0..8 {
+            let expected = super::super::dot_legacy(super::super::Q8_0, q8_refs[r], &input_blocks)?;
+            assert_eq!(q8_eight[r].to_bits(), expected.to_bits());
+            if r < 4 {
+                assert_eq!(q8_four[r].to_bits(), expected.to_bits());
+            }
+        }
+
+        let q4_rows: Vec<Vec<u8>> = (0_u8..8)
+            .map(|r| {
+                let mut row = Vec::new();
+                for b in 0_u8..2 {
+                    let scale = [0x3400_u16, 0xb400, 0x3800, 0x3c00][usize::from(r + b) % 4];
+                    row.extend_from_slice(&scale.to_le_bytes());
+                    for idx in 0_u8..16 {
+                        row.push(
+                            r.wrapping_mul(29)
+                                .wrapping_add(b.wrapping_mul(13))
+                                .wrapping_add(idx.wrapping_mul(7)),
+                        );
+                    }
+                }
+                row
+            })
+            .collect();
+        let q4_refs: [&[u8]; 8] = std::array::from_fn(|r| q4_rows[r].as_slice());
+        let q4_four = dot_q4_0_four_rows(
+            [q4_refs[0], q4_refs[1], q4_refs[2], q4_refs[3]],
+            &input_blocks,
+        )?;
+        let q4_eight = dot_q4_0_eight_rows(q4_refs, &input_blocks)?;
+        for r in 0..8 {
+            let expected = super::super::dot_legacy(super::super::Q4_0, q4_refs[r], &input_blocks)?;
+            assert_eq!(q4_eight[r].to_bits(), expected.to_bits());
+            if r < 4 {
+                assert_eq!(q4_four[r].to_bits(), expected.to_bits());
+            }
         }
         Ok(())
     }

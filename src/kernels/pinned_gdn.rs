@@ -42,6 +42,27 @@ pub(crate) fn dot(first: &[f32], second: &[f32]) -> Result<f32> {
     dot_scalar(first, second)
 }
 
+/// Computes `(dot(state, first), dot(state, second))` in a single pass over `state`.
+///
+/// # Errors
+/// Rejects unequal vector lengths or a nonfinite result.
+pub(crate) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Result<(f32, f32)> {
+    if state.len() != first.len() || state.len() != second.len() {
+        return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some((first_result, second_result)) = neon::dot_pair(state, first, second) {
+        return Ok((super::finite(first_result)?, super::finite(second_result)?));
+    }
+    Ok((dot_scalar(state, first)?, dot_scalar(state, second)?))
+}
+
 // Floating matrix projections deliberately retain scalar diagnostics and their
 // explicit scalar policy. Only the graph's pinned GDN helper selects NEON.
 #[allow(
@@ -79,7 +100,6 @@ pub(super) fn dot_scalar(first: &[f32], second: &[f32]) -> Result<f32> {
 ///
 /// # Errors
 /// Rejects unequal vector lengths before mutation, or a nonfinite dot result.
-#[cfg(test)]
 pub(crate) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
     if state.len() != key.len() {
         return Err(invalid("pinned GDN dot requires matching vectors"));
@@ -197,8 +217,8 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_scalar, scalar_add_scaled,
-        update_and_dot,
+        add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_pair, dot_scalar,
+        scalar_add_scaled, update_and_dot,
     };
     use crate::Result;
 
@@ -228,6 +248,9 @@ mod tests {
                 dot(&first, &second)?.to_bits(),
                 dot_scalar(&first, &second)?.to_bits()
             );
+            let (pair_first, pair_second) = dot_pair(&first, &second, &first)?;
+            assert_eq!(pair_first.to_bits(), dot_scalar(&first, &second)?.to_bits());
+            assert_eq!(pair_second.to_bits(), dot_scalar(&first, &first)?.to_bits());
             for scale in [0.0, -0.0, 0.375, -1.125, f32::from_bits(1)] {
                 let mut expected = first.clone();
                 let mut actual = first.clone();

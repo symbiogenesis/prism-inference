@@ -40,8 +40,58 @@ pub(super) fn dot(first: &[f32], second: &[f32]) -> Option<f32> {
     Some(result)
 }
 
+/// Computes `(dot(state, first), dot(state, second))` in a single pass over `state`,
+/// reusing each `state` vector load across both four-register FMA reduction trees.
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+pub(super) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Option<(f32, f32)> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let vectorized = state.len() / 16 * 16;
+    let mut f0 = f32x4::splat(neon, 0.0);
+    let mut f1 = f32x4::splat(neon, 0.0);
+    let mut f2 = f32x4::splat(neon, 0.0);
+    let mut f3 = f32x4::splat(neon, 0.0);
+    let mut s0 = f32x4::splat(neon, 0.0);
+    let mut s1 = f32x4::splat(neon, 0.0);
+    let mut s2 = f32x4::splat(neon, 0.0);
+    let mut s3 = f32x4::splat(neon, 0.0);
+    for ((state, first), second) in state[..vectorized]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(first[..vectorized].as_chunks::<16>().0)
+        .zip(second[..vectorized].as_chunks::<16>().0)
+    {
+        let st0 = f32x4::from_slice(neon, &state[0..4]);
+        let st1 = f32x4::from_slice(neon, &state[4..8]);
+        let st2 = f32x4::from_slice(neon, &state[8..12]);
+        let st3 = f32x4::from_slice(neon, &state[12..16]);
+        f0 = st0.mul_add_precise(f32x4::from_slice(neon, &first[0..4]), f0);
+        f1 = st1.mul_add_precise(f32x4::from_slice(neon, &first[4..8]), f1);
+        f2 = st2.mul_add_precise(f32x4::from_slice(neon, &first[8..12]), f2);
+        f3 = st3.mul_add_precise(f32x4::from_slice(neon, &first[12..16]), f3);
+        s0 = st0.mul_add_precise(f32x4::from_slice(neon, &second[0..4]), s0);
+        s1 = st1.mul_add_precise(f32x4::from_slice(neon, &second[4..8]), s1);
+        s2 = st2.mul_add_precise(f32x4::from_slice(neon, &second[8..12]), s2);
+        s3 = st3.mul_add_precise(f32x4::from_slice(neon, &second[12..16]), s3);
+    }
+    let mut first_result = ((f0 + f2) + (f1 + f3)).reduce_sum();
+    let mut second_result = ((s0 + s2) + (s1 + s3)).reduce_sum();
+    for ((&state, &first), &second) in state[vectorized..]
+        .iter()
+        .zip(&first[vectorized..])
+        .zip(&second[vectorized..])
+    {
+        first_result += state * first;
+        second_result += state * second;
+    }
+    Some((first_result, second_result))
+}
+
 /// Scales `state` by `decay` and accumulates its four-register FMA dot product with `key` in one pass.
-#[cfg(test)]
 #[inline]
 #[allow(
     clippy::suboptimal_flops,

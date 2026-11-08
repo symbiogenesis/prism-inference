@@ -138,6 +138,25 @@ impl Arithmetic {
         }
     }
 
+    fn gdn_dot_pair(self, state: &[f32], first: &[f32], second: &[f32]) -> Result<(f32, f32)> {
+        match self {
+            Self::Source => Ok((dot(state, first), dot(state, second))),
+            Self::PinnedSwift => crate::kernels::pinned_gdn::dot_pair(state, first, second),
+        }
+    }
+
+    fn gdn_decay_and_dot(self, state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
+        match self {
+            Self::Source => {
+                for element in state.iter_mut() {
+                    *element *= decay;
+                }
+                Ok(dot(state, key))
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::decay_and_dot(state, key, decay),
+        }
+    }
+
     fn gdn_decay_and_dot_from(
         self,
         previous: &[f32],
@@ -275,6 +294,7 @@ impl Arithmetic {
         probabilities: &[f32],
         output: &mut [f32],
     ) -> Result<()> {
+        let last = probabilities.len().saturating_sub(1);
         match self {
             Self::Source => {
                 // Match Iterator::sum's initial value, including signed zero.
@@ -282,19 +302,19 @@ impl Arithmetic {
                 // channel's token order while reading adjacent FP16 values.
                 let zero = std::iter::empty::<f64>().sum::<f64>();
                 let mut sums = [zero; crate::kernels::pinned_attention::VALUE_TILE];
-                for (past, &probability) in values.tokens().zip(probabilities) {
+                for (past, &probability) in values.tokens().take(last).zip(&probabilities[..last]) {
                     for (sum, &value) in sums.iter_mut().zip(&past[offset..offset + output.len()]) {
                         *sum += f64::from(probability * half_to_float(value));
                     }
                 }
-                let probability = probabilities[probabilities.len() - 1];
+                let probability = probabilities[last];
                 for ((out, sum), &value) in output.iter_mut().zip(sums).zip(current) {
                     *out = (sum + f64::from(probability * value)) as f32;
                 }
                 Ok(())
             }
             Self::PinnedSwift => crate::kernels::pinned_attention::value_tile(
-                values.tokens(),
+                values.tokens().take(last),
                 current,
                 probabilities,
                 offset,
@@ -316,12 +336,13 @@ impl Arithmetic {
         probabilities: [&[f32]; 4],
         outputs: [&mut [f32]; 4],
     ) -> Result<()> {
+        let last = probabilities[0].len().saturating_sub(1);
         match self {
             Self::Source => {
                 let zero = std::iter::empty::<f64>().sum::<f64>();
                 let out_len = outputs[0].len();
                 let mut sums = [[zero; crate::kernels::pinned_attention::VALUE_TILE]; 4];
-                for (pos, past) in values.tokens().enumerate() {
+                for (pos, past) in values.tokens().take(last).enumerate() {
                     let row = &past[offset..offset + out_len];
                     for (channel, &value) in row.iter().enumerate() {
                         let decoded = half_to_float(value);
@@ -330,7 +351,6 @@ impl Arithmetic {
                         }
                     }
                 }
-                let last = probabilities[0].len() - 1;
                 for (output, (prob_row, sum_row)) in outputs
                     .into_iter()
                     .zip(probabilities.into_iter().zip(&sums))
@@ -345,7 +365,7 @@ impl Arithmetic {
                 Ok(())
             }
             Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four(
-                values.tokens(),
+                values.tokens().take(last),
                 current,
                 probabilities,
                 offset,

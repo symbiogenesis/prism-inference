@@ -3,12 +3,14 @@
 use std::fmt::Write as _;
 
 use super::{
-    Arithmetic, Attention, Evaluation, LayerDelta, LayerState, Qwen35, Transforms, add,
-    checked_product, finite, row_into,
+    Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
+    Transforms, add, checked_product, finite, resize_into, rope_frequencies, row_into, sigmoid,
+    small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
     prefill::{ProjectionTile, ROW_TASK_SCRATCH_BYTES},
+    round_f16_slice,
 };
 use crate::model::Tensor;
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
@@ -64,6 +66,8 @@ pub(super) struct TiledPrefill {
     alpha: Vec<Vec<f32>>,
     attended: Vec<Vec<f32>>,
     attention: Vec<Vec<f32>>,
+    frequencies: Vec<Vec<(f32, f32)>>,
+    gdn_conv_outputs: Vec<f32>,
     gdn_head_outputs: Vec<f32>,
     gdn_key_dots: Vec<f32>,
     chunkwise_gdn: bool,
@@ -100,6 +104,11 @@ impl TiledPrefill {
             }
             Ok(rows)
         };
+        let mut frequencies = Vec::new();
+        frequencies.try_reserve_exact(tokens)?;
+        for _ in 0..tokens {
+            frequencies.push(Vec::new());
+        }
         let mut projector = ProjectionTile::with_backend(backend);
         projector.set_row_parallelism(parallelism);
         Ok(Self {
@@ -116,6 +125,8 @@ impl TiledPrefill {
             alpha: create()?,
             attended: create()?,
             attention: create()?,
+            frequencies,
+            gdn_conv_outputs: Vec::new(),
             gdn_head_outputs: Vec::new(),
             gdn_key_dots: Vec::new(),
             chunkwise_gdn: false,
@@ -365,6 +376,7 @@ impl Qwen35 {
         // position nonempty before any state mutation so explicit reset always
         // clears provisional state, including failure during the first tile.
         self.position = base + count;
+        let mut frequencies_ready = false;
         for ((layer, state), delta) in self
             .layers
             .iter()
@@ -405,7 +417,7 @@ impl Qwen35 {
                 }
             }
             match (&layer.attention, &mut *state) {
-                (Attention::Recurrent(weights), _) if tile.chunkwise_gdn => {
+                (Attention::Recurrent(weights), _) => {
                     gdn::recurrent_tile(
                         weights,
                         state,
@@ -421,109 +433,6 @@ impl Qwen35 {
                         check,
                         tile,
                         reborrow_executor(&mut executor),
-                    )?;
-                }
-                (
-                    Attention::Recurrent(weights),
-                    LayerState::Recurrent {
-                        convolution,
-                        matrix,
-                    },
-                ) => {
-                    check()?;
-                    let mut reuse = project_tile_pair(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        [&weights.qkv, &weights.gate],
-                        &tile.normalized[..count],
-                        &mut tile.mixed[..count],
-                        &mut tile.recurrent_gate[..count],
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        reborrow_executor(&mut executor),
-                        check,
-                    )?;
-                    for (weight, outputs) in [
-                        (&weights.beta, &mut tile.beta),
-                        (&weights.alpha, &mut tile.alpha),
-                    ] {
-                        check()?;
-                        reuse = project_tile(
-                            &self.transforms,
-                            &self.geometry,
-                            self.arithmetic,
-                            self.adapter.as_ref(),
-                            self.adapter_scale,
-                            &mut self.workspace.adapter,
-                            &mut self.workspace.projection.matvec,
-                            reuse,
-                            weight,
-                            &tile.normalized[..count],
-                            &mut outputs[..count],
-                            &mut tile.transformed[..count],
-                            &mut tile.projector,
-                            reborrow_executor(&mut executor),
-                            check,
-                        )?;
-                    }
-                    for index in 0..count {
-                        check()?;
-                        let evaluation = Evaluation {
-                            geometry: &self.geometry,
-                            arithmetic: self.arithmetic,
-                            transforms: &self.transforms,
-                            position: base + index,
-                            frequencies_ready: false,
-                            projection: &mut self.workspace.projection,
-                            adapter: self.adapter.as_ref(),
-                            adapter_scale: self.adapter_scale,
-                            adapter_scratch: &mut self.workspace.adapter,
-                            executor: None,
-                        };
-                        evaluation.recurrent_attention_state(
-                            weights,
-                            &mut tile.mixed[index],
-                            &tile.recurrent_gate[index],
-                            &tile.beta[index],
-                            &tile.alpha[index],
-                            convolution,
-                            matrix,
-                            delta,
-                            &mut tile.attended[index],
-                        )?;
-                        let LayerDelta::Recurrent {
-                            convolution: next,
-                            matrix: next_matrix,
-                        } = &mut *delta
-                        else {
-                            return Err(invalid("CPU tiled prefill delta mismatch"));
-                        };
-                        std::mem::swap(convolution, next);
-                        std::mem::swap(matrix, next_matrix);
-                        check()?;
-                    }
-                    check()?;
-                    let _ = project_tile(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        TileReuse::default(),
-                        &weights.output,
-                        &tile.attended[..count],
-                        &mut tile.attention[..count],
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        reborrow_executor(&mut executor),
-                        check,
                     )?;
                 }
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
@@ -546,39 +455,24 @@ impl Qwen35 {
                         reborrow_executor(&mut executor),
                         check,
                     )?;
-                    for index in 0..count {
-                        check()?;
-                        let mut evaluation = Evaluation {
-                            geometry: &self.geometry,
-                            arithmetic: self.arithmetic,
-                            transforms: &self.transforms,
-                            position: base + index,
-                            frequencies_ready: false,
-                            projection: &mut self.workspace.projection,
-                            adapter: self.adapter.as_ref(),
-                            adapter_scale: self.adapter_scale,
-                            adapter_scratch: &mut self.workspace.adapter,
-                            executor: None,
-                        };
-                        evaluation.full_attention_state(
-                            weights,
-                            &tile.mixed[index],
-                            &mut tile.recurrent_gate[index],
-                            &mut tile.beta[index],
-                            keys,
-                            values,
-                            &mut self.workspace.attention_scratch.query,
-                            &mut self.workspace.attention_scratch.gate,
-                            &mut self.workspace.attention_scratch.scores,
-                            &mut self.workspace.attention_scratch.frequencies,
-                            &mut tile.attended[index],
-                        )?;
-                        keys.reserve_append()?;
-                        values.reserve_append()?;
-                        keys.append(&tile.recurrent_gate[index]);
-                        values.append(&tile.beta[index]);
-                        check()?;
-                    }
+                    full_attention_tile(
+                        weights,
+                        &self.geometry,
+                        self.arithmetic,
+                        &self.transforms,
+                        base,
+                        count,
+                        &mut frequencies_ready,
+                        keys,
+                        values,
+                        &mut self.workspace.projection,
+                        self.adapter.as_ref(),
+                        self.adapter_scale,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.attention_scratch,
+                        tile,
+                        check,
+                    )?;
                     check()?;
                     let _ = project_tile(
                         &self.transforms,
@@ -708,9 +602,329 @@ impl Qwen35 {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::suboptimal_flops,
+    reason = "Keep causal KV append ordering, exact FP16 score/value rounding and tile scratch explicit."
+)]
+fn full_attention_tile(
+    weights: &FullAttention,
+    g: &Geometry,
+    arithmetic: Arithmetic,
+    transforms: &Transforms,
+    base: usize,
+    count: usize,
+    frequencies_ready: &mut bool,
+    keys: &mut KvCache,
+    values: &mut KvCache,
+    projection: &mut super::ProjectionScratch,
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &mut AdapterScratch,
+    attention_scratch: &mut super::AttentionScratch,
+    tile: &mut TiledPrefill,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    if count <= 1 || tile.projector.row_parallelism().workers() <= 1 {
+        for index in 0..count {
+            check()?;
+            if !*frequencies_ready {
+                rope_frequencies(g, base + index, &mut tile.frequencies[index])?;
+            }
+            std::mem::swap(
+                &mut attention_scratch.frequencies,
+                &mut tile.frequencies[index],
+            );
+            let mut evaluation = Evaluation {
+                geometry: g,
+                arithmetic,
+                transforms,
+                position: base + index,
+                frequencies_ready: true,
+                projection,
+                adapter,
+                adapter_scale,
+                adapter_scratch,
+                executor: None,
+            };
+            let step_result = evaluation.full_attention_state(
+                weights,
+                &tile.mixed[index],
+                &mut tile.recurrent_gate[index],
+                &mut tile.beta[index],
+                keys,
+                values,
+                &mut attention_scratch.query,
+                &mut attention_scratch.gate,
+                &mut attention_scratch.scores,
+                &mut attention_scratch.frequencies,
+                &mut tile.attended[index],
+            );
+            std::mem::swap(
+                &mut attention_scratch.frequencies,
+                &mut tile.frequencies[index],
+            );
+            step_result?;
+            keys.reserve_append()?;
+            values.reserve_append()?;
+            keys.append(&tile.recurrent_gate[index]);
+            values.append(&tile.beta[index]);
+            check()?;
+        }
+        *frequencies_ready = true;
+        return Ok(());
+    }
+
+    check()?;
+    if !*frequencies_ready {
+        for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
+            rope_frequencies(g, base + index, frequencies)?;
+        }
+        *frequencies_ready = true;
+    }
+    let query_gate_len = g.head * g.heads;
+    for index in 0..count {
+        resize_into(query_gate_len, &mut tile.up[index])?;
+        resize_into(query_gate_len, &mut tile.gate[index])?;
+        resize_into(query_gate_len, &mut tile.attended[index])?;
+    }
+    let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
+    let frequencies_ref: &[Vec<(f32, f32)>] = &tile.frequencies[..count];
+    let query_norm: &[f32] = &weights.query_norm;
+    tile.projector.row_parallelism().update_paired_chunks(
+        &mut tile.up[..count],
+        1,
+        &mut tile.gate[..count],
+        1,
+        |base_tok, query_chunk, gate_chunk| {
+            for (offset, (query_tok, gate_tok)) in query_chunk
+                .iter_mut()
+                .zip(gate_chunk.iter_mut())
+                .enumerate()
+            {
+                let tok = base_tok + offset;
+                let projected = &mixed_ref[tok];
+                let frequencies = &frequencies_ref[tok];
+                for (head_idx, (query_head, gate_head)) in query_tok
+                    .chunks_exact_mut(g.head)
+                    .zip(gate_tok.chunks_exact_mut(g.head))
+                    .enumerate()
+                {
+                    let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
+                    query_head.copy_from_slice(&src[..g.head]);
+                    gate_head.copy_from_slice(&src[g.head..]);
+                    arithmetic.normalize_in_place(query_head, query_norm, g.epsilon)?;
+                    arithmetic.attention_rope(query_head, g, frequencies)?;
+                    round_f16_slice(query_head);
+                }
+                finite(query_tok, "binary16 attention query")?;
+            }
+            Ok(())
+        },
+    )?;
+    let key_norm: &[f32] = &weights.key_norm;
+    tile.projector.row_parallelism().update_paired_chunks(
+        &mut tile.recurrent_gate[..count],
+        1,
+        &mut tile.beta[..count],
+        1,
+        |base_tok, key_chunk, value_chunk| {
+            for (offset, (key_tok, value_tok)) in
+                key_chunk.iter_mut().zip(value_chunk.iter_mut()).enumerate()
+            {
+                let tok = base_tok + offset;
+                let frequencies = &frequencies_ref[tok];
+                for (key_head, value_head) in key_tok
+                    .chunks_exact_mut(g.head)
+                    .zip(value_tok.chunks_exact_mut(g.head))
+                {
+                    arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
+                    arithmetic.attention_rope(key_head, g, frequencies)?;
+                    round_f16_slice(key_head);
+                    round_f16_slice(value_head);
+                }
+                finite(key_tok, "binary16 key cache")?;
+                finite(value_tok, "binary16 value cache")?;
+            }
+            Ok(())
+        },
+    )?;
+    for index in 0..count {
+        if index > 0 {
+            check()?;
+        }
+        keys.reserve_append()?;
+        values.reserve_append()?;
+        keys.append(&tile.recurrent_gate[index]);
+        values.append(&tile.beta[index]);
+        check()?;
+    }
+    let scale = 1.0 / small_float(g.head)?.sqrt();
+    let max_score_len = base + count;
+    let token_score_stride = 4 * max_score_len;
+    resize_into(count * token_score_stride, &mut attention_scratch.scores)?;
+    let query_ref: &[Vec<f32>] = &tile.up[..count];
+    let gate_ref: &[Vec<f32>] = &tile.gate[..count];
+    let current_keys: &[Vec<f32>] = &tile.recurrent_gate[..count];
+    let current_values: &[Vec<f32>] = &tile.beta[..count];
+    let key_cache: &KvCache = keys;
+    let value_cache: &KvCache = values;
+    let heads_per_kv = g.heads / g.kv_heads;
+    tile.projector.row_parallelism().update_paired_chunks(
+        &mut tile.attended[..count],
+        1,
+        &mut attention_scratch.scores,
+        token_score_stride,
+        |base_tok, attended_chunk, scores_chunk| {
+            let chunk_tokens = attended_chunk.len();
+            let mut head = 0;
+            while head < g.heads {
+                let kv_head = head / heads_per_kv;
+                let offset = kv_head * g.head;
+                if head + 4 <= g.heads && kv_head == (head + 3) / heads_per_kv {
+                    for (pos, past) in key_cache
+                        .tokens()
+                        .take(base + base_tok + chunk_tokens.saturating_sub(1))
+                        .enumerate()
+                    {
+                        let past_key = &past[offset..offset + g.head];
+                        let first_t = (pos + 1).saturating_sub(base + base_tok);
+                        for t in first_t..chunk_tokens {
+                            let tok = base_tok + t;
+                            let queries = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok][h * g.head..(h + 1) * g.head]
+                            });
+                            let dots = arithmetic.attention_dot_four(queries, past_key)?;
+                            let tok_scores = &mut scores_chunk
+                                [t * token_score_stride..(t + 1) * token_score_stride];
+                            tok_scores[pos] = dots[0] * scale;
+                            tok_scores[max_score_len + pos] = dots[1] * scale;
+                            tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                    }
+                    for (t, attended_tok) in attended_chunk.iter_mut().enumerate() {
+                        let tok = base_tok + t;
+                        let score_len = base + tok + 1;
+                        let queries = std::array::from_fn(|i| {
+                            let h = head + i;
+                            &query_ref[tok][h * g.head..(h + 1) * g.head]
+                        });
+                        let current_dots = arithmetic.attention_current_dot_four(
+                            queries,
+                            &current_keys[tok][offset..offset + g.head],
+                        )?;
+                        let tok_scores =
+                            &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
+                        let (s01, s23) = tok_scores.split_at_mut(2 * max_score_len);
+                        let (s0, s1) = s01.split_at_mut(max_score_len);
+                        let (s2, s3) = s23.split_at_mut(max_score_len);
+                        let s0 = &mut s0[..score_len];
+                        let s1 = &mut s1[..score_len];
+                        let s2 = &mut s2[..score_len];
+                        let s3 = &mut s3[..score_len];
+                        s0[score_len - 1] = current_dots[0] * scale;
+                        s1[score_len - 1] = current_dots[1] * scale;
+                        s2[score_len - 1] = current_dots[2] * scale;
+                        s3[score_len - 1] = current_dots[3] * scale;
+                        for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
+                            arithmetic.attention_softmax(scores)?;
+                            round_f16_slice(scores);
+                        }
+                        let probs: [&[f32]; 4] = [s0, s1, s2, s3];
+                        let (r01, r23) = attended_tok[head * g.head..(head + 4) * g.head]
+                            .split_at_mut(2 * g.head);
+                        let (r0, r1) = r01.split_at_mut(g.head);
+                        let (r2, r3) = r23.split_at_mut(g.head);
+                        for (tile_idx, (((out0, out1), out2), out3)) in r0
+                            .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                            .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                            .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                            .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                            .enumerate()
+                        {
+                            let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE;
+                            arithmetic.attention_value_tile_four(
+                                value_cache,
+                                &current_values[tok]
+                                    [offset + dimension..offset + dimension + out0.len()],
+                                offset + dimension,
+                                probs,
+                                [out0, out1, out2, out3],
+                            )?;
+                        }
+                        for (i, result) in [r0, r1, r2, r3].into_iter().enumerate() {
+                            let h = head + i;
+                            for (out, &gate) in result
+                                .iter_mut()
+                                .zip(&gate_ref[tok][h * g.head..(h + 1) * g.head])
+                            {
+                                *out *= sigmoid(gate);
+                            }
+                        }
+                    }
+                    head += 4;
+                    continue;
+                }
+                for (pos, past) in key_cache
+                    .tokens()
+                    .take(base + base_tok + chunk_tokens.saturating_sub(1))
+                    .enumerate()
+                {
+                    let past_key = &past[offset..offset + g.head];
+                    let first_t = (pos + 1).saturating_sub(base + base_tok);
+                    for t in first_t..chunk_tokens {
+                        let tok = base_tok + t;
+                        let q = &query_ref[tok][head * g.head..(head + 1) * g.head];
+                        scores_chunk[t * token_score_stride + pos] =
+                            arithmetic.attention_dot(q, past_key)? * scale;
+                    }
+                }
+                for (t, attended_tok) in attended_chunk.iter_mut().enumerate() {
+                    let tok = base_tok + t;
+                    let score_len = base + tok + 1;
+                    let q = &query_ref[tok][head * g.head..(head + 1) * g.head];
+                    let scores = &mut scores_chunk
+                        [t * token_score_stride..t * token_score_stride + score_len];
+                    scores[score_len - 1] = arithmetic
+                        .attention_current_dot(q, &current_keys[tok][offset..offset + g.head])?
+                        * scale;
+                    arithmetic.attention_softmax(scores)?;
+                    round_f16_slice(scores);
+                    let result = &mut attended_tok[head * g.head..(head + 1) * g.head];
+                    for (tile_idx, out) in result
+                        .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                        .enumerate()
+                    {
+                        let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE;
+                        arithmetic.attention_value_tile(
+                            value_cache,
+                            &current_values[tok]
+                                [offset + dimension..offset + dimension + out.len()],
+                            offset + dimension,
+                            scores,
+                            out,
+                        )?;
+                    }
+                    for (out, &gate) in result
+                        .iter_mut()
+                        .zip(&gate_ref[tok][head * g.head..(head + 1) * g.head])
+                    {
+                        *out *= sigmoid(gate);
+                    }
+                }
+                head += 1;
+            }
+            Ok(())
+        },
+    )
+}
+
 fn transform_tile_inputs<'a>(
     transforms: &Transforms,
-    geometry: &super::Geometry,
+    geometry: &Geometry,
     tensor: &Tensor,
     reuse_basis: bool,
     inputs: &'a [Vec<f32>],
@@ -756,7 +970,7 @@ fn transform_tile_inputs<'a>(
 )]
 fn project_tile_pair<'a>(
     transforms: &Transforms,
-    geometry: &super::Geometry,
+    geometry: &Geometry,
     arithmetic: Arithmetic,
     adapter: Option<&RankOneAdapter>,
     adapter_scale: f32,
@@ -878,7 +1092,7 @@ fn project_tile_pair<'a>(
 )]
 fn project_tile_triple<'a>(
     transforms: &Transforms,
-    geometry: &super::Geometry,
+    geometry: &Geometry,
     arithmetic: Arithmetic,
     adapter: Option<&RankOneAdapter>,
     adapter_scale: f32,
@@ -1000,7 +1214,7 @@ fn project_tile_triple<'a>(
 )]
 fn project_tile<'a>(
     transforms: &Transforms,
-    geometry: &super::Geometry,
+    geometry: &Geometry,
     arithmetic: Arithmetic,
     adapter: Option<&RankOneAdapter>,
     adapter_scale: f32,

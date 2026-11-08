@@ -422,3 +422,124 @@ fn tiled_prefill_batches_packed_attention_and_recurrent_projections() -> Result<
     }
     Ok(())
 }
+
+#[cfg(feature = "parallel-rows")]
+fn parallel_grouped_hybrid_fixture(pinned: bool) -> Model {
+    let mut model = paged_hybrid_fixture();
+    for (key, val) in [
+        ("qwen35.embedding_length", 16_u64),
+        ("qwen35.feed_forward_length", 16),
+        ("qwen35.attention.head_count", 8),
+        ("qwen35.attention.head_count_kv", 2),
+        ("qwen35.attention.key_length", 256),
+        ("qwen35.attention.value_length", 256),
+        ("qwen35.rope.dimension_count", 64),
+        ("qwen35.ssm.state_size", 16),
+        ("qwen35.ssm.group_count", 2),
+        ("qwen35.ssm.time_step_rank", 4),
+        ("qwen35.ssm.inner_size", 64),
+        ("qwen35.ssm.conv_kernel", 4),
+        ("qwen35.full_attention_interval", 2),
+    ] {
+        model
+            .metadata
+            .insert(key.to_owned(), MetadataValue::from(val));
+    }
+    model.metadata.insert(
+        "qwen35.rope.dimension_sections".to_owned(),
+        MetadataValue::from(vec![16_i64, 8, 8, 0]),
+    );
+    let mut tensors = BTreeMap::new();
+    let p0: &[f32] = &[0.125, -0.25, 0.0625, 0.25, -0.125];
+    let p1: &[f32] = &[0.25, 0.125, -0.125, 0.0625, -0.25];
+    let p2: &[f32] = &[-0.125, 0.25, 0.125, -0.0625, 0.25];
+    let p3: &[f32] = &[0.0625, -0.125, 0.125, 0.0625, -0.0625];
+    let specs: &[(&str, &[usize], &[f32])] = &[
+        ("token_embd.weight", &[16, 2], p0),
+        ("output.weight", &[16, 2], p1),
+        ("output_norm.weight", &[16], &[1.0]),
+        ("blk.0.attn_norm.weight", &[16], &[1.0]),
+        ("blk.0.post_attention_norm.weight", &[16], &[1.0]),
+        ("blk.0.ffn_up.weight", &[16, 16], p0),
+        ("blk.0.ffn_gate.weight", &[16, 16], p1),
+        ("blk.0.ffn_down.weight", &[16, 16], p2),
+        ("blk.0.attn_q.weight", &[16, 4096], p0),
+        ("blk.0.attn_k.weight", &[16, 512], p1),
+        ("blk.0.attn_v.weight", &[16, 512], p2),
+        ("blk.0.attn_output.weight", &[2048, 16], p3),
+        ("blk.0.attn_q_norm.weight", &[256], &[1.0]),
+        ("blk.0.attn_k_norm.weight", &[256], &[1.0]),
+        ("blk.1.attn_norm.weight", &[16], &[1.0]),
+        ("blk.1.post_attention_norm.weight", &[16], &[1.0]),
+        ("blk.1.ffn_up.weight", &[16, 16], p0),
+        ("blk.1.ffn_gate.weight", &[16, 16], p1),
+        ("blk.1.ffn_down.weight", &[16, 16], p2),
+        ("blk.1.attn_qkv.weight", &[16, 128], p0),
+        ("blk.1.attn_gate.weight", &[16, 64], p1),
+        ("blk.1.ssm_conv1d.weight", &[4, 128], p2),
+        ("blk.1.ssm_dt.bias", &[4], &[0.1, -0.1, 0.2, -0.2]),
+        ("blk.1.ssm_a", &[4], &[-0.5, -0.25, -0.75, -0.125]),
+        ("blk.1.ssm_beta.weight", &[16, 4], p0),
+        ("blk.1.ssm_alpha.weight", &[16, 4], p1),
+        ("blk.1.ssm_norm.weight", &[16], &[1.0]),
+        ("blk.1.ssm_out.weight", &[64, 16], p3),
+    ];
+    for &(name, dimensions, pattern) in specs {
+        let len: usize = dimensions.iter().product();
+        let values: Vec<f32> = pattern.iter().copied().cycle().take(len).collect();
+        tensors.insert(name.to_owned(), weight(name, dimensions, &values));
+    }
+    model.tensors = tensors;
+    model.identity = if pinned {
+        bonsai_prism_runtime::model::swift::MODEL_SHA256.to_owned()
+    } else {
+        "parallel-grouped-hybrid-fixture".to_owned()
+    };
+    model
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn tiled_prefill_parallel_grouped_kv_and_head_major_recurrent_match_single_token() -> Result<()> {
+    use bonsai_prism_runtime::kernels::RowParallelism;
+
+    let workers = RowParallelism::new(4)?;
+    let prompt: Vec<u32> = [0, 1, 1, 0, 1, 0, 0].into_iter().cycle().take(65).collect();
+    for pinned in [false, true] {
+        let mut expected = Qwen35::new(parallel_grouped_hybrid_fixture(pinned), 192)?;
+        expected.set_row_parallelism(workers.clone());
+        for &token in &prompt {
+            expected.ingest(token)?;
+        }
+        let expected_state = state_values(&expected)?;
+        let expected_bits = graph_bits(&expected)?;
+        let expected_logits = expected.evaluate(1)?;
+
+        for tokens in [8, 16, 32] {
+            for chunkwise in [false, true] {
+                let mut actual = tiled(parallel_grouped_hybrid_fixture(pinned), tokens, chunkwise)?;
+                actual.set_row_parallelism(workers.clone());
+                actual.ingest_block(&prompt, &|| Ok(()))?;
+                if chunkwise {
+                    close(&state_values(&actual)?, &expected_state);
+                    close(&actual.evaluate(1)?, &expected_logits);
+                } else {
+                    assert_eq!(graph_bits(&actual)?, expected_bits);
+                    assert_eq!(
+                        actual
+                            .evaluate(1)?
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        expected_logits
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

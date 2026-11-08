@@ -3298,6 +3298,368 @@ pub(super) fn hadamard_into(
     ))
 }
 
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product roundings for both RMS contracts."
+)]
+fn hadamard_16_registers_rms_norm<const PINNED: bool>(
+    neon: Neon,
+    in_block: &[f32],
+    w_block: &[f32],
+    scale_vec: f32x4<Neon>,
+    signs: Option<&[f32]>,
+    norm_out: &mut [f32],
+) -> (
+    [f32x4<Neon>; 4],
+    fearless_simd::mask32x4<Neon>,
+    fearless_simd::mask32x4<Neon>,
+) {
+    let x0 = f32x4::from_slice(neon, &in_block[0..4]);
+    let x1 = f32x4::from_slice(neon, &in_block[4..8]);
+    let x2 = f32x4::from_slice(neon, &in_block[8..12]);
+    let x3 = f32x4::from_slice(neon, &in_block[12..16]);
+    let w0 = f32x4::from_slice(neon, &w_block[0..4]);
+    let w1 = f32x4::from_slice(neon, &w_block[4..8]);
+    let w2 = f32x4::from_slice(neon, &w_block[8..12]);
+    let w3 = f32x4::from_slice(neon, &w_block[12..16]);
+    let (n0, n1, n2, n3) = if PINNED {
+        (
+            (x0 * w0) * scale_vec,
+            (x1 * w1) * scale_vec,
+            (x2 * w2) * scale_vec,
+            (x3 * w3) * scale_vec,
+        )
+    } else {
+        (
+            (x0 * scale_vec) * w0,
+            (x1 * scale_vec) * w1,
+            (x2 * scale_vec) * w2,
+            (x3 * scale_vec) * w3,
+        )
+    };
+    n0.store_slice(&mut norm_out[0..4]);
+    n1.store_slice(&mut norm_out[4..8]);
+    n2.store_slice(&mut norm_out[8..12]);
+    n3.store_slice(&mut norm_out[12..16]);
+    let norm_finite = n0.is_finite() & n1.is_finite() & n2.is_finite() & n3.is_finite();
+    let (r0, r1, r2, r3) = signs.map_or((n0, n1, n2, n3), |s| {
+        (
+            n0 * f32x4::from_slice(neon, &s[0..4]),
+            n1 * f32x4::from_slice(neon, &s[4..8]),
+            n2 * f32x4::from_slice(neon, &s[8..12]),
+            n3 * f32x4::from_slice(neon, &s[12..16]),
+        )
+    });
+    let had_finite = r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite();
+    let [a0, a1, a2, a3] = transpose_4x4(r0, r1, r2, r3);
+    let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+    let [v0, v1, v2, v3] = transpose_4x4(b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+    let (c0, c1, c2, c3) = (v0 + v1, v0 - v1, v2 + v3, v2 - v3);
+    ([c0 + c2, c1 + c3, c0 - c2, c1 - c3], norm_finite, had_finite)
+}
+
+/// Fuses weighted `RMSNorm` scaling, optional sign multiplication, and normalized
+/// Sylvester Hadamard butterfly stages for one power-of-two block (`>= 16` elements).
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep register-fused 16/64-element RMSNorm, sign multiplication, and Hadamard stages together."
+)]
+pub(super) fn rms_norm_hadamard_block_into<const PINNED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    scale: f32,
+    signs: Option<&[f32]>,
+    norm_out: &mut [f32],
+    values: &mut [f32],
+    normalization: f32,
+) -> Option<Result<()>> {
+    if values.len() < 16
+        || input.len() != values.len()
+        || weight.len() != values.len()
+        || norm_out.len() != values.len()
+        || signs.is_some_and(|s| s.len() < values.len())
+    {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let scale_vec = f32x4::splat(neon, scale);
+    let norm = f32x4::splat(neon, normalization);
+    let mut norm_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut in_finite = norm_finite;
+    let mut finite_mask = norm_finite;
+    let half = if values.len() >= 64 {
+        let fuse_norm = values.len() == 64;
+        for (block_idx, (((in_block, w_block), n_block), out_block)) in input
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .zip(weight.as_chunks::<64>().0)
+            .zip(norm_out.as_chunks_mut::<64>().0)
+            .zip(values.as_chunks_mut::<64>().0)
+            .enumerate()
+        {
+            let s_block = signs.map(|s| &s[block_idx * 64..(block_idx + 1) * 64]);
+            let (q0, nf0, f0) = hadamard_16_registers_rms_norm::<PINNED>(
+                neon,
+                &in_block[0..16],
+                &w_block[0..16],
+                scale_vec,
+                s_block.map(|s| &s[0..16]),
+                &mut n_block[0..16],
+            );
+            let (q1, nf1, f1) = hadamard_16_registers_rms_norm::<PINNED>(
+                neon,
+                &in_block[16..32],
+                &w_block[16..32],
+                scale_vec,
+                s_block.map(|s| &s[16..32]),
+                &mut n_block[16..32],
+            );
+            let (q2, nf2, f2) = hadamard_16_registers_rms_norm::<PINNED>(
+                neon,
+                &in_block[32..48],
+                &w_block[32..48],
+                scale_vec,
+                s_block.map(|s| &s[32..48]),
+                &mut n_block[32..48],
+            );
+            let (q3, nf3, f3) = hadamard_16_registers_rms_norm::<PINNED>(
+                neon,
+                &in_block[48..64],
+                &w_block[48..64],
+                scale_vec,
+                s_block.map(|s| &s[48..64]),
+                &mut n_block[48..64],
+            );
+            norm_finite &= nf0 & nf1 & nf2 & nf3;
+            in_finite &= f0 & f1 & f2 & f3;
+            for i in 0..4 {
+                let b0 = q0[i] + q1[i];
+                let b1 = q0[i] - q1[i];
+                let b2 = q2[i] + q3[i];
+                let b3 = q2[i] - q3[i];
+                let (mut out0, mut out1, mut out2, mut out3) = (b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+                if fuse_norm {
+                    out0 *= norm;
+                    out1 *= norm;
+                    out2 *= norm;
+                    out3 *= norm;
+                    finite_mask &=
+                        out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
+                }
+                let base = i * 4;
+                out0.store_slice(&mut out_block[base..base + 4]);
+                out1.store_slice(&mut out_block[16 + base..20 + base]);
+                out2.store_slice(&mut out_block[32 + base..36 + base]);
+                out3.store_slice(&mut out_block[48 + base..52 + base]);
+            }
+        }
+        64
+    } else {
+        let fuse_norm = values.len() == 16;
+        for (block_idx, (((in_block, w_block), n_block), out_block)) in input
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(weight.as_chunks::<16>().0)
+            .zip(norm_out.as_chunks_mut::<16>().0)
+            .zip(values.as_chunks_mut::<16>().0)
+            .enumerate()
+        {
+            let s_block = signs.map(|s| &s[block_idx * 16..(block_idx + 1) * 16]);
+            let ([mut d0, mut d1, mut d2, mut d3], nf0, f0) =
+                hadamard_16_registers_rms_norm::<PINNED>(
+                    neon, in_block, w_block, scale_vec, s_block, n_block,
+                );
+            norm_finite &= nf0;
+            in_finite &= f0;
+            if fuse_norm {
+                d0 *= norm;
+                d1 *= norm;
+                d2 *= norm;
+                d3 *= norm;
+                finite_mask &= d0.is_finite() & d1.is_finite() & d2.is_finite() & d3.is_finite();
+            }
+            d0.store_slice(&mut out_block[0..4]);
+            d1.store_slice(&mut out_block[4..8]);
+            d2.store_slice(&mut out_block[8..12]);
+            d3.store_slice(&mut out_block[12..16]);
+        }
+        16
+    };
+    if !norm_finite.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    Some(hadamard_finish(
+        neon,
+        values,
+        half,
+        norm,
+        in_finite,
+        finite_mask,
+    ))
+}
+
+#[inline]
+fn hadamard_16_registers_swiglu_read(
+    neon: Neon,
+    gate_block: &[f32],
+    up_block: &[f32],
+    signs: Option<&[f32]>,
+) -> ([f32x4<Neon>; 4], fearless_simd::mask32x4<Neon>) {
+    let zero = f32x4::splat(neon, 0.0);
+    let one = f32x4::splat(neon, 1.0);
+    let g0 = f32x4::from_slice(neon, &gate_block[0..4]);
+    let g1 = f32x4::from_slice(neon, &gate_block[4..8]);
+    let g2 = f32x4::from_slice(neon, &gate_block[8..12]);
+    let g3 = f32x4::from_slice(neon, &gate_block[12..16]);
+    let u0 = f32x4::from_slice(neon, &up_block[0..4]);
+    let u1 = f32x4::from_slice(neon, &up_block[4..8]);
+    let u2 = f32x4::from_slice(neon, &up_block[8..12]);
+    let u3 = f32x4::from_slice(neon, &up_block[12..16]);
+    let s0 = (g0 * u0) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g0));
+    let s1 = (g1 * u1) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g1));
+    let s2 = (g2 * u2) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g2));
+    let s3 = (g3 * u3) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g3));
+    let (r0, r1, r2, r3) = signs.map_or((s0, s1, s2, s3), |s| {
+        (
+            s0 * f32x4::from_slice(neon, &s[0..4]),
+            s1 * f32x4::from_slice(neon, &s[4..8]),
+            s2 * f32x4::from_slice(neon, &s[8..12]),
+            s3 * f32x4::from_slice(neon, &s[12..16]),
+        )
+    });
+    let finite = r0.is_finite() & r1.is_finite() & r2.is_finite() & r3.is_finite();
+    let [a0, a1, a2, a3] = transpose_4x4(r0, r1, r2, r3);
+    let (b0, b1, b2, b3) = (a0 + a1, a0 - a1, a2 + a3, a2 - a3);
+    let [v0, v1, v2, v3] = transpose_4x4(b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+    let (c0, c1, c2, c3) = (v0 + v1, v0 - v1, v2 + v3, v2 - v3);
+    ([c0 + c2, c1 + c3, c0 - c2, c1 - c3], finite)
+}
+
+/// Fuses pinned `SwiGLU`, optional sign multiplication, and normalized Sylvester Hadamard
+/// butterfly stages for one power-of-two block (`>= 16` elements) without mutating `up`.
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep register-fused 16/64-element SwiGLU, sign multiplication, and Hadamard stages together."
+)]
+pub(super) fn swiglu_hadamard_block_read_into(
+    gate: &[f32],
+    up: &[f32],
+    signs: Option<&[f32]>,
+    values: &mut [f32],
+    normalization: f32,
+) -> Option<Result<()>> {
+    if values.len() < 16
+        || gate.len() != values.len()
+        || up.len() != values.len()
+        || signs.is_some_and(|s| s.len() < values.len())
+    {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let norm = f32x4::splat(neon, normalization);
+    let mut in_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut finite_mask = in_finite;
+    let half = if values.len() >= 64 {
+        let fuse_norm = values.len() == 64;
+        for (block_idx, ((g_block, u_block), out_block)) in gate
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .zip(up.as_chunks::<64>().0)
+            .zip(values.as_chunks_mut::<64>().0)
+            .enumerate()
+        {
+            let s_block = signs.map(|s| &s[block_idx * 64..(block_idx + 1) * 64]);
+            let (q0, f0) = hadamard_16_registers_swiglu_read(
+                neon,
+                &g_block[0..16],
+                &u_block[0..16],
+                s_block.map(|s| &s[0..16]),
+            );
+            let (q1, f1) = hadamard_16_registers_swiglu_read(
+                neon,
+                &g_block[16..32],
+                &u_block[16..32],
+                s_block.map(|s| &s[16..32]),
+            );
+            let (q2, f2) = hadamard_16_registers_swiglu_read(
+                neon,
+                &g_block[32..48],
+                &u_block[32..48],
+                s_block.map(|s| &s[32..48]),
+            );
+            let (q3, f3) = hadamard_16_registers_swiglu_read(
+                neon,
+                &g_block[48..64],
+                &u_block[48..64],
+                s_block.map(|s| &s[48..64]),
+            );
+            in_finite &= f0 & f1 & f2 & f3;
+            for i in 0..4 {
+                let b0 = q0[i] + q1[i];
+                let b1 = q0[i] - q1[i];
+                let b2 = q2[i] + q3[i];
+                let b3 = q2[i] - q3[i];
+                let (mut out0, mut out1, mut out2, mut out3) = (b0 + b2, b1 + b3, b0 - b2, b1 - b3);
+                if fuse_norm {
+                    out0 *= norm;
+                    out1 *= norm;
+                    out2 *= norm;
+                    out3 *= norm;
+                    finite_mask &=
+                        out0.is_finite() & out1.is_finite() & out2.is_finite() & out3.is_finite();
+                }
+                let base = i * 4;
+                out0.store_slice(&mut out_block[base..base + 4]);
+                out1.store_slice(&mut out_block[16 + base..20 + base]);
+                out2.store_slice(&mut out_block[32 + base..36 + base]);
+                out3.store_slice(&mut out_block[48 + base..52 + base]);
+            }
+        }
+        64
+    } else {
+        let fuse_norm = values.len() == 16;
+        for (block_idx, ((g_block, u_block), out_block)) in gate
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(up.as_chunks::<16>().0)
+            .zip(values.as_chunks_mut::<16>().0)
+            .enumerate()
+        {
+            let s_block = signs.map(|s| &s[block_idx * 16..(block_idx + 1) * 16]);
+            let ([mut d0, mut d1, mut d2, mut d3], f0) =
+                hadamard_16_registers_swiglu_read(neon, g_block, u_block, s_block);
+            in_finite &= f0;
+            if fuse_norm {
+                d0 *= norm;
+                d1 *= norm;
+                d2 *= norm;
+                d3 *= norm;
+                finite_mask &= d0.is_finite() & d1.is_finite() & d2.is_finite() & d3.is_finite();
+            }
+            d0.store_slice(&mut out_block[0..4]);
+            d1.store_slice(&mut out_block[4..8]);
+            d2.store_slice(&mut out_block[8..12]);
+            d3.store_slice(&mut out_block[12..16]);
+        }
+        16
+    };
+    Some(hadamard_finish(
+        neon,
+        values,
+        half,
+        norm,
+        in_finite,
+        finite_mask,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3917,6 +4279,103 @@ mod tests {
             assert_eq!(q4_eight[r].to_bits(), expected.to_bits());
             if r < 4 {
                 assert_eq!(q4_four[r].to_bits(), expected.to_bits());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_rms_norm_and_swiglu_hadamard_match_unfused_zero_ulp() -> TestResult {
+        for block in [16_usize, 64, 256, 1024] {
+            let input: Vec<f32> = (0..block * 2)
+                .map(|i| {
+                    let raw = u16::try_from((i * 197 + 13) % 1024).unwrap_or(0);
+                    (f32::from(raw) - 512.0) * 0.015_625
+                })
+                .collect();
+            let weight: Vec<f32> = (0..block * 2)
+                .map(|i| {
+                    let raw = u16::try_from((i * 73 + 29) % 512).unwrap_or(0);
+                    f32::from(raw).mul_add(0.001_953_125, 0.5)
+                })
+                .collect();
+            let signs: Vec<f32> = (0..block * 2)
+                .map(|i| if (i * 31 + 7) % 2 == 0 { 1.0 } else { -1.0 })
+                .collect();
+
+            for sign_opt in [None, Some(signs.as_slice())] {
+                let mut ref_norm = Vec::new();
+                let mut ref_rot = vec![0.0_f32; block * 2];
+                super::super::rms_norm_into(&input, &weight, 1e-6, &mut ref_norm)?;
+                for (idx, out_b) in ref_rot.chunks_exact_mut(block).enumerate() {
+                    let off = idx * block;
+                    super::super::hadamard_into(
+                        &ref_norm[off..off + block],
+                        sign_opt.map(|s| &s[off..off + block]),
+                        out_b,
+                    )?;
+                }
+                let mut fused_norm = Vec::new();
+                let mut fused_rot = Vec::new();
+                super::super::rms_norm_hadamard_into::<false>(
+                    &input,
+                    &weight,
+                    1e-6,
+                    block,
+                    sign_opt,
+                    &mut fused_norm,
+                    &mut fused_rot,
+                )?;
+                for (a, b) in fused_norm.iter().zip(&ref_norm) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_rot.iter().zip(&ref_rot) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+
+                super::super::rms_norm_pinned_into(&input, &weight, 1e-6, &mut ref_norm)?;
+                for (idx, out_b) in ref_rot.chunks_exact_mut(block).enumerate() {
+                    let off = idx * block;
+                    super::super::hadamard_into(
+                        &ref_norm[off..off + block],
+                        sign_opt.map(|s| &s[off..off + block]),
+                        out_b,
+                    )?;
+                }
+                super::super::rms_norm_hadamard_into::<true>(
+                    &input,
+                    &weight,
+                    1e-6,
+                    block,
+                    sign_opt,
+                    &mut fused_norm,
+                    &mut fused_rot,
+                )?;
+                for (a, b) in fused_norm.iter().zip(&ref_norm) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_rot.iter().zip(&ref_rot) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+
+                let mut up_pinned = weight[..block].to_vec();
+                super::super::pinned_activations::swiglu_in_place(&input[..block], &mut up_pinned)?;
+                let mut expected_swiglu_rot = vec![0.0_f32; block];
+                super::super::hadamard_into(
+                    &up_pinned,
+                    sign_opt.map(|s| &s[..block]),
+                    &mut expected_swiglu_rot,
+                )?;
+                let mut actual_swiglu_rot = vec![0.0_f32; block];
+                super::super::swiglu_hadamard_block_read_into::<true>(
+                    &input[..block],
+                    &weight[..block],
+                    sign_opt.map(|s| &s[..block]),
+                    &mut actual_swiglu_rot,
+                )?;
+                for (a, b) in actual_swiglu_rot.iter().zip(&expected_swiglu_rot) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
             }
         }
         Ok(())

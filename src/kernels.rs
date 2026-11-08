@@ -2920,6 +2920,136 @@ pub(crate) fn hadamard_into(
     hadamard(output)
 }
 
+pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    block: usize,
+    signs: Option<&[f32]>,
+    norm_out: &mut Vec<f32>,
+    rotated_out: &mut Vec<f32>,
+) -> Result<()> {
+    let result = (|| {
+        if !block.is_power_of_two()
+            || !input.len().is_multiple_of(block)
+            || signs.is_some_and(|s| s.len() < input.len())
+        {
+            return Err(invalid("Hadamard requires a finite power-of-two block"));
+        }
+        let scale = rms_norm_scale(input, weight, epsilon)?;
+        if norm_out.len() != input.len() {
+            norm_out.clear();
+            norm_out.try_reserve_exact(input.len())?;
+            norm_out.resize(input.len(), 0.0);
+        }
+        if rotated_out.len() != input.len() {
+            rotated_out.clear();
+            rotated_out.try_reserve_exact(input.len())?;
+            rotated_out.resize(input.len(), 0.0);
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        let normalization = {
+            let count = u32::try_from(block)?;
+            1.0 / integer_float(i32::try_from(count)?).sqrt()
+        };
+        for (block_idx, (norm_block, rot_block)) in norm_out
+            .chunks_exact_mut(block)
+            .zip(rotated_out.chunks_exact_mut(block))
+            .enumerate()
+        {
+            let offset = block_idx * block;
+            let in_block = &input[offset..offset + block];
+            let w_block = &weight[offset..offset + block];
+            let sign_block = signs.map(|s| &s[offset..offset + block]);
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            if let Some(res) = neon::rms_norm_hadamard_block_into::<PINNED>(
+                in_block,
+                w_block,
+                scale,
+                sign_block,
+                norm_block,
+                rot_block,
+                normalization,
+            ) {
+                res?;
+                continue;
+            }
+            for ((n_dst, &val), &w) in norm_block.iter_mut().zip(in_block).zip(w_block) {
+                *n_dst = finite(if PINNED {
+                    (val * w) * scale
+                } else {
+                    (val * scale) * w
+                })?;
+            }
+            hadamard_into(norm_block, sign_block, rot_block)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        norm_out.clear();
+        rotated_out.clear();
+    }
+    result
+}
+
+pub(crate) fn swiglu_hadamard_block_read_into<const PINNED: bool>(
+    gate: &[f32],
+    up: &[f32],
+    signs: Option<&[f32]>,
+    output: &mut [f32],
+) -> Result<()> {
+    if !output.len().is_power_of_two()
+        || gate.len() != output.len()
+        || up.len() != output.len()
+        || signs.is_some_and(|s| s.len() < output.len())
+    {
+        return Err(invalid("Hadamard requires a finite power-of-two block"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if PINNED {
+        let count = u32::try_from(output.len())?;
+        let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
+        if let Some(result) =
+            neon::swiglu_hadamard_block_read_into(gate, up, signs, output, normalization)
+        {
+            return result;
+        }
+    }
+    if PINNED {
+        pinned_activations::swiglu_into(gate, up, output)?;
+        if let Some(signs) = signs {
+            mul_slice_in_place(output, &signs[..output.len()]);
+        }
+    } else if let Some(signs) = signs {
+        for (((out, &u), &g), &sign) in output.iter_mut().zip(up).zip(gate).zip(signs) {
+            *out = (u * silu(g)) * sign;
+        }
+    } else {
+        for ((out, &u), &g) in output.iter_mut().zip(up).zip(gate) {
+            *out = u * silu(g);
+        }
+    }
+    hadamard(output)
+}
+
 /// Replaces finite logits by their normalized, stable exponential weights.
 ///
 /// Negative infinity is accepted as an attention mask. All-masked rows fail.

@@ -124,6 +124,98 @@ impl Arithmetic {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Pass explicit RMSNorm parameters, Hadamard block geometry, and reusable output buffers."
+    )]
+    fn normalize_hadamard_into(
+        self,
+        input: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        block: usize,
+        signs: Option<&[f32]>,
+        norm_out: &mut Vec<f32>,
+        rotated_out: &mut Vec<f32>,
+    ) -> Result<()> {
+        match self {
+            Self::Source => crate::kernels::rms_norm_hadamard_into::<false>(
+                input,
+                weight,
+                epsilon,
+                block,
+                signs,
+                norm_out,
+                rotated_out,
+            ),
+            Self::PinnedSwift => crate::kernels::rms_norm_hadamard_into::<true>(
+                input,
+                weight,
+                epsilon,
+                block,
+                signs,
+                norm_out,
+                rotated_out,
+            ),
+        }
+    }
+
+    fn swiglu_hadamard_read_into_with_parallelism(
+        self,
+        gate: &[f32],
+        up: &[f32],
+        block: usize,
+        signs: Option<&[f32]>,
+        parallelism: &RowParallelism,
+        rotated_out: &mut Vec<f32>,
+    ) -> Result<()> {
+        if gate.len() != up.len()
+            || block == 0
+            || !block.is_power_of_two()
+            || !up.len().is_multiple_of(block)
+            || signs.is_some_and(|s| s.len() < up.len())
+        {
+            return Err(invalid("Hadamard requires a finite power-of-two block"));
+        }
+        resize_into(up.len(), rotated_out)?;
+        if parallelism.workers() > 1 && block >= 256 && up.len() >= block.saturating_mul(16) {
+            return parallelism.update_chunks(rotated_out, block, |base_block, chunk| {
+                for (local_idx, out_block) in chunk.chunks_exact_mut(block).enumerate() {
+                    let offset = (base_block + local_idx) * block;
+                    let g_block = &gate[offset..offset + block];
+                    let u_block = &up[offset..offset + block];
+                    let s_block = signs.map(|s| &s[offset..offset + block]);
+                    match self {
+                        Self::Source => crate::kernels::swiglu_hadamard_block_read_into::<false>(
+                            g_block, u_block, s_block, out_block,
+                        )?,
+                        Self::PinnedSwift => {
+                            crate::kernels::swiglu_hadamard_block_read_into::<true>(
+                                g_block, u_block, s_block, out_block,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+        for (block_idx, out_block) in rotated_out.chunks_exact_mut(block).enumerate() {
+            let offset = block_idx * block;
+            let g_block = &gate[offset..offset + block];
+            let u_block = &up[offset..offset + block];
+            let s_block = signs.map(|s| &s[offset..offset + block]);
+            match self {
+                Self::Source => crate::kernels::swiglu_hadamard_block_read_into::<false>(
+                    g_block, u_block, s_block, out_block,
+                )?,
+                Self::PinnedSwift => crate::kernels::swiglu_hadamard_block_read_into::<true>(
+                    g_block, u_block, s_block, out_block,
+                )?,
+            }
+        }
+        Ok(())
+    }
+
     fn scratch(self, backend: MatvecBackend) -> MatvecScratch {
         match self {
             Self::Source => MatvecScratch::with_backend(backend),
@@ -674,6 +766,7 @@ enum LayerDelta {
 #[derive(Default)]
 struct ProjectionScratch {
     transformed: Vec<f32>,
+    pre_transformed_len: Option<usize>,
     matvec: MatvecScratch,
     #[cfg(test)]
     transforms: usize,
@@ -896,6 +989,16 @@ impl Transforms {
         )
     }
 
+    fn can_block_hadamard(&self, len: usize) -> bool {
+        self.block >= 16
+            && self.block.is_power_of_two()
+            && len.is_multiple_of(self.block)
+            && self
+                .signs
+                .get(&len)
+                .is_none_or(|signs| signs.len() >= len)
+    }
+
     // The fixed-size group borrows one exact input slice for its whole scope.
     // Nothing is reused across calls, tokens, layers or failed evaluations.
     #[cfg(test)]
@@ -924,6 +1027,7 @@ impl Transforms {
         scratch: &mut ProjectionScratch,
         executor: &mut Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
+        let mut pre_transformed = scratch.pre_transformed_len.take();
         let result = (|| {
             if N > 4 {
                 return Err(invalid("projection group exceeds four siblings"));
@@ -935,13 +1039,18 @@ impl Transforms {
                 }
                 let basis = self.basis(weights[index]);
                 let activation = if basis.0 {
-                    self.transform_into_with_parallelism(
-                        weights[index],
-                        input,
-                        geometry,
-                        scratch.matvec.row_parallelism(),
-                        &mut scratch.transformed,
-                    )?;
+                    if basis.1
+                        || pre_transformed.take() != Some(input.len())
+                        || scratch.transformed.len() != input.len()
+                    {
+                        self.transform_into_with_parallelism(
+                            weights[index],
+                            input,
+                            geometry,
+                            scratch.matvec.row_parallelism(),
+                            &mut scratch.transformed,
+                        )?;
+                    }
                     #[cfg(test)]
                     {
                         scratch.transforms += 1;
@@ -1999,9 +2108,14 @@ impl Qwen35 {
             .zip(deltas.iter_mut())
             .enumerate()
         {
-            self.arithmetic
-                .normalize(hidden, &layer.norm, self.geometry.epsilon, normalized)?;
-            if narrow_final && layer_idx + 1 == total_layers {
+            let is_narrow_final = narrow_final && layer_idx + 1 == total_layers;
+            let first_attn_target = match &layer.attention {
+                Attention::Full(weights) if is_narrow_final => &weights.key,
+                Attention::Full(weights) => &weights.query,
+                Attention::Recurrent(weights) => &weights.qkv,
+            };
+            evaluation.normalize_for_into(hidden, &layer.norm, normalized, first_attn_target)?;
+            if is_narrow_final {
                 match (&layer.attention, state) {
                     (Attention::Full(weights), LayerState::Full { .. }) => {
                         evaluation.full_attention_kv_only(
@@ -2061,28 +2175,25 @@ impl Qwen35 {
                 _ => return Err(invalid("decoder layer/cache kind mismatch")),
             }
             add(hidden, attention);
-            self.arithmetic.normalize(
-                hidden,
-                &layer.post_norm,
-                self.geometry.epsilon,
-                normalized,
-            )?;
+            evaluation.normalize_for_into(hidden, &layer.post_norm, normalized, &layer.up)?;
             // Attention no longer reads its projections or gates. Keep the
             // exact FFN operations while reusing their high-water allocations.
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
-            evaluation.project_ffn_swiglu_into(&layer.gate, &layer.up, normalized, gate, up)?;
+            evaluation.project_ffn_swiglu_into(
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+                normalized,
+                gate,
+                up,
+            )?;
             evaluation.project_into(&layer.down, up, attention)?;
             add(hidden, attention);
             finite(hidden, "decoder layer output")?;
         }
         if let Some(logits) = logits {
-            self.arithmetic.normalize(
-                hidden,
-                &self.output_norm,
-                self.geometry.epsilon,
-                normalized,
-            )?;
+            evaluation.normalize_for_into(hidden, &self.output_norm, normalized, &self.output)?;
             evaluation.project_into(&self.output, normalized, logits)?;
             finite(logits, "output logits")?;
         }
@@ -2168,10 +2279,45 @@ impl Evaluation<'_, '_> {
         self.project_group_into([tensor], input, [output])
     }
 
+    fn normalize_for_into(
+        &mut self,
+        input: &[f32],
+        weight: &[f32],
+        output: &mut Vec<f32>,
+        first_target: &Tensor,
+    ) -> Result<()> {
+        self.projection.pre_transformed_len = None;
+        if self.transforms.basis(first_target) == (true, false)
+            && self.transforms.can_block_hadamard(input.len())
+            && first_target.dimensions.first().copied() == Some(input.len())
+        {
+            let signs = self.transforms.signs.get(&input.len()).map(Vec::as_slice);
+            if self
+                .arithmetic
+                .normalize_hadamard_into(
+                    input,
+                    weight,
+                    self.geometry.epsilon,
+                    self.transforms.block,
+                    signs,
+                    output,
+                    &mut self.projection.transformed,
+                )
+                .is_ok()
+            {
+                self.projection.pre_transformed_len = Some(input.len());
+                return Ok(());
+            }
+        }
+        self.arithmetic
+            .normalize(input, weight, self.geometry.epsilon, output)
+    }
+
     fn project_ffn_swiglu_into(
         &mut self,
         gate_weight: &Tensor,
         up_weight: &Tensor,
+        down_weight: &Tensor,
         input: &[f32],
         gate: &mut Vec<f32>,
         up: &mut Vec<f32>,
@@ -2183,15 +2329,21 @@ impl Evaluation<'_, '_> {
                 .as_deref()
                 .is_some_and(|exec| exec.supports_f32_ffn_swiglu(gate_weight, up_weight))
         {
+            let pre_transformed = self.projection.pre_transformed_len.take();
             let basis = self.transforms.basis(gate_weight);
             let activation = if basis.0 {
-                self.transforms.transform_into_with_parallelism(
-                    gate_weight,
-                    input,
-                    self.geometry,
-                    self.projection.matvec.row_parallelism(),
-                    &mut self.projection.transformed,
-                )?;
+                if basis.1
+                    || pre_transformed != Some(input.len())
+                    || self.projection.transformed.len() != input.len()
+                {
+                    self.transforms.transform_into_with_parallelism(
+                        gate_weight,
+                        input,
+                        self.geometry,
+                        self.projection.matvec.row_parallelism(),
+                        &mut self.projection.transformed,
+                    )?;
+                }
                 #[cfg(test)]
                 {
                     self.projection.transforms += 1;
@@ -2214,6 +2366,28 @@ impl Evaluation<'_, '_> {
             }
         }
         self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
+        if self.adapter.is_none()
+            && self.transforms.basis(down_weight) == (true, false)
+            && self.transforms.can_block_hadamard(up.len())
+            && down_weight.dimensions.first().copied() == Some(up.len())
+        {
+            let signs = self.transforms.signs.get(&up.len()).map(Vec::as_slice);
+            if self
+                .arithmetic
+                .swiglu_hadamard_read_into_with_parallelism(
+                    gate,
+                    up,
+                    self.transforms.block,
+                    signs,
+                    self.projection.matvec.row_parallelism(),
+                    &mut self.projection.transformed,
+                )
+                .is_ok()
+            {
+                self.projection.pre_transformed_len = Some(up.len());
+                return Ok(());
+            }
+        }
         self.arithmetic.swiglu_in_place_with_parallelism(
             gate,
             up,

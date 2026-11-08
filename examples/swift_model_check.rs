@@ -30,7 +30,7 @@ const USAGE: &str = concat!(
     "       swift_model_check rollback <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check request-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-messages.json> <output-1..16> <absolute-deadline-unix-ms> <source-commit>\n",
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
-    "For load/forward/trajectory/rollback/request-timing, --row-workers <1..16> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
+    "For load/forward/trajectory/rollback/request-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
     "For selected current-weight load/forward/trajectory/rollback/request-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(default, ["forward", "model.gguf"]);
         let path = std::env::temp_dir().join("approved-adapter.gguf");
         for repacked in [false, true] {
-            for workers in [1_usize, 2, 16] {
+            for workers in [1_usize, 2, 16, 18] {
                 let mut arguments = Vec::new();
                 if repacked {
                     arguments.push("--use-repacked-ptq1".into());
@@ -477,7 +477,7 @@ mod tests {
                 assert_eq!(arguments, ["forward"]);
             }
         }
-        for value in ["", "0", "17", "+2", "-1", "2.0", "184467440737095516160"] {
+        for value in ["", "0", "19", "+2", "-1", "2.0", "184467440737095516160"] {
             let mut arguments = vec!["--row-workers".into(), value.into(), "forward".into()];
             assert!(select_row_workers(&mut arguments).is_err());
         }

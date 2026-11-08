@@ -262,7 +262,7 @@ mod tests {
             selected.extend(["--prompt-reuse", value].map(OsString::from));
             assert!(parse(selected).is_err());
         }
-        for value in ["0", "17", "invalid"] {
+        for value in ["0", "19", "invalid"] {
             let mut args = good.to_vec();
             args.extend(["--row-workers", value].map(OsString::from));
             assert!(parse(args).is_err());

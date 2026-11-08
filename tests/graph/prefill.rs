@@ -543,3 +543,54 @@ fn tiled_prefill_parallel_grouped_kv_and_head_major_recurrent_match_single_token
     }
     Ok(())
 }
+
+#[test]
+fn last_layer_prefill_narrowing_preserves_state_and_skips_unused_final_projections() -> Result<()> {
+    let make_four_layer = || {
+        let mut four_layer = paged_hybrid_fixture();
+        four_layer.metadata.insert(
+            "qwen35.block_count".to_owned(),
+            MetadataValue::from(4_u64),
+        );
+        four_layer.metadata.insert(
+            "qwen35.attention.recurrent_layers".to_owned(),
+            MetadataValue::from(vec![true, true, true, false]),
+        );
+        four_layer.tensors.retain(|name, _| !name.starts_with("blk."));
+        let rec_tensors = fixture(true).tensors;
+        let full_tensors = fixture(false).tensors;
+        for blk in 0..4 {
+            let src = if blk < 3 { &rec_tensors } else { &full_tensors };
+            for (name, mut tensor) in src.clone() {
+                if let Some(suffix) = name.strip_prefix("blk.0.") {
+                    let target = format!("blk.{blk}.{suffix}");
+                    tensor.name.clone_from(&target);
+                    four_layer.tensors.insert(target, tensor);
+                }
+            }
+        }
+        four_layer
+    };
+    let prompt = [0, 1, 1, 0, 1, 0, 0, 1, 0];
+    let mut narrowed_single = Qwen35::new(make_four_layer(), 192)?;
+    assert!(narrowed_single.last_layer_prefill_narrowing());
+    let mut full_single = Qwen35::new(make_four_layer(), 192)?;
+    full_single.set_last_layer_prefill_narrowing(false);
+    assert!(!full_single.last_layer_prefill_narrowing());
+    for &tok in &prompt {
+        narrowed_single.ingest(tok)?;
+        full_single.ingest(tok)?;
+    }
+    assert_eq!(graph_bits(&narrowed_single)?, graph_bits(&full_single)?);
+    assert_eq!(narrowed_single.evaluate(1)?, full_single.evaluate(1)?);
+
+    let mut narrowed_tiled = tiled(make_four_layer(), 8, false)?;
+    assert!(narrowed_tiled.last_layer_prefill_narrowing());
+    let mut full_tiled = tiled(make_four_layer(), 8, false)?;
+    full_tiled.set_last_layer_prefill_narrowing(false);
+    narrowed_tiled.ingest_block(&prompt, &|| Ok(()))?;
+    full_tiled.ingest_block(&prompt, &|| Ok(()))?;
+    assert_eq!(graph_bits(&narrowed_tiled)?, graph_bits(&full_tiled)?);
+    assert_eq!(narrowed_tiled.evaluate(1)?, full_tiled.evaluate(1)?);
+    Ok(())
+}

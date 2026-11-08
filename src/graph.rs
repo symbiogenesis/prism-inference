@@ -1245,6 +1245,7 @@ pub struct Qwen35 {
     context_limit: usize,
     position: usize,
     vocabulary: usize,
+    narrow_last_layer: bool,
     tiled_prefill: Option<prefill::TiledPrefill>,
     projection_executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
 }
@@ -1780,6 +1781,7 @@ impl Qwen35 {
             context_limit,
             position: 0,
             vocabulary,
+            narrow_last_layer: layer_count >= 4,
             tiled_prefill: None,
             projection_executor: None,
         })
@@ -1832,6 +1834,25 @@ impl Qwen35 {
         executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
     ) {
         self.projection_executor = executor;
+    }
+
+    /// Enable or disable last-layer (lk.N-1) state-only prefill row narrowing.
+    ///
+    /// Enabled by default for graphs with at least 4 layers (such as the 64-layer
+    /// Qwen3.5-27B hybrid stack). When enabled, state-only token/tile ingestion
+    /// (`ingest` and `ingest_block` without output logits) computes only the final
+    /// layer's committed state (K/V cache append on a full-attention final
+    /// layer or convolution/matrix update on a recurrent final layer), skipping
+    /// the unused final-layer query, attention, output, and FFN projections with
+    /// zero change to committed state or subsequent token logits.
+    pub const fn set_last_layer_prefill_narrowing(&mut self, enabled: bool) {
+        self.narrow_last_layer = enabled;
+    }
+
+    /// Returns whether last-layer state-only prefill row narrowing is enabled.
+    #[must_use]
+    pub const fn last_layer_prefill_narrowing(&self) -> bool {
+        self.narrow_last_layer
     }
 
     /// Look up a named projection tensor across all decoder layers.
@@ -1969,9 +1990,47 @@ impl Qwen35 {
                 evaluation.adapter_scratch,
             )?;
         }
-        for ((layer, state), delta) in self.layers.iter().zip(&self.state).zip(deltas.iter_mut()) {
+        let total_layers = self.layers.len();
+        let narrow_final = logits.is_none() && self.narrow_last_layer;
+        for (layer_idx, ((layer, state), delta)) in self
+            .layers
+            .iter()
+            .zip(&self.state)
+            .zip(deltas.iter_mut())
+            .enumerate()
+        {
             self.arithmetic
                 .normalize(hidden, &layer.norm, self.geometry.epsilon, normalized)?;
+            if narrow_final && layer_idx + 1 == total_layers {
+                match (&layer.attention, state) {
+                    (Attention::Full(weights), LayerState::Full { .. }) => {
+                        evaluation.full_attention_kv_only(
+                            weights,
+                            normalized,
+                            attention_scratch,
+                            delta,
+                        )?;
+                    }
+                    (
+                        Attention::Recurrent(weights),
+                        LayerState::Recurrent {
+                            convolution,
+                            matrix,
+                        },
+                    ) => {
+                        evaluation.recurrent_attention_state_only(
+                            weights,
+                            normalized,
+                            convolution,
+                            matrix,
+                            attention_scratch,
+                            delta,
+                        )?;
+                    }
+                    _ => return Err(invalid("decoder layer/cache kind mismatch")),
+                }
+                continue;
+            }
             match (&layer.attention, state) {
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
                     evaluation.full_attention(
@@ -2198,6 +2257,44 @@ impl Evaluation<'_, '_> {
             &mut scratch.attended,
         )?;
         self.project_into(&layer.output, &scratch.attended, output)
+    }
+
+    fn full_attention_kv_only(
+        &mut self,
+        layer: &FullAttention,
+        input: &[f32],
+        scratch: &mut AttentionScratch,
+        delta: &mut LayerDelta,
+    ) -> Result<()> {
+        let LayerDelta::Full { key, value } = delta else {
+            return Err(invalid("decoder full-attention delta kind mismatch"));
+        };
+        self.project_group_into([&layer.key, &layer.value], input, [key, value])?;
+        let g = self.geometry;
+        if !self.frequencies_ready {
+            rope_frequencies(g, self.position, &mut scratch.frequencies)?;
+            self.frequencies_ready = true;
+        }
+        let arithmetic = self.arithmetic;
+        let key_norm: &[f32] = &layer.key_norm;
+        let frequencies: &[(f32, f32)] = &scratch.frequencies;
+        self.projection
+            .matvec
+            .row_parallelism()
+            .update_paired_chunks(key, g.head, value, g.head, |_, key_chunk, value_chunk| {
+                for (key_head, value_head) in key_chunk
+                    .chunks_exact_mut(g.head)
+                    .zip(value_chunk.chunks_exact_mut(g.head))
+                {
+                    arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
+                    arithmetic.attention_rope(key_head, g, frequencies)?;
+                    round_f16_slice(key_head);
+                    round_f16_slice(value_head);
+                }
+                Ok(())
+            })?;
+        finite(key, "binary16 key cache")?;
+        finite(value, "binary16 value cache")
     }
 
     #[allow(
@@ -2447,6 +2544,34 @@ impl Evaluation<'_, '_> {
             &mut scratch.attended,
         )?;
         self.project_into(&layer.output, &scratch.attended, output)
+    }
+
+    fn recurrent_attention_state_only(
+        &mut self,
+        layer: &RecurrentAttention,
+        input: &[f32],
+        history: &[f32],
+        previous: &[f32],
+        scratch: &mut AttentionScratch,
+        delta: &mut LayerDelta,
+    ) -> Result<()> {
+        self.project_group_into(
+            [&layer.qkv, &layer.beta, &layer.alpha],
+            input,
+            [&mut scratch.projected, &mut scratch.beta, &mut scratch.alpha],
+        )?;
+        resize_into(self.geometry.value_width(), &mut scratch.gate)?;
+        self.recurrent_attention_state(
+            layer,
+            &mut scratch.projected,
+            &scratch.gate,
+            &scratch.beta,
+            &scratch.alpha,
+            history,
+            previous,
+            delta,
+            &mut scratch.attended,
+        )
     }
 
     #[allow(

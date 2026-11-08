@@ -377,11 +377,14 @@ impl Qwen35 {
         // clears provisional state, including failure during the first tile.
         self.position = base + count;
         let mut frequencies_ready = false;
-        for ((layer, state), delta) in self
+        let total_layers = self.layers.len();
+        let narrow_final = self.narrow_last_layer;
+        for (layer_idx, ((layer, state), delta)) in self
             .layers
             .iter()
             .zip(&mut self.state)
             .zip(&mut self.workspace.deltas)
+            .enumerate()
         {
             if count > 1 && tile.projector.row_parallelism().workers() > 1 {
                 let hidden_ref = &tile.hidden[..count];
@@ -415,6 +418,63 @@ impl Qwen35 {
                         normalized,
                     )?;
                 }
+            }
+            if narrow_final && layer_idx + 1 == total_layers {
+                match (&layer.attention, &mut *state) {
+                    (Attention::Recurrent(weights), _) => {
+                        gdn::recurrent_tile(
+                            weights,
+                            state,
+                            delta,
+                            &self.geometry,
+                            self.arithmetic,
+                            &self.transforms,
+                            self.adapter.as_ref(),
+                            self.adapter_scale,
+                            &mut self.workspace.adapter,
+                            &mut self.workspace.projection.matvec,
+                            count,
+                            check,
+                            tile,
+                            reborrow_executor(&mut executor),
+                        )?;
+                    }
+                    (Attention::Full(weights), LayerState::Full { keys, values }) => {
+                        check()?;
+                        let _ = project_tile_pair(
+                            &self.transforms,
+                            &self.geometry,
+                            self.arithmetic,
+                            self.adapter.as_ref(),
+                            self.adapter_scale,
+                            &mut self.workspace.adapter,
+                            &mut self.workspace.projection.matvec,
+                            [&weights.key, &weights.value],
+                            &tile.normalized[..count],
+                            &mut tile.recurrent_gate[..count],
+                            &mut tile.beta[..count],
+                            &mut tile.transformed[..count],
+                            &mut tile.projector,
+                            reborrow_executor(&mut executor),
+                            check,
+                        )?;
+                        full_attention_kv_only_tile(
+                            weights,
+                            &self.geometry,
+                            self.arithmetic,
+                            base,
+                            count,
+                            &mut frequencies_ready,
+                            keys,
+                            values,
+                            tile,
+                            check,
+                        )?;
+                    }
+                    _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
+                }
+                check()?;
+                continue;
             }
             match (&layer.attention, &mut *state) {
                 (Attention::Recurrent(weights), _) => {
@@ -579,6 +639,89 @@ impl Qwen35 {
         }
         Ok(())
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep causal KV append ordering and tile scratch explicit."
+)]
+fn full_attention_kv_only_tile(
+    weights: &FullAttention,
+    g: &Geometry,
+    arithmetic: Arithmetic,
+    base: usize,
+    count: usize,
+    frequencies_ready: &mut bool,
+    keys: &mut KvCache,
+    values: &mut KvCache,
+    tile: &mut TiledPrefill,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    check()?;
+    if !*frequencies_ready {
+        for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
+            rope_frequencies(g, base + index, frequencies)?;
+        }
+        *frequencies_ready = true;
+    }
+    let frequencies_ref: &[Vec<(f32, f32)>] = &tile.frequencies[..count];
+    let key_norm: &[f32] = &weights.key_norm;
+    if count > 1 && tile.projector.row_parallelism().workers() > 1 {
+        tile.projector.row_parallelism().update_paired_chunks(
+            &mut tile.recurrent_gate[..count],
+            1,
+            &mut tile.beta[..count],
+            1,
+            |base_tok, key_chunk, value_chunk| {
+                for (offset, (key_tok, value_tok)) in
+                    key_chunk.iter_mut().zip(value_chunk.iter_mut()).enumerate()
+                {
+                    let tok = base_tok + offset;
+                    let frequencies = &frequencies_ref[tok];
+                    for (key_head, value_head) in key_tok
+                        .chunks_exact_mut(g.head)
+                        .zip(value_tok.chunks_exact_mut(g.head))
+                    {
+                        arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
+                        arithmetic.attention_rope(key_head, g, frequencies)?;
+                        round_f16_slice(key_head);
+                        round_f16_slice(value_head);
+                    }
+                    finite(key_tok, "binary16 key cache")?;
+                    finite(value_tok, "binary16 value cache")?;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        for tok in 0..count {
+            let frequencies = &frequencies_ref[tok];
+            let key_tok = &mut tile.recurrent_gate[tok];
+            let value_tok = &mut tile.beta[tok];
+            for (key_head, value_head) in key_tok
+                .chunks_exact_mut(g.head)
+                .zip(value_tok.chunks_exact_mut(g.head))
+            {
+                arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
+                arithmetic.attention_rope(key_head, g, frequencies)?;
+                round_f16_slice(key_head);
+                round_f16_slice(value_head);
+            }
+            finite(key_tok, "binary16 key cache")?;
+            finite(value_tok, "binary16 value cache")?;
+        }
+    }
+    for index in 0..count {
+        if index > 0 {
+            check()?;
+        }
+        keys.reserve_append()?;
+        values.reserve_append()?;
+        keys.append(&tile.recurrent_gate[index]);
+        values.append(&tile.beta[index]);
+        check()?;
+    }
+    Ok(())
 }
 
 #[allow(

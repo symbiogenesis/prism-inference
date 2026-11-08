@@ -48,10 +48,10 @@ const TQ2_BYTE_LUT: [[i8; 4]; 256] = {
     let mut byte = 0_usize;
     while byte < 256 {
         let b = byte as u8;
-        lut[byte][0] = ((b & 3) as i8) - 1;
-        lut[byte][1] = (((b >> 2) & 3) as i8) - 1;
-        lut[byte][2] = (((b >> 4) & 3) as i8) - 1;
-        lut[byte][3] = (((b >> 6) & 3) as i8) - 1;
+        lut[byte][0] = (b & 3).cast_signed() - 1;
+        lut[byte][1] = ((b >> 2) & 3).cast_signed() - 1;
+        lut[byte][2] = ((b >> 4) & 3).cast_signed() - 1;
+        lut[byte][3] = ((b >> 6) & 3).cast_signed() - 1;
         byte += 1;
     }
     lut
@@ -342,7 +342,8 @@ mod tests {
         }
         let mut activations = [0_i8; 128];
         for (idx, a) in activations.iter_mut().enumerate() {
-            *a = (((idx * 37 + 11) % 251) as i16 - 125) as i8;
+            let rem = i16::try_from((idx * 37 + 11) % 251).unwrap_or(0);
+            *a = (rem - 125) as i8;
         }
         let contiguous_lut = Tl1BlockLut::from_contiguous_activations(&activations);
         let expected_contiguous: i32 = activations

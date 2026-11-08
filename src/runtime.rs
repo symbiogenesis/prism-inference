@@ -3,6 +3,9 @@
 use crate::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid,
     sampling::{Greedy, Sampler},
+    speculative::{
+        MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixDrafter,
+    },
 };
 use std::sync::{
     Arc,
@@ -878,6 +881,308 @@ impl<D: Decoder> Runtime<D> {
         }
         Ok(completion)
     }
+
+    /// Generate greedy tokens with training-free prompt/history suffix speculation
+    /// (`SuffixDecoding`) and exact target verification.
+    ///
+    /// Preserves bit-identical greedy output tokens, stop-token semantics, and
+    /// whole-request rollback on cancellation or error.
+    ///
+    /// # Errors
+    /// Rejects invalid suffix draft configs or any [`Self::generate_with_prefill`] error.
+    pub fn generate_speculative(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        suffix_config: SuffixDraftConfig,
+        cancellation: &Cancellation,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<(Completion, SpeculativeStats)> {
+        self.generate_speculative_checked(
+            prompt,
+            options,
+            prefill,
+            suffix_config,
+            &|| cancellation.check(),
+            emit,
+        )
+    }
+
+    /// Generate greedy tokens with prompt/history suffix speculation before a deadline.
+    ///
+    /// # Errors
+    /// Rejects invalid suffix draft configs, deadline expiry, or any
+    /// [`Self::generate_until_with_prefill`] error.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Explicit suffix draft configuration extends the bounded deadline API."
+    )]
+    pub fn generate_speculative_until(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        suffix_config: SuffixDraftConfig,
+        cancellation: &Cancellation,
+        deadline: Instant,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<(Completion, SpeculativeStats)> {
+        self.generate_speculative_checked(
+            prompt,
+            options,
+            prefill,
+            suffix_config,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            emit,
+        )
+    }
+
+    /// Speculatively advance and verify a short draft chain (`1..=8` tokens) against
+    /// the current committed state, rolling back the decoder checkpoint on the first
+    /// rejected draft token and committing all accepted tokens plus one bonus/correction token.
+    ///
+    /// # Errors
+    /// Rejects faulted runtimes, empty committed state, invalid draft lengths or token IDs,
+    /// context overflow, cancellation, or decoder checkpoint/restore failures.
+    pub fn verify_draft_block(
+        &mut self,
+        draft: &[u32],
+        cancellation: &Cancellation,
+    ) -> Result<(Vec<u32>, SpeculativeStats)> {
+        if self.faulted {
+            return Err(invalid(
+                "native runtime requires reset after failed restoration",
+            ));
+        }
+        cancellation.check()?;
+        if self.tokens.is_empty() || self.logits.is_empty() {
+            return Err(invalid(
+                "speculative block verification requires a prepared nonempty prefix",
+            ));
+        }
+        if draft.is_empty()
+            || draft.len() > MAX_SPECULATIVE_DRAFT_TOKENS
+            || draft.iter().any(|&token| {
+                usize::try_from(token).map_or(true, |value| value >= self.decoder.vocab_size())
+            })
+        {
+            return Err(invalid("invalid speculative draft block bounds or tokens"));
+        }
+        let max_advance = draft
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| invalid("speculative context length overflow"))?;
+        if self
+            .tokens
+            .len()
+            .checked_add(max_advance)
+            .is_none_or(|len| len > self.limits.context_tokens)
+        {
+            return Err(invalid(
+                "speculative draft block exceeds context token limit",
+            ));
+        }
+        self.decoder.admit_work(0, max_advance)?;
+        let check = || cancellation.check();
+        let rollback = self.capture(0, &check)?;
+        let result = (|| {
+            let mut stats = SpeculativeStats {
+                draft_rounds: 1,
+                draft_tokens_proposed: draft.len(),
+                draft_tokens_accepted: 0,
+                target_evaluations: 0,
+                rollback_restores: 0,
+            };
+            let mut committed = Vec::new();
+            committed.try_reserve_exact(max_advance)?;
+            for &candidate in draft {
+                check()?;
+                let expected = greedy(&self.logits)?;
+                let step_state = self.decoder.checkpoint()?;
+                let step_logits = copy(&self.logits)?;
+                let step_tokens_len = self.tokens.len();
+                self.evaluate(candidate, &check)?;
+                stats.target_evaluations += 1;
+                if candidate == expected {
+                    stats.draft_tokens_accepted += 1;
+                    committed.push(candidate);
+                } else {
+                    // Candidate diverged from greedy target verification: restore
+                    // recurrent GDN + KV state to the pre-step checkpoint and
+                    // advance with the exact target correction token.
+                    self.decoder.restore(&step_state)?;
+                    self.tokens.truncate(step_tokens_len);
+                    self.logits = step_logits;
+                    stats.rollback_restores += 1;
+                    self.evaluate(expected, &check)?;
+                    stats.target_evaluations += 1;
+                    committed.push(expected);
+                    return Ok((committed, stats));
+                }
+            }
+            // All draft tokens were accepted; emit one bonus token from the final distribution.
+            check()?;
+            let bonus = greedy(&self.logits)?;
+            self.evaluate(bonus, &check)?;
+            stats.target_evaluations += 1;
+            committed.push(bonus);
+            Ok((committed, stats))
+        })();
+        if let Err(error) = result {
+            self.faulted = true;
+            let restored = self.decoder.restore(&rollback.state);
+            self.tokens = rollback.tokens;
+            self.logits = rollback.logits;
+            restored?;
+            self.faulted = false;
+            return Err(error);
+        }
+        result
+    }
+
+    fn generate_speculative_checked(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        suffix_config: SuffixDraftConfig,
+        check: &impl Fn() -> Result<()>,
+        mut emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<(Completion, SpeculativeStats)> {
+        if self.faulted {
+            return Err(invalid(
+                "native runtime requires reset after failed restoration",
+            ));
+        }
+        suffix_config.validate()?;
+        check()?;
+        self.validate_request(prompt, options, prefill)?;
+        check()?;
+        let rollback = self.capture(0, check)?;
+        let result = (|| {
+            check()?;
+            let (completion, stats) = self.generate_speculative_inner(
+                prompt,
+                options,
+                prefill,
+                suffix_config,
+                check,
+                &mut emit,
+            )?;
+            check()?;
+            let snapshot = if self.limits.checkpoints == 0 {
+                None
+            } else {
+                let snapshot = self.capture(rollback.bytes, check).ok();
+                check()?;
+                snapshot
+            };
+            Ok((completion, stats, snapshot))
+        })();
+        match result {
+            Ok((completion, stats, snapshot)) => {
+                if let Some(snapshot) = snapshot {
+                    if self.checkpoints.len() == self.limits.checkpoints {
+                        self.checkpoints.remove(0);
+                    }
+                    self.checkpoints.push(snapshot);
+                }
+                Ok((completion, stats))
+            }
+            Err(error) => {
+                self.faulted = true;
+                let restored = self.decoder.restore(&rollback.state);
+                self.tokens = rollback.tokens;
+                self.logits = rollback.logits;
+                restored?;
+                self.faulted = false;
+                Err(error)
+            }
+        }
+    }
+
+    fn generate_speculative_inner(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        suffix_config: SuffixDraftConfig,
+        check: &impl Fn() -> Result<()>,
+        emit: &mut impl FnMut(u32) -> Result<()>,
+    ) -> Result<(Completion, SpeculativeStats)> {
+        check()?;
+        let reused = self.prepare(prompt, check)?;
+        check()?;
+        let remaining = prompt.len() - reused;
+        let evaluations = options
+            .max_tokens
+            .checked_add(usize::from(remaining > 0))
+            .ok_or_else(|| invalid("native forward work count overflow"))?;
+        self.decoder
+            .admit_work(remaining.saturating_sub(1), evaluations)?;
+        check()?;
+        if let Some((&last, prefix)) = prompt[reused..].split_last() {
+            for block in prefix.chunks(prefill.block_tokens) {
+                self.ingest_block(block, check)?;
+            }
+            self.evaluate(last, check)?;
+        }
+        let mut completion = Completion {
+            prompt_tokens: prompt.len(),
+            reused_tokens: reused,
+            generated_tokens: 0,
+            finish: Finish::Length,
+        };
+        let mut stats = SpeculativeStats::default();
+        while completion.generated_tokens < options.max_tokens {
+            check()?;
+            let remaining_budget = options.max_tokens - completion.generated_tokens;
+            let draft = SuffixDrafter::propose(&self.tokens, suffix_config, remaining_budget)?;
+            let mut stopped = false;
+            if !draft.is_empty() {
+                stats.draft_rounds += 1;
+                stats.draft_tokens_proposed += draft.len();
+                for &candidate in &draft {
+                    check()?;
+                    let target_token = greedy(&self.logits)?;
+                    check()?;
+                    if target_token != candidate {
+                        break;
+                    }
+                    stats.draft_tokens_accepted += 1;
+                    if options.stop_tokens.contains(&target_token) {
+                        completion.finish = Finish::Stop;
+                        stopped = true;
+                        break;
+                    }
+                    self.evaluate(target_token, check)?;
+                    stats.target_evaluations += 1;
+                    check()?;
+                    emit(target_token)?;
+                    check()?;
+                    completion.generated_tokens += 1;
+                }
+            }
+            if stopped || completion.generated_tokens >= options.max_tokens {
+                break;
+            }
+            check()?;
+            let token = greedy(&self.logits)?;
+            check()?;
+            if options.stop_tokens.contains(&token) {
+                completion.finish = Finish::Stop;
+                break;
+            }
+            self.evaluate(token, check)?;
+            stats.target_evaluations += 1;
+            check()?;
+            emit(token)?;
+            check()?;
+            completion.generated_tokens += 1;
+        }
+        Ok((completion, stats))
+    }
 }
 
 fn check_deadline(cancellation: &Cancellation, deadline: Instant, now: Instant) -> Result<()> {
@@ -1331,6 +1636,72 @@ mod deadline_tests {
             assert_eq!(runtime.is_faulted(), fail_restore);
             assert!(!clock.operations.borrow().contains(&Operation::Evaluate(5)));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_suffix_generation_and_block_verifier_preserve_exact_greedy_state() -> Result<()>
+    {
+        let now = Instant::now();
+        let make_runtime = || -> Result<(Runtime<TimedDecoder>, Rc<Clock>)> {
+            let clock = Rc::new(Clock {
+                now: Cell::new(now),
+                deadline: now + Duration::from_secs(10),
+                expire_on: Cell::new(None),
+                operations: RefCell::new(Vec::new()),
+                restore_fail: Cell::new(false),
+            });
+            let runtime = Runtime::new(
+                TimedDecoder {
+                    tokens: Vec::new(),
+                    clock: clock.clone(),
+                },
+                LIMITS,
+            )?;
+            Ok((runtime, clock))
+        };
+
+        // Prompt [0, 0, 0, 0, 0] causes TimedDecoder (sum % 8) to emit 0 repeatedly,
+        // so SuffixDrafter matches [0, 0] in history and proposes [0, 0] drafts that are accepted!
+        let prompt = [0_u32, 0, 0, 0, 0];
+        let gen_opts = Generation {
+            max_tokens: 6,
+            stop_tokens: vec![],
+        };
+        let (mut baseline_rt, _) = make_runtime()?;
+        let mut baseline_out = Vec::new();
+        let baseline_comp =
+            baseline_rt.generate(&prompt, &gen_opts, &Cancellation::default(), |t| {
+                baseline_out.push(t);
+                Ok(())
+            })?;
+
+        let (mut spec_rt, _) = make_runtime()?;
+        let mut spec_out = Vec::new();
+        let (spec_comp, spec_stats) = spec_rt.generate_speculative(
+            &prompt,
+            &gen_opts,
+            Prefill::default(),
+            SuffixDraftConfig::new(2, 8, 3)?,
+            &Cancellation::default(),
+            |t| {
+                spec_out.push(t);
+                Ok(())
+            },
+        )?;
+        assert_eq!(spec_comp, baseline_comp);
+        assert_eq!(spec_out, baseline_out);
+        assert_eq!(spec_rt.tokens(), baseline_rt.tokens());
+        assert!(spec_stats.draft_rounds > 0);
+        assert!(spec_stats.draft_tokens_accepted > 0);
+
+        // Now test verify_draft_block with a draft chain where token 0 is accepted and token 1 (7 != 0) is rejected:
+        let (rendered, verify_stats) =
+            spec_rt.verify_draft_block(&[0, 7, 0], &Cancellation::default())?;
+        assert_eq!(rendered, vec![0, 0]);
+        assert_eq!(verify_stats.draft_tokens_proposed, 3);
+        assert_eq!(verify_stats.draft_tokens_accepted, 1);
+        assert_eq!(verify_stats.rollback_restores, 1);
         Ok(())
     }
 }

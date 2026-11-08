@@ -917,9 +917,10 @@ fn dot_pq2_neon<const FUSED: bool>(bytes: &[u8], input: &[Q8KBlock]) -> Result<f
     finite(output)
 }
 
-/// Computes a direct `PTQ1` (28-byte 128-element ternary blocks) dot product
-/// against `Q8_K` (256-element activation blocks) without requiring a separate
-/// `Q8_0` activation quantization pass when `Q8_K` blocks are already prepared.
+/// Computes a direct `PTQ1` dot product against `Q8_K` activation blocks.
+///
+/// Avoids a separate `Q8_0` activation quantization pass when 256-element
+/// `Q8_K` blocks are already prepared.
 ///
 /// # Errors
 /// Rejects malformed or mismatched `PTQ1`/`Q8_K` extents, invalid ternary bytes,
@@ -3567,6 +3568,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "Test reference mirrors scalar non-fused multiply-then-add order."
+    )]
     fn dot_ptq1_q8k_matches_dequantized_reference() -> crate::Result<()> {
         let mut weights = [0.0_f32; 256];
         for (i, w) in weights.iter_mut().enumerate() {

@@ -18,6 +18,7 @@ use crate::{
     },
     runtime::{Cancellation, Completion, GenerationTimings, Limits, Prefill, PromptReuse, Runtime},
     sampling::SwiftSampler,
+    speculative::{SpeculativeStats, SuffixDraftConfig},
     swift_chat::SwiftChatSession,
     text_output::Utf8Output,
     vocabulary::Vocabulary,
@@ -398,6 +399,61 @@ impl SwiftSession {
     ) -> Result<Completion> {
         *timings = GenerationTimings::default();
         self.complete_observed(prompt, cancellation, deadline, Some(timings), emit)
+    }
+
+    /// Generate greedy text with prompt/history suffix speculation (`SuffixDecoding`)
+    /// under the complete output cap and absolute deadline.
+    ///
+    /// # Errors
+    /// Rejects invalid suffix draft configs or any [`Self::complete`] error.
+    pub fn complete_speculative(
+        &mut self,
+        prompt: &PreparedChat,
+        suffix_config: SuffixDraftConfig,
+        cancellation: &Cancellation,
+        deadline: Instant,
+        mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
+    ) -> Result<(Completion, SpeculativeStats)> {
+        suffix_config.validate()?;
+        if self.is_faulted() {
+            return Err(invalid("Swift session requires reset"));
+        }
+        validate_prompt_owner(&self.owner, prompt)?;
+        validate_adapter_scale(self.adapter_identity.is_some(), prompt.adapter_scale)?;
+        check_request(cancellation, deadline)?;
+        self.runtime
+            .prepare_profile_request(prompt.adapter_scale, self.prompt_reuse)?;
+        let options = self.chat.generation(prompt.output_tokens)?;
+        let mut display = Utf8Output::new();
+        let mut output_bytes = 0usize;
+        let consume = |token| {
+            let text = display.push(self.vocabulary.piece(token)?)?;
+            charge_output(&mut output_bytes, text.len())?;
+            if !text.is_empty() {
+                emit(TextEvent::Delta(&text))?;
+            }
+            Ok(())
+        };
+        let (completion, stats) = self.runtime.generate_speculative_until(
+            &prompt.tokens,
+            &options,
+            Prefill { block_tokens: 64 },
+            suffix_config,
+            cancellation,
+            deadline,
+            consume,
+        )?;
+        self.delivery_fault = true;
+        let suffix = display.finish();
+        charge_output(&mut output_bytes, suffix.len())?;
+        if !suffix.is_empty() {
+            emit(TextEvent::Delta(suffix))?;
+        }
+        check_request(cancellation, deadline)?;
+        emit(TextEvent::Complete(completion))?;
+        check_request(cancellation, deadline)?;
+        self.delivery_fault = false;
+        Ok((completion, stats))
     }
 
     fn complete_observed(

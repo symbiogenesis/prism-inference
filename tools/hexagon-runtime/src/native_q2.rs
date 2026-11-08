@@ -1042,7 +1042,11 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut rem_act = activations;
         let mut rem_out = outputs;
         while !rem_act.is_empty() {
-            let chunk_len = rem_act.len().min(4);
+            let chunk_len = if rem_act.len() >= 8 {
+                8
+            } else {
+                rem_act.len().min(4)
+            };
             let (act_chunk, next_act) = rem_act.split_at(chunk_len);
             let (out_chunk, next_out) = rem_out.split_at_mut(chunk_len);
             rem_act = next_act;
@@ -1054,6 +1058,33 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 .saturating_add(chunk_u64);
             self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
             match out_chunk {
+                [o0, o1, o2, o3, o4, o5, o6, o7] => {
+                    self.submitter.submit_resident_multi8(
+                        [
+                            handle, handle, handle, handle, handle, handle, handle, handle,
+                        ],
+                        [
+                            act_chunk[0].as_slice(),
+                            act_chunk[1].as_slice(),
+                            act_chunk[2].as_slice(),
+                            act_chunk[3].as_slice(),
+                            act_chunk[4].as_slice(),
+                            act_chunk[5].as_slice(),
+                            act_chunk[6].as_slice(),
+                            act_chunk[7].as_slice(),
+                        ],
+                        [
+                            o0.as_mut_slice(),
+                            o1.as_mut_slice(),
+                            o2.as_mut_slice(),
+                            o3.as_mut_slice(),
+                            o4.as_mut_slice(),
+                            o5.as_mut_slice(),
+                            o6.as_mut_slice(),
+                            o7.as_mut_slice(),
+                        ],
+                    )?;
+                }
                 [o0, o1, o2, o3] => {
                     self.submitter.submit_resident_multi4(
                         [handle, handle, handle, handle],
@@ -1210,7 +1241,49 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut rem_a = outputs_a;
         let mut rem_b = outputs_b;
         while !rem_act.is_empty() {
-            if rem_act.len() >= 2 {
+            if rem_act.len() >= 8 {
+                let (act_chunk, next_act) = rem_act.split_at(4);
+                let (a_chunk, next_a) = rem_a.split_at_mut(4);
+                let (b_chunk, next_b) = rem_b.split_at_mut(4);
+                rem_act = next_act;
+                rem_a = next_a;
+                rem_b = next_b;
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(8);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                let [oa0, oa1, oa2, oa3] = a_chunk else {
+                    return Err(invalid("unexpected pair token slice"));
+                };
+                let [ob0, ob1, ob2, ob3] = b_chunk else {
+                    return Err(invalid("unexpected pair token slice"));
+                };
+                let a0 = act_chunk[0].as_slice();
+                let a1 = act_chunk[1].as_slice();
+                let a2 = act_chunk[2].as_slice();
+                let a3 = act_chunk[3].as_slice();
+                self.submitter.submit_resident_multi8(
+                    [h0, h1, h0, h1, h0, h1, h0, h1],
+                    [a0, a0, a1, a1, a2, a2, a3, a3],
+                    [
+                        oa0.as_mut_slice(),
+                        ob0.as_mut_slice(),
+                        oa1.as_mut_slice(),
+                        ob1.as_mut_slice(),
+                        oa2.as_mut_slice(),
+                        ob2.as_mut_slice(),
+                        oa3.as_mut_slice(),
+                        ob3.as_mut_slice(),
+                    ],
+                )?;
+                for out in [oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3] {
+                    finite_slice(out)?;
+                }
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(8);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(8);
+            } else if rem_act.len() >= 2 {
                 let (act_chunk, next_act) = rem_act.split_at(2);
                 let (a_chunk, next_a) = rem_a.split_at_mut(2);
                 let (b_chunk, next_b) = rem_b.split_at_mut(2);
@@ -1371,7 +1444,97 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut rem_b = outputs_b;
         let mut rem_c = outputs_c;
         while !rem_act.is_empty() {
-            if rem_act.len() >= 4 {
+            if rem_act.len() >= 8 {
+                let (act_chunk, next_act) = rem_act.split_at(8);
+                let (a_chunk, next_a) = rem_a.split_at_mut(8);
+                let (b_chunk, next_b) = rem_b.split_at_mut(8);
+                let (c_chunk, next_c) = rem_c.split_at_mut(8);
+                rem_act = next_act;
+                rem_a = next_a;
+                rem_b = next_b;
+                rem_c = next_c;
+                let [oa0, oa1, oa2, oa3, oa4, oa5, oa6, oa7] = a_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let [ob0, ob1, ob2, ob3, ob4, ob5, ob6, ob7] = b_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let [oc0, oc1, oc2, oc3, oc4, oc5, oc6, oc7] = c_chunk else {
+                    return Err(invalid("unexpected triple token slice"));
+                };
+                let x = [
+                    act_chunk[0].as_slice(),
+                    act_chunk[1].as_slice(),
+                    act_chunk[2].as_slice(),
+                    act_chunk[3].as_slice(),
+                    act_chunk[4].as_slice(),
+                    act_chunk[5].as_slice(),
+                    act_chunk[6].as_slice(),
+                    act_chunk[7].as_slice(),
+                ];
+                for (handles, acts, outs) in [
+                    (
+                        [h0, h1, h2, h0, h1, h2, h0, h1],
+                        [x[0], x[0], x[0], x[1], x[1], x[1], x[2], x[2]],
+                        [
+                            oa0.as_mut_slice(),
+                            ob0.as_mut_slice(),
+                            oc0.as_mut_slice(),
+                            oa1.as_mut_slice(),
+                            ob1.as_mut_slice(),
+                            oc1.as_mut_slice(),
+                            oa2.as_mut_slice(),
+                            ob2.as_mut_slice(),
+                        ],
+                    ),
+                    (
+                        [h2, h0, h1, h2, h0, h1, h2, h0],
+                        [x[2], x[3], x[3], x[3], x[4], x[4], x[4], x[5]],
+                        [
+                            oc2.as_mut_slice(),
+                            oa3.as_mut_slice(),
+                            ob3.as_mut_slice(),
+                            oc3.as_mut_slice(),
+                            oa4.as_mut_slice(),
+                            ob4.as_mut_slice(),
+                            oc4.as_mut_slice(),
+                            oa5.as_mut_slice(),
+                        ],
+                    ),
+                    (
+                        [h1, h2, h0, h1, h2, h0, h1, h2],
+                        [x[5], x[5], x[6], x[6], x[6], x[7], x[7], x[7]],
+                        [
+                            ob5.as_mut_slice(),
+                            oc5.as_mut_slice(),
+                            oa6.as_mut_slice(),
+                            ob6.as_mut_slice(),
+                            oc6.as_mut_slice(),
+                            oa7.as_mut_slice(),
+                            ob7.as_mut_slice(),
+                            oc7.as_mut_slice(),
+                        ],
+                    ),
+                ] {
+                    self.statistics.operations_attempted =
+                        self.statistics.operations_attempted.saturating_add(8);
+                    self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                    let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
+                    self.submitter.submit_resident_multi8(
+                        handles,
+                        acts,
+                        [o0, o1, o2, o3, o4, o5, o6, o7],
+                    )?;
+                    for out in [&*o0, &*o1, &*o2, &*o3, &*o4, &*o5, &*o6, &*o7] {
+                        finite_slice(out)?;
+                    }
+                    self.statistics.operations_completed =
+                        self.statistics.operations_completed.saturating_add(8);
+                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                    self.statistics.projections_completed =
+                        self.statistics.projections_completed.saturating_add(8);
+                }
+            } else if rem_act.len() >= 4 {
                 let (act_chunk, next_act) = rem_act.split_at(4);
                 let (a_chunk, next_a) = rem_a.split_at_mut(4);
                 let (b_chunk, next_b) = rem_b.split_at_mut(4);
@@ -1526,6 +1689,111 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                     self.statistics.projections_completed.saturating_add(3);
             }
         }
+        Ok(())
+    }
+
+    /// Execute a fused `ffn_gate` + `ffn_up` + `HTP_OP_GLU_SWIGLU` chain in a
+    /// single 3-operation DSP queue submission with VTCM intermediate residency.
+    ///
+    /// # Errors
+    /// Rejects non-resident or mismatched tensors, non-finite inputs/outputs or
+    /// failed submissions, closing the executor on any failure.
+    pub fn project_f32_ffn_swiglu(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activation: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        let result = self.project_f32_ffn_swiglu_inner(gate, up, activation, output);
+        if result.is_err() {
+            self.failed = true;
+            output.clear();
+        }
+        result
+    }
+
+    fn project_f32_ffn_swiglu_inner(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activation: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        let tensors = [gate, up];
+        let Some((columns, rows_per_member, cached_indices)) = self.validate_f32_group(&tensors)
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon fused FFN SwiGLU projection group",
+            ));
+        };
+        let rows = rows_per_member[0];
+        if rows_per_member[1] != rows || activation.len() != columns {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        finite_slice(activation)?;
+        let mut weights = Vec::new();
+        for (member, &tensor) in tensors.iter().enumerate() {
+            if cached_indices[member].is_none() {
+                let max_mapped_rows = rows.next_multiple_of(32);
+                let required_bytes = max_mapped_rows * 36 * (columns / 128);
+                if weights.len() < required_bytes {
+                    weights
+                        .try_reserve(required_bytes - weights.len())
+                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+                    weights.resize(required_bytes, 0_u8);
+                }
+                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
+        }
+        let mut indices = [0_usize; 2];
+        if let Some(cache) = &mut self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                let idx = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+                if cache.projections[idx].evaluated {
+                    cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
+                } else {
+                    cache.projections[idx].evaluated = true;
+                }
+                indices[member] = idx;
+            }
+        }
+        if output.len() != rows {
+            output.clear();
+            output
+                .try_reserve(rows)
+                .map_err(|_| invalid("native Q2 output allocation failed"))?;
+            output.resize(rows, f32::NAN);
+        }
+        self.statistics.operations_attempted =
+            self.statistics.operations_attempted.saturating_add(3);
+        self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let gate_handle = &cache.handles[cache.projections[indices[0]].first_handle];
+        let up_handle = &cache.handles[cache.projections[indices[1]].first_handle];
+        self.submitter.submit_resident_ffn_swiglu(
+            gate_handle,
+            up_handle,
+            activation,
+            output.as_mut_slice(),
+        )?;
+        finite_slice(output)?;
+        self.statistics.operations_completed =
+            self.statistics.operations_completed.saturating_add(3);
+        self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+        self.statistics.projections_completed =
+            self.statistics.projections_completed.saturating_add(2);
         Ok(())
     }
 }
@@ -2025,6 +2293,48 @@ mod tests {
             Ok(())
         }
 
+        fn submit_resident_multi8(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 8],
+            activations: [&[f32]; 8],
+            outputs: [&mut [f32]; 8],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 8;
+            self.resident_calls += 8;
+            for (member, handle) in handles.into_iter().enumerate() {
+                let activation = activations[member];
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                outputs[member].fill(0.0);
+                outputs[member][0] =
+                    activation.iter().sum::<f32>() + f32::from(u8::try_from(member).unwrap_or(0));
+            }
+            Ok(())
+        }
+
+        fn submit_resident_ffn_swiglu(
+            &mut self,
+            gate_handle: &NativeQ2WeightHandle,
+            up_handle: &NativeQ2WeightHandle,
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.calls += 3;
+            self.resident_calls += 2;
+            if gate_handle.columns() != up_handle.columns()
+                || gate_handle.rows() != up_handle.rows()
+                || activation.len() != gate_handle.columns()
+                || output.len() != gate_handle.rows()
+            {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            let sum = activation.iter().sum::<f32>();
+            output.fill(0.0);
+            output[0] = sum * 2.0;
+            Ok(())
+        }
+
         fn submit(
             &mut self,
             columns: usize,
@@ -2347,6 +2657,53 @@ mod tests {
         assert_eq!(outs_a[4][0], 1280.0);
         assert_eq!(outs_b[4][0], 1281.0);
         assert_eq!(outs_c[4][0], 1282.0);
+
+        // Verify 8-token batching via submit_resident_multi8 (1 queue write for 8 single-proj tokens,
+        // 2 queue writes for 8 pair-proj tokens, 3 queue writes for 8 triple-proj tokens) and fused FFN SwiGLU.
+        let acts8: Vec<Vec<f32>> = (1..=8_u8).map(|i| vec![f32::from(i); columns]).collect();
+        let mut outs8_a = vec![Vec::new(); 8];
+        let mut outs8_b = vec![Vec::new(); 8];
+        let mut outs8_c = vec![Vec::new(); 8];
+        executor.project_f32_tokens(&q, &acts8, true, &mut outs8_a)?;
+        assert_eq!(executor.queue_writes_completed(), 12);
+        assert_eq!(executor.statistics().operations_completed, 43);
+        assert_eq!(outs8_a[0][0], 256.0);
+        assert_eq!(outs8_a[7][0], 2048.0 + 7.0);
+
+        executor.project_f32_pair_tokens(
+            [&qkv, &gate],
+            &acts8,
+            true,
+            &mut outs8_a,
+            &mut outs8_b,
+        )?;
+        // 8 tokens * 2 projections = 16 ops in 2 queue writes (8 + 4 + 4 -> 8 via multi8 + 2*multi4 for remaining 4).
+        assert_eq!(executor.queue_writes_completed(), 15);
+        assert_eq!(executor.statistics().operations_completed, 59);
+
+        executor.project_f32_triple_tokens(
+            [&q, &k, &v],
+            &acts8,
+            true,
+            &mut outs8_a,
+            &mut outs8_b,
+            &mut outs8_c,
+        )?;
+        // 8 tokens * 3 projections = 24 ops in 3 queue writes (8 + 8 + 8).
+        assert_eq!(executor.queue_writes_completed(), 18);
+        assert_eq!(executor.statistics().operations_completed, 83);
+
+        let ffn_gate = make_tensor("blk.0.ffn_gate.weight", 64);
+        let ffn_up = make_tensor("blk.0.ffn_up.weight", 64);
+        let mut ffn_executor = NativeQ2Executor::new(&mut submitter, limits, 64 * 1024 * 1024)
+            .with_resident_weights(16_384)?;
+        let mut swiglu_out = Vec::new();
+        ffn_executor.project_f32_ffn_swiglu(&ffn_gate, &ffn_up, &activation, &mut swiglu_out)?;
+        assert_eq!(swiglu_out.len(), 64);
+        assert_eq!(swiglu_out[0], 512.0);
+        assert_eq!(ffn_executor.queue_writes_completed(), 1);
+        assert_eq!(ffn_executor.statistics().operations_completed, 3);
+        assert_eq!(ffn_executor.statistics().projections_completed, 2);
         Ok(())
     }
 }

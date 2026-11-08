@@ -323,7 +323,7 @@ impl NativeQ2WeightRegistry {
                 let arena_index = u16::try_from(arena_idx).map_err(|_| Error::Contract)?;
                 self.active_arena = arena_idx;
                 self.used[arena_idx] = end;
-                self.total_used = self.used[0] + self.used[1] + self.used[2] + self.used[3];
+                self.total_used = self.used.iter().sum();
                 return Ok(Some(NativeQ2WeightHandle {
                     owner: self.owner,
                     arena_index,
@@ -343,7 +343,7 @@ impl NativeQ2WeightRegistry {
         self.total_used
     }
 
-    /// Bytes of the specified arena (`0..4`) currently populated.
+    /// Bytes of the specified arena (`0..NATIVE_Q2_MAX_WEIGHT_ARENAS`) currently populated.
     #[must_use]
     pub const fn arena_used_bytes(&self, arena_index: usize) -> usize {
         if arena_index < NATIVE_Q2_MAX_WEIGHT_ARENAS {
@@ -503,6 +503,59 @@ pub trait NativeQ2Submitter {
         Err(Error::Contract)
     }
 
+    /// Submit eight resident `HTP_TYPE_Q2_0` projections with per-operation `F32`
+    /// activation vectors in a single 8-op DSP queue submission (or two 4-op
+    /// submissions when the submitter only implements 4-op batching).
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched input columns or
+    /// submission failures reject and close the session with no CPU replay.
+    fn submit_resident_multi8(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 8],
+        activations: [&[f32]; 8],
+        outputs: [&mut [f32]; 8],
+    ) -> Result<(), Error> {
+        let [o0, o1, o2, o3, o4, o5, o6, o7] = outputs;
+        self.submit_resident_multi4(
+            [handles[0], handles[1], handles[2], handles[3]],
+            [
+                activations[0],
+                activations[1],
+                activations[2],
+                activations[3],
+            ],
+            [o0, o1, o2, o3],
+        )?;
+        self.submit_resident_multi4(
+            [handles[4], handles[5], handles[6], handles[7]],
+            [
+                activations[4],
+                activations[5],
+                activations[6],
+                activations[7],
+            ],
+            [o4, o5, o6, o7],
+        )
+    }
+
+    /// Submit a fused 3-operation `ffn_gate` + `ffn_up` + `HTP_OP_GLU_SWIGLU`
+    /// chain in a single DSP queue submission with VTCM intermediate residency.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched dimensions or
+    /// submission failures reject and close the session with no CPU replay.
+    fn submit_resident_ffn_swiglu(
+        &mut self,
+        _gate_handle: &NativeQ2WeightHandle,
+        _up_handle: &NativeQ2WeightHandle,
+        _activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        output.fill(f32::NAN);
+        Err(Error::Contract)
+    }
+
     /// Submit tiled `HTP_TYPE_Q2_0` weights (`[columns, rows]`) and one `F32`
     /// activation vector (`[columns]`) in a single DSP operation.
     ///
@@ -589,6 +642,25 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         outputs: [&mut [f32]; 4],
     ) -> Result<(), Error> {
         (**self).submit_resident_multi4(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi8(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 8],
+        activations: [&[f32]; 8],
+        outputs: [&mut [f32]; 8],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_multi8(handles, activations, outputs)
+    }
+
+    fn submit_resident_ffn_swiglu(
+        &mut self,
+        gate_handle: &NativeQ2WeightHandle,
+        up_handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_ffn_swiglu(gate_handle, up_handle, activation, output)
     }
 
     fn submit(
@@ -1012,14 +1084,14 @@ pub(crate) fn image_multi_resident<const B: usize>(
     handles: [&NativeQ2WeightHandle; B],
     activations: [&[f32]; B],
 ) -> Result<BatchLayout<B>, Error> {
-    const CMD_PAD: usize = 2048;
-    if !matches!(B, 2..=4) {
+    if !matches!(B, 2..=4 | 8) {
         return Err(Error::Contract);
     }
+    let cmd_pad = if B > 4 { 4096 } else { 2048 };
     let allocation = bytes.len();
     let columns = handles[0].columns;
     let act_bytes = columns * 4;
-    let mut next_offset = CMD_PAD;
+    let mut next_offset = cmd_pad;
     let mut act_offsets = [0_usize; B];
     let mut act_copy_member = [false; B];
     for (member, &activation) in activations.iter().enumerate() {
@@ -1097,7 +1169,7 @@ pub(crate) fn image_multi_resident<const B: usize>(
     }
     let n_bufs_usize = 1 + extra_buf_count;
     let n_bufs = u32::try_from(n_bufs_usize).map_err(|_| Error::Contract)?;
-    working[..CMD_PAD].fill(0);
+    working[..cmd_pad].fill(0);
     put64(working, 0, base);
     put64(
         working,
@@ -1157,6 +1229,154 @@ pub(crate) fn image_multi_resident<const B: usize>(
         output_offsets,
         output_end,
         n_bufs,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FfnSwigluLayout {
+    pub(crate) output_offset: usize,
+    pub(crate) output_end: usize,
+    pub(crate) n_bufs: u32,
+}
+
+/// Build a fused 3-operation `dspqueue` packet (`OP_MUL_MAT(gate)` +
+/// `OP_MUL_MAT(up)` + `HTP_OP_GLU_SWIGLU(gate_out, up_out) -> swiglu_out`)
+/// with VTCM intermediate residency chaining (`KEEP_DST_IN_VTCM` +
+/// `READ_SRC0_FROM_VTCM | READ_SRC1_FROM_VTCM`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep 2x Q2_0 MulMat + 1x GluSwiglu descriptor assembly and VTCM pass flags together"
+)]
+pub(crate) fn image_ffn_swiglu_resident(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    activation: &[f32],
+) -> Result<FfnSwigluLayout, Error> {
+    let columns = gate_handle.columns;
+    let rows = gate_handle.rows;
+    if up_handle.columns != columns
+        || up_handle.rows != rows
+        || activation.len() != columns
+        || !rows.is_multiple_of(32)
+    {
+        return Err(Error::Contract);
+    }
+    let batch = image_multi_resident::<2>(
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        [gate_handle, up_handle],
+        [activation, activation],
+    )?;
+    let out_bytes = rows * 4;
+    let gate_out_offset = batch.output_offsets[0];
+    let up_out_offset = batch.output_offsets[1];
+    let swiglu_out_offset = batch.output_end.next_multiple_of(128);
+    let output_end = swiglu_out_offset + out_bytes;
+    let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
+    if output_end > working.len() {
+        return Err(Error::Contract);
+    }
+    let n_bufs_usize = usize::try_from(batch.n_bufs).map_err(|_| Error::Contract)?;
+    // Re-layout tensors (9 descriptors = 504 bytes) and operations (3 descriptors = 696 bytes)
+    // inside CMD_PAD (2048 bytes) so n_tensors = 9, n_ops = 3.
+    let tensors_base = n_bufs_usize * 24;
+    let old_ops_base = tensors_base + 6 * 56;
+    let new_ops_base = tensors_base + 9 * 56;
+    working.copy_within(old_ops_base..old_ops_base + 2 * 232, new_ops_base);
+    working[tensors_base + 6 * 56..new_ops_base].fill(0);
+
+    // Chained VTCM flags on Op 0 (gate) and Op 1 (up) when 3 * out_bytes fits inside 1 MiB of VTCM.
+    let vtcm_chain = out_bytes.saturating_mul(3) <= 1_048_576;
+    let matmul_pass = if vtcm_chain {
+        crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
+    } else {
+        crate::htp_ops::HtpOpPassFlags::NONE
+    };
+    let glu_pass = if vtcm_chain {
+        crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+            .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
+    } else {
+        crate::htp_ops::HtpOpPassFlags::NONE
+    };
+    put32(working, new_ops_base + 4, matmul_pass.bits());
+    put32(working, new_ops_base + 232 + 4, matmul_pass.bits());
+
+    // Shape 1D [rows] F32 vectors as 2D [glu_cols, glu_rows] with glu_rows >= 2 for solve_glu_kparams.
+    let (glu_cols, glu_rows) = if rows >= 64 {
+        (32_usize, rows / 32)
+    } else {
+        (rows / 2, 2_usize)
+    };
+    let glu_cols_u32 = u32::try_from(glu_cols).map_err(|_| Error::Contract)?;
+    let glu_rows_u32 = u32::try_from(glu_rows).map_err(|_| Error::Contract)?;
+    let glu_kp = crate::htp_ops::solve_glu_kparams(glu_cols_u32, glu_rows_u32)?;
+    let glu_row_bytes = glu_cols * 4;
+
+    for (ti_offset, buf_offset) in [
+        (6_u16, gate_out_offset),
+        (7_u16, up_out_offset),
+        (8_u16, swiglu_out_offset),
+    ] {
+        let desc = tensors_base + usize::from(ti_offset) * 56;
+        put64(
+            working,
+            desc,
+            u64::try_from(buf_offset).map_err(|_| Error::Contract)?,
+        );
+        put16(working, desc + 20, 0);
+        put16(working, desc + 22, ti_offset);
+        for (off, val) in [
+            (desc + 8, out_bytes),
+            (desc + 12, 0),
+            (desc + 16, 0), // F32
+            (desc + 24, glu_cols),
+            (desc + 28, glu_rows),
+            (desc + 32, 1),
+            (desc + 36, 1),
+            (desc + 40, 4),
+            (desc + 44, glu_row_bytes),
+            (desc + 48, out_bytes),
+            (desc + 52, out_bytes),
+        ] {
+            put32(
+                working,
+                off,
+                u32::try_from(val).map_err(|_| Error::Contract)?,
+            );
+        }
+    }
+
+    let glu_op_desc = new_ops_base + 2 * 232;
+    working[glu_op_desc..glu_op_desc + 232].fill(0);
+    put32(
+        working,
+        glu_op_desc,
+        crate::htp_ops::HtpOpCode::GluSwiglu.id(),
+    );
+    put32(working, glu_op_desc + 4, glu_pass.bits());
+    working[glu_op_desc + 72..glu_op_desc + 84].copy_from_slice(&glu_kp);
+    working[glu_op_desc + 200..glu_op_desc + 228].fill(0xff);
+    put16(working, glu_op_desc + 200, 6);
+    put16(working, glu_op_desc + 202, 7);
+    put16(working, glu_op_desc + 220, 8);
+
+    working[swiglu_out_offset..output_end]
+        .as_chunks_mut::<4>()
+        .0
+        .fill(0x7fc0_ae51_u32.to_le_bytes());
+
+    Ok(FfnSwigluLayout {
+        output_offset: swiglu_out_offset,
+        output_end,
+        n_bufs: batch.n_bufs,
     })
 }
 
@@ -1753,6 +1973,100 @@ mod tests {
         // Two unique 512-byte activations at 2048 and 2560; 4 outputs at 3072, 3200, 3328, 3456.
         assert_eq!(multi4.output_offsets, [3072, 3200, 3328, 3456]);
         assert_eq!(multi4.output_end, 3584);
+
+        // Verify 8-op multi-resident batch and fused FFN SwiGLU 3-op packet.
+        let arena8_start = 16_384_usize;
+        let mut arena8 = vec![0_u8; arena8_start + 4096];
+        let multi8 = image_multi_resident(
+            &mut arena8,
+            0x1000_0000,
+            7,
+            arena8_start,
+            &extra,
+            [
+                &h_arena1, &h_arena1, &h_arena1, &h_arena1, &h_arena1, &h_arena1, &h_arena1,
+                &h_arena1,
+            ],
+            [
+                &activation,
+                &activation,
+                &act1,
+                &act1,
+                &activation,
+                &activation,
+                &act1,
+                &act1,
+            ],
+        )?;
+        assert_eq!(multi8.n_bufs, 2);
+        assert_eq!(multi8.output_offsets[0], 5120);
+        assert_eq!(multi8.output_end, 5120 + 8 * 128);
+
+        let swiglu = image_ffn_swiglu_resident(
+            &mut arena,
+            0x1000_0000,
+            7,
+            arena_start,
+            &extra,
+            &h_arena1,
+            &h_arena1,
+            &activation,
+        )?;
+        assert_eq!(swiglu.n_bufs, 2);
+        assert_eq!(swiglu.output_offset, 2816);
+        assert_eq!(swiglu.output_end, 2944);
+        // Verify GluSwiglu opcode (22) at Op 2 and KEEP_DST_IN_VTCM (1) on Op 0 & Op 1.
+        let ops_base = 2 * 24 + 9 * 56;
+        assert_eq!(
+            u32::from_le_bytes(
+                arena[ops_base + 4..ops_base + 8]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM.bits()
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                arena[ops_base + 232 + 4..ops_base + 232 + 8]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM.bits()
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                arena[ops_base + 2 * 232..ops_base + 2 * 232 + 4]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            crate::htp_ops::HtpOpCode::GluSwiglu.id()
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                arena[ops_base + 2 * 232 + 4..ops_base + 2 * 232 + 8]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?
+            ),
+            crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
+                .bits()
+        );
+
+        // Verify 6-arena total_used accounting across arenas 4 and 5.
+        let mut six_reg = NativeQ2WeightRegistry::new(2_888_663_040)?;
+        for expected_arena in 0..6_u16 {
+            let step = if expected_arena % 2 == 0 {
+                NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+            } else {
+                NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
+            };
+            let h = six_reg
+                .prepare_validated(5120, 17_408, step)?
+                .ok_or(Error::Contract)?;
+            assert_eq!(h.arena_index(), expected_arena);
+        }
+        assert_eq!(six_reg.used_bytes(), 2_888_663_040);
+        assert_eq!(six_reg.remaining_bytes(), 0);
         Ok(())
     }
 }

@@ -192,7 +192,7 @@ impl Q2ProjectionReport {
                     && self.batch_operations == 1
                     && self.resident_submissions > 0
                     && self.operations_submitted >= self.queue_writes_submitted
-                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(4)))
+                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(8)))
             && self.queue.completed_cycle()
     }
 }
@@ -235,7 +235,10 @@ pub(crate) fn request_batch_buffers(
     batch_operations: u32,
     n_bufs: u32,
 ) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
-    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10) || !(1..=4).contains(&n_bufs) {
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 8 | 10)
+        || !(1..=6).contains(&n_bufs)
+        || n_bufs > batch_operations + 1
+    {
         return Err(Error::Contract);
     }
     let mut result = request(sequence);
@@ -261,8 +264,9 @@ pub(crate) fn response_batch_buffers_valid(
     batch_operations: u32,
     n_bufs: u32,
 ) -> bool {
-    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 10)
-        || !(1..=4).contains(&n_bufs)
+    if !matches!(batch_operations, 1 | 2 | 3 | 4 | 8 | 10)
+        || !(1..=6).contains(&n_bufs)
+        || n_bufs > batch_operations + 1
         || sequence == 0
         || bytes.len() != compute::COMPUTE_RESPONSE_BYTES
     {

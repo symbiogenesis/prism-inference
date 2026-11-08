@@ -1,0 +1,14 @@
+[package]
+name = "bonsai-neon-dot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+license.workspace = true
+description = "Audited ARMv8.2-A dotprod and i8mm SIMD dot-product primitives for Prism"
+repository.workspace = true
+keywords = ["neon", "dotprod", "i8mm", "simd", "quantization"]
+categories = ["hardware-support", "science"]
+
+[lints]
+workspace = true

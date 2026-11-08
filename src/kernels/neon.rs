@@ -157,6 +157,9 @@ fn dot_q8_0_block_preloaded(
 /// against a 32-element `Q8_0` activation slice.
 #[inline]
 pub(super) fn dot_q8_0_block(weights: &[u8; 32], activations: &[i8; 32]) -> i32 {
+    if bonsai_neon_dot::has_dotprod() {
+        return bonsai_neon_dot::dot_q8_0_block(weights, activations);
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return weights
             .iter()
@@ -417,9 +420,13 @@ const fn scale_u16(block: &[u8; 34]) -> u16 {
 #[inline]
 pub(super) fn dot_consumption_order_prewidened(
     packed: &[u8; 32],
+    values: &[i8; 128],
     widened: &[i16; 128],
     activation_sum: i32,
 ) -> i32 {
+    if bonsai_neon_dot::has_dotprod() {
+        return bonsai_neon_dot::dot_pq2_consumption_block(packed, values, activation_sum);
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return packed
             .as_chunks::<16>()
@@ -472,6 +479,7 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
     input: &[super::packed_pq2::Activation],
 ) -> Option<Result<[f32; 4]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let c0 = rows[0].as_chunks::<34>().0;
     let c1 = rows[1].as_chunks::<34>().0;
     let c2 = rows[2].as_chunks::<34>().0;
@@ -485,29 +493,45 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
         );
         scales_finite &= row_scales.is_finite();
         let ds = row_scales * f32x4::splat(neon, activation.scale);
-        let blocks = [b0, b1, b2, b3];
-        let mut acc = [i16x8::splat(neon, 0); 4];
-        for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
-            let planes = values.as_chunks::<8>().0;
-            let p0_low = i16x8::from_slice(neon, &planes[0]);
-            let p0_high = i16x8::from_slice(neon, &planes[1]);
-            let p1_low = i16x8::from_slice(neon, &planes[2]);
-            let p1_high = i16x8::from_slice(neon, &planes[3]);
-            let p2_low = i16x8::from_slice(neon, &planes[4]);
-            let p2_high = i16x8::from_slice(neon, &planes[5]);
-            let p3_low = i16x8::from_slice(neon, &planes[6]);
-            let p3_high = i16x8::from_slice(neon, &planes[7]);
-            let offset = 2 + half * 16;
-            for row in 0..4 {
-                let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                acc[row] += pq2_half_unsigned_sum(
-                    w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
-                );
+        let sums = if use_dotprod {
+            let [_, _, ref p0 @ ..] = *b0;
+            let [_, _, ref p1 @ ..] = *b1;
+            let [_, _, ref p2 @ ..] = *b2;
+            let [_, _, ref p3 @ ..] = *b3;
+            i32x4::from_slice(
+                neon,
+                &bonsai_neon_dot::dot_pq2_four_consumption_precomputed(
+                    [p0, p1, p2, p3],
+                    &activation.values,
+                    activation.sum,
+                ),
+            )
+            .to_float::<f32x4<Neon>>()
+        } else {
+            let blocks = [b0, b1, b2, b3];
+            let mut acc = [i16x8::splat(neon, 0); 4];
+            for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
+                let planes = values.as_chunks::<8>().0;
+                let p0_low = i16x8::from_slice(neon, &planes[0]);
+                let p0_high = i16x8::from_slice(neon, &planes[1]);
+                let p1_low = i16x8::from_slice(neon, &planes[2]);
+                let p1_high = i16x8::from_slice(neon, &planes[3]);
+                let p2_low = i16x8::from_slice(neon, &planes[4]);
+                let p2_high = i16x8::from_slice(neon, &planes[5]);
+                let p3_low = i16x8::from_slice(neon, &planes[6]);
+                let p3_high = i16x8::from_slice(neon, &planes[7]);
+                let offset = 2 + half * 16;
+                for row in 0..4 {
+                    let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
+                    acc[row] += pq2_half_unsigned_sum(
+                        w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
+                    );
+                }
             }
-        }
-        let sums = (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3])
-            - i32x4::splat(neon, activation.sum))
-        .to_float::<f32x4<Neon>>();
+            (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3])
+                - i32x4::splat(neon, activation.sum))
+            .to_float::<f32x4<Neon>>()
+        };
         outputs = if FUSED {
             ds.mul_add(sums, outputs)
         } else {
@@ -528,6 +552,7 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
     input: &[super::packed_pq2::Activation],
 ) -> Option<Result<[f32; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let chunks: [&[[u8; 34]]; 8] = rows.map(|row| row.as_chunks::<34>().0);
     let mut out_lo = f32x4::splat(neon, 0.0);
     let mut out_hi = f32x4::splat(neon, 0.0);
@@ -551,30 +576,63 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
         let act_scale = f32x4::splat(neon, activation.scale);
         let ds_lo = scales_lo * act_scale;
         let ds_hi = scales_hi * act_scale;
-        let mut acc = [i16x8::splat(neon, 0); 8];
-        for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
-            let planes = values.as_chunks::<8>().0;
-            let p0_low = i16x8::from_slice(neon, &planes[0]);
-            let p0_high = i16x8::from_slice(neon, &planes[1]);
-            let p1_low = i16x8::from_slice(neon, &planes[2]);
-            let p1_high = i16x8::from_slice(neon, &planes[3]);
-            let p2_low = i16x8::from_slice(neon, &planes[4]);
-            let p2_high = i16x8::from_slice(neon, &planes[5]);
-            let p3_low = i16x8::from_slice(neon, &planes[6]);
-            let p3_high = i16x8::from_slice(neon, &planes[7]);
-            let offset = 2 + half * 16;
-            for row in 0..8 {
-                let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
-                acc[row] += pq2_half_unsigned_sum(
-                    w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
-                );
+        let (sums_lo, sums_hi) = if use_dotprod {
+            let [_, _, ref p0 @ ..] = *blocks[0];
+            let [_, _, ref p1 @ ..] = *blocks[1];
+            let [_, _, ref p2 @ ..] = *blocks[2];
+            let [_, _, ref p3 @ ..] = *blocks[3];
+            let [_, _, ref p4 @ ..] = *blocks[4];
+            let [_, _, ref p5 @ ..] = *blocks[5];
+            let [_, _, ref p6 @ ..] = *blocks[6];
+            let [_, _, ref p7 @ ..] = *blocks[7];
+            (
+                i32x4::from_slice(
+                    neon,
+                    &bonsai_neon_dot::dot_pq2_four_consumption_precomputed(
+                        [p0, p1, p2, p3],
+                        &activation.values,
+                        activation.sum,
+                    ),
+                )
+                .to_float::<f32x4<Neon>>(),
+                i32x4::from_slice(
+                    neon,
+                    &bonsai_neon_dot::dot_pq2_four_consumption_precomputed(
+                        [p4, p5, p6, p7],
+                        &activation.values,
+                        activation.sum,
+                    ),
+                )
+                .to_float::<f32x4<Neon>>(),
+            )
+        } else {
+            let mut acc = [i16x8::splat(neon, 0); 8];
+            for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
+                let planes = values.as_chunks::<8>().0;
+                let p0_low = i16x8::from_slice(neon, &planes[0]);
+                let p0_high = i16x8::from_slice(neon, &planes[1]);
+                let p1_low = i16x8::from_slice(neon, &planes[2]);
+                let p1_high = i16x8::from_slice(neon, &planes[3]);
+                let p2_low = i16x8::from_slice(neon, &planes[4]);
+                let p2_high = i16x8::from_slice(neon, &planes[5]);
+                let p3_low = i16x8::from_slice(neon, &planes[6]);
+                let p3_high = i16x8::from_slice(neon, &planes[7]);
+                let offset = 2 + half * 16;
+                for row in 0..8 {
+                    let w = u8x16::from_slice(neon, &blocks[row][offset..offset + 16]);
+                    acc[row] += pq2_half_unsigned_sum(
+                        w, p0_low, p0_high, p1_low, p1_high, p2_low, p2_high, p3_low, p3_high,
+                    );
+                }
             }
-        }
-        let act_sum = i32x4::splat(neon, activation.sum);
-        let sums_lo = (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3]) - act_sum)
-            .to_float::<f32x4<Neon>>();
-        let sums_hi = (reduce4_i16x8_to_i32x4(acc[4], acc[5], acc[6], acc[7]) - act_sum)
-            .to_float::<f32x4<Neon>>();
+            let act_sum = i32x4::splat(neon, activation.sum);
+            (
+                (reduce4_i16x8_to_i32x4(acc[0], acc[1], acc[2], acc[3]) - act_sum)
+                    .to_float::<f32x4<Neon>>(),
+                (reduce4_i16x8_to_i32x4(acc[4], acc[5], acc[6], acc[7]) - act_sum)
+                    .to_float::<f32x4<Neon>>(),
+            )
+        };
         if FUSED {
             out_lo = ds_lo.mul_add(sums_lo, out_lo);
             out_hi = ds_hi.mul_add(sums_hi, out_hi);
@@ -1441,32 +1499,6 @@ const fn ptq1_scale_u16(block: &[u8; 28]) -> u16 {
     u16::from_le_bytes([block[26], block[27]])
 }
 
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    reason = "Each fractional base-3 digit is in 0..=2, so (rem >> 8) as i8 - 1 is in -1..=1."
-)]
-pub(super) const PTQ1_TAIL_EVEN_U64: [u64; 256] = {
-    let mut table = [0_u64; 256];
-    let mut byte = 0_usize;
-    while byte < 256 {
-        let mut rem = byte as u16;
-        let mut digits = [0_u8; 8];
-        let mut step = 0_usize;
-        while step < 4 {
-            rem *= 3;
-            let trit = ((rem >> 8) as i8) - 1;
-            digits[step * 2] = trit.to_ne_bytes()[0];
-            rem &= 255;
-            step += 1;
-        }
-        table[byte] = u64::from_le_bytes(digits);
-        byte += 1;
-    }
-    table
-};
-
 #[inline]
 #[allow(
     clippy::too_many_arguments,
@@ -1508,47 +1540,59 @@ fn dot32_native_lanes_w16_i32x4(
 }
 
 #[inline]
+fn extract_trits_u8x16(v: u8x16<Neon>) -> i8x16<Neon> {
+    // Overflow-free u8 halving average: (v & (v >> 1)) + ((v ^ (v >> 1)) >> 1) == (3 * v) >> 2.
+    // Shifting right by 6 yields (3 * v) >> 8 in 0..=2 for all v in 0..=255 without widening.
+    let b = v >> 1;
+    let avg = (v & b) + ((v ^ b) >> 1);
+    (avg >> 6).bitcast::<i8x16<Neon>>() - 1
+}
+
+#[inline]
+pub(in crate::kernels) fn decode_ptq1_i8(neon: Neon, packed: &[u8; 28]) -> [i8x16<Neon>; 8] {
+    let qs = u8x16::from_slice(neon, &packed[..16]);
+    let t0 = extract_trits_u8x16(qs);
+    let t1 = extract_trits_u8x16(qs * u8x16::splat(neon, 3));
+    let t2 = extract_trits_u8x16(qs * u8x16::splat(neon, 9));
+    let t3 = extract_trits_u8x16(qs * u8x16::splat(neon, 27));
+    let t4 = extract_trits_u8x16(qs * u8x16::splat(neon, 81));
+
+    let qm_u64 = u64::from_le_bytes([
+        packed[16], packed[17], packed[18], packed[19], packed[20], packed[21], packed[22],
+        packed[23],
+    ]);
+    let qm_dup = u64x2::splat(neon, qm_u64).bitcast::<u8x16<Neon>>();
+    let m5 = u8x16::from_slice(neon, &[1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3]);
+    let m6 = u8x16::from_slice(
+        neon,
+        &[9, 9, 9, 9, 9, 9, 9, 9, 27, 27, 27, 27, 27, 27, 27, 27],
+    );
+    let t5 = extract_trits_u8x16(qm_dup * m5);
+    let t6 = extract_trits_u8x16(qm_dup * m6);
+
+    let qh_pair = u16::from_le_bytes([packed[24], packed[25]]);
+    let tail_u64 = u64::from(qh_pair) * 0x0001_0001_0001_0001_u64;
+    let qm_qh = u64x2::from_slice(neon, &[qm_u64, tail_u64]).bitcast::<u8x16<Neon>>();
+    let m7 = u8x16::from_slice(
+        neon,
+        &[81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27],
+    );
+    let t7 = extract_trits_u8x16(qm_qh * m7);
+
+    [t0, t1, t2, t3, t4, t5, t6, t7]
+}
+
+#[inline]
 pub(in crate::kernels) fn decode_ptq1_i16(neon: Neon, packed: &[u8; 28]) -> [i16x8<Neon>; 16] {
-    let (mut low, mut high) = u8x16::from_slice(neon, &packed[..16]).widen();
-    let mut step_first = || {
-        low *= 3;
-        high *= 3;
-        let d_lo = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
-        let d_hi = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
-        low &= 255;
-        high &= 255;
-        (d_lo, d_hi)
-    };
-    let (w0, w1) = step_first();
-    let (w2, w3) = step_first();
-    let (w4, w5) = step_first();
-    let (w6, w7) = step_first();
-    low *= 3;
-    high *= 3;
-    let w8 = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let w9 = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
-
-    // Bytes 16..24 occupy the upper half of packed[8..24]. Widening once extracts
-    // all eight bytes into a single u16x8 without TBL swizzles or duplicate lanes.
-    let (_, mut mid) = u8x16::from_slice(neon, &packed[8..24]).widen();
-    let mut step_mid = || {
-        mid *= 3;
-        let d_mid = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
-        mid &= 255;
-        d_mid
-    };
-    let w10 = step_mid();
-    let w11 = step_mid();
-    let w12 = step_mid();
-    let w13 = step_mid();
-    mid *= 3;
-    let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
-
-    let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
-        | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
-    let (w15, _) = u64x2::splat(neon, tail_u64)
-        .bitcast::<i8x16<Neon>>()
-        .widen();
+    let [t0, t1, t2, t3, t4, t5, t6, t7] = decode_ptq1_i8(neon, packed);
+    let (w0, w1) = t0.widen();
+    let (w2, w3) = t1.widen();
+    let (w4, w5) = t2.widen();
+    let (w6, w7) = t3.widen();
+    let (w8, w9) = t4.widen();
+    let (w10, w11) = t5.widen();
+    let (w12, w13) = t6.widen();
+    let (w14, w15) = t7.widen();
     [
         w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15,
     ]
@@ -1585,56 +1629,46 @@ fn accumulate_ptq1_block_pinned(
     a3: f32,
     mut lane: f32x4<Neon>,
 ) -> f32x4<Neon> {
-    let (mut low, mut high) = u8x16::from_slice(neon, &packed[..16]).widen();
-    let mut step_first = || {
-        low *= 3;
-        high *= 3;
-        let d_lo = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
-        let d_hi = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
-        low &= 255;
-        high &= 255;
-        (d_lo, d_hi)
-    };
-    let (w0, w1) = step_first();
-    let (w2, w3) = step_first();
+    let [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15] =
+        decode_ptq1_i16(neon, packed);
     let f0 = dot32_native_lanes_w16_i32x4(w0, w1, w2, w3, v00_l, v00_h, v01_l, v01_h)
         .to_float::<f32x4<Neon>>();
     lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
-
-    let (w4, w5) = step_first();
-    let (w6, w7) = step_first();
     let f1 = dot32_native_lanes_w16_i32x4(w4, w5, w6, w7, v10_l, v10_h, v11_l, v11_h)
         .to_float::<f32x4<Neon>>();
     lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
-
-    low *= 3;
-    high *= 3;
-    let w8 = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let w9 = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let (_, mut mid) = u8x16::from_slice(neon, &packed[8..24]).widen();
-    let mut step_mid = || {
-        mid *= 3;
-        let d_mid = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
-        mid &= 255;
-        d_mid
-    };
-    let w10 = step_mid();
-    let w11 = step_mid();
     let f2 = dot32_native_lanes_w16_i32x4(w8, w9, w10, w11, v20_l, v20_h, v21_l, v21_h)
         .to_float::<f32x4<Neon>>();
     lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
-
-    let w12 = step_mid();
-    let w13 = step_mid();
-    mid *= 3;
-    let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
-        | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
-    let (w15, _) = u64x2::splat(neon, tail_u64)
-        .bitcast::<i8x16<Neon>>()
-        .widen();
     let f3 = dot32_native_lanes_w16_i32x4(w12, w13, w14, w15, v30_l, v30_h, v31_l, v31_h)
         .to_float::<f32x4<Neon>>();
+    f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane)
+}
+
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Streams the four 32-element PTQ1 groups via ARMv8.2-A SDOT while preserving exact lane FMA order."
+)]
+fn accumulate_ptq1_block_pinned_dotprod(
+    neon: Neon,
+    packed: &[u8; 28],
+    act_values: [&[i8; 32]; 4],
+    row_scale: f32,
+    a0: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    mut lane: f32x4<Neon>,
+) -> f32x4<Neon> {
+    let group_lanes = bonsai_neon_dot::dot_ptq1_block_lanes(packed, act_values);
+    let f0 = i32x4::from_slice(neon, &group_lanes[0]).to_float::<f32x4<Neon>>();
+    lane = f0.mul_add_precise(f32x4::splat(neon, row_scale * a0), lane);
+    let f1 = i32x4::from_slice(neon, &group_lanes[1]).to_float::<f32x4<Neon>>();
+    lane = f1.mul_add_precise(f32x4::splat(neon, row_scale * a1), lane);
+    let f2 = i32x4::from_slice(neon, &group_lanes[2]).to_float::<f32x4<Neon>>();
+    lane = f2.mul_add_precise(f32x4::splat(neon, row_scale * a2), lane);
+    let f3 = i32x4::from_slice(neon, &group_lanes[3]).to_float::<f32x4<Neon>>();
     f3.mul_add_precise(f32x4::splat(neon, row_scale * a3), lane)
 }
 
@@ -1644,6 +1678,9 @@ pub(super) fn dot_ptq1_native_lanes(
     packed: &[u8; 28],
     activations: [&[i8; 32]; 4],
 ) -> Result<[[i32; 4]; 4]> {
+    if bonsai_neon_dot::has_dotprod() {
+        return Ok(bonsai_neon_dot::dot_ptq1_block_lanes(packed, activations));
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let weights = super::ptq1_values(packed)?;
         return Ok(std::array::from_fn(|group| {
@@ -1677,6 +1714,9 @@ pub(super) fn dot_ptq1_native_lanes(
 /// fit i16 and each 32-element sum has absolute magnitude at most 4,096.
 #[inline]
 pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) -> Result<[i32; 4]> {
+    if bonsai_neon_dot::has_dotprod() {
+        return Ok(bonsai_neon_dot::dot_ptq1_block_groups(packed, activations));
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let weights = super::ptq1_values(packed)?;
         return Ok(std::array::from_fn(|group| {
@@ -1710,50 +1750,74 @@ pub(super) fn dot_ptq1_row_pinned(bytes: &[u8], input: &[super::Q8Block]) -> Res
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return super::dot_q8_groups_pinned::<false>(super::PTQ1, bytes, input);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut lanes = f32x4::splat(neon, 0.0);
     for (index, block) in bytes.as_chunks::<28>().0.iter().enumerate() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
         let weight_scale = super::scale(&block[26..])?;
-        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
-        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
-        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
-        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
-        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
-        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
-        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
-        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
-        lanes = accumulate_ptq1_block_pinned(
-            neon,
-            block,
-            v00_l,
-            v00_h,
-            v01_l,
-            v01_h,
-            v10_l,
-            v10_h,
-            v11_l,
-            v11_h,
-            v20_l,
-            v20_h,
-            v21_l,
-            v21_h,
-            v30_l,
-            v30_h,
-            v31_l,
-            v31_h,
-            weight_scale,
-            activations[0].scale,
-            activations[1].scale,
-            activations[2].scale,
-            activations[3].scale,
-            lanes,
-        );
+        if use_dotprod {
+            lanes = accumulate_ptq1_block_pinned_dotprod(
+                neon,
+                block,
+                [
+                    &activations[0].values,
+                    &activations[1].values,
+                    &activations[2].values,
+                    &activations[3].values,
+                ],
+                weight_scale,
+                activations[0].scale,
+                activations[1].scale,
+                activations[2].scale,
+                activations[3].scale,
+                lanes,
+            );
+        } else {
+            let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+            let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+            let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+            let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+            let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+            let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+            let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+            let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+            lanes = accumulate_ptq1_block_pinned(
+                neon,
+                block,
+                v00_l,
+                v00_h,
+                v01_l,
+                v01_h,
+                v10_l,
+                v10_h,
+                v11_l,
+                v11_h,
+                v20_l,
+                v20_h,
+                v21_l,
+                v21_h,
+                v30_l,
+                v30_h,
+                v31_l,
+                v31_h,
+                weight_scale,
+                activations[0].scale,
+                activations[1].scale,
+                activations[2].scale,
+                activations[3].scale,
+                lanes,
+            );
+        }
     }
     let [l0, l1, l2, l3] = lanes.to_array();
     super::finite((l0 + l1) + (l2 + l3))
 }
 
 #[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across four rows."
+)]
 pub(super) fn dot_ptq1_four_rows_pinned(
     rows: [&[u8]; 4],
     input: &[super::Q8Block],
@@ -1766,6 +1830,7 @@ pub(super) fn dot_ptq1_four_rows_pinned(
             super::dot_q8_groups_pinned::<false>(super::PTQ1, rows[3], input)?,
         ]);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut lanes = [f32x4::splat(neon, 0.0); 4];
     let mut scales_finite = lanes[0].is_finite();
     let r0 = rows[0].as_chunks::<28>().0;
@@ -1785,46 +1850,68 @@ pub(super) fn dot_ptq1_four_rows_pinned(
         );
         scales_finite &= scales_vec.is_finite();
         let row_scales = scales_vec.to_array();
-        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
-        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
-        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
-        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
-        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
-        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
-        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
-        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
         let a0 = activations[0].scale;
         let a1 = activations[1].scale;
         let a2 = activations[2].scale;
         let a3 = activations[3].scale;
         let blocks = [b0, b1, b2, b3];
-        for r in 0..4 {
-            lanes[r] = accumulate_ptq1_block_pinned(
-                neon,
-                blocks[r],
-                v00_l,
-                v00_h,
-                v01_l,
-                v01_h,
-                v10_l,
-                v10_h,
-                v11_l,
-                v11_h,
-                v20_l,
-                v20_h,
-                v21_l,
-                v21_h,
-                v30_l,
-                v30_h,
-                v31_l,
-                v31_h,
-                row_scales[r],
-                a0,
-                a1,
-                a2,
-                a3,
-                lanes[r],
-            );
+        if use_dotprod {
+            let act_values = [
+                &activations[0].values,
+                &activations[1].values,
+                &activations[2].values,
+                &activations[3].values,
+            ];
+            for r in 0..4 {
+                lanes[r] = accumulate_ptq1_block_pinned_dotprod(
+                    neon,
+                    blocks[r],
+                    act_values,
+                    row_scales[r],
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    lanes[r],
+                );
+            }
+        } else {
+            let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+            let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+            let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+            let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+            let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+            let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+            let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+            let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+            for r in 0..4 {
+                lanes[r] = accumulate_ptq1_block_pinned(
+                    neon,
+                    blocks[r],
+                    v00_l,
+                    v00_h,
+                    v01_l,
+                    v01_h,
+                    v10_l,
+                    v10_h,
+                    v11_l,
+                    v11_h,
+                    v20_l,
+                    v20_h,
+                    v21_l,
+                    v21_h,
+                    v30_l,
+                    v30_h,
+                    v31_l,
+                    v31_h,
+                    row_scales[r],
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    lanes[r],
+                );
+            }
         }
     }
     if !scales_finite.all_true() {
@@ -1839,6 +1926,10 @@ pub(super) fn dot_ptq1_four_rows_pinned(
 }
 
 #[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across eight rows."
+)]
 pub(super) fn dot_ptq1_eight_rows_pinned(
     rows: [&[u8]; 8],
     input: &[super::Q8Block],
@@ -1850,6 +1941,7 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
             first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
         ]);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut lanes = [f32x4::splat(neon, 0.0); 8];
     let mut scales_finite = lanes[0].is_finite();
     let chunks = rows.map(|row| row.as_chunks::<28>().0);
@@ -1881,45 +1973,67 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
             scales_hi_arr[2],
             scales_hi_arr[3],
         ];
-        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
-        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
-        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
-        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
-        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
-        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
-        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
-        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
         let a0 = activations[0].scale;
         let a1 = activations[1].scale;
         let a2 = activations[2].scale;
         let a3 = activations[3].scale;
-        for r in 0..8 {
-            lanes[r] = accumulate_ptq1_block_pinned(
-                neon,
-                &chunks[r][index],
-                v00_l,
-                v00_h,
-                v01_l,
-                v01_h,
-                v10_l,
-                v10_h,
-                v11_l,
-                v11_h,
-                v20_l,
-                v20_h,
-                v21_l,
-                v21_h,
-                v30_l,
-                v30_h,
-                v31_l,
-                v31_h,
-                row_scales[r],
-                a0,
-                a1,
-                a2,
-                a3,
-                lanes[r],
-            );
+        if use_dotprod {
+            let act_values = [
+                &activations[0].values,
+                &activations[1].values,
+                &activations[2].values,
+                &activations[3].values,
+            ];
+            for r in 0..8 {
+                lanes[r] = accumulate_ptq1_block_pinned_dotprod(
+                    neon,
+                    &chunks[r][index],
+                    act_values,
+                    row_scales[r],
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    lanes[r],
+                );
+            }
+        } else {
+            let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+            let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+            let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+            let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+            let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+            let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+            let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+            let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+            for r in 0..8 {
+                lanes[r] = accumulate_ptq1_block_pinned(
+                    neon,
+                    &chunks[r][index],
+                    v00_l,
+                    v00_h,
+                    v01_l,
+                    v01_h,
+                    v10_l,
+                    v10_h,
+                    v11_l,
+                    v11_h,
+                    v20_l,
+                    v20_h,
+                    v21_l,
+                    v21_h,
+                    v30_l,
+                    v30_h,
+                    v31_l,
+                    v31_h,
+                    row_scales[r],
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    lanes[r],
+                );
+            }
         }
     }
     if !scales_finite.all_true() {
@@ -1962,55 +2076,36 @@ fn accumulate_ptq1_block_source(
     act_scales: f32x4<Neon>,
     output: f32,
 ) -> f32 {
-    let (mut low, mut high) = u8x16::from_slice(neon, &packed[..16]).widen();
-    let mut step_first = || {
-        low *= 3;
-        high *= 3;
-        let d_lo = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
-        let d_hi = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
-        low &= 255;
-        high &= 255;
-        (d_lo, d_hi)
-    };
-    let (w0, w1) = step_first();
-    let (w2, w3) = step_first();
+    let [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15] =
+        decode_ptq1_i16(neon, packed);
     let (g0_l, g0_h) = ((w0 * v00_l + w1 * v00_h) + (w2 * v01_l + w3 * v01_h)).widen();
     let s0 = g0_l + g0_h;
-
-    let (w4, w5) = step_first();
-    let (w6, w7) = step_first();
     let (g1_l, g1_h) = ((w4 * v10_l + w5 * v10_h) + (w6 * v11_l + w7 * v11_h)).widen();
     let s1 = g1_l + g1_h;
-
-    low *= 3;
-    high *= 3;
-    let w8 = (low >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let w9 = (high >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let (_, mut mid) = u8x16::from_slice(neon, &packed[8..24]).widen();
-    let mut step_mid = || {
-        mid *= 3;
-        let d_mid = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
-        mid &= 255;
-        d_mid
-    };
-    let w10 = step_mid();
-    let w11 = step_mid();
     let (g2_l, g2_h) = ((w8 * v20_l + w9 * v20_h) + (w10 * v21_l + w11 * v21_h)).widen();
     let s2 = g2_l + g2_h;
-
-    let w12 = step_mid();
-    let w13 = step_mid();
-    mid *= 3;
-    let w14 = (mid >> 8).bitcast::<i16x8<Neon>>() - 1;
-    let tail_u64 = PTQ1_TAIL_EVEN_U64[usize::from(packed[24])]
-        | (PTQ1_TAIL_EVEN_U64[usize::from(packed[25])] << 8);
-    let (w15, _) = u64x2::splat(neon, tail_u64)
-        .bitcast::<i8x16<Neon>>()
-        .widen();
     let (g3_l, g3_h) = ((w12 * v30_l + w13 * v30_h) + (w14 * v31_l + w15 * v31_h)).widen();
     let s3 = g3_l + g3_h;
-
     let prod = (reduce4_i32x4(s0, s1, s2, s3).to_float::<f32x4<Neon>>() * act_scales).to_array();
+    let sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+    output + row_scale * sum
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Streams the four 32-element PTQ1 groups via ARMv8.2-A SDOT while preserving scalar reference multiply-then-add rounding."
+)]
+fn accumulate_ptq1_block_source_dotprod(
+    neon: Neon,
+    packed: &[u8; 28],
+    act_values: [&[i8; 32]; 4],
+    row_scale: f32,
+    act_scales: f32x4<Neon>,
+    output: f32,
+) -> f32 {
+    let groups = bonsai_neon_dot::dot_ptq1_block_groups(packed, act_values);
+    let prod = (i32x4::from_slice(neon, &groups).to_float::<f32x4<Neon>>() * act_scales).to_array();
     let sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
     output + row_scale * sum
 }
@@ -2020,6 +2115,7 @@ pub(super) fn dot_ptq1_row_source(bytes: &[u8], input: &[super::Q8Block]) -> Res
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return super::dot_q8_groups(super::PTQ1, bytes, input);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut output = 0.0_f32;
     for (index, block) in bytes.as_chunks::<28>().0.iter().enumerate() {
         let activations = <&[super::Q8Block; 4]>::try_from(&input[index * 4..index * 4 + 4])?;
@@ -2033,37 +2129,53 @@ pub(super) fn dot_ptq1_row_source(bytes: &[u8], input: &[super::Q8Block]) -> Res
                 activations[3].scale,
             ],
         );
-        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
-        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
-        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
-        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
-        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
-        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
-        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
-        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
-        output = accumulate_ptq1_block_source(
-            neon,
-            block,
-            v00_l,
-            v00_h,
-            v01_l,
-            v01_h,
-            v10_l,
-            v10_h,
-            v11_l,
-            v11_h,
-            v20_l,
-            v20_h,
-            v21_l,
-            v21_h,
-            v30_l,
-            v30_h,
-            v31_l,
-            v31_h,
-            weight_scale,
-            act_scales,
-            output,
-        );
+        if use_dotprod {
+            output = accumulate_ptq1_block_source_dotprod(
+                neon,
+                block,
+                [
+                    &activations[0].values,
+                    &activations[1].values,
+                    &activations[2].values,
+                    &activations[3].values,
+                ],
+                weight_scale,
+                act_scales,
+                output,
+            );
+        } else {
+            let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+            let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+            let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+            let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+            let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+            let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+            let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+            let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+            output = accumulate_ptq1_block_source(
+                neon,
+                block,
+                v00_l,
+                v00_h,
+                v01_l,
+                v01_h,
+                v10_l,
+                v10_h,
+                v11_l,
+                v11_h,
+                v20_l,
+                v20_h,
+                v21_l,
+                v21_h,
+                v30_l,
+                v30_h,
+                v31_l,
+                v31_h,
+                weight_scale,
+                act_scales,
+                output,
+            );
+        }
     }
     super::finite(output)
 }
@@ -2081,6 +2193,7 @@ pub(super) fn dot_ptq1_four_rows_source(
             super::dot_q8_groups(super::PTQ1, rows[3], input)?,
         ]);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut outputs = [0.0_f32; 4];
     let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
     let r0 = rows[0].as_chunks::<28>().0;
@@ -2109,39 +2222,58 @@ pub(super) fn dot_ptq1_four_rows_source(
                 activations[3].scale,
             ],
         );
-        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
-        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
-        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
-        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
-        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
-        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
-        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
-        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
         let blocks = [b0, b1, b2, b3];
-        for r in 0..4 {
-            outputs[r] = accumulate_ptq1_block_source(
-                neon,
-                blocks[r],
-                v00_l,
-                v00_h,
-                v01_l,
-                v01_h,
-                v10_l,
-                v10_h,
-                v11_l,
-                v11_h,
-                v20_l,
-                v20_h,
-                v21_l,
-                v21_h,
-                v30_l,
-                v30_h,
-                v31_l,
-                v31_h,
-                row_scales[r],
-                act_scales,
-                outputs[r],
-            );
+        if use_dotprod {
+            let act_values = [
+                &activations[0].values,
+                &activations[1].values,
+                &activations[2].values,
+                &activations[3].values,
+            ];
+            for r in 0..4 {
+                outputs[r] = accumulate_ptq1_block_source_dotprod(
+                    neon,
+                    blocks[r],
+                    act_values,
+                    row_scales[r],
+                    act_scales,
+                    outputs[r],
+                );
+            }
+        } else {
+            let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+            let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+            let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+            let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+            let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+            let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+            let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+            let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+            for r in 0..4 {
+                outputs[r] = accumulate_ptq1_block_source(
+                    neon,
+                    blocks[r],
+                    v00_l,
+                    v00_h,
+                    v01_l,
+                    v01_h,
+                    v10_l,
+                    v10_h,
+                    v11_l,
+                    v11_h,
+                    v20_l,
+                    v20_h,
+                    v21_l,
+                    v21_h,
+                    v30_l,
+                    v30_h,
+                    v31_l,
+                    v31_h,
+                    row_scales[r],
+                    act_scales,
+                    outputs[r],
+                );
+            }
         }
     }
     if !scales_finite.all_true() {
@@ -2154,6 +2286,10 @@ pub(super) fn dot_ptq1_four_rows_source(
 }
 
 #[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across eight rows."
+)]
 pub(super) fn dot_ptq1_eight_rows_source(
     rows: [&[u8]; 8],
     input: &[super::Q8Block],
@@ -2165,6 +2301,7 @@ pub(super) fn dot_ptq1_eight_rows_source(
             first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
         ]);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut outputs = [0.0_f32; 8];
     let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
     let chunks = rows.map(|row| row.as_chunks::<28>().0);
@@ -2205,38 +2342,57 @@ pub(super) fn dot_ptq1_eight_rows_source(
                 activations[3].scale,
             ],
         );
-        let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
-        let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
-        let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
-        let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
-        let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
-        let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
-        let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
-        let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
-        for r in 0..8 {
-            outputs[r] = accumulate_ptq1_block_source(
-                neon,
-                &chunks[r][index],
-                v00_l,
-                v00_h,
-                v01_l,
-                v01_h,
-                v10_l,
-                v10_h,
-                v11_l,
-                v11_h,
-                v20_l,
-                v20_h,
-                v21_l,
-                v21_h,
-                v30_l,
-                v30_h,
-                v31_l,
-                v31_h,
-                row_scales[r],
-                act_scales,
-                outputs[r],
-            );
+        if use_dotprod {
+            let act_values = [
+                &activations[0].values,
+                &activations[1].values,
+                &activations[2].values,
+                &activations[3].values,
+            ];
+            for r in 0..8 {
+                outputs[r] = accumulate_ptq1_block_source_dotprod(
+                    neon,
+                    &chunks[r][index],
+                    act_values,
+                    row_scales[r],
+                    act_scales,
+                    outputs[r],
+                );
+            }
+        } else {
+            let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
+            let (v01_l, v01_h) = i8x16::from_slice(neon, &activations[0].values[16..]).widen();
+            let (v10_l, v10_h) = i8x16::from_slice(neon, &activations[1].values[..16]).widen();
+            let (v11_l, v11_h) = i8x16::from_slice(neon, &activations[1].values[16..]).widen();
+            let (v20_l, v20_h) = i8x16::from_slice(neon, &activations[2].values[..16]).widen();
+            let (v21_l, v21_h) = i8x16::from_slice(neon, &activations[2].values[16..]).widen();
+            let (v30_l, v30_h) = i8x16::from_slice(neon, &activations[3].values[..16]).widen();
+            let (v31_l, v31_h) = i8x16::from_slice(neon, &activations[3].values[16..]).widen();
+            for r in 0..8 {
+                outputs[r] = accumulate_ptq1_block_source(
+                    neon,
+                    &chunks[r][index],
+                    v00_l,
+                    v00_h,
+                    v01_l,
+                    v01_h,
+                    v10_l,
+                    v10_h,
+                    v11_l,
+                    v11_h,
+                    v20_l,
+                    v20_h,
+                    v21_l,
+                    v21_h,
+                    v30_l,
+                    v30_h,
+                    v31_l,
+                    v31_h,
+                    row_scales[r],
+                    act_scales,
+                    outputs[r],
+                );
+            }
         }
     }
     if !scales_finite.all_true() {
@@ -2262,6 +2418,7 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
             super::dot_legacy(super::Q8_0, rows[3], input)?,
         ]);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut outputs = [0.0_f32; 4];
     let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
@@ -2281,15 +2438,24 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
         );
         scales_finite &= scales_vec.is_finite();
         let row_scales = scales_vec.to_array();
-        let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
-        let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
         let blocks = [b0, b1, b2, b3];
-        for r in 0..4 {
-            let weights: &[u8; 32] = blocks[r][2..34].try_into()?;
-            let sum = super::integer_float(dot_q8_0_block_preloaded(
-                neon, weights, a0_l, a0_h, a1_l, a1_h,
-            ));
-            outputs[r] += (row_scales[r] * activation.scale) * sum;
+        if use_dotprod {
+            for r in 0..4 {
+                let [_, _, ref weights @ ..] = *blocks[r];
+                let sum =
+                    super::integer_float(bonsai_neon_dot::dot_q8_0_block(weights, &activation.values));
+                outputs[r] += (row_scales[r] * activation.scale) * sum;
+            }
+        } else {
+            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            for r in 0..4 {
+                let [_, _, ref weights @ ..] = *blocks[r];
+                let sum = super::integer_float(dot_q8_0_block_preloaded(
+                    neon, weights, a0_l, a0_h, a1_l, a1_h,
+                ));
+                outputs[r] += (row_scales[r] * activation.scale) * sum;
+            }
         }
     }
     if !scales_finite.all_true() {
@@ -2314,6 +2480,7 @@ pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
             first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
         ]);
     };
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut outputs = [0.0_f32; 8];
     let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
@@ -2344,14 +2511,23 @@ pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
             scales_hi_arr[2],
             scales_hi_arr[3],
         ];
-        let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
-        let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
-        for r in 0..8 {
-            let weights: &[u8; 32] = chunks[r][index][2..34].try_into()?;
-            let sum = super::integer_float(dot_q8_0_block_preloaded(
-                neon, weights, a0_l, a0_h, a1_l, a1_h,
-            ));
-            outputs[r] += (row_scales[r] * activation.scale) * sum;
+        if use_dotprod {
+            for r in 0..8 {
+                let [_, _, ref weights @ ..] = chunks[r][index];
+                let sum =
+                    super::integer_float(bonsai_neon_dot::dot_q8_0_block(weights, &activation.values));
+                outputs[r] += (row_scales[r] * activation.scale) * sum;
+            }
+        } else {
+            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            for r in 0..8 {
+                let [_, _, ref weights @ ..] = chunks[r][index];
+                let sum = super::integer_float(dot_q8_0_block_preloaded(
+                    neon, weights, a0_l, a0_h, a1_l, a1_h,
+                ));
+                outputs[r] += (row_scales[r] * activation.scale) * sum;
+            }
         }
     }
     if !scales_finite.all_true() {
@@ -2488,29 +2664,57 @@ pub(super) fn dot_q8_0_tile_row<const TOKENS: usize>(
     preparations: &[super::MatvecScratch],
 ) -> Option<Result<[f32; TOKENS]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_i8mm = bonsai_neon_dot::has_i8mm();
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut sums = [0.0_f32; TOKENS];
     for (index, block) in row.as_chunks::<34>().0.iter().enumerate() {
         let weight_scale = match super::scale(block) {
             Ok(s) => s,
             Err(err) => return Some(Err(err)),
         };
-        let (w0_l, w0_h) = u8x16::from_slice(neon, &block[2..18])
-            .bitcast::<i8x16<Neon>>()
-            .widen();
-        let (w1_l, w1_h) = u8x16::from_slice(neon, &block[18..34])
-            .bitcast::<i8x16<Neon>>()
-            .widen();
-        for (sum, scratch) in sums.iter_mut().zip(preparations) {
-            let activation = &scratch.q8[index];
-            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
-            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
-            let (p00_l, p00_h) = (w0_l * a0_l).widen();
-            let (p01_l, p01_h) = (w0_h * a0_h).widen();
-            let (p10_l, p10_h) = (w1_l * a1_l).widen();
-            let (p11_l, p11_h) = (w1_h * a1_h).widen();
-            let int_dot = ((p00_l + p00_h) + (p01_l + p01_h) + (p10_l + p10_h) + (p11_l + p11_h))
-                .reduce_sum();
-            *sum += (weight_scale * activation.scale) * super::integer_float(int_dot);
+        let [_, _, ref weights @ ..] = *block;
+        if use_i8mm && preparations.len() >= 2 {
+            let token_count = preparations.len().min(TOKENS);
+            let mut t = 0;
+            while t + 2 <= token_count {
+                let a0 = &preparations[t].q8[index];
+                let a1 = &preparations[t + 1].q8[index];
+                let tile = bonsai_neon_dot::smmla_q8_0_2x2(weights, weights, &a0.values, &a1.values);
+                sums[t] += (weight_scale * a0.scale) * super::integer_float(tile[0][0]);
+                sums[t + 1] += (weight_scale * a1.scale) * super::integer_float(tile[0][1]);
+                t += 2;
+            }
+            if t < token_count {
+                let activation = &preparations[t].q8[index];
+                let int_dot = bonsai_neon_dot::dot_q8_0_block(weights, &activation.values);
+                sums[t] += (weight_scale * activation.scale) * super::integer_float(int_dot);
+            }
+        } else if use_dotprod {
+            for (sum, scratch) in sums.iter_mut().zip(preparations) {
+                let activation = &scratch.q8[index];
+                let int_dot = bonsai_neon_dot::dot_q8_0_block(weights, &activation.values);
+                *sum += (weight_scale * activation.scale) * super::integer_float(int_dot);
+            }
+        } else {
+            let (w0_l, w0_h) = u8x16::from_slice(neon, &block[2..18])
+                .bitcast::<i8x16<Neon>>()
+                .widen();
+            let (w1_l, w1_h) = u8x16::from_slice(neon, &block[18..34])
+                .bitcast::<i8x16<Neon>>()
+                .widen();
+            for (sum, scratch) in sums.iter_mut().zip(preparations) {
+                let activation = &scratch.q8[index];
+                let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+                let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+                let (p00_l, p00_h) = (w0_l * a0_l).widen();
+                let (p01_l, p01_h) = (w0_h * a0_h).widen();
+                let (p10_l, p10_h) = (w1_l * a1_l).widen();
+                let (p11_l, p11_h) = (w1_h * a1_h).widen();
+                let int_dot =
+                    ((p00_l + p00_h) + (p01_l + p01_h) + (p10_l + p10_h) + (p11_l + p11_h))
+                        .reduce_sum();
+                *sum += (weight_scale * activation.scale) * super::integer_float(int_dot);
+            }
         }
     }
     for sum in sums.iter_mut().take(preparations.len()) {

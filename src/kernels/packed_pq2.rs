@@ -96,7 +96,7 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &[Activation]) -> 
         let d = super::scale(block)? * activation.scale;
         let sum = super::integer_float(super::neon::dot_consumption_order_prewidened(
             block[2..].try_into()?,
-            &activation.widened,
+            &activation.values, &activation.widened,
             activation.sum,
         ));
         output = if FUSED {

@@ -108,6 +108,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonsai-neon-dot"
+version = "0.1.0"
+
+[[package]]
 name = "bonsai-prism"
 version = "0.1.3"
 dependencies = [
@@ -607,6 +611,7 @@ version = "0.1.20"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
+ "bonsai-neon-dot",
  "bonsai-prism",
  "bonsai-ternary",
  "fancy-regex",

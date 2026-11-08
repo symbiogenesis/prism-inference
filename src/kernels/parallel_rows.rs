@@ -14,7 +14,7 @@ use crate::{Result, invalid};
 mod tile;
 
 /// Largest explicit number of persistent projection workers.
-pub const MAX_ROW_WORKERS: usize = 16;
+pub const MAX_ROW_WORKERS: usize = 18;
 
 /// Shared private row-worker pool, independent of Rayon global configuration.
 ///
@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn pinned_parallel_rows_preserve_both_activation_contracts() -> Result<()> {
-        for workers in [2, 4] {
+        for workers in [2, 4, 18] {
             let policy = RowParallelism::new(workers)?;
             for (kind, columns) in [(142, 5120), (142, 384), (143, 6144)] {
                 let mut block = [0x66_u8; 34];
@@ -176,7 +176,7 @@ impl RowParallelism {
     /// initialized and no larger or silently reduced budget is substituted.
     pub fn new(workers: usize) -> Result<Self> {
         if !(1..=MAX_ROW_WORKERS).contains(&workers) {
-            return Err(invalid("row worker count must be from 1 through 16"));
+            return Err(invalid("row worker count must be from 1 through 18"));
         }
         if workers == 1 {
             return Ok(Self::default());

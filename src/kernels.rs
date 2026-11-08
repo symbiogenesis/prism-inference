@@ -46,6 +46,7 @@ pub(crate) mod pinned_gdn;
 pub(crate) mod prefill;
 mod signquants;
 mod tquants;
+pub use tquants::Tl1BlockLut;
 
 #[cfg(test)]
 mod pinned_float_tests;
@@ -912,6 +913,57 @@ fn dot_pq2_neon<const FUSED: bool>(bytes: &[u8], input: &[Q8KBlock]) -> Result<f
         } else {
             output + d * sum
         };
+    }
+    finite(output)
+}
+
+/// Computes a direct `PTQ1` (28-byte 128-element ternary blocks) dot product
+/// against `Q8_K` (256-element activation blocks) without requiring a separate
+/// `Q8_0` activation quantization pass when `Q8_K` blocks are already prepared.
+///
+/// # Errors
+/// Rejects malformed or mismatched `PTQ1`/`Q8_K` extents, invalid ternary bytes,
+/// or non-finite scales.
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding."
+)]
+pub fn dot_ptq1_q8k(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(28) {
+        return Err(invalid("PTQ1 packed dot requires complete 28-byte blocks"));
+    }
+    let ptq1_blocks = bytes.len() / 28;
+    if ptq1_blocks.div_ceil(2) != input.len() {
+        return Err(invalid("PTQ1 and Q8_K packed dot extents differ"));
+    }
+    let mut output = 0.0_f32;
+    for (index, block) in bytes.as_chunks::<28>().0.iter().enumerate() {
+        let activation = &input[index / 2];
+        let start = (index % 2) * 128;
+        let d = scale(&block[26..])? * finite(activation.scale)?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        let sum = {
+            let act_half = &activation.values[start..start + 128];
+            let groups = act_half.as_chunks::<32>().0;
+            let group_sums =
+                neon::dot_ptq1_groups(block, [&groups[0], &groups[1], &groups[2], &groups[3]])?;
+            integer_float(group_sums.into_iter().sum())
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        )))]
+        let sum = dot_integer(&ptq1_values(block)?, &activation.values[start..start + 128]);
+        output += d * sum;
     }
     finite(output)
 }
@@ -3511,6 +3563,38 @@ mod tests {
             retained_bits
         );
         assert!(scratch.diagnostics().succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn dot_ptq1_q8k_matches_dequantized_reference() -> crate::Result<()> {
+        let mut weights = [0.0_f32; 256];
+        for (i, w) in weights.iter_mut().enumerate() {
+            *w = match i % 3 {
+                0 => -0.5,
+                1 => 0.0,
+                _ => 0.5,
+            };
+        }
+        let ptq1_bytes = super::quantize_row(super::PTQ1, &weights)?;
+        let mut acts = [0.0_f32; 256];
+        for (i, a) in acts.iter_mut().enumerate() {
+            let signed = i32::try_from(i % 29).unwrap_or(0) - 14;
+            *a = f32::from(i16::try_from(signed).unwrap_or(0)) * 0.125;
+        }
+        let mut q8k = Vec::new();
+        q8k_into(&acts, &mut q8k)?;
+        let actual = super::dot_ptq1_q8k(&ptq1_bytes, &q8k)?;
+        let d0 = super::scale(&ptq1_bytes[26..28])? * q8k[0].scale;
+        let d1 = super::scale(&ptq1_bytes[54..56])? * q8k[0].scale;
+        let w0 = super::ptq1_values(&ptq1_bytes[..28])?;
+        let w1 = super::ptq1_values(&ptq1_bytes[28..56])?;
+        let s0 = super::dot_integer(&w0, &q8k[0].values[..128]);
+        let s1 = super::dot_integer(&w1, &q8k[0].values[128..]);
+        let expected = d0 * s0 + d1 * s1;
+        assert!((actual - expected).abs() <= 1e-5);
+        assert!(super::dot_ptq1_q8k(&ptq1_bytes[..27], &q8k).is_err());
+        assert!(super::dot_ptq1_q8k(&ptq1_bytes, &[]).is_err());
         Ok(())
     }
 }

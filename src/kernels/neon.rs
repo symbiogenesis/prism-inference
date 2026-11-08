@@ -87,6 +87,50 @@ pub(super) fn dot(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
     pq2_reduce(even + odd)
 }
 
+/// Computes the exact 256-element integer dot product of a 64-byte `TQ2_0`
+/// payload against a 256-element `Q8_K` activation slice using 128-bit NEON
+/// plane extraction.
+#[inline]
+pub(super) fn dot_tq2_block(packed: &[u8; 64], activations: &[i8; 256]) -> i32 {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return (0..256)
+            .map(|index| {
+                let weight = i32::from(
+                    (packed[index / 128 * 32 + index % 32] >> (2 * (index % 128 / 32))) & 3,
+                ) - 1;
+                weight * i32::from(activations[index])
+            })
+            .sum();
+    };
+    let mut total = 0_i32;
+    for (half_bytes, half_acts) in packed
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(activations.as_chunks::<128>().0)
+    {
+        let mut acc0 = i16x8::splat(neon, 0);
+        let mut acc1 = i16x8::splat(neon, 0);
+        let planes = half_acts.as_chunks::<32>().0;
+        for chunk in 0..2 {
+            let offset = chunk * 16;
+            let w = u8x16::from_slice(neon, &half_bytes[offset..offset + 16]);
+            let p0 = (w & 3).bitcast::<i8x16<Neon>>() - 1;
+            let p1 = ((w >> 2) & 3).bitcast::<i8x16<Neon>>() - 1;
+            let p2 = ((w >> 4) & 3).bitcast::<i8x16<Neon>>() - 1;
+            let p3 = (w >> 6).bitcast::<i8x16<Neon>>() - 1;
+            let a0 = i8x16::from_slice(neon, &planes[0][offset..offset + 16]);
+            let a1 = i8x16::from_slice(neon, &planes[1][offset..offset + 16]);
+            let a2 = i8x16::from_slice(neon, &planes[2][offset..offset + 16]);
+            let a3 = i8x16::from_slice(neon, &planes[3][offset..offset + 16]);
+            acc0 += pq2_pair_sums(p0, a0) + pq2_pair_sums(p2, a2);
+            acc1 += pq2_pair_sums(p1, a1) + pq2_pair_sums(p3, a3);
+        }
+        total += pq2_reduce(acc0 + acc1);
+    }
+    total
+}
+
 #[inline]
 #[allow(
     clippy::too_many_arguments,

@@ -163,7 +163,7 @@ fn select_row_workers(arguments: &mut Vec<String>) -> Result<Option<usize>> {
     }
     let workers = value.parse::<usize>()?;
     if !(1..=MAX_ROW_WORKERS).contains(&workers) {
-        return Err(reject("row workers must be from 1 through 16"));
+        return Err(reject("row workers must be from 1 through 18"));
     }
     arguments.drain(..2);
     if arguments

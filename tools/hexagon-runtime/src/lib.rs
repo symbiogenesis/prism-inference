@@ -18,7 +18,7 @@ pub use native_q2::{
 mod q8;
 pub use q8::HmxQ8Executor;
 mod placement;
-pub use placement::PlacedProjectionExecutor;
+pub use placement::{HybridPrefillSchedule, HybridPrefillStep, PlacedProjectionExecutor, plan_hybrid_prefill_pipeline};
 
 type Result<T> = bonsai_prism_runtime::Result<T>;
 

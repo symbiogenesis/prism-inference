@@ -34,8 +34,8 @@ pub use hmx_projection::{
     HmxQ2WeightRegistry,
 };
 pub use htp_ops::{
-    HtpOpCode, HtpOpPassFlags, htp_fastdiv, solve_binary_kparams, solve_glu_kparams,
-    solve_unary_kparams,
+    HTP_DMA32_MAX_STRIDE_BYTES, HtpOpCode, HtpOpPassFlags, htp_fastdiv, requires_dma64_stride,
+    solve_binary_kparams, solve_glu_kparams, solve_unary_kparams,
 };
 pub use native_q2::{
     NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES, NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES,

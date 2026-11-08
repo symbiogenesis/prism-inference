@@ -92,6 +92,22 @@ impl HtpOpPassFlags {
     }
 }
 
+/// Maximum unsigned byte stride representable in a standard 24-bit Hexagon DMA descriptor (`16 MiB - 1`).
+///
+/// Strides exceeding `0x00ff_ffff` require 64-bit DMA descriptors (`DMA64`, per `ggml-org/llama.cpp` PR `#31442`)
+/// or must be rejected before 32-bit descriptor assembly to prevent silent upper-byte truncation.
+pub const HTP_DMA32_MAX_STRIDE_BYTES: u32 = 0x00ff_ffff;
+
+/// Returns `true` when `stride_bytes` exceeds the 24-bit stride limit of a 32-bit Hexagon DMA descriptor.
+#[must_use]
+#[allow(
+    clippy::as_conversions,
+    reason = "u32 -> u64 widening is lossless and const-compatible."
+)]
+pub const fn requires_dma64_stride(stride_bytes: u64) -> bool {
+    stride_bytes > (HTP_DMA32_MAX_STRIDE_BYTES as u64)
+}
+
 /// Compute the 64-bit `(shift << 32) | magic` fast-division constant used by `htp_kparams_solve`.
 #[must_use]
 #[allow(
@@ -145,6 +161,9 @@ pub fn solve_unary_kparams(
         _ => 2_u32,
     };
     let aligned_row = row_bytes.next_multiple_of(128);
+    if requires_dma64_stride(u64::from(aligned_row)) {
+        return Err(Error::Contract);
+    }
     let bcast_vtcm = if bcast_src1 != 0 { aligned_row } else { 0 };
     let per_thread_vtcm = aligned_row
         .checked_mul(buffers_per_row)
@@ -183,6 +202,9 @@ pub fn solve_glu_kparams(columns: u32, rows: u32) -> Result<[u8; 12], Error> {
     }
     let row_bytes = columns.checked_mul(4).ok_or(Error::Contract)?;
     let aligned_row = row_bytes.next_multiple_of(128);
+    if requires_dma64_stride(u64::from(aligned_row)) {
+        return Err(Error::Contract);
+    }
     let n_threads = rows.clamp(1, HMX_Q2_HVX_WORKERS);
     let per_step_bytes = aligned_row
         .checked_mul(n_threads)
@@ -239,7 +261,10 @@ pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u
     let n_chunks = total_elems.div_ceil(target);
     let n_threads = n_chunks.clamp(1, HMX_Q2_HVX_WORKERS);
     let chunk_bytes = (target * 4).next_multiple_of(128);
-    let row_bytes = (columns * 4).next_multiple_of(128);
+    let row_bytes = columns.checked_mul(4).ok_or(Error::Contract)?.next_multiple_of(128);
+    if requires_dma64_stride(u64::from(row_bytes)) {
+        return Err(Error::Contract);
+    }
     let vtcm_size = chunk_bytes
         .checked_mul(3)
         .and_then(|bytes| bytes.checked_mul(n_threads))
@@ -320,6 +345,9 @@ mod tests {
             u32::from_le_bytes([mul_kp[8], mul_kp[9], mul_kp[10], mul_kp[11]]),
             8
         );
+        assert!(!requires_dma64_stride(u64::from(HTP_DMA32_MAX_STRIDE_BYTES)));
+        assert!(requires_dma64_stride(u64::from(HTP_DMA32_MAX_STRIDE_BYTES) + 1));
+        assert!(solve_binary_kparams(HtpOpCode::Add, 4_194_304, 1).is_err());
         Ok(())
     }
 }

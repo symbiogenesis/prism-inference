@@ -576,6 +576,25 @@ pub trait NativeQ2Submitter {
         self.submit_resident_ffn_swiglu(gate_handle, up_handle, activations[1], o1)
     }
 
+    /// Submit a full intra-layer FFN chain (`[gate_handle, up_handle, down_handle]`:
+    /// `ffn_gate` + `ffn_up` + `HTP_OP_GLU_SWIGLU` + optional `HTP_OP_HADAMARD` +
+    /// `ffn_down` + optional `HTP_OP_ADD` residual) with VTCM intermediate residency chaining.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched dimensions or
+    /// submission failures reject and close the session with no CPU replay.
+    fn submit_resident_ffn_chain(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        output.fill(f32::NAN);
+        Err(Error::Contract)
+    }
+
     /// Submit tiled `HTP_TYPE_Q2_0` weights (`[columns, rows]`) and one `F32`
     /// activation vector (`[columns]`) in a single DSP operation.
     ///
@@ -691,6 +710,23 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         outputs: [&mut [f32]; 2],
     ) -> Result<(), Error> {
         (**self).submit_resident_ffn_swiglu_multi2(gate_handle, up_handle, activations, outputs)
+    }
+
+    fn submit_resident_ffn_chain(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_ffn_chain(
+            handles,
+            activation,
+            residual,
+            hadamard_block_size,
+            output,
+        )
     }
 
     fn submit(
@@ -1623,6 +1659,456 @@ pub(crate) fn image_ffn_swiglu_multi2_resident(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Used by full intra-layer FFN VTCM chain packet construction and verification"
+)]
+pub(crate) struct FfnFullChainLayout {
+    pub(crate) output_offset: usize,
+    pub(crate) output_end: usize,
+    pub(crate) n_bufs: u32,
+    pub(crate) n_tensors: u32,
+    pub(crate) n_ops: u32,
+}
+
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "Keep F32 2D tensor descriptor fields together for intra-layer VTCM chains"
+)]
+fn write_f32_2d_tensor_desc(
+    working: &mut [u8],
+    tensors_base: usize,
+    ti: u16,
+    buf_offset: usize,
+    total_bytes: usize,
+    cols: usize,
+    rows: usize,
+) -> Result<(), Error> {
+    let desc = tensors_base + usize::from(ti) * 56;
+    let row_bytes = cols.checked_mul(4).ok_or(Error::Contract)?;
+    put64(
+        working,
+        desc,
+        u64::try_from(buf_offset).map_err(|_| Error::Contract)?,
+    );
+    put16(working, desc + 20, 0);
+    put16(working, desc + 22, ti);
+    for (off, val) in [
+        (desc + 8, total_bytes),
+        (desc + 12, 0),
+        (desc + 16, 0),
+        (desc + 24, cols),
+        (desc + 28, rows),
+        (desc + 32, 1),
+        (desc + 36, 1),
+        (desc + 40, 4),
+        (desc + 44, row_bytes),
+        (desc + 48, total_bytes),
+        (desc + 52, total_bytes),
+    ] {
+        put32(
+            working,
+            off,
+            u32::try_from(val).map_err(|_| Error::Contract)?,
+        );
+    }
+    Ok(())
+}
+
+/// Build a full intra-layer FFN `dspqueue` packet:
+/// `OP_MUL_MAT(gate)` + `OP_MUL_MAT(up)` + `HTP_OP_GLU_SWIGLU` +
+/// optional `HTP_OP_HADAMARD` + `OP_MUL_MAT(down)` + optional `HTP_OP_ADD(residual)`
+/// with VTCM intermediate residency chaining across all stages.
+#[allow(
+    dead_code,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "Keep full intra-layer FFN 4/5/6-op descriptor assembly and VTCM pass flags together"
+)]
+pub(crate) fn image_ffn_full_chain_resident(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    down_handle: &NativeQ2WeightHandle,
+    activation: &[f32],
+    residual: Option<&[f32]>,
+    hadamard_block_size: Option<u32>,
+) -> Result<FfnFullChainLayout, Error> {
+    let hidden = gate_handle.columns;
+    let ffn_dim = gate_handle.rows;
+    if up_handle.columns != hidden
+        || up_handle.rows != ffn_dim
+        || down_handle.columns != ffn_dim
+        || down_handle.rows != hidden
+        || activation.len() != hidden
+        || !hidden.is_multiple_of(128)
+        || !ffn_dim.is_multiple_of(128)
+        || residual.is_some_and(|res| res.len() != hidden || !is_finite_f32_slice(res))
+        || !is_finite_f32_slice(activation)
+    {
+        return Err(Error::Contract);
+    }
+    if let Some(block_size) = hadamard_block_size {
+        let block_usize = usize::try_from(block_size).map_err(|_| Error::Contract)?;
+        if block_size < 32 || !block_size.is_power_of_two() || !ffn_dim.is_multiple_of(block_usize) {
+            return Err(Error::Contract);
+        }
+    }
+    let allocation = bytes.len();
+    if arena_start > allocation || arena_start < 4096 {
+        return Err(Error::Contract);
+    }
+    let handles = [gate_handle, up_handle, down_handle];
+    let mut extra_buf_count = 0_usize;
+    let mut batch_extra_arena_indices = [0_u16; 3];
+    let mut batch_extra_descs = [HtpBufferDesc {
+        base: 0,
+        size: 0,
+        fd: 0,
+    }; 3];
+    let mut weight_offsets = [0_usize; 3];
+    let mut weight_bis = [0_u16; 3];
+    for (member, handle) in handles.into_iter().enumerate() {
+        let expected_weights = layout(handle.columns, handle.rows).weights;
+        if handle.packed_bytes() != expected_weights {
+            return Err(Error::Contract);
+        }
+        if handle.arena_index == 0 {
+            let start = arena_start
+                .checked_add(handle.range.start)
+                .ok_or(Error::Contract)?;
+            let end = arena_start
+                .checked_add(handle.range.end)
+                .ok_or(Error::Contract)?;
+            if end > allocation {
+                return Err(Error::Contract);
+            }
+            weight_offsets[member] = start;
+            weight_bis[member] = 0;
+        } else {
+            let extra_idx = usize::from(handle.arena_index - 1);
+            let extra = extra_arenas
+                .get(extra_idx)
+                .copied()
+                .ok_or(Error::Contract)?;
+            if handle.range.end > extra.size {
+                return Err(Error::Contract);
+            }
+            let bi = if let Some(pos) = batch_extra_arena_indices[..extra_buf_count]
+                .iter()
+                .position(|&idx| idx == handle.arena_index)
+            {
+                u16::try_from(pos + 1).map_err(|_| Error::Contract)?
+            } else {
+                batch_extra_arena_indices[extra_buf_count] = handle.arena_index;
+                batch_extra_descs[extra_buf_count] = extra;
+                extra_buf_count += 1;
+                u16::try_from(extra_buf_count).map_err(|_| Error::Contract)?
+            };
+            weight_offsets[member] = handle.range.start;
+            weight_bis[member] = bi;
+        }
+    }
+
+    let cmd_pad = 4096_usize;
+    let hidden_bytes = hidden * 4;
+    let ffn_bytes = ffn_dim * 4;
+    let act_offset = cmd_pad;
+    let mut next_offset = (act_offset + hidden_bytes).next_multiple_of(128);
+    let res_offset = if residual.is_some() {
+        let off = next_offset;
+        next_offset = (off + hidden_bytes).next_multiple_of(128);
+        off
+    } else {
+        0
+    };
+    let gate_out_offset = next_offset;
+    let up_out_offset = (gate_out_offset + ffn_bytes).next_multiple_of(128);
+    let swiglu_out_offset = (up_out_offset + ffn_bytes).next_multiple_of(128);
+    let hadamard_out_offset = if hadamard_block_size.is_some() {
+        (swiglu_out_offset + ffn_bytes).next_multiple_of(128)
+    } else {
+        swiglu_out_offset
+    };
+    let down_out_offset = (hadamard_out_offset + ffn_bytes).next_multiple_of(128);
+    let final_out_offset = if residual.is_some() {
+        (down_out_offset + hidden_bytes).next_multiple_of(128)
+    } else {
+        down_out_offset
+    };
+    let output_end = final_out_offset + hidden_bytes;
+    let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
+    if output_end > working.len() {
+        return Err(Error::Contract);
+    }
+
+    let n_bufs_usize = 1 + extra_buf_count;
+    let n_bufs = u32::try_from(n_bufs_usize).map_err(|_| Error::Contract)?;
+    let n_tensors_usize = 12
+        + usize::from(hadamard_block_size.is_some()) * 2
+        + usize::from(residual.is_some()) * 3;
+    let n_ops_usize = 4
+        + usize::from(hadamard_block_size.is_some())
+        + usize::from(residual.is_some());
+    let tensors_base = n_bufs_usize * 24;
+    let ops_base = tensors_base + n_tensors_usize * 56;
+    if ops_base + n_ops_usize * 232 > cmd_pad {
+        return Err(Error::Contract);
+    }
+    working[..cmd_pad].fill(0);
+    put64(working, 0, base);
+    put64(
+        working,
+        8,
+        u64::try_from(allocation).map_err(|_| Error::Contract)?,
+    );
+    put32(working, 20, fd);
+    for (idx, extra) in batch_extra_descs[..extra_buf_count].iter().enumerate() {
+        let buf_offset = (idx + 1) * 24;
+        put64(working, buf_offset, extra.base);
+        put64(
+            working,
+            buf_offset + 8,
+            u64::try_from(extra.size).map_err(|_| Error::Contract)?,
+        );
+        put32(working, buf_offset + 20, extra.fd);
+    }
+
+    let vtcm_chain = ffn_bytes.saturating_mul(3) <= 1_048_576;
+    let keep_vtcm = if vtcm_chain {
+        crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
+    } else {
+        crate::htp_ops::HtpOpPassFlags::NONE
+    };
+
+    // Op 0 (gate: ti 0, 1 -> 2) and Op 1 (up: ti 3, 4 -> 5).
+    write_member_descriptors(
+        working,
+        0,
+        weight_bis[0],
+        tensors_base,
+        ops_base,
+        hidden,
+        ffn_dim,
+        weight_offsets[0],
+        layout(hidden, ffn_dim).weights,
+        act_offset,
+        gate_out_offset,
+    )?;
+    put32(working, ops_base + 4, keep_vtcm.bits());
+
+    write_member_descriptors(
+        working,
+        3,
+        weight_bis[1],
+        tensors_base + 3 * 56,
+        ops_base + 232,
+        hidden,
+        ffn_dim,
+        weight_offsets[1],
+        layout(hidden, ffn_dim).weights,
+        act_offset,
+        up_out_offset,
+    )?;
+    put32(working, ops_base + 232 + 4, keep_vtcm.bits());
+
+    // Op 2: GluSwiglu (ti 6, 7 -> 8).
+    let (glu_cols, glu_rows) = if ffn_dim >= 64 {
+        (32_usize, ffn_dim / 32)
+    } else {
+        (ffn_dim / 2, 2_usize)
+    };
+    let glu_kp = crate::htp_ops::solve_glu_kparams(
+        u32::try_from(glu_cols).map_err(|_| Error::Contract)?,
+        u32::try_from(glu_rows).map_err(|_| Error::Contract)?,
+    )?;
+    for (ti, buf_off) in [
+        (6_u16, gate_out_offset),
+        (7_u16, up_out_offset),
+        (8_u16, swiglu_out_offset),
+    ] {
+        write_f32_2d_tensor_desc(working, tensors_base, ti, buf_off, ffn_bytes, glu_cols, glu_rows)?;
+    }
+    let glu_op_desc = ops_base + 2 * 232;
+    let glu_flags = if vtcm_chain {
+        crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+            .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
+            .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+    } else {
+        crate::htp_ops::HtpOpPassFlags::NONE
+    };
+    put32(working, glu_op_desc, crate::htp_ops::HtpOpCode::GluSwiglu.id());
+    put32(working, glu_op_desc + 4, glu_flags.bits());
+    working[glu_op_desc + 72..glu_op_desc + 84].copy_from_slice(&glu_kp);
+    working[glu_op_desc + 200..glu_op_desc + 228].fill(0xff);
+    put16(working, glu_op_desc + 200, 6);
+    put16(working, glu_op_desc + 202, 7);
+    put16(working, glu_op_desc + 220, 8);
+
+    let mut next_ti = 9_u16;
+    let mut next_op = 3_usize;
+
+    // Optional Op 3: HTP_OP_HADAMARD (69) over [block_size, ffn_dim / block_size].
+    if let Some(block_size) = hadamard_block_size {
+        let block_cols = usize::try_from(block_size).map_err(|_| Error::Contract)?;
+        let block_rows = ffn_dim / block_cols;
+        let had_kp = crate::htp_ops::solve_unary_kparams(
+            crate::htp_ops::HtpOpCode::Hadamard,
+            block_size,
+            u32::try_from(block_rows).map_err(|_| Error::Contract)?,
+            1,
+        )?;
+        write_f32_2d_tensor_desc(
+            working,
+            tensors_base,
+            next_ti,
+            swiglu_out_offset,
+            ffn_bytes,
+            block_cols,
+            block_rows,
+        )?;
+        write_f32_2d_tensor_desc(
+            working,
+            tensors_base,
+            next_ti + 1,
+            hadamard_out_offset,
+            ffn_bytes,
+            block_cols,
+            block_rows,
+        )?;
+        let had_op_desc = ops_base + next_op * 232;
+        let had_flags = if vtcm_chain {
+            crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+        } else {
+            crate::htp_ops::HtpOpPassFlags::NONE
+        };
+        put32(working, had_op_desc, crate::htp_ops::HtpOpCode::Hadamard.id());
+        put32(working, had_op_desc + 4, had_flags.bits());
+        working[had_op_desc + 72..had_op_desc + 136].copy_from_slice(&had_kp);
+        working[had_op_desc + 200..had_op_desc + 228].fill(0xff);
+        put16(working, had_op_desc + 200, next_ti);
+        put16(working, had_op_desc + 220, next_ti + 1);
+        next_ti += 2;
+        next_op += 1;
+    }
+
+    // Next Op: MUL_MAT(down) reading activation from VTCM.
+    let down_op_desc = ops_base + next_op * 232;
+    write_member_descriptors(
+        working,
+        next_ti,
+        weight_bis[2],
+        tensors_base + usize::from(next_ti) * 56,
+        down_op_desc,
+        ffn_dim,
+        hidden,
+        weight_offsets[2],
+        layout(ffn_dim, hidden).weights,
+        hadamard_out_offset,
+        down_out_offset,
+    )?;
+    let down_flags = if vtcm_chain {
+        let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM;
+        if residual.is_some() {
+            base_flags.union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+        } else {
+            base_flags
+        }
+    } else {
+        crate::htp_ops::HtpOpPassFlags::NONE
+    };
+    put32(working, down_op_desc + 4, down_flags.bits());
+    next_ti += 3;
+    next_op += 1;
+
+    // Optional Final Op: HTP_OP_ADD(down_out, residual) -> final_out.
+    if residual.is_some() {
+        let add_kp = crate::htp_ops::solve_binary_kparams(
+            crate::htp_ops::HtpOpCode::Add,
+            u32::try_from(hidden).map_err(|_| Error::Contract)?,
+            1,
+        )?;
+        write_f32_2d_tensor_desc(
+            working,
+            tensors_base,
+            next_ti,
+            down_out_offset,
+            hidden_bytes,
+            hidden,
+            1,
+        )?;
+        write_f32_2d_tensor_desc(
+            working,
+            tensors_base,
+            next_ti + 1,
+            res_offset,
+            hidden_bytes,
+            hidden,
+            1,
+        )?;
+        write_f32_2d_tensor_desc(
+            working,
+            tensors_base,
+            next_ti + 2,
+            final_out_offset,
+            hidden_bytes,
+            hidden,
+            1,
+        )?;
+        let add_op_desc = ops_base + next_op * 232;
+        let add_flags = if vtcm_chain {
+            crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+        } else {
+            crate::htp_ops::HtpOpPassFlags::NONE
+        };
+        put32(working, add_op_desc, crate::htp_ops::HtpOpCode::Add.id());
+        put32(working, add_op_desc + 4, add_flags.bits());
+        working[add_op_desc + 72..add_op_desc + 168].copy_from_slice(&add_kp);
+        working[add_op_desc + 200..add_op_desc + 228].fill(0xff);
+        put16(working, add_op_desc + 200, next_ti);
+        put16(working, add_op_desc + 202, next_ti + 1);
+        put16(working, add_op_desc + 220, next_ti + 2);
+    }
+
+    for (dst, &val) in working[act_offset..act_offset + hidden_bytes]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(activation)
+    {
+        *dst = val.to_bits().to_le_bytes();
+    }
+    if let Some(res_slice) = residual {
+        for (dst, &val) in working[res_offset..res_offset + hidden_bytes]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(res_slice)
+        {
+            *dst = val.to_bits().to_le_bytes();
+        }
+    }
+    working[gate_out_offset..output_end]
+        .as_chunks_mut::<4>()
+        .0
+        .fill(0x7fc0_ae51_u32.to_le_bytes());
+
+    Ok(FfnFullChainLayout {
+        output_offset: final_out_offset,
+        output_end,
+        n_bufs,
+        n_tensors: u32::try_from(n_tensors_usize).map_err(|_| Error::Contract)?,
+        n_ops: u32::try_from(n_ops_usize).map_err(|_| Error::Contract)?,
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "Keep full-K Q2_0 tensor descriptors, HVX kparams and output poison region together"
@@ -2324,6 +2810,55 @@ mod tests {
                         .map_err(|_| Error::Contract)?
                 ),
                 crate::htp_ops::HtpOpCode::GluSwiglu.id()
+            );
+        }
+
+        // Verify 6-op full intra-layer FFN VTCM chain (gate + up + GluSwiglu + Hadamard + down + Add).
+        let h_down = multi_reg
+            .prepare_validated(128, 128, 4608)?
+            .ok_or(Error::Contract)?;
+        let h_gate128 = multi_reg
+            .prepare_validated(128, 128, 4608)?
+            .ok_or(Error::Contract)?;
+        let extra_large = [HtpBufferDesc {
+            base: 0x2000_0000,
+            size: 32_768,
+            fd: 9,
+        }];
+        let chain = image_ffn_full_chain_resident(
+            &mut arena8,
+            0x1000_0000,
+            7,
+            arena8_start,
+            &extra_large,
+            &h_gate128,
+            &h_gate128,
+            &h_down,
+            &activation,
+            Some(&act1),
+            Some(64),
+        )?;
+        assert_eq!(chain.n_bufs, 2);
+        assert_eq!(chain.n_tensors, 17);
+        assert_eq!(chain.n_ops, 6);
+        let chain_ops_base = 2 * 24 + 17 * 56;
+        let expected_opcodes = [
+            crate::htp_ops::HtpOpCode::MulMat.id(),
+            crate::htp_ops::HtpOpCode::MulMat.id(),
+            crate::htp_ops::HtpOpCode::GluSwiglu.id(),
+            crate::htp_ops::HtpOpCode::Hadamard.id(),
+            crate::htp_ops::HtpOpCode::MulMat.id(),
+            crate::htp_ops::HtpOpCode::Add.id(),
+        ];
+        for (op_idx, expected_op) in expected_opcodes.into_iter().enumerate() {
+            let op_off = chain_ops_base + op_idx * 232;
+            assert_eq!(
+                u32::from_le_bytes(
+                    arena8[op_off..op_off + 4]
+                        .try_into()
+                        .map_err(|_| Error::Contract)?
+                ),
+                expected_op
             );
         }
 

@@ -484,5 +484,88 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
     }
 }
 
+/// One double-buffered pipeline step in a 2-stage Hexagon NPU + CPU prefill schedule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HybridPrefillStep {
+    /// Microbatch index executing on Stage 0 (Hexagon NPU `blk.0..npu_layers`), when active.
+    pub npu_microbatch: Option<usize>,
+    /// Microbatch index executing on Stage 1 (Oryon CPU `blk.npu_layers..total_layers`), when active.
+    pub cpu_microbatch: Option<usize>,
+    /// Token range `[start..end)` of the active NPU microbatch (or `0..0` when idle).
+    pub npu_token_range: std::ops::Range<usize>,
+    /// Token range `[start..end)` of the active CPU microbatch (or `0..0` when idle).
+    pub cpu_token_range: std::ops::Range<usize>,
+}
+
+/// Two-stage double-buffered chunked prefill schedule overlapping Hexagon NPU
+/// (`blk.0..npu_layers`) on microbatch `m + 1` with Oryon CPU (`blk.npu_layers..total_layers`)
+/// on microbatch `m`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HybridPrefillSchedule {
+    /// Layer range assigned to Stage 0 (Hexagon NPU, e.g., `0..27`).
+    pub npu_layer_range: std::ops::Range<usize>,
+    /// Layer range assigned to Stage 1 (Oryon CPU / Adreno GPU, e.g., `27..64`).
+    pub cpu_layer_range: std::ops::Range<usize>,
+    /// Maximum tokens per microbatch (`1..=64`, typically `8`).
+    pub microbatch_tokens: usize,
+    /// Total number of microbatches covering `prompt_tokens`.
+    pub microbatch_count: usize,
+    /// Ordered pipeline steps (`microbatch_count + 1` steps when `microbatch_count >= 1`).
+    pub steps: Vec<HybridPrefillStep>,
+}
+
+/// Plan a 2-stage double-buffered Hexagon NPU + Oryon CPU chunked prefill pipeline.
+///
+/// Stage 0 (`0..npu_layers`) runs microbatch `m + 1` on the Hexagon NPU while
+/// Stage 1 (`npu_layers..total_layers`) runs microbatch `m` on the Oryon CPU.
+///
+/// # Errors
+/// Rejects zero layers, `npu_layers >= total_layers`, zero prompt tokens or
+/// `microbatch_tokens` outside `1..=64`.
+pub fn plan_hybrid_prefill_pipeline(
+    total_layers: usize,
+    npu_layers: usize,
+    prompt_tokens: usize,
+    microbatch_tokens: usize,
+) -> Result<HybridPrefillSchedule> {
+    if total_layers < 2
+        || npu_layers == 0
+        || npu_layers >= total_layers
+        || prompt_tokens == 0
+        || microbatch_tokens == 0
+        || microbatch_tokens > 64
+    {
+        return Err(invalid("invalid hybrid NPU+CPU prefill pipeline parameters"));
+    }
+    let microbatch_count = prompt_tokens.div_ceil(microbatch_tokens);
+    let step_count = microbatch_count + 1;
+    let mut steps = Vec::new();
+    steps
+        .try_reserve_exact(step_count)
+        .map_err(|_| invalid("hybrid prefill schedule allocation failed"))?;
+    let token_range = |mb: usize| {
+        let start = mb * microbatch_tokens;
+        let end = (start + microbatch_tokens).min(prompt_tokens);
+        start..end
+    };
+    for step in 0..step_count {
+        let npu_microbatch = (step < microbatch_count).then_some(step);
+        let cpu_microbatch = step.checked_sub(1).filter(|&mb| mb < microbatch_count);
+        steps.push(HybridPrefillStep {
+            npu_microbatch,
+            cpu_microbatch,
+            npu_token_range: npu_microbatch.map_or(0..0, token_range),
+            cpu_token_range: cpu_microbatch.map_or(0..0, token_range),
+        });
+    }
+    Ok(HybridPrefillSchedule {
+        npu_layer_range: 0..npu_layers,
+        cpu_layer_range: npu_layers..total_layers,
+        microbatch_tokens,
+        microbatch_count,
+        steps,
+    })
+}
+
 #[cfg(test)]
 mod tests;

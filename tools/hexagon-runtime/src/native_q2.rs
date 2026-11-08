@@ -1964,6 +1964,212 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         Ok(())
     }
+
+    /// Execute a single `F32` projection while overlapping/fusing the host CPU
+    /// rank-1 adapter update (`output += (activation · adapter_a) * adapter_b`).
+    ///
+    /// # Errors
+    /// Rejects non-finite activations/adapters, mismatched adapter dimensions or
+    /// failed submissions, closing the executor on any failure.
+    pub fn project_f32_with_rank1_adapter(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        adapter_a: &[f32],
+        adapter_b: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        let result = self.project_f32_with_rank1_adapter_inner(
+            tensor,
+            activation,
+            adapter_a,
+            adapter_b,
+            output,
+        );
+        if result.is_err() {
+            self.failed = true;
+            output.clear();
+        }
+        result
+    }
+
+    fn project_f32_with_rank1_adapter_inner(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        adapter_a: &[f32],
+        adapter_b: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        let (columns, rows) = native_dimensions(tensor)?;
+        if activation.len() != columns || adapter_a.len() != columns || adapter_b.len() != rows {
+            return Err(invalid("mismatched rank-1 adapter dimensions"));
+        }
+        finite_slice(adapter_a)?;
+        finite_slice(adapter_b)?;
+        let mut dot_accum = 0.0_f32;
+        for (&x, &a) in activation.iter().zip(adapter_a) {
+            dot_accum = finite(x.mul_add(a, dot_accum))?;
+        }
+        self.project_f32_inner(tensor, activation, output)?;
+        if dot_accum != 0.0 {
+            for (dst, &b) in output.iter_mut().zip(adapter_b) {
+                *dst = finite(dot_accum.mul_add(b, *dst))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a full intra-layer FFN chain (`[gate, up, down]` + `HTP_OP_GLU_SWIGLU` +
+    /// optional `HTP_OP_HADAMARD` + optional `HTP_OP_ADD` residual) in a single DSP
+    /// queue submission with VTCM intermediate residency chaining.
+    ///
+    /// # Errors
+    /// Rejects non-resident or mismatched tensors, non-finite inputs/outputs or
+    /// failed submissions, closing the executor on any failure.
+    pub fn project_f32_ffn_chain(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        let result = self.project_f32_ffn_chain_inner(
+            tensors,
+            activation,
+            residual,
+            hadamard_block_size,
+            output,
+        );
+        if result.is_err() {
+            self.failed = true;
+            output.clear();
+        }
+        result
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep full intra-layer FFN VTCM chain validation, resident preparation and statistics together."
+    )]
+    fn project_f32_ffn_chain_inner(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        let [gate, up, down] = tensors;
+        let Some((hidden, gate_up_rows, cached_gate_up)) = self.validate_f32_group(&[gate, up])
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon fused FFN chain projection group",
+            ));
+        };
+        let ffn_dim = gate_up_rows[0];
+        if gate_up_rows[1] != ffn_dim || activation.len() != hidden || !self.supports_f32(down) {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        let (down_cols, down_rows) = native_dimensions(down)?;
+        if down_cols != ffn_dim
+            || down_rows != hidden
+            || down_cols > self.maximum_columns
+            || down_rows > self.maximum_rows
+            || !down_rows.is_multiple_of(32)
+        {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        if let Some(res) = residual {
+            if res.len() != hidden {
+                return Err(invalid("mismatched FFN chain residual length"));
+            }
+            finite_slice(res)?;
+        }
+        if let Some(block_size) = hadamard_block_size {
+            let block_usize = usize::try_from(block_size)?;
+            if block_size < 32 || !block_size.is_power_of_two() || !ffn_dim.is_multiple_of(block_usize) {
+                return Err(invalid("invalid FFN chain Hadamard block size"));
+            }
+        }
+        finite_slice(activation)?;
+        let cached_down = self.residency.as_ref().and_then(|cache| cache.find(down));
+        let cached_all = [cached_gate_up[0], cached_gate_up[1], cached_down];
+        let mut weights = Vec::new();
+        for (member, &tensor) in tensors.iter().enumerate() {
+            if cached_all[member].is_none() {
+                let (cols, rows) = native_dimensions(tensor)?;
+                let max_mapped_rows = rows.next_multiple_of(32);
+                let required_bytes = max_mapped_rows * 36 * (cols / 128);
+                if weights.len() < required_bytes {
+                    weights
+                        .try_reserve(required_bytes - weights.len())
+                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+                    weights.resize(required_bytes, 0_u8);
+                }
+                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
+        }
+        let mut indices = [0_usize; 3];
+        if let Some(cache) = &mut self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                let idx = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+                if cache.projections[idx].evaluated {
+                    cache.statistics.cache_hits = cache.statistics.cache_hits.saturating_add(1);
+                } else {
+                    cache.projections[idx].evaluated = true;
+                }
+                indices[member] = idx;
+            }
+        }
+        if output.len() != hidden {
+            output.clear();
+            output
+                .try_reserve(hidden)
+                .map_err(|_| invalid("native Q2 output allocation failed"))?;
+            output.resize(hidden, f32::NAN);
+        }
+        let op_count = 4_u64
+            + u64::from(hadamard_block_size.is_some())
+            + u64::from(residual.is_some());
+        self.statistics.operations_attempted = self
+            .statistics
+            .operations_attempted
+            .saturating_add(op_count);
+        self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let gate_handle = &cache.handles[cache.projections[indices[0]].first_handle];
+        let up_handle = &cache.handles[cache.projections[indices[1]].first_handle];
+        let down_handle = &cache.handles[cache.projections[indices[2]].first_handle];
+        self.submitter.submit_resident_ffn_chain(
+            [gate_handle, up_handle, down_handle],
+            activation,
+            residual,
+            hadamard_block_size,
+            output.as_mut_slice(),
+        )?;
+        finite_slice(output)?;
+        self.statistics.operations_completed = self
+            .statistics
+            .operations_completed
+            .saturating_add(op_count);
+        self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+        self.statistics.projections_completed =
+            self.statistics.projections_completed.saturating_add(3);
+        Ok(())
+    }
 }
 
 fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
@@ -2534,6 +2740,36 @@ mod tests {
             Ok(())
         }
 
+        fn submit_resident_ffn_chain(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activation: &[f32],
+            residual: Option<&[f32]>,
+            hadamard_block_size: Option<u32>,
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            let ops = 4_u64
+                + u64::from(hadamard_block_size.is_some())
+                + u64::from(residual.is_some());
+            self.calls += ops;
+            self.resident_calls += 3;
+            let [gate, up, down] = handles;
+            if gate.columns() != up.columns()
+                || gate.rows() != up.rows()
+                || down.columns() != gate.rows()
+                || down.rows() != gate.columns()
+                || activation.len() != gate.columns()
+                || output.len() != down.rows()
+            {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            let sum = activation.iter().sum::<f32>();
+            let res0 = residual.and_then(|r| r.first().copied()).unwrap_or(0.0);
+            output.fill(0.0);
+            output[0] = sum.mul_add(3.0, res0);
+            Ok(())
+        }
+
         fn submit_resident_ffn_swiglu_multi2(
             &mut self,
             gate_handle: &NativeQ2WeightHandle,
@@ -2774,13 +3010,13 @@ mod tests {
 
         let limits = NativeQ2ProjectionLimits::new(5120, 17_408, 100, Duration::from_secs(10))
             .map_err(|_| invalid("limits"))?
-            .with_resident_weights(65_536)
+            .with_resident_weights(131_072)
             .map_err(|_| invalid("residency"))?;
         let mut submitter = MockNativeSubmitter {
             calls: 0,
             resident_calls: 0,
             remaining: 100,
-            residency_bytes: 65_536,
+            residency_bytes: 131_072,
         };
         let mut executor = NativeQ2Executor::new(&mut submitter, limits, 64 * 1024 * 1024)
             .with_resident_weights(16_384)?;
@@ -2953,6 +3189,52 @@ mod tests {
         assert_eq!(swiglu_outs[0][0], 512.0);
         assert_eq!(swiglu_outs[1][0], 1025.0);
         assert_eq!(swiglu_outs[4][0], 2560.0);
+
+        let ffn_gate_128 = make_tensor("blk.0.ffn_gate_128.weight", columns);
+        let ffn_up_128 = make_tensor("blk.0.ffn_up_128.weight", columns);
+        let ffn_down_128 = make_tensor("blk.0.ffn_down_128.weight", columns);
+        let residual = vec![10.0_f32; columns];
+        let mut chain_out = Vec::new();
+        ffn_executor.project_f32_ffn_chain(
+            [&ffn_gate_128, &ffn_up_128, &ffn_down_128],
+            &activation,
+            Some(&residual),
+            Some(64),
+            &mut chain_out,
+        )?;
+        assert_eq!(chain_out.len(), columns);
+        assert_eq!(chain_out[0], 778.0);
+        assert_eq!(ffn_executor.queue_writes_completed(), 5);
+        assert_eq!(ffn_executor.statistics().operations_completed, 24);
+        assert_eq!(ffn_executor.statistics().projections_completed, 15);
+
+        let adapter_a = vec![0.5_f32; columns];
+        let adapter_b = vec![2.0_f32; 64];
+        let mut adapted_out = Vec::new();
+        ffn_executor.project_f32_with_rank1_adapter(
+            &ffn_gate,
+            &activation,
+            &adapter_a,
+            &adapter_b,
+            &mut adapted_out,
+        )?;
+        assert_eq!(adapted_out.len(), 64);
+        // base = 256.0, dot = 128.0, adapter_b[0] = 2.0 -> 256.0 + 256.0 = 512.0.
+        assert_eq!(adapted_out[0], 512.0);
+        assert_eq!(adapted_out[1], 256.0);
+
+        let schedule = crate::plan_hybrid_prefill_pipeline(64, 27, 20, 8)?;
+        assert_eq!(schedule.npu_layer_range, 0..27);
+        assert_eq!(schedule.cpu_layer_range, 27..64);
+        assert_eq!(schedule.microbatch_count, 3);
+        assert_eq!(schedule.steps.len(), 4);
+        assert_eq!(schedule.steps[0].npu_microbatch, Some(0));
+        assert_eq!(schedule.steps[0].cpu_microbatch, None);
+        assert_eq!(schedule.steps[1].npu_microbatch, Some(1));
+        assert_eq!(schedule.steps[1].cpu_microbatch, Some(0));
+        assert_eq!(schedule.steps[3].npu_microbatch, None);
+        assert_eq!(schedule.steps[3].cpu_microbatch, Some(2));
+        assert_eq!(schedule.steps[3].cpu_token_range, 16..20);
         Ok(())
     }
 }

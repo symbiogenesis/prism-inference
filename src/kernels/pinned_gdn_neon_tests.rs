@@ -160,6 +160,136 @@ fn pinned_gdn_decode_capacities_preserve_failure_and_refusal_bits() -> Result<()
     Ok(())
 }
 
+fn grouped_decode(
+    previous: &[f32],
+    state: &mut [f32],
+    rows: usize,
+    width: usize,
+    key: &[f32],
+    query: &[f32],
+    token_values: &[f32],
+) -> Result<Option<Vec<f32>>> {
+    Ok(if rows == 4 {
+        super::step_four_rows_from(
+            std::array::from_fn(|row| &previous[row * width..(row + 1) * width]),
+            mutable_rows(state, width)?,
+            key,
+            query,
+            0.875,
+            std::array::from_fn(|row| token_values[row]),
+            0.625,
+        )
+        .map(Vec::from)
+    } else {
+        super::step_eight_rows_from(
+            std::array::from_fn(|row| &previous[row * width..(row + 1) * width]),
+            mutable_rows(state, width)?,
+            key,
+            query,
+            0.875,
+            std::array::from_fn(|row| token_values[row]),
+            0.625,
+        )
+        .map(Vec::from)
+    })
+}
+
+#[test]
+fn pinned_gdn_grouped_decode_capacities_match_independent_scalar_bits() -> Result<()> {
+    for width in [16, 128, 144, 256] {
+        let key = values(width);
+        let mut query = values(width);
+        query.reverse();
+        for rows in [4, 8] {
+            let mut previous = values(width * rows);
+            previous[0] = -0.0;
+            previous[1] = f32::from_bits(1);
+            let token_values = values(rows);
+            let mut expected = previous.clone();
+            let expected_output = expected
+                .chunks_exact_mut(width)
+                .zip(&token_values)
+                .map(|(state, &value)| decode_oracle(state, &key, &query, 0.875, value, 0.625))
+                .collect::<Result<Vec<_>>>()?;
+            let mut actual = vec![-5.0; width * rows];
+            let actual_output = grouped_decode(
+                &previous,
+                &mut actual,
+                rows,
+                width,
+                &key,
+                &query,
+                &token_values,
+            )?
+            .ok_or_else(|| invalid("baseline NEON grouped decode was not selected"))?;
+            assert_eq!(bits(&actual), bits(&expected));
+            assert_eq!(bits(&actual_output), bits(&expected_output));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_gdn_grouped_decode_capacities_keep_failure_atomic() -> Result<()> {
+    for width in [128, 144] {
+        for rows in [4, 8] {
+            for failure in 0..3 {
+                let previous = values(width * rows);
+                let mut key = values(width);
+                let mut query = values(width);
+                let mut token_values = values(rows);
+                match failure {
+                    0 => key[width - 1] = f32::NAN,
+                    1 => {
+                        token_values[rows - 1] = f32::MAX;
+                        key[width / 2] = 2.0;
+                    }
+                    _ => query[width - 1] = f32::NAN,
+                }
+                let mut actual = vec![-5.0; width * rows];
+                let original = bits(&actual);
+                assert!(
+                    grouped_decode(
+                        &previous,
+                        &mut actual,
+                        rows,
+                        width,
+                        &key,
+                        &query,
+                        &token_values,
+                    )?
+                    .is_none()
+                );
+                assert_eq!(bits(&actual), original);
+            }
+        }
+    }
+    for width in [129, 272] {
+        for rows in [4, 8] {
+            let previous = values(width * rows);
+            let key = values(width);
+            let query = values(width);
+            let token_values = values(rows);
+            let mut actual = vec![-5.0; width * rows];
+            let original = bits(&actual);
+            assert!(
+                grouped_decode(
+                    &previous,
+                    &mut actual,
+                    rows,
+                    width,
+                    &key,
+                    &query,
+                    &token_values,
+                )?
+                .is_none()
+            );
+            assert_eq!(bits(&actual), original);
+        }
+    }
+    Ok(())
+}
+
 fn grouped_from(
     previous: &[f32],
     state: &mut [f32],

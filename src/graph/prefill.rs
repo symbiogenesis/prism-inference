@@ -4,8 +4,7 @@ use std::fmt::Write as _;
 
 use super::{
     Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
-    Transforms, add, checked_product, finite, resize_into, rope_frequencies, row_into, sigmoid,
-    small_float,
+    Transforms, add, checked_product, finite, resize_into, rope_frequencies, row_into, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -1134,26 +1133,37 @@ fn full_attention_tile(
                                 (((out0_0, out0_1), out0_2), out0_3),
                                 (((out1_0, out1_1), out1_2), out1_3),
                             ),
-                        ) in
-                            r0_0.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
-                                .zip(r0_1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
-                                .zip(r0_2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
-                                .zip(r0_3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
-                                .zip(
-                                    r1_0.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
-                                        .zip(r1_1.chunks_mut(
-                                            crate::kernels::pinned_attention::VALUE_TILE,
-                                        ))
-                                        .zip(r1_2.chunks_mut(
-                                            crate::kernels::pinned_attention::VALUE_TILE,
-                                        ))
-                                        .zip(r1_3.chunks_mut(
-                                            crate::kernels::pinned_attention::VALUE_TILE,
-                                        )),
+                        ) in r0_0
+                            .chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            )
+                            .zip(r0_1.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            ))
+                            .zip(r0_2.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            ))
+                            .zip(r0_3.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            ))
+                            .zip(
+                                r1_0.chunks_mut(
+                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
                                 )
-                                .enumerate()
+                                .zip(r1_1.chunks_mut(
+                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                                ))
+                                .zip(r1_2.chunks_mut(
+                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                                ))
+                                .zip(r1_3.chunks_mut(
+                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                                )),
+                            )
+                            .enumerate()
                         {
-                            let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE;
+                            let dimension = tile_idx
+                                * crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS;
                             let len = out0_0.len();
                             arithmetic.attention_value_tile_four_two_tokens(
                                 value_cache,
@@ -1170,24 +1180,14 @@ fn full_attention_tile(
                                 [out1_0, out1_1, out1_2, out1_3],
                             )?;
                         }
-                        for (i, result) in [r0_0, r0_1, r0_2, r0_3].into_iter().enumerate() {
-                            let h = head + i;
-                            for (out, &gate) in result
-                                .iter_mut()
-                                .zip(&gate_ref[tok0][h * g.head..(h + 1) * g.head])
-                            {
-                                *out *= sigmoid(gate);
-                            }
-                        }
-                        for (i, result) in [r1_0, r1_1, r1_2, r1_3].into_iter().enumerate() {
-                            let h = head + i;
-                            for (out, &gate) in result
-                                .iter_mut()
-                                .zip(&gate_ref[tok1][h * g.head..(h + 1) * g.head])
-                            {
-                                *out *= sigmoid(gate);
-                            }
-                        }
+                        crate::kernels::mul_sigmoid_in_place(
+                            &mut attended_tok0[head * g.head..(head + 4) * g.head],
+                            &gate_ref[tok0][head * g.head..(head + 4) * g.head],
+                        );
+                        crate::kernels::mul_sigmoid_in_place(
+                            &mut attended_tok1[head * g.head..(head + 4) * g.head],
+                            &gate_ref[tok1][head * g.head..(head + 4) * g.head],
+                        );
                     }
                     if let Some(attended_tok) = attended_odd.first_mut() {
                         let t = attended_pairs.len() * 2;
@@ -1224,13 +1224,14 @@ fn full_attention_tile(
                         let (r0, r1) = r01.split_at_mut(g.head);
                         let (r2, r3) = r23.split_at_mut(g.head);
                         for (tile_idx, (((out0, out1), out2), out3)) in r0
-                            .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
-                            .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
-                            .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
-                            .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE))
+                            .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
+                            .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                            .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                            .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
                             .enumerate()
                         {
-                            let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE;
+                            let dimension =
+                                tile_idx * crate::kernels::pinned_attention::VALUE_TILE_FOUR;
                             arithmetic.attention_value_tile_four(
                                 value_cache,
                                 &current_values[tok]
@@ -1240,15 +1241,10 @@ fn full_attention_tile(
                                 [out0, out1, out2, out3],
                             )?;
                         }
-                        for (i, result) in [r0, r1, r2, r3].into_iter().enumerate() {
-                            let h = head + i;
-                            for (out, &gate) in result
-                                .iter_mut()
-                                .zip(&gate_ref[tok][h * g.head..(h + 1) * g.head])
-                            {
-                                *out *= sigmoid(gate);
-                            }
-                        }
+                        crate::kernels::mul_sigmoid_in_place(
+                            &mut attended_tok[head * g.head..(head + 4) * g.head],
+                            &gate_ref[tok][head * g.head..(head + 4) * g.head],
+                        );
                     }
                     head += 4;
                     continue;
@@ -1293,12 +1289,10 @@ fn full_attention_tile(
                             out,
                         )?;
                     }
-                    for (out, &gate) in result
-                        .iter_mut()
-                        .zip(&gate_ref[tok][head * g.head..(head + 1) * g.head])
-                    {
-                        *out *= sigmoid(gate);
-                    }
+                    crate::kernels::mul_sigmoid_in_place(
+                        result,
+                        &gate_ref[tok][head * g.head..(head + 1) * g.head],
+                    );
                 }
                 head += 1;
             }

@@ -4,7 +4,7 @@ use fearless_simd::{Neon, f32x4, prelude::*};
 
 use crate::{Result, invalid};
 
-use super::{VALUE_TILE, padded_dot_steps};
+use super::{VALUE_TILE, VALUE_TILE_FOUR, VALUE_TILE_FOUR_TWO_TOKENS, padded_dot_steps};
 
 /// Consumes a validated tile whose width is a positive multiple of four.
 ///
@@ -79,8 +79,9 @@ pub(super) fn value_tile<'a>(
 /// four query heads, while retaining each head's independent sixteen-lane FMA
 /// accumulator and reduction tree.
 #[allow(
+    clippy::large_stack_arrays,
     clippy::needless_range_loop,
-    reason = "Keep explicit 4-head and token indices aligned across fixed arrays."
+    reason = "Keep explicit 4-head and token indices aligned across the 32 KiB stack accumulator."
 )]
 pub(super) fn value_tile_four<'a>(
     neon: Neon,
@@ -91,7 +92,7 @@ pub(super) fn value_tile_four<'a>(
     outputs: [&mut [f32]; 4],
 ) -> Result<()> {
     let zero = f32x4::splat(neon, 0.0);
-    let mut sums = [[[zero; VALUE_TILE / 4]; 16]; 4];
+    let mut sums = [[[zero; VALUE_TILE_FOUR / 4]; 16]; 4];
     let groups = outputs[0].len() / 4;
     let token_count = weights[0].len();
     let last = token_count - 1;
@@ -177,8 +178,8 @@ pub(super) fn value_tile_four_two_tokens<'a>(
     outputs1: [&mut [f32]; 4],
 ) -> Result<()> {
     let zero = f32x4::splat(neon, 0.0);
-    let mut sums0 = [[[zero; VALUE_TILE / 4]; 16]; 4];
-    let mut sums1 = [[[zero; VALUE_TILE / 4]; 16]; 4];
+    let mut sums0 = [[[zero; VALUE_TILE_FOUR_TWO_TOKENS / 4]; 16]; 4];
+    let mut sums1 = [[[zero; VALUE_TILE_FOUR_TWO_TOKENS / 4]; 16]; 4];
     let groups = outputs0[0].len() / 4;
     let token_count0 = weights0[0].len();
     let token_count1 = weights1[0].len();
@@ -745,7 +746,10 @@ mod tests {
     use bonsai_ternary::half_to_float;
     use fearless_simd::{Neon, f32x4, prelude::*};
 
-    use super::{VALUE_TILE, value_tile, value_tile_four, value_tile_four_two_tokens};
+    use super::{
+        VALUE_TILE, VALUE_TILE_FOUR, VALUE_TILE_FOUR_TWO_TOKENS, value_tile, value_tile_four,
+        value_tile_four_two_tokens,
+    };
 
     #[derive(serde::Deserialize)]
     struct Capture {
@@ -836,18 +840,22 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Verify 1-token and 2-token 4-head value tiles across history lengths and tile widths."
+    )]
     fn neon_value_tile_four_two_tokens_matches_single_token_four_head_tiles() -> crate::Result<()> {
         let neon = fearless_simd::Level::baseline()
             .as_neon()
             .ok_or_else(|| crate::invalid("required attention baseline NEON token is absent"))?;
         let cases = [0_u16, 0x8000, 1, 0x0400, 0x3c00, 0xbc00, 0x3800, 0xb800];
         for history in [0, 1, 7, 15, 16, 17, 31] {
-            let rows: Vec<[u16; VALUE_TILE]> = (0..=history)
+            let rows: Vec<[u16; VALUE_TILE_FOUR]> = (0..=history)
                 .map(|pos| std::array::from_fn(|ch| cases[(pos * 3 + ch) % cases.len()]))
                 .collect();
-            let current0: [f32; VALUE_TILE] =
+            let current0: [f32; VALUE_TILE_FOUR] =
                 std::array::from_fn(|ch| half_to_float(rows[history][ch]));
-            let current1: [f32; VALUE_TILE] =
+            let current1: [f32; VALUE_TILE_FOUR] =
                 std::array::from_fn(|ch| half_to_float(cases[(history + ch + 5) % cases.len()]));
             let weights0: [[f32; 33]; 4] = std::array::from_fn(|h| {
                 std::array::from_fn(|pos| [0.5_f32, -0.25, 0.125, -0.0, 0.0][(pos + h) % 5])
@@ -857,15 +865,17 @@ mod tests {
             });
             let w0_refs: [&[f32]; 4] = std::array::from_fn(|h| &weights0[h][..=history]);
             let w1_refs: [&[f32]; 4] = std::array::from_fn(|h| &weights1[h][..history + 2]);
-            for tile_len in [12, 24, VALUE_TILE] {
-                let mut exp0 = [[0.0_f32; VALUE_TILE]; 4];
-                let mut exp1 = [[0.0_f32; VALUE_TILE]; 4];
+            for tile_len in [12, 24, VALUE_TILE, VALUE_TILE_FOUR_TWO_TOKENS] {
+                let mut exp0 = [[0.0_f32; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+                let mut exp1 = [[0.0_f32; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
                 let (e0_0, e0_rest) = exp0.split_at_mut(1);
                 let (e0_1, e0_rest) = e0_rest.split_at_mut(1);
                 let (e0_2, e0_3) = e0_rest.split_at_mut(1);
                 value_tile_four(
                     neon,
-                    rows[..history].iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    rows[..history]
+                        .iter()
+                        .map(<[u16; VALUE_TILE_FOUR]>::as_slice),
                     &current0[..tile_len],
                     w0_refs,
                     &(0..tile_len),
@@ -881,7 +891,9 @@ mod tests {
                 let (e1_2, e1_3) = e1_rest.split_at_mut(1);
                 value_tile_four(
                     neon,
-                    rows[..=history].iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    rows[..=history]
+                        .iter()
+                        .map(<[u16; VALUE_TILE_FOUR]>::as_slice),
                     &current1[..tile_len],
                     w1_refs,
                     &(0..tile_len),
@@ -893,8 +905,8 @@ mod tests {
                     ],
                 )?;
 
-                let mut act0 = [[f32::NAN; VALUE_TILE]; 4];
-                let mut act1 = [[f32::NAN; VALUE_TILE]; 4];
+                let mut act0 = [[f32::NAN; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+                let mut act1 = [[f32::NAN; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
                 let (a0_0, a0_rest) = act0.split_at_mut(1);
                 let (a0_1, a0_rest) = a0_rest.split_at_mut(1);
                 let (a0_2, a0_3) = a0_rest.split_at_mut(1);
@@ -903,7 +915,9 @@ mod tests {
                 let (a1_2, a1_3) = a1_rest.split_at_mut(1);
                 value_tile_four_two_tokens(
                     neon,
-                    rows[..=history].iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    rows[..=history]
+                        .iter()
+                        .map(<[u16; VALUE_TILE_FOUR]>::as_slice),
                     [&current0[..tile_len], &current1[..tile_len]],
                     w0_refs,
                     w1_refs,
@@ -925,6 +939,39 @@ mod tests {
                     for ch in 0..tile_len {
                         assert_eq!(act0[h][ch].to_bits(), exp0[h][ch].to_bits());
                         assert_eq!(act1[h][ch].to_bits(), exp1[h][ch].to_bits());
+                    }
+                }
+            }
+            let mut wide = [[0.0_f32; VALUE_TILE_FOUR]; 4];
+            let (w0, w_rest) = wide.split_at_mut(1);
+            let (w1, w_rest) = w_rest.split_at_mut(1);
+            let (w2, w3) = w_rest.split_at_mut(1);
+            value_tile_four(
+                neon,
+                rows[..history]
+                    .iter()
+                    .map(<[u16; VALUE_TILE_FOUR]>::as_slice),
+                &current0,
+                w0_refs,
+                &(0..VALUE_TILE_FOUR),
+                [&mut w0[0], &mut w1[0], &mut w2[0], &mut w3[0]],
+            )?;
+            for (h, head_out) in wide.iter().enumerate() {
+                for tile_idx in 0..(VALUE_TILE_FOUR / VALUE_TILE) {
+                    let start = tile_idx * VALUE_TILE;
+                    let mut single = [0.0_f32; VALUE_TILE];
+                    value_tile(
+                        neon,
+                        rows[..history]
+                            .iter()
+                            .map(<[u16; VALUE_TILE_FOUR]>::as_slice),
+                        &current0[start..start + VALUE_TILE],
+                        w0_refs[h],
+                        &(start..start + VALUE_TILE),
+                        &mut single,
+                    )?;
+                    for ch in 0..VALUE_TILE {
+                        assert_eq!(head_out[start + ch].to_bits(), single[ch].to_bits());
                     }
                 }
             }

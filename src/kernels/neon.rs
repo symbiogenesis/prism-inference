@@ -1131,6 +1131,264 @@ pub(super) fn mul_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
 }
 
 #[inline]
+pub(super) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let count = values.len().min(gate.len());
+    let one = f32x4::splat(neon, 1.0);
+    let (v_chunks, v_tail) = values[..count].as_chunks_mut::<4>();
+    let (g_chunks, g_tail) = gate[..count].as_chunks::<4>();
+    for (v_chunk, g_chunk) in v_chunks.iter_mut().zip(g_chunks) {
+        let v = f32x4::from_slice(neon, v_chunk);
+        let exp_neg = f32x4::load_array(
+            neon,
+            [
+                (-g_chunk[0]).exp(),
+                (-g_chunk[1]).exp(),
+                (-g_chunk[2]).exp(),
+                (-g_chunk[3]).exp(),
+            ],
+        );
+        (v * (one / (one + exp_neg))).store_slice(v_chunk);
+    }
+    for (v, &g) in v_tail.iter_mut().zip(g_tail) {
+        *v *= 1.0 / (1.0 + (-g).exp());
+    }
+    true
+}
+
+#[inline]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Preserve each channel's binary64 sum and final binary32 rounding."
+)]
+pub(super) fn source_value_tile<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    offset: usize,
+    probabilities: &[f32],
+    output: &mut [f32],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let out_len = output.len();
+    let last = probabilities.len().saturating_sub(1);
+    let mut sums = [-0.0_f64; super::pinned_attention::VALUE_TILE];
+    for (past_row, &prob) in past.zip(&probabilities[..last]) {
+        let row = &past_row[offset..offset + out_len];
+        let prob_vec = f32x4::splat(neon, prob);
+        let (chunks8, rem) = row.as_chunks::<8>();
+        for (chunk_idx, chunk8) in chunks8.iter().enumerate() {
+            let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+            let p0 = (prob_vec * v0).to_array();
+            let p1 = (prob_vec * v1).to_array();
+            let base = chunk_idx * 8;
+            let s = &mut sums[base..base + 8];
+            s[0] += f64::from(p0[0]);
+            s[1] += f64::from(p0[1]);
+            s[2] += f64::from(p0[2]);
+            s[3] += f64::from(p0[3]);
+            s[4] += f64::from(p1[0]);
+            s[5] += f64::from(p1[1]);
+            s[6] += f64::from(p1[2]);
+            s[7] += f64::from(p1[3]);
+        }
+        let rem_base = chunks8.len() * 8;
+        for (i, &val) in rem.iter().enumerate() {
+            sums[rem_base + i] += f64::from(prob * bonsai_ternary::half_to_float(val));
+        }
+    }
+    let prob = probabilities[last];
+    for ((out, &sum), &val) in output.iter_mut().zip(&sums[..out_len]).zip(current) {
+        *out = (sum + f64::from(prob * val)) as f32;
+    }
+    true
+}
+
+#[inline]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    reason = "Preserve each channel's binary64 sum and final binary32 rounding across 4 heads."
+)]
+pub(super) fn source_value_tile_four<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    offset: usize,
+    probabilities: [&[f32]; 4],
+    outputs: [&mut [f32]; 4],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let out_len = outputs[0].len();
+    let last = probabilities[0].len().saturating_sub(1);
+    let mut sums = [[-0.0_f64; super::pinned_attention::VALUE_TILE_FOUR]; 4];
+    for (pos, past_row) in past.enumerate() {
+        let row = &past_row[offset..offset + out_len];
+        let probs: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities[h][pos]));
+        let (chunks8, rem) = row.as_chunks::<8>();
+        for (chunk_idx, chunk8) in chunks8.iter().enumerate() {
+            let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+            let base = chunk_idx * 8;
+            for h in 0..4 {
+                let p0 = (probs[h] * v0).to_array();
+                let p1 = (probs[h] * v1).to_array();
+                let s = &mut sums[h][base..base + 8];
+                s[0] += f64::from(p0[0]);
+                s[1] += f64::from(p0[1]);
+                s[2] += f64::from(p0[2]);
+                s[3] += f64::from(p0[3]);
+                s[4] += f64::from(p1[0]);
+                s[5] += f64::from(p1[1]);
+                s[6] += f64::from(p1[2]);
+                s[7] += f64::from(p1[3]);
+            }
+        }
+        let rem_base = chunks8.len() * 8;
+        for (i, &val) in rem.iter().enumerate() {
+            let decoded = bonsai_ternary::half_to_float(val);
+            for h in 0..4 {
+                sums[h][rem_base + i] += f64::from(probabilities[h][pos] * decoded);
+            }
+        }
+    }
+    for (output, (prob_row, sum_row)) in outputs
+        .into_iter()
+        .zip(probabilities.into_iter().zip(&sums))
+    {
+        let probability = prob_row[last];
+        for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(current) {
+            *out = (sum + f64::from(probability * value)) as f32;
+        }
+    }
+    true
+}
+
+#[inline]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens and four heads."
+)]
+pub(super) fn source_value_tile_four_two_tokens<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    offset: usize,
+    probabilities0: [&[f32]; 4],
+    probabilities1: [&[f32]; 4],
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let out_len = outputs0[0].len();
+    let last0 = probabilities0[0].len().saturating_sub(1);
+    let last1 = probabilities1[0].len().saturating_sub(1);
+    let mut sums0 = [[-0.0_f64; super::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+    let mut sums1 = [[-0.0_f64; super::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+    for (pos, past_row) in past.enumerate() {
+        let row = &past_row[offset..offset + out_len];
+        let probs1: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities1[h][pos]));
+        let (chunks8, rem) = row.as_chunks::<8>();
+        if pos < last0 {
+            let probs0: [f32x4<Neon>; 4] =
+                std::array::from_fn(|h| f32x4::splat(neon, probabilities0[h][pos]));
+            for (chunk_idx, chunk8) in chunks8.iter().enumerate() {
+                let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+                let base = chunk_idx * 8;
+                for h in 0..4 {
+                    let p0_0 = (probs0[h] * v0).to_array();
+                    let p0_1 = (probs0[h] * v1).to_array();
+                    let s0 = &mut sums0[h][base..base + 8];
+                    s0[0] += f64::from(p0_0[0]);
+                    s0[1] += f64::from(p0_0[1]);
+                    s0[2] += f64::from(p0_0[2]);
+                    s0[3] += f64::from(p0_0[3]);
+                    s0[4] += f64::from(p0_1[0]);
+                    s0[5] += f64::from(p0_1[1]);
+                    s0[6] += f64::from(p0_1[2]);
+                    s0[7] += f64::from(p0_1[3]);
+                    let p1_0 = (probs1[h] * v0).to_array();
+                    let p1_1 = (probs1[h] * v1).to_array();
+                    let s1 = &mut sums1[h][base..base + 8];
+                    s1[0] += f64::from(p1_0[0]);
+                    s1[1] += f64::from(p1_0[1]);
+                    s1[2] += f64::from(p1_0[2]);
+                    s1[3] += f64::from(p1_0[3]);
+                    s1[4] += f64::from(p1_1[0]);
+                    s1[5] += f64::from(p1_1[1]);
+                    s1[6] += f64::from(p1_1[2]);
+                    s1[7] += f64::from(p1_1[3]);
+                }
+            }
+            let rem_base = chunks8.len() * 8;
+            for (i, &val) in rem.iter().enumerate() {
+                let decoded = bonsai_ternary::half_to_float(val);
+                for h in 0..4 {
+                    sums0[h][rem_base + i] += f64::from(probabilities0[h][pos] * decoded);
+                    sums1[h][rem_base + i] += f64::from(probabilities1[h][pos] * decoded);
+                }
+            }
+        } else {
+            for (chunk_idx, chunk8) in chunks8.iter().enumerate() {
+                let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+                let base = chunk_idx * 8;
+                for h in 0..4 {
+                    let p1_0 = (probs1[h] * v0).to_array();
+                    let p1_1 = (probs1[h] * v1).to_array();
+                    let s1 = &mut sums1[h][base..base + 8];
+                    s1[0] += f64::from(p1_0[0]);
+                    s1[1] += f64::from(p1_0[1]);
+                    s1[2] += f64::from(p1_0[2]);
+                    s1[3] += f64::from(p1_0[3]);
+                    s1[4] += f64::from(p1_1[0]);
+                    s1[5] += f64::from(p1_1[1]);
+                    s1[6] += f64::from(p1_1[2]);
+                    s1[7] += f64::from(p1_1[3]);
+                }
+            }
+            let rem_base = chunks8.len() * 8;
+            for (i, &val) in rem.iter().enumerate() {
+                let decoded = bonsai_ternary::half_to_float(val);
+                for h in 0..4 {
+                    sums1[h][rem_base + i] += f64::from(probabilities1[h][pos] * decoded);
+                }
+            }
+        }
+    }
+    for (output, (prob_row, sum_row)) in outputs0
+        .into_iter()
+        .zip(probabilities0.into_iter().zip(&sums0))
+    {
+        let probability = prob_row[last0];
+        for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(currents[0]) {
+            *out = (sum + f64::from(probability * value)) as f32;
+        }
+    }
+    for (output, (prob_row, sum_row)) in outputs1
+        .into_iter()
+        .zip(probabilities1.into_iter().zip(&sums1))
+    {
+        let probability = prob_row[last1];
+        for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(currents[1]) {
+            *out = (sum + f64::from(probability * value)) as f32;
+        }
+    }
+    true
+}
+
+#[inline]
 pub(super) fn mul_slice_into(input: &[f32], signs: &[f32], output: &mut [f32]) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;

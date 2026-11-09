@@ -2660,6 +2660,216 @@ pub(crate) fn mul_slice_in_place(target: &mut [f32], other: &[f32]) {
     }
 }
 
+pub(crate) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::mul_sigmoid_in_place(values, gate) {
+        return;
+    }
+    for (v, &g) in values.iter_mut().zip(gate) {
+        *v *= 1.0 / (1.0 + (-g).exp());
+    }
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Preserve each channel's binary64 sum and final binary32 rounding."
+)]
+pub(crate) fn source_value_tile<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    offset: usize,
+    probabilities: &[f32],
+    output: &mut [f32],
+) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        let _ = neon::source_value_tile(past, current, offset, probabilities, output);
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        let last = probabilities.len().saturating_sub(1);
+        let zero = std::iter::empty::<f64>().sum::<f64>();
+        let mut sums = [zero; pinned_attention::VALUE_TILE];
+        for (past_row, &probability) in past.zip(&probabilities[..last]) {
+            for (sum, &value) in sums
+                .iter_mut()
+                .zip(&past_row[offset..offset + output.len()])
+            {
+                *sum += f64::from(probability * half_to_float(value));
+            }
+        }
+        let probability = probabilities[last];
+        for ((out, sum), &value) in output.iter_mut().zip(sums).zip(current) {
+            *out = (sum + f64::from(probability * value)) as f32;
+        }
+    }
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    reason = "Preserve each channel's binary64 sum and final binary32 rounding across 4 heads."
+)]
+pub(crate) fn source_value_tile_four<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    offset: usize,
+    probabilities: [&[f32]; 4],
+    outputs: [&mut [f32]; 4],
+) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        let _ = neon::source_value_tile_four(past, current, offset, probabilities, outputs);
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        let last = probabilities[0].len().saturating_sub(1);
+        let zero = std::iter::empty::<f64>().sum::<f64>();
+        let out_len = outputs[0].len();
+        let mut sums = [[zero; pinned_attention::VALUE_TILE_FOUR]; 4];
+        for (pos, past_row) in past.enumerate() {
+            let row = &past_row[offset..offset + out_len];
+            for (channel, &value) in row.iter().enumerate() {
+                let decoded = half_to_float(value);
+                for h in 0..4 {
+                    sums[h][channel] += f64::from(probabilities[h][pos] * decoded);
+                }
+            }
+        }
+        for (output, (prob_row, sum_row)) in outputs
+            .into_iter()
+            .zip(probabilities.into_iter().zip(&sums))
+        {
+            let probability = prob_row[last];
+            for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(current) {
+                *out = (sum + f64::from(probability * value)) as f32;
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens and four heads."
+)]
+pub(crate) fn source_value_tile_four_two_tokens<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    offset: usize,
+    probabilities0: [&[f32]; 4],
+    probabilities1: [&[f32]; 4],
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        let _ = neon::source_value_tile_four_two_tokens(
+            past,
+            currents,
+            offset,
+            probabilities0,
+            probabilities1,
+            outputs0,
+            outputs1,
+        );
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        let last0 = probabilities0[0].len().saturating_sub(1);
+        let last1 = probabilities1[0].len().saturating_sub(1);
+        let zero = std::iter::empty::<f64>().sum::<f64>();
+        let out_len = outputs0[0].len();
+        let mut sums0 = [[zero; pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+        let mut sums1 = [[zero; pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+        for (pos, past_row) in past.enumerate() {
+            let row = &past_row[offset..offset + out_len];
+            if pos < last0 {
+                for (channel, &value) in row.iter().enumerate() {
+                    let decoded = half_to_float(value);
+                    for h in 0..4 {
+                        sums0[h][channel] += f64::from(probabilities0[h][pos] * decoded);
+                        sums1[h][channel] += f64::from(probabilities1[h][pos] * decoded);
+                    }
+                }
+            } else {
+                for (channel, &value) in row.iter().enumerate() {
+                    let decoded = half_to_float(value);
+                    for h in 0..4 {
+                        sums1[h][channel] += f64::from(probabilities1[h][pos] * decoded);
+                    }
+                }
+            }
+        }
+        for (output, (prob_row, sum_row)) in outputs0
+            .into_iter()
+            .zip(probabilities0.into_iter().zip(&sums0))
+        {
+            let probability = prob_row[last0];
+            for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(currents[0])
+            {
+                *out = (sum + f64::from(probability * value)) as f32;
+            }
+        }
+        for (output, (prob_row, sum_row)) in outputs1
+            .into_iter()
+            .zip(probabilities1.into_iter().zip(&sums1))
+        {
+            let probability = prob_row[last1];
+            for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(currents[1])
+            {
+                *out = (sum + f64::from(probability * value)) as f32;
+            }
+        }
+    }
+}
+
 pub(crate) fn mul_slice_into(input: &[f32], signs: &[f32], output: &mut [f32]) {
     #[cfg(all(
         feature = "experimental-neon",

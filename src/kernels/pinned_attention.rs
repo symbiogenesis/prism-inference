@@ -14,6 +14,10 @@ use crate::{Result, invalid};
 const CACHE_PADDING: usize = 256;
 /// A contiguous cache-line-sized segment of binary16 value channels.
 pub(crate) const VALUE_TILE: usize = 32;
+/// Multi-head value tile width for 4-query-head single-token GQA reduction (32 KiB stack accumulator).
+pub(crate) const VALUE_TILE_FOUR: usize = 128;
+/// Multi-head value tile width for 4-query-head two-token GQA reduction (32 KiB stack accumulator).
+pub(crate) const VALUE_TILE_FOUR_TWO_TOKENS: usize = 64;
 
 #[cfg(test)]
 #[path = "pinned_attention_padding_tests.rs"]
@@ -144,7 +148,7 @@ pub(crate) fn value_tile_four<'a>(
     let out_len = outputs[0].len();
     let weight_len = weights[0].len();
     if out_len == 0
-        || out_len > VALUE_TILE
+        || out_len > VALUE_TILE_FOUR
         || current.len() != out_len
         || weight_len == 0
         || weight_len > crate::model::swift::CONTEXT_TOKENS
@@ -174,8 +178,9 @@ pub(crate) fn value_tile_four<'a>(
 }
 
 #[allow(
+    clippy::large_stack_arrays,
     clippy::needless_range_loop,
-    reason = "Keep explicit 4-head and token indices aligned across fixed arrays."
+    reason = "Keep explicit 4-head and token indices aligned across the 32 KiB stack accumulator."
 )]
 fn value_tile_four_scalar<'a>(
     mut past: impl Iterator<Item = &'a [u16]>,
@@ -186,7 +191,7 @@ fn value_tile_four_scalar<'a>(
 ) -> Result<()> {
     let out_len = outputs[0].len();
     let weight_len = weights[0].len();
-    let mut sums = [[[[0.0_f32; 4]; 4]; VALUE_TILE]; 4];
+    let mut sums = [[[[0.0_f32; 4]; 4]; VALUE_TILE_FOUR]; 4];
     let last = weight_len - 1;
     for index in 0..last {
         let values = past
@@ -224,7 +229,7 @@ fn value_tile_four_scalar<'a>(
             }
         }
     }
-    let mut staged = [[0.0_f32; VALUE_TILE]; 4];
+    let mut staged = [[0.0_f32; VALUE_TILE_FOUR]; 4];
     for h in 0..4 {
         for (out, sum) in staged[h][..out_len].iter_mut().zip(&sums[h][..out_len]) {
             let mut lanes = [0.0; 4];
@@ -240,7 +245,7 @@ fn value_tile_four_scalar<'a>(
     Ok(())
 }
 
-/// Reduces up to [`VALUE_TILE`] value channels across two consecutive tokens and four query heads.
+/// Reduces up to [`VALUE_TILE_FOUR_TWO_TOKENS`] value channels across two consecutive tokens and four query heads.
 ///
 /// # Errors
 /// Rejects invalid widths, mismatched lengths, short/long iterators, offset overflow,
@@ -262,7 +267,7 @@ pub(crate) fn value_tile_four_two_tokens<'a>(
     let weight_len0 = weights0[0].len();
     let weight_len1 = weights1[0].len();
     if out_len == 0
-        || out_len > VALUE_TILE
+        || out_len > VALUE_TILE_FOUR_TWO_TOKENS
         || currents.iter().any(|c| c.len() != out_len)
         || weight_len0 == 0
         || weight_len1 != weight_len0.saturating_add(1)
@@ -329,8 +334,8 @@ fn value_tile_four_two_tokens_scalar<'a>(
     let out_len = outputs0[0].len();
     let weight_len0 = weights0[0].len();
     let weight_len1 = weights1[0].len();
-    let mut sums0 = [[[[0.0_f32; 4]; 4]; VALUE_TILE]; 4];
-    let mut sums1 = [[[[0.0_f32; 4]; 4]; VALUE_TILE]; 4];
+    let mut sums0 = [[[[0.0_f32; 4]; 4]; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+    let mut sums1 = [[[[0.0_f32; 4]; 4]; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
     let last0 = weight_len0 - 1;
     let last1 = weight_len1 - 1;
     for index in 0..last0 {
@@ -396,8 +401,8 @@ fn value_tile_four_two_tokens_scalar<'a>(
             }
         }
     }
-    let mut staged0 = [[0.0_f32; VALUE_TILE]; 4];
-    let mut staged1 = [[0.0_f32; VALUE_TILE]; 4];
+    let mut staged0 = [[0.0_f32; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+    let mut staged1 = [[0.0_f32; VALUE_TILE_FOUR_TWO_TOKENS]; 4];
     for (staged, sums) in [(&mut staged0, &sums0), (&mut staged1, &sums1)] {
         for h in 0..4 {
             for (out, sum) in staged[h][..out_len].iter_mut().zip(&sums[h][..out_len]) {

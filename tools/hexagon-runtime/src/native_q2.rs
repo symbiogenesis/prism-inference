@@ -2723,19 +2723,24 @@ mod tests {
         assert!(executor.is_faulted());
         assert_eq!(executor.statistics().operations_completed, 0);
         assert_eq!(executor.queue_writes_completed(), 0);
-        assert!(single.is_empty() || single == [9.0]);
-        assert!(second.is_empty() || second == [9.0]);
-        assert!(third.is_empty() || third == [9.0]);
-        for output in first_tokens.iter().chain(&second_tokens).chain(&third_tokens) {
-            assert!(output.is_empty() || output == &[9.0]);
+        assert_lazy_failure_outputs(
+            mode,
+            [&single, &second, &third],
+            [&first_tokens, &second_tokens, &third_tokens],
+        );
+        Ok(())
+    }
+
+    fn assert_lazy_failure_outputs(mode: u8, singles: [&[f32]; 3], tokens: [&[Vec<f32>]; 3]) {
+        for output in singles.into_iter().chain(tokens.into_iter().flatten().map(Vec::as_slice)) {
+            assert!(output.is_empty() || (output.len() == 1 && output[0].to_bits() == 9.0_f32.to_bits()));
         }
         // Every output selected for this entrypoint must be cleared on failure.
-        if matches!(mode, 0 | 1 | 5 | 7) { assert!(single.is_empty()); }
-        if mode == 1 { assert!(second.is_empty() && third.is_empty()); }
-        if matches!(mode, 2 | 3 | 4 | 6) { assert!(first_tokens.iter().all(Vec::is_empty)); }
-        if matches!(mode, 3 | 4) { assert!(second_tokens.iter().all(Vec::is_empty)); }
-        if mode == 4 { assert!(third_tokens.iter().all(Vec::is_empty)); }
-        Ok(())
+        if matches!(mode, 0 | 1 | 5 | 7) { assert!(singles[0].is_empty()); }
+        if mode == 1 { assert!(singles[1].is_empty() && singles[2].is_empty()); }
+        if matches!(mode, 2 | 3 | 4 | 6) { assert!(tokens[0].iter().all(Vec::is_empty)); }
+        if matches!(mode, 3 | 4) { assert!(tokens[1].iter().all(Vec::is_empty)); }
+        if mode == 4 { assert!(tokens[2].iter().all(Vec::is_empty)); }
     }
 
     #[test]
@@ -3178,7 +3183,8 @@ mod tests {
             executor.project_f32(&tensor, &[1.0; 256], true, &mut output)?;
             assert_eq!(output.len(), rows);
             for (index, value) in output.iter().enumerate() {
-                assert_eq!(*value, if index.is_multiple_of(32) { 256.0 } else { 0.0 });
+                let expected = if index.is_multiple_of(32) { 256.0_f32 } else { 0.0_f32 };
+                assert_eq!(value.to_bits(), expected.to_bits());
             }
             assert_eq!(executor.submitter.mock.calls, expected_calls);
             assert_eq!(executor.submitter.mock.resident_calls, 0);

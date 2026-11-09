@@ -177,6 +177,7 @@ pub(crate) fn swiglu_in_place(gate: &[f32], up: &mut [f32]) -> Result<()> {
 ///
 /// # Errors
 /// Rejects unequal row lengths before changing the output.
+#[cfg(test)]
 pub(crate) fn swiglu_into(gate: &[f32], up: &[f32], output: &mut [f32]) -> Result<()> {
     if gate.len() != up.len() || gate.len() != output.len() {
         return Err(invalid(

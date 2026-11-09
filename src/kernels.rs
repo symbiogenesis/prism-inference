@@ -2910,6 +2910,83 @@ pub(crate) fn rms_norm_pinned_in_place(
     Ok(())
 }
 
+pub(crate) fn rms_norm_swiglu_in_place<const PINNED: bool>(
+    values: &mut [f32],
+    weight: &[f32],
+    epsilon: f32,
+    gate: &[f32],
+) -> Result<()> {
+    let scale = rms_norm_scale(values, weight, epsilon)?;
+    if gate.len() != values.len() {
+        return Err(invalid("SwiGLU requires equal gate and up vector lengths"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if PINNED
+        && let Some(result) =
+            neon::rms_norm_scale_pinned_swiglu_in_place(values, weight, scale, gate)
+    {
+        return result;
+    }
+    if PINNED {
+        for (value, &w) in values.iter_mut().zip(weight) {
+            *value = finite((*value * w) * scale)?;
+        }
+        pinned_activations::swiglu_in_place(gate, values)
+    } else {
+        for (value, &w) in values.iter_mut().zip(weight) {
+            *value = finite(*value * scale * w)?;
+        }
+        for (value, &g) in values.iter_mut().zip(gate) {
+            *value *= silu(g);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn rms_norm_swiglu_into<const PINNED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    gate: &[f32],
+    output: &mut [f32],
+) -> Result<()> {
+    let scale = rms_norm_scale(input, weight, epsilon)?;
+    if gate.len() != input.len() || output.len() != input.len() {
+        return Err(invalid("SwiGLU requires equal gate and up vector lengths"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if PINNED
+        && let Some(result) =
+            neon::rms_norm_scale_pinned_swiglu_into(input, weight, scale, gate, output)
+    {
+        return result;
+    }
+    if PINNED {
+        for ((out, &val), &w) in output.iter_mut().zip(input).zip(weight) {
+            *out = finite((val * w) * scale)?;
+        }
+        pinned_activations::swiglu_in_place(gate, output)
+    } else {
+        for (((out, &val), &w), &g) in output.iter_mut().zip(input).zip(weight).zip(gate) {
+            let norm = finite(val * scale * w)?;
+            *out = norm * silu(g);
+        }
+        Ok(())
+    }
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -3032,6 +3109,66 @@ pub(crate) fn hadamard_into(
         mul_slice_into(input, signs, output);
     } else {
         output.copy_from_slice(input);
+    }
+    hadamard(output)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
+)]
+pub(crate) fn hadamard_grouped_block_into(
+    input: &[f32],
+    signs: Option<&[f32]>,
+    block_idx: usize,
+    heads_per_block: usize,
+    repetitions: usize,
+    ssm_keys: usize,
+    ssm_head: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    if !output.len().is_power_of_two()
+        || ssm_head == 0
+        || output.len() != heads_per_block.saturating_mul(ssm_head)
+    {
+        return Err(invalid("Hadamard requires a finite power-of-two block"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        let count = u32::try_from(output.len())?;
+        let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
+        if let Some(result) = neon::hadamard_grouped_block_into(
+            input,
+            signs,
+            block_idx,
+            heads_per_block,
+            repetitions,
+            ssm_keys,
+            ssm_head,
+            output,
+            normalization,
+        ) {
+            return result;
+        }
+    }
+    for (h, out_head) in output.chunks_exact_mut(ssm_head).enumerate() {
+        let target_head = block_idx * heads_per_block + h;
+        let key = target_head / repetitions;
+        let repeat = target_head % repetitions;
+        let source = (repeat * ssm_keys + key) * ssm_head;
+        let target = target_head * ssm_head;
+        let in_head = &input[source..source + ssm_head];
+        if let Some(signs) = signs {
+            mul_slice_into(in_head, &signs[target..target + ssm_head], out_head);
+        } else {
+            out_head.copy_from_slice(in_head);
+        }
     }
     hadamard(output)
 }

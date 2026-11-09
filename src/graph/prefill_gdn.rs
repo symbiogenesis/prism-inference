@@ -763,10 +763,11 @@ pub(super) fn recurrent_tile<'a>(
                     }
                     for token in 0..count {
                         let token_out = &mut head_out[token * width..(token + 1) * width];
-                        arithmetic.normalize_in_place(token_out, &layer.norm, geometry.epsilon)?;
-                        arithmetic.swiglu_in_place(
-                            &gate_ref[token][head_index * width..(head_index + 1) * width],
+                        arithmetic.normalize_swiglu_in_place(
                             token_out,
+                            &layer.norm,
+                            geometry.epsilon,
+                            &gate_ref[token][head_index * width..(head_index + 1) * width],
                         )?;
                     }
                 }
@@ -855,11 +856,12 @@ pub(super) fn recurrent_tile<'a>(
                 )?;
             }
             for token in 0..count {
-                let token_out = &mut tile.gdn_head_outputs[token * width..(token + 1) * width];
-                arithmetic.normalize_in_place(token_out, &layer.norm, geometry.epsilon)?;
-                arithmetic.swiglu_into(
-                    &tile.recurrent_gate[token][head_index * width..(head_index + 1) * width],
+                let token_out = &tile.gdn_head_outputs[token * width..(token + 1) * width];
+                arithmetic.normalize_swiglu_into(
                     token_out,
+                    &layer.norm,
+                    geometry.epsilon,
+                    &tile.recurrent_gate[token][head_index * width..(head_index + 1) * width],
                     &mut tile.attended[token][head_index * width..(head_index + 1) * width],
                 )?;
             }

@@ -11,13 +11,13 @@ use std::sync::Arc;
 use bonsai_gguf::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
 use bonsai_ternary::half_to_float;
 
-use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place, swiglu_into};
+use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place};
 use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism,
     add_scaled_slice_in_place, add_slice_in_place, append_half_bits, f16_dot, float_dot,
     is_finite_slice, l2_norm_in_place, mul_slice_in_place, mul_slice_into, rms_norm_in_place,
-    rms_norm_into, rms_norm_pinned_in_place, rms_norm_pinned_into, round_f16_slice, row, row_into,
-    scale_slice_into, silu, softmax,
+    rms_norm_into, rms_norm_pinned_in_place, rms_norm_pinned_into, rms_norm_swiglu_in_place,
+    rms_norm_swiglu_into, round_f16_slice, row, row_into, scale_slice_into, silu, softmax,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -112,15 +112,30 @@ impl Arithmetic {
         self.swiglu_in_place(gate, up)
     }
 
-    fn swiglu_into(self, gate: &[f32], up: &[f32], output: &mut [f32]) -> Result<()> {
+    fn normalize_swiglu_in_place(
+        self,
+        values: &mut [f32],
+        weight: &[f32],
+        epsilon: f32,
+        gate: &[f32],
+    ) -> Result<()> {
         match self {
-            Self::Source => {
-                for ((output, &up), &gate) in output.iter_mut().zip(up).zip(gate) {
-                    *output = up * silu(gate);
-                }
-                Ok(())
-            }
-            Self::PinnedSwift => swiglu_into(gate, up, output),
+            Self::Source => rms_norm_swiglu_in_place::<false>(values, weight, epsilon, gate),
+            Self::PinnedSwift => rms_norm_swiglu_in_place::<true>(values, weight, epsilon, gate),
+        }
+    }
+
+    fn normalize_swiglu_into(
+        self,
+        input: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        gate: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        match self {
+            Self::Source => rms_norm_swiglu_into::<false>(input, weight, epsilon, gate, output),
+            Self::PinnedSwift => rms_norm_swiglu_into::<true>(input, weight, epsilon, gate, output),
         }
     }
 
@@ -1473,19 +1488,23 @@ impl Transforms {
         if self.grouped_values && weight.name.ends_with(".ssm_out.weight") {
             resize_into(input.len(), transformed)?;
             let repetitions = geometry.ssm_values / geometry.ssm_keys;
-            if let Some(signs) = self
+            let valid_signs = self
                 .signs
                 .get(&input.len())
-                .filter(|signs| signs.len() >= input.len())
+                .map(Vec::as_slice)
+                .filter(|signs| signs.len() >= input.len());
+            if self.block >= 64
+                && self.block.is_power_of_two()
+                && geometry.ssm_head > 0
+                && self.block.is_multiple_of(geometry.ssm_head)
+                && input.len().is_multiple_of(self.block)
+                && (valid_signs.is_some() || !self.signs.contains_key(&input.len()))
             {
+                let heads_per_block = self.block / geometry.ssm_head;
                 if parallelism.workers() > 1
                     && self.block >= 256
-                    && geometry.ssm_head > 0
-                    && self.block.is_multiple_of(geometry.ssm_head)
                     && input.len() >= self.block.saturating_mul(2)
-                    && input.len().is_multiple_of(self.block)
                 {
-                    let heads_per_block = self.block / geometry.ssm_head;
                     return parallelism.update_chunks(
                         transformed,
                         self.block,
@@ -1493,28 +1512,36 @@ impl Transforms {
                             for (local_idx, out_block) in
                                 chunk.chunks_exact_mut(self.block).enumerate()
                             {
-                                let block_idx = base_block + local_idx;
-                                for h in 0..heads_per_block {
-                                    let target_head = block_idx * heads_per_block + h;
-                                    let key = target_head / repetitions;
-                                    let repeat = target_head % repetitions;
-                                    let source =
-                                        (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
-                                    let target = target_head * geometry.ssm_head;
-                                    let out_head = &mut out_block
-                                        [h * geometry.ssm_head..(h + 1) * geometry.ssm_head];
-                                    mul_slice_into(
-                                        &input[source..source + geometry.ssm_head],
-                                        &signs[target..target + geometry.ssm_head],
-                                        out_head,
-                                    );
-                                }
-                                crate::kernels::hadamard(out_block)?;
+                                crate::kernels::hadamard_grouped_block_into(
+                                    input,
+                                    valid_signs,
+                                    base_block + local_idx,
+                                    heads_per_block,
+                                    repetitions,
+                                    geometry.ssm_keys,
+                                    geometry.ssm_head,
+                                    out_block,
+                                )?;
                             }
                             Ok(())
                         },
                     );
                 }
+                for (block_idx, out_block) in transformed.chunks_exact_mut(self.block).enumerate() {
+                    crate::kernels::hadamard_grouped_block_into(
+                        input,
+                        valid_signs,
+                        block_idx,
+                        heads_per_block,
+                        repetitions,
+                        geometry.ssm_keys,
+                        geometry.ssm_head,
+                        out_block,
+                    )?;
+                }
+                return Ok(());
+            }
+            if let Some(signs) = valid_signs {
                 for key in 0..geometry.ssm_keys {
                     for repeat in 0..repetitions {
                         let source = (repeat * geometry.ssm_keys + key) * geometry.ssm_head;
@@ -3406,12 +3433,13 @@ impl Evaluation<'_, '_> {
                                 prev_row, state_row, k, q, decay, v[row_idx], update,
                             )? * scale;
                         }
-                        arithmetic.normalize_in_place(output, &layer.norm, g.epsilon)?;
                         // Pinned qwen35.cpp build_norm_gated explicitly uses
                         // ggml_swiglu_split(gate, normalized), not separate SiLU/MUL nodes.
-                        arithmetic.swiglu_in_place(
-                            &gate_ref[head * g.ssm_head..(head + 1) * g.ssm_head],
+                        arithmetic.normalize_swiglu_in_place(
                             output,
+                            &layer.norm,
+                            g.epsilon,
+                            &gate_ref[head * g.ssm_head..(head + 1) * g.ssm_head],
                         )?;
                     }
                     Ok(())

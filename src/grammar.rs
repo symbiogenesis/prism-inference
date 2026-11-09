@@ -54,12 +54,12 @@ impl Grammar {
         };
         parser.space(true);
         while parser.byte() != 0 {
-            let name = parser.name()?.to_owned();
+            let name = parser.name()?;
             parser.space(false);
-            let id = parser.symbol(&name)?;
+            let id = parser.symbol(name)?;
             parser.expect(b"::=")?;
             parser.space(true);
-            parser.alternates(&name, id, false)?;
+            parser.alternates(name, id, false)?;
             match parser.byte() {
                 b'\r' => {
                     parser.pos += 1;
@@ -379,8 +379,8 @@ impl<'a> Parser<'a> {
                     self.space(nested);
                 }
                 byte if word(byte) => {
-                    let reference = self.name()?.to_owned();
-                    let id = self.symbol(&reference)?;
+                    let reference = self.name()?;
+                    let id = self.symbol(reference)?;
                     last_start = rule.len();
                     previous = 1;
                     rule.push(element(2, id));

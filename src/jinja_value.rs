@@ -102,6 +102,24 @@ impl Val {
     pub(super) fn kind(&self) -> Kind {
         self.0.borrow().kind.clone()
     }
+    pub(super) fn is_string(&self) -> bool {
+        matches!(self.0.borrow().kind, Kind::String(_))
+    }
+    pub(super) fn is_int(&self) -> bool {
+        matches!(self.0.borrow().kind, Kind::Int(_))
+    }
+    pub(super) fn raw_text_eq(&self, expected: &[u8]) -> bool {
+        let borrowed = self.0.borrow();
+        let Kind::String(parts) = &borrowed.kind else {
+            return false;
+        };
+        let total: usize = parts.iter().map(|part| part.bytes.len()).sum();
+        total == expected.len()
+            && parts
+                .iter()
+                .flat_map(|part| part.bytes.iter().copied())
+                .eq(expected.iter().copied())
+    }
     pub(super) fn undefined() -> Self {
         Self::new(Kind::Undefined)
     }
@@ -139,11 +157,11 @@ impl Val {
     }
     pub(super) fn truth(&self) -> bool {
         self.mark();
-        match self.kind() {
+        match &self.0.borrow().kind {
             Kind::Undefined | Kind::None => false,
-            Kind::Bool(value) => value,
-            Kind::Int(value) => value != 0,
-            Kind::Float(value) => value != 0.0,
+            Kind::Bool(value) => *value,
+            Kind::Int(value) => *value != 0,
+            Kind::Float(value) => *value != 0.0,
             Kind::String(parts) => parts.iter().any(|part| !part.bytes.is_empty()),
             Kind::Array(values) | Kind::Tuple(values) => !values.is_empty(),
             Kind::Object(values) => !values.is_empty(),
@@ -157,7 +175,7 @@ impl Val {
     )]
     pub(super) fn number(&self) -> Result<f64> {
         self.mark();
-        match self.kind() {
+        match self.0.borrow().kind {
             Kind::Bool(value) => Ok(f64::from(value)),
             Kind::Int(value) => Ok(value as f64),
             Kind::Float(value) => Ok(value),
@@ -172,7 +190,7 @@ impl Val {
     )]
     pub(super) fn integer(&self) -> Result<i64> {
         self.mark();
-        match self.kind() {
+        match self.0.borrow().kind {
             Kind::Bool(value) => Ok(i64::from(value)),
             Kind::Int(value) => Ok(value),
             Kind::Float(value)
@@ -223,7 +241,7 @@ impl Val {
         }
     }
     pub(super) fn repr(&self) -> Vec<u8> {
-        if matches!(self.kind(), Kind::String(_)) {
+        if self.is_string() {
             let mut result = b"'".to_vec();
             for byte in self.text() {
                 match byte {
@@ -254,7 +272,7 @@ impl Val {
     }
     pub(super) fn len(&self) -> Result<usize> {
         self.mark();
-        match self.kind() {
+        match &self.0.borrow().kind {
             Kind::Undefined => Ok(0),
             Kind::String(parts) => Ok(parts.iter().map(|part| part.bytes.len()).sum()),
             Kind::Array(values) | Kind::Tuple(values) => Ok(values.len()),
@@ -461,7 +479,7 @@ impl<'de> Visitor<'de> for OrderedVisitor {
         while let Some(key) = map.next_key::<String>()? {
             if values
                 .iter()
-                .any(|(other, _)| other.text() == key.as_bytes())
+                .any(|(other, _)| other.raw_text_eq(key.as_bytes()))
             {
                 return Err(de::Error::custom("duplicate Jinja variable key"));
             }

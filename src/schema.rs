@@ -319,18 +319,25 @@ impl Converter {
     }
     fn add(&mut self, name: &str, rule: &str) -> String {
         let name = escape_name(name);
-        if self.rules.get(&name).is_none_or(|value| value == rule) {
-            self.rules.insert(name.clone(), rule.to_owned());
-            return name;
+        match self.rules.get(&name) {
+            Some(value) if value == rule => return name,
+            None => {
+                self.rules.insert(name.clone(), rule.to_owned());
+                return name;
+            }
+            Some(_) => {}
         }
         let mut index = 0;
         loop {
             let key = format!("{name}{index}");
-            if self.rules.get(&key).is_none_or(|value| value == rule) {
-                self.rules.insert(key.clone(), rule.to_owned());
-                return key;
+            match self.rules.get(&key) {
+                Some(value) if value == rule => return key,
+                None => {
+                    self.rules.insert(key.clone(), rule.to_owned());
+                    return key;
+                }
+                Some(_) => index += 1,
             }
-            index += 1;
         }
     }
     fn primitive(&mut self, name: &str, kind: &str) -> Result<String> {

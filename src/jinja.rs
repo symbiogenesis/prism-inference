@@ -150,7 +150,7 @@ impl Template {
                     false,
                 );
             }
-            if !matches!(destination.kind(), Kind::String(_)) {
+            if !destination.is_string() {
                 return Err(invalid("Jinja byte overlay requires an existing string"));
             }
             destination.0.borrow_mut().kind = Kind::String(vec![Part {
@@ -739,7 +739,7 @@ impl Runtime {
                 Kind::String(_) | Kind::Array(_) | Kind::Tuple(_)
             ) =>
             {
-                let (container, count) = if matches!(left.kind(), Kind::Int(_)) {
+                let (container, count) = if left.is_int() {
                     (right, left.integer()?)
                 } else {
                     let count = right.integer()?;
@@ -750,7 +750,7 @@ impl Runtime {
                 if count.saturating_mul(container.len()?) > 65536 {
                     return Err(invalid("Jinja repetition bound exceeded"));
                 }
-                if matches!(container.kind(), Kind::String(_)) {
+                if container.is_string() {
                     Ok(Val::new(Kind::String(
                         (0..count).flat_map(|_| container.parts()).collect(),
                     )))

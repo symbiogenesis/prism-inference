@@ -1315,6 +1315,48 @@ pub(crate) fn f16_dot_two_token_four_queries(
     (f16_dot_four(queries0, key), f16_dot_four(queries1, key))
 }
 
+pub(crate) fn f16_dot_four_keys_four_queries(
+    queries: [&[f32]; 4],
+    keys: [&[u16]; 4],
+) -> [[f32; 4]; 4] {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::f16_dot_four_keys_four_queries(queries, keys) {
+        return values;
+    }
+    keys.map(|key| f16_dot_four(queries, key))
+}
+
+pub(crate) fn f16_dot_four_keys_two_token_four_queries(
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+    keys: [&[u16]; 4],
+) -> (
+    pinned_attention::FourKeyFourQueryScores,
+    pinned_attention::FourKeyFourQueryScores,
+) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::f16_dot_four_keys_two_token_four_queries(queries0, queries1, keys) {
+        return values;
+    }
+    let (k0_0, k0_1) = f16_dot_two_token_four_queries(queries0, queries1, keys[0]);
+    let (k1_0, k1_1) = f16_dot_two_token_four_queries(queries0, queries1, keys[1]);
+    let (k2_0, k2_1) = f16_dot_two_token_four_queries(queries0, queries1, keys[2]);
+    let (k3_0, k3_1) = f16_dot_two_token_four_queries(queries0, queries1, keys[3]);
+    ([k0_0, k1_0, k2_0, k3_0], [k0_1, k1_1, k2_1, k3_1])
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -2167,6 +2209,70 @@ pub(crate) fn lora_a_dot(
         output.push(value);
         Ok(())
     })
+}
+
+pub(crate) fn lora_a_dot_pair(
+    a_values: &[f32],
+    input0: &[f32],
+    input1: &[f32],
+    scratch: &MatvecScratch,
+) -> Option<(f32, f32)> {
+    if a_values.is_empty()
+        || input0.len() != a_values.len()
+        || input1.len() != a_values.len()
+        || !is_finite_slice(input0)
+        || !is_finite_slice(input1)
+    {
+        return None;
+    }
+    if scratch.pinned_accumulation && a_values.len().is_multiple_of(16) {
+        pinned_gdn::dot_pair(a_values, input0, input1).ok()
+    } else {
+        let (v0, v1) = float_dot_pair(a_values, input0, input1);
+        if v0.is_finite() && v1.is_finite() {
+            Some((v0, v1))
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) fn lora_b_scale_and_finish(
+    b_values: &[f32],
+    rank: &[f32],
+    scale: f32,
+    output: &mut [f32],
+    correction: &mut Vec<f32>,
+) -> Result<()> {
+    let [rank_val] = *rank else {
+        correction.clear();
+        return Err(invalid(
+            "matvec requires a matching finite activation vector",
+        ));
+    };
+    if b_values.is_empty() || !rank_val.is_finite() {
+        correction.clear();
+        return Err(invalid(
+            "matvec requires a matching finite activation vector",
+        ));
+    }
+    if output.len() == b_values.len() {
+        correction.try_reserve_exact(b_values.len().saturating_sub(correction.len()))?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(result) =
+            neon::lora_b_scale_and_finish(b_values, rank_val, scale, output, correction)
+        {
+            return result;
+        }
+    }
+    lora_b_scale(b_values, rank, correction)?;
+    lora_finish_in_place(scale, output, correction)
 }
 
 pub(crate) fn lora_b_scale(

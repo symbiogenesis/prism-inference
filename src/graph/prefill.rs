@@ -1512,24 +1512,20 @@ fn project_tile_pair<'a>(
             finite(out_b, "projection executor output")?;
         }
         if let Some(adapter) = adapter {
-            for (input, output) in inputs.iter().zip(outputs_a) {
-                adapter.linear(
-                    &tensors[0].name,
-                    input,
-                    adapter_scale,
-                    output,
-                    adapter_scratch,
-                )?;
-            }
-            for (input, output) in inputs.iter().zip(outputs_b) {
-                adapter.linear(
-                    &tensors[1].name,
-                    input,
-                    adapter_scale,
-                    output,
-                    adapter_scratch,
-                )?;
-            }
+            adapter.linear_tokens(
+                &tensors[0].name,
+                inputs,
+                adapter_scale,
+                outputs_a,
+                adapter_scratch,
+            )?;
+            adapter.linear_tokens(
+                &tensors[1].name,
+                inputs,
+                adapter_scale,
+                outputs_b,
+                adapter_scratch,
+            )?;
         }
         return Ok(TileReuse {
             basis: Some(tensors[1]),
@@ -1893,9 +1889,13 @@ fn project_tile_triple<'a>(
                 (tensors[1], &mut *outputs_b),
                 (tensors[2], &mut *outputs_c),
             ] {
-                for (input, output) in inputs.iter().zip(outputs) {
-                    adapter.linear(&tensor.name, input, adapter_scale, output, adapter_scratch)?;
-                }
+                adapter.linear_tokens(
+                    &tensor.name,
+                    inputs,
+                    adapter_scale,
+                    outputs,
+                    adapter_scratch,
+                )?;
             }
         }
         return Ok(TileReuse {
@@ -2034,9 +2034,13 @@ fn project_tile<'a>(
         Some(tensor)
     };
     if let Some(adapter) = adapter {
-        for (input, output) in inputs.iter().zip(outputs) {
-            adapter.linear(&tensor.name, input, adapter_scale, output, adapter_scratch)?;
-        }
+        adapter.linear_tokens(
+            &tensor.name,
+            inputs,
+            adapter_scale,
+            outputs,
+            adapter_scratch,
+        )?;
     }
     Ok(TileReuse {
         basis: Some(tensor),

@@ -12,7 +12,8 @@ use super::{Model, Tensor};
 use crate::{
     Result, invalid,
     kernels::{
-        MatvecBackend, MatvecScratch, lora_a_dot, lora_b_scale, lora_finish_in_place, row_into,
+        MatvecBackend, MatvecScratch, lora_a_dot, lora_a_dot_pair, lora_b_scale_and_finish,
+        row_into,
     },
 };
 
@@ -250,12 +251,72 @@ impl RankOneAdapter {
         output: &mut [f32],
         scratch: &mut Scratch,
     ) -> Result<()> {
-        let Some(factors) = self.factors.get(target).filter(|_| scale != 0.0) else {
+        if scale == 0.0 || !possible_factor_target(target) {
+            return Ok(());
+        }
+        let Some(factors) = self.factors.get(target) else {
             return Ok(());
         };
         lora_a_dot(&factors.a_values, input, &mut scratch.rank, &scratch.matvec)?;
-        lora_b_scale(&factors.b_values, &scratch.rank, &mut scratch.correction)?;
-        self.finish(scale, output, &mut scratch.correction)
+        self.scale_and_finish(&factors.b_values, scale, output, scratch)
+    }
+
+    pub(crate) fn linear_tokens(
+        &self,
+        target: &str,
+        inputs: &[Vec<f32>],
+        scale: f32,
+        outputs: &mut [Vec<f32>],
+        scratch: &mut Scratch,
+    ) -> Result<()> {
+        if scale == 0.0 || !possible_factor_target(target) {
+            return Ok(());
+        }
+        let Some(factors) = self.factors.get(target) else {
+            return Ok(());
+        };
+        let count = inputs.len().min(outputs.len());
+        let mut idx = 0;
+        while idx + 2 <= count {
+            if let Some((r0, r1)) = lora_a_dot_pair(
+                &factors.a_values,
+                &inputs[idx],
+                &inputs[idx + 1],
+                &scratch.matvec,
+            ) {
+                scratch.rank.clear();
+                scratch.rank.try_reserve_exact(1)?;
+                scratch.rank.push(r0);
+                self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx], scratch)?;
+                scratch.rank[0] = r1;
+            } else {
+                lora_a_dot(
+                    &factors.a_values,
+                    &inputs[idx],
+                    &mut scratch.rank,
+                    &scratch.matvec,
+                )?;
+                self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx], scratch)?;
+                lora_a_dot(
+                    &factors.a_values,
+                    &inputs[idx + 1],
+                    &mut scratch.rank,
+                    &scratch.matvec,
+                )?;
+            }
+            self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx + 1], scratch)?;
+            idx += 2;
+        }
+        if idx < count {
+            lora_a_dot(
+                &factors.a_values,
+                &inputs[idx],
+                &mut scratch.rank,
+                &scratch.matvec,
+            )?;
+            self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx], scratch)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn embedding(
@@ -273,13 +334,32 @@ impl RankOneAdapter {
             return Ok(());
         };
         row_into(&factors.a, token, &mut scratch.rank)?;
-        lora_b_scale(&factors.b_values, &scratch.rank, &mut scratch.correction)?;
-        self.finish(scale, output, &mut scratch.correction)
+        self.scale_and_finish(&factors.b_values, scale, output, scratch)
     }
 
-    fn finish(&self, scale: f32, output: &mut [f32], correction: &mut [f32]) -> Result<()> {
-        lora_finish_in_place(scale * self.alpha, output, correction)
+    fn scale_and_finish(
+        &self,
+        b_values: &[f32],
+        scale: f32,
+        output: &mut [f32],
+        scratch: &mut Scratch,
+    ) -> Result<()> {
+        lora_b_scale_and_finish(
+            b_values,
+            &scratch.rank,
+            scale * self.alpha,
+            output,
+            &mut scratch.correction,
+        )
     }
+}
+
+#[inline]
+fn possible_factor_target(name: &str) -> bool {
+    name.ends_with(".ffn_down.weight")
+        || name.ends_with(".ssm_out.weight")
+        || name.ends_with(".attn_output.weight")
+        || name == "token_embd.weight"
 }
 
 fn supported_target(name: &str) -> bool {
@@ -481,6 +561,92 @@ mod tests {
                 .is_err()
         );
         assert_eq!(output, [3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn rank_one_linear_tokens_matches_single_token_bits() -> Result<()> {
+        let target = "blk.0.ffn_down.weight";
+        let a_vals: Vec<f32> = (0..32)
+            .map(|i| f32::from(i8::try_from((i * 5) % 13 - 6).unwrap_or(0)) * 0.125)
+            .collect();
+        let b_vals: Vec<f32> = (0..16)
+            .map(|i| f32::from(i8::try_from((i * 3) % 11 - 5).unwrap_or(0)) * 0.25)
+            .collect();
+        let base_tensor = Tensor {
+            name: target.into(),
+            dimensions: vec![a_vals.len(), b_vals.len()],
+            kind: 0,
+            data: Arc::from(vec![0_u8; a_vals.len() * b_vals.len() * 4]),
+        };
+        let a_tensor = Tensor {
+            name: format!("{target}.lora_a"),
+            dimensions: vec![a_vals.len(), 1],
+            kind: 0,
+            data: Arc::from(
+                a_vals
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        let b_tensor = tensor(&format!("{target}.lora_b"), &b_vals);
+        let base = Model {
+            identity: "base".into(),
+            metadata: BTreeMap::from([(
+                "general.architecture".into(),
+                MetadataValue::from("qwen35"),
+            )]),
+            tensors: BTreeMap::from([(target.into(), base_tensor)]),
+        };
+        let factors = Model {
+            identity: "adapter".into(),
+            metadata: BTreeMap::from([
+                ("general.architecture".into(), MetadataValue::from("qwen35")),
+                ("general.type".into(), MetadataValue::from("adapter")),
+                ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
+            ]),
+            tensors: BTreeMap::from([
+                (format!("{target}.lora_a"), a_tensor),
+                (format!("{target}.lora_b"), b_tensor),
+            ]),
+        };
+        let adapter = RankOneAdapter::from_model(factors, &base)?;
+        let inputs: Vec<Vec<f32>> = (0..3)
+            .map(|tok| {
+                (0..32)
+                    .map(|i| f32::from(i8::try_from((i + tok * 7) % 17 - 8).unwrap_or(0)) * 0.0625)
+                    .collect()
+            })
+            .collect();
+        for pinned in [false, true] {
+            let mut single_outputs: Vec<Vec<f32>> = (0..3)
+                .map(|tok| {
+                    (0..16)
+                        .map(|i| f32::from(u8::try_from(i + tok).unwrap_or(0)))
+                        .collect()
+                })
+                .collect();
+            let mut batch_outputs = single_outputs.clone();
+            let mut scratch_single = Scratch::new(MatvecBackend::ExperimentalNeon, pinned);
+            let mut scratch_batch = Scratch::new(MatvecBackend::ExperimentalNeon, pinned);
+            for (inp, out) in inputs.iter().zip(&mut single_outputs) {
+                adapter.linear(target, inp, 0.75, out, &mut scratch_single)?;
+            }
+            adapter.linear_tokens(
+                target,
+                &inputs,
+                0.75,
+                &mut batch_outputs,
+                &mut scratch_batch,
+            )?;
+            for (actual, expected) in batch_outputs.iter().zip(&single_outputs) {
+                let actual_bits: Vec<u32> = actual.iter().copied().map(f32::to_bits).collect();
+                let expected_bits: Vec<u32> = expected.iter().copied().map(f32::to_bits).collect();
+                assert_eq!(actual_bits, expected_bits);
+            }
+        }
         Ok(())
     }
 }

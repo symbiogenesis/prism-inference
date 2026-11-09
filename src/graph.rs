@@ -416,7 +416,9 @@ impl Arithmetic {
         keys: [&[u16]; 4],
     ) -> Result<[[f32; 4]; 4]> {
         match self {
-            Self::Source => Ok(keys.map(|key| crate::kernels::f16_dot_four(queries, key))),
+            Self::Source => Ok(crate::kernels::f16_dot_four_keys_four_queries(
+                queries, keys,
+            )),
             Self::PinnedSwift => {
                 crate::kernels::pinned_attention::dot_f16_four_keys_four_queries(keys, queries)
             }
@@ -433,17 +435,9 @@ impl Arithmetic {
         crate::kernels::pinned_attention::FourKeyFourQueryScores,
     )> {
         match self {
-            Self::Source => {
-                let (k0_0, k0_1) =
-                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[0]);
-                let (k1_0, k1_1) =
-                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[1]);
-                let (k2_0, k2_1) =
-                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[2]);
-                let (k3_0, k3_1) =
-                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[3]);
-                Ok(([k0_0, k1_0, k2_0, k3_0], [k0_1, k1_1, k2_1, k3_1]))
-            }
+            Self::Source => Ok(crate::kernels::f16_dot_four_keys_two_token_four_queries(
+                queries0, queries1, keys,
+            )),
             Self::PinnedSwift => {
                 crate::kernels::pinned_attention::dot_f16_four_keys_two_token_four_queries(
                     keys, queries0, queries1,

@@ -537,15 +537,75 @@ fn dot_f16_two_keys_four_queries(
     Ok(out)
 }
 
-/// Reduces four validated F16 key slices against four F32 query slices sharing the same KV head.
+#[inline]
+fn dot_f16_four_keys_four_queries_stream(
+    neon: Neon,
+    k_chunks8: [&[[u16; 8]]; 4],
+    q_chunks8: [&[[f32; 8]]; 4],
+    start_pair: usize,
+    half_offset: usize,
+) -> [[f32x4<Neon>; 4]; 4] {
+    let mut acc = [[f32x4::splat(neon, 0.0); 4]; 4];
+    for pair_idx in (start_pair..k_chunks8[0].len()).step_by(2) {
+        let (k0, k1) = super::super::neon::f16_pair_x4_to_f32_x4(
+            neon,
+            &k_chunks8[0][pair_idx][half_offset..half_offset + 4],
+            &k_chunks8[1][pair_idx][half_offset..half_offset + 4],
+        );
+        let (k2, k3) = super::super::neon::f16_pair_x4_to_f32_x4(
+            neon,
+            &k_chunks8[2][pair_idx][half_offset..half_offset + 4],
+            &k_chunks8[3][pair_idx][half_offset..half_offset + 4],
+        );
+        for h in 0..4 {
+            let qv = f32x4::from_slice(neon, &q_chunks8[h][pair_idx][half_offset..half_offset + 4]);
+            acc[0][h] = k0.mul_add_precise(qv, acc[0][h]);
+            acc[1][h] = k1.mul_add_precise(qv, acc[1][h]);
+            acc[2][h] = k2.mul_add_precise(qv, acc[2][h]);
+            acc[3][h] = k3.mul_add_precise(qv, acc[3][h]);
+        }
+    }
+    acc
+}
+
+/// Reduces four validated F16 key slices against four F32 query slices sharing the same KV head,
+/// sharing each query vector load across all four keys without exceeding 16 accumulator registers per pass.
 pub(super) fn dot_f16_four_keys_four_queries(
     neon: Neon,
     keys: [&[u16]; 4],
     queries: [&[f32]; 4],
 ) -> Result<[[f32; 4]; 4]> {
-    let [r0, r1] = dot_f16_two_keys_four_queries(neon, [keys[0], keys[1]], queries)?;
-    let [r2, r3] = dot_f16_two_keys_four_queries(neon, [keys[2], keys[3]], queries)?;
-    Ok([r0, r1, r2, r3])
+    let len = queries[0].len();
+    let total_steps = padded_dot_steps(len);
+    let (k0_chunks8, k0_rem) = keys[0].as_chunks::<8>();
+    let (k1_chunks8, k1_rem) = keys[1].as_chunks::<8>();
+    let (k2_chunks8, k2_rem) = keys[2].as_chunks::<8>();
+    let (k3_chunks8, k3_rem) = keys[3].as_chunks::<8>();
+    let vector_steps = k0_chunks8.len() * 8;
+    if vector_steps != total_steps
+        || !k0_rem.is_empty()
+        || !k1_rem.is_empty()
+        || !k2_rem.is_empty()
+        || !k3_rem.is_empty()
+    {
+        let [r0, r1] = dot_f16_two_keys_four_queries(neon, [keys[0], keys[1]], queries)?;
+        let [r2, r3] = dot_f16_two_keys_four_queries(neon, [keys[2], keys[3]], queries)?;
+        return Ok([r0, r1, r2, r3]);
+    }
+    let key_blocks = [k0_chunks8, k1_chunks8, k2_chunks8, k3_chunks8];
+    let q_chunks8 = queries.map(|q| q.as_chunks::<8>().0);
+    let s0 = dot_f16_four_keys_four_queries_stream(neon, key_blocks, q_chunks8, 0, 0);
+    let s1 = dot_f16_four_keys_four_queries_stream(neon, key_blocks, q_chunks8, 0, 4);
+    let s2 = dot_f16_four_keys_four_queries_stream(neon, key_blocks, q_chunks8, 1, 0);
+    let s3 = dot_f16_four_keys_four_queries_stream(neon, key_blocks, q_chunks8, 1, 4);
+    let mut out = [[0.0_f32; 4]; 4];
+    for k in 0..4 {
+        for h in 0..4 {
+            let lanes = ((s0[k][h] + s2[k][h]) + (s1[k][h] + s3[k][h])).to_array();
+            out[k][h] = super::super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+    }
+    Ok(out)
 }
 
 /// Reduces one validated F16 key slice against two tokens x four F32 query slices sharing a KV head,
@@ -611,6 +671,87 @@ pub(super) fn dot_f16_two_token_four_queries(
     Ok((out0, out1))
 }
 
+type TwoKeyStreamPair = ([[f32x4<Neon>; 4]; 2], [[f32x4<Neon>; 4]; 2]);
+type TwoKeyScorePair = ([[f32; 4]; 2], [[f32; 4]; 2]);
+
+#[inline]
+fn dot_f16_two_keys_two_token_four_queries_stream(
+    neon: Neon,
+    k_chunks8: [&[[u16; 8]]; 2],
+    q0_chunks8: [&[[f32; 8]]; 4],
+    q1_chunks8: [&[[f32; 8]]; 4],
+    start_pair: usize,
+    half_offset: usize,
+) -> TwoKeyStreamPair {
+    let mut acc0 = [[f32x4::splat(neon, 0.0); 4]; 2];
+    let mut acc1 = [[f32x4::splat(neon, 0.0); 4]; 2];
+    for pair_idx in (start_pair..k_chunks8[0].len()).step_by(2) {
+        let (k0, k1) = super::super::neon::f16_pair_x4_to_f32_x4(
+            neon,
+            &k_chunks8[0][pair_idx][half_offset..half_offset + 4],
+            &k_chunks8[1][pair_idx][half_offset..half_offset + 4],
+        );
+        for h in 0..4 {
+            let qv0 =
+                f32x4::from_slice(neon, &q0_chunks8[h][pair_idx][half_offset..half_offset + 4]);
+            acc0[0][h] = k0.mul_add_precise(qv0, acc0[0][h]);
+            acc0[1][h] = k1.mul_add_precise(qv0, acc0[1][h]);
+            let qv1 =
+                f32x4::from_slice(neon, &q1_chunks8[h][pair_idx][half_offset..half_offset + 4]);
+            acc1[0][h] = k0.mul_add_precise(qv1, acc1[0][h]);
+            acc1[1][h] = k1.mul_add_precise(qv1, acc1[1][h]);
+        }
+    }
+    (acc0, acc1)
+}
+
+#[inline]
+fn dot_f16_two_keys_two_token_four_queries(
+    neon: Neon,
+    keys: [&[u16]; 2],
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+) -> Result<TwoKeyScorePair> {
+    let len = queries0[0].len();
+    let total_steps = padded_dot_steps(len);
+    let (k0_chunks8, k0_rem) = keys[0].as_chunks::<8>();
+    let (k1_chunks8, k1_rem) = keys[1].as_chunks::<8>();
+    let vector_steps = k0_chunks8.len() * 8;
+    if vector_steps != total_steps || !k0_rem.is_empty() || !k1_rem.is_empty() {
+        let (r0_0, r0_1) = dot_f16_two_token_four_queries(neon, keys[0], queries0, queries1)?;
+        let (r1_0, r1_1) = dot_f16_two_token_four_queries(neon, keys[1], queries0, queries1)?;
+        return Ok(([r0_0, r1_0], [r0_1, r1_1]));
+    }
+    let key_blocks = [k0_chunks8, k1_chunks8];
+    let q0_chunks8 = queries0.map(|q| q.as_chunks::<8>().0);
+    let q1_chunks8 = queries1.map(|q| q.as_chunks::<8>().0);
+    let (s0_0, s0_1) = dot_f16_two_keys_two_token_four_queries_stream(
+        neon, key_blocks, q0_chunks8, q1_chunks8, 0, 0,
+    );
+    let (s1_0, s1_1) = dot_f16_two_keys_two_token_four_queries_stream(
+        neon, key_blocks, q0_chunks8, q1_chunks8, 0, 4,
+    );
+    let (s2_0, s2_1) = dot_f16_two_keys_two_token_four_queries_stream(
+        neon, key_blocks, q0_chunks8, q1_chunks8, 1, 0,
+    );
+    let (s3_0, s3_1) = dot_f16_two_keys_two_token_four_queries_stream(
+        neon, key_blocks, q0_chunks8, q1_chunks8, 1, 4,
+    );
+    let mut out0 = [[0.0_f32; 4]; 2];
+    let mut out1 = [[0.0_f32; 4]; 2];
+    for k in 0..2 {
+        for h in 0..4 {
+            let lanes0 = ((s0_0[k][h] + s2_0[k][h]) + (s1_0[k][h] + s3_0[k][h])).to_array();
+            out0[k][h] = super::super::finite((lanes0[0] + lanes0[1]) + (lanes0[2] + lanes0[3]))?;
+        }
+        for h in 0..4 {
+            let lanes1 = ((s0_1[k][h] + s2_1[k][h]) + (s1_1[k][h] + s3_1[k][h])).to_array();
+            out1[k][h] = super::super::finite((lanes1[0] + lanes1[1]) + (lanes1[2] + lanes1[3]))?;
+        }
+    }
+    Ok((out0, out1))
+}
+
 /// Reduces four validated F16 key slices against two tokens x four F32 query slices sharing a KV head.
 pub(super) fn dot_f16_four_keys_two_token_four_queries(
     neon: Neon,
@@ -618,10 +759,10 @@ pub(super) fn dot_f16_four_keys_two_token_four_queries(
     queries0: [&[f32]; 4],
     queries1: [&[f32]; 4],
 ) -> Result<(super::FourKeyFourQueryScores, super::FourKeyFourQueryScores)> {
-    let (r0_0, r0_1) = dot_f16_two_token_four_queries(neon, keys[0], queries0, queries1)?;
-    let (r1_0, r1_1) = dot_f16_two_token_four_queries(neon, keys[1], queries0, queries1)?;
-    let (r2_0, r2_1) = dot_f16_two_token_four_queries(neon, keys[2], queries0, queries1)?;
-    let (r3_0, r3_1) = dot_f16_two_token_four_queries(neon, keys[3], queries0, queries1)?;
+    let ([r0_0, r1_0], [r0_1, r1_1]) =
+        dot_f16_two_keys_two_token_four_queries(neon, [keys[0], keys[1]], queries0, queries1)?;
+    let ([r2_0, r3_0], [r2_1, r3_1]) =
+        dot_f16_two_keys_two_token_four_queries(neon, [keys[2], keys[3]], queries0, queries1)?;
     Ok(([r0_0, r1_0, r2_0, r3_0], [r0_1, r1_1, r2_1, r3_1]))
 }
 

@@ -1198,4 +1198,83 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn four_key_four_query_dot_matches_single_key_bits() -> crate::Result<()> {
+        let capture: Capture = serde_json::from_str(include_str!(
+            "../../tests/fixtures/swift-attention-dot.json"
+        ))?;
+        let values = capture.weighted_value;
+        let q0: Vec<f32> = values
+            .probabilities
+            .iter()
+            .copied()
+            .map(half_to_float)
+            .collect();
+        let q1: Vec<f32> = q0
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let scale = f32::from(u8::try_from(i % 5).unwrap_or(0)).mul_add(0.125, 1.0);
+                x * scale
+            })
+            .collect();
+        let q2: Vec<f32> = q0
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let scale = f32::from(u8::try_from(i % 3).unwrap_or(0)).mul_add(-0.25, 0.75);
+                x * scale
+            })
+            .collect();
+        let q3: Vec<f32> = q0.iter().copied().rev().collect();
+        let k1: Vec<u16> = values
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v.wrapping_add(u16::try_from(i % 5).unwrap_or(0)))
+            .collect();
+        let k2: Vec<u16> = values.values.iter().copied().rev().collect();
+        let k3: Vec<u16> = k1.iter().copied().rev().collect();
+        let keys4 = [
+            values.values.as_slice(),
+            k1.as_slice(),
+            k2.as_slice(),
+            k3.as_slice(),
+        ];
+        let queries0 = [&q0[..], &q1[..], &q2[..], &q3[..]];
+        let queries1 = [&q3[..], &q2[..], &q1[..], &q0[..]];
+        let actual_4k4q =
+            super::dot_f16_four_keys_four_queries(keys4, queries0)?.map(|r| r.map(f32::to_bits));
+        let expected_4k4q = keys4.map(|k| {
+            dot_f16_four(k, queries0)
+                .unwrap_or([0.0; 4])
+                .map(f32::to_bits)
+        });
+        assert_eq!(actual_4k4q, expected_4k4q);
+        let (actual_2t0, actual_2t1) =
+            super::dot_f16_four_keys_two_token_four_queries(keys4, queries0, queries1)?;
+        assert_eq!(actual_2t0.map(|r| r.map(f32::to_bits)), expected_4k4q);
+        let expected_2t1 = keys4.map(|k| {
+            dot_f16_four(k, queries1)
+                .unwrap_or([0.0; 4])
+                .map(f32::to_bits)
+        });
+        assert_eq!(actual_2t1.map(|r| r.map(f32::to_bits)), expected_2t1);
+        let source_4k4q = crate::kernels::f16_dot_four_keys_four_queries(queries0, keys4)
+            .map(|r| r.map(f32::to_bits));
+        let expected_source_4k4q =
+            keys4.map(|k| crate::kernels::f16_dot_four(queries0, k).map(f32::to_bits));
+        assert_eq!(source_4k4q, expected_source_4k4q);
+        let (source_2t0, source_2t1) =
+            crate::kernels::f16_dot_four_keys_two_token_four_queries(queries0, queries1, keys4);
+        assert_eq!(
+            source_2t0.map(|r| r.map(f32::to_bits)),
+            expected_source_4k4q
+        );
+        let expected_source_2t1 =
+            keys4.map(|k| crate::kernels::f16_dot_four(queries1, k).map(f32::to_bits));
+        assert_eq!(source_2t1.map(|r| r.map(f32::to_bits)), expected_source_2t1);
+        Ok(())
+    }
 }

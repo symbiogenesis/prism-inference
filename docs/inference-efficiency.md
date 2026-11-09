@@ -155,6 +155,18 @@ across all eight lazy entry families, with a separate successful transient
 control. The ordinary prewarmed default is unchanged by this follow-up.
 Conservative admission remains charged; no startup or execution gain is measured.
 
+Single-operation transient native-Q2 token tiles now pack immutable PQ2 weights
+once for the tile when residency is absent or refused. The call-local packed
+buffer is reused across the same ordered `N = 1` submissions and then released;
+no persistent expanded copy or new DSP batch is introduced. For an 8/16/32-token
+tile this omits 7/15/31 full host transcoding passes and their scratch allocations,
+while operation counts, queue writes and conservative payload admission stay
+unchanged. Multi-operation tiled shapes and resident dispatch retain their
+existing routes. Independent digit-level layout/scalar controls cover original
+fourth-symbol values, token order, absent/refused residency, input and scale
+failure precedence, late failure, output clearing and terminal refusal. These
+host-only controls do not qualify signed-device arithmetic or prompt latency.
+
 ## Device and delivery acceptance
 
 No workflow dispatch, source change or source check qualifies actual Swift

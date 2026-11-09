@@ -999,11 +999,14 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let single_op =
             columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
         let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
-        if !single_op || (cached.is_none() && self.residency.is_none()) {
+        if !single_op {
             for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
                 self.project_f32_inner(tensor, activation, output)?;
             }
             return Ok(());
+        }
+        if cached.is_none() && self.residency.is_none() {
+            return self.project_transient_token_tile(tensor, (columns, rows), activations, outputs);
         }
         for activation in activations {
             if activation.len() != columns {
@@ -1016,10 +1019,12 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         } else {
             let mut weights = Vec::new();
             let Some(idx) = self.prepare_resident(tensor, &mut weights, false)? else {
-                for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
-                    self.project_f32_inner(tensor, activation, output)?;
-                }
-                return Ok(());
+                return self.project_transient_token_tile(
+                    tensor,
+                    (columns, rows),
+                    activations,
+                    outputs,
+                );
             };
             idx
         };
@@ -1148,6 +1153,60 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 .statistics
                 .projections_completed
                 .saturating_add(chunk_u64);
+        }
+        Ok(())
+    }
+
+    fn project_transient_token_tile(
+        &mut self,
+        tensor: &Tensor,
+        (columns, rows): (usize, usize),
+        activations: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        // Keep the existing per-token input/allocation/submit ordering. Only
+        // immutable packing is shared, and its buffer lives for this call.
+        let mut weights = Vec::new();
+        for (token, (activation, output)) in activations.iter().zip(outputs).enumerate() {
+            if activation.len() != columns {
+                return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+            }
+            finite_slice(activation)?;
+            if token == 0 {
+                resize_packed_scratch(&mut weights, rows * 36 * (columns / 128))?;
+            }
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, f32::NAN);
+            }
+            if token == 0 {
+                pack_native_chunk(
+                    &tensor.data,
+                    ChunkGeometry {
+                        total_blocks: columns / 128,
+                        row_start: 0,
+                        active_rows: rows,
+                        block_start: 0,
+                        chunk_blocks: columns / 128,
+                    },
+                    &mut weights,
+                    self.row_parallelism.as_ref(),
+                )?;
+            }
+            self.statistics.operations_attempted =
+                self.statistics.operations_attempted.saturating_add(1);
+            self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+            self.submitter
+                .submit(columns, rows, &weights, activation, output.as_mut_slice())?;
+            finite_slice(output)?;
+            self.statistics.operations_completed =
+                self.statistics.operations_completed.saturating_add(1);
+            self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+            self.statistics.projections_completed =
+                self.statistics.projections_completed.saturating_add(1);
         }
         Ok(())
     }
@@ -3190,6 +3249,223 @@ mod tests {
         mock: MockNativeSubmitter,
         scale_headers: usize,
         maximum_packed_bytes: usize,
+    }
+
+    struct TransientTokenCapture {
+        columns: usize,
+        rows: usize,
+        expected_weights: Vec<u8>,
+        activations: Vec<Vec<f32>>,
+        fail_call: Option<usize>,
+        nonfinite_call: Option<usize>,
+    }
+
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "The independent scalar test decoder retains explicit multiply then add order."
+    )]
+    impl NativeQ2Submitter for TransientTokenCapture {
+        fn submit(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            assert_eq!((columns, rows), (self.columns, self.rows));
+            assert_eq!(weights, self.expected_weights);
+            self.activations.push(activation.to_vec());
+            if self.fail_call == Some(self.activations.len()) {
+                output.fill(123.0);
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            // Decode the native digit lanes directly. This does not call the
+            // production permutation or any CPU/DSP projection implementation.
+            for (row, destination) in output.iter_mut().enumerate() {
+                let mut sum = 0.0_f32;
+                for block in 0..columns / 128 {
+                    let pair = (row / 32 * (columns / 128) + block) * 1152;
+                    let scale_at = pair + 512 + (row % 32) * 2;
+                    let bits = u16::from_le_bytes([weights[scale_at], weights[scale_at + 1]]);
+                    let factor = if bits == 0x3800 { 0.5 } else { 1.0 };
+                    let mut dot = 0.0_f32;
+                    for index in 0..128 {
+                        let group = (index % 32) / 4;
+                        let lane = index % 4;
+                        let at = pair + (group / 4) * 576 + (group % 4) * 128
+                            + (row % 32) * 4 + index / 32;
+                        let code = (weights[at] >> (lane * 2)) & 3;
+                        dot += f32::from(i16::from(code) - 1) * activation[block * 128 + index];
+                    }
+                    sum += factor * dot;
+                }
+                *destination = sum;
+            }
+            if self.nonfinite_call == Some(self.activations.len()) {
+                output[rows - 1] = f32::INFINITY;
+            }
+            Ok(())
+        }
+    }
+
+    fn transient_token_tensor(rows: usize) -> Tensor {
+        let mut tensor = lazy_tensor("blk.0.ffn_up.weight", 256, rows);
+        let mut data = tensor.data.to_vec();
+        for (index, block) in data.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+            let header = if index.is_multiple_of(3) { 0x3800_u16 } else { 0x3c00_u16 };
+            block[..2].copy_from_slice(&header.to_le_bytes());
+            for (lane, byte) in block[2..].iter_mut().enumerate() {
+                *byte = u8::try_from((index * 13 + lane * 7) % 256).unwrap_or(0);
+            }
+        }
+        tensor.data = Arc::from(data);
+        tensor
+    }
+
+    fn transient_token_executor(
+        tensor: &Tensor,
+        refused_residency: bool,
+    ) -> Result<NativeQ2Executor<TransientTokenCapture>> {
+        let (columns, rows) = native_dimensions(tensor)?;
+        let mut expected_weights = vec![0_u8; rows * 36 * (columns / 128)];
+        // Build the native layout one two-bit digit at a time, independently
+        // of the production word-swap permutation and row-group packer.
+        for row in 0..rows {
+            for block in 0..columns / 128 {
+                let original = &tensor.data[(row * (columns / 128) + block) * 34..][..34];
+                let pair = (row / 32 * (columns / 128) + block) * 1152;
+                for half in 0..2 {
+                    let at = pair + half * 576 + 512 + (row % 32) * 2;
+                    expected_weights[at..at + 2].copy_from_slice(&original[..2]);
+                }
+                for group in 0..8 {
+                    for digit in 0..4 {
+                        let at = pair + (group / 4) * 576 + (group % 4) * 128
+                            + (row % 32) * 4 + digit;
+                        for lane in 0..4 {
+                            let code = (original[2 + group * 4 + lane] >> (digit * 2)) & 3;
+                            expected_weights[at] |= code << (lane * 2);
+                        }
+                    }
+                }
+            }
+        }
+        let limits = NativeQ2ProjectionLimits::new(columns, rows, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?;
+        let metadata = if refused_residency { 4096 } else { 0 };
+        let payload = rows * 4 + expected_weights.len() + rows * 4 + metadata;
+        let submitter = TransientTokenCapture {
+            columns,
+            rows,
+            expected_weights,
+            activations: Vec::new(),
+            fail_call: None,
+            nonfinite_call: None,
+        };
+        let executor = NativeQ2Executor::new(submitter, limits, payload);
+        if refused_residency { executor.with_resident_weights(metadata) } else { Ok(executor) }
+    }
+
+    #[test]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "The independent original-PQ2 test oracle retains explicit multiply then add order."
+    )]
+    fn native_q2_transient_token_tile_matches_independent_layout_and_scalar_outputs() -> Result<()> {
+        for rows in [32, 64] {
+            let tensor = transient_token_tensor(rows);
+            for refused_residency in [false, true] {
+                for tokens in [0, 1, 8, 16, 32] {
+                    let mut executor = transient_token_executor(&tensor, refused_residency)?;
+                    let activations: Vec<Vec<f32>> = (0..tokens).map(|token| {
+                        (0..256).map(|index| {
+                            f32::from(i16::try_from((token * 3 + index) % 17).unwrap_or(0) - 8)
+                        }).collect()
+                    }).collect();
+                    let mut outputs = vec![vec![91.0]; tokens];
+                    executor.project_f32_tokens(&tensor, &activations, true, &mut outputs)?;
+                    for (activation, output) in activations.iter().zip(&outputs) {
+                        for (row, value) in output.iter().enumerate() {
+                            let mut expected = 0.0_f32;
+                            for block in 0..2 {
+                                let original = &tensor.data[(row * 2 + block) * 34..][..34];
+                                let mut dot = 0.0_f32;
+                                for index in 0..128 {
+                                    let code = (original[2 + index % 32] >> (2 * (index / 32))) & 3;
+                                    dot += f32::from(i16::from(code) - 1) * activation[block * 128 + index];
+                                }
+                                expected += scale(original)? * dot;
+                            }
+                            assert_eq!(value.to_bits(), expected.to_bits());
+                        }
+                    }
+                    assert_eq!(executor.submitter.activations, activations);
+                    let count = u64::try_from(tokens)?;
+                    assert_eq!(executor.statistics().operations_attempted, count);
+                    assert_eq!(executor.statistics().operations_completed, count);
+                    assert_eq!(executor.statistics().projections_completed, count);
+                    assert_eq!(executor.queue_writes_attempted(), count);
+                    assert_eq!(executor.queue_writes_completed(), count);
+                    assert_eq!(executor.residency_statistics().tensors_prepared, 0);
+                    assert_eq!(executor.scratch_weights.capacity(), 0);
+                    assert!(!executor.is_faulted());
+                    executor.maximum_owned_payload_bytes -= 1;
+                    assert!(!executor.supports_f32(&tensor));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_transient_token_tile_preserves_failure_order_and_terminal_publication() -> Result<()> {
+        for refused_residency in [false, true] {
+            for failure in 0..7 {
+                let mut tensor = transient_token_tensor(32);
+                let mut executor = transient_token_executor(&tensor, refused_residency)?;
+                let mut activations = vec![vec![1.0; 256]; 3];
+                let mut outputs = vec![vec![91.0]; 3];
+                match failure {
+                    0 => activations[0][0] = f32::NAN,
+                    1 => activations[2][0] = f32::INFINITY,
+                    2 => activations[2].truncate(255),
+                    3 => executor.submitter.fail_call = Some(2),
+                    4 => executor.submitter.nonfinite_call = Some(2),
+                    5 | 6 => {
+                        let mut data = tensor.data.to_vec();
+                        data[34..36].copy_from_slice(&0x7e00_u16.to_le_bytes());
+                        tensor.data = Arc::from(data);
+                        if failure == 6 { activations[0][0] = f32::NAN; }
+                    }
+                    _ => return Err(invalid("unsupported test failure selection")),
+                }
+                let result = executor.project_f32_tokens(&tensor, &activations, true, &mut outputs);
+                assert!(result.is_err());
+                assert!(outputs.iter().all(Vec::is_empty));
+                assert!(executor.is_faulted());
+                let expected_calls = match failure {
+                    1 | 2 if !refused_residency => 2,
+                    3 | 4 => 2,
+                    _ => 0,
+                };
+                assert_eq!(executor.submitter.activations.len(), expected_calls);
+                if failure == 6 {
+                    let error = result.err().ok_or_else(|| invalid("missing expected error"))?;
+                    assert!(error.to_string().contains("nonfinite Hexagon projection value"));
+                }
+                let attempted = u64::try_from(expected_calls)?;
+                let completed = if matches!(failure, 3 | 4) { 1 } else { attempted };
+                assert_eq!(executor.statistics().operations_attempted, attempted);
+                assert_eq!(executor.statistics().operations_completed, completed);
+                assert_eq!(executor.queue_writes_attempted(), attempted);
+                assert_eq!(executor.queue_writes_completed(), completed);
+                assert!(executor.project_f32_tokens(&tensor, &activations, true, &mut outputs).is_err());
+                assert_eq!(executor.submitter.activations.len(), expected_calls);
+                assert_eq!(executor.residency_statistics().tensors_prepared, 0);
+            }
+        }
+        Ok(())
     }
     impl NativeQ2Submitter for TransientCapture {
         fn submit(

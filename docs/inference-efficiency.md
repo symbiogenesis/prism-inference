@@ -45,6 +45,21 @@ against the retained original forward, length-first search. Owning hosted checks
 actual-model state/adapter parity and matched complete-request benefit remain
 pending before any performance qualification or default change.
 
+Exact NEON GDN multi-token helpers now reuse the private state staging array for
+decay and update. Each old block is dead after its decay multiplication; each
+decayed block is dead after its checked update. Removing the duplicate array
+eliminates 1 KiB, 4 KiB or 8 KiB of declared staging payload in the one-, four-
+and eight-row helpers, respectively. The two floating passes, reduction trees
+and token order are unchanged. Grouped helpers still publish state and outputs
+only after every token succeeds, and single-row failure still publishes exactly
+the updated finite prefix followed by untouched decayed elements. Caller-owned
+snapshots never share the private staging array. Direct Windows ARM64 controls
+compare all state/output bits with an independent scalar oracle and exercise
+late key-dot, update and query-dot failure without relying on dispatch fallback.
+These are source storage reductions; Release code generation, actual stack use,
+full-model parity and matched request benefit remain pending. No scratch or
+worker-stack admission reserve is reduced.
+
 ## Exact hosted correctness gate
 
 The owner-operated [Inference efficiency candidate workflow](../.github/workflows/inference-efficiency.yml)

@@ -1,8 +1,18 @@
 //! Safe baseline NEON for the exact pinned GDN tree and checked row update.
+//!
+//! Multi-token rows use one private staging array for both decayed and updated
+//! state. Decay consumes the old block before replacing it; the second pass
+//! consumes that decayed block before replacing it with its checked update.
+//! Caller-owned rows remain untouched until the helper's existing publication
+//! point, so grouped fallback and single-row partial-error semantics are retained.
 
 use fearless_simd::{Neon, f32x4, prelude::*};
 
 use crate::Result;
+
+#[cfg(test)]
+#[path = "pinned_gdn_neon_tests.rs"]
+mod tests;
 
 /// Geometry is checked by the parent before any load. The fixed four-register
 /// tree is the scalar reference's tree, including adjacent horizontal pairs.
@@ -742,10 +752,6 @@ fn flush_blocks(state: &mut [f32], blocks: &[[f32x4<Neon>; 4]], count: usize) {
 /// in `[[f32x4<Neon>; 4]; 16]` across tokens, writing `state` to memory only once
 /// after all tokens complete (or flushing exact partial state on a non-finite error).
 #[inline]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep multi-token register-resident NEON GDN row recurrence and exact partial-mutation fallback together."
-)]
 pub(super) fn step_row_tokens_from(
     previous: &[f32],
     state: &mut [f32],
@@ -770,7 +776,6 @@ pub(super) fn step_row_tokens_from(
             f32x4::from_slice(neon, &prev_block[12..16]),
         ];
     }
-    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; 16];
     for (token, input) in inputs.iter().enumerate() {
         let decays = f32x4::splat(neon, input.decay);
         let mut s0 = f32x4::splat(neon, 0.0);
@@ -783,7 +788,7 @@ pub(super) fn step_row_tokens_from(
             let d1 = c1 * decays;
             let d2 = c2 * decays;
             let d3 = c3 * decays;
-            decayed[b] = [d0, d1, d2, d3];
+            current[b] = [d0, d1, d2, d3];
             s0 = d0.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), s0);
             s1 = d1.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), s1);
             s2 = d2.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), s2);
@@ -792,7 +797,7 @@ pub(super) fn step_row_tokens_from(
         let dot_k = match super::super::finite(((s0 + s2) + (s1 + s3)).reduce_sum()) {
             Ok(val) => val,
             Err(err) => {
-                flush_blocks(state, &decayed, blocks);
+                flush_blocks(state, &current, blocks);
                 return Some(Err(err));
             }
         };
@@ -810,7 +815,7 @@ pub(super) fn step_row_tokens_from(
             .zip(input.query.as_chunks::<16>().0)
             .enumerate()
         {
-            let [d0, d1, d2, d3] = decayed[b];
+            let [d0, d1, d2, d3] = current[b];
             let u0 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), d0);
             let u1 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), d1);
             let u2 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), d2);
@@ -822,21 +827,9 @@ pub(super) fn step_row_tokens_from(
                 q2 = u2.mul_add_precise(f32x4::from_slice(neon, &query_block[8..12]), q2);
                 q3 = u3.mul_add_precise(f32x4::from_slice(neon, &query_block[12..16]), q3);
             } else {
-                flush_blocks(state, &current, b);
-                for (rem_b, rem_state) in state
-                    .as_chunks_mut::<16>()
-                    .0
-                    .iter_mut()
-                    .enumerate()
-                    .take(blocks)
-                    .skip(b)
-                {
-                    let [rd0, rd1, rd2, rd3] = decayed[rem_b];
-                    rd0.store_slice(&mut rem_state[0..4]);
-                    rd1.store_slice(&mut rem_state[4..8]);
-                    rd2.store_slice(&mut rem_state[8..12]);
-                    rd3.store_slice(&mut rem_state[12..16]);
-                }
+                // Earlier blocks already contain checked updates; this and
+                // later blocks still contain their exact decayed values.
+                flush_blocks(state, &current, blocks);
                 let state_block = &mut state[b * 16..(b + 1) * 16];
                 for (target_elem, &key_elem) in state_block.iter_mut().zip(key_block) {
                     match super::super::finite(delta.mul_add(key_elem, *target_elem)) {
@@ -1005,7 +998,6 @@ pub(super) fn step_four_rows_tokens_from(
             ];
         }
     }
-    let mut decayed = [[[f32x4::splat(neon, 0.0); 4]; 16]; 4];
     let mut staged_out = [[0.0_f32; 64]; 4];
 
     for (token, input) in inputs.iter().enumerate() {
@@ -1025,7 +1017,7 @@ pub(super) fn step_four_rows_tokens_from(
                 let d1 = c1 * decays;
                 let d2 = c2 * decays;
                 let d3 = c3 * decays;
-                decayed[r][b] = [d0, d1, d2, d3];
+                current[r][b] = [d0, d1, d2, d3];
                 s0[r] = d0.mul_add_precise(k0, s0[r]);
                 s1[r] = d1.mul_add_precise(k1, s1[r]);
                 s2[r] = d2.mul_add_precise(k2, s2[r]);
@@ -1061,7 +1053,7 @@ pub(super) fn step_four_rows_tokens_from(
             let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
             let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
             for r in 0..4 {
-                let [d0, d1, d2, d3] = decayed[r][b];
+                let [d0, d1, d2, d3] = current[r][b];
                 let delta = scales[r];
                 let u0 = delta.mul_add_precise(k0, d0);
                 let u1 = delta.mul_add_precise(k1, d1);
@@ -1244,7 +1236,6 @@ pub(super) fn step_eight_rows_tokens_from(
             ];
         }
     }
-    let mut decayed = [[[f32x4::splat(neon, 0.0); 4]; 16]; 8];
     let mut staged_out = [[0.0_f32; 64]; 8];
 
     for (token, input) in inputs.iter().enumerate() {
@@ -1264,7 +1255,7 @@ pub(super) fn step_eight_rows_tokens_from(
                 let d1 = c1 * decays;
                 let d2 = c2 * decays;
                 let d3 = c3 * decays;
-                decayed[r][b] = [d0, d1, d2, d3];
+                current[r][b] = [d0, d1, d2, d3];
                 s0[r] = d0.mul_add_precise(k0, s0[r]);
                 s1[r] = d1.mul_add_precise(k1, s1[r]);
                 s2[r] = d2.mul_add_precise(k2, s2[r]);
@@ -1300,7 +1291,7 @@ pub(super) fn step_eight_rows_tokens_from(
             let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
             let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
             for r in 0..8 {
-                let [d0, d1, d2, d3] = decayed[r][b];
+                let [d0, d1, d2, d3] = current[r][b];
                 let delta = scales[r];
                 let u0 = delta.mul_add_precise(k0, d0);
                 let u1 = delta.mul_add_precise(k1, d1);
@@ -1365,7 +1356,6 @@ pub(super) fn step_four_rows_tokens_in_place(
             ];
         }
     }
-    let mut decayed = [[[f32x4::splat(neon, 0.0); 4]; 16]; 4];
 
     for input in inputs {
         let decays = f32x4::splat(neon, input.decay);
@@ -1384,7 +1374,7 @@ pub(super) fn step_four_rows_tokens_in_place(
                 let d1 = c1 * decays;
                 let d2 = c2 * decays;
                 let d3 = c3 * decays;
-                decayed[r][b] = [d0, d1, d2, d3];
+                current[r][b] = [d0, d1, d2, d3];
                 s0[r] = d0.mul_add_precise(k0, s0[r]);
                 s1[r] = d1.mul_add_precise(k1, s1[r]);
                 s2[r] = d2.mul_add_precise(k2, s2[r]);
@@ -1420,7 +1410,7 @@ pub(super) fn step_four_rows_tokens_in_place(
             let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
             let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
             for r in 0..4 {
-                let [d0, d1, d2, d3] = decayed[r][b];
+                let [d0, d1, d2, d3] = current[r][b];
                 let delta = scales[r];
                 let u0 = delta.mul_add_precise(k0, d0);
                 let u1 = delta.mul_add_precise(k1, d1);
@@ -1478,7 +1468,6 @@ pub(super) fn step_eight_rows_tokens_in_place(
             ];
         }
     }
-    let mut decayed = [[[f32x4::splat(neon, 0.0); 4]; 16]; 8];
 
     for input in inputs {
         let decays = f32x4::splat(neon, input.decay);
@@ -1497,7 +1486,7 @@ pub(super) fn step_eight_rows_tokens_in_place(
                 let d1 = c1 * decays;
                 let d2 = c2 * decays;
                 let d3 = c3 * decays;
-                decayed[r][b] = [d0, d1, d2, d3];
+                current[r][b] = [d0, d1, d2, d3];
                 s0[r] = d0.mul_add_precise(k0, s0[r]);
                 s1[r] = d1.mul_add_precise(k1, s1[r]);
                 s2[r] = d2.mul_add_precise(k2, s2[r]);
@@ -1533,7 +1522,7 @@ pub(super) fn step_eight_rows_tokens_in_place(
             let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
             let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
             for r in 0..8 {
-                let [d0, d1, d2, d3] = decayed[r][b];
+                let [d0, d1, d2, d3] = current[r][b];
                 let delta = scales[r];
                 let u0 = delta.mul_add_precise(k0, d0);
                 let u1 = delta.mul_add_precise(k1, d1);

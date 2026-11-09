@@ -3440,9 +3440,8 @@ pub(crate) fn rms_norm_swiglu_in_place<const PINNED: bool>(
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    if PINNED
-        && let Some(result) =
-            neon::rms_norm_scale_pinned_swiglu_in_place(values, weight, scale, gate)
+    if let Some(result) =
+        neon::rms_norm_scale_swiglu_in_place::<PINNED>(values, weight, scale, gate)
     {
         return result;
     }
@@ -3480,9 +3479,8 @@ pub(crate) fn rms_norm_swiglu_into<const PINNED: bool>(
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    if PINNED
-        && let Some(result) =
-            neon::rms_norm_scale_pinned_swiglu_into(input, weight, scale, gate, output)
+    if let Some(result) =
+        neon::rms_norm_scale_swiglu_into::<PINNED>(input, weight, scale, gate, output)
     {
         return result;
     }
@@ -3848,8 +3846,9 @@ pub(crate) fn hadamard_into(
     clippy::too_many_arguments,
     reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
 )]
-pub(crate) fn hadamard_grouped_block_into(
+pub(crate) fn hadamard_grouped_strided_block_into(
     input: &[f32],
+    head_stride: usize,
     signs: Option<&[f32]>,
     block_idx: usize,
     heads_per_block: usize,
@@ -3860,6 +3859,7 @@ pub(crate) fn hadamard_grouped_block_into(
 ) -> Result<()> {
     if !output.len().is_power_of_two()
         || ssm_head == 0
+        || head_stride < ssm_head
         || output.len() != heads_per_block.saturating_mul(ssm_head)
     {
         return Err(invalid("Hadamard requires a finite power-of-two block"));
@@ -3874,8 +3874,9 @@ pub(crate) fn hadamard_grouped_block_into(
     {
         let count = u32::try_from(output.len())?;
         let normalization = 1.0 / integer_float(i32::try_from(count)?).sqrt();
-        if let Some(result) = neon::hadamard_grouped_block_into(
+        if let Some(result) = neon::hadamard_grouped_strided_block_into(
             input,
+            head_stride,
             signs,
             block_idx,
             heads_per_block,
@@ -3892,7 +3893,7 @@ pub(crate) fn hadamard_grouped_block_into(
         let target_head = block_idx * heads_per_block + h;
         let key = target_head / repetitions;
         let repeat = target_head % repetitions;
-        let source = (repeat * ssm_keys + key) * ssm_head;
+        let source = (repeat * ssm_keys + key) * head_stride;
         let target = target_head * ssm_head;
         let in_head = &input[source..source + ssm_head];
         if let Some(signs) = signs {
@@ -3902,6 +3903,34 @@ pub(crate) fn hadamard_grouped_block_into(
         }
     }
     hadamard(output)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
+)]
+pub(crate) fn hadamard_grouped_block_into(
+    input: &[f32],
+    signs: Option<&[f32]>,
+    block_idx: usize,
+    heads_per_block: usize,
+    repetitions: usize,
+    ssm_keys: usize,
+    ssm_head: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    hadamard_grouped_strided_block_into(
+        input,
+        ssm_head,
+        signs,
+        block_idx,
+        heads_per_block,
+        repetitions,
+        ssm_keys,
+        ssm_head,
+        output,
+    )
 }
 
 #[allow(

@@ -778,6 +778,7 @@ pub(super) fn recurrent_tile<'a>(
             },
         )?;
     }
+    let mut output_reuse = TileReuse::default();
     if tile.projector.row_parallelism().workers() > 1 && geometry.ssm_values > 1 {
         if chunkwise {
             for _ in 0..geometry.ssm_values {
@@ -886,12 +887,65 @@ pub(super) fn recurrent_tile<'a>(
                 Ok(())
             },
         )?;
-        for head_index in 0..geometry.ssm_values {
-            let head_out =
-                &tile.gdn_head_outputs[head_index * head_out_len..(head_index + 1) * head_out_len];
-            for token in 0..count {
-                tile.attended[token][head_index * width..(head_index + 1) * width]
-                    .copy_from_slice(&head_out[token * width..(token + 1) * width]);
+        if transforms.can_grouped_block_hadamard(&layer.output, geometry) && adapter.is_none() {
+            let head_outputs = &tile.gdn_head_outputs;
+            let parallelism = tile.projector.row_parallelism();
+            if count > 1 {
+                let single_worker = crate::kernels::RowParallelism::default();
+                parallelism.update_chunks(
+                    &mut tile.transformed[..count],
+                    1,
+                    |base_tok, chunk| {
+                        for (offset, target) in chunk.iter_mut().enumerate() {
+                            let tok = base_tok + offset;
+                            transforms.transform_grouped_strided_into_with_parallelism(
+                                &head_outputs[tok * width..],
+                                head_out_len,
+                                geometry,
+                                &single_worker,
+                                target,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                transforms.transform_grouped_strided_into_with_parallelism(
+                    head_outputs,
+                    head_out_len,
+                    geometry,
+                    parallelism,
+                    &mut tile.transformed[0],
+                )?;
+            }
+            output_reuse = TileReuse {
+                basis: Some(&layer.output),
+                prepared: None,
+            };
+        } else if count > 1 {
+            let head_outputs = &tile.gdn_head_outputs;
+            let ssm_values = geometry.ssm_values;
+            tile.projector.row_parallelism().update_chunks(
+                &mut tile.attended[..count],
+                1,
+                |base_tok, chunk| {
+                    for (offset, attended_tok) in chunk.iter_mut().enumerate() {
+                        let tok = base_tok + offset;
+                        for head_index in 0..ssm_values {
+                            let src_start = head_index * head_out_len + tok * width;
+                            attended_tok[head_index * width..(head_index + 1) * width]
+                                .copy_from_slice(&head_outputs[src_start..src_start + width]);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for head_index in 0..geometry.ssm_values {
+                let head_out = &tile.gdn_head_outputs
+                    [head_index * head_out_len..(head_index + 1) * head_out_len];
+                tile.attended[0][head_index * width..(head_index + 1) * width]
+                    .copy_from_slice(&head_out[..width]);
             }
         }
         if chunkwise {
@@ -992,7 +1046,7 @@ pub(super) fn recurrent_tile<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
-        TileReuse::default(),
+        output_reuse,
         &layer.output,
         &tile.attended[..count],
         &mut tile.attention[..count],

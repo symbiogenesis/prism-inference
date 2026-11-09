@@ -1624,6 +1624,71 @@ impl Transforms {
         )
     }
 
+    pub(super) fn can_grouped_block_hadamard(&self, weight: &Tensor, geometry: &Geometry) -> bool {
+        let len = geometry.value_width();
+        self.weights.contains(&weight.name)
+            && self.grouped_values
+            && weight.name.ends_with(".ssm_out.weight")
+            && self.block >= 64
+            && self.block.is_power_of_two()
+            && geometry.ssm_head > 0
+            && self.block.is_multiple_of(geometry.ssm_head)
+            && len > 0
+            && len.is_multiple_of(self.block)
+            && self.signs.get(&len).is_none_or(|signs| signs.len() >= len)
+    }
+
+    pub(super) fn transform_grouped_strided_into_with_parallelism(
+        &self,
+        input: &[f32],
+        head_stride: usize,
+        geometry: &Geometry,
+        parallelism: &RowParallelism,
+        transformed: &mut Vec<f32>,
+    ) -> Result<()> {
+        let len = geometry.value_width();
+        resize_into(len, transformed)?;
+        let repetitions = geometry.ssm_values / geometry.ssm_keys;
+        let valid_signs = self
+            .signs
+            .get(&len)
+            .map(Vec::as_slice)
+            .filter(|signs| signs.len() >= len);
+        let heads_per_block = self.block / geometry.ssm_head;
+        if parallelism.workers() > 1 && self.block >= 256 && len >= self.block.saturating_mul(2) {
+            return parallelism.update_chunks(transformed, self.block, |base_block, chunk| {
+                for (local_idx, out_block) in chunk.chunks_exact_mut(self.block).enumerate() {
+                    crate::kernels::hadamard_grouped_strided_block_into(
+                        input,
+                        head_stride,
+                        valid_signs,
+                        base_block + local_idx,
+                        heads_per_block,
+                        repetitions,
+                        geometry.ssm_keys,
+                        geometry.ssm_head,
+                        out_block,
+                    )?;
+                }
+                Ok(())
+            });
+        }
+        for (block_idx, out_block) in transformed.chunks_exact_mut(self.block).enumerate() {
+            crate::kernels::hadamard_grouped_strided_block_into(
+                input,
+                head_stride,
+                valid_signs,
+                block_idx,
+                heads_per_block,
+                repetitions,
+                geometry.ssm_keys,
+                geometry.ssm_head,
+                out_block,
+            )?;
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "Keep grouped-value permutation, fused sign-Hadamard blocks, and parallel chunking together."
@@ -1637,6 +1702,17 @@ impl Transforms {
         transformed: &mut Vec<f32>,
     ) -> Result<()> {
         if self.grouped_values && weight.name.ends_with(".ssm_out.weight") {
+            if self.can_grouped_block_hadamard(weight, geometry)
+                && input.len() == geometry.value_width()
+            {
+                return self.transform_grouped_strided_into_with_parallelism(
+                    input,
+                    geometry.ssm_head,
+                    geometry,
+                    parallelism,
+                    transformed,
+                );
+            }
             resize_into(input.len(), transformed)?;
             let repetitions = geometry.ssm_values / geometry.ssm_keys;
             let valid_signs = self
@@ -1644,54 +1720,6 @@ impl Transforms {
                 .get(&input.len())
                 .map(Vec::as_slice)
                 .filter(|signs| signs.len() >= input.len());
-            if self.block >= 64
-                && self.block.is_power_of_two()
-                && geometry.ssm_head > 0
-                && self.block.is_multiple_of(geometry.ssm_head)
-                && input.len().is_multiple_of(self.block)
-                && (valid_signs.is_some() || !self.signs.contains_key(&input.len()))
-            {
-                let heads_per_block = self.block / geometry.ssm_head;
-                if parallelism.workers() > 1
-                    && self.block >= 256
-                    && input.len() >= self.block.saturating_mul(2)
-                {
-                    return parallelism.update_chunks(
-                        transformed,
-                        self.block,
-                        |base_block, chunk| {
-                            for (local_idx, out_block) in
-                                chunk.chunks_exact_mut(self.block).enumerate()
-                            {
-                                crate::kernels::hadamard_grouped_block_into(
-                                    input,
-                                    valid_signs,
-                                    base_block + local_idx,
-                                    heads_per_block,
-                                    repetitions,
-                                    geometry.ssm_keys,
-                                    geometry.ssm_head,
-                                    out_block,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    );
-                }
-                for (block_idx, out_block) in transformed.chunks_exact_mut(self.block).enumerate() {
-                    crate::kernels::hadamard_grouped_block_into(
-                        input,
-                        valid_signs,
-                        block_idx,
-                        heads_per_block,
-                        repetitions,
-                        geometry.ssm_keys,
-                        geometry.ssm_head,
-                        out_block,
-                    )?;
-                }
-                return Ok(());
-            }
             if let Some(signs) = valid_signs {
                 for key in 0..geometry.ssm_keys {
                     for repeat in 0..repetitions {

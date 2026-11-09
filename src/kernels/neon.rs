@@ -1777,8 +1777,40 @@ pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut sum = 0.0_f64;
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    let (in_chunks, in_tail) = input.as_chunks::<4>();
-    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    let (in_blocks16, in_rem16) = input.as_chunks::<16>();
+    let (w_blocks16, w_rem16) = weight.as_chunks::<16>();
+    for (in_b, w_b) in in_blocks16.iter().zip(w_blocks16) {
+        let v0 = f32x4::from_slice(neon, &in_b[0..4]);
+        let v1 = f32x4::from_slice(neon, &in_b[4..8]);
+        let v2 = f32x4::from_slice(neon, &in_b[8..12]);
+        let v3 = f32x4::from_slice(neon, &in_b[12..16]);
+        let w0 = f32x4::from_slice(neon, &w_b[0..4]);
+        let w1 = f32x4::from_slice(neon, &w_b[4..8]);
+        let w2 = f32x4::from_slice(neon, &w_b[8..12]);
+        let w3 = f32x4::from_slice(neon, &w_b[12..16]);
+        finite_mask = finite_mask
+            & v0.is_finite()
+            & w0.is_finite()
+            & v1.is_finite()
+            & w1.is_finite()
+            & v2.is_finite()
+            & w2.is_finite()
+            & v3.is_finite()
+            & w3.is_finite();
+        for sq in [
+            (v0 * v0).to_array(),
+            (v1 * v1).to_array(),
+            (v2 * v2).to_array(),
+            (v3 * v3).to_array(),
+        ] {
+            sum += f64::from(sq[0]);
+            sum += f64::from(sq[1]);
+            sum += f64::from(sq[2]);
+            sum += f64::from(sq[3]);
+        }
+    }
+    let (in_chunks, in_tail) = in_rem16.as_chunks::<4>();
+    let (w_chunks, w_tail) = w_rem16.as_chunks::<4>();
     for (in_chunk, w_chunk) in in_chunks.iter().zip(w_chunks) {
         let v = f32x4::from_slice(neon, in_chunk);
         let w = f32x4::from_slice(neon, w_chunk);
@@ -1813,9 +1845,46 @@ pub(super) fn add_rms_norm_squares(
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut sum = 0.0_f64;
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    let (val_chunks, val_tail) = values.as_chunks_mut::<4>();
-    let (d_chunks, d_tail) = delta.as_chunks::<4>();
-    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    let (val_blocks16, val_rem16) = values.as_chunks_mut::<16>();
+    let (d_blocks16, d_rem16) = delta.as_chunks::<16>();
+    let (w_blocks16, w_rem16) = weight.as_chunks::<16>();
+    for ((val_b, d_b), w_b) in val_blocks16.iter_mut().zip(d_blocks16).zip(w_blocks16) {
+        let v0 = f32x4::from_slice(neon, &val_b[0..4]) + f32x4::from_slice(neon, &d_b[0..4]);
+        let v1 = f32x4::from_slice(neon, &val_b[4..8]) + f32x4::from_slice(neon, &d_b[4..8]);
+        let v2 = f32x4::from_slice(neon, &val_b[8..12]) + f32x4::from_slice(neon, &d_b[8..12]);
+        let v3 = f32x4::from_slice(neon, &val_b[12..16]) + f32x4::from_slice(neon, &d_b[12..16]);
+        v0.store_slice(&mut val_b[0..4]);
+        v1.store_slice(&mut val_b[4..8]);
+        v2.store_slice(&mut val_b[8..12]);
+        v3.store_slice(&mut val_b[12..16]);
+        let w0 = f32x4::from_slice(neon, &w_b[0..4]);
+        let w1 = f32x4::from_slice(neon, &w_b[4..8]);
+        let w2 = f32x4::from_slice(neon, &w_b[8..12]);
+        let w3 = f32x4::from_slice(neon, &w_b[12..16]);
+        finite_mask = finite_mask
+            & v0.is_finite()
+            & w0.is_finite()
+            & v1.is_finite()
+            & w1.is_finite()
+            & v2.is_finite()
+            & w2.is_finite()
+            & v3.is_finite()
+            & w3.is_finite();
+        for sq in [
+            (v0 * v0).to_array(),
+            (v1 * v1).to_array(),
+            (v2 * v2).to_array(),
+            (v3 * v3).to_array(),
+        ] {
+            sum += f64::from(sq[0]);
+            sum += f64::from(sq[1]);
+            sum += f64::from(sq[2]);
+            sum += f64::from(sq[3]);
+        }
+    }
+    let (val_chunks, val_tail) = val_rem16.as_chunks_mut::<4>();
+    let (d_chunks, d_tail) = d_rem16.as_chunks::<4>();
+    let (w_chunks, w_tail) = w_rem16.as_chunks::<4>();
     for ((val_chunk, d_chunk), w_chunk) in val_chunks.iter_mut().zip(d_chunks).zip(w_chunks) {
         let v = f32x4::from_slice(neon, val_chunk) + f32x4::from_slice(neon, d_chunk);
         v.store_slice(val_chunk);
@@ -1939,9 +2008,43 @@ pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
 #[inline]
 #[allow(
     clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for pinned RMSNorm followed by pinned SwiGLU."
+    reason = "Preserve separate binary32 product roundings for both RMSNorm and SwiGLU contracts."
 )]
-pub(super) fn rms_norm_scale_pinned_swiglu_in_place(
+fn rms_norm_swiglu_x4<const PINNED: bool>(
+    neon: Neon,
+    v: f32x4<Neon>,
+    w: f32x4<Neon>,
+    scale_vec: f32x4<Neon>,
+    g: f32x4<Neon>,
+) -> (f32x4<Neon>, fearless_simd::mask32x4<Neon>) {
+    let zero = f32x4::splat(neon, 0.0);
+    let one = f32x4::splat(neon, 1.0);
+    if PINNED {
+        let norm = (v * w) * scale_vec;
+        let out = (g * norm) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g));
+        (out, norm.is_finite())
+    } else {
+        let norm = (v * scale_vec) * w;
+        let g_arr = g.to_array();
+        let exp_neg = f32x4::load_array(
+            neon,
+            [
+                (-g_arr[0]).exp(),
+                (-g_arr[1]).exp(),
+                (-g_arr[2]).exp(),
+                (-g_arr[3]).exp(),
+            ],
+        );
+        (norm * (g / (one + exp_neg)), norm.is_finite())
+    }
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product roundings for both RMSNorm and SwiGLU contracts."
+)]
+pub(super) fn rms_norm_scale_swiglu_in_place<const PINNED: bool>(
     values: &mut [f32],
     weight: &[f32],
     scale: f32,
@@ -1949,30 +2052,60 @@ pub(super) fn rms_norm_scale_pinned_swiglu_in_place(
 ) -> Option<Result<()>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let scale_vec = f32x4::splat(neon, scale);
-    let zero = f32x4::splat(neon, 0.0);
-    let one = f32x4::splat(neon, 1.0);
-    let mut finite_mask = zero.is_finite();
-    let (val_chunks, val_tail) = values.as_chunks_mut::<4>();
-    let (w_chunks, w_tail) = weight.as_chunks::<4>();
-    let (g_chunks, g_tail) = gate.as_chunks::<4>();
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (val_blocks8, val_rem8) = values.as_chunks_mut::<8>();
+    let (w_blocks8, w_rem8) = weight.as_chunks::<8>();
+    let (g_blocks8, g_rem8) = gate.as_chunks::<8>();
+    for ((val_b, w_b), g_b) in val_blocks8.iter_mut().zip(w_blocks8).zip(g_blocks8) {
+        let (out0, f0) = rms_norm_swiglu_x4::<PINNED>(
+            neon,
+            f32x4::from_slice(neon, &val_b[0..4]),
+            f32x4::from_slice(neon, &w_b[0..4]),
+            scale_vec,
+            f32x4::from_slice(neon, &g_b[0..4]),
+        );
+        let (out1, f1) = rms_norm_swiglu_x4::<PINNED>(
+            neon,
+            f32x4::from_slice(neon, &val_b[4..8]),
+            f32x4::from_slice(neon, &w_b[4..8]),
+            scale_vec,
+            f32x4::from_slice(neon, &g_b[4..8]),
+        );
+        finite_mask &= f0 & f1;
+        out0.store_slice(&mut val_b[0..4]);
+        out1.store_slice(&mut val_b[4..8]);
+    }
+    let (val_chunks, val_tail) = val_rem8.as_chunks_mut::<4>();
+    let (w_chunks, w_tail) = w_rem8.as_chunks::<4>();
+    let (g_chunks, g_tail) = g_rem8.as_chunks::<4>();
     for ((val_chunk, w_chunk), g_chunk) in val_chunks.iter_mut().zip(w_chunks).zip(g_chunks) {
-        let v = f32x4::from_slice(neon, val_chunk);
-        let w = f32x4::from_slice(neon, w_chunk);
-        let g = f32x4::from_slice(neon, g_chunk);
-        let norm = (v * w) * scale_vec;
-        finite_mask &= norm.is_finite();
-        let out = (g * norm) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g));
+        let (out, f) = rms_norm_swiglu_x4::<PINNED>(
+            neon,
+            f32x4::from_slice(neon, val_chunk),
+            f32x4::from_slice(neon, w_chunk),
+            scale_vec,
+            f32x4::from_slice(neon, g_chunk),
+        );
+        finite_mask &= f;
         out.store_slice(val_chunk);
     }
     if !finite_mask.all_true() {
         return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for ((value, &w), &g) in val_tail.iter_mut().zip(w_tail).zip(g_tail) {
-        let norm = (*value * w) * scale;
+        let norm = if PINNED {
+            (*value * w) * scale
+        } else {
+            (*value * scale) * w
+        };
         if !norm.is_finite() {
             return Some(Err(crate::invalid("nonfinite tensor or activation value")));
         }
-        *value = (g * norm) / (1.0 + (-g).exp());
+        *value = if PINNED {
+            (g * norm) / (1.0 + (-g).exp())
+        } else {
+            norm * (g / (1.0 + (-g).exp()))
+        };
     }
     Some(Ok(()))
 }
@@ -1980,9 +2113,9 @@ pub(super) fn rms_norm_scale_pinned_swiglu_in_place(
 #[inline]
 #[allow(
     clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for pinned RMSNorm followed by pinned SwiGLU."
+    reason = "Preserve separate binary32 product roundings for both RMSNorm and SwiGLU contracts."
 )]
-pub(super) fn rms_norm_scale_pinned_swiglu_into(
+pub(super) fn rms_norm_scale_swiglu_into<const PINNED: bool>(
     input: &[f32],
     weight: &[f32],
     scale: f32,
@@ -1991,33 +2124,69 @@ pub(super) fn rms_norm_scale_pinned_swiglu_into(
 ) -> Option<Result<()>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let scale_vec = f32x4::splat(neon, scale);
-    let zero = f32x4::splat(neon, 0.0);
-    let one = f32x4::splat(neon, 1.0);
-    let mut finite_mask = zero.is_finite();
-    let (in_chunks, in_tail) = input.as_chunks::<4>();
-    let (w_chunks, w_tail) = weight.as_chunks::<4>();
-    let (g_chunks, g_tail) = gate.as_chunks::<4>();
-    let (out_chunks, out_tail) = output.as_chunks_mut::<4>();
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (in_blocks8, in_rem8) = input.as_chunks::<8>();
+    let (w_blocks8, w_rem8) = weight.as_chunks::<8>();
+    let (g_blocks8, g_rem8) = gate.as_chunks::<8>();
+    let (out_blocks8, out_rem8) = output.as_chunks_mut::<8>();
+    for (((in_b, w_b), g_b), out_b) in in_blocks8
+        .iter()
+        .zip(w_blocks8)
+        .zip(g_blocks8)
+        .zip(out_blocks8)
+    {
+        let (out0, f0) = rms_norm_swiglu_x4::<PINNED>(
+            neon,
+            f32x4::from_slice(neon, &in_b[0..4]),
+            f32x4::from_slice(neon, &w_b[0..4]),
+            scale_vec,
+            f32x4::from_slice(neon, &g_b[0..4]),
+        );
+        let (out1, f1) = rms_norm_swiglu_x4::<PINNED>(
+            neon,
+            f32x4::from_slice(neon, &in_b[4..8]),
+            f32x4::from_slice(neon, &w_b[4..8]),
+            scale_vec,
+            f32x4::from_slice(neon, &g_b[4..8]),
+        );
+        finite_mask &= f0 & f1;
+        out0.store_slice(&mut out_b[0..4]);
+        out1.store_slice(&mut out_b[4..8]);
+    }
+    let (in_chunks, in_tail) = in_rem8.as_chunks::<4>();
+    let (w_chunks, w_tail) = w_rem8.as_chunks::<4>();
+    let (g_chunks, g_tail) = g_rem8.as_chunks::<4>();
+    let (out_chunks, out_tail) = out_rem8.as_chunks_mut::<4>();
     for (((in_chunk, w_chunk), g_chunk), out_chunk) in
         in_chunks.iter().zip(w_chunks).zip(g_chunks).zip(out_chunks)
     {
-        let v = f32x4::from_slice(neon, in_chunk);
-        let w = f32x4::from_slice(neon, w_chunk);
-        let g = f32x4::from_slice(neon, g_chunk);
-        let norm = (v * w) * scale_vec;
-        finite_mask &= norm.is_finite();
-        let out = (g * norm) / (one + super::pinned_activations::vector_exp_x4(neon, zero - g));
+        let (out, f) = rms_norm_swiglu_x4::<PINNED>(
+            neon,
+            f32x4::from_slice(neon, in_chunk),
+            f32x4::from_slice(neon, w_chunk),
+            scale_vec,
+            f32x4::from_slice(neon, g_chunk),
+        );
+        finite_mask &= f;
         out.store_slice(out_chunk);
     }
     if !finite_mask.all_true() {
         return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for (((&value, &w), &g), out) in in_tail.iter().zip(w_tail).zip(g_tail).zip(out_tail) {
-        let norm = (value * w) * scale;
+        let norm = if PINNED {
+            (value * w) * scale
+        } else {
+            (value * scale) * w
+        };
         if !norm.is_finite() {
             return Some(Err(crate::invalid("nonfinite tensor or activation value")));
         }
-        *out = (g * norm) / (1.0 + (-g).exp());
+        *out = if PINNED {
+            (g * norm) / (1.0 + (-g).exp())
+        } else {
+            norm * (g / (1.0 + (-g).exp()))
+        };
     }
     Some(Ok(()))
 }
@@ -5224,8 +5393,9 @@ pub(super) fn hadamard_into(
     clippy::too_many_arguments,
     reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
 )]
-pub(super) fn hadamard_grouped_block_into(
+pub(super) fn hadamard_grouped_strided_block_into(
     input: &[f32],
+    head_stride: usize,
     signs: Option<&[f32]>,
     block_idx: usize,
     heads_per_block: usize,
@@ -5237,6 +5407,7 @@ pub(super) fn hadamard_grouped_block_into(
 ) -> Option<Result<()>> {
     if values.len() < 64
         || ssm_head < 64
+        || head_stride < ssm_head
         || !ssm_head.is_multiple_of(64)
         || values.len() != heads_per_block.saturating_mul(ssm_head)
     {
@@ -5251,7 +5422,7 @@ pub(super) fn hadamard_grouped_block_into(
         let target_head = block_idx * heads_per_block + h;
         let key = target_head / repetitions;
         let repeat = target_head % repetitions;
-        let source = (repeat * ssm_keys + key) * ssm_head;
+        let source = (repeat * ssm_keys + key) * head_stride;
         let target = target_head * ssm_head;
         let in_head = &input[source..source + ssm_head];
         let s_head = signs.map(|s| &s[target..target + ssm_head]);
@@ -6503,7 +6674,7 @@ mod tests {
                     assert_eq!(a.to_bits(), b.to_bits());
                 }
 
-                for len in [block, block + 3] {
+                for len in [block, block + 3, block + 7] {
                     let gate_vec: Vec<f32> = (0..len)
                         .map(|i| ((i * 53 + 11) % 64) as f32 * 0.0625 - 2.0)
                         .collect();
@@ -6531,9 +6702,31 @@ mod tests {
                         &gate_vec,
                         &mut into_pinned,
                     )?;
+                    let mut exp_source = val_vec.clone();
+                    super::super::rms_norm_in_place(&mut exp_source, &w_vec, 1e-6)?;
+                    for (v, &g) in exp_source.iter_mut().zip(&gate_vec) {
+                        *v *= super::super::silu(g);
+                    }
+                    let mut act_source = val_vec.clone();
+                    super::super::rms_norm_swiglu_in_place::<false>(
+                        &mut act_source,
+                        &w_vec,
+                        1e-6,
+                        &gate_vec,
+                    )?;
+                    let mut into_source = vec![0.0_f32; len];
+                    super::super::rms_norm_swiglu_into::<false>(
+                        &val_vec,
+                        &w_vec,
+                        1e-6,
+                        &gate_vec,
+                        &mut into_source,
+                    )?;
                     for idx in 0..len {
                         assert_eq!(act_pinned[idx].to_bits(), exp_pinned[idx].to_bits());
                         assert_eq!(into_pinned[idx].to_bits(), exp_pinned[idx].to_bits());
+                        assert_eq!(act_source[idx].to_bits(), exp_source[idx].to_bits());
+                        assert_eq!(into_source[idx].to_bits(), exp_source[idx].to_bits());
                     }
                 }
             }
@@ -6541,7 +6734,8 @@ mod tests {
         let ssm_head = 128;
         let ssm_keys = 2;
         let repetitions = 3;
-        let total = ssm_keys * repetitions * ssm_head;
+        let ssm_values = ssm_keys * repetitions;
+        let total = ssm_values * ssm_head;
         let block = 256;
         let heads_per_block = block / ssm_head;
         let input: Vec<f32> = (0..total)
@@ -6550,6 +6744,18 @@ mod tests {
         let signs: Vec<f32> = (0..total)
             .map(|i| if (i * 17 + 3) % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
+        let token_count = 3;
+        let head_out_len = token_count * ssm_head;
+        let mut head_major = vec![0.0_f32; ssm_values * head_out_len];
+        for h in 0..ssm_values {
+            for tok in 0..token_count {
+                let scale = (tok + 1) as f32 * 0.5;
+                for c in 0..ssm_head {
+                    head_major[h * head_out_len + tok * ssm_head + c] =
+                        input[h * ssm_head + c] * scale;
+                }
+            }
+        }
         for sign_opt in [None, Some(signs.as_slice())] {
             for block_idx in 0..(total / block) {
                 let mut exp_block = vec![0.0_f32; block];
@@ -6584,6 +6790,40 @@ mod tests {
                 )?;
                 for (a, b) in act_block.iter().zip(&exp_block) {
                     assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for tok in 0..token_count {
+                    let mut tok_contig = vec![0.0_f32; total];
+                    for h in 0..ssm_values {
+                        let src = h * head_out_len + tok * ssm_head;
+                        tok_contig[h * ssm_head..(h + 1) * ssm_head]
+                            .copy_from_slice(&head_major[src..src + ssm_head]);
+                    }
+                    let mut exp_strided = vec![0.0_f32; block];
+                    super::super::hadamard_grouped_block_into(
+                        &tok_contig,
+                        sign_opt,
+                        block_idx,
+                        heads_per_block,
+                        repetitions,
+                        ssm_keys,
+                        ssm_head,
+                        &mut exp_strided,
+                    )?;
+                    let mut act_strided = vec![0.0_f32; block];
+                    super::super::hadamard_grouped_strided_block_into(
+                        &head_major[tok * ssm_head..],
+                        head_out_len,
+                        sign_opt,
+                        block_idx,
+                        heads_per_block,
+                        repetitions,
+                        ssm_keys,
+                        ssm_head,
+                        &mut act_strided,
+                    )?;
+                    for (a, b) in act_strided.iter().zip(&exp_strided) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
                 }
             }
         }

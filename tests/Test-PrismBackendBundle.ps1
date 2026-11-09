@@ -37,7 +37,7 @@ foreach ($name in @('harness', 'common', 'ggml', 'lora')) {
 }
 $digest = (Get-FileHash -LiteralPath $paths.harness -Algorithm SHA256).Hash.ToLowerInvariant()
 $revision = 'a' * 40
-$toolchain = 'nightly-2026-11-02-aarch64-pc-windows-msvc'
+$toolchain = 'nightly-2026-11-09-aarch64-pc-windows-msvc'
 $patchLock = Get-Content -LiteralPath (Join-Path $runtimeSource 'tools/prism/upstream/reference-patches.lock.json') -Raw | ConvertFrom-Json -AsHashtable
 $receipt = [ordered]@{
     NativePlatform='ARM64'; ProjectRevision=$revision; SourceCommit=$lock.Commit

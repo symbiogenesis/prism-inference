@@ -1,5 +1,5 @@
 {
   "SchemaVersion": 1,
   "StableToolchain": "1.99.1-aarch64-pc-windows-msvc",
-  "NightlyToolchain": "nightly-2026-11-02-aarch64-pc-windows-msvc"
+  "NightlyToolchain": "nightly-2026-11-09-aarch64-pc-windows-msvc"
 }

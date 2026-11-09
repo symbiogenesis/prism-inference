@@ -2,7 +2,7 @@
 # production library; the Rust conformance harness owns all test semantics.
 function(add_prism_rust_ggml_bridge)
   find_program(PRISM_RUSTUP_EXECUTABLE rustup REQUIRED)
-  set(PRISM_RUST_TOOLCHAIN "nightly-2026-11-02" CACHE STRING "Pinned Rust toolchain for the ggml process adapter")
+  set(PRISM_RUST_TOOLCHAIN "nightly-2026-11-09" CACHE STRING "Pinned Rust toolchain for the ggml process adapter")
   if(NOT PRISM_RUST_TOOLCHAIN MATCHES "^[A-Za-z0-9_.-]+$")
     message(FATAL_ERROR "PRISM_RUST_TOOLCHAIN must be one explicit rustup toolchain name")
   endif()

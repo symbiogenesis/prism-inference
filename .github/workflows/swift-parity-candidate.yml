@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-11-02-${{ matrix.target }}
+          toolchain: nightly-2026-11-09-${{ matrix.target }}
       - name: Check native hashing, transactional serving and worker protocol
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -55,12 +55,12 @@ jobs:
           Start-Transcript -LiteralPath (Join-Path $evidence 'checks.log') | Out-Null
           try {
             $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
-            cargo +nightly-2026-11-02 fmt --manifest-path $manifest --all -- --check
-            cargo +nightly-2026-11-02 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
-            cargo +nightly-2026-11-02 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf
-            cargo +nightly-2026-11-02 test --manifest-path $manifest --locked --release -p prism-inference --features parallel-rows --test graph --test swift_session --test swift_worker_request --test swift_worker_output --test swift_sampling --test swift_client
-            cargo +nightly-2026-11-02 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows
-            cargo +nightly-2026-11-02 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --no-deps
+            cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
+            cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference --features parallel-rows --test graph --test swift_session --test swift_worker_request --test swift_worker_output --test swift_sampling --test swift_client
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows
+            cargo +nightly-2026-11-09 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --no-deps
           } finally { Stop-Transcript | Out-Null }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && env.SWIFT_PARITY_EVIDENCE != ''

@@ -29,7 +29,7 @@ foreach ($name in @('LICENSE','NOTICE','PRISM-LICENSE.txt','CAMELID-LICENSE.txt'
 }
 [IO.File]::WriteAllText((Join-Path $fixture 'Cargo.toml'), "[package]`nname = `"prism-inference`"`nversion = `"0.1.2`"`n")
 [IO.File]::WriteAllText((Join-Path $fixture 'server/Cargo.toml'), "[package]`nname = `"prism-inference-server`"`nversion = `"0.1.2`"`n[dependencies]`nbonsai-prism-runtime = { package = `"prism-inference`", path = `"..`", version = `"=0.1.2`" }`n")
-[IO.File]::WriteAllText((Join-Path $fixture 'rust-toolchain.toml'), "[toolchain]`nchannel = `"nightly-2026-11-02`"`n")
+[IO.File]::WriteAllText((Join-Path $fixture 'rust-toolchain.toml'), "[toolchain]`nchannel = `"nightly-2026-11-09`"`n")
 foreach ($name in @('prism-inference.exe','bonsai-token-worker.exe','bonsai-swift-worker.exe','prism-inference-server.exe','bonsai-gguf.exe')) {
     $bytes = [byte[]]::new(128)
     [BitConverter]::GetBytes([uint16]0x5a4d).CopyTo($bytes, 0)
@@ -77,7 +77,7 @@ $parameters = @{
     Target = 'aarch64-pc-windows-msvc'
     SourceRevision = $revision
     Version = '0.1.2'
-    Toolchain = 'nightly-2026-11-02-aarch64-pc-windows-msvc'
+    Toolchain = 'nightly-2026-11-09-aarch64-pc-windows-msvc'
 }
 if ($Case -in @('Identity','Archive','All')) {
     $receipt = & (Join-Path $fixture 'scripts/New-ReleaseBundle.ps1') @parameters
@@ -121,7 +121,7 @@ if ($Case -in @('Identity','All')) {
 if ($Case -in @('Target','All')) {
     $parameters.OutputDirectory = Join-Path $scratch 'wrong-target'
     $parameters.Target = 'x86_64-pc-windows-msvc'
-    $parameters.Toolchain = 'nightly-2026-11-02-x86_64-pc-windows-msvc'
+    $parameters.Toolchain = 'nightly-2026-11-09-x86_64-pc-windows-msvc'
     Assert-BundleRejected $parameters 'Executable target differs'
 }
 if ($Case -in @('Archive','All')) {

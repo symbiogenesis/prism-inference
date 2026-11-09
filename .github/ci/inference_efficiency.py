@@ -9,7 +9,7 @@ import re
 import subprocess
 
 
-TOOLCHAIN = "+nightly-2026-11-02"
+TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
         "kernels::tests::scalar_column_projection_matches_decoded_rows_without_row_storage",

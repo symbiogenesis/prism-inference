@@ -2,7 +2,7 @@
 
 This dependency-free crate compares standalone compiler capabilities using stable
 1.99.1 and the nightly pinned in [configuration](../../config/rust-nightly-trial.json).
-The workspace uses nightly-2026-11-02, whose defaults enable the next trait solver
+The workspace uses nightly-2026-11-09, whose defaults enable the next trait solver
 and Polonius Alpha. Stable is retained only as a compiler-probe control.
 
 ## Stable storage reuse

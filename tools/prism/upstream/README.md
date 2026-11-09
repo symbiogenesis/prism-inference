@@ -173,7 +173,7 @@ repository-name correction. Assets are materialized only in external evidence.
 
 The PQ2/PTQ1 process adapter is implemented in Rust under `bridge/`; its former
 `bridge.cpp` has been removed. `RustBridge.cmake` compiles it with the pinned
-`nightly-2026-11-02` toolchain and links the same production ggml libraries through
+`nightly-2026-11-09` toolchain and links the same production ggml libraries through
 a small reviewed C ABI. The broader `common/` production API bridge is separate.
 Both CMake entry points retain the `prism-upstream-bridge` target and executable
 name. Set `PRISM_RUST_TOOLCHAIN` to select an explicitly installed toolchain;

@@ -18,7 +18,7 @@ param(
     [string]$CMakePath,
     [ValidateSet('Ninja', 'Visual Studio 18 2026', 'Visual Studio 17 2022')][string]$Generator = 'Ninja',
     [ValidateSet('ARM64', 'x64')][string]$NativePlatform = 'ARM64',
-    [string]$Toolchain = 'nightly-2026-11-02',
+    [string]$Toolchain = 'nightly-2026-11-09',
     [string]$CompilerLauncher,
     [ValidateRange(1, 12)][int]$Parallel = 2,
     [ValidateRange(1, 12)][int]$CaseParallel = 2,

@@ -11,7 +11,7 @@ After the [release gates](release-0.1.21.md#installation-and-provenance) pass an
 the tag is published, install its source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-11-02 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.21 prism-inference --locked
+cargo +nightly-2026-11-09 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.21 prism-inference --locked
 prism-inference --help
 ```
 
@@ -103,7 +103,7 @@ Publish the new hash dependency before a registry GGUF release that requires it.
 
 ## Build a checkout
 
-Use the pinned Rust nightly-2026-11-02 and an absolute manifest/target path from
+Use the pinned Rust nightly-2026-11-09 and an absolute manifest/target path from
 a unique system-temp working directory. After fetching locked dependencies:
 
 ```powershell
@@ -114,7 +114,7 @@ $previous = [Environment]::CurrentDirectory
 Push-Location $lane
 try {
     [Environment]::CurrentDirectory = $lane
-    cargo +nightly-2026-11-02-aarch64-pc-windows-msvc build --workspace --bins --locked --offline --release `
+    cargo +nightly-2026-11-09-aarch64-pc-windows-msvc build --workspace --bins --locked --offline --release `
         --manifest-path (Join-Path $repo 'Cargo.toml') `
         --target-dir (Join-Path $lane 'build')
     if ($LASTEXITCODE) { throw 'Prism Inference build failed.' }
@@ -152,7 +152,7 @@ run focused named regressions, from the same external working directory
 convention, for example:
 
 ```powershell
-cargo +nightly-2026-11-02-aarch64-pc-windows-msvc test --locked --offline --release `
+cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline --release `
     --manifest-path <repo>/Cargo.toml --target-dir <temp>/build `
     --test runtime edited_turns_restore_complete_recurrent_prefix_and_failed_stream_rolls_back -- --exact
 ```

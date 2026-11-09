@@ -2,6 +2,6 @@
 # This nightly enables the next trait solver and Polonius Alpha by default.
 # tools/rust-trial/tests/compiler.rs verifies both through ordinary Cargo compilation.
 # Move to the earliest qualifying beta, then stable, once both are promoted.
-channel = "nightly-2026-11-02"
+channel = "nightly-2026-11-09"
 profile = "minimal"
 components = ["clippy", "rustfmt"]

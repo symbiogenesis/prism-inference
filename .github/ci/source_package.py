@@ -59,7 +59,7 @@ def main():
     # Cargo >= 1.90 verifies interdependent unpublished members together.
     selection = [item for name in PACKAGES for item in ("-p", name)]
     run(
-        "cargo", "+nightly-2026-11-02", "package", "--manifest-path",
+        "cargo", "+nightly-2026-11-09", "package", "--manifest-path",
         str(root / "Cargo.toml"), "--registry", "crates-io", "--locked", *selection,
     )
     versions = {
@@ -129,7 +129,7 @@ bonsai-neon-dot = {{ path = "{neon_dot}" }}
     )
     (consumer / "src/main.rs").write_text(CONSUMER, encoding="utf-8")
     manifest = str(consumer / "Cargo.toml")
-    run("cargo", "+nightly-2026-11-02", "generate-lockfile", "--manifest-path", manifest)
+    run("cargo", "+nightly-2026-11-09", "generate-lockfile", "--manifest-path", manifest)
     for features in ("scalar", "default", "parallel-rows"):
         options = {
             "scalar": ("--no-default-features",),
@@ -137,7 +137,7 @@ bonsai-neon-dot = {{ path = "{neon_dot}" }}
             "parallel-rows": ("--features", "parallel-rows"),
         }[features]
         run(
-            "cargo", "+nightly-2026-11-02", "run", "--manifest-path", manifest,
+            "cargo", "+nightly-2026-11-09", "run", "--manifest-path", manifest,
             "--locked", "--release", *options,
         )
     (evidence / "receipt.json").write_text(

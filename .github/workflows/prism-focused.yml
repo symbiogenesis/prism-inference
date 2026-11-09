@@ -57,7 +57,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) { throw 'Prism reference diagnostics require native Windows ARM64.' }
-          $identity = rustc +nightly-2026-11-02-aarch64-pc-windows-msvc -vV
+          $identity = rustc +nightly-2026-11-09-aarch64-pc-windows-msvc -vV
           if ($identity -notcontains 'host: aarch64-pc-windows-msvc') { throw 'Expected native Windows ARM64 Rust.' }
           $identity
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
@@ -89,9 +89,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/SwiftBonsai-PrismUpstreamRust
-          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-11-02-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-${{ hashFiles('src/**', 'tests/upstream_prism/**', 'tests/fixtures/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/prism/src/**', 'tools/prism/build.rs', 'tools/prism/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-content-v2
+          key: prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/source.lock.json') }}-${{ hashFiles('src/**', 'tests/upstream_prism/**', 'tests/fixtures/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/prism/src/**', 'tools/prism/build.rs', 'tools/prism/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-content-v2
           restore-keys: |
-            prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-11-02-
+            prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-11-09-
       - name: Reuse exact pinned upstream native builds
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -131,7 +131,7 @@ jobs:
             RunUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
             Case = $env:PRISM_FOCUSED_CASE
             Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
-            Toolchain = 'nightly-2026-11-02-aarch64-pc-windows-msvc'
+            Toolchain = 'nightly-2026-11-09-aarch64-pc-windows-msvc'
             Generator = 'Visual Studio 18 2026'
             NativePlatform = 'ARM64'
             NativeCompilerIdentity = $env:PRISM_UPSTREAM_NATIVE_HOST
@@ -161,14 +161,14 @@ jobs:
             [void][IO.Directory]::CreateDirectory($downloads)
             $archive = Join-Path $downloads ("prism-$($lock.ArchiveSha256).zip")
             $null = Receive-LockedArtifact -Uri $lock.ArchiveUrl -Path $archive -Bytes $lock.ArchiveBytes -Sha256 $lock.ArchiveSha256 -TimeoutSeconds 600
-              cargo +nightly-2026-11-02-aarch64-pc-windows-msvc fetch --locked --manifest-path (Join-Path $inference 'Cargo.toml')
+              cargo +nightly-2026-11-09-aarch64-pc-windows-msvc fetch --locked --manifest-path (Join-Path $inference 'Cargo.toml')
             if ($env:PRISM_FOCUSED_CASE -ceq 'BackendPlan') {
-              $prepared = & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case BackendOps -PrepareBackendToolsOnly -SourceArchive $archive -EvidenceDirectory $caseEvidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-11-02-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1
+              $prepared = & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case BackendOps -PrepareBackendToolsOnly -SourceArchive $archive -EvidenceDirectory $caseEvidence -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-11-09-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1
               if ($prepared.Status -cne 'backend-tools-ready' -or $prepared.ProjectRevision -cne $env:GITHUB_SHA -or $prepared.FullSourceGate -isnot [bool] -or $prepared.FullSourceGate -ne $false) { throw 'Backend preparation did not produce the expected diagnostic handoff.' }
               $prepared | ConvertTo-Json -Depth 12
               & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismBackend.ps1') -Phase Plan -BundleDirectory $prepared.BackendBundleDirectory -EvidenceDirectory (Join-Path $evidence 'backend-plan') -Index 0 -Benchmarks -Gradients:($env:PRISM_FOCUSED_GRADIENTS -ceq 'true') | ConvertTo-Json -Depth 12
             } else {
-              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case $env:PRISM_FOCUSED_CASE -SourceArchive $archive -EvidenceDirectory $caseEvidence -AssetCacheDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismFixtureDownloads') -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-11-02-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1 | ConvertTo-Json -Depth 12
+              & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismUpstream.ps1') -Case $env:PRISM_FOCUSED_CASE -SourceArchive $archive -EvidenceDirectory $caseEvidence -AssetCacheDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismFixtureDownloads') -TargetDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') -NativeBuildDirectory (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamNative') -Generator 'Visual Studio 18 2026' -NativePlatform ARM64 -Toolchain nightly-2026-11-09-aarch64-pc-windows-msvc -Parallel 4 -CaseParallel 1 | ConvertTo-Json -Depth 12
             }
             $provenance.ControllerStatus = 'complete'
           } catch {

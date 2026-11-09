@@ -41,7 +41,7 @@ function Resolve-PrismRustTool {
     $cargo = (Get-Command -Name cargo -CommandType Application -ErrorAction Stop).Source
     $manifest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $ManifestRelativePath))
     $target = Join-Path $scratch 'target'
-    $arguments = @('+nightly-2026-11-02-aarch64-pc-windows-msvc', 'build', '--locked', '--release', '--manifest-path', $manifest, '--target-dir', $target)
+    $arguments = @('+nightly-2026-11-09-aarch64-pc-windows-msvc', 'build', '--locked', '--release', '--manifest-path', $manifest, '--target-dir', $target)
     $log = Join-Path $scratch ('cargo-build-' + [guid]::NewGuid().ToString('N') + '.log')
     $result = Invoke-BonsaiNativeProcess -Executable $cargo -ArgumentList $arguments -WorkingDirectory $scratch -LogPath $log
     if ($result.ExitCode -ne 0) { throw "Tool build failed; inspect $log`n$($result.StandardError)" }

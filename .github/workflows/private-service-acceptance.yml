@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-11-02-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-09-aarch64-pc-windows-msvc
       - name: Check out the exact reviewed process owner without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,10 +58,10 @@ jobs:
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Private-Service-Check-Build'
           "CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR" >> $env:GITHUB_ENV
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
-          cargo +nightly-2026-11-02 fmt --manifest-path $manifest -p prism-inference-server -- --check
-          cargo +nightly-2026-11-02 clippy --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check -- -D warnings
-          cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
-          cargo +nightly-2026-11-02 build --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
+          cargo +nightly-2026-11-09 fmt --manifest-path $manifest -p prism-inference-server -- --check
+          cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check -- -D warnings
+          cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
+          cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference-server --locked --release --example private_service_check
       - name: Build and check the Prism-owned capture against the exact Runner owner
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -76,10 +76,10 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/private-service-acceptance/owner.rs') -Destination (Join-Path $examples 'prism_private_service_owner.rs')
           $env:PRISM_HARNESS_REVISION = $env:GITHUB_SHA
           $manifest = Join-Path $source 'Cargo.toml'
-          cargo +nightly-2026-11-02 fmt --manifest-path $manifest -p bonsai-broker -- --check
-          cargo +nightly-2026-11-02 clippy --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner -- -D warnings
-          cargo +nightly-2026-11-02 test --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner
-          cargo +nightly-2026-11-02 build --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner
+          cargo +nightly-2026-11-09 fmt --manifest-path $manifest -p bonsai-broker -- --check
+          cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner -- -D warnings
+          cargo +nightly-2026-11-09 test --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner
+          cargo +nightly-2026-11-09 build --manifest-path $manifest -p bonsai-broker --locked --release --example prism_private_service_owner
       - name: Bind the checker to owning main source and run
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -106,7 +106,7 @@ jobs:
             scope = 'harness-preparation-only'
             runnerOwnerRevision = '1914330f8a31769bfe8368ca9728fe7a418ed84e'
             ownerSourceSha256 = (Get-FileHash -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/private-service-acceptance/owner.rs') -Algorithm SHA256).Hash.ToLowerInvariant()
-            compilerIdentity = (& rustc +nightly-2026-11-02 -vV) -join "`n"
+            compilerIdentity = (& rustc +nightly-2026-11-09 -vV) -join "`n"
             files = @([ordered]@{
               name = 'private-service-check.exe'
               bytes = (Get-Item -LiteralPath $checker).Length

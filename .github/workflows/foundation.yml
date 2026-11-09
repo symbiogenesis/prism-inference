@@ -78,7 +78,7 @@ jobs:
       - name: Reuse the exact native Rust compiler
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-11-02-${{ matrix.target }}
+          toolchain: nightly-2026-11-09-${{ matrix.target }}
       - name: Identify the host and external build lane
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -88,7 +88,7 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $identity = rustc "+nightly-2026-11-02-$env:EXPECTED_TARGET" -vV
+          $identity = rustc "+nightly-2026-11-09-$env:EXPECTED_TARGET" -vV
           if ($identity -notcontains "host: $env:EXPECTED_TARGET") { throw 'Expected the native target compiler.' }
           $identity
           "PRISM_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
@@ -108,9 +108,9 @@ jobs:
           # Never seed every shard with the old full-workspace target: retaining
           # only its own outputs keeps restore time and cache quota bounded.
           path: ${{ env.CARGO_TARGET_DIR }}
-          key: prism-runtime-v2-${{ matrix.target }}-${{ matrix.lane }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-02-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', '.github/ci/foundation_shards.py', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
+          key: prism-runtime-v2-${{ matrix.target }}-${{ matrix.lane }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', '.github/ci/foundation_shards.py', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
-            prism-runtime-v2-${{ matrix.target }}-${{ matrix.lane }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-02-
+            prism-runtime-v2-${{ matrix.target }}-${{ matrix.lane }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-
       - name: Fetch the locked workspace and prepare evidence
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -122,7 +122,7 @@ jobs:
           $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
           if (-not $packages.Count) { throw 'A selected Windows lane requires affected packages.' }
           [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
-          cargo +nightly-2026-11-02 fetch --manifest-path $manifest --locked
+          cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
       - name: Save locked downloads once per architecture
         if: matrix.lane == 'correctness-0' && steps.downloads.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -144,10 +144,10 @@ jobs:
           $selection = @($packages | ForEach-Object { '--package'; $_ })
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'workspace.log') | Out-Null
           try {
-            cargo +nightly-2026-11-02 fmt --manifest-path $manifest @selection -- --check
+            cargo +nightly-2026-11-09 fmt --manifest-path $manifest @selection -- --check
             # Native linking is covered separately by the selected overlay gate.
-            cargo +nightly-2026-11-02 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
-            cargo +nightly-2026-11-02 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
+            cargo +nightly-2026-11-09 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
+            cargo +nightly-2026-11-09 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
           } finally { Stop-Transcript | Out-Null }
       - name: Run this shard's complete Cargo correctness targets
         if: startsWith(matrix.lane, 'correctness-')
@@ -186,7 +186,7 @@ jobs:
             }
             if ($buildPackages.Count) {
               $buildSelection = @($buildPackages | ForEach-Object { '--package'; $_ })
-              cargo +nightly-2026-11-02 build --manifest-path $manifest @buildSelection @buildFeatures --bins --locked --offline --release
+              cargo +nightly-2026-11-09 build --manifest-path $manifest @buildSelection @buildFeatures --bins --locked --offline --release
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Check feature variants, scalar fallback and loader ABI
@@ -202,32 +202,32 @@ jobs:
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'feature-variants.log') | Out-Null
           try {
             if ('prism-inference' -cin $packages) {
-              cargo +nightly-2026-11-02 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
-              cargo +nightly-2026-11-02 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
-              cargo +nightly-2026-11-02 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
-              cargo +nightly-2026-11-02 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::packed_pq2::
+              cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
+              cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
+              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
+              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::packed_pq2::
               if ($env:CARGO_BUILD_TARGET -ceq 'aarch64-pc-windows-msvc') {
-                cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::neon::tests::simd_neon_packed_consumption_
+                cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::neon::tests::simd_neon_packed_consumption_
               }
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
             }
             if ('prism-inference-server' -cin $packages) {
-              cargo +nightly-2026-11-02 clippy --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --all-targets -- -D warnings
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_child::tests::
-              cargo +nightly-2026-11-02 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_backend::tests::private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts -- --exact
+              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --all-targets -- -D warnings
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_child::tests::
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_backend::tests::private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts -- --exact
             }
             if ('bonsai-gguf' -cin $packages) {
-              cargo +nightly-2026-11-02 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
+              cargo +nightly-2026-11-09 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
             }
             if ('bonsai-prism' -cin $packages) {
               # Check the loader ABI without enabling the native-tests link feature.
-              cargo +nightly-2026-11-02 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
-              cargo +nightly-2026-11-02 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
+              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
+              cargo +nightly-2026-11-09 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Verify immutable reference fixtures and kill the bounded mutation catalog
@@ -257,7 +257,7 @@ jobs:
             & (Join-Path $build ($name + '.exe')) --help
           }
           $output = Join-Path $env:RUNNER_TEMP ('PrismInference-Bundle-' + [guid]::NewGuid().ToString('N'))
-          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $env:RELEASE_TARGET -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-11-02-$env:RELEASE_TARGET" | ConvertTo-Json -Depth 8
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $env:RELEASE_TARGET -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-11-09-$env:RELEASE_TARGET" | ConvertTo-Json -Depth 8
           "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
       - name: Retain the checked release bundle and source receipt
         if: matrix.lane == 'correctness-0' && needs.changes.outputs.release == 'true'
@@ -287,7 +287,7 @@ jobs:
       - name: Reuse the pinned Linux ARM64 Rust compiler
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-11-02-aarch64-unknown-linux-gnu
+          toolchain: nightly-2026-11-09-aarch64-unknown-linux-gnu
       - name: Identify native Rust for the storage policy and regression
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -295,7 +295,7 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          rustc +nightly-2026-11-02 -vV
+          rustc +nightly-2026-11-09 -vV
       - name: Select the ccache installation identity
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -354,9 +354,9 @@ jobs:
             ~/.cargo/git/db
             ${{ runner.temp }}/SwiftBonsai-PrismRustChecks
             ${{ runner.temp }}/SwiftBonsai-PrismRustBuild
-          key: prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-02-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/**', 'scripts/Build-PrismEngine.ps1', 'scripts/Bonsai.Rust.psm1', 'tests/Test-Rust.ps1', 'config/rust-packages.psd1', 'rust-toolchain.toml') }}-content-v1
+          key: prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/**', 'scripts/Build-PrismEngine.ps1', 'scripts/Bonsai.Rust.psm1', 'tests/Test-Rust.ps1', 'config/rust-packages.psd1', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
-            prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-02-
+            prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-
       - name: Check Rust and build the pinned engine with its Rust storage overlay
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -373,10 +373,10 @@ jobs:
           if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Expected native ARM64 source build.' }
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'tools/prism/Cargo.toml'
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismRustChecks'
-          cargo +nightly-2026-11-02 fetch --manifest-path $manifest --locked
+          cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
           $checks = Join-Path $env:RUNNER_TEMP ('SwiftBonsai-PrismChecks-' + [guid]::NewGuid().ToString('N'))
           "PRISM_CHECK_EVIDENCE=$checks" >> $env:GITHUB_ENV
-          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-11-02 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'policy') -FullTests -Offline | ConvertTo-Json -Depth 8
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-11-09 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'policy') -FullTests -Offline | ConvertTo-Json -Depth 8
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1') -Force
           $lock = Get-Content -Raw -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/prism/source.lock.json') | ConvertFrom-Json
           $lane = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismDownloads'
@@ -395,7 +395,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Native immutable B-sharing regression failed.' }
           $nativeLibraries = @(Get-ChildItem -LiteralPath (Join-Path $result.EvidenceDirectory 'build-probe') -Recurse -File | Where-Object { $_.Name -in @('libggml.a','libggml-cpu.a','libggml-base.a') })
           $env:BONSAI_PRISM_NATIVE_LIB_DIR = @($nativeLibraries.DirectoryName | Sort-Object -Unique) -join [IO.Path]::PathSeparator
-          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-11-02 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'native') -CheckProfile Native -Phase clippy,doc -Offline | ConvertTo-Json -Depth 8
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-11-09 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'native') -CheckProfile Native -Phase clippy,doc -Offline | ConvertTo-Json -Depth 8
           ccache --show-stats
           'Rust sharing policy and native regression passed; pinned engine compiled and linked to Rust. Model TPS/quality remains unqualified.' >> $env:GITHUB_STEP_SUMMARY
       - name: Retain source-build receipts and technical logs

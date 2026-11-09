@@ -2826,7 +2826,8 @@ mod tests {
         }
         // Every output selected for this entrypoint must be cleared on failure.
         if matches!(mode, 0 | 1 | 5 | 7) {
-            assert!(singles[0].is_empty());
+            let empty: &[f32] = &[];
+            assert_eq!(singles[0], empty);
         }
         if mode == 1 {
             assert!(singles[1].is_empty() && singles[2].is_empty());
@@ -2901,7 +2902,7 @@ mod tests {
                 .project_f32(&tensor, &[1.0; 128], true, &mut output)
                 .is_err()
         );
-        assert!(output.is_empty());
+        assert_eq!(output, Vec::<f32>::new());
         assert!(executor.is_faulted());
         assert_eq!(executor.submitter.registry.used_bytes(), 0);
         assert_eq!(executor.submitter.initializations, 1);
@@ -2939,7 +2940,7 @@ mod tests {
         assert_eq!(direct.submitter.copies, 0);
         assert_eq!(direct.submitter.initializations, 4);
         assert_eq!(direct.scratch_weights.capacity(), 0);
-        assert!(!copied.scratch_weights.is_empty());
+        assert_ne!(copied.scratch_weights, Vec::<u8>::new());
         assert_eq!(
             direct.residency_statistics().weight_payload_bytes_prepared,
             4608
@@ -3889,7 +3890,7 @@ mod tests {
                     .project_f32(&tensor, &[1.0; 256], true, &mut output)
                     .is_err()
             );
-            assert!(output.is_empty());
+            assert_eq!(output, Vec::<f32>::new());
             assert_eq!(executor.submitter.mock.calls, expected_calls);
         }
         Ok(())

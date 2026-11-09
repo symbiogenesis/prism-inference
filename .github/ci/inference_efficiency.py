@@ -179,7 +179,8 @@ def test_artifacts(output):
 
 def source_hashes(root):
     """Bind all runtime source and selected fixtures rather than a display version."""
-    files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml"}
+    files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml",
+             root / "clippy.toml"}
     for directory in ["src", "server/src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src",
                       "tools/hexagon-native/src", "tools/hexagon-runtime/src", "tools/neon-dot/src"]:
         files.update((root / directory).rglob("*.rs"))

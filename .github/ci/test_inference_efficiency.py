@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -10,6 +11,28 @@ import inference_efficiency as efficiency  # noqa: E402
 
 
 class EfficiencyReceiptTests(unittest.TestCase):
+    def test_source_identity_binds_the_analyzer_dependency_policy(self):
+        root = Path(__file__).resolve().parents[2]
+        original = efficiency.source_hashes(root)
+        self.assertIn("clippy.toml", original)
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            for name in original:
+                path = fixture / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+            before = efficiency.source_hashes(fixture)
+            (fixture / "clippy.toml").write_text("changed policy", encoding="utf-8")
+            after = efficiency.source_hashes(fixture)
+            self.assertEqual([name for name in before if before[name] != after[name]],
+                             ["clippy.toml"])
+            (fixture / "clippy.toml").unlink()
+            # Missing required policy is an identity failure, not an optional input.
+            with self.assertRaises(FileNotFoundError):
+                efficiency.source_hashes(fixture)
+        policy = (root / "clippy.toml").read_text(encoding="utf-8")
+        self.assertIn('allowed-duplicate-crates = ["windows-sys"]', policy)
+
     def test_exact_control_rejects_zero_ignored_failed_or_duplicate_matches(self):
         output = ("\nrunning 1 test\ntest selected ... ok\n\n"
                   "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.01s\n")

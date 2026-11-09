@@ -1,0 +1,6 @@
+# The pinned bonsai-windows-process 0.1.2 containment boundary uses mxc-sdk 1.0.1,
+# whose winreg 0.55.0 requires windows-sys 0.59.0. Native hashing and other current
+# Windows consumers require 0.61.2. These incompatible requirements cannot be
+# unified without changing a reviewed dependency boundary. Permit only this
+# known duplicate crate; retain every other multiple-crate-versions diagnostic.
+allowed-duplicate-crates = ["windows-sys"]

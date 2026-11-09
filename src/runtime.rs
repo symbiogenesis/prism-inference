@@ -1783,15 +1783,11 @@ mod deadline_tests {
                     let (mut ordinary, ordinary_clock) = seeded()?;
                     let (mut speculative, speculative_clock) = seeded()?;
                     let mut ordinary_output = Vec::new();
-                    let ordinary_completion = ordinary.generate(
-                        prompt,
-                        &options,
-                        &Cancellation::default(),
-                        |token| {
+                    let ordinary_completion =
+                        ordinary.generate(prompt, &options, &Cancellation::default(), |token| {
                             ordinary_output.push(token);
                             Ok(())
-                        },
-                    )?;
+                        })?;
                     let mut speculative_output = Vec::new();
                     let (speculative_completion, stats) = speculative.generate_speculative(
                         prompt,

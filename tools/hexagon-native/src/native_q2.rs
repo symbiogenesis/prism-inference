@@ -2490,14 +2490,21 @@ mod tests {
         let row_size = columns.div_ceil(128) * 5120;
         let activation = (columns * 4).next_multiple_of(512);
         let output = (rows * 4).div_ceil(8).next_multiple_of(128) * 8;
-        let budget = if columns > 6144 { 4 * 1024 * 1024 } else { 2 * 1024 * 1024 };
+        let budget = if columns > 6144 {
+            4 * 1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        };
         for prefetch in [16_u8, 8, 4, 2, 1] {
-            let weights = (usize::from(prefetch) * columns.div_ceil(64) * 640)
-                .next_multiple_of(256) * 8;
+            let weights =
+                (usize::from(prefetch) * columns.div_ceil(64) * 640).next_multiple_of(256) * 8;
             let total = row_size.next_multiple_of(256) + activation.max(output + weights);
             if total <= budget {
-                return Ok((prefetch, u32::try_from(row_size).map_err(|_| Error::Contract)?,
-                    u32::try_from(total).map_err(|_| Error::Contract)?));
+                return Ok((
+                    prefetch,
+                    u32::try_from(row_size).map_err(|_| Error::Contract)?,
+                    u32::try_from(total).map_err(|_| Error::Contract)?,
+                ));
             }
         }
         Err(Error::Contract)
@@ -2510,18 +2517,34 @@ mod tests {
                 let expected = reference_hvx_params(columns, rows)?;
                 let extent = layout(columns, rows).weights;
                 let mut registry = NativeQ2WeightRegistry::new(extent)?;
-                let handle = registry.prepare_validated(columns, rows, extent)?
+                let handle = registry
+                    .prepare_validated(columns, rows, extent)?
                     .ok_or(Error::Contract)?;
                 assert_eq!(handle.hvx_params, expected);
                 let mut actual = [0_u8; 1024];
-                write_member_descriptors(&mut actual, 0, 0, 24, 192, columns, rows,
-                    1024, extent, 4096, 8192, handle.hvx_params)?;
+                write_member_descriptors(
+                    &mut actual,
+                    0,
+                    0,
+                    24,
+                    192,
+                    columns,
+                    rows,
+                    1024,
+                    extent,
+                    4096,
+                    8192,
+                    handle.hvx_params,
+                )?;
                 let kernel = 192 + 72;
                 assert_eq!(actual[kernel], 7);
                 assert_eq!(actual[kernel + 4], 8);
                 assert_eq!(actual[kernel + 6], expected.0);
                 for (offset, value) in [(16, 576), (20, 640), (24, expected.1), (28, expected.2)] {
-                    assert_eq!(&actual[kernel + offset..kernel + offset + 4], &value.to_le_bytes());
+                    assert_eq!(
+                        &actual[kernel + offset..kernel + offset + 4],
+                        &value.to_le_bytes()
+                    );
                 }
             }
         }
@@ -2529,7 +2552,8 @@ mod tests {
     }
 
     #[test]
-    fn native_q2_cached_resident_frame_matches_transient_and_refuses_invalid_plan() -> Result<(), Error> {
+    fn native_q2_cached_resident_frame_matches_transient_and_refuses_invalid_plan()
+    -> Result<(), Error> {
         for columns in [128, 384, 6272] {
             for rows in [32, 96] {
                 let active = layout(columns, rows);
@@ -2538,16 +2562,34 @@ mod tests {
                     tile[512..].fill(0);
                 }
                 let mut registry = NativeQ2WeightRegistry::new(weights.len())?;
-                let handle = registry.prepare(columns, rows, &weights)?.ok_or(Error::Contract)?;
+                let handle = registry
+                    .prepare(columns, rows, &weights)?
+                    .ok_or(Error::Contract)?;
                 let arena_start = (active.output + rows * 4).next_multiple_of(128);
                 let activation: Vec<_> = (0..columns)
-                    .map(|lane| [0.0, -0.0, f32::from_bits(1), -1.5][lane % 4]).collect();
+                    .map(|lane| [0.0, -0.0, f32::from_bits(1), -1.5][lane % 4])
+                    .collect();
                 let mut expected = vec![0xa5_u8; active.allocation];
-                image(&mut expected, 0x1_0000, 17, columns, rows, &weights, &activation)?;
+                image(
+                    &mut expected,
+                    0x1_0000,
+                    17,
+                    columns,
+                    rows,
+                    &weights,
+                    &activation,
+                )?;
                 let mut actual = vec![0xa5_u8; active.allocation];
                 actual[arena_start..arena_start + weights.len()].copy_from_slice(&weights);
-                let frame = image_resident(&mut actual, 0x1_0000, 17, arena_start, &[], &handle,
-                    &activation)?;
+                let frame = image_resident(
+                    &mut actual,
+                    0x1_0000,
+                    17,
+                    arena_start,
+                    &[],
+                    &handle,
+                    &activation,
+                )?;
                 assert_eq!(frame.output, active.output);
                 assert_eq!(frame.n_bufs, 1);
                 assert_eq!(actual, expected);
@@ -2560,7 +2602,9 @@ mod tests {
             assert_eq!(registry.remaining_bytes(), 8192);
         }
         let weights = vec![0_u8; layout(128, 32).weights];
-        let handle = registry.prepare(128, 32, &weights)?.ok_or(Error::Contract)?;
+        let handle = registry
+            .prepare(128, 32, &weights)?
+            .ok_or(Error::Contract)?;
         assert_eq!(registry.range(&handle)?, 0..1152);
         Ok(())
     }

@@ -78,19 +78,11 @@ fn pinned_gdn_decode_capacities_match_independent_scalar_bits() -> Result<()> {
             (-0.25, -0.25, 1.0),
         ] {
             let mut expected = previous.clone();
-            let expected_output =
-                decode_oracle(&mut expected, &key, &query, decay, value, beta)?;
+            let expected_output = decode_oracle(&mut expected, &key, &query, decay, value, beta)?;
             let mut actual = vec![-5.0; width];
-            let actual_output = super::step_row_from(
-                &previous,
-                &mut actual,
-                &key,
-                &query,
-                decay,
-                value,
-                beta,
-            )
-            .ok_or_else(|| invalid("baseline NEON decode was not selected"))??;
+            let actual_output =
+                super::step_row_from(&previous, &mut actual, &key, &query, decay, value, beta)
+                    .ok_or_else(|| invalid("baseline NEON decode was not selected"))??;
             assert_eq!(bits(&actual), bits(&expected));
             assert_eq!(actual_output.to_bits(), expected_output.to_bits());
             let mut in_place = previous.clone();
@@ -120,22 +112,14 @@ fn pinned_gdn_decode_capacities_preserve_failure_and_refusal_bits() -> Result<()
             let mut expected = previous.clone();
             assert!(decode_oracle(&mut expected, &key, &query, 0.875, value, 1.0).is_err());
             let mut actual = vec![-5.0; width];
-            let result = super::step_row_from(
-                &previous,
-                &mut actual,
-                &key,
-                &query,
-                0.875,
-                value,
-                1.0,
-            )
-            .ok_or_else(|| invalid("baseline NEON decode was not selected"))?;
+            let result =
+                super::step_row_from(&previous, &mut actual, &key, &query, 0.875, value, 1.0)
+                    .ok_or_else(|| invalid("baseline NEON decode was not selected"))?;
             assert!(result.is_err());
             assert_eq!(bits(&actual), bits(&expected));
             let mut in_place = previous;
-            let result =
-                super::step_row_in_place(&mut in_place, &key, &query, 0.875, value, 1.0)
-                    .ok_or_else(|| invalid("baseline NEON decode was not selected"))?;
+            let result = super::step_row_in_place(&mut in_place, &key, &query, 0.875, value, 1.0)
+                .ok_or_else(|| invalid("baseline NEON decode was not selected"))?;
             assert!(result.is_err());
             assert_eq!(bits(&in_place), bits(&expected));
         }
@@ -151,10 +135,7 @@ fn pinned_gdn_decode_capacities_preserve_failure_and_refusal_bits() -> Result<()
                 .is_none()
         );
         assert_eq!(bits(&actual), original);
-        assert!(
-            super::step_row_in_place(&mut actual, &key, &query, 0.875, 0.125, 0.625)
-                .is_none()
-        );
+        assert!(super::step_row_in_place(&mut actual, &key, &query, 0.875, 0.125, 0.625).is_none());
         assert_eq!(bits(&actual), original);
     }
     Ok(())

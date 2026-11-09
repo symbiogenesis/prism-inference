@@ -538,6 +538,18 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
+For a separately authorized short packaging operation, the manually dispatched
+[Foundation bundle workflow](../.github/workflows/foundation-bundle.yml) builds
+only those five executables on hosted Windows ARM64. Its one job has a four-minute
+limit; the operator must also bound queueing, monitoring, cancellation and artifact
+retention in the declared total operation allowance. It derives the version from
+matching runtime/server manifests and the server's exact runtime pin, then uses
+the ordinary source-bound bundle producer and genuine GitHub run identity.
+The retained `bundle-scope.json` explicitly leaves full Foundation correctness,
+model acceptance and performance unqualified. This separate workflow cannot serve
+as Foundation's successful-ancestor validation baseline. A missing cache or a
+timeout leaves packaging incomplete; it does not authorize another attempt.
+
 The prepared `0.1.22` GitHub/source release preserves all older full and prerelease artifacts. The
 [release scope](release-0.1.22.md) compares it with `0.1.21` and records its supported delivery, publication gates and
 qualification boundaries. Its Windows credential helper is pinned to Runner revision

@@ -1,0 +1,90 @@
+name: Foundation bundle
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: foundation-bundle-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+  CARGO_BUILD_FINGERPRINT: content
+  CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+jobs:
+  bundle:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bind the package version and external build lane
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/release_version.py') | Out-String).Trim()
+          "PRISM_VERSION=$version" >> $env:GITHUB_ENV
+          "PRISM_CACHE_HOST=$env:ImageOS-$env:ImageVersion-$([Environment]::OSVersion.Version)" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'PrismInference-Target')" >> $env:GITHUB_ENV
+      - name: Reuse the exact native Rust compiler
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-11-09-aarch64-pc-windows-msvc
+      - name: Reuse locked Cargo downloads
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Reuse only the matching ARM64 correctness build artifacts
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: prism-runtime-v2-aarch64-pc-windows-msvc-correctness-0-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', '.github/ci/foundation_shards.py', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1
+          restore-keys: |
+            prism-runtime-v2-aarch64-pc-windows-msvc-correctness-0-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-
+      - name: Build and package only the five release executables
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
+          cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference -p prism-inference-server -p bonsai-gguf --features prism-inference/parallel-rows,prism-inference-server/parallel-rows --bins --locked --offline --release
+          $target = 'aarch64-pc-windows-msvc'
+          $build = Join-Path $env:CARGO_TARGET_DIR "$target/release"
+          foreach ($name in @('prism-inference','bonsai-token-worker','bonsai-swift-worker','prism-inference-server','bonsai-gguf')) {
+            & (Join-Path $build ($name + '.exe')) --help
+          }
+          $output = Join-Path $env:RUNNER_TEMP ('PrismInference-ShortBundle-' + [guid]::NewGuid().ToString('N'))
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $target -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-11-09-$target" | ConvertTo-Json -Depth 8
+          [ordered]@{
+            SchemaVersion = 1
+            Kind = 'hosted-foundation-bundle-only'
+            SourceRevision = $env:GITHUB_SHA
+            Version = $env:PRISM_VERSION
+            Target = $target
+            RunId = $env:GITHUB_RUN_ID
+            RunAttempt = $env:GITHUB_RUN_ATTEMPT
+            FullFoundationQualified = $false
+            ModelAcceptanceQualified = $false
+            PerformanceQualified = $false
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'bundle-scope.json') -Encoding utf8NoBOM
+          "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
+          'This four-minute job builds and packages the five executables only. Full Foundation correctness, model acceptance and performance remain separate pending gates.' >> $env:GITHUB_STEP_SUMMARY
+      - name: Retain the source-bound bundle and explicit limited scope
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prism-inference-${{ env.PRISM_VERSION }}-aarch64-pc-windows-msvc
+          path: |
+            ${{ env.PRISM_BUNDLE_DIRECTORY }}/*.zip
+            ${{ env.PRISM_BUNDLE_DIRECTORY }}/*.receipt.json
+            ${{ env.PRISM_BUNDLE_DIRECTORY }}/bundle-scope.json
+          if-no-files-found: error

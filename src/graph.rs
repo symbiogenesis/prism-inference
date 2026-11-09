@@ -235,8 +235,24 @@ impl Arithmetic {
 
     fn gdn_dot_pair(self, state: &[f32], first: &[f32], second: &[f32]) -> Result<(f32, f32)> {
         match self {
-            Self::Source => Ok((dot(state, first), dot(state, second))),
+            Self::Source => Ok(crate::kernels::float_dot_pair(state, first, second)),
             Self::PinnedSwift => crate::kernels::pinned_gdn::dot_pair(state, first, second),
+        }
+    }
+
+    fn gdn_dot_pair_four_rows(
+        self,
+        states: [&[f32]; 4],
+        first: &[f32],
+        second: &[f32],
+    ) -> Result<[(f32, f32); 4]> {
+        match self {
+            Self::Source => Ok(crate::kernels::float_dot_pair_four_rows(
+                states, first, second,
+            )),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_gdn::dot_pair_four_rows(states, first, second)
+            }
         }
     }
 
@@ -681,6 +697,88 @@ impl Arithmetic {
             }
             Self::PinnedSwift => crate::kernels::pinned_gdn::step_row_tokens_from(
                 previous, state, inputs, row, stride, scale, output,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep 4-row GDN step parameters explicit."
+    )]
+    fn gdn_step_four_rows_from(
+        self,
+        previous: [&[f32]; 4],
+        states: [&mut [f32]; 4],
+        key: &[f32],
+        query: &[f32],
+        decay: f32,
+        values: [f32; 4],
+        beta: f32,
+    ) -> Result<[f32; 4]> {
+        match self {
+            Self::Source => {
+                let [s0, s1, s2, s3] = states;
+                Ok([
+                    self.gdn_step_row_from(previous[0], s0, key, query, decay, values[0], beta)?,
+                    self.gdn_step_row_from(previous[1], s1, key, query, decay, values[1], beta)?,
+                    self.gdn_step_row_from(previous[2], s2, key, query, decay, values[2], beta)?,
+                    self.gdn_step_row_from(previous[3], s3, key, query, decay, values[3], beta)?,
+                ])
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::step_four_rows_from(
+                previous, states, key, query, decay, values, beta,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep 4-row multi-token GDN recurrence parameters explicit."
+    )]
+    fn gdn_step_four_rows_tokens_from(
+        self,
+        previous: [&[f32]; 4],
+        states: [&mut [f32]; 4],
+        inputs: &[crate::kernels::pinned_gdn::ChunkInput<'_>],
+        row: usize,
+        stride: usize,
+        scale: f32,
+        output: &mut [f32],
+    ) -> Result<()> {
+        match self {
+            Self::Source => {
+                let [s0, s1, s2, s3] = states;
+                self.gdn_step_row_tokens_from(previous[0], s0, inputs, row, stride, scale, output)?;
+                self.gdn_step_row_tokens_from(
+                    previous[1],
+                    s1,
+                    inputs,
+                    row + 1,
+                    stride,
+                    scale,
+                    output,
+                )?;
+                self.gdn_step_row_tokens_from(
+                    previous[2],
+                    s2,
+                    inputs,
+                    row + 2,
+                    stride,
+                    scale,
+                    output,
+                )?;
+                self.gdn_step_row_tokens_from(
+                    previous[3],
+                    s3,
+                    inputs,
+                    row + 3,
+                    stride,
+                    scale,
+                    output,
+                )
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::step_four_rows_tokens_from(
+                previous, states, inputs, row, stride, scale, output,
             ),
         }
     }
@@ -3222,14 +3320,45 @@ impl Evaluation<'_, '_> {
                         };
                         let decay = (softplus * layer.decay[head]).exp();
                         let update = sigmoid(beta_ref[head]);
-                        for (((state_row, prev_row), &value), out) in state
-                            .chunks_exact_mut(g.ssm_head)
-                            .zip(prev_state.chunks_exact(g.ssm_head))
-                            .zip(v)
-                            .zip(output.iter_mut())
-                        {
-                            *out = arithmetic.gdn_step_row_from(
-                                prev_row, state_row, k, q, decay, value, update,
+                        let row_stride = g.ssm_head;
+                        let row_count = v.len();
+                        let four_row_blocks = row_count / 4;
+                        for block_idx in 0..four_row_blocks {
+                            let row_idx = block_idx * 4;
+                            let prev_rows = [
+                                &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride],
+                                &prev_state[(row_idx + 1) * row_stride..(row_idx + 2) * row_stride],
+                                &prev_state[(row_idx + 2) * row_stride..(row_idx + 3) * row_stride],
+                                &prev_state[(row_idx + 3) * row_stride..(row_idx + 4) * row_stride],
+                            ];
+                            let state_slice =
+                                &mut state[row_idx * row_stride..(row_idx + 4) * row_stride];
+                            let (s01, s23) = state_slice.split_at_mut(2 * row_stride);
+                            let (s0, s1) = s01.split_at_mut(row_stride);
+                            let (s2, s3) = s23.split_at_mut(row_stride);
+                            let values =
+                                [v[row_idx], v[row_idx + 1], v[row_idx + 2], v[row_idx + 3]];
+                            let outs = arithmetic.gdn_step_four_rows_from(
+                                prev_rows,
+                                [s0, s1, s2, s3],
+                                k,
+                                q,
+                                decay,
+                                values,
+                                update,
+                            )?;
+                            output[row_idx] = outs[0] * scale;
+                            output[row_idx + 1] = outs[1] * scale;
+                            output[row_idx + 2] = outs[2] * scale;
+                            output[row_idx + 3] = outs[3] * scale;
+                        }
+                        for row_idx in (four_row_blocks * 4)..row_count {
+                            let prev_row =
+                                &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride];
+                            let state_row =
+                                &mut state[row_idx * row_stride..(row_idx + 1) * row_stride];
+                            output[row_idx] = arithmetic.gdn_step_row_from(
+                                prev_row, state_row, k, q, decay, v[row_idx], update,
                             )? * scale;
                         }
                         arithmetic.normalize_in_place(output, &layer.norm, g.epsilon)?;

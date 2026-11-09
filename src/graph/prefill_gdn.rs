@@ -48,7 +48,22 @@ fn fill_key_head_dots(
         let row_base = token * 32;
         let query_token = &token_mixed[q_range.clone()];
         let key_token = &token_mixed[k_range.clone()];
-        for (prior, prior_mixed) in mixed[..token].iter().enumerate() {
+        let four_blocks = token / 4;
+        for b in 0..four_blocks {
+            let p = b * 4;
+            let keys = [
+                &mixed[p][k_range.clone()],
+                &mixed[p + 1][k_range.clone()],
+                &mixed[p + 2][k_range.clone()],
+                &mixed[p + 3][k_range.clone()],
+            ];
+            let pairs = arithmetic.gdn_dot_pair_four_rows(keys, query_token, key_token)?;
+            for (i, &(q_dot, k_dot)) in pairs.iter().enumerate() {
+                dots[row_base + p + i] = q_dot;
+                dots[1024 + row_base + p + i] = k_dot;
+            }
+        }
+        for (prior, prior_mixed) in mixed[..token].iter().enumerate().skip(four_blocks * 4) {
             let key_prior = &prior_mixed[k_range.clone()];
             let (q_dot, k_dot) = arithmetic.gdn_dot_pair(key_prior, query_token, key_token)?;
             dots[row_base + prior] = q_dot;
@@ -71,7 +86,22 @@ fn fill_key_head_dots_head_major(
         let row_base = token * 32;
         let query_token = &q_head[token * width..(token + 1) * width];
         let key_token = &k_head[token * width..(token + 1) * width];
-        for prior in 0..token {
+        let four_blocks = token / 4;
+        for b in 0..four_blocks {
+            let p = b * 4;
+            let keys = [
+                &k_head[p * width..(p + 1) * width],
+                &k_head[(p + 1) * width..(p + 2) * width],
+                &k_head[(p + 2) * width..(p + 3) * width],
+                &k_head[(p + 3) * width..(p + 4) * width],
+            ];
+            let pairs = arithmetic.gdn_dot_pair_four_rows(keys, query_token, key_token)?;
+            for (i, &(q_dot, k_dot)) in pairs.iter().enumerate() {
+                dots[row_base + p + i] = q_dot;
+                dots[1024 + row_base + p + i] = k_dot;
+            }
+        }
+        for prior in (four_blocks * 4)..token {
             let key_prior = &k_head[prior * width..(prior + 1) * width];
             let (q_dot, k_dot) = arithmetic.gdn_dot_pair(key_prior, query_token, key_token)?;
             dots[row_base + prior] = q_dot;
@@ -98,13 +128,35 @@ fn exact_head_into(
     };
     let width = first.key.len();
     let scale = 1.0 / small_float(width)?.sqrt();
-    for ((row, prev_row), state_row) in previous
-        .chunks_exact(width)
-        .enumerate()
-        .zip(matrix.chunks_exact_mut(width))
-    {
+    let row_count = previous.len() / width;
+    let four_row_blocks = row_count / 4;
+    for block_idx in 0..four_row_blocks {
+        let r = block_idx * 4;
+        let prev_rows = [
+            &previous[r * width..(r + 1) * width],
+            &previous[(r + 1) * width..(r + 2) * width],
+            &previous[(r + 2) * width..(r + 3) * width],
+            &previous[(r + 3) * width..(r + 4) * width],
+        ];
+        let state_slice = &mut matrix[r * width..(r + 4) * width];
+        let (s01, s23) = state_slice.split_at_mut(2 * width);
+        let (s0, s1) = s01.split_at_mut(width);
+        let (s2, s3) = s23.split_at_mut(width);
+        arithmetic.gdn_step_four_rows_tokens_from(
+            prev_rows,
+            [s0, s1, s2, s3],
+            inputs,
+            r,
+            width,
+            scale,
+            output,
+        )?;
+    }
+    for r in (four_row_blocks * 4)..row_count {
+        let prev_row = &previous[r * width..(r + 1) * width];
+        let state_row = &mut matrix[r * width..(r + 1) * width];
         arithmetic
-            .gdn_step_row_tokens_from(prev_row, state_row, inputs, row, width, scale, output)?;
+            .gdn_step_row_tokens_from(prev_row, state_row, inputs, r, width, scale, output)?;
     }
     Ok(())
 }

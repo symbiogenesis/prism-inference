@@ -1209,6 +1209,43 @@ pub(crate) fn float_dot(weights: &[f32], input: &[f32]) -> f32 {
         .sum::<f64>() as f32
 }
 
+pub(crate) fn float_dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> (f32, f32) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(pair) = neon::float_dot_pair(state, first, second) {
+        return pair;
+    }
+    (float_dot(state, first), float_dot(state, second))
+}
+
+pub(crate) fn float_dot_pair_four_rows(
+    states: [&[f32]; 4],
+    first: &[f32],
+    second: &[f32],
+) -> [(f32, f32); 4] {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(pairs) = neon::float_dot_pair_four_rows(states, first, second) {
+        return pairs;
+    }
+    [
+        float_dot_pair(states[0], first, second),
+        float_dot_pair(states[1], first, second),
+        float_dot_pair(states[2], first, second),
+        float_dot_pair(states[3], first, second),
+    ]
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,

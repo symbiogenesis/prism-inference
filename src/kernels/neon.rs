@@ -1290,6 +1290,19 @@ pub(super) fn block16_all_finite_le(values: &[f32; 16], threshold: f32) -> bool 
 }
 
 #[inline]
+pub(super) fn block16_all_le(values: &[f32; 16], threshold: f32) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let v0 = f32x4::from_slice(neon, &values[0..4]);
+    let v1 = f32x4::from_slice(neon, &values[4..8]);
+    let v2 = f32x4::from_slice(neon, &values[8..12]);
+    let v3 = f32x4::from_slice(neon, &values[12..16]);
+    let t = f32x4::splat(neon, threshold);
+    !(v0.simd_gt(t) | v1.simd_gt(t) | v2.simd_gt(t) | v3.simd_gt(t)).any_true()
+}
+
+#[inline]
 pub(super) fn add_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;
@@ -6230,10 +6243,10 @@ pub(super) fn swiglu_hadamard_block_read_into(
 #[cfg(test)]
 mod tests {
     use super::{
-        block16_all_finite_le, dot, dot_consumption_order, dot_groups, dot_i16_block,
-        dot_ptq1_groups, dot_q4_0_block, dot_q4_0_eight_rows, dot_q4_0_four_rows, dot_q4_1_block,
-        dot_q8_0_block, dot_q8_0_eight_rows, dot_q8_0_four_rows, hadamard, hadamard_into,
-        round_bf16_into, round_f16_into, round_f16_slice,
+        block16_all_finite_le, block16_all_le, dot, dot_consumption_order, dot_groups,
+        dot_i16_block, dot_ptq1_groups, dot_q4_0_block, dot_q4_0_eight_rows, dot_q4_0_four_rows,
+        dot_q4_1_block, dot_q8_0_block, dot_q8_0_eight_rows, dot_q8_0_four_rows, hadamard,
+        hadamard_into, round_bf16_into, round_f16_into, round_f16_slice,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -6574,6 +6587,26 @@ mod tests {
         assert_eq!(row_count, 169);
         assert_eq!(bytes.len(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn simd_neon_block16_all_le_matches_finite_thresholds() {
+        for threshold in [f32::MIN, -0.0, 0.0, f32::from_bits(1), 1.0, f32::MAX] {
+            for lane in 0..16 {
+                for value in [f32::MIN, -0.0, 0.0, f32::from_bits(1), 1.0, f32::MAX] {
+                    let mut block = [threshold; 16];
+                    block[lane] = value;
+                    assert_eq!(
+                        block16_all_le(&block, threshold),
+                        block.iter().all(|&v| v <= threshold)
+                    );
+                    assert_eq!(
+                        block16_all_le(&block, threshold),
+                        block16_all_finite_le(&block, threshold)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid,
-    sampling::{Greedy, Sampler},
+    sampling::{FiniteLogits, Greedy, Sampler},
     speculative::{
         MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixDrafter,
     },
@@ -854,7 +854,9 @@ impl<D: Decoder> Runtime<D> {
         for _ in 0..options.max_tokens {
             check()?;
             let token = measure(&mut effects.timings, GenerationPhase::Sampling, 1, || {
-                effects.sampler.sample(&self.logits)
+                effects
+                    .sampler
+                    .sample_finite(FiniteLogits::from_validated(&self.logits)?)
             })?;
             check()?;
             if !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size()) {
@@ -998,7 +1000,7 @@ impl<D: Decoder> Runtime<D> {
             committed.try_reserve_exact(max_advance)?;
             for &candidate in draft {
                 check()?;
-                let expected = greedy(&self.logits)?;
+                let expected = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
                 if candidate == expected {
                     self.evaluate(candidate, &check)?;
                     stats.target_evaluations += 1;
@@ -1018,7 +1020,7 @@ impl<D: Decoder> Runtime<D> {
             }
             // All draft tokens were accepted; emit one bonus token from the final distribution.
             check()?;
-            let bonus = greedy(&self.logits)?;
+            let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
             self.evaluate(bonus, &check)?;
             stats.target_evaluations += 1;
             committed.push(bonus);
@@ -1148,7 +1150,7 @@ impl<D: Decoder> Runtime<D> {
                 stats.draft_tokens_proposed += draft.len();
                 for &candidate in draft {
                     check()?;
-                    let target_token = greedy(&self.logits)?;
+                    let target_token = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
                     check()?;
                     if target_token != candidate {
                         // No evaluation or callback occurs before correction,
@@ -1175,7 +1177,10 @@ impl<D: Decoder> Runtime<D> {
                 break;
             }
             check()?;
-            let token = correction.map_or_else(|| greedy(&self.logits), Ok)?;
+            let token = correction.map_or_else(
+                || greedy_finite(FiniteLogits::from_validated(&self.logits)?),
+                Ok,
+            )?;
             check()?;
             if options.stop_tokens.contains(&token) {
                 completion.finish = Finish::Stop;
@@ -1219,14 +1224,27 @@ pub fn greedy(logits: &[f32]) -> Result<u32> {
     if logits.is_empty() || logits.len() > 1_048_576 {
         return Err(invalid("greedy sampling requires nonempty finite logits"));
     }
+    Ok(u32::try_from(greedy_inner::<true>(logits)?)?)
+}
+
+pub(crate) fn greedy_finite(logits: FiniteLogits<'_>) -> Result<u32> {
+    Ok(u32::try_from(greedy_inner::<false>(logits.as_slice())?)?)
+}
+
+fn greedy_inner<const VALIDATE: bool>(logits: &[f32]) -> Result<usize> {
     let mut best = 0;
     let mut maximum = logits[0];
-    if !maximum.is_finite() {
+    if VALIDATE && !maximum.is_finite() {
         return Err(invalid("greedy sampling requires nonempty finite logits"));
     }
     let (blocks, remainder) = logits.as_chunks::<16>();
     for (block_index, block) in blocks.iter().enumerate() {
-        if crate::kernels::block16_all_finite_le(block, maximum) {
+        let skip = if VALIDATE {
+            crate::kernels::block16_all_finite_le(block, maximum)
+        } else {
+            crate::kernels::block16_all_le(block, maximum)
+        };
+        if skip {
             continue;
         }
         let base = block_index * 16;
@@ -1234,7 +1252,7 @@ pub fn greedy(logits: &[f32]) -> Result<u32> {
             // Validate every element even after finding an unbeatable maximum.
             // A strict comparison retains the lowest token ID for all ties,
             // including equal positive/negative zero values.
-            if !value.is_finite() {
+            if VALIDATE && !value.is_finite() {
                 return Err(invalid("greedy sampling requires nonempty finite logits"));
             }
             if value > maximum {
@@ -1245,7 +1263,7 @@ pub fn greedy(logits: &[f32]) -> Result<u32> {
     }
     let base = blocks.len() * 16;
     for (offset, &value) in remainder.iter().enumerate() {
-        if !value.is_finite() {
+        if VALIDATE && !value.is_finite() {
             return Err(invalid("greedy sampling requires nonempty finite logits"));
         }
         if value > maximum {
@@ -1253,7 +1271,7 @@ pub fn greedy(logits: &[f32]) -> Result<u32> {
             maximum = value;
         }
     }
-    Ok(u32::try_from(best)?)
+    Ok(best)
 }
 
 #[cfg(test)]
@@ -1414,6 +1432,43 @@ mod deadline_tests {
         assert_eq!(completion.reused_tokens, committed.len());
         let expected = committed.iter().sum::<u32>() % 8;
         assert_eq!(runtime.tokens().last(), Some(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn finite_greedy_matches_checked_selection_across_tiles_and_ties() -> Result<()> {
+        for length in [1_usize, 15, 16, 17, 31, 32, 33, 257, 1_024] {
+            for round in 0..6 {
+                let mut logits = vec![0.0; length];
+                for (index, value) in logits.iter_mut().enumerate() {
+                    *value = match round {
+                        0 => -0.0,
+                        1 => {
+                            if index.is_multiple_of(2) {
+                                -0.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        2 => f32::MIN,
+                        3 => f32::MAX,
+                        4 => f32::from_bits(u32::try_from(index)?),
+                        _ => f32::from(u8::try_from(index % 7)?) - 3.0,
+                    };
+                }
+                let view = FiniteLogits::new(&logits)?;
+                assert_eq!(greedy_finite(view)?, greedy(&logits)?);
+                assert_eq!(Greedy.sample_finite(view)?, Greedy.sample(&logits)?);
+                for index in 0..length {
+                    logits[index] = f32::MAX;
+                    assert_eq!(
+                        greedy_finite(FiniteLogits::new(&logits)?)?,
+                        greedy(&logits)?
+                    );
+                    logits[index] = 0.0;
+                }
+            }
+        }
         Ok(())
     }
 

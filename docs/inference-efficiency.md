@@ -27,6 +27,27 @@ including an otherwise discarded tail candidate, rejects before drawing RNG.
 The reusable allocation survives rejection, and ties, signed zeros, heap order,
 probability arithmetic and the distribution's draws retain their existing contract.
 
+Runtime-owned sampling now passes an immutable `FiniteLogits` view after the
+existing complete decoder-output validation. Public views validate the whole
+nonempty bounded slice once, and their borrow prevents subsequent mutation.
+Greedy selection and the fixed Swift top-20 heap omit finite predicates for
+that view, including the four vector finiteness masks per skipped 16-logit
+NEON block; their threshold comparisons and token order are unchanged. Ordinary
+public sampling still rejects nonfinite values anywhere. Custom `Sampler`
+implementations keep their existing `sample` entry point through the default
+`sample_finite` method; the CLI's sampler wrapper forwards the typed view.
+
+This retains the runtime's original output-size/finite validation before every
+prefix publication, including the last generated token. Only its private
+validated logits and independent snapshots create runtime views. Ingestion
+invalidates old logits; cancellation, malformed output and failed continuation
+restore the earlier validated snapshot and sampler state. Focused controls cover
+all NEON lanes, finite extremes, signed-zero/tie ordering, candidate/probability
+bits, seeded draws, clone/reset/rejection, custom dispatch and decoder failures
+before and after sampling. These are source work reductions, with unchanged
+vocabulary reads, storage, admission and qualification gates; no measured
+request-time or throughput benefit is asserted.
+
 The fixed Swift chain now retains its validated top-p state at sampler
 construction. Native min-p zero returns without mutation, and temperature one
 preserves every admitted finite logit bit, so those identity stages need no

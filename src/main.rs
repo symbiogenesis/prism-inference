@@ -8,7 +8,7 @@ use bonsai_prism_runtime::{
     model::{Model, ModelMetadata},
     prompt_input::read_prompt,
     runtime::{Cancellation, Finish, Generation, Limits, Prefill, Runtime},
-    sampling::{Greedy, ReferenceSampler, Sampler, Sampling},
+    sampling::{FiniteLogits, Greedy, ReferenceSampler, Sampler, Sampling},
     special_input::SpecialInputPolicy,
     special_tokens::SpecialTokens,
     text_output::Utf8Output,
@@ -163,6 +163,13 @@ impl Sampler for DriverSampler {
         match self {
             Self::Greedy(sampler) => sampler.sample(logits),
             Self::Reference(sampler) => sampler.sample(logits),
+        }
+    }
+
+    fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
+        match self {
+            Self::Greedy(sampler) => sampler.sample_finite(logits),
+            Self::Reference(sampler) => sampler.sample_finite(logits),
         }
     }
 }

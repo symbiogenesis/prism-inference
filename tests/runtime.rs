@@ -7,7 +7,7 @@ mod timing;
 use bonsai_prism_runtime::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result,
     runtime::{Cancellation, Finish, Generation, Limits, Prefill, Runtime},
-    sampling::Sampler,
+    sampling::{FiniteLogits, Sampler},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -780,6 +780,110 @@ impl Decoder for Reusing {
         }
         Ok(())
     }
+}
+
+#[test]
+fn validated_sampler_never_receives_invalid_decoder_outputs_and_rolls_back() -> Result<()> {
+    #[derive(Clone)]
+    struct ValidatedSampler {
+        draws: usize,
+        calls: Rc<Cell<usize>>,
+        poison: Rc<Cell<bool>>,
+        fault: Rc<Cell<OutputFault>>,
+    }
+    impl Sampler for ValidatedSampler {
+        fn sample(&mut self, _: &[f32]) -> Result<u32> {
+            Err(std::io::Error::other("runtime must supply its validated view").into())
+        }
+        fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
+            assert!(logits.as_slice().iter().all(|value| value.is_finite()));
+            self.draws += 1;
+            self.calls.set(self.calls.get() + 1);
+            if self.poison.replace(false) {
+                self.fault.set(OutputFault::Nonfinite);
+            }
+            bonsai_prism_runtime::runtime::greedy(logits.as_slice())
+        }
+    }
+    let fault = Rc::new(Cell::new(OutputFault::None));
+    let poison = Rc::new(Cell::new(false));
+    let calls = Rc::new(Cell::new(0));
+    let mut sampler = ValidatedSampler {
+        draws: 0,
+        calls: calls.clone(),
+        poison: poison.clone(),
+        fault: fault.clone(),
+    };
+    let cancellation = Cancellation::default();
+    let mut runtime = Runtime::new(
+        Reusing {
+            inner: decoder(),
+            storage: Rc::new(RefCell::new(Vec::new())),
+            owned_calls: Rc::new(Cell::new(0)),
+            fault: fault.clone(),
+            cancellation: cancellation.clone(),
+        },
+        LIMITS,
+    )?;
+    runtime.generate_sampled(
+        &[1],
+        &options(),
+        Prefill::default(),
+        &cancellation,
+        &mut sampler,
+        |_| Ok(()),
+    )?;
+    assert_eq!(runtime.tokens(), &[1, 1]);
+    assert_eq!(sampler.draws, 1);
+    // Invalid prefill output must fail before the typed sampler is invoked.
+    fault.set(OutputFault::Nonfinite);
+    assert!(
+        runtime
+            .generate_sampled(
+                &[2],
+                &options(),
+                Prefill::default(),
+                &cancellation,
+                &mut sampler,
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(sampler.draws, 1);
+    assert_eq!(runtime.tokens(), &[1, 1]);
+    // A valid saved prefix may be sampled, but its following invalid decoder
+    // output must roll back both the private logits and caller-owned draws.
+    poison.set(true);
+    assert!(
+        runtime
+            .generate_sampled(
+                &[1, 1],
+                &options(),
+                Prefill::default(),
+                &cancellation,
+                &mut sampler,
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(calls.get(), 2);
+    assert_eq!(sampler.draws, 1);
+    assert_eq!(runtime.tokens(), &[1, 1]);
+    assert!(!runtime.is_faulted());
+    let completion = runtime.generate_sampled(
+        &[1, 1],
+        &options(),
+        Prefill::default(),
+        &cancellation,
+        &mut sampler,
+        |_| Ok(()),
+    )?;
+    assert_eq!(completion.reused_tokens, 2);
+    assert_eq!(runtime.tokens(), &[1, 1, 2]);
+    assert_eq!(sampler.draws, 2);
+    assert_eq!(calls.get(), 3);
+    Ok(())
 }
 
 #[test]

@@ -463,13 +463,29 @@ pub(super) fn top_k_logits(
     keep: usize,
     backing: &mut Vec<Candidate>,
 ) -> Result<()> {
+    top_k_logits_inner::<true>(logits, keep, backing)
+}
+
+pub(super) fn top_k_finite_logits(
+    logits: super::FiniteLogits<'_>,
+    keep: usize,
+    backing: &mut Vec<Candidate>,
+) -> Result<()> {
+    top_k_logits_inner::<false>(logits.as_slice(), keep, backing)
+}
+
+fn top_k_logits_inner<const VALIDATE: bool>(
+    logits: &[f32],
+    keep: usize,
+    backing: &mut Vec<Candidate>,
+) -> Result<()> {
     if keep == 0 || keep > 128 || keep > logits.len() || logits.len() > MAX_CANDIDATES {
         return Err(invalid("bounded logit top-k extent is invalid"));
     }
     backing.clear();
     backing.try_reserve_exact(keep)?;
     for (index, &logit) in logits[..keep].iter().enumerate() {
-        if !logit.is_finite() {
+        if VALIDATE && !logit.is_finite() {
             backing.clear();
             return Err(invalid(
                 "Swift sampling requires the complete finite pinned vocabulary",
@@ -485,12 +501,17 @@ pub(super) fn top_k_logits(
     let tail = &logits[keep..];
     let (blocks, remainder) = tail.as_chunks::<16>();
     for (block_index, block) in blocks.iter().enumerate() {
-        if crate::kernels::block16_all_finite_le(block, backing[0].logit) {
+        let skip = if VALIDATE {
+            crate::kernels::block16_all_finite_le(block, backing[0].logit)
+        } else {
+            crate::kernels::block16_all_le(block, backing[0].logit)
+        };
+        if skip {
             continue;
         }
         let base = keep + block_index * 16;
         for (offset, &logit) in block.iter().enumerate() {
-            if !logit.is_finite() {
+            if VALIDATE && !logit.is_finite() {
                 backing.clear();
                 return Err(invalid(
                     "Swift sampling requires the complete finite pinned vocabulary",
@@ -508,7 +529,7 @@ pub(super) fn top_k_logits(
     }
     let base = keep + blocks.len() * 16;
     for (offset, &logit) in remainder.iter().enumerate() {
-        if !logit.is_finite() {
+        if VALIDATE && !logit.is_finite() {
             backing.clear();
             return Err(invalid(
                 "Swift sampling requires the complete finite pinned vocabulary",

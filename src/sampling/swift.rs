@@ -1,8 +1,8 @@
 //! Fixed Swift sampler bridge to the production Prism candidate/RNG contract.
 
 use super::{
-    Sampler,
-    upstream::{Candidate, Candidates, Config, State, top_k_logits},
+    FiniteLogits, Sampler,
+    upstream::{Candidate, Candidates, Config, State, top_k_finite_logits, top_k_logits},
 };
 use crate::{Result, invalid};
 
@@ -75,10 +75,28 @@ impl Sampler for SwiftSampler {
                 "Swift sampling requires the complete finite pinned vocabulary",
             ));
         }
+        self.sample_selected(|backing| top_k_logits(logits, Self::TOP_K, backing))
+    }
+
+    fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
+        if logits.as_slice().len() != Self::VOCABULARY {
+            return Err(invalid(
+                "Swift sampling requires the complete finite pinned vocabulary",
+            ));
+        }
+        self.sample_selected(|backing| top_k_finite_logits(logits, Self::TOP_K, backing))
+    }
+}
+
+impl SwiftSampler {
+    fn sample_selected(
+        &mut self,
+        select: impl FnOnce(&mut Vec<Candidate>) -> Result<()>,
+    ) -> Result<u32> {
         let mut backing = std::mem::take(&mut self.backing);
-        // Selection validates every logit, including discarded candidates, in
+        // Ordinary selection validates every logit, including discarded candidates, in
         // the same traversal. Preserve reusable storage if that validation fails.
-        if let Err(error) = top_k_logits(logits, Self::TOP_K, &mut backing) {
+        if let Err(error) = select(&mut backing) {
             self.backing = backing;
             return Err(error);
         }
@@ -132,6 +150,60 @@ mod tests {
         distribution.apply(candidates)?;
         let selected = usize::try_from(candidates.selected())?;
         Ok(u32::try_from(candidates.data()[selected].id)?)
+    }
+
+    #[test]
+    fn finite_selection_matches_checked_heap_bits_rng_reset_and_rejection() -> crate::Result<()> {
+        let mut checked = SwiftSampler::new(4242)?;
+        let mut finite = SwiftSampler::new(4242)?;
+        let mut logits = vec![0.0; SwiftSampler::VOCABULARY];
+        for round in 0_usize..32 {
+            if round == 16 {
+                checked.reset();
+                finite.reset();
+            }
+            for (index, logit) in logits.iter_mut().enumerate() {
+                *logit = match round % 8 {
+                    0 => -0.0,
+                    1 => {
+                        if index.is_multiple_of(2) {
+                            -0.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    2 => f32::MIN,
+                    3 => f32::MAX,
+                    4 => f32::from(u8::try_from(index % 7)?) - 3.0,
+                    5 => f32::from(u16::try_from(index / 4)?),
+                    6 => -f32::from(u16::try_from(index / 4)?),
+                    _ => f32::from_bits(u32::try_from(index % 1024)?),
+                };
+            }
+            let expected = checked.sample(&logits)?;
+            let view = super::FiniteLogits::new(&logits)?;
+            let mut independent = finite.clone();
+            assert_eq!(finite.sample_finite(view)?, expected);
+            assert_eq!(independent.sample_finite(view)?, expected);
+            assert_eq!(checked.backing.len(), finite.backing.len());
+            for (original, actual) in checked.backing.iter().zip(&finite.backing) {
+                assert_eq!(actual.id, original.id);
+                assert_eq!(actual.logit.to_bits(), original.logit.to_bits());
+                assert_eq!(actual.probability.to_bits(), original.probability.to_bits());
+            }
+            // Rejected public and typed extents must not consume a draw or
+            // replace the reusable allocation of either path.
+            let allocation = finite.backing.as_ptr();
+            assert!(
+                finite
+                    .sample_finite(super::FiniteLogits::new(&[0.0])?)
+                    .is_err()
+            );
+            assert!(finite.sample(&[f32::NAN]).is_err());
+            assert_eq!(finite.backing.as_ptr(), allocation);
+        }
+        assert_eq!(checked.sample(&logits)?, finite.sample(&logits)?);
+        Ok(())
     }
 
     #[test]

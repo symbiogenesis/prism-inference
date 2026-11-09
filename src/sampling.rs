@@ -12,6 +12,48 @@ pub mod upstream;
 
 pub use swift::SwiftSampler;
 
+/// Immutable, bounded, nonempty logits whose values have already been checked finite.
+///
+/// The borrow prevents mutation for the lifetime of the view. Runtime-owned
+/// views originate only from checked decoder output or its independent snapshot.
+#[derive(Clone, Copy)]
+pub struct FiniteLogits<'a>(&'a [f32]);
+
+impl<'a> FiniteLogits<'a> {
+    /// Validate a borrowed vocabulary without changing its floating-point bits.
+    ///
+    /// # Errors
+    /// Rejects empty, oversized (more than 1,048,576), or nonfinite logits.
+    pub fn new(logits: &'a [f32]) -> Result<Self> {
+        let view = Self::from_validated(logits)?;
+        if !crate::kernels::is_finite_slice(logits) {
+            return Err(invalid(
+                "finite logits require a bounded nonempty finite vocabulary",
+            ));
+        }
+        Ok(view)
+    }
+
+    /// Borrow the original finite values in vocabulary order.
+    #[must_use]
+    pub const fn as_slice(self) -> &'a [f32] {
+        self.0
+    }
+
+    // Runtime::evaluate validates every decoder value before assigning any
+    // token to this prefix. Reuse and rollback restore only independent copies
+    // of that validated output. Keep the O(1) bounds check here: a custom
+    // Decoder may change its reported vocabulary size after Runtime::new.
+    pub(crate) fn from_validated(logits: &'a [f32]) -> Result<Self> {
+        if logits.is_empty() || logits.len() > 1_048_576 {
+            return Err(invalid(
+                "finite logits require a bounded nonempty finite vocabulary",
+            ));
+        }
+        Ok(Self(logits))
+    }
+}
+
 /// Select a token from the complete next-token logits.
 ///
 /// A sampler may retain mutable state. Runtime requests that accept a sampler
@@ -22,6 +64,18 @@ pub trait Sampler {
     /// # Errors
     /// Rejects invalid logits, sampler options, or resource exhaustion.
     fn sample(&mut self, logits: &[f32]) -> Result<u32>;
+
+    /// Select from logits already validated by the caller or runtime.
+    ///
+    /// The default preserves existing custom sampler behavior by delegating to
+    /// [`Self::sample`]. Implementations may omit repeated finite checks while
+    /// retaining their token, probability, tie, RNG and failure semantics.
+    ///
+    /// # Errors
+    /// Returns the same sampler-specific errors as [`Self::sample`].
+    fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
+        self.sample(logits.as_slice())
+    }
 }
 
 /// Deterministic maximum-logit selection, with the lowest token ID winning ties.
@@ -31,6 +85,10 @@ pub struct Greedy;
 impl Sampler for Greedy {
     fn sample(&mut self, logits: &[f32]) -> Result<u32> {
         greedy(logits)
+    }
+
+    fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
+        crate::runtime::greedy_finite(logits)
     }
 }
 
@@ -415,6 +473,41 @@ impl Sampler for ReferenceSampler {
 #[cfg(test)]
 mod tests {
     use super::{ReferenceSampler, Sampler, Sampling};
+
+    #[test]
+    fn finite_logits_preserves_bits_bounds_and_custom_sampler_dispatch() -> crate::Result<()> {
+        let logits = [0.0, -0.0, f32::MIN, f32::MAX, f32::from_bits(1)];
+        let view = super::FiniteLogits::new(&logits)?;
+        assert_eq!(view.as_slice().as_ptr(), logits.as_ptr());
+        assert_eq!(
+            view.as_slice()
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            logits.map(f32::to_bits)
+        );
+        assert!(super::FiniteLogits::new(&[]).is_err());
+        assert!(super::FiniteLogits::new(&vec![0.0; 1_048_577]).is_err());
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for index in 0..logits.len() {
+                let mut rejected = logits;
+                rejected[index] = invalid;
+                assert!(super::FiniteLogits::new(&rejected).is_err());
+            }
+        }
+        struct CustomSampler(usize);
+        impl Sampler for CustomSampler {
+            fn sample(&mut self, logits: &[f32]) -> crate::Result<u32> {
+                self.0 += 1;
+                crate::runtime::greedy(logits)
+            }
+        }
+        let mut sampler = CustomSampler(0);
+        assert_eq!(sampler.sample_finite(view)?, 3);
+        assert_eq!(sampler.0, 1);
+        Ok(())
+    }
 
     #[test]
     fn candidate_storage_reuses_capacity_and_clones_only_semantic_state() -> crate::Result<()> {

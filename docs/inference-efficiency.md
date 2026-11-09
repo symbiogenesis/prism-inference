@@ -26,6 +26,25 @@ including an otherwise discarded tail candidate, rejects before drawing RNG.
 The reusable allocation survives rejection, and ties, signed zeros, heap order,
 probability arithmetic and the distribution's draws retain their existing contract.
 
+The explicit suffix drafter now visits historical match ends once, comparing
+backwards against the current suffix with the existing 64-token maximum window.
+It preserves overlapping matches, longest-match priority and the most recent
+start on ties, while avoiding a separate history scan for every permitted match
+length. Runtime generation copies at most eight continuation tokens into a fixed
+stack buffer reused for the request; it no longer allocates a proposal vector for
+each round. The public `SuffixDrafter::propose` API still returns an independently
+owned, fallibly allocated vector. Invalid configurations reject before proposal
+storage changes, even with zero remaining tokens.
+
+This is bounded source-work reduction in the opt-in suffix path, not evidence
+that serial greedy verification is faster than ordinary decoding. Decoder work,
+state checkpoints, cancellation checks around proposal/verification, output limits
+and exact greedy decisions retain their contracts. Exhaustive binary histories
+through ten tokens and 8K maximum-window controls compare both proposal routes
+against the retained original forward, length-first search. Owning hosted checks,
+actual-model state/adapter parity and matched complete-request benefit remain
+pending before any performance qualification or default change.
+
 ## Exact hosted correctness gate
 
 The owner-operated [Inference efficiency candidate workflow](../.github/workflows/inference-efficiency.yml)

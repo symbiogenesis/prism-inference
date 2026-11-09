@@ -135,31 +135,65 @@ impl SuffixDrafter {
         config: SuffixDraftConfig,
         remaining_tokens: usize,
     ) -> Result<Vec<u32>> {
+        let continuation = Self::continuation(history, config, remaining_tokens)?;
+        let mut draft = Vec::new();
+        draft.try_reserve_exact(continuation.len())?;
+        draft.extend_from_slice(continuation);
+        Ok(draft)
+    }
+
+    pub(crate) fn propose_into(
+        history: &[u32],
+        config: SuffixDraftConfig,
+        remaining_tokens: usize,
+        storage: &mut [u32; MAX_SPECULATIVE_DRAFT_TOKENS],
+    ) -> Result<usize> {
+        let continuation = Self::continuation(history, config, remaining_tokens)?;
+        storage[..continuation.len()].copy_from_slice(continuation);
+        Ok(continuation.len())
+    }
+
+    fn continuation(
+        history: &[u32],
+        config: SuffixDraftConfig,
+        remaining_tokens: usize,
+    ) -> Result<&[u32]> {
         config.validate()?;
         let limit = config.max_draft_tokens.min(remaining_tokens);
         if limit == 0 || history.len() <= config.min_match_tokens {
-            return Ok(Vec::new());
+            return Ok(&[]);
         }
         let max_len = config.max_match_tokens.min(history.len() - 1);
-        for match_len in (config.min_match_tokens..=max_len).rev() {
-            let suffix_start = history.len() - match_len;
-            let suffix = &history[suffix_start..];
-            // Search backwards from suffix_start - 1 so the most recent prior match wins,
-            // and require at least one continuation token after the matched span.
-            for candidate_start in (0..suffix_start).rev() {
-                if history[candidate_start..candidate_start + match_len] == *suffix {
-                    let cont_start = candidate_start + match_len;
-                    let available = (history.len() - cont_start).min(limit);
-                    if available > 0 {
-                        let mut draft = Vec::new();
-                        draft.try_reserve_exact(available)?;
-                        draft.extend_from_slice(&history[cont_start..cont_start + available]);
-                        return Ok(draft);
-                    }
+        let mut best_len = config.min_match_tokens - 1;
+        let mut continuation_start = 0;
+        // A match ending at `end` has a continuation only when end < history.len().
+        // Compare backwards once per end instead of rescanning the entire history
+        // for every permitted length. Overlapping historical matches remain valid.
+        for end in (config.min_match_tokens..history.len()).rev() {
+            if end <= best_len {
+                break;
+            }
+            let mut matched = 0;
+            while matched < max_len.min(end)
+                && history[end - matched - 1] == history[history.len() - matched - 1]
+            {
+                matched += 1;
+            }
+            // Ends are visited newest first, so equal lengths keep the most recent
+            // start. A maximum-length match cannot be improved by any earlier end.
+            if matched > best_len {
+                best_len = matched;
+                continuation_start = end;
+                if matched == max_len {
+                    break;
                 }
             }
         }
-        Ok(Vec::new())
+        if continuation_start == 0 {
+            return Ok(&[]);
+        }
+        let available = (history.len() - continuation_start).min(limit);
+        Ok(&history[continuation_start..continuation_start + available])
     }
 }
 
@@ -532,8 +566,8 @@ impl GdnVerifyTape {
 mod tests {
     use super::{
         DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, GdnVerifyTape,
-        MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixDrafter,
-        mtp_first_decode_fits, verify_stochastic_step,
+        MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS, SpeculativeStats,
+        SuffixDraftConfig, SuffixDrafter, mtp_first_decode_fits, verify_stochastic_step,
     };
     use crate::Result;
 
@@ -577,6 +611,107 @@ mod tests {
         assert!(SuffixDraftConfig::new(0, 4, 2).is_err());
         assert!(SuffixDraftConfig::new(5, 4, 2).is_err());
         assert!(SuffixDraftConfig::new(2, 4, MAX_SPECULATIVE_DRAFT_TOKENS + 1).is_err());
+        Ok(())
+    }
+
+    // Retain the original independent length-first search as the behavioral
+    // oracle. It compares forward spans and ranks starts, whereas production
+    // compares backwards by match end.
+    fn reference_suffix_continuation(
+        history: &[u32],
+        config: SuffixDraftConfig,
+        remaining: usize,
+    ) -> &[u32] {
+        let limit = config.max_draft_tokens.min(remaining);
+        if limit == 0 || history.len() <= config.min_match_tokens {
+            return &[];
+        }
+        for length in
+            (config.min_match_tokens..=config.max_match_tokens.min(history.len() - 1)).rev()
+        {
+            let suffix = history.len() - length;
+            for start in (0..suffix).rev() {
+                if history[start..start + length] == history[suffix..] {
+                    let end = start + length;
+                    return &history[end..end + limit.min(history.len() - end)];
+                }
+            }
+        }
+        &[]
+    }
+
+    fn check_suffix_apis(
+        history: &[u32],
+        config: SuffixDraftConfig,
+        remaining: usize,
+    ) -> Result<()> {
+        let expected = reference_suffix_continuation(history, config, remaining);
+        assert_eq!(SuffixDrafter::propose(history, config, remaining)?, expected);
+        let mut storage = [u32::MAX; MAX_SPECULATIVE_DRAFT_TOKENS];
+        let length = SuffixDrafter::propose_into(history, config, remaining, &mut storage)?;
+        assert_eq!(&storage[..length], expected);
+        assert!(storage[length..].iter().all(|&token| token == u32::MAX));
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_drafter_exhaustively_matches_length_first_overlap_and_tie_order() -> Result<()> {
+        // Every binary history through ten tokens includes overlapping runs,
+        // competing match lengths, recent ties and histories shorter than a window.
+        for length in 0..=10 {
+            for bits in 0_u32..1 << length {
+                let history = (0..length).map(|index| (bits >> index) & 1).collect::<Vec<_>>();
+                for min_match in 1..=5 {
+                    for max_match in min_match..=5 {
+                        for draft in [1, 4, MAX_SPECULATIVE_DRAFT_TOKENS] {
+                            let config = SuffixDraftConfig::new(min_match, max_match, draft)?;
+                            for remaining in [0, 1, 3, MAX_SPECULATIVE_DRAFT_TOKENS] {
+                                check_suffix_apis(&history, config, remaining)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_drafter_maximum_windows_match_reference_and_reject_before_writing() -> Result<()> {
+        let distinct = (0_u32..8192).collect::<Vec<_>>();
+        let periodic = distinct.iter().map(|token| token % 97).collect::<Vec<_>>();
+        let mut near_match = periodic.clone();
+        near_match[8191 - MAX_SUFFIX_MATCH_TOKENS / 2] = u32::MAX;
+        let mut constant = distinct.clone();
+        constant.fill(7);
+        for history in [&distinct, &periodic, &near_match, &constant] {
+            for min_match in [1, MAX_SUFFIX_MATCH_TOKENS] {
+                let config = SuffixDraftConfig::new(
+                    min_match,
+                    MAX_SUFFIX_MATCH_TOKENS,
+                    MAX_SPECULATIVE_DRAFT_TOKENS,
+                )?;
+                for remaining in [0, 1, MAX_SPECULATIVE_DRAFT_TOKENS, usize::MAX] {
+                    check_suffix_apis(history, config, remaining)?;
+                }
+            }
+        }
+        let valid = SuffixDraftConfig::default();
+        for config in [
+            SuffixDraftConfig { min_match_tokens: 0, ..valid },
+            SuffixDraftConfig { min_match_tokens: 17, ..valid },
+            SuffixDraftConfig { max_match_tokens: MAX_SUFFIX_MATCH_TOKENS + 1, ..valid },
+            SuffixDraftConfig { max_draft_tokens: 0, ..valid },
+            SuffixDraftConfig {
+                max_draft_tokens: MAX_SPECULATIVE_DRAFT_TOKENS + 1,
+                ..valid
+            },
+        ] {
+            let mut storage = [42; MAX_SPECULATIVE_DRAFT_TOKENS];
+            assert!(SuffixDrafter::propose_into(&periodic, config, 0, &mut storage).is_err());
+            assert_eq!(storage, [42; MAX_SPECULATIVE_DRAFT_TOKENS]);
+            assert!(SuffixDrafter::propose(&periodic, config, 0).is_err());
+        }
         Ok(())
     }
 

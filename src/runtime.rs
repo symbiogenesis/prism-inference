@@ -1130,15 +1130,22 @@ impl<D: Decoder> Runtime<D> {
             finish: Finish::Length,
         };
         let mut stats = SpeculativeStats::default();
+        let mut draft_storage = [0; MAX_SPECULATIVE_DRAFT_TOKENS];
         while completion.generated_tokens < options.max_tokens {
             check()?;
             let remaining_budget = options.max_tokens - completion.generated_tokens;
-            let draft = SuffixDrafter::propose(&self.tokens, suffix_config, remaining_budget)?;
+            let draft_len = SuffixDrafter::propose_into(
+                &self.tokens,
+                suffix_config,
+                remaining_budget,
+                &mut draft_storage,
+            )?;
+            let draft = &draft_storage[..draft_len];
             let mut stopped = false;
             if !draft.is_empty() {
                 stats.draft_rounds += 1;
                 stats.draft_tokens_proposed += draft.len();
-                for &candidate in &draft {
+                for &candidate in draft {
                     check()?;
                     let target_token = greedy(&self.logits)?;
                     check()?;
@@ -1247,6 +1254,7 @@ pub fn greedy(logits: &[f32]) -> Result<u32> {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+    use crate::speculative::MAX_SUFFIX_MATCH_TOKENS;
     use std::{
         cell::{Cell, RefCell},
         io::ErrorKind,
@@ -1697,6 +1705,44 @@ mod deadline_tests {
         assert_eq!(verify_stats.draft_tokens_proposed, 3);
         assert_eq!(verify_stats.draft_tokens_accepted, 1);
         assert_eq!(verify_stats.rollback_restores, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_suffix_buffered_rounds_restore_state_after_cancel_and_delivery_failure()
+    -> Result<()> {
+        for cancel in [false, true] {
+            let (mut runtime, _) = seeded()?;
+            let before_tokens = runtime.tokens.clone();
+            let before_logits = runtime.logits.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+            let cancellation = Cancellation::default();
+            let mut emitted = 0;
+            let result = runtime.generate_speculative(
+                &[0, 0, 0, 0, 0],
+                &Generation { max_tokens: 6, stop_tokens: vec![] },
+                Prefill::default(),
+                SuffixDraftConfig::new(1, MAX_SUFFIX_MATCH_TOKENS, 1)?,
+                &cancellation,
+                |_| {
+                    emitted += 1;
+                    if emitted == 3 {
+                        if cancel {
+                            cancellation.cancel();
+                        } else {
+                            return Err(invalid("injected speculative delivery failure"));
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(emitted, 3);
+            assert_eq!(runtime.tokens, before_tokens);
+            assert_eq!(runtime.decoder.tokens, before_tokens);
+            assert_eq!(runtime.logits.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), before_logits);
+            assert!(!runtime.is_faulted());
+            assert_continues(&mut runtime)?;
+        }
         Ok(())
     }
 }

@@ -5163,7 +5163,7 @@ mod tests {
             query_norm: vec![1.0; 4],
             key_norm: vec![1.0; 4],
         };
-        let mut projected = vec![0.0; geometry.query_gate_width()];
+        let mut projected = vec![0.0_f32; geometry.query_gate_width()];
         let mut expected_gates = Vec::new();
         for (head, pair) in projected.chunks_exact_mut(8).enumerate() {
             for (channel, gate) in pair[4..].iter_mut().enumerate() {

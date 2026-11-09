@@ -51,7 +51,7 @@ class EfficiencyReceiptTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 efficiency.source_hashes(fixture)
         policy = (root / "clippy.toml").read_text(encoding="utf-8")
-        self.assertIn('allowed-duplicate-crates = ["windows-sys"]', policy)
+        self.assertIn('allowed-duplicate-crates = ["windows-sys", "syn"]', policy)
 
     def test_exact_control_rejects_zero_ignored_failed_or_duplicate_matches(self):
         output = ("\nrunning 1 test\ntest selected ... ok\n\n"

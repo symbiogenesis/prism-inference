@@ -27,6 +27,22 @@ including an otherwise discarded tail candidate, rejects before drawing RNG.
 The reusable allocation survives rejection, and ties, signed zeros, heap order,
 probability arithmetic and the distribution's draws retain their existing contract.
 
+The fixed Swift chain now retains its validated top-p state at sampler
+construction. Native min-p zero returns without mutation, and temperature one
+preserves every admitted finite logit bit, so those identity stages need no
+temporary states. This omits three temporary configuration-vector allocations
+per output token and retains one additional sampler-state metadata value.
+Independent controls replay the original three-stage chain across candidate
+bits, ties, signed zero, subnormals, extremes, RNG draws, cloning, reset and
+full-vocabulary rejection. This is a source allocation/work reduction; it does
+not establish lower process RAM, request latency or reduced admission.
+
+Full-attention decode and tiled prefill also read immutable gate heads from
+their original interleaved projection output. The separate gate copy is
+omitted while query normalization, sigmoid and attention arithmetic keep their
+order. See the [tiled-prefill contract](cpu-tiled-prefill.md) for source work
+counts and the unchanged resource and qualification boundaries.
+
 The explicit suffix drafter now visits historical match ends once, comparing
 backwards against the current suffix with the existing 64-token maximum window.
 It preserves overlapping matches, longest-match priority and the most recent
@@ -88,6 +104,15 @@ directly packed bytes with the existing copied route. The receipt hashes both
 accelerator tool crates, and their Release analyzers and linking remain part of
 the same hosted workflow. This expands correctness coverage without qualifying
 NPU placement, model output or startup benefit.
+
+Lazy native-Q2 resident preparation now shares the direct initialization path
+without allocating an unused packed-weight vector first. Copied preparation
+grows bounded scratch only after resident admission; transient execution sizes
+its scratch after selecting that route. Fake-arena controls cover direct/copied
+bytes, refused capacity, malformed scales and terminal publication failure
+across all eight lazy entry families, with a separate successful transient
+control. The ordinary prewarmed default is unchanged by this follow-up.
+Conservative admission remains charged; no startup or execution gain is measured.
 
 ## Device and delivery acceptance
 

@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use super::{
     Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
-    Transforms, add, add_finite, checked_product, finite, resize_into, rope_frequencies, row_into,
+    Transforms, add, add_finite, attention_gate, checked_product, finite, resize_into, rope_frequencies, row_into,
     small_float,
 };
 use crate::kernels::{
@@ -789,7 +789,6 @@ fn full_attention_tile(
                 keys,
                 values,
                 &mut attention_scratch.query,
-                &mut attention_scratch.gate,
                 &mut attention_scratch.scores,
                 &mut attention_scratch.frequencies,
                 &mut tile.attended[index],
@@ -819,34 +818,26 @@ fn full_attention_tile(
     let query_gate_len = g.head * g.heads;
     for index in 0..count {
         resize_into(query_gate_len, &mut tile.up[index])?;
-        resize_into(query_gate_len, &mut tile.gate[index])?;
         resize_into(query_gate_len, &mut tile.attended[index])?;
     }
     let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
     let frequencies_ref: &[Vec<(f32, f32)>] = &tile.frequencies[..count];
     let query_norm: &[f32] = &weights.query_norm;
-    tile.projector.row_parallelism().update_paired_chunks(
+    tile.projector.row_parallelism().update_chunks(
         &mut tile.up[..count],
         1,
-        &mut tile.gate[..count],
-        1,
-        |base_tok, query_chunk, gate_chunk| {
-            for (offset, (query_tok, gate_tok)) in query_chunk
-                .iter_mut()
-                .zip(gate_chunk.iter_mut())
-                .enumerate()
+        |base_tok, query_chunk| {
+            for (offset, query_tok) in query_chunk.iter_mut().enumerate()
             {
                 let tok = base_tok + offset;
                 let projected = &mixed_ref[tok];
                 let frequencies = &frequencies_ref[tok];
                 let mut query_finite = true;
-                for (head_idx, (query_head, gate_head)) in query_tok
+                for (head_idx, query_head) in query_tok
                     .chunks_exact_mut(g.head)
-                    .zip(gate_tok.chunks_exact_mut(g.head))
                     .enumerate()
                 {
                     let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                    gate_head.copy_from_slice(&src[g.head..]);
                     query_finite &= arithmetic.normalize_rope_round_f16_into(
                         &src[..g.head],
                         query_norm,
@@ -915,7 +906,8 @@ fn full_attention_tile(
     let token_score_stride = 4 * max_score_len;
     resize_into(count * token_score_stride, &mut attention_scratch.scores)?;
     let query_ref: &[Vec<f32>] = &tile.up[..count];
-    let gate_ref: &[Vec<f32>] = &tile.gate[..count];
+    // The projected query/gate rows stay immutable through score/value work.
+    let projected_ref: &[Vec<f32>] = &tile.mixed[..count];
     let current_keys: &[Vec<f32>] = &tile.recurrent_gate[..count];
     let current_values: &[Vec<f32>] = &tile.beta[..count];
     let key_cache: &KvCache = keys;
@@ -1237,14 +1229,14 @@ fn full_attention_tile(
                             .split_at_mut(2 * g.head);
                         let (r1_0, r1_1) = r1_left.split_at_mut(g.head);
                         let (r1_2, r1_3) = r1_right.split_at_mut(g.head);
-                        let g0_0 = &gate_ref[tok0][head * g.head..(head + 1) * g.head];
-                        let g0_1 = &gate_ref[tok0][(head + 1) * g.head..(head + 2) * g.head];
-                        let g0_2 = &gate_ref[tok0][(head + 2) * g.head..(head + 3) * g.head];
-                        let g0_3 = &gate_ref[tok0][(head + 3) * g.head..(head + 4) * g.head];
-                        let g1_0 = &gate_ref[tok1][head * g.head..(head + 1) * g.head];
-                        let g1_1 = &gate_ref[tok1][(head + 1) * g.head..(head + 2) * g.head];
-                        let g1_2 = &gate_ref[tok1][(head + 2) * g.head..(head + 3) * g.head];
-                        let g1_3 = &gate_ref[tok1][(head + 3) * g.head..(head + 4) * g.head];
+                        let g0_0 = attention_gate(&projected_ref[tok0], head, g.head);
+                        let g0_1 = attention_gate(&projected_ref[tok0], head + 1, g.head);
+                        let g0_2 = attention_gate(&projected_ref[tok0], head + 2, g.head);
+                        let g0_3 = attention_gate(&projected_ref[tok0], head + 3, g.head);
+                        let g1_0 = attention_gate(&projected_ref[tok1], head, g.head);
+                        let g1_1 = attention_gate(&projected_ref[tok1], head + 1, g.head);
+                        let g1_2 = attention_gate(&projected_ref[tok1], head + 2, g.head);
+                        let g1_3 = attention_gate(&projected_ref[tok1], head + 3, g.head);
                         for (
                             tile_idx,
                             (
@@ -1364,10 +1356,10 @@ fn full_attention_tile(
                             .split_at_mut(2 * g.head);
                         let (r0, r1) = r01.split_at_mut(g.head);
                         let (r2, r3) = r23.split_at_mut(g.head);
-                        let g0 = &gate_ref[tok][head * g.head..(head + 1) * g.head];
-                        let g1 = &gate_ref[tok][(head + 1) * g.head..(head + 2) * g.head];
-                        let g2 = &gate_ref[tok][(head + 2) * g.head..(head + 3) * g.head];
-                        let g3 = &gate_ref[tok][(head + 3) * g.head..(head + 4) * g.head];
+                        let g0 = attention_gate(&projected_ref[tok], head, g.head);
+                        let g1 = attention_gate(&projected_ref[tok], head + 1, g.head);
+                        let g2 = attention_gate(&projected_ref[tok], head + 2, g.head);
+                        let g3 = attention_gate(&projected_ref[tok], head + 3, g.head);
                         for (tile_idx, (((out0, out1), out2), out3)) in r0
                             .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
                             .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
@@ -1431,7 +1423,7 @@ fn full_attention_tile(
                         * scale;
                     arithmetic.attention_softmax_round_f16(scores)?;
                     let result = &mut attended_tok[head * g.head..(head + 1) * g.head];
-                    let g_head = &gate_ref[tok][head * g.head..(head + 1) * g.head];
+                    let g_head = attention_gate(&projected_ref[tok], head, g.head);
                     for (tile_idx, out) in result
                         .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
                         .enumerate()

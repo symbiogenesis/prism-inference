@@ -32,6 +32,16 @@ other supported formats use the existing matvec contract. Each token is
 transformed independently; adapters consume the original untransformed input.
 No decoded matrix or persistent repacked weight copy is retained.
 
+Full-attention decode and tiles borrow gate heads directly from the immutable
+interleaved query/gate projection. Only queries are normalized into separate
+scratch; the original gate values remain available until score/value work has
+finished. This omits one gate materialization without changing sigmoid, rounded
+probabilities, value accumulation, adapters or cancellation/rollback behavior.
+For Swift's 32 heads of width 128 across 16 full-attention layers, the omitted
+copy payload is 256 KiB per token (512 KiB of logical copy reads/writes), excluding
+the unchanged later gate reads. Actual traffic, latency and peak RAM are
+unmeasured. Recurrent/FFN gate scratch and conservative admission remain charged.
+
 Without the separate chunkwise selection, full attention, recurrent attention,
 convolution and FP32 GDN retain their previous per-token operations. The graph's
 `ingest_block` path is the consumer; this is more than a standalone tiled helper.

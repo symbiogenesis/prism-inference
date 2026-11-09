@@ -3054,7 +3054,6 @@ impl Evaluation<'_, '_> {
             keys,
             values,
             &mut scratch.query,
-            &mut scratch.gate,
             &mut scratch.scores,
             &mut scratch.frequencies,
             &mut scratch.attended,
@@ -3124,7 +3123,6 @@ impl Evaluation<'_, '_> {
         keys: &KvCache,
         values: &KvCache,
         query_scratch: &mut Vec<f32>,
-        gate_scratch: &mut Vec<f32>,
         scores_scratch: &mut Vec<f32>,
         frequencies_scratch: &mut Vec<(f32, f32)>,
         attended: &mut Vec<f32>,
@@ -3138,28 +3136,23 @@ impl Evaluation<'_, '_> {
             self.frequencies_ready = true;
         }
         resize_into(g.head * g.heads, query_scratch)?;
-        resize_into(g.head * g.heads, gate_scratch)?;
         let arithmetic = self.arithmetic;
         let query_norm: &[f32] = &layer.query_norm;
         let frequencies: &[(f32, f32)] = frequencies_scratch;
         self.projection
             .matvec
             .row_parallelism()
-            .update_paired_chunks(
+            .update_chunks(
                 query_scratch,
                 g.head,
-                gate_scratch,
-                g.head,
-                |base_head, query_chunk, gate_chunk| {
+                |base_head, query_chunk| {
                     let mut query_finite = true;
-                    for (head_offset, (query_head, gate_head)) in query_chunk
+                    for (head_offset, query_head) in query_chunk
                         .chunks_exact_mut(g.head)
-                        .zip(gate_chunk.chunks_exact_mut(g.head))
                         .enumerate()
                     {
                         let head_idx = base_head + head_offset;
                         let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                        gate_head.copy_from_slice(&src[g.head..]);
                         // F16 K x Q converts the F32 query to F16 even with F32 precision.
                         query_finite &= arithmetic.normalize_rope_round_f16_into(
                             &src[..g.head],
@@ -3210,7 +3203,6 @@ impl Evaluation<'_, '_> {
         let scale = 1.0 / small_float(g.head)?.sqrt();
         let arithmetic = self.arithmetic;
         let query_ref: &[f32] = query_scratch;
-        let gate_ref: &[f32] = gate_scratch;
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
         let heads_per_kv = g.heads / g.kv_heads;
@@ -3332,10 +3324,10 @@ impl Evaluation<'_, '_> {
                                 arithmetic.attention_softmax_round_f16(scores)?;
                             }
                             let probs: [&[f32]; 4] = [s0, s1, s2, s3];
-                            let g0 = &gate_ref[head * g.head..(head + 1) * g.head];
-                            let g1 = &gate_ref[(head + 1) * g.head..(head + 2) * g.head];
-                            let g2 = &gate_ref[(head + 2) * g.head..(head + 3) * g.head];
-                            let g3 = &gate_ref[(head + 3) * g.head..(head + 4) * g.head];
+                            let g0 = attention_gate(projected, head, g.head);
+                            let g1 = attention_gate(projected, head + 1, g.head);
+                            let g2 = attention_gate(projected, head + 2, g.head);
+                            let g3 = attention_gate(projected, head + 3, g.head);
                             for (tile, (((out0, out1), out2), out3)) in
                                 r0.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
                                     .zip(r1.chunks_mut(
@@ -3382,7 +3374,7 @@ impl Evaluation<'_, '_> {
                             * scale;
                         // Nonflash V(F16) x softmax(F16) also converts its RHS to F16.
                         arithmetic.attention_softmax_round_f16(scores)?;
-                        let g_head = &gate_ref[head * g.head..(head + 1) * g.head];
+                        let g_head = attention_gate(projected, head, g.head);
                         for (tile, out) in result
                             .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
                             .enumerate()
@@ -4181,6 +4173,14 @@ fn resize_into(count: usize, output: &mut Vec<f32>) -> Result<()> {
         zeros_into(count, output)?;
     }
     Ok(())
+}
+
+// Full attention projects [query_head, gate_head] pairs. Queries are normalized
+// into separate scratch, while each immutable gate remains directly borrowable
+// until attention completes. Geometry and projection lengths are validated by
+// graph construction/projection before this private view is used.
+fn attention_gate(projected: &[f32], head: usize, width: usize) -> &[f32] {
+    &projected[(2 * head + 1) * width..(2 * head + 2) * width]
 }
 
 fn copy_into(input: &[f32], output: &mut Vec<f32>) -> Result<()> {
@@ -5075,6 +5075,94 @@ mod tests {
             dot_f16(&query, &bits).to_bits(),
             dot(&query, &expanded).to_bits()
         );
+    }
+
+    #[test]
+    fn full_attention_reads_original_interleaved_gates_across_worker_groups() -> Result<()> {
+        let mut geometry = projection_geometry(4);
+        geometry.heads = 8;
+        geometry.kv_heads = 2;
+        let layer = super::FullAttention {
+            query: projection_weight("q", 0, 4),
+            key: projection_weight("k", 0, 4),
+            value: projection_weight("v", 0, 4),
+            output: projection_weight("out", 0, 4),
+            query_norm: vec![1.0; 4],
+            key_norm: vec![1.0; 4],
+        };
+        let mut projected = vec![0.0; geometry.query_gate_width()];
+        let mut expected_gates = Vec::new();
+        for (head, pair) in projected.chunks_exact_mut(8).enumerate() {
+            for (channel, gate) in pair[4..].iter_mut().enumerate() {
+                *gate = [-4.0, -1.0, 0.0, 1.0, 4.0][(head + channel) % 5];
+                expected_gates.push(*gate);
+            }
+        }
+        let original_values = [0.25, -0.5, 1.0, 2.0, -0.25, 0.5, -1.0, -2.0];
+        // With zero Q/K and no prior tokens, attention has exactly unit
+        // probability. Independently apply each head's known gate to its KV
+        // head's rounded values; this exercises both 4-head and tail workers.
+        let expected: Vec<f32> = expected_gates
+            .iter()
+            .enumerate()
+            .map(|(index, &gate)| {
+                let head = index / 4;
+                let kv = head / 4;
+                let value = half_to_float(half_bits(original_values[kv * 4 + index % 4]));
+                value * (1.0 / (1.0 + (-gate).exp()))
+            })
+            .collect();
+        #[cfg(feature = "parallel-rows")]
+        let worker_counts = [1, 2, 4];
+        #[cfg(not(feature = "parallel-rows"))]
+        let worker_counts = [1];
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            for workers in worker_counts {
+                let mut projection = ProjectionScratch::default();
+                projection.matvec.set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
+                let transforms = Transforms::default();
+                let mut adapter = crate::model::lora::Scratch::default();
+                let mut evaluation = super::Evaluation {
+                    geometry: &geometry,
+                    arithmetic,
+                    transforms: &transforms,
+                    position: 0,
+                    frequencies_ready: false,
+                    projection: &mut projection,
+                    adapter: None,
+                    adapter_scale: 0.0,
+                    adapter_scratch: &mut adapter,
+                    executor: None,
+                };
+                let keys = KvCache::new(8, 2)?;
+                let values = KvCache::new(8, 2)?;
+                let mut scratch = super::AttentionScratch::default();
+                let mut key = [0.0; 8];
+                let mut value = original_values;
+                // A failed rounding attempt must not publish attended output
+                // or append state; reuse the same scratch for the valid retry.
+                value[0] = 70_000.0;
+                assert!(evaluation.full_attention_state(
+                    &layer, &projected, &mut key, &mut value, &keys, &values,
+                    &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
+                    &mut scratch.attended,
+                ).is_err());
+                assert!(scratch.attended.is_empty());
+                assert!(scratch.gate.is_empty());
+                assert_eq!(keys.tokens().count(), 0);
+                assert_eq!(values.tokens().count(), 0);
+                let mut value = original_values;
+                evaluation.full_attention_state(
+                    &layer, &projected, &mut key, &mut value, &keys, &values,
+                    &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
+                    &mut scratch.attended,
+                )?;
+                assert!(scratch.gate.is_empty());
+                assert!(scratch.attended.iter().map(|value| value.to_bits())
+                    .eq(expected.iter().map(|value| value.to_bits())));
+            }
+        }
+        Ok(())
     }
 
     #[test]

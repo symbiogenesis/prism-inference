@@ -15,9 +15,9 @@ use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place};
 use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism,
     add_scaled_slice_in_place, add_slice_in_place, append_half_bits, f16_dot, float_dot,
-    is_finite_slice, l2_norm_in_place, mul_slice_in_place, mul_slice_into, rms_norm_in_place,
-    rms_norm_into, rms_norm_pinned_in_place, rms_norm_pinned_into, rms_norm_swiglu_in_place,
-    rms_norm_swiglu_into, round_f16_slice, row, row_into, scale_slice_into, silu, softmax,
+    is_finite_slice, l2_norm_in_place, mul_slice_in_place, mul_slice_into, rms_norm_into,
+    rms_norm_pinned_into, rms_norm_swiglu_in_place, rms_norm_swiglu_into, round_f16_slice, row,
+    row_into, scale_slice_into, silu, softmax,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -64,13 +64,6 @@ impl Arithmetic {
         match self {
             Self::Source => rms_norm_into(input, weight, epsilon, output),
             Self::PinnedSwift => rms_norm_pinned_into(input, weight, epsilon, output),
-        }
-    }
-
-    fn normalize_in_place(self, values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
-        match self {
-            Self::Source => rms_norm_in_place(values, weight, epsilon),
-            Self::PinnedSwift => rms_norm_pinned_in_place(values, weight, epsilon),
         }
     }
 
@@ -136,6 +129,65 @@ impl Arithmetic {
         match self {
             Self::Source => rms_norm_swiglu_into::<false>(input, weight, epsilon, gate, output),
             Self::PinnedSwift => rms_norm_swiglu_into::<true>(input, weight, epsilon, gate, output),
+        }
+    }
+
+    fn normalize_rope_round_f16_into(
+        self,
+        input: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        geometry: &Geometry,
+        frequencies: &[(f32, f32)],
+        output: &mut [f32],
+    ) -> Result<bool> {
+        match self {
+            Self::Source => crate::kernels::rms_norm_rope_round_f16_into::<false>(
+                input,
+                weight,
+                epsilon,
+                geometry.head,
+                geometry.rope,
+                frequencies,
+                output,
+            ),
+            Self::PinnedSwift => crate::kernels::rms_norm_rope_round_f16_into::<true>(
+                input,
+                weight,
+                epsilon,
+                geometry.head,
+                geometry.rope,
+                frequencies,
+                output,
+            ),
+        }
+    }
+
+    fn normalize_rope_round_f16_in_place(
+        self,
+        values: &mut [f32],
+        weight: &[f32],
+        epsilon: f32,
+        geometry: &Geometry,
+        frequencies: &[(f32, f32)],
+    ) -> Result<bool> {
+        match self {
+            Self::Source => crate::kernels::rms_norm_rope_round_f16_in_place::<false>(
+                values,
+                weight,
+                epsilon,
+                geometry.head,
+                geometry.rope,
+                frequencies,
+            ),
+            Self::PinnedSwift => crate::kernels::rms_norm_rope_round_f16_in_place::<true>(
+                values,
+                weight,
+                epsilon,
+                geometry.head,
+                geometry.rope,
+                frequencies,
+            ),
         }
     }
 
@@ -414,6 +466,7 @@ impl Arithmetic {
         }
     }
 
+    #[cfg(test)]
     fn attention_rope(
         self,
         input: &mut [f32],
@@ -2866,19 +2919,29 @@ impl Evaluation<'_, '_> {
             .matvec
             .row_parallelism()
             .update_paired_chunks(key, g.head, value, g.head, |_, key_chunk, value_chunk| {
+                let mut key_finite = true;
+                let mut value_finite = true;
                 for (key_head, value_head) in key_chunk
                     .chunks_exact_mut(g.head)
                     .zip(value_chunk.chunks_exact_mut(g.head))
                 {
-                    arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
-                    arithmetic.attention_rope(key_head, g, frequencies)?;
-                    round_f16_slice(key_head);
-                    round_f16_slice(value_head);
+                    key_finite &= arithmetic.normalize_rope_round_f16_in_place(
+                        key_head,
+                        key_norm,
+                        g.epsilon,
+                        g,
+                        frequencies,
+                    )?;
+                    value_finite &= round_f16_slice(value_head);
+                }
+                if !key_finite {
+                    return Err(invalid("nonfinite values in binary16 key cache"));
+                }
+                if !value_finite {
+                    return Err(invalid("nonfinite values in binary16 value cache"));
                 }
                 Ok(())
-            })?;
-        finite(key, "binary16 key cache")?;
-        finite(value, "binary16 value cache")
+            })
     }
 
     #[allow(
@@ -2925,6 +2988,7 @@ impl Evaluation<'_, '_> {
                 gate_scratch,
                 g.head,
                 |base_head, query_chunk, gate_chunk| {
+                    let mut query_finite = true;
                     for (head_offset, (query_head, gate_head)) in query_chunk
                         .chunks_exact_mut(g.head)
                         .zip(gate_chunk.chunks_exact_mut(g.head))
@@ -2932,12 +2996,19 @@ impl Evaluation<'_, '_> {
                     {
                         let head_idx = base_head + head_offset;
                         let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                        query_head.copy_from_slice(&src[..g.head]);
                         gate_head.copy_from_slice(&src[g.head..]);
-                        arithmetic.normalize_in_place(query_head, query_norm, g.epsilon)?;
-                        arithmetic.attention_rope(query_head, g, frequencies)?;
                         // F16 K x Q converts the F32 query to F16 even with F32 precision.
-                        round_f16_slice(query_head);
+                        query_finite &= arithmetic.normalize_rope_round_f16_into(
+                            &src[..g.head],
+                            query_norm,
+                            g.epsilon,
+                            g,
+                            frequencies,
+                            query_head,
+                        )?;
+                    }
+                    if !query_finite {
+                        return Err(invalid("nonfinite values in binary16 attention query"));
                     }
                     Ok(())
                 },
@@ -2947,20 +3018,29 @@ impl Evaluation<'_, '_> {
             .matvec
             .row_parallelism()
             .update_paired_chunks(key, g.head, value, g.head, |_, key_chunk, value_chunk| {
+                let mut key_finite = true;
+                let mut value_finite = true;
                 for (key_head, value_head) in key_chunk
                     .chunks_exact_mut(g.head)
                     .zip(value_chunk.chunks_exact_mut(g.head))
                 {
-                    arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
-                    arithmetic.attention_rope(key_head, g, frequencies)?;
-                    round_f16_slice(key_head);
-                    round_f16_slice(value_head);
+                    key_finite &= arithmetic.normalize_rope_round_f16_in_place(
+                        key_head,
+                        key_norm,
+                        g.epsilon,
+                        g,
+                        frequencies,
+                    )?;
+                    value_finite &= round_f16_slice(value_head);
+                }
+                if !key_finite {
+                    return Err(invalid("nonfinite values in binary16 key cache"));
+                }
+                if !value_finite {
+                    return Err(invalid("nonfinite values in binary16 value cache"));
                 }
                 Ok(())
             })?;
-        finite(query_scratch, "binary16 attention query")?;
-        finite(key, "binary16 key cache")?;
-        finite(value, "binary16 value cache")?;
         resize_into(g.head * g.heads, attended)?;
         let score_len = self.position + 1;
         resize_into(g.heads * score_len, scores_scratch)?;
@@ -4113,6 +4193,7 @@ fn rope_frequencies(
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(
     clippy::suboptimal_flops,
     reason = "Preserve separate multiply/add rounding in the scalar RoPE reference."

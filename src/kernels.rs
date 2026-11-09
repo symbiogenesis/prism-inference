@@ -2540,7 +2540,7 @@ pub fn round_f16(value: f32) -> f32 {
     half_to_float(half_bits(value))
 }
 
-pub(crate) fn round_f16_slice(values: &mut [f32]) {
+pub(crate) fn round_f16_slice(values: &mut [f32]) -> bool {
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -2548,12 +2548,16 @@ pub(crate) fn round_f16_slice(values: &mut [f32]) {
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    if neon::round_f16_slice(values) {
-        return;
+    if let Some(all_finite) = neon::round_f16_slice(values) {
+        return all_finite;
     }
+    let mut all_finite = true;
     for value in values {
-        *value = round_f16(*value);
+        let rounded = round_f16(*value);
+        all_finite &= rounded.is_finite();
+        *value = rounded;
     }
+    all_finite
 }
 
 pub(crate) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) {
@@ -2870,6 +2874,7 @@ pub(crate) fn rms_norm_pinned_into(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
     let scale = rms_norm_scale(values, weight, epsilon)?;
     #[cfg(all(
@@ -2888,6 +2893,7 @@ pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn rms_norm_pinned_in_place(
     values: &mut [f32],
     weight: &[f32],
@@ -2985,6 +2991,146 @@ pub(crate) fn rms_norm_swiglu_into<const PINNED: bool>(
         }
         Ok(())
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops,
+    reason = "Keep explicit head/rotary geometry and separate multiply/add roundings for Source fallback."
+)]
+pub(crate) fn rms_norm_rope_round_f16_into<const PINNED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    head: usize,
+    rotary: usize,
+    frequencies: &[(f32, f32)],
+    output: &mut [f32],
+) -> Result<bool> {
+    if output.len() != input.len() {
+        return Err(invalid(
+            "RMS normalization requires equal nonempty vectors and nonnegative epsilon",
+        ));
+    }
+    let scale = rms_norm_scale(input, weight, epsilon)?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if head == 256
+        && rotary == 64
+        && let (Ok(in_arr), Ok(w_arr), Ok(freq_arr), Ok(out_arr)) = (
+            <&[f32; 256]>::try_from(input),
+            <&[f32; 256]>::try_from(weight),
+            <&[(f32, f32); 32]>::try_from(frequencies),
+            <&mut [f32; 256]>::try_from(&mut *output),
+        )
+    {
+        if PINNED
+            && freq_arr
+                .iter()
+                .any(|&(cosine, sine)| !cosine.is_finite() || !sine.is_finite())
+        {
+            return Err(invalid("invalid pinned Swift RoPE geometry or frequencies"));
+        }
+        if let Some(result) = neon::rms_norm_rope_round_f16_256_into::<PINNED>(
+            in_arr, w_arr, scale, freq_arr, out_arr,
+        ) {
+            return result;
+        }
+    }
+    for ((out, &val), &w) in output.iter_mut().zip(input).zip(weight) {
+        *out = finite(if PINNED {
+            (val * w) * scale
+        } else {
+            (val * scale) * w
+        })?;
+    }
+    if PINNED {
+        pinned_attention::rope_in_place(output, head, rotary, frequencies)?;
+    } else {
+        for head_slice in output.chunks_exact_mut(head) {
+            for (index, &(cosine, sine)) in frequencies.iter().enumerate() {
+                let first = head_slice[index];
+                let second = head_slice[index + rotary / 2];
+                head_slice[index] = first * cosine - second * sine;
+                head_slice[index + rotary / 2] = first * sine + second * cosine;
+            }
+        }
+        if !is_finite_slice(output) {
+            return Err(invalid("nonfinite values in RoPE output"));
+        }
+    }
+    Ok(round_f16_slice(output))
+}
+
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Keep separate multiply/add roundings for Source fallback."
+)]
+pub(crate) fn rms_norm_rope_round_f16_in_place<const PINNED: bool>(
+    values: &mut [f32],
+    weight: &[f32],
+    epsilon: f32,
+    head: usize,
+    rotary: usize,
+    frequencies: &[(f32, f32)],
+) -> Result<bool> {
+    let scale = rms_norm_scale(values, weight, epsilon)?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if head == 256
+        && rotary == 64
+        && let (Ok(val_arr), Ok(w_arr), Ok(freq_arr)) = (
+            <&mut [f32; 256]>::try_from(&mut *values),
+            <&[f32; 256]>::try_from(weight),
+            <&[(f32, f32); 32]>::try_from(frequencies),
+        )
+    {
+        if PINNED
+            && freq_arr
+                .iter()
+                .any(|&(cosine, sine)| !cosine.is_finite() || !sine.is_finite())
+        {
+            return Err(invalid("invalid pinned Swift RoPE geometry or frequencies"));
+        }
+        if let Some(result) =
+            neon::rms_norm_rope_round_f16_256_in_place::<PINNED>(val_arr, w_arr, scale, freq_arr)
+        {
+            return result;
+        }
+    }
+    for (val, &w) in values.iter_mut().zip(weight) {
+        *val = finite(if PINNED {
+            (*val * w) * scale
+        } else {
+            (*val * scale) * w
+        })?;
+    }
+    if PINNED {
+        pinned_attention::rope_in_place(values, head, rotary, frequencies)?;
+    } else {
+        for head_slice in values.chunks_exact_mut(head) {
+            for (index, &(cosine, sine)) in frequencies.iter().enumerate() {
+                let first = head_slice[index];
+                let second = head_slice[index + rotary / 2];
+                head_slice[index] = first * cosine - second * sine;
+                head_slice[index + rotary / 2] = first * sine + second * cosine;
+            }
+        }
+        if !is_finite_slice(values) {
+            return Err(invalid("nonfinite values in RoPE output"));
+        }
+    }
+    Ok(round_f16_slice(values))
 }
 
 #[allow(

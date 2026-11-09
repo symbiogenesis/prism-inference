@@ -956,18 +956,22 @@ pub(super) fn lora_finish_in_place(
 }
 
 #[inline]
-pub(super) fn round_f16_slice(values: &mut [f32]) -> bool {
-    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
-        return false;
-    };
+pub(super) fn round_f16_slice(values: &mut [f32]) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let (chunks, tail) = values.as_chunks_mut::<4>();
     for chunk in chunks {
-        round_f16_x4(neon, f32x4::from_slice(neon, chunk)).store_slice(chunk);
+        let rounded = round_f16_x4(neon, f32x4::from_slice(neon, chunk));
+        finite_mask &= rounded.is_finite();
+        rounded.store_slice(chunk);
     }
+    let mut all_finite = finite_mask.all_true();
     for value in tail {
-        *value = super::round_f16(*value);
+        let rounded = super::round_f16(*value);
+        all_finite &= rounded.is_finite();
+        *value = rounded;
     }
-    true
+    Some(all_finite)
 }
 
 #[inline]
@@ -1391,6 +1395,7 @@ pub(super) fn rms_norm_scale_into<const PINNED: bool>(
     Some(Ok(()))
 }
 
+#[cfg(test)]
 #[inline]
 #[allow(
     clippy::suboptimal_flops,
@@ -1518,6 +1523,210 @@ pub(super) fn rms_norm_scale_pinned_swiglu_into(
         *out = (g * norm) / (1.0 + (-g).exp());
     }
     Some(Ok(()))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product roundings for RMSNorm and Source RoPE while fusing PinnedSwift FMA RoPE and binary16 rounding."
+)]
+pub(super) fn rms_norm_rope_round_f16_256_into<const PINNED: bool>(
+    input: &[f32; 256],
+    weight: &[f32; 256],
+    scale: f32,
+    frequencies: &[(f32, f32); 32],
+    output: &mut [f32; 256],
+) -> Option<Result<bool>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let scale_vec = f32x4::splat(neon, scale);
+    let zero_mask = f32x4::splat(neon, 0.0).is_finite();
+    let mut norm_finite = zero_mask;
+    let mut rope_finite = zero_mask;
+    let mut f16_finite = zero_mask;
+    for chunk in 0..8 {
+        let base = chunk * 4;
+        let x0 = f32x4::from_slice(neon, &input[base..base + 4]);
+        let w0 = f32x4::from_slice(neon, &weight[base..base + 4]);
+        let x1 = f32x4::from_slice(neon, &input[32 + base..36 + base]);
+        let w1 = f32x4::from_slice(neon, &weight[32 + base..36 + base]);
+        let (first, second) = if PINNED {
+            ((x0 * w0) * scale_vec, (x1 * w1) * scale_vec)
+        } else {
+            ((x0 * scale_vec) * w0, (x1 * scale_vec) * w1)
+        };
+        norm_finite = norm_finite & first.is_finite() & second.is_finite();
+        let cos = f32x4::load_array(
+            neon,
+            [
+                frequencies[base].0,
+                frequencies[base + 1].0,
+                frequencies[base + 2].0,
+                frequencies[base + 3].0,
+            ],
+        );
+        let sin = f32x4::load_array(
+            neon,
+            [
+                frequencies[base].1,
+                frequencies[base + 1].1,
+                frequencies[base + 2].1,
+                frequencies[base + 3].1,
+            ],
+        );
+        let (rot0, rot1) = if PINNED {
+            (
+                first.mul_add_precise(cos, -(second * sin)),
+                second.mul_add_precise(cos, first * sin),
+            )
+        } else {
+            (
+                (first * cos) - (second * sin),
+                (first * sin) + (second * cos),
+            )
+        };
+        rope_finite = rope_finite & rot0.is_finite() & rot1.is_finite();
+        let r0 = round_f16_x4(neon, rot0);
+        let r1 = round_f16_x4(neon, rot1);
+        f16_finite = f16_finite & r0.is_finite() & r1.is_finite();
+        r0.store_slice(&mut output[base..base + 4]);
+        r1.store_slice(&mut output[32 + base..36 + base]);
+    }
+    for ((in_chunk, w_chunk), out_chunk) in input[64..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(weight[64..].as_chunks::<4>().0)
+        .zip(output[64..].as_chunks_mut::<4>().0)
+    {
+        let v = f32x4::from_slice(neon, in_chunk);
+        let w = f32x4::from_slice(neon, w_chunk);
+        let norm = if PINNED {
+            (v * w) * scale_vec
+        } else {
+            (v * scale_vec) * w
+        };
+        norm_finite &= norm.is_finite();
+        rope_finite &= norm.is_finite();
+        let rounded = round_f16_x4(neon, norm);
+        f16_finite &= rounded.is_finite();
+        rounded.store_slice(out_chunk);
+    }
+    if !norm_finite.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    if !rope_finite.all_true() {
+        return Some(Err(crate::invalid(if PINNED {
+            "nonfinite pinned Swift RoPE output"
+        } else {
+            "nonfinite values in RoPE output"
+        })));
+    }
+    Some(Ok(f16_finite.all_true()))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 product roundings for RMSNorm and Source RoPE while fusing PinnedSwift FMA RoPE and binary16 rounding."
+)]
+pub(super) fn rms_norm_rope_round_f16_256_in_place<const PINNED: bool>(
+    values: &mut [f32; 256],
+    weight: &[f32; 256],
+    scale: f32,
+    frequencies: &[(f32, f32); 32],
+) -> Option<Result<bool>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let scale_vec = f32x4::splat(neon, scale);
+    let zero_mask = f32x4::splat(neon, 0.0).is_finite();
+    let mut norm_finite = zero_mask;
+    let mut rope_finite = zero_mask;
+    let mut f16_finite = zero_mask;
+    let (rotary, suffix) = values.split_at_mut(64);
+    let (first_half, second_half) = rotary.split_at_mut(32);
+    for (chunk, (first_chunk, second_chunk)) in first_half
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(second_half.as_chunks_mut::<4>().0)
+        .enumerate()
+    {
+        let base = chunk * 4;
+        let x0 = f32x4::from_slice(neon, first_chunk);
+        let w0 = f32x4::from_slice(neon, &weight[base..base + 4]);
+        let x1 = f32x4::from_slice(neon, second_chunk);
+        let w1 = f32x4::from_slice(neon, &weight[32 + base..36 + base]);
+        let (first, second) = if PINNED {
+            ((x0 * w0) * scale_vec, (x1 * w1) * scale_vec)
+        } else {
+            ((x0 * scale_vec) * w0, (x1 * scale_vec) * w1)
+        };
+        norm_finite = norm_finite & first.is_finite() & second.is_finite();
+        let cos = f32x4::load_array(
+            neon,
+            [
+                frequencies[base].0,
+                frequencies[base + 1].0,
+                frequencies[base + 2].0,
+                frequencies[base + 3].0,
+            ],
+        );
+        let sin = f32x4::load_array(
+            neon,
+            [
+                frequencies[base].1,
+                frequencies[base + 1].1,
+                frequencies[base + 2].1,
+                frequencies[base + 3].1,
+            ],
+        );
+        let (rot0, rot1) = if PINNED {
+            (
+                first.mul_add_precise(cos, -(second * sin)),
+                second.mul_add_precise(cos, first * sin),
+            )
+        } else {
+            (
+                (first * cos) - (second * sin),
+                (first * sin) + (second * cos),
+            )
+        };
+        rope_finite = rope_finite & rot0.is_finite() & rot1.is_finite();
+        let r0 = round_f16_x4(neon, rot0);
+        let r1 = round_f16_x4(neon, rot1);
+        f16_finite = f16_finite & r0.is_finite() & r1.is_finite();
+        r0.store_slice(first_chunk);
+        r1.store_slice(second_chunk);
+    }
+    for (val_chunk, w_chunk) in suffix
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(weight[64..].as_chunks::<4>().0)
+    {
+        let v = f32x4::from_slice(neon, val_chunk);
+        let w = f32x4::from_slice(neon, w_chunk);
+        let norm = if PINNED {
+            (v * w) * scale_vec
+        } else {
+            (v * scale_vec) * w
+        };
+        norm_finite &= norm.is_finite();
+        rope_finite &= norm.is_finite();
+        let rounded = round_f16_x4(neon, norm);
+        f16_finite &= rounded.is_finite();
+        rounded.store_slice(val_chunk);
+    }
+    if !norm_finite.all_true() {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+    }
+    if !rope_finite.all_true() {
+        return Some(Err(crate::invalid(if PINNED {
+            "nonfinite pinned Swift RoPE output"
+        } else {
+            "nonfinite values in RoPE output"
+        })));
+    }
+    Some(Ok(f16_finite.all_true()))
 }
 
 #[inline]
@@ -5095,7 +5304,7 @@ mod tests {
             );
 
             let mut f16_in_place = input.clone();
-            assert!(round_f16_slice(&mut f16_in_place));
+            assert_eq!(round_f16_slice(&mut f16_in_place), Some(true));
             let mut f16_into = vec![0.0_f32; len];
             round_f16_into(&input, &mut f16_into).ok_or("missing baseline NEON token")??;
             assert_eq!(
@@ -5241,6 +5450,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        reason = "Cover fused RMSNorm, SwiGLU, and grouped Hadamard block sizes in one test."
+    )]
     fn fused_rms_norm_and_swiglu_hadamard_match_unfused_zero_ulp() -> TestResult {
         for block in [16_usize, 64, 256, 1024] {
             let input: Vec<f32> = (0..block * 2)
@@ -5418,6 +5634,95 @@ mod tests {
                     assert_eq!(a.to_bits(), b.to_bits());
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        clippy::suboptimal_flops,
+        reason = "Deterministic synthetic test values and Source RoPE reference."
+    )]
+    fn fused_rms_norm_rope_round_f16_matches_unfused_zero_ulp() -> TestResult {
+        let head = 256;
+        let rotary = 64;
+        let input: Vec<f32> = (0..head)
+            .map(|i| ((i * 59 + 13) % 97) as f32 * 0.03125 - 1.5)
+            .collect();
+        let weight: Vec<f32> = (0..head)
+            .map(|i| ((i * 31 + 7) % 67) as f32 * 0.015_625 + 0.25)
+            .collect();
+        let frequencies: Vec<(f32, f32)> = (0..rotary / 2)
+            .map(|i| {
+                let angle = (i as f32) * 0.11;
+                (angle.cos(), angle.sin())
+            })
+            .collect();
+        let eps = 1e-6_f32;
+
+        // PinnedSwift (PINNED = true)
+        let mut exp_pinned = input.clone();
+        super::super::rms_norm_pinned_in_place(&mut exp_pinned, &weight, eps)?;
+        super::super::pinned_attention::rope_in_place(&mut exp_pinned, head, rotary, &frequencies)?;
+        assert!(super::super::round_f16_slice(&mut exp_pinned));
+        let mut act_pinned_in_place = input.clone();
+        assert!(super::super::rms_norm_rope_round_f16_in_place::<true>(
+            &mut act_pinned_in_place,
+            &weight,
+            eps,
+            head,
+            rotary,
+            &frequencies,
+        )?);
+        let mut act_pinned_into = vec![0.0_f32; head];
+        assert!(super::super::rms_norm_rope_round_f16_into::<true>(
+            &input,
+            &weight,
+            eps,
+            head,
+            rotary,
+            &frequencies,
+            &mut act_pinned_into,
+        )?);
+        for i in 0..head {
+            assert_eq!(act_pinned_in_place[i].to_bits(), exp_pinned[i].to_bits());
+            assert_eq!(act_pinned_into[i].to_bits(), exp_pinned[i].to_bits());
+        }
+
+        // Source (PINNED = false)
+        let mut exp_source = input.clone();
+        super::super::rms_norm_in_place(&mut exp_source, &weight, eps)?;
+        for (idx, &(c, s)) in frequencies.iter().enumerate() {
+            let first = exp_source[idx];
+            let second = exp_source[idx + rotary / 2];
+            exp_source[idx] = first * c - second * s;
+            exp_source[idx + rotary / 2] = first * s + second * c;
+        }
+        assert!(super::super::round_f16_slice(&mut exp_source));
+        let mut act_source_in_place = input.clone();
+        assert!(super::super::rms_norm_rope_round_f16_in_place::<false>(
+            &mut act_source_in_place,
+            &weight,
+            eps,
+            head,
+            rotary,
+            &frequencies,
+        )?);
+        let mut act_source_into = vec![0.0_f32; head];
+        assert!(super::super::rms_norm_rope_round_f16_into::<false>(
+            &input,
+            &weight,
+            eps,
+            head,
+            rotary,
+            &frequencies,
+            &mut act_source_into,
+        )?);
+        for i in 0..head {
+            assert_eq!(act_source_in_place[i].to_bits(), exp_source[i].to_bits());
+            assert_eq!(act_source_into[i].to_bits(), exp_source[i].to_bits());
         }
         Ok(())
     }

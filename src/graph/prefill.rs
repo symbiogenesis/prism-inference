@@ -671,17 +671,27 @@ fn full_attention_kv_only_tile(
                 {
                     let tok = base_tok + offset;
                     let frequencies = &frequencies_ref[tok];
+                    let mut key_finite = true;
+                    let mut value_finite = true;
                     for (key_head, value_head) in key_tok
                         .chunks_exact_mut(g.head)
                         .zip(value_tok.chunks_exact_mut(g.head))
                     {
-                        arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
-                        arithmetic.attention_rope(key_head, g, frequencies)?;
-                        round_f16_slice(key_head);
-                        round_f16_slice(value_head);
+                        key_finite &= arithmetic.normalize_rope_round_f16_in_place(
+                            key_head,
+                            key_norm,
+                            g.epsilon,
+                            g,
+                            frequencies,
+                        )?;
+                        value_finite &= round_f16_slice(value_head);
                     }
-                    finite(key_tok, "binary16 key cache")?;
-                    finite(value_tok, "binary16 value cache")?;
+                    if !key_finite {
+                        return Err(invalid("nonfinite values in binary16 key cache"));
+                    }
+                    if !value_finite {
+                        return Err(invalid("nonfinite values in binary16 value cache"));
+                    }
                 }
                 Ok(())
             },
@@ -691,17 +701,27 @@ fn full_attention_kv_only_tile(
             let frequencies = &frequencies_ref[tok];
             let key_tok = &mut tile.recurrent_gate[tok];
             let value_tok = &mut tile.beta[tok];
+            let mut key_finite = true;
+            let mut value_finite = true;
             for (key_head, value_head) in key_tok
                 .chunks_exact_mut(g.head)
                 .zip(value_tok.chunks_exact_mut(g.head))
             {
-                arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
-                arithmetic.attention_rope(key_head, g, frequencies)?;
-                round_f16_slice(key_head);
-                round_f16_slice(value_head);
+                key_finite &= arithmetic.normalize_rope_round_f16_in_place(
+                    key_head,
+                    key_norm,
+                    g.epsilon,
+                    g,
+                    frequencies,
+                )?;
+                value_finite &= round_f16_slice(value_head);
             }
-            finite(key_tok, "binary16 key cache")?;
-            finite(value_tok, "binary16 value cache")?;
+            if !key_finite {
+                return Err(invalid("nonfinite values in binary16 key cache"));
+            }
+            if !value_finite {
+                return Err(invalid("nonfinite values in binary16 value cache"));
+            }
         }
     }
     for index in 0..count {
@@ -821,19 +841,26 @@ fn full_attention_tile(
                 let tok = base_tok + offset;
                 let projected = &mixed_ref[tok];
                 let frequencies = &frequencies_ref[tok];
+                let mut query_finite = true;
                 for (head_idx, (query_head, gate_head)) in query_tok
                     .chunks_exact_mut(g.head)
                     .zip(gate_tok.chunks_exact_mut(g.head))
                     .enumerate()
                 {
                     let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                    query_head.copy_from_slice(&src[..g.head]);
                     gate_head.copy_from_slice(&src[g.head..]);
-                    arithmetic.normalize_in_place(query_head, query_norm, g.epsilon)?;
-                    arithmetic.attention_rope(query_head, g, frequencies)?;
-                    round_f16_slice(query_head);
+                    query_finite &= arithmetic.normalize_rope_round_f16_into(
+                        &src[..g.head],
+                        query_norm,
+                        g.epsilon,
+                        g,
+                        frequencies,
+                        query_head,
+                    )?;
                 }
-                finite(query_tok, "binary16 attention query")?;
+                if !query_finite {
+                    return Err(invalid("nonfinite values in binary16 attention query"));
+                }
             }
             Ok(())
         },
@@ -850,17 +877,27 @@ fn full_attention_tile(
             {
                 let tok = base_tok + offset;
                 let frequencies = &frequencies_ref[tok];
+                let mut key_finite = true;
+                let mut value_finite = true;
                 for (key_head, value_head) in key_tok
                     .chunks_exact_mut(g.head)
                     .zip(value_tok.chunks_exact_mut(g.head))
                 {
-                    arithmetic.normalize_in_place(key_head, key_norm, g.epsilon)?;
-                    arithmetic.attention_rope(key_head, g, frequencies)?;
-                    round_f16_slice(key_head);
-                    round_f16_slice(value_head);
+                    key_finite &= arithmetic.normalize_rope_round_f16_in_place(
+                        key_head,
+                        key_norm,
+                        g.epsilon,
+                        g,
+                        frequencies,
+                    )?;
+                    value_finite &= round_f16_slice(value_head);
                 }
-                finite(key_tok, "binary16 key cache")?;
-                finite(value_tok, "binary16 value cache")?;
+                if !key_finite {
+                    return Err(invalid("nonfinite values in binary16 key cache"));
+                }
+                if !value_finite {
+                    return Err(invalid("nonfinite values in binary16 value cache"));
+                }
             }
             Ok(())
         },

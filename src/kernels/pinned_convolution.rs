@@ -656,6 +656,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        reason = "Deterministic synthetic test inputs."
+    )]
     fn pinned_convolution_multi_token_matches_single_token_steps_bit_for_bit() -> Result<()> {
         for channels in [8, 128, 65] {
             for width in [4, 2] {

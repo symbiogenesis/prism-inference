@@ -179,8 +179,7 @@ mod tests {
             let mut optimized = expected.clone();
             let mut independent_clone = actual.clone();
             let mut clone_candidates = expected.clone();
-            let expected_token =
-                original_fixed_chain(&mut reference_distribution, &mut expected)?;
+            let expected_token = original_fixed_chain(&mut reference_distribution, &mut expected)?;
             assert_eq!(actual.sample_candidates(&mut optimized)?, expected_token);
             assert_eq!(
                 independent_clone.sample_candidates(&mut clone_candidates)?,
@@ -190,10 +189,7 @@ mod tests {
             assert_eq!(optimized.sorted(), expected.sorted());
             assert_eq!(optimized.offset(), expected.offset());
             assert_eq!(optimized.data().len(), expected.data().len());
-            for (observed, original) in optimized
-                .into_backing()
-                .iter()
-                .zip(expected.into_backing())
+            for (observed, original) in optimized.into_backing().iter().zip(expected.into_backing())
             {
                 assert_eq!(observed.id, original.id);
                 assert_eq!(observed.logit.to_bits(), original.logit.to_bits());

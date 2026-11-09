@@ -4,8 +4,8 @@ use std::fmt::Write as _;
 
 use super::{
     Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
-    Transforms, add, add_finite, attention_gate, checked_product, finite, resize_into, rope_frequencies, row_into,
-    small_float,
+    Transforms, add, add_finite, attention_gate, checked_product, finite, resize_into,
+    rope_frequencies, row_into, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -827,16 +827,12 @@ fn full_attention_tile(
         &mut tile.up[..count],
         1,
         |base_tok, query_chunk| {
-            for (offset, query_tok) in query_chunk.iter_mut().enumerate()
-            {
+            for (offset, query_tok) in query_chunk.iter_mut().enumerate() {
                 let tok = base_tok + offset;
                 let projected = &mixed_ref[tok];
                 let frequencies = &frequencies_ref[tok];
                 let mut query_finite = true;
-                for (head_idx, query_head) in query_tok
-                    .chunks_exact_mut(g.head)
-                    .enumerate()
-                {
+                for (head_idx, query_head) in query_tok.chunks_exact_mut(g.head).enumerate() {
                     let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
                     query_finite &= arithmetic.normalize_rope_round_f16_into(
                         &src[..g.head],

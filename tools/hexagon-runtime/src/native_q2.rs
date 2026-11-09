@@ -724,10 +724,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             self.prepare_resident(tensor, &mut weights, true)?
         };
         if resident.is_none() {
-            resize_packed_scratch(
-                &mut weights,
-                max_mapped_rows * 36 * (max_chunk_cols / 128),
-            )?;
+            resize_packed_scratch(&mut weights, max_mapped_rows * 36 * (max_chunk_cols / 128))?;
         }
         if single_op {
             return self.project_single_op(
@@ -2662,8 +2659,16 @@ mod tests {
             .with_resident_weights(4096)?;
         let mut copied_weights = Vec::new();
         let mut direct_weights = Vec::new();
-        assert!(copied.prepare_resident(&tensor, &mut copied_weights, false)?.is_some());
-        assert!(direct.prepare_resident(&tensor, &mut direct_weights, false)?.is_some());
+        assert!(
+            copied
+                .prepare_resident(&tensor, &mut copied_weights, false)?
+                .is_some()
+        );
+        assert!(
+            direct
+                .prepare_resident(&tensor, &mut direct_weights, false)?
+                .is_some()
+        );
         assert_eq!(direct.submitter.memory, copied.submitter.memory);
         assert_eq!(direct_weights.capacity(), 0);
         assert_eq!(copied_weights.len(), 1152);
@@ -2674,7 +2679,11 @@ mod tests {
         for executor in [&mut copied, &mut direct] {
             let mut refused_weights = Vec::new();
             let bytes_before = executor.submitter.registry.used_bytes();
-            assert!(executor.prepare_resident(&oversized, &mut refused_weights, false)?.is_none());
+            assert!(
+                executor
+                    .prepare_resident(&oversized, &mut refused_weights, false)?
+                    .is_none()
+            );
             assert_eq!(refused_weights.capacity(), 0);
             assert_eq!(executor.submitter.registry.used_bytes(), bytes_before);
             assert_eq!(executor.residency_statistics().tensors_prepared, 1);
@@ -2705,16 +2714,26 @@ mod tests {
             ),
             2 => executor.project_f32_tokens(tensors[0], &activations, true, &mut first_tokens),
             3 => executor.project_f32_pair_tokens(
-                [tensors[0], tensors[1]], &activations, true,
-                &mut first_tokens, &mut second_tokens,
+                [tensors[0], tensors[1]],
+                &activations,
+                true,
+                &mut first_tokens,
+                &mut second_tokens,
             ),
             4 => executor.project_f32_triple_tokens(
-                tensors, &activations, true,
-                &mut first_tokens, &mut second_tokens, &mut third_tokens,
+                tensors,
+                &activations,
+                true,
+                &mut first_tokens,
+                &mut second_tokens,
+                &mut third_tokens,
             ),
             5 => executor.project_f32_ffn_swiglu(tensors[0], tensors[1], &activation, &mut single),
             6 => executor.project_f32_ffn_swiglu_tokens(
-                tensors[0], tensors[1], &activations, &mut first_tokens,
+                tensors[0],
+                tensors[1],
+                &activations,
+                &mut first_tokens,
             ),
             7 => executor.project_f32_ffn_chain(tensors, &activation, None, None, &mut single),
             _ => return Err(invalid("invalid lazy projection test mode")),
@@ -2732,15 +2751,31 @@ mod tests {
     }
 
     fn assert_lazy_failure_outputs(mode: u8, singles: [&[f32]; 3], tokens: [&[Vec<f32>]; 3]) {
-        for output in singles.into_iter().chain(tokens.into_iter().flatten().map(Vec::as_slice)) {
-            assert!(output.is_empty() || (output.len() == 1 && output[0].to_bits() == 9.0_f32.to_bits()));
+        for output in singles
+            .into_iter()
+            .chain(tokens.into_iter().flatten().map(Vec::as_slice))
+        {
+            assert!(
+                output.is_empty()
+                    || (output.len() == 1 && output[0].to_bits() == 9.0_f32.to_bits())
+            );
         }
         // Every output selected for this entrypoint must be cleared on failure.
-        if matches!(mode, 0 | 1 | 5 | 7) { assert!(singles[0].is_empty()); }
-        if mode == 1 { assert!(singles[1].is_empty() && singles[2].is_empty()); }
-        if matches!(mode, 2 | 3 | 4 | 6) { assert!(tokens[0].iter().all(Vec::is_empty)); }
-        if matches!(mode, 3 | 4) { assert!(tokens[1].iter().all(Vec::is_empty)); }
-        if mode == 4 { assert!(tokens[2].iter().all(Vec::is_empty)); }
+        if matches!(mode, 0 | 1 | 5 | 7) {
+            assert!(singles[0].is_empty());
+        }
+        if mode == 1 {
+            assert!(singles[1].is_empty() && singles[2].is_empty());
+        }
+        if matches!(mode, 2 | 3 | 4 | 6) {
+            assert!(tokens[0].iter().all(Vec::is_empty));
+        }
+        if matches!(mode, 3 | 4) {
+            assert!(tokens[1].iter().all(Vec::is_empty));
+        }
+        if mode == 4 {
+            assert!(tokens[2].iter().all(Vec::is_empty));
+        }
     }
 
     #[test]
@@ -2752,20 +2787,36 @@ mod tests {
             .map_err(|_| invalid("limits"))?;
         for mode in 0..8 {
             let mut copied = NativeQ2Executor::new(
-                arena_submitter_at_capacity(false, 32_768)?, limits, 1024 * 1024,
-            ).with_resident_weights(4096)?;
+                arena_submitter_at_capacity(false, 32_768)?,
+                limits,
+                1024 * 1024,
+            )
+            .with_resident_weights(4096)?;
             let mut direct = NativeQ2Executor::new(
-                arena_submitter_at_capacity(true, 32_768)?, limits, 1024 * 1024,
-            ).with_resident_weights(4096)?;
+                arena_submitter_at_capacity(true, 32_768)?,
+                limits,
+                1024 * 1024,
+            )
+            .with_resident_weights(4096)?;
             lazy_submit_failure(&mut copied, [&gate, &up, &down], mode)?;
             lazy_submit_failure(&mut direct, [&gate, &up, &down], mode)?;
             assert_eq!(direct.submitter.memory, copied.submitter.memory);
             assert_eq!(direct.submitter.copies, 0);
             assert_eq!(direct.submitter.initializations, copied.submitter.copies);
-            assert_eq!(direct.submitter.registry.used_bytes(), copied.submitter.registry.used_bytes());
-            let prepared = match mode { 0 | 2 => 1, 3 | 5 | 6 => 2, _ => 3 };
+            assert_eq!(
+                direct.submitter.registry.used_bytes(),
+                copied.submitter.registry.used_bytes()
+            );
+            let prepared = match mode {
+                0 | 2 => 1,
+                3 | 5 | 6 => 2,
+                _ => 3,
+            };
             assert_eq!(direct.residency_statistics().tensors_prepared, prepared);
-            assert_eq!(direct.statistics().operations_attempted, copied.statistics().operations_attempted);
+            assert_eq!(
+                direct.statistics().operations_attempted,
+                copied.statistics().operations_attempted
+            );
         }
         Ok(())
     }
@@ -2781,7 +2832,11 @@ mod tests {
         let mut executor = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
             .with_resident_weights(4096)?;
         let mut output = vec![9.0];
-        assert!(executor.project_f32(&tensor, &[1.0; 128], true, &mut output).is_err());
+        assert!(
+            executor
+                .project_f32(&tensor, &[1.0; 128], true, &mut output)
+                .is_err()
+        );
         assert!(output.is_empty());
         assert!(executor.is_faulted());
         assert_eq!(executor.submitter.registry.used_bytes(), 0);
@@ -3166,13 +3221,18 @@ mod tests {
                 block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
             }
             tensor.data = Arc::from(data);
-            let limits = NativeQ2ProjectionLimits::new(
-                maximum_columns, 32, 100, Duration::from_secs(10),
-            ).map_err(|_| invalid("limits"))?;
+            let limits =
+                NativeQ2ProjectionLimits::new(maximum_columns, 32, 100, Duration::from_secs(10))
+                    .map_err(|_| invalid("limits"))?;
             let packed_bytes = 32 * 36 * (maximum_columns / 128);
             let payload_bytes = rows * 4 + packed_bytes + 32 * 4;
             let submitter = TransientCapture {
-                mock: MockNativeSubmitter { calls: 0, resident_calls: 0, remaining: 100, residency_bytes: 0 },
+                mock: MockNativeSubmitter {
+                    calls: 0,
+                    resident_calls: 0,
+                    remaining: 100,
+                    residency_bytes: 0,
+                },
                 scale_headers: 0,
                 maximum_packed_bytes: 0,
             };
@@ -3183,7 +3243,11 @@ mod tests {
             executor.project_f32(&tensor, &[1.0; 256], true, &mut output)?;
             assert_eq!(output.len(), rows);
             for (index, value) in output.iter().enumerate() {
-                let expected = if index.is_multiple_of(32) { 256.0_f32 } else { 0.0_f32 };
+                let expected = if index.is_multiple_of(32) {
+                    256.0_f32
+                } else {
+                    0.0_f32
+                };
                 assert_eq!(value.to_bits(), expected.to_bits());
             }
             assert_eq!(executor.submitter.mock.calls, expected_calls);
@@ -3195,7 +3259,11 @@ mod tests {
             assert!(!executor.is_faulted());
             executor.maximum_owned_payload_bytes = payload_bytes - 1;
             assert!(!executor.supports_f32(&tensor));
-            assert!(executor.project_f32(&tensor, &[1.0; 256], true, &mut output).is_err());
+            assert!(
+                executor
+                    .project_f32(&tensor, &[1.0; 256], true, &mut output)
+                    .is_err()
+            );
             assert!(output.is_empty());
             assert_eq!(executor.submitter.mock.calls, expected_calls);
         }

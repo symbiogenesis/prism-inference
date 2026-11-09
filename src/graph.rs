@@ -3139,36 +3139,30 @@ impl Evaluation<'_, '_> {
         let arithmetic = self.arithmetic;
         let query_norm: &[f32] = &layer.query_norm;
         let frequencies: &[(f32, f32)] = frequencies_scratch;
-        self.projection
-            .matvec
-            .row_parallelism()
-            .update_chunks(
-                query_scratch,
-                g.head,
-                |base_head, query_chunk| {
-                    let mut query_finite = true;
-                    for (head_offset, query_head) in query_chunk
-                        .chunks_exact_mut(g.head)
-                        .enumerate()
-                    {
-                        let head_idx = base_head + head_offset;
-                        let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                        // F16 K x Q converts the F32 query to F16 even with F32 precision.
-                        query_finite &= arithmetic.normalize_rope_round_f16_into(
-                            &src[..g.head],
-                            query_norm,
-                            g.epsilon,
-                            g,
-                            frequencies,
-                            query_head,
-                        )?;
-                    }
-                    if !query_finite {
-                        return Err(invalid("nonfinite values in binary16 attention query"));
-                    }
-                    Ok(())
-                },
-            )?;
+        self.projection.matvec.row_parallelism().update_chunks(
+            query_scratch,
+            g.head,
+            |base_head, query_chunk| {
+                let mut query_finite = true;
+                for (head_offset, query_head) in query_chunk.chunks_exact_mut(g.head).enumerate() {
+                    let head_idx = base_head + head_offset;
+                    let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
+                    // F16 K x Q converts the F32 query to F16 even with F32 precision.
+                    query_finite &= arithmetic.normalize_rope_round_f16_into(
+                        &src[..g.head],
+                        query_norm,
+                        g.epsilon,
+                        g,
+                        frequencies,
+                        query_head,
+                    )?;
+                }
+                if !query_finite {
+                    return Err(invalid("nonfinite values in binary16 attention query"));
+                }
+                Ok(())
+            },
+        )?;
         let key_norm: &[f32] = &layer.key_norm;
         self.projection
             .matvec
@@ -5087,7 +5081,9 @@ mod tests {
         workers: usize,
     ) -> Result<()> {
         let mut projection = ProjectionScratch::default();
-        projection.matvec.set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
+        projection
+            .matvec
+            .set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
         let transforms = Transforms::default();
         let mut adapter = crate::model::lora::Scratch::default();
         let mut evaluation = super::Evaluation {
@@ -5110,24 +5106,47 @@ mod tests {
         // A failed rounding attempt must not publish attended output
         // or append state; reuse the same scratch for the valid retry.
         value[0] = 70_000.0;
-        assert!(evaluation.full_attention_state(
-            layer, projected, &mut key, &mut value, &keys, &values,
-            &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
-            &mut scratch.attended,
-        ).is_err());
+        assert!(
+            evaluation
+                .full_attention_state(
+                    layer,
+                    projected,
+                    &mut key,
+                    &mut value,
+                    &keys,
+                    &values,
+                    &mut scratch.query,
+                    &mut scratch.scores,
+                    &mut scratch.frequencies,
+                    &mut scratch.attended,
+                )
+                .is_err()
+        );
         assert!(scratch.attended.is_empty());
         assert!(scratch.gate.is_empty());
         assert_eq!(keys.tokens().count(), 0);
         assert_eq!(values.tokens().count(), 0);
         let mut value = original_values;
         evaluation.full_attention_state(
-            layer, projected, &mut key, &mut value, &keys, &values,
-            &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
+            layer,
+            projected,
+            &mut key,
+            &mut value,
+            &keys,
+            &values,
+            &mut scratch.query,
+            &mut scratch.scores,
+            &mut scratch.frequencies,
             &mut scratch.attended,
         )?;
         assert!(scratch.gate.is_empty());
-        assert!(scratch.attended.iter().map(|value| value.to_bits())
-            .eq(expected.iter().map(|value| value.to_bits())));
+        assert!(
+            scratch
+                .attended
+                .iter()
+                .map(|value| value.to_bits())
+                .eq(expected.iter().map(|value| value.to_bits()))
+        );
         Ok(())
     }
 
@@ -5173,7 +5192,13 @@ mod tests {
         for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
             for workers in worker_counts {
                 check_original_attention_gates(
-                    &geometry, &layer, &projected, original_values, &expected, arithmetic, workers,
+                    &geometry,
+                    &layer,
+                    &projected,
+                    original_values,
+                    &expected,
+                    arithmetic,
+                    workers,
                 )?;
             }
         }

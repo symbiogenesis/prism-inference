@@ -3125,6 +3125,77 @@ mod tests {
         }
     }
 
+    struct TransientCapture {
+        mock: MockNativeSubmitter,
+        scale_headers: usize,
+        maximum_packed_bytes: usize,
+    }
+    impl NativeQ2Submitter for TransientCapture {
+        fn submit(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            for tile in weights.as_chunks::<576>().0 {
+                assert!(tile[..512].iter().all(|&code| code == 0x55));
+                for scale in tile[512..].as_chunks::<2>().0 {
+                    let bits = u16::from_le_bytes(*scale);
+                    assert!(matches!(bits, 0 | 0x3800));
+                    self.scale_headers += usize::from(bits == 0x3800);
+                }
+            }
+            self.maximum_packed_bytes = self.maximum_packed_bytes.max(weights.len());
+            self.mock.submit(columns, rows, weights, activation, output)
+        }
+    }
+    #[test]
+    fn native_q2_nonresident_single_and_tiled_fallback_preserve_packing_and_bounds() -> Result<()> {
+        for (rows, maximum_columns, expected_calls) in [(32, 256, 1), (49, 128, 4)] {
+            let columns = 256;
+            let mut tensor = lazy_tensor("blk.0.ffn_up.weight", columns, rows);
+            let mut data = tensor.data.to_vec();
+            for block in data.as_chunks_mut::<34>().0 {
+                block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            }
+            tensor.data = Arc::from(data);
+            let limits = NativeQ2ProjectionLimits::new(
+                maximum_columns, 32, 100, Duration::from_secs(10),
+            ).map_err(|_| invalid("limits"))?;
+            let packed_bytes = 32 * 36 * (maximum_columns / 128);
+            let payload_bytes = rows * 4 + packed_bytes + 32 * 4;
+            let submitter = TransientCapture {
+                mock: MockNativeSubmitter { calls: 0, resident_calls: 0, remaining: 100, residency_bytes: 0 },
+                scale_headers: 0,
+                maximum_packed_bytes: 0,
+            };
+            let mut executor = NativeQ2Executor::new(submitter, limits, payload_bytes);
+            assert!(executor.supports_f32(&tensor));
+            assert!(executor.residency.is_none());
+            let mut output = vec![9.0];
+            executor.project_f32(&tensor, &[1.0; 256], true, &mut output)?;
+            assert_eq!(output.len(), rows);
+            for (index, value) in output.iter().enumerate() {
+                assert_eq!(*value, if index.is_multiple_of(32) { 256.0 } else { 0.0 });
+            }
+            assert_eq!(executor.submitter.mock.calls, expected_calls);
+            assert_eq!(executor.submitter.mock.resident_calls, 0);
+            assert_eq!(executor.statistics().operations_completed, expected_calls);
+            assert_eq!(executor.queue_writes_completed(), expected_calls);
+            assert_eq!(executor.submitter.scale_headers, rows * (columns / 128) * 2);
+            assert_eq!(executor.submitter.maximum_packed_bytes, packed_bytes);
+            assert!(!executor.is_faulted());
+            executor.maximum_owned_payload_bytes = payload_bytes - 1;
+            assert!(!executor.supports_f32(&tensor));
+            assert!(executor.project_f32(&tensor, &[1.0; 256], true, &mut output).is_err());
+            assert!(output.is_empty());
+            assert_eq!(executor.submitter.mock.calls, expected_calls);
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_q2_transcodes_scales_and_executes_full_k_in_one_operation() -> Result<()> {
         let columns = 256;

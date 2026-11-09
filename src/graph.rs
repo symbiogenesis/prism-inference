@@ -5122,8 +5122,8 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(scratch.attended.is_empty());
-        assert!(scratch.gate.is_empty());
+        assert_eq!(scratch.attended, [] as [f32; 0]);
+        assert_eq!(scratch.gate, [] as [f32; 0]);
         assert_eq!(keys.tokens().count(), 0);
         assert_eq!(values.tokens().count(), 0);
         let mut value = original_values;
@@ -5139,7 +5139,7 @@ mod tests {
             &mut scratch.frequencies,
             &mut scratch.attended,
         )?;
-        assert!(scratch.gate.is_empty());
+        assert_eq!(scratch.gate, [] as [f32; 0]);
         assert!(
             scratch
                 .attended
@@ -5165,7 +5165,7 @@ mod tests {
         };
         let mut projected = vec![0.0_f32; geometry.query_gate_width()];
         let mut expected_gates = Vec::new();
-        for (head, pair) in projected.chunks_exact_mut(8).enumerate() {
+        for (head, pair) in projected.as_chunks_mut::<8>().0.iter_mut().enumerate() {
             for (channel, gate) in pair[4..].iter_mut().enumerate() {
                 *gate = [-4.0, -1.0, 0.0, 1.0, 4.0][(head + channel) % 5];
                 expected_gates.push(*gate);

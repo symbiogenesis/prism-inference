@@ -3416,16 +3416,21 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn resident_native_q2_batch2_and_batch3_share_activation_and_validate_mixed_rows()
-    -> Result<(), Error> {
-        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
-        let mut weights_32 = vec![0x55_u8; 1152];
-        for tile in weights_32.as_chunks_mut::<576>().0 {
+    fn resident_native_q2_weights_32() -> Vec<u8> {
+        let mut weights = vec![0x55_u8; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
             for scale in tile[512..].as_chunks_mut::<2>().0 {
                 *scale = [0, 0x3c];
             }
         }
+        weights
+    }
+
+    #[test]
+    fn resident_native_q2_batch2_and_batch3_share_activation_and_validate_mixed_rows()
+    -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let weights_32 = resident_native_q2_weights_32();
         let weights_64 = weights_32.repeat(2);
         let activation = [1.0_f32; 128];
         {
@@ -3513,12 +3518,7 @@ mod tests {
     fn resident_native_q2_multi_arena_populates_secondary_buffer_and_batches_across_arenas()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
-        let mut weights_32 = vec![0x55_u8; 1152];
-        for tile in weights_32.as_chunks_mut::<576>().0 {
-            for scale in tile[512..].as_chunks_mut::<2>().0 {
-                *scale = [0, 0x3c];
-            }
-        }
+        let weights_32 = resident_native_q2_weights_32();
         let activation = [1.0_f32; 128];
         {
             let mut state = STATE.lock().map_err(|_| Error::Contract)?;
@@ -3623,12 +3623,7 @@ mod tests {
     fn resident_native_q2_multi4_executes_four_operations_in_single_queue_write()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
-        let mut weights_32 = vec![0x55_u8; 1152];
-        for tile in weights_32.as_chunks_mut::<576>().0 {
-            for scale in tile[512..].as_chunks_mut::<2>().0 {
-                *scale = [0, 0x3c];
-            }
-        }
+        let weights_32 = resident_native_q2_weights_32();
         let act0 = [1.0_f32; 128];
         let act1 = [2.0_f32; 128];
         {

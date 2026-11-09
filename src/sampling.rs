@@ -476,6 +476,13 @@ mod tests {
 
     #[test]
     fn finite_logits_preserves_bits_bounds_and_custom_sampler_dispatch() -> crate::Result<()> {
+        struct CustomSampler(usize);
+        impl Sampler for CustomSampler {
+            fn sample(&mut self, logits: &[f32]) -> crate::Result<u32> {
+                self.0 += 1;
+                crate::runtime::greedy(logits)
+            }
+        }
         let logits = [0.0, -0.0, f32::MIN, f32::MAX, f32::from_bits(1)];
         let view = super::FiniteLogits::new(&logits)?;
         assert_eq!(view.as_slice().as_ptr(), logits.as_ptr());
@@ -494,13 +501,6 @@ mod tests {
                 let mut rejected = logits;
                 rejected[index] = invalid;
                 assert!(super::FiniteLogits::new(&rejected).is_err());
-            }
-        }
-        struct CustomSampler(usize);
-        impl Sampler for CustomSampler {
-            fn sample(&mut self, logits: &[f32]) -> crate::Result<u32> {
-                self.0 += 1;
-                crate::runtime::greedy(logits)
             }
         }
         let mut sampler = CustomSampler(0);

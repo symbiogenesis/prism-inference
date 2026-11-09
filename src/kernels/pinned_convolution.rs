@@ -1086,7 +1086,7 @@ mod tests {
                         let mut expected_history = history.clone();
                         let mut expected: Vec<_> = rows
                             .iter()
-                            .flat_map(|row| row[1..1 + channels].iter().copied())
+                            .flat_map(|row| row[1..=channels].iter().copied())
                             .collect();
                         assert!(
                             step_silu_tokens_in_place(

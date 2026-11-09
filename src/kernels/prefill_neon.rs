@@ -1626,6 +1626,90 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[7].try_into().ok()?),
             ];
             let mut token = 0;
+            while token + 8 <= preparations.len() {
+                let acts: [&[crate::kernels::Q8Block; 4]; 8] = [
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 1].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 2].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 3].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 4].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 5].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 6].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 7].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                ];
+                let act_values: [[&[i8; 32]; 4]; 8] = std::array::from_fn(|t| {
+                    [
+                        &acts[t][0].values,
+                        &acts[t][1].values,
+                        &acts[t][2].values,
+                        &acts[t][3].values,
+                    ]
+                });
+                if pinned {
+                    let tile_lanes = bonsai_neon_dot::dot_ptq1_8x8_lanes(&trits, act_values);
+                    for r in 0..8 {
+                        let rs = row_scales[r];
+                        for t in 0..8 {
+                            let mut acc = lanes[r][token + t];
+                            for (group, lane_sums) in tile_lanes[r][t].iter().enumerate() {
+                                let floats =
+                                    i32x4::from_slice(neon, lane_sums).to_float::<f32x4<Neon>>();
+                                let d = f32x4::splat(neon, rs * acts[t][group].scale);
+                                acc = floats.mul_add_precise(d, acc);
+                            }
+                            lanes[r][token + t] = acc;
+                        }
+                    }
+                } else {
+                    let act_scales: [f32x4<Neon>; 8] = std::array::from_fn(|t| {
+                        f32x4::from_slice(
+                            neon,
+                            &[
+                                acts[t][0].scale,
+                                acts[t][1].scale,
+                                acts[t][2].scale,
+                                acts[t][3].scale,
+                            ],
+                        )
+                    });
+                    let tile_groups = bonsai_neon_dot::dot_ptq1_8x8_groups(&trits, act_values);
+                    for r in 0..8 {
+                        let rs = row_scales[r];
+                        for t in 0..8 {
+                            let dots = i32x4::from_slice(neon, &tile_groups[r][t])
+                                .to_float::<f32x4<Neon>>();
+                            let prod = (dots * act_scales[t]).to_array();
+                            let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                            sums[r][token + t] += rs * dot_sum;
+                        }
+                    }
+                }
+                token += 8;
+            }
             while token + 4 <= preparations.len() {
                 let acts: [&[crate::kernels::Q8Block; 4]; 4] = [
                     <&[crate::kernels::Q8Block; 4]>::try_from(

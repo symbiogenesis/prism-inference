@@ -713,6 +713,366 @@ pub(super) fn smmla_q8_0_2x2(
     Some(unsafe { smmla_q8_0_2x2_i8mm(r0, r1, c0, c1) })
 }
 
+#[target_feature(enable = "neon,i8mm")]
+fn smmla_q8_0_4x2_i8mm(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 2]) -> [[i32; 2]; 4] {
+    let r_halves = rows.map(|r| r.as_chunks::<16>().0);
+    let c0_halves = cols[0].as_chunks::<16>().0;
+    let c1_halves = cols[1].as_chunks::<16>().0;
+
+    let mut acc0 = vdupq_n_s32(0);
+    let mut acc1 = vdupq_n_s32(0);
+    for half in 0..2 {
+        let a0 = load_s8x16(&c0_halves[half]);
+        let a1 = load_s8x16(&c1_halves[half]);
+        let a_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+        let a_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&r_halves[0][half]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&r_halves[1][half]));
+        let w2 = vreinterpretq_s8_u8(load_u8x16(&r_halves[2][half]));
+        let w3 = vreinterpretq_s8_u8(load_u8x16(&r_halves[3][half]));
+
+        let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+        let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+        let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+        let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+
+        acc0 = smmla_s32(smmla_s32(acc0, w01_lo, a_lo), w01_hi, a_hi);
+        acc1 = smmla_s32(smmla_s32(acc1, w23_lo, a_lo), w23_hi, a_hi);
+    }
+    let mut q0 = [0_i32; 4];
+    let mut q1 = [0_i32; 4];
+    store_s32x4(acc0, &mut q0);
+    store_s32x4(acc1, &mut q1);
+    [
+        [q0[0], q0[1]],
+        [q0[2], q0[3]],
+        [q1[0], q1[1]],
+        [q1[2], q1[3]],
+    ]
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn smmla_q8_0_4x2_dotprod(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 2]) -> [[i32; 2]; 4] {
+    let c0_halves = cols[0].as_chunks::<16>().0;
+    let c1_halves = cols[1].as_chunks::<16>().0;
+    let a00 = load_s8x16(&c0_halves[0]);
+    let a01 = load_s8x16(&c0_halves[1]);
+    let a10 = load_s8x16(&c1_halves[0]);
+    let a11 = load_s8x16(&c1_halves[1]);
+    let mut out = [[0_i32; 2]; 4];
+    for (r, row) in rows.into_iter().enumerate() {
+        let w_halves = row.as_chunks::<16>().0;
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&w_halves[0]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&w_halves[1]));
+        out[r] = [
+            vaddvq_s32(sdot32_vec(w0, w1, a00, a01)),
+            vaddvq_s32(sdot32_vec(w0, w1, a10, a11)),
+        ];
+    }
+    out
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn smmla_q8_0_4x4_i8mm(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
+    let r_halves = rows.map(|r| r.as_chunks::<16>().0);
+    let c_halves = cols.map(|c| c.as_chunks::<16>().0);
+
+    let mut acc00 = vdupq_n_s32(0);
+    let mut acc01 = vdupq_n_s32(0);
+    let mut acc10 = vdupq_n_s32(0);
+    let mut acc11 = vdupq_n_s32(0);
+    for half in 0..2 {
+        let a0 = load_s8x16(&c_halves[0][half]);
+        let a1 = load_s8x16(&c_halves[1][half]);
+        let a2 = load_s8x16(&c_halves[2][half]);
+        let a3 = load_s8x16(&c_halves[3][half]);
+        let a01_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+        let a01_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+        let a23_lo = vcombine_s8(vget_low_s8(a2), vget_low_s8(a3));
+        let a23_hi = vcombine_s8(vget_high_s8(a2), vget_high_s8(a3));
+
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&r_halves[0][half]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&r_halves[1][half]));
+        let w2 = vreinterpretq_s8_u8(load_u8x16(&r_halves[2][half]));
+        let w3 = vreinterpretq_s8_u8(load_u8x16(&r_halves[3][half]));
+        let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+        let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+        let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+        let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+
+        acc00 = smmla_s32(smmla_s32(acc00, w01_lo, a01_lo), w01_hi, a01_hi);
+        acc01 = smmla_s32(smmla_s32(acc01, w01_lo, a23_lo), w01_hi, a23_hi);
+        acc10 = smmla_s32(smmla_s32(acc10, w23_lo, a01_lo), w23_hi, a01_hi);
+        acc11 = smmla_s32(smmla_s32(acc11, w23_lo, a23_lo), w23_hi, a23_hi);
+    }
+    let mut out = [[0_i32; 4]; 4];
+    store_s32x4(
+        vcombine_s32(vget_low_s32(acc00), vget_low_s32(acc01)),
+        &mut out[0],
+    );
+    store_s32x4(
+        vcombine_s32(vget_high_s32(acc00), vget_high_s32(acc01)),
+        &mut out[1],
+    );
+    store_s32x4(
+        vcombine_s32(vget_low_s32(acc10), vget_low_s32(acc11)),
+        &mut out[2],
+    );
+    store_s32x4(
+        vcombine_s32(vget_high_s32(acc10), vget_high_s32(acc11)),
+        &mut out[3],
+    );
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn smmla_q8_0_4x4_dotprod(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
+    let acts: [(int8x16_t, int8x16_t); 4] = cols.map(|col| {
+        let halves = col.as_chunks::<16>().0;
+        (load_s8x16(&halves[0]), load_s8x16(&halves[1]))
+    });
+    let mut out = [[0_i32; 4]; 4];
+    for (r, row) in rows.into_iter().enumerate() {
+        let w_halves = row.as_chunks::<16>().0;
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&w_halves[0]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&w_halves[1]));
+        let l0 = sdot32_vec(w0, w1, acts[0].0, acts[0].1);
+        let l1 = sdot32_vec(w0, w1, acts[1].0, acts[1].1);
+        let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
+        let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
+        store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut out[r]);
+    }
+    out
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn smmla_q8_0_8x2_i8mm(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 2]) -> [[i32; 2]; 8] {
+    let r_halves = rows.map(|r| r.as_chunks::<16>().0);
+    let c0_halves = cols[0].as_chunks::<16>().0;
+    let c1_halves = cols[1].as_chunks::<16>().0;
+
+    let mut acc0 = vdupq_n_s32(0);
+    let mut acc1 = vdupq_n_s32(0);
+    let mut acc2 = vdupq_n_s32(0);
+    let mut acc3 = vdupq_n_s32(0);
+    for half in 0..2 {
+        let a0 = load_s8x16(&c0_halves[half]);
+        let a1 = load_s8x16(&c1_halves[half]);
+        let a_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+        let a_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&r_halves[0][half]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&r_halves[1][half]));
+        let w2 = vreinterpretq_s8_u8(load_u8x16(&r_halves[2][half]));
+        let w3 = vreinterpretq_s8_u8(load_u8x16(&r_halves[3][half]));
+        let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+        let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+        let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+        let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+
+        acc0 = smmla_s32(smmla_s32(acc0, w01_lo, a_lo), w01_hi, a_hi);
+        acc1 = smmla_s32(smmla_s32(acc1, w23_lo, a_lo), w23_hi, a_hi);
+
+        let w4 = vreinterpretq_s8_u8(load_u8x16(&r_halves[4][half]));
+        let w5 = vreinterpretq_s8_u8(load_u8x16(&r_halves[5][half]));
+        let w6 = vreinterpretq_s8_u8(load_u8x16(&r_halves[6][half]));
+        let w7 = vreinterpretq_s8_u8(load_u8x16(&r_halves[7][half]));
+        let w45_lo = vcombine_s8(vget_low_s8(w4), vget_low_s8(w5));
+        let w45_hi = vcombine_s8(vget_high_s8(w4), vget_high_s8(w5));
+        let w67_lo = vcombine_s8(vget_low_s8(w6), vget_low_s8(w7));
+        let w67_hi = vcombine_s8(vget_high_s8(w6), vget_high_s8(w7));
+
+        acc2 = smmla_s32(smmla_s32(acc2, w45_lo, a_lo), w45_hi, a_hi);
+        acc3 = smmla_s32(smmla_s32(acc3, w67_lo, a_lo), w67_hi, a_hi);
+    }
+    let mut q0 = [0_i32; 4];
+    let mut q1 = [0_i32; 4];
+    let mut q2 = [0_i32; 4];
+    let mut q3 = [0_i32; 4];
+    store_s32x4(acc0, &mut q0);
+    store_s32x4(acc1, &mut q1);
+    store_s32x4(acc2, &mut q2);
+    store_s32x4(acc3, &mut q3);
+    [
+        [q0[0], q0[1]],
+        [q0[2], q0[3]],
+        [q1[0], q1[1]],
+        [q1[2], q1[3]],
+        [q2[0], q2[1]],
+        [q2[2], q2[3]],
+        [q3[0], q3[1]],
+        [q3[2], q3[3]],
+    ]
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn smmla_q8_0_8x2_dotprod(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 2]) -> [[i32; 2]; 8] {
+    let c0_halves = cols[0].as_chunks::<16>().0;
+    let c1_halves = cols[1].as_chunks::<16>().0;
+    let a00 = load_s8x16(&c0_halves[0]);
+    let a01 = load_s8x16(&c0_halves[1]);
+    let a10 = load_s8x16(&c1_halves[0]);
+    let a11 = load_s8x16(&c1_halves[1]);
+    let mut out = [[0_i32; 2]; 8];
+    for (r, row) in rows.into_iter().enumerate() {
+        let w_halves = row.as_chunks::<16>().0;
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&w_halves[0]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&w_halves[1]));
+        out[r] = [
+            vaddvq_s32(sdot32_vec(w0, w1, a00, a01)),
+            vaddvq_s32(sdot32_vec(w0, w1, a10, a11)),
+        ];
+    }
+    out
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn smmla_q8_0_8x4_i8mm(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 8] {
+    let r_halves = rows.map(|r| r.as_chunks::<16>().0);
+    let c_halves = cols.map(|c| c.as_chunks::<16>().0);
+
+    let mut acc00 = vdupq_n_s32(0);
+    let mut acc01 = vdupq_n_s32(0);
+    let mut acc10 = vdupq_n_s32(0);
+    let mut acc11 = vdupq_n_s32(0);
+    let mut acc20 = vdupq_n_s32(0);
+    let mut acc21 = vdupq_n_s32(0);
+    let mut acc30 = vdupq_n_s32(0);
+    let mut acc31 = vdupq_n_s32(0);
+    for half in 0..2 {
+        let a0 = load_s8x16(&c_halves[0][half]);
+        let a1 = load_s8x16(&c_halves[1][half]);
+        let a2 = load_s8x16(&c_halves[2][half]);
+        let a3 = load_s8x16(&c_halves[3][half]);
+        let a01_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+        let a01_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+        let a23_lo = vcombine_s8(vget_low_s8(a2), vget_low_s8(a3));
+        let a23_hi = vcombine_s8(vget_high_s8(a2), vget_high_s8(a3));
+
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&r_halves[0][half]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&r_halves[1][half]));
+        let w2 = vreinterpretq_s8_u8(load_u8x16(&r_halves[2][half]));
+        let w3 = vreinterpretq_s8_u8(load_u8x16(&r_halves[3][half]));
+        let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+        let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+        let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+        let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+
+        acc00 = smmla_s32(smmla_s32(acc00, w01_lo, a01_lo), w01_hi, a01_hi);
+        acc01 = smmla_s32(smmla_s32(acc01, w01_lo, a23_lo), w01_hi, a23_hi);
+        acc10 = smmla_s32(smmla_s32(acc10, w23_lo, a01_lo), w23_hi, a01_hi);
+        acc11 = smmla_s32(smmla_s32(acc11, w23_lo, a23_lo), w23_hi, a23_hi);
+
+        let w4 = vreinterpretq_s8_u8(load_u8x16(&r_halves[4][half]));
+        let w5 = vreinterpretq_s8_u8(load_u8x16(&r_halves[5][half]));
+        let w6 = vreinterpretq_s8_u8(load_u8x16(&r_halves[6][half]));
+        let w7 = vreinterpretq_s8_u8(load_u8x16(&r_halves[7][half]));
+        let w45_lo = vcombine_s8(vget_low_s8(w4), vget_low_s8(w5));
+        let w45_hi = vcombine_s8(vget_high_s8(w4), vget_high_s8(w5));
+        let w67_lo = vcombine_s8(vget_low_s8(w6), vget_low_s8(w7));
+        let w67_hi = vcombine_s8(vget_high_s8(w6), vget_high_s8(w7));
+
+        acc20 = smmla_s32(smmla_s32(acc20, w45_lo, a01_lo), w45_hi, a01_hi);
+        acc21 = smmla_s32(smmla_s32(acc21, w45_lo, a23_lo), w45_hi, a23_hi);
+        acc30 = smmla_s32(smmla_s32(acc30, w67_lo, a01_lo), w67_hi, a01_hi);
+        acc31 = smmla_s32(smmla_s32(acc31, w67_lo, a23_lo), w67_hi, a23_hi);
+    }
+    let mut out = [[0_i32; 4]; 8];
+    for (pair_idx, (acc_lo, acc_hi)) in [
+        (acc00, acc01),
+        (acc10, acc11),
+        (acc20, acc21),
+        (acc30, acc31),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r0 = pair_idx * 2;
+        store_s32x4(
+            vcombine_s32(vget_low_s32(acc_lo), vget_low_s32(acc_hi)),
+            &mut out[r0],
+        );
+        store_s32x4(
+            vcombine_s32(vget_high_s32(acc_lo), vget_high_s32(acc_hi)),
+            &mut out[r0 + 1],
+        );
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn smmla_q8_0_8x4_dotprod(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 8] {
+    let acts: [(int8x16_t, int8x16_t); 4] = cols.map(|col| {
+        let halves = col.as_chunks::<16>().0;
+        (load_s8x16(&halves[0]), load_s8x16(&halves[1]))
+    });
+    let mut out = [[0_i32; 4]; 8];
+    for (r, row) in rows.into_iter().enumerate() {
+        let w_halves = row.as_chunks::<16>().0;
+        let w0 = vreinterpretq_s8_u8(load_u8x16(&w_halves[0]));
+        let w1 = vreinterpretq_s8_u8(load_u8x16(&w_halves[1]));
+        let l0 = sdot32_vec(w0, w1, acts[0].0, acts[0].1);
+        let l1 = sdot32_vec(w0, w1, acts[1].0, acts[1].1);
+        let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
+        let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
+        store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut out[r]);
+    }
+    out
+}
+
+#[inline]
+pub(super) fn smmla_q8_0_4x2(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 2]) -> Option<[[i32; 2]; 4]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_4x2_i8mm(rows, cols) });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_4x2_dotprod(rows, cols) });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn smmla_q8_0_4x4(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 4]) -> Option<[[i32; 4]; 4]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_4x4_i8mm(rows, cols) });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_4x4_dotprod(rows, cols) });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn smmla_q8_0_8x2(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 2]) -> Option<[[i32; 2]; 8]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_8x2_i8mm(rows, cols) });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_8x2_dotprod(rows, cols) });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn smmla_q8_0_8x4(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> Option<[[i32; 4]; 8]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_8x4_i8mm(rows, cols) });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe { smmla_q8_0_8x4_dotprod(rows, cols) });
+    }
+    None
+}
+
 #[inline]
 pub(super) fn smmla_dot32_2x2(
     r0: &[i8; 32],
@@ -1826,6 +2186,215 @@ fn dot_ptq1_8x4_groups_dotprod(
         }
     }
     out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_8x8_lanes_dotprod(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> super::Ptq1EightRowEightTokenLanes {
+    let mut out = [[[[0_i32; 4]; 4]; 8]; 8];
+    for group in 0..4 {
+        let acts: [(int8x16_t, int8x16_t); 8] = std::array::from_fn(|t| {
+            let halves = activations[t][group].as_chunks::<16>().0;
+            (load_s8x16(&halves[0]), load_s8x16(&halves[1]))
+        });
+        for r in 0..8 {
+            let w0 = load_s8x16(&trits[r][group * 2]);
+            let w1 = load_s8x16(&trits[r][group * 2 + 1]);
+            for t in 0..8 {
+                let lanes = sdot32_vec(w0, w1, acts[t].0, acts[t].1);
+                store_s32x4(lanes, &mut out[r][t][group]);
+            }
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,i8mm")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep 8 weight rows in registers across both 4-token halves of the 8x8 I8MM tile."
+)]
+fn dot_ptq1_8x8_groups_i8mm(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> super::Ptq1EightRowEightTokenGroups {
+    let mut out = [[[0_i32; 4]; 8]; 8];
+    for group in 0..4 {
+        let mut acc00 = vdupq_n_s32(0);
+        let mut acc01 = vdupq_n_s32(0);
+        let mut acc02 = vdupq_n_s32(0);
+        let mut acc03 = vdupq_n_s32(0);
+        let mut acc10 = vdupq_n_s32(0);
+        let mut acc11 = vdupq_n_s32(0);
+        let mut acc12 = vdupq_n_s32(0);
+        let mut acc13 = vdupq_n_s32(0);
+        let mut acc20 = vdupq_n_s32(0);
+        let mut acc21 = vdupq_n_s32(0);
+        let mut acc22 = vdupq_n_s32(0);
+        let mut acc23 = vdupq_n_s32(0);
+        let mut acc30 = vdupq_n_s32(0);
+        let mut acc31 = vdupq_n_s32(0);
+        let mut acc32 = vdupq_n_s32(0);
+        let mut acc33 = vdupq_n_s32(0);
+        let a_halves: [&[[i8; 16]]; 8] =
+            std::array::from_fn(|t| activations[t][group].as_chunks::<16>().0);
+        for half in 0..2 {
+            let w0 = load_s8x16(&trits[0][group * 2 + half]);
+            let w1 = load_s8x16(&trits[1][group * 2 + half]);
+            let w2 = load_s8x16(&trits[2][group * 2 + half]);
+            let w3 = load_s8x16(&trits[3][group * 2 + half]);
+            let w4 = load_s8x16(&trits[4][group * 2 + half]);
+            let w5 = load_s8x16(&trits[5][group * 2 + half]);
+            let w6 = load_s8x16(&trits[6][group * 2 + half]);
+            let w7 = load_s8x16(&trits[7][group * 2 + half]);
+            let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+            let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+            let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+            let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+            let w45_lo = vcombine_s8(vget_low_s8(w4), vget_low_s8(w5));
+            let w45_hi = vcombine_s8(vget_high_s8(w4), vget_high_s8(w5));
+            let w67_lo = vcombine_s8(vget_low_s8(w6), vget_low_s8(w7));
+            let w67_hi = vcombine_s8(vget_high_s8(w6), vget_high_s8(w7));
+
+            let a0 = load_s8x16(&a_halves[0][half]);
+            let a1 = load_s8x16(&a_halves[1][half]);
+            let a2 = load_s8x16(&a_halves[2][half]);
+            let a3 = load_s8x16(&a_halves[3][half]);
+            let a01_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+            let a01_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+            let a23_lo = vcombine_s8(vget_low_s8(a2), vget_low_s8(a3));
+            let a23_hi = vcombine_s8(vget_high_s8(a2), vget_high_s8(a3));
+
+            acc00 = smmla_s32(smmla_s32(acc00, w01_lo, a01_lo), w01_hi, a01_hi);
+            acc01 = smmla_s32(smmla_s32(acc01, w01_lo, a23_lo), w01_hi, a23_hi);
+            acc10 = smmla_s32(smmla_s32(acc10, w23_lo, a01_lo), w23_hi, a01_hi);
+            acc11 = smmla_s32(smmla_s32(acc11, w23_lo, a23_lo), w23_hi, a23_hi);
+            acc20 = smmla_s32(smmla_s32(acc20, w45_lo, a01_lo), w45_hi, a01_hi);
+            acc21 = smmla_s32(smmla_s32(acc21, w45_lo, a23_lo), w45_hi, a23_hi);
+            acc30 = smmla_s32(smmla_s32(acc30, w67_lo, a01_lo), w67_hi, a01_hi);
+            acc31 = smmla_s32(smmla_s32(acc31, w67_lo, a23_lo), w67_hi, a23_hi);
+
+            let a4 = load_s8x16(&a_halves[4][half]);
+            let a5 = load_s8x16(&a_halves[5][half]);
+            let a6 = load_s8x16(&a_halves[6][half]);
+            let a7 = load_s8x16(&a_halves[7][half]);
+            let a45_lo = vcombine_s8(vget_low_s8(a4), vget_low_s8(a5));
+            let a45_hi = vcombine_s8(vget_high_s8(a4), vget_high_s8(a5));
+            let a67_lo = vcombine_s8(vget_low_s8(a6), vget_low_s8(a7));
+            let a67_hi = vcombine_s8(vget_high_s8(a6), vget_high_s8(a7));
+
+            acc02 = smmla_s32(smmla_s32(acc02, w01_lo, a45_lo), w01_hi, a45_hi);
+            acc03 = smmla_s32(smmla_s32(acc03, w01_lo, a67_lo), w01_hi, a67_hi);
+            acc12 = smmla_s32(smmla_s32(acc12, w23_lo, a45_lo), w23_hi, a45_hi);
+            acc13 = smmla_s32(smmla_s32(acc13, w23_lo, a67_lo), w23_hi, a67_hi);
+            acc22 = smmla_s32(smmla_s32(acc22, w45_lo, a45_lo), w45_hi, a45_hi);
+            acc23 = smmla_s32(smmla_s32(acc23, w45_lo, a67_lo), w45_hi, a67_hi);
+            acc32 = smmla_s32(smmla_s32(acc32, w67_lo, a45_lo), w67_hi, a45_hi);
+            acc33 = smmla_s32(smmla_s32(acc33, w67_lo, a67_lo), w67_hi, a67_hi);
+        }
+        for (pair_idx, [acc_0, acc_1, acc_2, acc_3]) in [
+            [acc00, acc01, acc02, acc03],
+            [acc10, acc11, acc12, acc13],
+            [acc20, acc21, acc22, acc23],
+            [acc30, acc31, acc32, acc33],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut q0 = [0_i32; 4];
+            let mut q1 = [0_i32; 4];
+            let mut q2 = [0_i32; 4];
+            let mut q3 = [0_i32; 4];
+            store_s32x4(acc_0, &mut q0);
+            store_s32x4(acc_1, &mut q1);
+            store_s32x4(acc_2, &mut q2);
+            store_s32x4(acc_3, &mut q3);
+            let r0 = pair_idx * 2;
+            let r1 = r0 + 1;
+            out[r0][0][group] = q0[0];
+            out[r0][1][group] = q0[1];
+            out[r0][2][group] = q1[0];
+            out[r0][3][group] = q1[1];
+            out[r0][4][group] = q2[0];
+            out[r0][5][group] = q2[1];
+            out[r0][6][group] = q3[0];
+            out[r0][7][group] = q3[1];
+            out[r1][0][group] = q0[2];
+            out[r1][1][group] = q0[3];
+            out[r1][2][group] = q1[2];
+            out[r1][3][group] = q1[3];
+            out[r1][4][group] = q2[2];
+            out[r1][5][group] = q2[3];
+            out[r1][6][group] = q3[2];
+            out[r1][7][group] = q3[3];
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_8x8_groups_dotprod(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> super::Ptq1EightRowEightTokenGroups {
+    let mut out = [[[0_i32; 4]; 8]; 8];
+    for group in 0..4 {
+        let acts: [(int8x16_t, int8x16_t); 8] = std::array::from_fn(|t| {
+            let halves = activations[t][group].as_chunks::<16>().0;
+            (load_s8x16(&halves[0]), load_s8x16(&halves[1]))
+        });
+        for r in 0..8 {
+            let w0 = load_s8x16(&trits[r][group * 2]);
+            let w1 = load_s8x16(&trits[r][group * 2 + 1]);
+            let l0 = sdot32_vec(w0, w1, acts[0].0, acts[0].1);
+            let l1 = sdot32_vec(w0, w1, acts[1].0, acts[1].1);
+            let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
+            let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
+            let l4 = sdot32_vec(w0, w1, acts[4].0, acts[4].1);
+            let l5 = sdot32_vec(w0, w1, acts[5].0, acts[5].1);
+            let l6 = sdot32_vec(w0, w1, acts[6].0, acts[6].1);
+            let l7 = sdot32_vec(w0, w1, acts[7].0, acts[7].1);
+            let mut sums_lo = [0_i32; 4];
+            let mut sums_hi = [0_i32; 4];
+            store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut sums_lo);
+            store_s32x4(reduce4_s32x4(l4, l5, l6, l7), &mut sums_hi);
+            for t in 0..4 {
+                out[r][t][group] = sums_lo[t];
+                out[r][t + 4][group] = sums_hi[t];
+            }
+        }
+    }
+    out
+}
+
+#[inline]
+pub(super) fn dot_ptq1_8x8_lanes(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> Option<super::Ptq1EightRowEightTokenLanes> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_8x8_lanes_dotprod(trits, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_8x8_groups(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> Option<super::Ptq1EightRowEightTokenGroups> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe { dot_ptq1_8x8_groups_i8mm(trits, activations) });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe { dot_ptq1_8x8_groups_dotprod(trits, activations) });
+    }
+    None
 }
 
 #[inline]

@@ -234,6 +234,12 @@ pub type Ptq1EightRowFourTokenLanes = [[[[i32; 4]; 4]; 4]; 8];
 /// Eight-row by four-token by four-group 32-element integer dot sums (`[row][token][group]`).
 pub type Ptq1EightRowFourTokenGroups = [[[i32; 4]; 4]; 8];
 
+/// Eight-row by eight-token by four-group by four-lane `DOTPROD` sums (`[row][token][group][lane]`).
+pub type Ptq1EightRowEightTokenLanes = [[[[i32; 4]; 4]; 8]; 8];
+
+/// Eight-row by eight-token by four-group 32-element integer dot sums (`[row][token][group]`).
+pub type Ptq1EightRowEightTokenGroups = [[[i32; 4]; 8]; 8];
+
 /// Computes the 4-row by 1-token by 4-group 4-lane `DOTPROD` sums from
 /// pre-decoded `PTQ1_0` trit rows and one token of `Q8_0` activation groups.
 #[inline]
@@ -371,6 +377,60 @@ pub fn dot_ptq1_8x4_groups(
 ) -> Ptq1EightRowFourTokenGroups {
     #[cfg(target_arch = "aarch64")]
     if let Some(groups) = aarch64::dot_ptq1_8x4_groups(trits, activations) {
+        return groups;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|group| {
+                let halves = activations[t][group].as_chunks::<16>().0;
+                dot32_s8_sum(
+                    &trits[r][group * 2],
+                    &trits[r][group * 2 + 1],
+                    &halves[0],
+                    &halves[1],
+                )
+            })
+        })
+    })
+}
+
+/// Computes the 8-row by 8-token by 4-group 4-lane `DOTPROD` sums from
+/// pre-decoded `PTQ1_0` trit rows and eight tokens of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_8x8_lanes(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> Ptq1EightRowEightTokenLanes {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_8x8_lanes(trits, activations) {
+        return lanes;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|group| {
+                let halves = activations[t][group].as_chunks::<16>().0;
+                dot32_s8_lanes(
+                    &trits[r][group * 2],
+                    &trits[r][group * 2 + 1],
+                    &halves[0],
+                    &halves[1],
+                )
+            })
+        })
+    })
+}
+
+/// Computes the 8-row by 8-token by 4-group 32-element integer dot sums from
+/// pre-decoded `PTQ1_0` trit rows and eight tokens of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_8x8_groups(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 8],
+) -> Ptq1EightRowEightTokenGroups {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_8x8_groups(trits, activations) {
         return groups;
     }
     std::array::from_fn(|r| {
@@ -556,6 +616,54 @@ pub fn smmla_q8_0_2x2(r0: &[u8; 32], r1: &[u8; 32], c0: &[i8; 32], c1: &[i8; 32]
         [dot_q8_0_block(r0, c0), dot_q8_0_block(r0, c1)],
         [dot_q8_0_block(r1, c0), dot_q8_0_block(r1, c1)],
     ]
+}
+
+/// Computes a 4-row by 2-column 32-element `Q8_0` matrix-matrix dot tile using
+/// ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available, or scalar fallback.
+#[inline]
+#[must_use]
+pub fn smmla_q8_0_4x2(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 2]) -> [[i32; 2]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::smmla_q8_0_4x2(rows, cols) {
+        return tile;
+    }
+    rows.map(|row| [dot_q8_0_block(row, cols[0]), dot_q8_0_block(row, cols[1])])
+}
+
+/// Computes a 4-row by 4-column 32-element `Q8_0` matrix-matrix dot tile using
+/// ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available, or scalar fallback.
+#[inline]
+#[must_use]
+pub fn smmla_q8_0_4x4(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::smmla_q8_0_4x4(rows, cols) {
+        return tile;
+    }
+    rows.map(|row| cols.map(|col| dot_q8_0_block(row, col)))
+}
+
+/// Computes an 8-row by 2-column 32-element `Q8_0` matrix-matrix dot tile using
+/// ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available, or scalar fallback.
+#[inline]
+#[must_use]
+pub fn smmla_q8_0_8x2(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 2]) -> [[i32; 2]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::smmla_q8_0_8x2(rows, cols) {
+        return tile;
+    }
+    rows.map(|row| [dot_q8_0_block(row, cols[0]), dot_q8_0_block(row, cols[1])])
+}
+
+/// Computes an 8-row by 4-column 32-element `Q8_0` matrix-matrix dot tile using
+/// ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available, or scalar fallback.
+#[inline]
+#[must_use]
+pub fn smmla_q8_0_8x4(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::smmla_q8_0_8x4(rows, cols) {
+        return tile;
+    }
+    rows.map(|row| cols.map(|col| dot_q8_0_block(row, col)))
 }
 
 /// Computes a 2-row by 2-column 32-element `i8` matrix-matrix dot tile using
@@ -882,6 +990,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "Test compares 4x4, 8x4, and 8x8 lane and group variants side by side."
+    )]
     fn ptq1_4x4_lanes_and_groups_match_single_row_single_token_primitives() {
         let rows: [[u8; 28]; 4] = std::array::from_fn(|r| {
             std::array::from_fn(|i| {
@@ -952,6 +1064,78 @@ mod tests {
         for r in 0..4 {
             assert_eq!(four_1_lanes[r], tile_lanes[r][0]);
             assert_eq!(four_1_groups[r], tile_groups[r][0]);
+        }
+
+        let acts8: [[[i8; 32]; 4]; 8] = std::array::from_fn(|t| {
+            std::array::from_fn(|g| {
+                std::array::from_fn(|i| {
+                    i8::from_ne_bytes([t.to_le_bytes()[0]
+                        .wrapping_mul(67)
+                        .wrapping_add(g.to_le_bytes()[0].wrapping_mul(23))
+                        .wrapping_add(i.to_le_bytes()[0].wrapping_mul(113))
+                        .wrapping_add(7)])
+                })
+            })
+        });
+        let act_refs8: [[&[i8; 32]; 4]; 8] =
+            std::array::from_fn(|t| std::array::from_fn(|g| &acts8[t][g]));
+        let tile8x8_lanes = dot_ptq1_8x8_lanes(&trits8, act_refs8);
+        let tile8x8_groups = dot_ptq1_8x8_groups(&trits8, act_refs8);
+        for r in 0..8 {
+            for t in 0..8 {
+                assert_eq!(
+                    tile8x8_lanes[r][t],
+                    dot_ptq1_block_lanes(&rows8[r], act_refs8[t])
+                );
+                assert_eq!(
+                    tile8x8_groups[r][t],
+                    dot_ptq1_block_groups(&rows8[r], act_refs8[t])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_multi_row_multi_token_tiles_match_single_block_dot() {
+        let rows: [[u8; 32]; 8] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| {
+                r.to_le_bytes()[0]
+                    .wrapping_mul(47)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(83))
+                    .wrapping_add(29)
+            })
+        });
+        let cols: [[i8; 32]; 4] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| {
+                i8::from_ne_bytes([c.to_le_bytes()[0]
+                    .wrapping_mul(61)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(101))
+                    .wrapping_add(17)])
+            })
+        });
+        let rows4: [&[u8; 32]; 4] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+        let rows8: [&[u8; 32]; 8] = std::array::from_fn(|r| &rows[r]);
+        let cols2: [&[i8; 32]; 2] = [&cols[0], &cols[1]];
+        let cols4: [&[i8; 32]; 4] = std::array::from_fn(|c| &cols[c]);
+
+        let tile4x2 = smmla_q8_0_4x2(rows4, cols2);
+        let tile4x4 = smmla_q8_0_4x4(rows4, cols4);
+        let tile8x2 = smmla_q8_0_8x2(rows8, cols2);
+        let tile8x4 = smmla_q8_0_8x4(rows8, cols4);
+        for r in 0..8 {
+            for c in 0..4 {
+                let expected = dot_q8_0_block(&rows[r], &cols[c]);
+                assert_eq!(tile8x4[r][c], expected);
+                if c < 2 {
+                    assert_eq!(tile8x2[r][c], expected);
+                }
+                if r < 4 {
+                    assert_eq!(tile4x4[r][c], expected);
+                    if c < 2 {
+                        assert_eq!(tile4x2[r][c], expected);
+                    }
+                }
+            }
         }
     }
 }

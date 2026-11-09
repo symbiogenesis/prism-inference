@@ -3900,22 +3900,33 @@ pub(super) fn dot_q8_0_four_rows_tile<const TOKENS: usize>(
         let [_, _, ref w2 @ ..] = *b2;
         let [_, _, ref w3 @ ..] = *b3;
         let weights = [w0, w1, w2, w3];
-        if use_i8mm && token_count >= 2 {
+        if (use_i8mm || use_dotprod) && token_count >= 2 {
             let mut t = 0;
+            while t + 4 <= token_count {
+                let a0 = &preparations[t].q8[index];
+                let a1 = &preparations[t + 1].q8[index];
+                let a2 = &preparations[t + 2].q8[index];
+                let a3 = &preparations[t + 3].q8[index];
+                let tile = bonsai_neon_dot::smmla_q8_0_4x4(
+                    weights,
+                    [&a0.values, &a1.values, &a2.values, &a3.values],
+                );
+                let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+                for r in 0..4 {
+                    let dots = i32x4::from_slice(neon, &tile[r]).to_float::<f32x4<Neon>>();
+                    let prod = (f32x4::splat(neon, row_scales[r]) * act_scales) * dots;
+                    let acc = f32x4::from_slice(neon, &sums[r][t..t + 4]) + prod;
+                    sums[r][t..t + 4].copy_from_slice(&acc.to_array());
+                }
+                t += 4;
+            }
             while t + 2 <= token_count {
                 let a0 = &preparations[t].q8[index];
                 let a1 = &preparations[t + 1].q8[index];
-                let tile01 = bonsai_neon_dot::smmla_q8_0_2x2(w0, w1, &a0.values, &a1.values);
-                let tile23 = bonsai_neon_dot::smmla_q8_0_2x2(w2, w3, &a0.values, &a1.values);
-                for (pair, tile) in [(0, tile01), (2, tile23)] {
-                    sums[pair][t] +=
-                        (row_scales[pair] * a0.scale) * super::integer_float(tile[0][0]);
-                    sums[pair][t + 1] +=
-                        (row_scales[pair] * a1.scale) * super::integer_float(tile[0][1]);
-                    sums[pair + 1][t] +=
-                        (row_scales[pair + 1] * a0.scale) * super::integer_float(tile[1][0]);
-                    sums[pair + 1][t + 1] +=
-                        (row_scales[pair + 1] * a1.scale) * super::integer_float(tile[1][1]);
+                let tile = bonsai_neon_dot::smmla_q8_0_4x2(weights, [&a0.values, &a1.values]);
+                for r in 0..4 {
+                    sums[r][t] += (row_scales[r] * a0.scale) * super::integer_float(tile[r][0]);
+                    sums[r][t + 1] += (row_scales[r] * a1.scale) * super::integer_float(tile[r][1]);
                 }
                 t += 2;
             }
@@ -4026,26 +4037,33 @@ pub(super) fn dot_q8_0_eight_rows_tile<const TOKENS: usize>(
             let [_, _, ref w @ ..] = chunks[r][index];
             w
         });
-        if use_i8mm && token_count >= 2 {
+        if (use_i8mm || use_dotprod) && token_count >= 2 {
             let mut t = 0;
+            while t + 4 <= token_count {
+                let a0 = &preparations[t].q8[index];
+                let a1 = &preparations[t + 1].q8[index];
+                let a2 = &preparations[t + 2].q8[index];
+                let a3 = &preparations[t + 3].q8[index];
+                let tile = bonsai_neon_dot::smmla_q8_0_8x4(
+                    weights,
+                    [&a0.values, &a1.values, &a2.values, &a3.values],
+                );
+                let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+                for r in 0..8 {
+                    let dots = i32x4::from_slice(neon, &tile[r]).to_float::<f32x4<Neon>>();
+                    let prod = (f32x4::splat(neon, row_scales[r]) * act_scales) * dots;
+                    let acc = f32x4::from_slice(neon, &sums[r][t..t + 4]) + prod;
+                    sums[r][t..t + 4].copy_from_slice(&acc.to_array());
+                }
+                t += 4;
+            }
             while t + 2 <= token_count {
                 let a0 = &preparations[t].q8[index];
                 let a1 = &preparations[t + 1].q8[index];
-                for pair in [0, 2, 4, 6] {
-                    let tile = bonsai_neon_dot::smmla_q8_0_2x2(
-                        weights[pair],
-                        weights[pair + 1],
-                        &a0.values,
-                        &a1.values,
-                    );
-                    sums[pair][t] +=
-                        (row_scales[pair] * a0.scale) * super::integer_float(tile[0][0]);
-                    sums[pair][t + 1] +=
-                        (row_scales[pair] * a1.scale) * super::integer_float(tile[0][1]);
-                    sums[pair + 1][t] +=
-                        (row_scales[pair + 1] * a0.scale) * super::integer_float(tile[1][0]);
-                    sums[pair + 1][t + 1] +=
-                        (row_scales[pair + 1] * a1.scale) * super::integer_float(tile[1][1]);
+                let tile = bonsai_neon_dot::smmla_q8_0_8x2(weights, [&a0.values, &a1.values]);
+                for r in 0..8 {
+                    sums[r][t] += (row_scales[r] * a0.scale) * super::integer_float(tile[r][0]);
+                    sums[r][t + 1] += (row_scales[r] * a1.scale) * super::integer_float(tile[r][1]);
                 }
                 t += 2;
             }

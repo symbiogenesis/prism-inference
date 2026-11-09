@@ -26,6 +26,7 @@ use profile::ModelProfile;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     future::poll_fn,
     pin::pin,
     sync::atomic::{AtomicBool, Ordering},
@@ -350,17 +351,28 @@ async fn receive<C: AsyncRead + Unpin>(
     if used - head > length {
         return Err(NativeBackendError::Configuration);
     }
-    let mut body = Vec::new();
-    body.try_reserve_exact(length)
-        .map_err(|_| NativeBackendError::Configuration)?;
-    body.extend_from_slice(&bytes[head..used]);
-    body.resize(length, 0);
-    let mut filled = used - head;
-    while filled < length {
-        filled += read_before(client, &mut body[filled..], intake_deadline).await?;
-    }
+    let body = if length <= bytes.len() - head {
+        let body_end = head + length;
+        while used < body_end {
+            used += read_before(client, &mut bytes[used..body_end], intake_deadline).await?;
+        }
+        &bytes[head..body_end]
+    } else {
+        let prefix = used - head;
+        bytes.copy_within(head..used, 0);
+        bytes.truncate(prefix);
+        bytes
+            .try_reserve_exact(length - prefix)
+            .map_err(|_| NativeBackendError::Configuration)?;
+        bytes.resize(length, 0);
+        let mut filled = prefix;
+        while filled < length {
+            filled += read_before(client, &mut bytes[filled..], intake_deadline).await?;
+        }
+        &bytes[..]
+    };
     let pending = if matches!(route, Route::Count | Route::Generate) {
-        Some(canonical_for_profile(&body, profile)?)
+        Some(canonical_for_profile(body, profile)?)
     } else {
         None
     };
@@ -440,16 +452,18 @@ struct FixedBody<'a> {
     presence_penalty: f32,
     frequency_penalty: f32,
     repeat_penalty: f32,
-    chat_template_kwargs: Object<FixedTemplate>,
+    #[serde(borrow)]
+    chat_template_kwargs: Object<FixedTemplate<'a>>,
     #[serde(default, deserialize_with = "optional_lora")]
     lora: Option<[Object<PinnedLora>; 1]>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FixedTemplate {
+struct FixedTemplate<'a> {
     enable_thinking: bool,
-    reasoning_effort: String,
+    #[serde(borrow)]
+    reasoning_effort: Cow<'a, str>,
     preserve_thinking: bool,
 }
 

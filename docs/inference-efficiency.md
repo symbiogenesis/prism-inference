@@ -97,6 +97,21 @@ bit controls cover both sides of the capacity boundary, exceptional values,
 late failures and unchanged unsupported-width refusal. Conservative resource
 reserves remain charged.
 
+Exact multi-token NEON GDN prefill and state-only replay now select the same
+eight-block capacity for rows through 128 elements, retaining sixteen blocks
+for supported wider rows through 256. The one-, four- and eight-row prefill
+helpers and four/eight-row replay helpers instantiate their existing arithmetic
+with the selected capacity. For Swift's 128-wide rows, their private state
+staging declares 512 bytes per row instead of 1,024; eight-row groups declare
+4 KiB instead of 8 KiB. Output staging, token limits, FMA/reduction order,
+publication and scalar failure fallback remain unchanged. This does not prove
+fewer generated stores, smaller compiled stack frames or measured latency.
+Direct scalar-bit controls cover zero through 64 tokens, both capacity ranges,
+strided output sentinels, late key/update/query failure and unsupported shapes
+or excessive token counts. Release ARM64 code generation/stack review, hosted
+controls, complete-model state/adapter parity and matched request benefit remain
+pending. No admitted scratch or worker-stack reserve is reduced.
+
 Suffix generation retains the already validated target token when a proposal
 is rejected. The correction boundary consumes that token without a second
 full-vocabulary greedy scan; no evaluation or callback changes logits between

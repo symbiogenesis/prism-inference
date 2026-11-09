@@ -785,7 +785,7 @@ fn flush_blocks(state: &mut [f32], blocks: &[[f32x4<Neon>; 4]], count: usize) {
 }
 
 /// Steps one GDN state row across `inputs.len()` tokens while keeping the state row
-/// in `[[f32x4<Neon>; 4]; 16]` across tokens, writing `state` to memory only once
+/// in private width-selected blocks across tokens, writing `state` to memory only once
 /// after all tokens complete (or flushing exact partial state on a non-finite error).
 #[inline]
 pub(super) fn step_row_tokens_from(
@@ -797,13 +797,30 @@ pub(super) fn step_row_tokens_from(
     scale: f32,
     output: &mut [f32],
 ) -> Option<Result<()>> {
+    if state.len() <= 128 {
+        step_row_tokens_from_blocks::<8>(previous, state, inputs, row, stride, scale, output)
+    } else {
+        step_row_tokens_from_blocks::<16>(previous, state, inputs, row, stride, scale, output)
+    }
+}
+
+#[inline]
+fn step_row_tokens_from_blocks<const BLOCKS: usize>(
+    previous: &[f32],
+    state: &mut [f32],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> Option<Result<()>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let width = state.len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) {
         return None;
     }
     let blocks = width / 16;
-    let mut current = [[f32x4::splat(neon, 0.0); 4]; 16];
+    let mut current = [[f32x4::splat(neon, 0.0); 4]; BLOCKS];
     for (b, prev_block) in previous.as_chunks::<16>().0.iter().enumerate() {
         current[b] = [
             f32x4::from_slice(neon, &prev_block[0..4]),
@@ -1019,11 +1036,30 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
 /// `states` or `output` if any non-finite value occurs, allowing the caller to fall
 /// back to the sequential per-row path for exact partial-mutation semantics.
 #[inline]
+pub(super) fn step_four_rows_tokens_from(
+    previous: [&[f32]; 4],
+    states: [&mut [f32]; 4],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> bool {
+    if states[0].len() <= 128 {
+        step_four_rows_tokens_from_blocks::<8>(previous, states, inputs, row, stride, scale, output)
+    } else {
+        step_four_rows_tokens_from_blocks::<16>(
+            previous, states, inputs, row, stride, scale, output,
+        )
+    }
+}
+
+#[inline]
 #[expect(
     clippy::too_many_lines,
     reason = "Keep 4-row multi-token register-resident NEON GDN recurrence together."
 )]
-pub(super) fn step_four_rows_tokens_from(
+fn step_four_rows_tokens_from_blocks<const BLOCKS: usize>(
     previous: [&[f32]; 4],
     states: [&mut [f32]; 4],
     inputs: &[super::ChunkInput<'_>],
@@ -1036,11 +1072,11 @@ pub(super) fn step_four_rows_tokens_from(
         return false;
     };
     let width = states[0].len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) || inputs.len() > 64 {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) || inputs.len() > 64 {
         return false;
     }
     let blocks = width / 16;
-    let mut current = [[[f32x4::splat(neon, 0.0); 4]; 16]; 4];
+    let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 4];
     for (r, prev) in previous.iter().enumerate() {
         for (b, prev_block) in prev.as_chunks::<16>().0.iter().enumerate() {
             current[r][b] = [
@@ -1274,11 +1310,32 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
 /// `states` or `output` if any non-finite value occurs, allowing the caller to fall
 /// back to the sequential per-row path for exact partial-mutation semantics.
 #[inline]
+pub(super) fn step_eight_rows_tokens_from(
+    previous: [&[f32]; 8],
+    states: [&mut [f32]; 8],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> bool {
+    if states[0].len() <= 128 {
+        step_eight_rows_tokens_from_blocks::<8>(
+            previous, states, inputs, row, stride, scale, output,
+        )
+    } else {
+        step_eight_rows_tokens_from_blocks::<16>(
+            previous, states, inputs, row, stride, scale, output,
+        )
+    }
+}
+
+#[inline]
 #[expect(
     clippy::too_many_lines,
     reason = "Keep 8-row multi-token register-resident NEON GDN recurrence together."
 )]
-pub(super) fn step_eight_rows_tokens_from(
+fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
     previous: [&[f32]; 8],
     states: [&mut [f32]; 8],
     inputs: &[super::ChunkInput<'_>],
@@ -1291,11 +1348,11 @@ pub(super) fn step_eight_rows_tokens_from(
         return false;
     };
     let width = states[0].len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) || inputs.len() > 64 {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) || inputs.len() > 64 {
         return false;
     }
     let blocks = width / 16;
-    let mut current = [[[f32x4::splat(neon, 0.0); 4]; 16]; 8];
+    let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 8];
     for (r, prev) in previous.iter().enumerate() {
         for (b, prev_block) in prev.as_chunks::<16>().0.iter().enumerate() {
             current[r][b] = [
@@ -1407,15 +1464,28 @@ pub(super) fn step_four_rows_tokens_in_place(
     inputs: &[super::ChunkInput<'_>],
     row: usize,
 ) -> bool {
+    if states[0].len() <= 128 {
+        step_four_rows_tokens_in_place_blocks::<8>(states, inputs, row)
+    } else {
+        step_four_rows_tokens_in_place_blocks::<16>(states, inputs, row)
+    }
+}
+
+#[inline]
+fn step_four_rows_tokens_in_place_blocks<const BLOCKS: usize>(
+    states: [&mut [f32]; 4],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;
     };
     let width = states[0].len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) || inputs.len() > 64 {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) || inputs.len() > 64 {
         return false;
     }
     let blocks = width / 16;
-    let mut current = [[[f32x4::splat(neon, 0.0); 4]; 16]; 4];
+    let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 4];
     for (r, state) in states.iter().enumerate() {
         for (b, state_block) in state.as_chunks::<16>().0.iter().enumerate() {
             current[r][b] = [
@@ -1519,15 +1589,28 @@ pub(super) fn step_eight_rows_tokens_in_place(
     inputs: &[super::ChunkInput<'_>],
     row: usize,
 ) -> bool {
+    if states[0].len() <= 128 {
+        step_eight_rows_tokens_in_place_blocks::<8>(states, inputs, row)
+    } else {
+        step_eight_rows_tokens_in_place_blocks::<16>(states, inputs, row)
+    }
+}
+
+#[inline]
+fn step_eight_rows_tokens_in_place_blocks<const BLOCKS: usize>(
+    states: [&mut [f32]; 8],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;
     };
     let width = states[0].len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) || inputs.len() > 64 {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) || inputs.len() > 64 {
         return false;
     }
     let blocks = width / 16;
-    let mut current = [[[f32x4::splat(neon, 0.0); 4]; 16]; 8];
+    let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 8];
     for (r, state) in states.iter().enumerate() {
         for (b, state_block) in state.as_chunks::<16>().0.iter().enumerate() {
             current[r][b] = [

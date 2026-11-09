@@ -317,13 +317,13 @@ fn grouped_in_place(
 
 #[test]
 fn pinned_gdn_staged_rows_match_independent_scalar_bits() -> Result<()> {
-    for width in [16, 64, 128, 256] {
+    for width in [16, 64, 112, 128, 144, 240, 256] {
         let query = values(width);
         let mut key = values(width);
         key.reverse();
         let mut token_values = values(width);
         token_values[0] = -0.0;
-        for count in [1, 3, 8, 32] {
+        for count in [0, 1, 3, 8, 16, 32, 64] {
             let inputs: Vec<ChunkInput<'_>> = (0..count)
                 .map(|token| ChunkInput {
                     query: &query,
@@ -363,59 +363,60 @@ fn pinned_gdn_staged_rows_match_independent_scalar_bits() -> Result<()> {
 
 #[test]
 fn pinned_gdn_staged_group_failure_keeps_destinations_untouched() -> Result<()> {
-    let width = 128;
-    let query = values(width);
-    let key = values(width);
-    let token_values = values(width);
-    for rows in [4, 8] {
-        for failure in 0..3 {
-            let mut failing_query = query.clone();
-            let mut failing_key = key.clone();
-            let mut failing_values = token_values.clone();
-            match failure {
-                0 => failing_key[width - 1] = f32::NAN,
-                1 => {
-                    failing_values[rows - 1] = f32::MAX;
-                    failing_key[21] = 2.0;
+    for width in [128, 144] {
+        let query = values(width);
+        let key = values(width);
+        let token_values = values(width);
+        for rows in [4, 8] {
+            for failure in 0..3 {
+                let mut failing_query = query.clone();
+                let mut failing_key = key.clone();
+                let mut failing_values = token_values.clone();
+                match failure {
+                    0 => failing_key[width - 1] = f32::NAN,
+                    1 => {
+                        failing_values[rows - 1] = f32::MAX;
+                        failing_key[21] = 2.0;
+                    }
+                    _ => failing_query[width - 1] = f32::NAN,
                 }
-                _ => failing_query[width - 1] = f32::NAN,
+                let ordinary = ChunkInput {
+                    query: &query,
+                    key: &key,
+                    value: &token_values,
+                    decay: 0.875,
+                    beta: 0.625,
+                };
+                let inputs = [
+                    ordinary,
+                    ordinary,
+                    ChunkInput {
+                        query: &failing_query,
+                        key: &failing_key,
+                        value: &failing_values,
+                        beta: 1.0,
+                        ..ordinary
+                    },
+                ];
+                let previous = values(width * rows);
+                let mut state = vec![-5.0; width * rows];
+                let original_state = bits(&state);
+                let mut output = vec![-3.0; width * inputs.len()];
+                let original_output = bits(&output);
+                assert!(!grouped_from(
+                    &previous,
+                    &mut state,
+                    rows,
+                    width,
+                    &inputs,
+                    &mut output,
+                )?);
+                assert_eq!(bits(&state), original_state);
+                assert_eq!(bits(&output), original_output);
+                let mut in_place = previous.clone();
+                assert!(!grouped_in_place(&mut in_place, rows, width, &inputs)?);
+                assert_eq!(bits(&in_place), bits(&previous));
             }
-            let ordinary = ChunkInput {
-                query: &query,
-                key: &key,
-                value: &token_values,
-                decay: 0.875,
-                beta: 0.625,
-            };
-            let inputs = [
-                ordinary,
-                ordinary,
-                ChunkInput {
-                    query: &failing_query,
-                    key: &failing_key,
-                    value: &failing_values,
-                    beta: 1.0,
-                    ..ordinary
-                },
-            ];
-            let previous = values(width * rows);
-            let mut state = vec![-5.0; width * rows];
-            let original_state = bits(&state);
-            let mut output = vec![-3.0; width * inputs.len()];
-            let original_output = bits(&output);
-            assert!(!grouped_from(
-                &previous,
-                &mut state,
-                rows,
-                width,
-                &inputs,
-                &mut output,
-            )?);
-            assert_eq!(bits(&state), original_state);
-            assert_eq!(bits(&output), original_output);
-            let mut in_place = previous.clone();
-            assert!(!grouped_in_place(&mut in_place, rows, width, &inputs)?);
-            assert_eq!(bits(&in_place), bits(&previous));
         }
     }
     Ok(())
@@ -423,7 +424,7 @@ fn pinned_gdn_staged_group_failure_keeps_destinations_untouched() -> Result<()> 
 
 #[test]
 fn pinned_gdn_staged_single_row_retains_late_failure_bits() -> Result<()> {
-    for width in [16, 128, 256] {
+    for width in [16, 128, 144, 256] {
         for failure in 0..3 {
             let previous = values(width);
             let query = values(width);
@@ -476,6 +477,113 @@ fn pinned_gdn_staged_single_row_retains_late_failure_bits() -> Result<()> {
             assert!(result.is_err());
             assert_eq!(bits(&actual), bits(&expected));
             assert_eq!(bits(&actual_output), bits(&expected_output));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_gdn_multitoken_single_row_capacities_match_independent_scalar_bits() -> Result<()> {
+    for width in [16, 112, 128, 144, 240, 256] {
+        let key = values(width);
+        let mut query = values(width);
+        query.reverse();
+        let token_values = [-0.0];
+        for count in [0, 1, 3, 8, 16, 32, 64] {
+            let inputs: Vec<ChunkInput<'_>> = (0..count)
+                .map(|token| ChunkInput {
+                    query: &query,
+                    key: &key,
+                    value: &token_values,
+                    decay: [0.875, -0.0, 0.5, -0.25][token % 4],
+                    beta: [0.625, 0.0, -0.0, 0.375][token % 4],
+                })
+                .collect();
+            let mut previous = values(width);
+            previous[0] = -0.0;
+            previous[1] = f32::from_bits(1);
+            let mut expected = previous.clone();
+            let mut expected_output = vec![-3.0; count * 3];
+            oracle_row(&mut expected, &inputs, 0, 3, &mut expected_output)?;
+            let mut actual = vec![-5.0; width];
+            let mut actual_output = vec![-3.0; count * 3];
+            super::step_row_tokens_from(
+                &previous,
+                &mut actual,
+                &inputs,
+                0,
+                3,
+                0.125,
+                &mut actual_output,
+            )
+            .ok_or_else(|| invalid("baseline NEON multi-token control was not selected"))??;
+            assert_eq!(bits(&actual), bits(&expected));
+            assert_eq!(bits(&actual_output), bits(&expected_output));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_gdn_multitoken_capacities_preserve_refusal() -> Result<()> {
+    for width in [1, 15, 17, 127, 129, 255, 257, 272] {
+        let previous = values(width);
+        let mut actual = vec![-5.0; width];
+        let before = bits(&actual);
+        let mut output = [-3.0; 3];
+        assert!(
+            super::step_row_tokens_from(&previous, &mut actual, &[], 0, 1, 0.125, &mut output,)
+                .is_none()
+        );
+        assert_eq!(bits(&actual), before);
+        assert_eq!(output, [-3.0; 3]);
+        for rows in [4, 8] {
+            let previous = values(width * rows);
+            let mut actual = vec![-5.0; width * rows];
+            let before = bits(&actual);
+            assert!(!grouped_from(
+                &previous,
+                &mut actual,
+                rows,
+                width,
+                &[],
+                &mut output,
+            )?);
+            assert_eq!(bits(&actual), before);
+            assert!(!grouped_in_place(&mut actual, rows, width, &[])?);
+            assert_eq!(bits(&actual), before);
+            assert_eq!(output, [-3.0; 3]);
+        }
+    }
+    for width in [128, 144] {
+        let key = values(width);
+        let query = values(width);
+        let token_values = values(width);
+        let inputs = [ChunkInput {
+            query: &query,
+            key: &key,
+            value: &token_values,
+            decay: 0.875,
+            beta: 0.625,
+        }; 65];
+        for rows in [4, 8] {
+            let previous = values(width * rows);
+            let mut actual = vec![-5.0; width * rows];
+            let before = bits(&actual);
+            let mut output = vec![-3.0; 65 * width];
+            let before_output = bits(&output);
+            assert!(!grouped_from(
+                &previous,
+                &mut actual,
+                rows,
+                width,
+                &inputs,
+                &mut output,
+            )?);
+            assert_eq!(bits(&actual), before);
+            assert!(!grouped_in_place(&mut actual, rows, width, &inputs)?);
+            assert_eq!(bits(&actual), before);
+            assert_eq!(bits(&output), before_output);
         }
     }
     Ok(())

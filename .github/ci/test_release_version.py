@@ -40,7 +40,7 @@ class ReleaseVersionTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         bundle.release_version(root)
 
-    def test_workflow_is_a_separate_manual_hosted_four_minute_bundle(self):
+    def test_workflow_is_a_separate_manual_hosted_five_minute_bundle(self):
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github/workflows/foundation-bundle.yml").read_text(encoding="utf-8")
         self.assertTrue(workflow.startswith("name: Foundation bundle\n"))
@@ -51,7 +51,7 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_REVISION", workflow)
         self.assertNotIn("  push:", workflow)
         self.assertRegex(workflow, r"(?m)^    runs-on: windows-11-arm$")
-        self.assertRegex(workflow, r"(?m)^    timeout-minutes: 4$")
+        self.assertRegex(workflow, r"(?m)^    timeout-minutes: 5$")
         self.assertEqual(re.findall(r"(?m)^  ([a-z][a-z0-9_-]*):$", workflow.split("jobs:\n", 1)[1]),
                          ["bundle"])
         self.assertNotIn("matrix:", workflow)

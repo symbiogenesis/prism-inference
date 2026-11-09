@@ -543,9 +543,14 @@ For a separately authorized short packaging operation, the manually dispatched
 those five executables on hosted Windows ARM64 after nine focused receipt/version
 controls, formatting, strict Release all-target analyzers for the runtime, server
 and Hexagon crates, and a feature-disabled runtime library compilation check.
-It executes no numerical correctness suite or model. Its one job has a four-minute
-limit; the operator must also bound queueing, monitoring, cancellation and artifact
-retention in the declared total operation allowance. It derives the version from
+It executes no numerical correctness suite or model. Its one job has a five-minute
+upper limit. The standing agent operation allowance remains five minutes total,
+including setup, queueing, monitoring, cancellation and artifact retention. A
+selected fixed operation conservatively estimated at 350 seconds needs an explicit
+owner-approved six-minute aggregate exception; six minutes is the smallest
+whole-minute allowance above that estimate. The job timeout grants no exception.
+The operator must reserve cancellation/retention time and cancel before its own
+work cutoff even when the hosted job has time left. It derives the version from
 matching runtime/server manifests and the server's exact runtime pin, then uses
 the ordinary source-bound bundle producer and genuine GitHub run identity.
 Dispatch requires the exact expected main revision and a unique one-to-48-character

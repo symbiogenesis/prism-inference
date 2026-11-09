@@ -24,7 +24,7 @@ jobs:
   bundle:
     if: github.ref == 'refs/heads/main'
     runs-on: windows-11-arm
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Bind the operation and exact dispatched source
         shell: pwsh
@@ -128,7 +128,7 @@ jobs:
             PerformanceQualified = $false
           } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'bundle-scope.json') -Encoding utf8NoBOM
           "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
-          'This four-minute job checks selected source policies, analyzers and portable compilation, then links and packages five executables. Full Foundation correctness, model acceptance and performance remain separate pending gates.' >> $env:GITHUB_STEP_SUMMARY
+          'This five-minute job checks selected source policies, analyzers and portable compilation, then links and packages five executables. Its timeout does not extend the separately declared aggregate operation allowance. Full Foundation correctness, model acceptance and performance remain separate pending gates.' >> $env:GITHUB_STEP_SUMMARY
       - name: Retain the source-bound bundle and explicit limited scope
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

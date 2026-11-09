@@ -23,9 +23,10 @@ class EfficiencyReceiptTests(unittest.TestCase):
     def test_artifacts_require_all_unique_selected_test_executables(self):
         records = []
         for key in efficiency.CONTROLS:
-            name = {"lib": "bonsai_prism_runtime", "server": "prism_inference_server"}.get(key, key)
+            libraries = {value: name for name, value in efficiency.LIBRARY_TARGETS.items()}
+            name = libraries.get(key, key)
             records.append({"reason": "compiler-artifact", "profile": {"test": True},
-                "target": {"name": name, "kind": ["lib"] if key in {"lib", "server"} else ["test"]},
+                "target": {"name": name, "kind": ["lib"] if key in libraries else ["test"]},
                 "executable": f"/tmp/{key}"})
         encoded = "\n".join(json.dumps(record) for record in records)
         self.assertEqual(set(efficiency.test_artifacts(encoded)), set(efficiency.CONTROLS))
@@ -40,7 +41,8 @@ class EfficiencyReceiptTests(unittest.TestCase):
                  for name in controls]
         self.assertEqual(len(names), len(set(names)))
         sources = "\n".join(path.read_text(encoding="utf-8")
-                            for directory in [root / "src", root / "tests", root / "server/src"]
+                            for directory in [root / "src", root / "tests", root / "server/src",
+                                              root / "tools/hexagon-native/src", root / "tools/hexagon-runtime/src"]
                             for path in directory.rglob("*.rs"))
         for name in names:
             self.assertIn("fn " + name.split("::")[-1] + "(", sources)
@@ -50,6 +52,8 @@ class EfficiencyReceiptTests(unittest.TestCase):
         selected = efficiency.controls_for_target("aarch64-pc-windows-msvc")
         self.assertEqual(set(selected), set(before))
         self.assertEqual(selected["lib"], before["lib"] + efficiency.WINDOWS_ARM64_NEON_CONTROLS)
+        self.assertEqual(selected["hexagon_native"],
+                         before["hexagon_native"] + efficiency.WINDOWS_ARM64_NATIVE_CONTROLS)
         for target in ["x86_64-pc-windows-msvc", "aarch64-unknown-linux-gnu", "unknown"]:
             self.assertEqual(efficiency.controls_for_target(target), before)
         self.assertEqual(efficiency.CONTROLS, before)

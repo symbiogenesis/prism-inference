@@ -2,9 +2,10 @@
 
 The current source combines direct one-column F32 adapter and streaming BF16 projections,
 canonical-empty rollback checkpoint, native-order top-20 sampler, redundant
-empty-reset elimination and exact masked-attention padding pruning. The released
-0.1.14 Runner pin predates these changes. Their source work and storage reductions
-are not measured end-to-end gains or permission to lower admission limits.
+empty-reset elimination and exact masked-attention padding pruning. Runner's
+released 0.1.22 pin does not include later local source changes described below.
+Source work and storage reductions are not measured end-to-end gains or permission
+to lower admission limits.
 
 BF16 projections now consume each immutable weight directly from its two-byte
 payload after one complete tensor-geometry check. They preserve BF16 activation
@@ -70,13 +71,23 @@ old full-candidate route, independent full-padding attention controls, empty and
 nonempty snapshot ownership, adapter provenance, cancellation and seeded rollback.
 The fused copy/decay test remains a synthetic control, not production selection.
 
-The runner compiles its four test targets once and requires exactly one passed,
+The runner compiles its six test targets once and requires exactly one passed,
 nonignored test for every exact name. Missing or renamed controls, zero matches,
 ignored tests, duplicate executables and failures reject. Receipts retain the
 revision, source hashes, executable digests and raw results. Strict Release
 all-target Clippy and production executable linking are separate required steps;
 a correctness receipt alone does not imply that later steps passed. The complete
 workflow result is the model-free hosted gate.
+
+The fixed inventory also covers suffix-search reference parity and speculative
+rollback, staged GDN row reuse on Windows ARM64, and direct native-Q2 resident
+weight initialization. Accelerator controls use host-only fake arenas and mock
+submitters; they neither open a driver nor execute a DSP graph. Windows ARM64
+alone selects the native arena controls. Portable runtime controls still compare
+directly packed bytes with the existing copied route. The receipt hashes both
+accelerator tool crates, and their Release analyzers and linking remain part of
+the same hosted workflow. This expands correctness coverage without qualifying
+NPU placement, model output or startup benefit.
 
 ## Device and delivery acceptance
 

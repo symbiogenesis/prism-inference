@@ -59,8 +59,8 @@ jobs:
           cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
           cargo +nightly-2026-11-09 check --manifest-path $manifest --locked --release -p prism-inference --lib --no-default-features
           python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/inference_efficiency.py') --manifest $manifest --evidence $env:EFFICIENCY_EVIDENCE
-          cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
-          cargo +nightly-2026-11-09 build --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server --bins --features prism-inference/parallel-rows,prism-inference-server/parallel-rows
+          cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server -p bonsai-hexagon-native -p bonsai-hexagon-runtime --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
+          cargo +nightly-2026-11-09 build --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server -p bonsai-hexagon-native -p bonsai-hexagon-runtime --lib --bins --features prism-inference/parallel-rows,prism-inference-server/parallel-rows
       - name: Retain exact control receipts and failure logs
         if: always() && env.EFFICIENCY_EVIDENCE != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

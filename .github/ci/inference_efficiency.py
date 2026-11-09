@@ -44,6 +44,10 @@ CONTROLS = {
         "kernels::prefill::dot::tests::tiled_integer_reductions_preserve_extreme_values_and_native_lanes",
         "graph::prefill::gdn::tests::chunkwise_gdn_triangular_solve_matches_sequential_signed_and_zero_decay",
         "graph::prefill::gdn::tests::chunkwise_gdn_rejects_invalid_shapes_and_gates",
+        "speculative::tests::suffix_drafter_exhaustively_matches_length_first_overlap_and_tie_order",
+        "speculative::tests::suffix_drafter_maximum_windows_match_reference_and_reject_before_writing",
+        "runtime::deadline_tests::speculative_suffix_buffered_rounds_restore_state_after_cancel_and_delivery_failure",
+        "runtime::deadline_tests::speculative_suffix_generation_and_block_verifier_preserve_exact_greedy_state",
     ],
     "graph": [
         "rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits",
@@ -72,6 +76,18 @@ CONTROLS = {
     "server": [
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
+    "hexagon_runtime": [
+        "native_q2::tests::native_q2_direct_prewarm_matches_copied_tiles_without_scratch",
+        "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
+    ],
+    "hexagon_native": [],
+}
+
+LIBRARY_TARGETS = {
+    "bonsai_prism_runtime": "lib",
+    "prism_inference_server": "server",
+    "bonsai_hexagon_runtime": "hexagon_runtime",
+    "hexagon_native_rpc": "hexagon_native",
 }
 
 # The kernel module is compiled only by the default-feature Windows ARM64
@@ -85,6 +101,14 @@ WINDOWS_ARM64_NEON_CONTROLS = [
     "kernels::neon::tests::simd_neon_pq2_pair_accumulation_extremal_mixed_lanes",
     "kernels::pinned_gdn::tests::pinned_gdn_neon_executes_exact_vector_and_tail_contract",
     "kernels::pinned_attention::neon::tests::neon_value_tile_baseline_is_available_and_accumulator_remains_two_kib",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_staged_rows_match_independent_scalar_bits",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_staged_group_failure_keeps_destinations_untouched",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_staged_single_row_retains_late_failure_bits",
+]
+
+WINDOWS_ARM64_NATIVE_CONTROLS = [
+    "windows::compute_native::projection_native::tests::native_q2_in_place_preparation_preserves_extents_and_atomic_publication",
+    "windows::compute_native::projection_native::tests::resident_native_q2_multi_arena_populates_secondary_buffer_and_batches_across_arenas",
 ]
 
 
@@ -93,6 +117,7 @@ def controls_for_target(target):
     controls = {key: list(names) for key, names in CONTROLS.items()}
     if target == "aarch64-pc-windows-msvc":
         controls["lib"].extend(WINDOWS_ARM64_NEON_CONTROLS)
+        controls["hexagon_native"].extend(WINDOWS_ARM64_NATIVE_CONTROLS)
     return controls
 
 
@@ -122,9 +147,8 @@ def test_artifacts(output):
         target = record["target"]
         if not record.get("profile", {}).get("test"):
             continue
-        key = "lib" if target["kind"] == ["lib"] and target["name"] == "bonsai_prism_runtime" else target["name"]
-        if target["kind"] == ["lib"] and target["name"] == "prism_inference_server":
-            key = "server"
+        key = (LIBRARY_TARGETS.get(target["name"], target["name"])
+               if target["kind"] == ["lib"] else target["name"])
         if key not in CONTROLS:
             continue
         if key in selected:
@@ -138,9 +162,11 @@ def test_artifacts(output):
 def source_hashes(root):
     """Bind all runtime source and selected fixtures rather than a display version."""
     files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml"}
-    for directory in ["src", "server/src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src"]:
+    for directory in ["src", "server/src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src",
+                      "tools/hexagon-native/src", "tools/hexagon-runtime/src"]:
         files.update((root / directory).rglob("*.rs"))
-    for directory in ["server", "tools/ternary", "tools/gguf", "tools/native-hash", "tools/prism"]:
+    for directory in ["server", "tools/ternary", "tools/gguf", "tools/native-hash", "tools/prism",
+                      "tools/hexagon-native", "tools/hexagon-runtime"]:
         files.add(root / directory / "Cargo.toml")
         build_script = root / directory / "build.rs"
         if build_script.is_file():
@@ -193,6 +219,7 @@ def main():
             raise RuntimeError("Efficiency compiler host differs from the selected target")
         command = ["cargo", TOOLCHAIN, "test", "--manifest-path", str(root / "Cargo.toml"),
                    "--locked", "--release", "--package", "prism-inference", "--package", "prism-inference-server",
+                   "--package", "bonsai-hexagon-native", "--package", "bonsai-hexagon-runtime",
                    "--features", "prism-inference/parallel-rows,prism-inference-server/parallel-rows",
                    "--lib", "--test", "graph", "--test", "swift_sampling", "--no-run", "--message-format=json"]
         compiled = subprocess.run(command, capture_output=True, text=True, check=False)

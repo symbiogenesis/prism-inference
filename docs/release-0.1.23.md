@@ -13,6 +13,21 @@ normalized package verification ran. Subsequent analyzer-policy and hosted
 source-binding corrections require the owning checks. Do not rerun the closed
 local workload or treat the prepared version/pin as registry availability.
 
+The separate final-source registry attempt on `3bd63f6` passed all six updated
+receipt controls and formatting, then stopped on eight test-only strict Clippy
+findings. Its 52.8568851-second clock is closed with no package verification or
+upload. All 71 retained power observations reported AC connected, saver off and
+99% charge; sampling does not establish uninterrupted stability. The source-only
+test corrections preserve production behavior and remain uncompiled locally.
+Their checks belong to the separately authorized bounded hosted bundle operation,
+followed by default Cargo normalized-package verification before any upload.
+
+The dedicated [Foundation bundle workflow](../.github/workflows/foundation-bundle.yml)
+has a four-minute hosted ARM64 job and honest bundle-only receipts. Agents may
+operate it within the five-minute aggregate limit in [AGENTS.md](../AGENTS.md),
+including queue, monitoring, cancellation and artifact verification. It does not
+close complete Foundation, application, performance or platform qualification.
+
 ## Source changes
 
 The library includes the local CPU efficiency candidates documented in

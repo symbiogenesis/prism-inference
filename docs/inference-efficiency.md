@@ -136,6 +136,13 @@ all-target Clippy and production executable linking are separate required steps;
 a correctness receipt alone does not imply that later steps passed. The complete
 workflow result is the model-free hosted gate.
 
+The source receipt also binds the root `clippy.toml` policy. Its one named
+duplicate-crate allowance covers the incompatible pinned `windows-sys` versions:
+containment's `mxc-sdk`/`winreg` route requires 0.59, while native hashing and
+other current consumers require 0.61.2. This does not replace dependencies or
+disable other duplicate-crate diagnostics; changing or removing the policy
+changes the admitted source identity.
+
 The fixed inventory also covers suffix-search reference parity and speculative
 rollback, staged GDN row reuse on Windows ARM64, and direct native-Q2 resident
 weight initialization. Accelerator controls use host-only fake arenas and mock

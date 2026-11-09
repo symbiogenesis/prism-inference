@@ -125,15 +125,15 @@ fn automaton(
         for (value, next) in children {
             if current != 0 {
                 let mut fail = states[current].fail;
-                while fail != 0 && !states[fail].children.contains_key(&value) {
+                states[next].fail = loop {
+                    if let Some(&target) = states[fail].children.get(&value) {
+                        break if target == next { 0 } else { target };
+                    }
+                    if fail == 0 {
+                        break 0;
+                    }
                     fail = states[fail].fail;
-                }
-                states[next].fail = states[fail]
-                    .children
-                    .get(&value)
-                    .copied()
-                    .filter(|&id| id != next)
-                    .unwrap_or(0);
+                };
             }
             queue.push_back(next);
         }
@@ -159,10 +159,15 @@ fn automaton(
         let mut specific = Vec::new();
         for &value in &alphabet {
             let mut state = current;
-            while state != 0 && !states[state].children.contains_key(&value) {
+            let next = loop {
+                if let Some(&next) = states[state].children.get(&value) {
+                    break next;
+                }
+                if state == 0 {
+                    break 0;
+                }
                 state = states[state].fail;
-            }
-            let next = states[state].children.get(&value).copied().unwrap_or(0);
+            };
             if states[next].terminal {
                 completing.push(value);
                 specific.push(value);

@@ -203,18 +203,22 @@ impl Parser<'_> {
     }
 
     fn read_text(&mut self, size: usize) -> Result<String> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size)?;
-        let available = self.reader.fill_buf()?;
-        if let Some(text) = available.get(..size) {
-            bytes.extend_from_slice(text);
+        let value = if let Some(bytes) = self.reader.fill_buf()?.get(..size) {
+            let text = std::str::from_utf8(bytes)?;
+            let mut value = String::new();
+            value.try_reserve_exact(size)?;
+            value.push_str(text);
             self.reader.consume(size);
+            value
         } else {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size)?;
             bytes.resize(size, 0);
             self.reader.read_exact(&mut bytes)?;
-        }
+            String::from_utf8(bytes)?
+        };
         self.position = add(self.position, u64::try_from(size)?)?;
-        Ok(String::from_utf8(bytes)?)
+        Ok(value)
     }
 
     fn skip(&mut self, bytes: u64) -> Result<()> {

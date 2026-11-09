@@ -4,6 +4,25 @@ This unpublished Rust crate joins Prism's ordinary Qwen3.5 graph to a single
 caller-owned signed X2 projection session. The published CPU runtime depends on
 neither this crate nor the unpublished native driver boundary.
 
+`NativeQ2Executor` prewarming can initialize a fresh resident `Q2_0` extent directly
+through the native submitter's synchronous, exact-length callback. Packing then
+writes into its admitted `rpcmem` arena, retaining the same byte transcode and
+row-worker pool. The prospective registry and handle stay private until packing,
+all packed scales and the existing deadline pass. Callback errors close admission;
+unwinding publishes no handle or registry growth. Existing handles and neighboring
+extents remain untouched. Submitters without this optional capability retain the
+scratch-and-copy API and its original input validation.
+
+For the current 168-projection selection, this removes a nominal
+`2,888,663,040` bytes of startup host copying and the temporary packed-weight
+scratch from the direct prewarm path. This is a source work reduction, with no
+measured startup, RAM, request-throughput or DSP-transfer verdict. The existing
+host/resource admission, six mapped arenas, signed kernels, queue/cache protocol,
+operation limits and CPU placement remain unchanged. Hosted model-free controls
+compare direct and copied preparation across partial-row/column tiles and retain
+failure, unwinding, extent-bound and secondary-arena controls. Signed-device,
+actual-model state/adapter parity and matched whole-request benefit remain pending.
+
 `GuardedQ2Executor` uses the existing guarded HVX K=256/N=2 primitive.
 `HmxQ2Executor` uses the separate K=128/N=8 binary-plane HMX primitive. Both
 implement the public CPU runtime's `Pq2ProjectionExecutor` extension and consume

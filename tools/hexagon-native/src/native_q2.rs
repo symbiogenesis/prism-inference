@@ -398,6 +398,30 @@ pub trait NativeQ2Submitter {
         Ok(None)
     }
 
+    /// Whether fresh resident weights can be initialized directly in their admitted arena.
+    fn supports_in_place_weight_preparation(&self) -> bool {
+        false
+    }
+
+    /// Initialize one fresh, exact-length resident extent without an intermediate copy.
+    ///
+    /// The synchronous callback receives only the new extent and cannot retain its borrow.
+    /// Geometry and capacity are checked before calling it. A handle is published only
+    /// after the callback succeeds and every packed scale has been validated. Unsupported
+    /// submitters return `None` without calling the callback; callers should check
+    /// [`Self::supports_in_place_weight_preparation`] before selecting this path.
+    ///
+    /// # Errors
+    /// Invalid geometry, callback failure, malformed weights or a faulted session reject.
+    fn prepare_weights_in_place(
+        &mut self,
+        _columns: usize,
+        _rows: usize,
+        _initialize: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        Ok(None)
+    }
+
     /// Submit a previously prepared immutable extent without copying its weights.
     ///
     /// # Errors
@@ -627,6 +651,19 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         weights: &[u8],
     ) -> Result<Option<NativeQ2WeightHandle>, Error> {
         (**self).prepare_weights(columns, rows, weights)
+    }
+
+    fn supports_in_place_weight_preparation(&self) -> bool {
+        (**self).supports_in_place_weight_preparation()
+    }
+
+    fn prepare_weights_in_place(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        initialize: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        (**self).prepare_weights_in_place(columns, rows, initialize)
     }
 
     fn submit_resident(
@@ -937,6 +974,28 @@ fn tile_scales_valid(scales: &[u8]) -> bool {
     (mask & SIGN_BITS) == 0
 }
 
+pub(crate) const fn packed_weight_bytes(
+    maximum_columns: usize,
+    maximum_rows: usize,
+    columns: usize,
+    rows: usize,
+) -> Result<usize, Error> {
+    if columns == 0
+        || columns > maximum_columns
+        || !columns.is_multiple_of(128)
+        || rows == 0
+        || rows > maximum_rows
+        || !rows.is_multiple_of(32)
+    {
+        return Err(Error::Contract);
+    }
+    let bytes = layout(columns, rows).weights;
+    if bytes > NATIVE_Q2_MAX_WEIGHT_BYTES {
+        return Err(Error::Contract);
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn validate_weights(
     maximum_columns: usize,
     maximum_rows: usize,
@@ -944,14 +1003,7 @@ pub(crate) fn validate_weights(
     rows: usize,
     weights: &[u8],
 ) -> Result<(), Error> {
-    if columns == 0
-        || columns > maximum_columns
-        || !columns.is_multiple_of(128)
-        || rows == 0
-        || rows > maximum_rows
-        || !rows.is_multiple_of(32)
-        || weights.len() != layout(columns, rows).weights
-        || weights.len() > NATIVE_Q2_MAX_WEIGHT_BYTES
+    if weights.len() != packed_weight_bytes(maximum_columns, maximum_rows, columns, rows)?
         || weights
             .as_chunks::<576>()
             .0

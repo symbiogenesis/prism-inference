@@ -468,28 +468,47 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 let active_cols = (columns - col_start).min(self.maximum_columns);
                 let chunk_blocks = active_cols / 128;
                 let block_start = col_start / 128;
-                let chunk_weights = &mut weights[..mapped_rows * 36 * chunk_blocks];
-                pack_native_chunk(
-                    &tensor.data,
-                    ChunkGeometry {
-                        total_blocks,
-                        row_start,
-                        active_rows,
-                        block_start,
-                        chunk_blocks,
-                    },
-                    chunk_weights,
-                    self.row_parallelism.as_ref(),
-                )?;
-                let handle = self
-                    .submitter
-                    .prepare_weights(active_cols, mapped_rows, chunk_weights)?
+                let packed_bytes = mapped_rows * 36 * chunk_blocks;
+                let geometry = ChunkGeometry {
+                    total_blocks,
+                    row_start,
+                    active_rows,
+                    block_start,
+                    chunk_blocks,
+                };
+                let prepared = if self.submitter.supports_in_place_weight_preparation() {
+                    let row_parallelism = self.row_parallelism.as_ref();
+                    self.submitter.prepare_weights_in_place(
+                        active_cols,
+                        mapped_rows,
+                        &mut |destination| {
+                            if destination.len() != packed_bytes {
+                                return Err(hexagon_native_rpc::Error::Contract);
+                            }
+                            pack_native_chunk(&tensor.data, geometry, destination, row_parallelism)
+                                .map_err(|_| hexagon_native_rpc::Error::Contract)
+                        },
+                    )?
+                } else {
+                    let chunk_weights = weights
+                        .get_mut(..packed_bytes)
+                        .ok_or_else(|| invalid("native Q2 preparation scratch extent mismatch"))?;
+                    pack_native_chunk(
+                        &tensor.data,
+                        geometry,
+                        chunk_weights,
+                        self.row_parallelism.as_ref(),
+                    )?;
+                    self.submitter
+                        .prepare_weights(active_cols, mapped_rows, chunk_weights)?
+                };
+                let handle = prepared
                     .ok_or_else(|| {
                         invalid("native Q2 resident preparation contradicted capacity")
                     })?;
                 if handle.columns() != active_cols
                     || handle.rows() != mapped_rows
-                    || handle.packed_bytes() != chunk_weights.len()
+                    || handle.packed_bytes() != packed_bytes
                 {
                     return Err(invalid(
                         "native Q2 resident preparation returned invalid geometry",
@@ -499,7 +518,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 cache.statistics.weight_payload_bytes_prepared = cache
                     .statistics
                     .weight_payload_bytes_prepared
-                    .saturating_add(u64::try_from(chunk_weights.len())?);
+                    .saturating_add(u64::try_from(packed_bytes)?);
             }
         }
         Ok(Some(cache.commit(tensor, first_handle, evaluated)))
@@ -508,6 +527,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     /// Pre-pack and stage a `PQ2_0` projection tensor into the session's
     /// resident arena before token evaluation so Token 0 flushes the resident
     /// weight arena only once on its first submission.
+    /// Native sessions pack directly into fresh admitted resident extents, without
+    /// a temporary packed-weight buffer or a subsequent host copy. Other submitters
+    /// retain the bounded scratch-and-copy preparation contract.
     ///
     /// # Errors
     /// Rejects faulted executors, unsupported tensor geometry, or invalid scale headers.
@@ -550,13 +572,13 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let max_chunk_cols = columns.min(self.maximum_columns);
         let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
         let required_bytes = max_mapped_rows * 36 * (max_chunk_cols / 128);
-        if weights.len() < required_bytes {
+        if !self.submitter.supports_in_place_weight_preparation() && weights.len() < required_bytes {
             weights
                 .try_reserve(required_bytes - weights.len())
                 .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
             weights.resize(required_bytes, 0_u8);
         }
-        let result = self.prepare_resident(tensor, &mut weights[..required_bytes], false);
+        let result = self.prepare_resident(tensor, weights, false);
         if result.is_err() {
             self.failed = true;
         }
@@ -2586,6 +2608,147 @@ fn pack_native_chunk(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    struct ArenaSubmitter {
+        registry: hexagon_native_rpc::NativeQ2WeightRegistry,
+        memory: Vec<u8>,
+        direct: bool,
+        copies: usize,
+        initializations: usize,
+    }
+
+    impl NativeQ2Submitter for ArenaSubmitter {
+        fn residency_capacity_bytes(&self) -> usize {
+            self.registry.remaining_bytes()
+        }
+
+        fn supports_in_place_weight_preparation(&self) -> bool {
+            self.direct
+        }
+
+        fn prepare_weights(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+        ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
+            let handle = self.registry.prepare(columns, rows, weights)?;
+            if let Some(handle) = &handle {
+                let range = self.registry.range(handle)?;
+                self.memory[range].copy_from_slice(weights);
+                self.copies += 1;
+            }
+            Ok(handle)
+        }
+
+        fn prepare_weights_in_place(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            initialize: &mut dyn FnMut(
+                &mut [u8],
+            ) -> std::result::Result<(), hexagon_native_rpc::Error>,
+        ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
+            let start = self.registry.used_bytes().next_multiple_of(128);
+            let end = start + rows * 36 * (columns / 128);
+            let destination = self
+                .memory
+                .get_mut(start..end)
+                .ok_or(hexagon_native_rpc::Error::Contract)?;
+            self.initializations += 1;
+            initialize(destination)?;
+            self.registry.prepare(columns, rows, destination)
+        }
+
+        fn submit(
+            &mut self,
+            _columns: usize,
+            _rows: usize,
+            _weights: &[u8],
+            _activation: &[f32],
+            _output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            Err(hexagon_native_rpc::Error::Contract)
+        }
+    }
+
+    fn arena_submitter(direct: bool) -> Result<ArenaSubmitter> {
+        Ok(ArenaSubmitter {
+            registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(8192)
+                .map_err(|_| invalid("registry"))?,
+            memory: vec![0xa5; 8192],
+            direct,
+            copies: 0,
+            initializations: 0,
+        })
+    }
+
+    #[test]
+    fn native_q2_direct_prewarm_matches_copied_tiles_without_scratch() -> Result<()> {
+        let mut data: Vec<u8> = (0..256 * 49 * 34 / 128)
+            .map(|index| u8::try_from((index * 173 + 29) & 255).unwrap_or(0))
+            .collect();
+        for block in data.as_chunks_mut::<34>().0 {
+            block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+        }
+        let tensor = Tensor {
+            name: "blk.0.ffn_up.weight".to_owned(),
+            dimensions: vec![256, 49],
+            kind: 142,
+            data: Arc::from(data),
+        };
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(8192)
+            .map_err(|_| invalid("residency"))?;
+        let mut copied = NativeQ2Executor::new(arena_submitter(false)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        let mut direct = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        assert!(copied.prewarm_tensor(&tensor)?);
+        assert!(direct.prewarm_tensor(&tensor)?);
+        assert_eq!(direct.submitter.memory, copied.submitter.memory);
+        assert_eq!(copied.submitter.copies, 4);
+        assert_eq!(direct.submitter.copies, 0);
+        assert_eq!(direct.submitter.initializations, 4);
+        assert_eq!(direct.scratch_weights.capacity(), 0);
+        assert!(!copied.scratch_weights.is_empty());
+        assert_eq!(direct.residency_statistics().weight_payload_bytes_prepared, 4608);
+        assert_eq!(direct.statistics().operations_attempted, 0);
+        assert!(direct.prewarm_tensor(&tensor)?);
+        assert_eq!(direct.submitter.initializations, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_direct_prewarm_rejects_partially_packed_invalid_scale() -> Result<()> {
+        let mut data = vec![0x55_u8; 32 * 34];
+        for block in data.as_chunks_mut::<34>().0 {
+            block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        }
+        data[34..36].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        let tensor = Tensor {
+            name: "blk.0.ffn_up.weight".to_owned(),
+            dimensions: vec![128, 32],
+            kind: 142,
+            data: Arc::from(data),
+        };
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(8192)
+            .map_err(|_| invalid("residency"))?;
+        let mut executor = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        assert!(executor.prewarm_tensor(&tensor).is_err());
+        assert!(executor.is_faulted());
+        assert_eq!(executor.submitter.registry.used_bytes(), 0);
+        assert_eq!(executor.residency_statistics().tensors_prepared, 0);
+        assert_eq!(executor.submitter.initializations, 1);
+        assert_eq!(executor.scratch_weights.capacity(), 0);
+        assert!(executor.prewarm_tensor(&tensor).is_err());
+        assert_eq!(executor.submitter.initializations, 1);
+        Ok(())
+    }
 
     struct MockNativeSubmitter {
         calls: u64,

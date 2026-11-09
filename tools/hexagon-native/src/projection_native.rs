@@ -1722,6 +1722,108 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
     }
 }
 
+impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
+    fn initialize_native_weights(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        initialize: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
+        validate_initialized: bool,
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        let Mode::NativeQ2 {
+            columns: max_columns,
+        } = self.mode
+        else {
+            return Err(self.fail("projection-resident-owner-refused-pinned"));
+        };
+        if self.failed {
+            return Err(self.fail("projection-resident-owner-refused-pinned"));
+        }
+        if !self.within_deadline() {
+            return Err(Error::Contract);
+        }
+        let Ok(weight_bytes) =
+            native_q2::packed_weight_bytes(max_columns, self.limits.rows, columns, rows)
+        else {
+            return Err(self.fail("projection-resident-input-refused-pinned"));
+        };
+        // Keep the prospective registry private until the complete extent is valid.
+        // A callback error or unwind publishes neither a handle nor a reservation.
+        let mut pending_registry = self.native_resident_weights;
+        let handle = match pending_registry.prepare_validated(columns, rows, weight_bytes) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
+        };
+        let range = pending_registry.range(&handle)?;
+        let destination;
+        if handle.arena_index() == 0 {
+            let working = self.mode.allocation_bytes(self.limits.rows);
+            let Some(offset) = working.checked_add(range.start) else {
+                return Err(self.fail("projection-resident-reservation-refused-pinned"));
+            };
+            let Some(end) = working.checked_add(range.end) else {
+                return Err(self.fail("projection-resident-reservation-refused-pinned"));
+            };
+            if u64::try_from(end).map_or(true, |end| end > u64::from(self.expected.size)) {
+                return Err(self.fail("projection-resident-reservation-refused-pinned"));
+            }
+            // SAFETY: this fresh append-only reservation is inside the explicitly
+            // admitted initialized primary allocation; no handle or DSP consumer
+            // can refer to it before validation and publication below.
+            destination = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.memory.cast::<u8>().wrapping_add(offset),
+                    weight_bytes,
+                )
+            };
+        } else {
+            let extra_idx = usize::from(handle.arena_index() - 1);
+            if extra_idx >= self.extra_arena_count
+                || range.end > self.extra_arenas[extra_idx].allocation_bytes
+            {
+                return Err(self.fail("projection-resident-reservation-refused-pinned"));
+            }
+            let arena_ptr = self.extra_arenas[extra_idx].memory;
+            // SAFETY: this fresh append-only reservation is inside the explicitly
+            // admitted initialized secondary arena, disjoint from every published
+            // handle. The callback borrow ends before any handle publication.
+            destination = unsafe {
+                std::slice::from_raw_parts_mut(
+                    arena_ptr.cast::<u8>().wrapping_add(range.start),
+                    weight_bytes,
+                )
+            };
+        }
+        if initialize(destination).is_err()
+            || (validate_initialized && native_q2::validate_weights(
+                max_columns,
+                self.limits.rows,
+                columns,
+                rows,
+                destination,
+            )
+            .is_err())
+        {
+            return Err(self.fail("projection-resident-input-refused-pinned"));
+        }
+        if !self.within_deadline() {
+            return Err(Error::Contract);
+        }
+        self.native_resident_weights = pending_registry;
+        if handle.arena_index() == 0 {
+            self.dirty_resident_weights = true;
+        } else {
+            let extra_idx = usize::from(handle.arena_index() - 1);
+            self.extra_arenas[extra_idx].dirty = true;
+        }
+        self.report.resident_weight_bytes_prepared += weight_bytes;
+        self.report.resident_weight_preparations += 1;
+        Ok(Some(handle))
+    }
+
+}
+
 impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
     fn remaining_operations(&self) -> Option<u64> {
         if self.failed {
@@ -1768,55 +1870,24 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         {
             return Err(self.fail("projection-resident-input-refused-pinned"));
         }
-        let handle =
-            match self
-                .native_resident_weights
-                .prepare_validated(columns, rows, weights.len())
-            {
-                Ok(Some(handle)) => handle,
-                Ok(None) => return Ok(None),
-                Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
-            };
-        let range = self.native_resident_weights.range(&handle)?;
-        if handle.arena_index() == 0 {
-            let offset = self.mode.allocation_bytes(self.limits.rows) + range.start;
-            // SAFETY: this fresh append-only reservation is inside the explicitly
-            // admitted primary allocation.
-            let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    self.memory.cast::<u8>().wrapping_add(offset),
-                    weights.len(),
-                )
-            };
+        self.initialize_native_weights(columns, rows, &mut |destination| {
             destination.copy_from_slice(weights);
-            self.dirty_resident_weights = true;
-        } else {
-            let extra_idx = usize::from(handle.arena_index() - 1);
-            if extra_idx >= self.extra_arena_count
-                || range.end > self.extra_arenas[extra_idx].allocation_bytes
-            {
-                return Err(self.fail("projection-resident-reservation-refused-pinned"));
-            }
-            let arena_ptr = self.extra_arenas[extra_idx].memory;
-            // SAFETY: this fresh append-only reservation is inside the explicitly
-            // admitted secondary weight arena.
-            let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    arena_ptr.cast::<u8>().wrapping_add(range.start),
-                    weights.len(),
-                )
-            };
-            destination.copy_from_slice(weights);
-            self.extra_arenas[extra_idx].dirty = true;
-        }
-        self.report.resident_weight_bytes_prepared += weights.len();
-        self.report.resident_weight_preparations += 1;
-        if !self.within_deadline() {
-            return Err(Error::Contract);
-        }
-        Ok(Some(handle))
+            Ok(())
+        }, false)
     }
 
+    fn supports_in_place_weight_preparation(&self) -> bool {
+        !self.failed && self.mode.is_native_q2()
+    }
+
+    fn prepare_weights_in_place(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        initialize: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        self.initialize_native_weights(columns, rows, initialize, true)
+    }
     fn submit_resident(
         &mut self,
         handle: &NativeQ2WeightHandle,
@@ -2184,6 +2255,21 @@ impl NativeQ2Submitter for NativeQ2Session {
     ) -> Result<Option<NativeQ2WeightHandle>, Error> {
         self.with_session(|session| {
             NativeQ2Submitter::prepare_weights(session, columns, rows, weights)
+        })
+    }
+
+    fn supports_in_place_weight_preparation(&self) -> bool {
+        !self.failed
+    }
+
+    fn prepare_weights_in_place(
+        &mut self,
+        columns: usize,
+        rows: usize,
+        initialize: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
+    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::prepare_weights_in_place(session, columns, rows, initialize)
         })
     }
 
@@ -3128,6 +3214,123 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "One fake-arena lifecycle compares direct and copied preparation and all pre-publication failures."
+    )]
+    fn native_q2_in_place_preparation_preserves_extents_and_atomic_publication()
+    -> Result<(), Error> {
+        let mut weights = vec![0x55_u8; 1152];
+        for tile in weights.as_chunks_mut::<576>().0 {
+            for scale in tile[512..].as_chunks_mut::<2>().0 {
+                *scale = 0x3800_u16.to_le_bytes();
+            }
+        }
+        for case in 0..7 {
+            let capacity = if case == 4 { 1152 } else { 4096 };
+            let limits = NativeQ2ProjectionLimits::new(128, 32, 4, Duration::from_secs(4))?
+                .with_resident_weights(capacity)?;
+            let mut memory = vec![0xa5_u8; limits.allocation_bytes()];
+            let pointer = memory.as_mut_ptr().cast::<c_void>();
+            let expected = QueueBuffer {
+                fd: 7,
+                size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+                offset: 0,
+                flags: 0x90,
+                pointer,
+            };
+            let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            let queue_write = WriteCall::Nonblocking(write);
+            let mut progress: fn(&Q2ProjectionReport) = |_| {};
+            let mut session = Session {
+                report: &mut report,
+                queue_write: &queue_write,
+                queue_read: read,
+                queue: null_mut(),
+                memory: pointer,
+                expected,
+                extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+                extra_arena_count: 0,
+                mapper: None,
+                limits: limits.common,
+                mode: Mode::NativeQ2 { columns: 128 },
+                resident_weights: HmxQ2WeightRegistry::new(0)?,
+                native_resident_weights: NativeQ2WeightRegistry::new(capacity)?,
+                dirty_resident_weights: false,
+                work_deadline: Instant::now() + Duration::from_secs(4),
+                progress: &mut progress,
+                failed: false,
+            };
+            assert!(session.supports_in_place_weight_preparation());
+            let copied = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights)?
+                .ok_or(Error::Contract)?;
+            let copied_range = session.native_resident_weights.range(&copied)?;
+            assert_eq!(copied_range, 0..1152);
+            let mut called = false;
+            let mut initialize = |destination: &mut [u8]| {
+                called = true;
+                assert_eq!(destination.len(), weights.len());
+                destination.copy_from_slice(&weights);
+                if case == 1 {
+                    destination.fill(0x33);
+                    return Err(Error::Contract);
+                }
+                if case == 2 {
+                    destination[512..514].copy_from_slice(&0x7e00_u16.to_le_bytes());
+                }
+                if case == 5 {
+                    std::panic::resume_unwind(Box::new(()));
+                }
+                Ok(())
+            };
+            let columns = if case == 3 { usize::MAX } else { 128 };
+            let result = if case == 5 {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.prepare_weights_in_place(columns, 32, &mut initialize)
+                }))
+                .is_err());
+                // An unwound callback never publishes a handle or registry growth.
+                assert_eq!(session.native_resident_weights.used_bytes(), 1152);
+                session.prepare_weights_in_place(128, 32, &mut |destination| {
+                    destination.copy_from_slice(&weights);
+                    Ok(())
+                })
+            } else {
+                if case == 6 {
+                    session.work_deadline = Instant::now();
+                }
+                session.prepare_weights_in_place(columns, 32, &mut initialize)
+            };
+            if matches!(case, 0 | 5) {
+                let direct = result?.ok_or(Error::Contract)?;
+                assert_eq!(direct.columns(), copied.columns());
+                assert_eq!(direct.rows(), copied.rows());
+                assert_eq!(direct.packed_bytes(), copied.packed_bytes());
+                assert_eq!(session.native_resident_weights.range(&direct)?, 1152..2304);
+                assert_eq!(session.report.resident_weight_preparations, 2);
+            } else {
+                if case == 4 {
+                    assert!(result?.is_none());
+                } else {
+                    assert!(result.is_err());
+                    assert!(session.failed);
+                }
+                assert_eq!(session.native_resident_weights.used_bytes(), 1152);
+                assert_eq!(session.report.resident_weight_preparations, 1);
+            }
+            assert_eq!(called, matches!(case, 0 | 1 | 2 | 5));
+            let start = Mode::NativeQ2 { columns: 128 }.allocation_bytes(32);
+            assert_eq!(&memory[start..start + weights.len()], weights);
+            if matches!(case, 0 | 5) {
+                assert_eq!(&memory[start + 1152..start + 2304], weights);
+            }
+            assert!(memory[..start].iter().all(|&byte| byte == 0xa5));
+            assert!(memory[start + 2304..].iter().all(|&byte| byte == 0xa5));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn resident_native_q2_scopes_queue_buffer_flush_after_initial_dirty_submission()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
@@ -3374,13 +3577,19 @@ mod tests {
         };
         let h_a = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights_32)?
             .ok_or(Error::Contract)?;
-        let h_b = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights_32)?
+        let h_b = session
+            .prepare_weights_in_place(128, 32, &mut |destination| {
+                assert_eq!(destination.len(), weights_32.len());
+                destination.copy_from_slice(&weights_32);
+                Ok(())
+            })?
             .ok_or(Error::Contract)?;
         assert_eq!(h_a.arena_index(), 1);
         assert_eq!(h_b.arena_index(), 1);
         assert!(session.extra_arenas[0].dirty);
         assert_eq!(&extra_memory[..1152], &weights_32);
         assert_eq!(&extra_memory[1152..2304], &weights_32);
+        assert!(extra_memory[2304..].iter().all(|&byte| byte == 0));
 
         let mut out_a = [99.0_f32; 32];
         NativeQ2Submitter::submit_resident(&mut session, &h_a, &activation, &mut out_a)?;

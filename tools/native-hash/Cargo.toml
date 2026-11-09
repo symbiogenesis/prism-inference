@@ -11,7 +11,7 @@ keywords = ["sha256", "hash", "windows"]
 categories = ["cryptography"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Cryptography"] }
 
 [target.'cfg(not(windows))'.dependencies]
 sha2.workspace = true

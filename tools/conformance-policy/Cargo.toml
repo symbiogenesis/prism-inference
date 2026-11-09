@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "development-tools::testing"]
 
 [dependencies]
 bonsai-native-hash = { path = "../native-hash", version = "=0.1.1" }
-serde = { version = "=1.0.229", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [lints]

@@ -21,8 +21,8 @@ bonsai-ternary = { version = "=0.1.1", path = "../ternary" }
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-bonsai-windows-process = "=0.1.0"
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+bonsai-windows-process.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
 [lints]
 workspace = true

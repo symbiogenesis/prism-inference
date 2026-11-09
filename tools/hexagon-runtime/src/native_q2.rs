@@ -306,6 +306,7 @@ impl ResidentCache {
 
 /// Full-`K` 1-op native `HTP_TYPE_Q2_0` executor using `libggml-htp-v81.so`'s
 /// signed 8-thread HVX `q2_0 x q8_1` (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`) kernel.
+///
 /// Resident cache misses pack directly into supporting submitters' admitted arenas;
 /// copied preparation and nonresident execution allocate bounded packing scratch
 /// only after selecting those paths. Conservative payload admission is unchanged.

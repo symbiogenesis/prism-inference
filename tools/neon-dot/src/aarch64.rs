@@ -303,6 +303,86 @@ fn dot_ptq1_four_rows_groups_dotprod(
     out
 }
 
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_eight_rows_lanes_dotprod(
+    packed: [&[u8; 28]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 8] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act_pairs = [
+        (load_s8x16(&a0[0]), load_s8x16(&a0[1])),
+        (load_s8x16(&a1[0]), load_s8x16(&a1[1])),
+        (load_s8x16(&a2[0]), load_s8x16(&a2[1])),
+        (load_s8x16(&a3[0]), load_s8x16(&a3[1])),
+    ];
+    let mut out = [[[0_i32; 4]; 4]; 8];
+    for (row, block) in packed.into_iter().enumerate() {
+        let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
+        let pairs = [(t0, t1), (t2, t3), (t4, t5), (t6, t7)];
+        for (group, ((w0, w1), (act0, act1))) in pairs.into_iter().zip(act_pairs).enumerate() {
+            let acc = sdot32_vec(w0, w1, act0, act1);
+            store_s32x4(acc, &mut out[row][group]);
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_eight_rows_groups_dotprod(
+    packed: [&[u8; 28]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 8] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act00 = load_s8x16(&a0[0]);
+    let act01 = load_s8x16(&a0[1]);
+    let act10 = load_s8x16(&a1[0]);
+    let act11 = load_s8x16(&a1[1]);
+    let act20 = load_s8x16(&a2[0]);
+    let act21 = load_s8x16(&a2[1]);
+    let act30 = load_s8x16(&a3[0]);
+    let act31 = load_s8x16(&a3[1]);
+    let mut out = [[0_i32; 4]; 8];
+    for (row, block) in packed.into_iter().enumerate() {
+        let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
+        let g0 = sdot32_vec(t0, t1, act00, act01);
+        let g1 = sdot32_vec(t2, t3, act10, act11);
+        let g2 = sdot32_vec(t4, t5, act20, act21);
+        let g3 = sdot32_vec(t6, t7, act30, act31);
+        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[row]);
+    }
+    out
+}
+
+#[inline]
+pub(super) fn dot_ptq1_eight_rows_lanes(
+    packed: [&[u8; 28]; 8],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[[i32; 4]; 4]; 8]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_eight_rows_lanes_dotprod(packed, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_eight_rows_groups(
+    packed: [&[u8; 28]; 8],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[i32; 4]; 8]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_eight_rows_groups_dotprod(packed, activations) })
+}
+
 #[inline]
 pub(super) fn dot_ptq1_block_lanes(
     packed: &[u8; 28],
@@ -1454,6 +1534,334 @@ fn dot_ptq1_4x4_groups_dotprod(
         }
     }
     out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_4x1_lanes_dotprod(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 4] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act_pairs = [
+        (load_s8x16(&a0[0]), load_s8x16(&a0[1])),
+        (load_s8x16(&a1[0]), load_s8x16(&a1[1])),
+        (load_s8x16(&a2[0]), load_s8x16(&a2[1])),
+        (load_s8x16(&a3[0]), load_s8x16(&a3[1])),
+    ];
+    let mut out = [[[0_i32; 4]; 4]; 4];
+    for r in 0..4 {
+        for (group, (act0, act1)) in act_pairs.into_iter().enumerate() {
+            let acc = sdot32_vec(
+                load_s8x16(&trits[r][group * 2]),
+                load_s8x16(&trits[r][group * 2 + 1]),
+                act0,
+                act1,
+            );
+            store_s32x4(acc, &mut out[r][group]);
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_4x1_groups_dotprod(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 4] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act00 = load_s8x16(&a0[0]);
+    let act01 = load_s8x16(&a0[1]);
+    let act10 = load_s8x16(&a1[0]);
+    let act11 = load_s8x16(&a1[1]);
+    let act20 = load_s8x16(&a2[0]);
+    let act21 = load_s8x16(&a2[1]);
+    let act30 = load_s8x16(&a3[0]);
+    let act31 = load_s8x16(&a3[1]);
+    let mut out = [[0_i32; 4]; 4];
+    for r in 0..4 {
+        let g0 = sdot32_vec(load_s8x16(&trits[r][0]), load_s8x16(&trits[r][1]), act00, act01);
+        let g1 = sdot32_vec(load_s8x16(&trits[r][2]), load_s8x16(&trits[r][3]), act10, act11);
+        let g2 = sdot32_vec(load_s8x16(&trits[r][4]), load_s8x16(&trits[r][5]), act20, act21);
+        let g3 = sdot32_vec(load_s8x16(&trits[r][6]), load_s8x16(&trits[r][7]), act30, act31);
+        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[r]);
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_8x1_lanes_dotprod(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 8] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act_pairs = [
+        (load_s8x16(&a0[0]), load_s8x16(&a0[1])),
+        (load_s8x16(&a1[0]), load_s8x16(&a1[1])),
+        (load_s8x16(&a2[0]), load_s8x16(&a2[1])),
+        (load_s8x16(&a3[0]), load_s8x16(&a3[1])),
+    ];
+    let mut out = [[[0_i32; 4]; 4]; 8];
+    for r in 0..8 {
+        for (group, (act0, act1)) in act_pairs.into_iter().enumerate() {
+            let acc = sdot32_vec(
+                load_s8x16(&trits[r][group * 2]),
+                load_s8x16(&trits[r][group * 2 + 1]),
+                act0,
+                act1,
+            );
+            store_s32x4(acc, &mut out[r][group]);
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_8x1_groups_dotprod(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 8] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act00 = load_s8x16(&a0[0]);
+    let act01 = load_s8x16(&a0[1]);
+    let act10 = load_s8x16(&a1[0]);
+    let act11 = load_s8x16(&a1[1]);
+    let act20 = load_s8x16(&a2[0]);
+    let act21 = load_s8x16(&a2[1]);
+    let act30 = load_s8x16(&a3[0]);
+    let act31 = load_s8x16(&a3[1]);
+    let mut out = [[0_i32; 4]; 8];
+    for r in 0..8 {
+        let g0 = sdot32_vec(load_s8x16(&trits[r][0]), load_s8x16(&trits[r][1]), act00, act01);
+        let g1 = sdot32_vec(load_s8x16(&trits[r][2]), load_s8x16(&trits[r][3]), act10, act11);
+        let g2 = sdot32_vec(load_s8x16(&trits[r][4]), load_s8x16(&trits[r][5]), act20, act21);
+        let g3 = sdot32_vec(load_s8x16(&trits[r][6]), load_s8x16(&trits[r][7]), act30, act31);
+        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[r]);
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_8x4_lanes_dotprod(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> super::Ptq1EightRowFourTokenLanes {
+    let mut out = [[[[0_i32; 4]; 4]; 4]; 8];
+    for group in 0..4 {
+        let acts: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|t| {
+            let halves = activations[t][group].as_chunks::<16>().0;
+            (load_s8x16(&halves[0]), load_s8x16(&halves[1]))
+        });
+        for r in 0..8 {
+            let w0 = load_s8x16(&trits[r][group * 2]);
+            let w1 = load_s8x16(&trits[r][group * 2 + 1]);
+            for t in 0..4 {
+                let lanes = sdot32_vec(w0, w1, acts[t].0, acts[t].1);
+                store_s32x4(lanes, &mut out[r][t][group]);
+            }
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn dot_ptq1_8x4_groups_i8mm(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> super::Ptq1EightRowFourTokenGroups {
+    let mut out = [[[0_i32; 4]; 4]; 8];
+    for group in 0..4 {
+        let mut acc00 = vdupq_n_s32(0);
+        let mut acc01 = vdupq_n_s32(0);
+        let mut acc10 = vdupq_n_s32(0);
+        let mut acc11 = vdupq_n_s32(0);
+        let mut acc20 = vdupq_n_s32(0);
+        let mut acc21 = vdupq_n_s32(0);
+        let mut acc30 = vdupq_n_s32(0);
+        let mut acc31 = vdupq_n_s32(0);
+        let a0_halves = activations[0][group].as_chunks::<16>().0;
+        let a1_halves = activations[1][group].as_chunks::<16>().0;
+        let a2_halves = activations[2][group].as_chunks::<16>().0;
+        let a3_halves = activations[3][group].as_chunks::<16>().0;
+        for half in 0..2 {
+            let a0 = load_s8x16(&a0_halves[half]);
+            let a1 = load_s8x16(&a1_halves[half]);
+            let a2 = load_s8x16(&a2_halves[half]);
+            let a3 = load_s8x16(&a3_halves[half]);
+            let a01_lo = vcombine_s8(vget_low_s8(a0), vget_low_s8(a1));
+            let a01_hi = vcombine_s8(vget_high_s8(a0), vget_high_s8(a1));
+            let a23_lo = vcombine_s8(vget_low_s8(a2), vget_low_s8(a3));
+            let a23_hi = vcombine_s8(vget_high_s8(a2), vget_high_s8(a3));
+
+            let w0 = load_s8x16(&trits[0][group * 2 + half]);
+            let w1 = load_s8x16(&trits[1][group * 2 + half]);
+            let w2 = load_s8x16(&trits[2][group * 2 + half]);
+            let w3 = load_s8x16(&trits[3][group * 2 + half]);
+            let w01_lo = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+            let w01_hi = vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+            let w23_lo = vcombine_s8(vget_low_s8(w2), vget_low_s8(w3));
+            let w23_hi = vcombine_s8(vget_high_s8(w2), vget_high_s8(w3));
+
+            acc00 = smmla_s32(smmla_s32(acc00, w01_lo, a01_lo), w01_hi, a01_hi);
+            acc01 = smmla_s32(smmla_s32(acc01, w01_lo, a23_lo), w01_hi, a23_hi);
+            acc10 = smmla_s32(smmla_s32(acc10, w23_lo, a01_lo), w23_hi, a01_hi);
+            acc11 = smmla_s32(smmla_s32(acc11, w23_lo, a23_lo), w23_hi, a23_hi);
+
+            let w4 = load_s8x16(&trits[4][group * 2 + half]);
+            let w5 = load_s8x16(&trits[5][group * 2 + half]);
+            let w6 = load_s8x16(&trits[6][group * 2 + half]);
+            let w7 = load_s8x16(&trits[7][group * 2 + half]);
+            let w45_lo = vcombine_s8(vget_low_s8(w4), vget_low_s8(w5));
+            let w45_hi = vcombine_s8(vget_high_s8(w4), vget_high_s8(w5));
+            let w67_lo = vcombine_s8(vget_low_s8(w6), vget_low_s8(w7));
+            let w67_hi = vcombine_s8(vget_high_s8(w6), vget_high_s8(w7));
+
+            acc20 = smmla_s32(smmla_s32(acc20, w45_lo, a01_lo), w45_hi, a01_hi);
+            acc21 = smmla_s32(smmla_s32(acc21, w45_lo, a23_lo), w45_hi, a23_hi);
+            acc30 = smmla_s32(smmla_s32(acc30, w67_lo, a01_lo), w67_hi, a01_hi);
+            acc31 = smmla_s32(smmla_s32(acc31, w67_lo, a23_lo), w67_hi, a23_hi);
+        }
+        for (pair_idx, (acc_lo, acc_hi)) in [
+            (acc00, acc01),
+            (acc10, acc11),
+            (acc20, acc21),
+            (acc30, acc31),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut q_lo = [0_i32; 4];
+            let mut q_hi = [0_i32; 4];
+            store_s32x4(acc_lo, &mut q_lo);
+            store_s32x4(acc_hi, &mut q_hi);
+            let r0 = pair_idx * 2;
+            let r1 = r0 + 1;
+            out[r0][0][group] = q_lo[0];
+            out[r0][1][group] = q_lo[1];
+            out[r0][2][group] = q_hi[0];
+            out[r0][3][group] = q_hi[1];
+            out[r1][0][group] = q_lo[2];
+            out[r1][1][group] = q_lo[3];
+            out[r1][2][group] = q_hi[2];
+            out[r1][3][group] = q_hi[3];
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_8x4_groups_dotprod(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> super::Ptq1EightRowFourTokenGroups {
+    let mut out = [[[0_i32; 4]; 4]; 8];
+    for group in 0..4 {
+        let acts: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|t| {
+            let halves = activations[t][group].as_chunks::<16>().0;
+            (load_s8x16(&halves[0]), load_s8x16(&halves[1]))
+        });
+        for r in 0..8 {
+            let w0 = load_s8x16(&trits[r][group * 2]);
+            let w1 = load_s8x16(&trits[r][group * 2 + 1]);
+            let l0 = sdot32_vec(w0, w1, acts[0].0, acts[0].1);
+            let l1 = sdot32_vec(w0, w1, acts[1].0, acts[1].1);
+            let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
+            let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
+            let mut sums = [0_i32; 4];
+            store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut sums);
+            for t in 0..4 {
+                out[r][t][group] = sums[t];
+            }
+        }
+    }
+    out
+}
+
+#[inline]
+pub(super) fn dot_ptq1_4x1_lanes(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[[i32; 4]; 4]; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_4x1_lanes_dotprod(trits, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_4x1_groups(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[i32; 4]; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_4x1_groups_dotprod(trits, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_8x1_lanes(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[[i32; 4]; 4]; 8]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_8x1_lanes_dotprod(trits, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_8x1_groups(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[i32; 4]; 8]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_8x1_groups_dotprod(trits, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_8x4_lanes(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> Option<super::Ptq1EightRowFourTokenLanes> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_8x4_lanes_dotprod(trits, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_8x4_groups(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> Option<super::Ptq1EightRowFourTokenGroups> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe { dot_ptq1_8x4_groups_i8mm(trits, activations) });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe { dot_ptq1_8x4_groups_dotprod(trits, activations) });
+    }
+    None
 }
 
 #[inline]

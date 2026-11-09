@@ -192,11 +192,201 @@ pub fn dot_ptq1_four_rows_groups(
     packed.map(|row| dot_ptq1_block_groups(row, activations))
 }
 
+/// Unpacks eight 28-byte `PTQ1_0` blocks and computes their four 4-lane
+/// `DOTPROD` sums against four shared 32-element `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_eight_rows_lanes(
+    packed: [&[u8; 28]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_eight_rows_lanes(packed, activations) {
+        return lanes;
+    }
+    packed.map(|row| dot_ptq1_block_lanes(row, activations))
+}
+
+/// Unpacks eight 28-byte `PTQ1_0` blocks and computes their four 32-element
+/// group sums against four shared 32-element `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_eight_rows_groups(
+    packed: [&[u8; 28]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_eight_rows_groups(packed, activations) {
+        return groups;
+    }
+    packed.map(|row| dot_ptq1_block_groups(row, activations))
+}
+
 /// Four-row by four-token by four-group by four-lane `DOTPROD` sums (`[row][token][group][lane]`).
 pub type Ptq1FourRowFourTokenLanes = [[[[i32; 4]; 4]; 4]; 4];
 
 /// Four-row by four-token by four-group 32-element integer dot sums (`[row][token][group]`).
 pub type Ptq1FourRowFourTokenGroups = [[[i32; 4]; 4]; 4];
+
+/// Eight-row by four-token by four-group by four-lane `DOTPROD` sums (`[row][token][group][lane]`).
+pub type Ptq1EightRowFourTokenLanes = [[[[i32; 4]; 4]; 4]; 8];
+
+/// Eight-row by four-token by four-group 32-element integer dot sums (`[row][token][group]`).
+pub type Ptq1EightRowFourTokenGroups = [[[i32; 4]; 4]; 8];
+
+/// Computes the 4-row by 1-token by 4-group 4-lane `DOTPROD` sums from
+/// pre-decoded `PTQ1_0` trit rows and one token of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_4x1_lanes(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_4x1_lanes(trits, activations) {
+        return lanes;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|group| {
+            let halves = activations[group].as_chunks::<16>().0;
+            dot32_s8_lanes(
+                &trits[r][group * 2],
+                &trits[r][group * 2 + 1],
+                &halves[0],
+                &halves[1],
+            )
+        })
+    })
+}
+
+/// Computes the 4-row by 1-token by 4-group 32-element integer dot sums from
+/// pre-decoded `PTQ1_0` trit rows and one token of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_4x1_groups(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_4x1_groups(trits, activations) {
+        return groups;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|group| {
+            let halves = activations[group].as_chunks::<16>().0;
+            dot32_s8_sum(
+                &trits[r][group * 2],
+                &trits[r][group * 2 + 1],
+                &halves[0],
+                &halves[1],
+            )
+        })
+    })
+}
+
+/// Computes the 8-row by 1-token by 4-group 4-lane `DOTPROD` sums from
+/// pre-decoded `PTQ1_0` trit rows and one token of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_8x1_lanes(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_8x1_lanes(trits, activations) {
+        return lanes;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|group| {
+            let halves = activations[group].as_chunks::<16>().0;
+            dot32_s8_lanes(
+                &trits[r][group * 2],
+                &trits[r][group * 2 + 1],
+                &halves[0],
+                &halves[1],
+            )
+        })
+    })
+}
+
+/// Computes the 8-row by 1-token by 4-group 32-element integer dot sums from
+/// pre-decoded `PTQ1_0` trit rows and one token of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_8x1_groups(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_8x1_groups(trits, activations) {
+        return groups;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|group| {
+            let halves = activations[group].as_chunks::<16>().0;
+            dot32_s8_sum(
+                &trits[r][group * 2],
+                &trits[r][group * 2 + 1],
+                &halves[0],
+                &halves[1],
+            )
+        })
+    })
+}
+
+/// Computes the 8-row by 4-token by 4-group 4-lane `DOTPROD` sums from
+/// pre-decoded `PTQ1_0` trit rows and four tokens of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_8x4_lanes(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> Ptq1EightRowFourTokenLanes {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_8x4_lanes(trits, activations) {
+        return lanes;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|group| {
+                let halves = activations[t][group].as_chunks::<16>().0;
+                dot32_s8_lanes(
+                    &trits[r][group * 2],
+                    &trits[r][group * 2 + 1],
+                    &halves[0],
+                    &halves[1],
+                )
+            })
+        })
+    })
+}
+
+/// Computes the 8-row by 4-token by 4-group 32-element integer dot sums from
+/// pre-decoded `PTQ1_0` trit rows and four tokens of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_8x4_groups(
+    trits: &[[[i8; 16]; 8]; 8],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> Ptq1EightRowFourTokenGroups {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_8x4_groups(trits, activations) {
+        return groups;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|group| {
+                let halves = activations[t][group].as_chunks::<16>().0;
+                dot32_s8_sum(
+                    &trits[r][group * 2],
+                    &trits[r][group * 2 + 1],
+                    &halves[0],
+                    &halves[1],
+                )
+            })
+        })
+    })
+}
 
 /// Computes the 4-row by 4-token by 4-group 4-lane `DOTPROD` sums from
 /// pre-decoded `PTQ1_0` trit rows and four tokens of `Q8_0` activation groups.
@@ -730,6 +920,38 @@ mod tests {
                 assert_eq!(tile_lanes[r][t], expected_lanes);
                 assert_eq!(tile_groups[r][t], expected_groups);
             }
+        }
+        let rows8: [[u8; 28]; 8] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| {
+                r.to_le_bytes()[0]
+                    .wrapping_mul(41)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(89))
+                    .wrapping_add(13)
+            })
+        });
+        let row_refs8: [&[u8; 28]; 8] = std::array::from_fn(|r| &rows8[r]);
+        let trits8 = rows8.map(|row| decode_ptq1_trits_i8(&row));
+        let tile8_lanes = dot_ptq1_8x4_lanes(&trits8, act_refs);
+        let tile8_groups = dot_ptq1_8x4_groups(&trits8, act_refs);
+        let eight_lanes = dot_ptq1_eight_rows_lanes(row_refs8, act_refs[0]);
+        let eight_groups = dot_ptq1_eight_rows_groups(row_refs8, act_refs[0]);
+        let eight_1_lanes = dot_ptq1_8x1_lanes(&trits8, act_refs[0]);
+        let eight_1_groups = dot_ptq1_8x1_groups(&trits8, act_refs[0]);
+        let four_1_lanes = dot_ptq1_4x1_lanes(&trits, act_refs[0]);
+        let four_1_groups = dot_ptq1_4x1_groups(&trits, act_refs[0]);
+        for r in 0..8 {
+            assert_eq!(eight_lanes[r], tile8_lanes[r][0]);
+            assert_eq!(eight_groups[r], tile8_groups[r][0]);
+            assert_eq!(eight_1_lanes[r], tile8_lanes[r][0]);
+            assert_eq!(eight_1_groups[r], tile8_groups[r][0]);
+            for t in 0..4 {
+                assert_eq!(tile8_lanes[r][t], dot_ptq1_block_lanes(&rows8[r], act_refs[t]));
+                assert_eq!(tile8_groups[r][t], dot_ptq1_block_groups(&rows8[r], act_refs[t]));
+            }
+        }
+        for r in 0..4 {
+            assert_eq!(four_1_lanes[r], tile_lanes[r][0]);
+            assert_eq!(four_1_groups[r], tile_groups[r][0]);
         }
     }
 }

@@ -2707,28 +2707,28 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
                 &activations[2].values,
                 &activations[3].values,
             ];
-            for half in 0..2 {
-                let base = half * 4;
-                let blocks = [
-                    &chunks[base][index],
-                    &chunks[base + 1][index],
-                    &chunks[base + 2][index],
-                    &chunks[base + 3][index],
-                ];
-                let all_lanes = bonsai_neon_dot::dot_ptq1_four_rows_lanes(blocks, act_values);
-                for (offset, row_lanes) in all_lanes.iter().enumerate() {
-                    let r = base + offset;
-                    let rs = row_scales[r];
-                    let mut lane = lanes[r];
-                    let f0 = i32x4::from_slice(neon, &row_lanes[0]).to_float::<f32x4<Neon>>();
-                    lane = f0.mul_add_precise(f32x4::splat(neon, rs * a0), lane);
-                    let f1 = i32x4::from_slice(neon, &row_lanes[1]).to_float::<f32x4<Neon>>();
-                    lane = f1.mul_add_precise(f32x4::splat(neon, rs * a1), lane);
-                    let f2 = i32x4::from_slice(neon, &row_lanes[2]).to_float::<f32x4<Neon>>();
-                    lane = f2.mul_add_precise(f32x4::splat(neon, rs * a2), lane);
-                    let f3 = i32x4::from_slice(neon, &row_lanes[3]).to_float::<f32x4<Neon>>();
-                    lanes[r] = f3.mul_add_precise(f32x4::splat(neon, rs * a3), lane);
-                }
+            let blocks = [
+                &chunks[0][index],
+                &chunks[1][index],
+                &chunks[2][index],
+                &chunks[3][index],
+                &chunks[4][index],
+                &chunks[5][index],
+                &chunks[6][index],
+                &chunks[7][index],
+            ];
+            let all_lanes = bonsai_neon_dot::dot_ptq1_eight_rows_lanes(blocks, act_values);
+            for (r, row_lanes) in all_lanes.iter().enumerate() {
+                let rs = row_scales[r];
+                let mut lane = lanes[r];
+                let f0 = i32x4::from_slice(neon, &row_lanes[0]).to_float::<f32x4<Neon>>();
+                lane = f0.mul_add_precise(f32x4::splat(neon, rs * a0), lane);
+                let f1 = i32x4::from_slice(neon, &row_lanes[1]).to_float::<f32x4<Neon>>();
+                lane = f1.mul_add_precise(f32x4::splat(neon, rs * a1), lane);
+                let f2 = i32x4::from_slice(neon, &row_lanes[2]).to_float::<f32x4<Neon>>();
+                lane = f2.mul_add_precise(f32x4::splat(neon, rs * a2), lane);
+                let f3 = i32x4::from_slice(neon, &row_lanes[3]).to_float::<f32x4<Neon>>();
+                lanes[r] = f3.mul_add_precise(f32x4::splat(neon, rs * a3), lane);
             }
         } else {
             let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();
@@ -3100,23 +3100,22 @@ pub(super) fn dot_ptq1_eight_rows_source(
                 &activations[2].values,
                 &activations[3].values,
             ];
-            for half in 0..2 {
-                let base = half * 4;
-                let blocks = [
-                    &chunks[base][index],
-                    &chunks[base + 1][index],
-                    &chunks[base + 2][index],
-                    &chunks[base + 3][index],
-                ];
-                let all_groups = bonsai_neon_dot::dot_ptq1_four_rows_groups(blocks, act_values);
-                for (offset, groups) in all_groups.iter().enumerate() {
-                    let r = base + offset;
-                    let prod = (i32x4::from_slice(neon, groups).to_float::<f32x4<Neon>>()
-                        * act_scales)
-                        .to_array();
-                    let sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
-                    outputs[r] += row_scales[r] * sum;
-                }
+            let blocks = [
+                &chunks[0][index],
+                &chunks[1][index],
+                &chunks[2][index],
+                &chunks[3][index],
+                &chunks[4][index],
+                &chunks[5][index],
+                &chunks[6][index],
+                &chunks[7][index],
+            ];
+            let all_groups = bonsai_neon_dot::dot_ptq1_eight_rows_groups(blocks, act_values);
+            for (r, groups) in all_groups.iter().enumerate() {
+                let prod = (i32x4::from_slice(neon, groups).to_float::<f32x4<Neon>>() * act_scales)
+                    .to_array();
+                let sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                outputs[r] += row_scales[r] * sum;
             }
         } else {
             let (v00_l, v00_h) = i8x16::from_slice(neon, &activations[0].values[..16]).widen();

@@ -106,3 +106,89 @@ fn pinned_value_vector_tiles_preserve_validation_and_finite_failure_publication(
         }
     }
 }
+
+#[test]
+fn pinned_and_source_batched_two_token_four_query_dots_preserve_bits() -> crate::Result<()> {
+    let pattern = [
+        0_u16, 0x8000, 0x0001, 0x8001, 0x3c00, 0xbc00, 0x3555, 0xb555, 0x3a00, 0xba00,
+    ];
+    for width in [16, 32, 64, 128, 256] {
+        let keys_storage: Vec<Vec<u16>> = (0..4)
+            .map(|k| {
+                (0..width)
+                    .map(|idx| pattern[(k * 5 + idx) % pattern.len()])
+                    .collect()
+            })
+            .collect();
+        let keys = [
+            keys_storage[0].as_slice(),
+            keys_storage[1].as_slice(),
+            keys_storage[2].as_slice(),
+            keys_storage[3].as_slice(),
+        ];
+        let q0_storage: Vec<Vec<f32>> = (0..4)
+            .map(|h| {
+                (0..width)
+                    .map(|idx| half_to_float(pattern[(h * 3 + idx + 1) % pattern.len()]))
+                    .collect()
+            })
+            .collect();
+        let q1_storage: Vec<Vec<f32>> = (0..4)
+            .map(|h| {
+                (0..width)
+                    .map(|idx| half_to_float(pattern[(h * 7 + idx + 2) % pattern.len()]))
+                    .collect()
+            })
+            .collect();
+        let q0 = [
+            q0_storage[0].as_slice(),
+            q0_storage[1].as_slice(),
+            q0_storage[2].as_slice(),
+            q0_storage[3].as_slice(),
+        ];
+        let q1 = [
+            q1_storage[0].as_slice(),
+            q1_storage[1].as_slice(),
+            q1_storage[2].as_slice(),
+            q1_storage[3].as_slice(),
+        ];
+
+        let (actual0, actual1) = super::dot_f16_four_keys_two_token_four_queries(keys, q0, q1)?;
+        let expected0 = super::dot_f16_four_keys_four_queries(keys, q0)?;
+        let expected1 = super::dot_f16_four_keys_four_queries(keys, q1)?;
+        for k in 0..4 {
+            for h in 0..4 {
+                assert_eq!(actual0[k][h].to_bits(), expected0[k][h].to_bits());
+                assert_eq!(actual1[k][h].to_bits(), expected1[k][h].to_bits());
+                assert_eq!(
+                    actual0[k][h].to_bits(),
+                    super::dot_f16(keys[k], q0[h])?.to_bits()
+                );
+                assert_eq!(
+                    actual1[k][h].to_bits(),
+                    super::dot_f16(keys[k], q1[h])?.to_bits()
+                );
+            }
+        }
+
+        let (src0, src1) = crate::kernels::f16_dot_two_token_four_queries(q0, q1, keys[0]);
+        for h in 0..4 {
+            assert_eq!(
+                src0[h].to_bits(),
+                crate::kernels::f16_dot(q0[h], keys[0]).to_bits()
+            );
+            assert_eq!(
+                src1[h].to_bits(),
+                crate::kernels::f16_dot(q1[h], keys[0]).to_bits()
+            );
+        }
+        let f32_dots = crate::kernels::float_dot_four(q0, q1[0]);
+        for h in 0..4 {
+            assert_eq!(
+                f32_dots[h].to_bits(),
+                crate::kernels::float_dot(q0[h], q1[0]).to_bits()
+            );
+        }
+    }
+    Ok(())
+}

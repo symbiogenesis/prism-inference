@@ -1269,6 +1269,52 @@ pub(crate) fn f16_dot(first: &[f32], second: &[u16]) -> f32 {
         .sum::<f64>() as f32
 }
 
+pub(crate) fn float_dot_four(queries: [&[f32]; 4], key: &[f32]) -> [f32; 4] {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::float_dot_four(queries, key) {
+        return values;
+    }
+    queries.map(|query| float_dot(query, key))
+}
+
+pub(crate) fn f16_dot_four(queries: [&[f32]; 4], key: &[u16]) -> [f32; 4] {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::f16_dot_four(queries, key) {
+        return values;
+    }
+    queries.map(|query| f16_dot(query, key))
+}
+
+pub(crate) fn f16_dot_two_token_four_queries(
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+    key: &[u16],
+) -> ([f32; 4], [f32; 4]) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::f16_dot_two_token_four_queries(queries0, queries1, key) {
+        return values;
+    }
+    (f16_dot_four(queries0, key), f16_dot_four(queries1, key))
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,

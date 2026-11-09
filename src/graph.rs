@@ -322,8 +322,24 @@ impl Arithmetic {
 
     fn attention_dot_four(self, queries: [&[f32]; 4], key: &[u16]) -> Result<[f32; 4]> {
         match self {
-            Self::Source => Ok(queries.map(|query| dot_f16(query, key))),
+            Self::Source => Ok(crate::kernels::f16_dot_four(queries, key)),
             Self::PinnedSwift => crate::kernels::pinned_attention::dot_f16_four(key, queries),
+        }
+    }
+
+    fn attention_dot_two_token_four_queries(
+        self,
+        queries0: [&[f32]; 4],
+        queries1: [&[f32]; 4],
+        key: &[u16],
+    ) -> Result<([f32; 4], [f32; 4])> {
+        match self {
+            Self::Source => Ok(crate::kernels::f16_dot_two_token_four_queries(
+                queries0, queries1, key,
+            )),
+            Self::PinnedSwift => crate::kernels::pinned_attention::dot_f16_two_token_four_queries(
+                key, queries0, queries1,
+            ),
         }
     }
 
@@ -333,16 +349,45 @@ impl Arithmetic {
         keys: [&[u16]; 4],
     ) -> Result<[[f32; 4]; 4]> {
         match self {
-            Self::Source => Ok(keys.map(|key| queries.map(|query| dot_f16(query, key)))),
+            Self::Source => Ok(keys.map(|key| crate::kernels::f16_dot_four(queries, key))),
             Self::PinnedSwift => {
                 crate::kernels::pinned_attention::dot_f16_four_keys_four_queries(keys, queries)
             }
         }
     }
 
+    fn attention_dot_four_keys_two_token_four_queries(
+        self,
+        queries0: [&[f32]; 4],
+        queries1: [&[f32]; 4],
+        keys: [&[u16]; 4],
+    ) -> Result<(
+        crate::kernels::pinned_attention::FourKeyFourQueryScores,
+        crate::kernels::pinned_attention::FourKeyFourQueryScores,
+    )> {
+        match self {
+            Self::Source => {
+                let (k0_0, k0_1) =
+                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[0]);
+                let (k1_0, k1_1) =
+                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[1]);
+                let (k2_0, k2_1) =
+                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[2]);
+                let (k3_0, k3_1) =
+                    crate::kernels::f16_dot_two_token_four_queries(queries0, queries1, keys[3]);
+                Ok(([k0_0, k1_0, k2_0, k3_0], [k0_1, k1_1, k2_1, k3_1]))
+            }
+            Self::PinnedSwift => {
+                crate::kernels::pinned_attention::dot_f16_four_keys_two_token_four_queries(
+                    keys, queries0, queries1,
+                )
+            }
+        }
+    }
+
     fn attention_current_dot_four(self, queries: [&[f32]; 4], key: &[f32]) -> Result<[f32; 4]> {
         match self {
-            Self::Source => Ok(queries.map(|query| dot(query, key))),
+            Self::Source => Ok(crate::kernels::float_dot_four(queries, key)),
             Self::PinnedSwift => crate::kernels::pinned_attention::dot_f32_four(key, queries),
         }
     }

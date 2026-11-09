@@ -913,7 +913,45 @@ fn full_attention_tile(
                                 &p2[offset..offset + g.head],
                                 &p3[offset..offset + g.head],
                             ];
-                            for t in 0..chunk_tokens {
+                            let mut t = 0;
+                            while t + 2 <= chunk_tokens {
+                                let tok0 = base_tok + t;
+                                let tok1 = tok0 + 1;
+                                let queries0 = std::array::from_fn(|i| {
+                                    let h = head + i;
+                                    &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                                });
+                                let queries1 = std::array::from_fn(|i| {
+                                    let h = head + i;
+                                    &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                                });
+                                let (dots0_4, dots1_4) = arithmetic
+                                    .attention_dot_four_keys_two_token_four_queries(
+                                        queries0, queries1, keys4,
+                                    )?;
+                                let (scores_pair, _) = scores_chunk
+                                    [t * token_score_stride..(t + 2) * token_score_stride]
+                                    .split_at_mut(token_score_stride);
+                                let tok0_scores = scores_pair;
+                                for (k_off, dots) in dots0_4.into_iter().enumerate() {
+                                    let pos = pos0 + k_off;
+                                    tok0_scores[pos] = dots[0] * scale;
+                                    tok0_scores[max_score_len + pos] = dots[1] * scale;
+                                    tok0_scores[2 * max_score_len + pos] = dots[2] * scale;
+                                    tok0_scores[3 * max_score_len + pos] = dots[3] * scale;
+                                }
+                                let tok1_scores = &mut scores_chunk
+                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                                for (k_off, dots) in dots1_4.into_iter().enumerate() {
+                                    let pos = pos0 + k_off;
+                                    tok1_scores[pos] = dots[0] * scale;
+                                    tok1_scores[max_score_len + pos] = dots[1] * scale;
+                                    tok1_scores[2 * max_score_len + pos] = dots[2] * scale;
+                                    tok1_scores[3 * max_score_len + pos] = dots[3] * scale;
+                                }
+                                t += 2;
+                            }
+                            if t < chunk_tokens {
                                 let tok = base_tok + t;
                                 let queries = std::array::from_fn(|i| {
                                     let h = head + i;
@@ -935,15 +973,48 @@ fn full_attention_tile(
                         }
                         let past_key = &p0[offset..offset + g.head];
                         let first_t = (pos0 + 1).saturating_sub(shared_prefix_len);
-                        for t in first_t..chunk_tokens {
-                            let tok = base_tok + t;
+                        let mut t = first_t;
+                        while t + 2 <= chunk_tokens {
+                            let tok0 = base_tok + t;
+                            let tok1 = tok0 + 1;
+                            let queries0 = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                            });
+                            let queries1 = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                            });
+                            let (dots0, dots1) = arithmetic.attention_dot_two_token_four_queries(
+                                queries0, queries1, past_key,
+                            )?;
+                            {
+                                let tok0_scores = &mut scores_chunk
+                                    [t * token_score_stride..(t + 1) * token_score_stride];
+                                tok0_scores[pos0] = dots0[0] * scale;
+                                tok0_scores[max_score_len + pos0] = dots0[1] * scale;
+                                tok0_scores[2 * max_score_len + pos0] = dots0[2] * scale;
+                                tok0_scores[3 * max_score_len + pos0] = dots0[3] * scale;
+                            }
+                            {
+                                let tok1_scores = &mut scores_chunk
+                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                                tok1_scores[pos0] = dots1[0] * scale;
+                                tok1_scores[max_score_len + pos0] = dots1[1] * scale;
+                                tok1_scores[2 * max_score_len + pos0] = dots1[2] * scale;
+                                tok1_scores[3 * max_score_len + pos0] = dots1[3] * scale;
+                            }
+                            t += 2;
+                        }
+                        for rem_t in t..chunk_tokens {
+                            let tok = base_tok + rem_t;
                             let queries = std::array::from_fn(|i| {
                                 let h = head + i;
                                 &query_ref[tok][h * g.head..(h + 1) * g.head]
                             });
                             let dots = arithmetic.attention_dot_four(queries, past_key)?;
                             let tok_scores = &mut scores_chunk
-                                [t * token_score_stride..(t + 1) * token_score_stride];
+                                [rem_t * token_score_stride..(rem_t + 1) * token_score_stride];
                             tok_scores[pos0] = dots[0] * scale;
                             tok_scores[max_score_len + pos0] = dots[1] * scale;
                             tok_scores[2 * max_score_len + pos0] = dots[2] * scale;

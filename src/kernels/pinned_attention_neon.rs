@@ -547,6 +547,83 @@ pub(super) fn dot_f16_four_keys_four_queries(
     Ok([r0, r1, r2, r3])
 }
 
+/// Reduces one validated F16 key slice against two tokens x four F32 query slices sharing a KV head,
+/// converting each 8-element F16 key block once across all eight queries.
+pub(super) fn dot_f16_two_token_four_queries(
+    neon: Neon,
+    key: &[u16],
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+) -> Result<([f32; 4], [f32; 4])> {
+    let len = queries0[0].len();
+    let total_steps = padded_dot_steps(len);
+    let (k_chunks8, k_rem) = key.as_chunks::<8>();
+    let vector_steps = k_chunks8.len() * 8;
+    if vector_steps != total_steps || !k_rem.is_empty() {
+        return Ok((
+            dot_f16_four(neon, key, queries0)?,
+            dot_f16_four(neon, key, queries1)?,
+        ));
+    }
+    let q0_chunks8 = queries0.map(|q| q.as_chunks::<8>().0);
+    let q1_chunks8 = queries1.map(|q| q.as_chunks::<8>().0);
+    let mut s0_0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s1_0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s0_1 = [f32x4::splat(neon, 0.0); 4];
+    let mut s1_1 = [f32x4::splat(neon, 0.0); 4];
+    for pair_idx in (0..k_chunks8.len()).step_by(2) {
+        let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, &k_chunks8[pair_idx]);
+        for h in 0..4 {
+            let q8_0 = &q0_chunks8[h][pair_idx];
+            s0_0[h] = kv0.mul_add_precise(f32x4::from_slice(neon, &q8_0[..4]), s0_0[h]);
+            s1_0[h] = kv1.mul_add_precise(f32x4::from_slice(neon, &q8_0[4..]), s1_0[h]);
+            let q8_1 = &q1_chunks8[h][pair_idx];
+            s0_1[h] = kv0.mul_add_precise(f32x4::from_slice(neon, &q8_1[..4]), s0_1[h]);
+            s1_1[h] = kv1.mul_add_precise(f32x4::from_slice(neon, &q8_1[4..]), s1_1[h]);
+        }
+    }
+    let mut s2_0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s3_0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s2_1 = [f32x4::splat(neon, 0.0); 4];
+    let mut s3_1 = [f32x4::splat(neon, 0.0); 4];
+    for pair_idx in (1..k_chunks8.len()).step_by(2) {
+        let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, &k_chunks8[pair_idx]);
+        for h in 0..4 {
+            let q8_0 = &q0_chunks8[h][pair_idx];
+            s2_0[h] = kv0.mul_add_precise(f32x4::from_slice(neon, &q8_0[..4]), s2_0[h]);
+            s3_0[h] = kv1.mul_add_precise(f32x4::from_slice(neon, &q8_0[4..]), s3_0[h]);
+            let q8_1 = &q1_chunks8[h][pair_idx];
+            s2_1[h] = kv0.mul_add_precise(f32x4::from_slice(neon, &q8_1[..4]), s2_1[h]);
+            s3_1[h] = kv1.mul_add_precise(f32x4::from_slice(neon, &q8_1[4..]), s3_1[h]);
+        }
+    }
+    let mut out0 = [0.0_f32; 4];
+    let mut out1 = [0.0_f32; 4];
+    for h in 0..4 {
+        let lanes0 = ((s0_0[h] + s2_0[h]) + (s1_0[h] + s3_0[h])).to_array();
+        out0[h] = super::super::finite((lanes0[0] + lanes0[1]) + (lanes0[2] + lanes0[3]))?;
+    }
+    for h in 0..4 {
+        let lanes1 = ((s0_1[h] + s2_1[h]) + (s1_1[h] + s3_1[h])).to_array();
+        out1[h] = super::super::finite((lanes1[0] + lanes1[1]) + (lanes1[2] + lanes1[3]))?;
+    }
+    Ok((out0, out1))
+}
+
+/// Reduces four validated F16 key slices against two tokens x four F32 query slices sharing a KV head.
+pub(super) fn dot_f16_four_keys_two_token_four_queries(
+    neon: Neon,
+    keys: [&[u16]; 4],
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+) -> Result<(super::FourKeyFourQueryScores, super::FourKeyFourQueryScores)> {
+    let (r0_0, r0_1) = dot_f16_two_token_four_queries(neon, keys[0], queries0, queries1)?;
+    let (r1_0, r1_1) = dot_f16_two_token_four_queries(neon, keys[1], queries0, queries1)?;
+    let (r2_0, r2_1) = dot_f16_two_token_four_queries(neon, keys[2], queries0, queries1)?;
+    let (r3_0, r3_1) = dot_f16_two_token_four_queries(neon, keys[3], queries0, queries1)?;
+    Ok(([r0_0, r1_0, r2_0, r3_0], [r0_1, r1_1, r2_1, r3_1]))
+}
+
 /// Reduces one validated F32 key slice against four F32 query slices sharing the same KV head.
 pub(super) fn dot_f32_four(neon: Neon, key: &[f32], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
     let mut sums = [[f32x4::splat(neon, 0.0); 4]; 4];

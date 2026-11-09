@@ -3055,6 +3055,177 @@ pub(super) fn f16_dot(first: &[f32], second: &[u16]) -> Option<f32> {
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
 )]
 #[inline]
+pub(super) fn float_dot_four(queries: [&[f32]; 4], key: &[f32]) -> Option<[f32; 4]> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = key
+        .len()
+        .min(queries[0].len())
+        .min(queries[1].len())
+        .min(queries[2].len())
+        .min(queries[3].len());
+    let (k_chunks, k_rem) = key[..count].as_chunks::<4>();
+    let mut sums = [-0.0_f64; 4];
+    for (idx, k_chunk) in k_chunks.iter().enumerate() {
+        let k_vec = f32x4::from_slice(neon, k_chunk);
+        let offset = idx * 4;
+        for h in 0..4 {
+            let prod =
+                (f32x4::from_slice(neon, &queries[h][offset..offset + 4]) * k_vec).to_array();
+            sums[h] += f64::from(prod[0]);
+            sums[h] += f64::from(prod[1]);
+            sums[h] += f64::from(prod[2]);
+            sums[h] += f64::from(prod[3]);
+        }
+    }
+    let rem_base = k_chunks.len() * 4;
+    for (i, &k) in k_rem.iter().enumerate() {
+        let idx = rem_base + i;
+        for h in 0..4 {
+            sums[h] += f64::from(queries[h][idx] * k);
+        }
+    }
+    Some([
+        sums[0] as f32,
+        sums[1] as f32,
+        sums[2] as f32,
+        sums[3] as f32,
+    ])
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn f16_dot_four(queries: [&[f32]; 4], key: &[u16]) -> Option<[f32; 4]> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = key
+        .len()
+        .min(queries[0].len())
+        .min(queries[1].len())
+        .min(queries[2].len())
+        .min(queries[3].len());
+    let (s_chunks, s_rem) = key[..count].as_chunks::<8>();
+    let mut sums = [-0.0_f64; 4];
+    for (idx, s_chunk) in s_chunks.iter().enumerate() {
+        let (s0, s1) = f16_bits_to_f32_x8(neon, s_chunk);
+        let offset = idx * 8;
+        for h in 0..4 {
+            let q = &queries[h][offset..offset + 8];
+            let prod0 = (f32x4::from_slice(neon, &q[..4]) * s0).to_array();
+            let prod1 = (f32x4::from_slice(neon, &q[4..]) * s1).to_array();
+            sums[h] += f64::from(prod0[0]);
+            sums[h] += f64::from(prod0[1]);
+            sums[h] += f64::from(prod0[2]);
+            sums[h] += f64::from(prod0[3]);
+            sums[h] += f64::from(prod1[0]);
+            sums[h] += f64::from(prod1[1]);
+            sums[h] += f64::from(prod1[2]);
+            sums[h] += f64::from(prod1[3]);
+        }
+    }
+    let rem_base = s_chunks.len() * 8;
+    for (i, &s) in s_rem.iter().enumerate() {
+        let decoded = super::half_to_float(s);
+        let idx = rem_base + i;
+        for h in 0..4 {
+            sums[h] += f64::from(queries[h][idx] * decoded);
+        }
+    }
+    Some([
+        sums[0] as f32,
+        sums[1] as f32,
+        sums[2] as f32,
+        sums[3] as f32,
+    ])
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn f16_dot_two_token_four_queries(
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+    key: &[u16],
+) -> Option<([f32; 4], [f32; 4])> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = key
+        .len()
+        .min(queries0[0].len())
+        .min(queries0[1].len())
+        .min(queries0[2].len())
+        .min(queries0[3].len())
+        .min(queries1[0].len())
+        .min(queries1[1].len())
+        .min(queries1[2].len())
+        .min(queries1[3].len());
+    let (s_chunks, s_rem) = key[..count].as_chunks::<8>();
+    let mut sums0 = [-0.0_f64; 4];
+    let mut sums1 = [-0.0_f64; 4];
+    for (idx, s_chunk) in s_chunks.iter().enumerate() {
+        let (s0, s1) = f16_bits_to_f32_x8(neon, s_chunk);
+        let offset = idx * 8;
+        for h in 0..4 {
+            let q0 = &queries0[h][offset..offset + 8];
+            let p0_0 = (f32x4::from_slice(neon, &q0[..4]) * s0).to_array();
+            let p0_1 = (f32x4::from_slice(neon, &q0[4..]) * s1).to_array();
+            sums0[h] += f64::from(p0_0[0]);
+            sums0[h] += f64::from(p0_0[1]);
+            sums0[h] += f64::from(p0_0[2]);
+            sums0[h] += f64::from(p0_0[3]);
+            sums0[h] += f64::from(p0_1[0]);
+            sums0[h] += f64::from(p0_1[1]);
+            sums0[h] += f64::from(p0_1[2]);
+            sums0[h] += f64::from(p0_1[3]);
+
+            let q1 = &queries1[h][offset..offset + 8];
+            let p1_0 = (f32x4::from_slice(neon, &q1[..4]) * s0).to_array();
+            let p1_1 = (f32x4::from_slice(neon, &q1[4..]) * s1).to_array();
+            sums1[h] += f64::from(p1_0[0]);
+            sums1[h] += f64::from(p1_0[1]);
+            sums1[h] += f64::from(p1_0[2]);
+            sums1[h] += f64::from(p1_0[3]);
+            sums1[h] += f64::from(p1_1[0]);
+            sums1[h] += f64::from(p1_1[1]);
+            sums1[h] += f64::from(p1_1[2]);
+            sums1[h] += f64::from(p1_1[3]);
+        }
+    }
+    let rem_base = s_chunks.len() * 8;
+    for (i, &s) in s_rem.iter().enumerate() {
+        let decoded = super::half_to_float(s);
+        let idx = rem_base + i;
+        for h in 0..4 {
+            sums0[h] += f64::from(queries0[h][idx] * decoded);
+            sums1[h] += f64::from(queries1[h][idx] * decoded);
+        }
+    }
+    Some((
+        [
+            sums0[0] as f32,
+            sums0[1] as f32,
+            sums0[2] as f32,
+            sums0[3] as f32,
+        ],
+        [
+            sums1[0] as f32,
+            sums1[1] as f32,
+            sums1[2] as f32,
+            sums1[3] as f32,
+        ],
+    ))
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
 pub(super) fn bf16_dot(bytes: &[u8], input: &[f32]) -> Option<Result<f32>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let zero = u16x8::splat(neon, 0);

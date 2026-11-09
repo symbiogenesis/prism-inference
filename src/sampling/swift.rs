@@ -14,9 +14,13 @@ use crate::{Result, invalid};
 /// stages retain no history and consume no draws. There is no reasoning cutoff.
 /// Each call admits exactly the complete Swift vocabulary before filtering and
 /// retains only the native-ordered top 20 candidates in reusable scratch.
+/// The fixed top-p configuration is validated once at construction. Native
+/// min-p zero and temperature one retain their exact identity semantics without
+/// constructing temporary sampler states for each generated token.
 /// Cloning independently copies the RNG without copying candidate scratch, so
 /// [`crate::runtime::Runtime`] can roll it back on any request error.
 pub struct SwiftSampler {
+    top_p: State,
     distribution: State,
     backing: Vec<Candidate>,
 }
@@ -24,6 +28,7 @@ pub struct SwiftSampler {
 impl Clone for SwiftSampler {
     fn clone(&self) -> Self {
         Self {
+            top_p: self.top_p.clone(),
             distribution: self.distribution.clone(),
             backing: Vec::new(),
         }
@@ -48,6 +53,10 @@ impl SwiftSampler {
             ));
         }
         Ok(Self {
+            top_p: State::new(Config::TopP {
+                probability: 0.95,
+                min_keep: 1,
+            })?,
             distribution: State::new(Config::Distribution(seed))?,
             backing: Vec::new(),
         })
@@ -82,19 +91,12 @@ impl Sampler for SwiftSampler {
 
 impl SwiftSampler {
     fn sample_candidates(&mut self, candidates: &mut Candidates) -> Result<u32> {
-        for config in [
-            Config::TopP {
-                probability: 0.95,
-                min_keep: 1,
-            },
-            Config::MinP {
-                probability: 0.0,
-                min_keep: 1,
-            },
-            Config::Temperature(1.0),
-        ] {
-            State::new(config)?.apply(candidates)?;
-        }
+        // This fixed filter has neither history nor RNG. Validate it once at
+        // construction instead of allocating configuration scratch per token.
+        self.top_p.apply(candidates)?;
+        // Native MinP(0) returns without mutation, and division by temperature
+        // one preserves every finite logit bit (including signed zero). They
+        // consume no draws and change no candidate metadata or probability.
         self.distribution.apply(candidates)?;
         let selected = usize::try_from(candidates.selected())?;
         let token = candidates
@@ -109,6 +111,100 @@ impl SwiftSampler {
 mod tests {
     use super::{Sampler, SwiftSampler};
     use crate::sampling::upstream::{Candidate, Candidates, Config, State, top_k_logits};
+
+    fn original_fixed_chain(
+        distribution: &mut State,
+        candidates: &mut Candidates,
+    ) -> crate::Result<u32> {
+        for config in [
+            Config::TopP {
+                probability: 0.95,
+                min_keep: 1,
+            },
+            Config::MinP {
+                probability: 0.0,
+                min_keep: 1,
+            },
+            Config::Temperature(1.0),
+        ] {
+            State::new(config)?.apply(candidates)?;
+        }
+        distribution.apply(candidates)?;
+        let selected = usize::try_from(candidates.selected())?;
+        Ok(u32::try_from(candidates.data()[selected].id)?)
+    }
+
+    #[test]
+    fn fixed_chain_reuses_filter_and_preserves_original_stage_bits_and_rng() -> crate::Result<()> {
+        let mut actual = SwiftSampler::new(4242)?;
+        let mut reference_distribution = State::new(Config::Distribution(4242))?;
+        let mut invalid_logits = vec![0.0; SwiftSampler::VOCABULARY];
+        invalid_logits[SwiftSampler::VOCABULARY - 1] = f32::NAN;
+        for round in 0_usize..64 {
+            if round == 32 {
+                actual.reset();
+                reference_distribution.reset();
+            }
+            // Rejected full-vocabulary input must not advance the retained
+            // filter or distribution. The reference deliberately does no work.
+            if round.is_multiple_of(16) {
+                assert!(actual.sample(&invalid_logits).is_err());
+            }
+            let input = (0..SwiftSampler::TOP_K)
+                .map(|index| {
+                    let value = f32::from(u16::try_from(index)?);
+                    Ok(Candidate {
+                        id: i32::try_from(index)?,
+                        logit: match round % 8 {
+                            0 => 0.0,
+                            1 => {
+                                if index.is_multiple_of(2) {
+                                    -0.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            2 => value - 10.0,
+                            3 => 10.0 - value,
+                            4 => f32::MAX,
+                            5 => f32::MIN,
+                            6 => value * f32::from_bits(1),
+                            _ => (value - 10.0) * 1000.0,
+                        },
+                        probability: -0.0,
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let mut expected = Candidates::new(input, -1, false)?;
+            let mut optimized = expected.clone();
+            let mut independent_clone = actual.clone();
+            let mut clone_candidates = expected.clone();
+            let expected_token =
+                original_fixed_chain(&mut reference_distribution, &mut expected)?;
+            assert_eq!(actual.sample_candidates(&mut optimized)?, expected_token);
+            assert_eq!(
+                independent_clone.sample_candidates(&mut clone_candidates)?,
+                expected_token
+            );
+            assert_eq!(optimized.selected(), expected.selected());
+            assert_eq!(optimized.sorted(), expected.sorted());
+            assert_eq!(optimized.offset(), expected.offset());
+            assert_eq!(optimized.data().len(), expected.data().len());
+            for (observed, original) in optimized
+                .into_backing()
+                .iter()
+                .zip(expected.into_backing())
+            {
+                assert_eq!(observed.id, original.id);
+                assert_eq!(observed.logit.to_bits(), original.logit.to_bits());
+                assert_eq!(
+                    observed.probability.to_bits(),
+                    original.probability.to_bits()
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn bounded_top_k_matches_full_candidate_filter_bit_for_bit() -> crate::Result<()> {
@@ -181,7 +277,7 @@ mod tests {
             let mut control = SwiftSampler::new(4242)?;
             assert_eq!(
                 sampler.sample(&logits)?,
-                control.sample_candidates(&mut reference)?,
+                original_fixed_chain(&mut control.distribution, &mut reference)?,
                 "input kind {kind}"
             );
             let uniform = vec![0.0; SwiftSampler::VOCABULARY];

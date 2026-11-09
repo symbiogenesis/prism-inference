@@ -200,7 +200,7 @@ def test_artifacts(output):
 def source_hashes(root):
     """Bind all runtime source and selected fixtures rather than a display version."""
     files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml",
-             root / "clippy.toml"}
+             root / "clippy.toml", root / "rustfmt.toml"}
     for directory in ["src", "server/src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src",
                       "tools/hexagon-native/src", "tools/hexagon-runtime/src", "tools/neon-dot/src"]:
         files.update((root / directory).rglob("*.rs"))
@@ -211,9 +211,10 @@ def source_hashes(root):
         if build_script.is_file():
             files.add(build_script)
     files.update((root / "tests/graph").rglob("*.rs"))
+    files.update((root / "tests/runtime").rglob("*.rs"))
     files.update(path for path in (root / "tests/fixtures").rglob("*") if path.is_file())
     files.update(root / path for path in [
-        "tests/graph.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
+        "tests/graph.rs", "tests/runtime.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
         ".github/ci/test_inference_efficiency.py", ".github/workflows/inference-efficiency.yml",
     ])
     return {str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()

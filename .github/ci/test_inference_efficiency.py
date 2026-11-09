@@ -11,6 +11,26 @@ import inference_efficiency as efficiency  # noqa: E402
 
 
 class EfficiencyReceiptTests(unittest.TestCase):
+    def test_source_identity_binds_runtime_controls_and_format_policy(self):
+        root = Path(__file__).resolve().parents[2]
+        original = efficiency.source_hashes(root)
+        selected = ["tests/runtime.rs", "tests/runtime/timing.rs", "rustfmt.toml"]
+        for name in selected:
+            self.assertIn(name, original)
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            for name in original:
+                path = fixture / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+            before = efficiency.source_hashes(fixture)
+            for name in selected:
+                (fixture / name).write_bytes(b"changed selected input")
+                after = efficiency.source_hashes(fixture)
+                self.assertEqual([path for path in before if before[path] != after[path]],
+                                 [name])
+                (fixture / name).write_bytes(b"fixture")
+
     def test_source_identity_binds_the_analyzer_dependency_policy(self):
         root = Path(__file__).resolve().parents[2]
         original = efficiency.source_hashes(root)

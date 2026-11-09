@@ -44,6 +44,122 @@ fn oracle_row(
     Ok(())
 }
 
+fn decode_oracle(
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Result<f32> {
+    for element in &mut *state {
+        *element *= decay;
+    }
+    let dot = dot_scalar(state, key)?;
+    let delta = (value - dot) * beta;
+    scalar_add_scaled(state, key, delta)?;
+    dot_scalar(state, query)
+}
+
+#[test]
+fn pinned_gdn_decode_capacities_match_independent_scalar_bits() -> Result<()> {
+    for width in [16, 112, 128, 144, 240, 256] {
+        let mut previous = values(width);
+        previous[0] = -0.0;
+        previous[1] = f32::from_bits(1);
+        previous[2] = -f32::MIN_POSITIVE;
+        let key = values(width);
+        let mut query = values(width);
+        query.reverse();
+        for (decay, value, beta) in [
+            (0.875, 0.125, 0.625),
+            (0.0, -0.0, 0.0),
+            (-0.0, 0.125, -0.0),
+            (-0.25, -0.25, 1.0),
+        ] {
+            let mut expected = previous.clone();
+            let expected_output =
+                decode_oracle(&mut expected, &key, &query, decay, value, beta)?;
+            let mut actual = vec![-5.0; width];
+            let actual_output = super::step_row_from(
+                &previous,
+                &mut actual,
+                &key,
+                &query,
+                decay,
+                value,
+                beta,
+            )
+            .ok_or_else(|| invalid("baseline NEON decode was not selected"))??;
+            assert_eq!(bits(&actual), bits(&expected));
+            assert_eq!(actual_output.to_bits(), expected_output.to_bits());
+            let mut in_place = previous.clone();
+            let in_place_output =
+                super::step_row_in_place(&mut in_place, &key, &query, decay, value, beta)
+                    .ok_or_else(|| invalid("baseline NEON decode was not selected"))??;
+            assert_eq!(bits(&in_place), bits(&expected));
+            assert_eq!(in_place_output.to_bits(), expected_output.to_bits());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_gdn_decode_capacities_preserve_failure_and_refusal_bits() -> Result<()> {
+    for width in [16, 128, 144, 256] {
+        for failure in 0..3 {
+            let previous = values(width);
+            let mut key = values(width);
+            let mut query = values(width);
+            let value = if failure == 1 { f32::MAX } else { 0.125 };
+            match failure {
+                0 => key[width - 1] = f32::NAN,
+                1 => key[width / 2] = 2.0,
+                _ => query[width - 1] = f32::NAN,
+            }
+            let mut expected = previous.clone();
+            assert!(decode_oracle(&mut expected, &key, &query, 0.875, value, 1.0).is_err());
+            let mut actual = vec![-5.0; width];
+            let result = super::step_row_from(
+                &previous,
+                &mut actual,
+                &key,
+                &query,
+                0.875,
+                value,
+                1.0,
+            )
+            .ok_or_else(|| invalid("baseline NEON decode was not selected"))?;
+            assert!(result.is_err());
+            assert_eq!(bits(&actual), bits(&expected));
+            let mut in_place = previous;
+            let result =
+                super::step_row_in_place(&mut in_place, &key, &query, 0.875, value, 1.0)
+                    .ok_or_else(|| invalid("baseline NEON decode was not selected"))?;
+            assert!(result.is_err());
+            assert_eq!(bits(&in_place), bits(&expected));
+        }
+    }
+    for width in [0, 1, 15, 17, 127, 129, 255, 257, 272] {
+        let previous = values(width);
+        let key = values(width);
+        let query = values(width);
+        let mut actual = vec![-5.0; width];
+        let original = bits(&actual);
+        assert!(
+            super::step_row_from(&previous, &mut actual, &key, &query, 0.875, 0.125, 0.625)
+                .is_none()
+        );
+        assert_eq!(bits(&actual), original);
+        assert!(
+            super::step_row_in_place(&mut actual, &key, &query, 0.875, 0.125, 0.625)
+                .is_none()
+        );
+        assert_eq!(bits(&actual), original);
+    }
+    Ok(())
+}
+
 fn grouped_from(
     previous: &[f32],
     state: &mut [f32],

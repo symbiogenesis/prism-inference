@@ -517,14 +517,34 @@ pub(super) fn step_row_from(
     value: f32,
     beta: f32,
 ) -> Option<Result<f32>> {
+    if state.len() <= 128 {
+        step_row_from_blocks::<8>(previous, state, key, query, decay, value, beta)
+    } else {
+        step_row_from_blocks::<16>(previous, state, key, query, decay, value, beta)
+    }
+}
+
+// Swift uses 128-element rows. Its private staging need not initialize the
+// unused upper half of the generic 256-element row on every decode step.
+// Retain one arithmetic implementation for both bounded capacities.
+#[inline]
+fn step_row_from_blocks<const BLOCKS: usize>(
+    previous: &[f32],
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Option<Result<f32>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let width = state.len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) {
         return None;
     }
     let blocks = width / 16;
     let decays = f32x4::splat(neon, decay);
-    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; 16];
+    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; BLOCKS];
     let mut s0 = f32x4::splat(neon, 0.0);
     let mut s1 = f32x4::splat(neon, 0.0);
     let mut s2 = f32x4::splat(neon, 0.0);
@@ -630,14 +650,30 @@ pub(super) fn step_row_in_place(
     value: f32,
     beta: f32,
 ) -> Option<Result<f32>> {
+    if state.len() <= 128 {
+        step_row_in_place_blocks::<8>(state, key, query, decay, value, beta)
+    } else {
+        step_row_in_place_blocks::<16>(state, key, query, decay, value, beta)
+    }
+}
+
+#[inline]
+fn step_row_in_place_blocks<const BLOCKS: usize>(
+    state: &mut [f32],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    value: f32,
+    beta: f32,
+) -> Option<Result<f32>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let width = state.len();
-    if width == 0 || width > 256 || !width.is_multiple_of(16) {
+    if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) {
         return None;
     }
     let blocks = width / 16;
     let decays = f32x4::splat(neon, decay);
-    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; 16];
+    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; BLOCKS];
     let mut s0 = f32x4::splat(neon, 0.0);
     let mut s1 = f32x4::splat(neon, 0.0);
     let mut s2 = f32x4::splat(neon, 0.0);

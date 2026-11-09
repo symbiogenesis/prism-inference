@@ -3265,6 +3265,11 @@ mod tests {
         reason = "The independent scalar test decoder retains explicit multiply then add order."
     )]
     impl NativeQ2Submitter for TransientTokenCapture {
+        fn residency_capacity_bytes(&self) -> usize {
+            // Admit cache metadata, but refuse even the smallest test tensor.
+            1
+        }
+
         fn submit(
             &mut self,
             columns: usize,

@@ -23,6 +23,22 @@ compare direct and copied preparation across partial-row/column tiles and retain
 failure, unwinding, extent-bound and secondary-arena controls. Signed-device,
 actual-model state/adapter parity and matched whole-request benefit remain pending.
 
+For native submitters with direct eight-operation support, resident multi-token
+sibling dispatch fills the existing eight-operation packet
+for every complete four-token pair, including a four-token tail. Eight, sixteen
+and thirty-two pair tokens therefore use two, four and eight queue writes rather
+than three, five and nine. A four-token triple tail uses eight plus four
+operations in two queue writes rather than three four-operation writes. Member
+and token order, total operations, arithmetic, immutable handles and admission
+stay unchanged. These are source submission counts, with no measured latency
+claim. The same native multi-eight packet path already used for longer tiles
+carries these tails; no wider packet, activation/output reserve or session cap is
+introduced. A failed submission or nonfinite returned value clears every output
+in the tile and permanently closes the executor. Hosted controls retain all
+partial-token tails, distinguish member/token identities and inject failures
+and nonfinite results at every packet boundary. Signed-device lifecycle,
+full-model state/adapter parity and matched request benefit remain pending.
+
 `GuardedQ2Executor` uses the existing guarded HVX K=256/N=2 primitive.
 `HmxQ2Executor` uses the separate K=128/N=8 binary-plane HMX primitive. Both
 implement the public CPU runtime's `Pq2ProjectionExecutor` extension and consume

@@ -1218,7 +1218,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Keep 2-token sibling pair 4-op resident dispatch and odd-tail handling together."
+        reason = "Keep 4-token sibling pair 8-op resident dispatch and partial-tail handling together."
     )]
     fn project_f32_pair_tokens_inner(
         &mut self,
@@ -1303,7 +1303,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut rem_a = outputs_a;
         let mut rem_b = outputs_b;
         while !rem_act.is_empty() {
-            if rem_act.len() >= 8 {
+            if rem_act.len() >= 4 {
                 let (act_chunk, next_act) = rem_act.split_at(4);
                 let (a_chunk, next_a) = rem_a.split_at_mut(4);
                 let (b_chunk, next_b) = rem_b.split_at_mut(4);
@@ -1411,7 +1411,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Keep 4-token and 2-token sibling triple resident dispatch and tail handling together."
+        reason = "Keep 8/4/2-token sibling triple resident dispatch and partial-tail handling together."
     )]
     fn project_f32_triple_tokens_inner(
         &mut self,
@@ -1609,54 +1609,53 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 let x1 = act_chunk[1].as_slice();
                 let x2 = act_chunk[2].as_slice();
                 let x3 = act_chunk[3].as_slice();
-                for (handles, acts, outs) in [
-                    (
-                        [h0, h1, h2, h0],
-                        [x0, x0, x0, x1],
-                        [
-                            oa0.as_mut_slice(),
-                            ob0.as_mut_slice(),
-                            oc0.as_mut_slice(),
-                            oa1.as_mut_slice(),
-                        ],
-                    ),
-                    (
-                        [h1, h2, h0, h1],
-                        [x1, x1, x2, x2],
-                        [
-                            ob1.as_mut_slice(),
-                            oc1.as_mut_slice(),
-                            oa2.as_mut_slice(),
-                            ob2.as_mut_slice(),
-                        ],
-                    ),
-                    (
-                        [h2, h0, h1, h2],
-                        [x2, x3, x3, x3],
-                        [
-                            oc2.as_mut_slice(),
-                            oa3.as_mut_slice(),
-                            ob3.as_mut_slice(),
-                            oc3.as_mut_slice(),
-                        ],
-                    ),
-                ] {
-                    self.statistics.operations_attempted =
-                        self.statistics.operations_attempted.saturating_add(4);
-                    self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
-                    let [o0, o1, o2, o3] = outs;
-                    self.submitter
-                        .submit_resident_multi4(handles, acts, [o0, o1, o2, o3])?;
-                    finite_slice(o0)?;
-                    finite_slice(o1)?;
-                    finite_slice(o2)?;
-                    finite_slice(o3)?;
-                    self.statistics.operations_completed =
-                        self.statistics.operations_completed.saturating_add(4);
-                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
-                    self.statistics.projections_completed =
-                        self.statistics.projections_completed.saturating_add(4);
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(8);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_multi8(
+                    [h0, h1, h2, h0, h1, h2, h0, h1],
+                    [x0, x0, x0, x1, x1, x1, x2, x2],
+                    [
+                        oa0.as_mut_slice(),
+                        ob0.as_mut_slice(),
+                        oc0.as_mut_slice(),
+                        oa1.as_mut_slice(),
+                        ob1.as_mut_slice(),
+                        oc1.as_mut_slice(),
+                        oa2.as_mut_slice(),
+                        ob2.as_mut_slice(),
+                    ],
+                )?;
+                for out in [oa0, ob0, oc0, oa1, ob1, oc1, oa2, ob2] {
+                    finite_slice(out)?;
                 }
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(8);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(8);
+
+                self.statistics.operations_attempted =
+                    self.statistics.operations_attempted.saturating_add(4);
+                self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                self.submitter.submit_resident_multi4(
+                    [h2, h0, h1, h2],
+                    [x2, x3, x3, x3],
+                    [
+                        oc2.as_mut_slice(),
+                        oa3.as_mut_slice(),
+                        ob3.as_mut_slice(),
+                        oc3.as_mut_slice(),
+                    ],
+                )?;
+                for out in [oc2, oa3, ob3, oc3] {
+                    finite_slice(out)?;
+                }
+                self.statistics.operations_completed =
+                    self.statistics.operations_completed.saturating_add(4);
+                self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                self.statistics.projections_completed =
+                    self.statistics.projections_completed.saturating_add(4);
             } else if rem_act.len() >= 2 {
                 let (act_chunk, next_act) = rem_act.split_at(2);
                 let (a_chunk, next_a) = rem_a.split_at_mut(2);
@@ -3250,6 +3249,309 @@ mod tests {
         }
     }
 
+    struct ResidentTokenCapture {
+        registry: hexagon_native_rpc::NativeQ2WeightRegistry,
+        batches: Vec<Vec<(usize, u32)>>,
+        fail_at: Option<usize>,
+        nonfinite_at: Option<usize>,
+    }
+
+    impl ResidentTokenCapture {
+        fn capture<const B: usize>(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; B],
+            activations: [&[f32]; B],
+            outputs: [&mut [f32]; B],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            let mut batch = Vec::new();
+            for ((handle, activation), output) in handles.into_iter().zip(activations).zip(outputs)
+            {
+                self.registry.range(handle)?;
+                if activation.len() != handle.columns() || output.len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                batch.push((handle.rows(), activation[0].to_bits()));
+                let rows = u16::try_from(handle.rows())
+                    .map_err(|_| hexagon_native_rpc::Error::Contract)?;
+                output.fill(activation[0] + f32::from(rows));
+                if self.nonfinite_at == Some(self.batches.len() + 1) {
+                    output[0] = f32::NAN;
+                }
+            }
+            self.batches.push(batch);
+            if self.fail_at == Some(self.batches.len()) {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            Ok(())
+        }
+    }
+
+    impl NativeQ2Submitter for ResidentTokenCapture {
+        fn residency_capacity_bytes(&self) -> usize {
+            self.registry.remaining_bytes()
+        }
+
+        fn prepare_weights(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+        ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
+            self.registry.prepare(columns, rows, weights)
+        }
+
+        fn submit(
+            &mut self,
+            _columns: usize,
+            _rows: usize,
+            _weights: &[u8],
+            _activation: &[f32],
+            _output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            Err(hexagon_native_rpc::Error::Contract)
+        }
+
+        fn submit_resident_batch2(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 2],
+            activation: &[f32],
+            outputs: [&mut [f32]; 2],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.capture(handles, [activation; 2], outputs)
+        }
+
+        fn submit_resident_batch3(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activation: &[f32],
+            outputs: [&mut [f32]; 3],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.capture(handles, [activation; 3], outputs)
+        }
+
+        fn submit_resident_multi4(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 4],
+            activations: [&[f32]; 4],
+            outputs: [&mut [f32]; 4],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.capture(handles, activations, outputs)
+        }
+
+        fn submit_resident_multi8(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 8],
+            activations: [&[f32]; 8],
+            outputs: [&mut [f32]; 8],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.capture(handles, activations, outputs)
+        }
+    }
+
+    fn resident_token_executor() -> Result<NativeQ2Executor<ResidentTokenCapture>> {
+        let limits = NativeQ2ProjectionLimits::new(128, 128, 1000, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(65_536)
+            .map_err(|_| invalid("residency"))?;
+        let submitter = ResidentTokenCapture {
+            registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(65_536)
+                .map_err(|_| invalid("registry"))?,
+            batches: Vec::new(),
+            fail_at: None,
+            nonfinite_at: None,
+        };
+        NativeQ2Executor::new(submitter, limits, 1024 * 1024).with_resident_weights(4096)
+    }
+
+    fn expected_sibling_batches(members: usize, tokens: usize) -> Vec<usize> {
+        let mut batches = Vec::new();
+        let mut remaining = tokens;
+        if members == 3 {
+            while remaining >= 8 {
+                batches.extend_from_slice(&[8, 8, 8]);
+                remaining -= 8;
+            }
+        }
+        while remaining >= 4 {
+            if members == 2 {
+                batches.push(8);
+            } else {
+                batches.extend_from_slice(&[8, 4]);
+            }
+            remaining -= 4;
+        }
+        if remaining >= 2 {
+            batches.push(4);
+            if members == 3 {
+                batches.push(2);
+            }
+            remaining -= 2;
+        }
+        if remaining == 1 {
+            batches.push(members);
+        }
+        batches
+    }
+
+    #[test]
+    fn native_q2_resident_sibling_four_token_batches_preserve_order_and_tails() -> Result<()> {
+        let tensors = [
+            lazy_tensor("first", 128, 32),
+            lazy_tensor("second", 128, 64),
+            lazy_tensor("third", 128, 96),
+        ];
+        for members in [2, 3] {
+            for tokens in [0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 32] {
+                let mut executor = resident_token_executor()?;
+                let activations: Vec<_> = (0..tokens)
+                    .map(|token| vec![f32::from(token); 128])
+                    .collect();
+                let mut first = vec![Vec::new(); usize::from(tokens)];
+                let mut second = first.clone();
+                let mut third = first.clone();
+                if members == 2 {
+                    executor.project_f32_pair_tokens(
+                        [&tensors[0], &tensors[1]],
+                        &activations,
+                        true,
+                        &mut first,
+                        &mut second,
+                    )?;
+                } else {
+                    executor.project_f32_triple_tokens(
+                        [&tensors[0], &tensors[1], &tensors[2]],
+                        &activations,
+                        true,
+                        &mut first,
+                        &mut second,
+                        &mut third,
+                    )?;
+                }
+                let expected_batches = expected_sibling_batches(members, usize::from(tokens));
+                let batches = &executor.submitter.batches;
+                assert_eq!(
+                    batches.iter().map(Vec::len).collect::<Vec<_>>(),
+                    expected_batches
+                );
+                let expected: Vec<_> = (0..tokens)
+                    .flat_map(|token| {
+                        [32, 64, 96]
+                            .into_iter()
+                            .take(members)
+                            .map(move |rows| (rows, f32::from(token).to_bits()))
+                    })
+                    .collect();
+                assert_eq!(
+                    batches.iter().flatten().copied().collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    executor.queue_writes_completed(),
+                    u64::try_from(batches.len())?
+                );
+                assert_eq!(
+                    executor.statistics().operations_completed,
+                    u64::from(tokens) * u64::try_from(members)?
+                );
+                for (member, outputs) in [&first, &second, &third]
+                    .into_iter()
+                    .take(members)
+                    .enumerate()
+                {
+                    let rows = (member + 1) * 32;
+                    for (token, output) in (0..tokens).zip(outputs) {
+                        assert_eq!(
+                            output,
+                            &vec![f32::from(token) + f32::from(u16::try_from(rows)?); rows]
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_resident_sibling_eight_op_failure_clears_entire_tile() -> Result<()> {
+        let tensors = [
+            lazy_tensor("first", 128, 32),
+            lazy_tensor("second", 128, 64),
+            lazy_tensor("third", 128, 96),
+        ];
+        for members in [2, 3] {
+            for tokens in [4_u8, 5, 8] {
+                let expected_batches = expected_sibling_batches(members, usize::from(tokens));
+                for fail_at in 1..=expected_batches.len() {
+                    for nonfinite in [false, true] {
+                        let mut executor = resident_token_executor()?;
+                        if nonfinite {
+                            executor.submitter.nonfinite_at = Some(fail_at);
+                        } else {
+                            executor.submitter.fail_at = Some(fail_at);
+                        }
+                        let activations: Vec<_> = (0..tokens)
+                            .map(|token| vec![f32::from(token); 128])
+                            .collect();
+                        let mut first = vec![vec![123.0]; usize::from(tokens)];
+                        let mut second = first.clone();
+                        let mut third = first.clone();
+                        let result = if members == 2 {
+                            executor.project_f32_pair_tokens(
+                                [&tensors[0], &tensors[1]],
+                                &activations,
+                                true,
+                                &mut first,
+                                &mut second,
+                            )
+                        } else {
+                            executor.project_f32_triple_tokens(
+                                [&tensors[0], &tensors[1], &tensors[2]],
+                                &activations,
+                                true,
+                                &mut first,
+                                &mut second,
+                                &mut third,
+                            )
+                        };
+                        assert!(result.is_err());
+                        assert!(executor.is_faulted());
+                        for outputs in [&first, &second, &third].into_iter().take(members) {
+                            assert!(outputs.iter().all(Vec::is_empty));
+                        }
+                        assert_eq!(executor.submitter.batches.len(), fail_at);
+                        assert_eq!(executor.queue_writes_attempted(), u64::try_from(fail_at)?);
+                        assert_eq!(
+                            executor.queue_writes_completed(),
+                            u64::try_from(fail_at - 1)?
+                        );
+                        let completed: usize = expected_batches[..fail_at - 1].iter().sum();
+                        assert_eq!(
+                            executor.statistics().operations_completed,
+                            u64::try_from(completed)?
+                        );
+                        assert_eq!(
+                            executor.statistics().operations_attempted,
+                            u64::try_from(completed + expected_batches[fail_at - 1])?
+                        );
+                        assert!(
+                            executor
+                                .project_f32_pair_tokens(
+                                    [&tensors[0], &tensors[1]],
+                                    &activations,
+                                    true,
+                                    &mut first,
+                                    &mut second,
+                                )
+                                .is_err()
+                        );
+                        assert_eq!(executor.submitter.batches.len(), fail_at);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     struct TransientCapture {
         mock: MockNativeSubmitter,
         scale_headers: usize,
@@ -3839,7 +4141,7 @@ mod tests {
         assert_eq!(executor.statistics().operations_completed, 5);
         assert_eq!(executor.statistics().projections_completed, 5);
 
-        // Multi-token pair and single-projection batching via 4-op submissions.
+        // Multi-token pair batching uses 8-op submissions for every four tokens.
         let acts = vec![
             vec![1.0_f32; columns],
             vec![2.0_f32; columns],
@@ -3850,8 +4152,8 @@ mod tests {
         let mut outs_a = vec![Vec::new(); 5];
         let mut outs_b = vec![Vec::new(); 5];
         executor.project_f32_pair_tokens([&qkv, &gate], &acts, true, &mut outs_a, &mut outs_b)?;
-        // 5 tokens * 2 projections = 10 ops across 3 queue writes (4 + 4 + 2).
-        assert_eq!(executor.queue_writes_completed(), 5);
+        // 5 tokens * 2 projections = 10 ops across 2 queue writes (8 + 2).
+        assert_eq!(executor.queue_writes_completed(), 4);
         assert_eq!(executor.statistics().operations_completed, 15);
         assert_eq!(outs_a[0][0], 256.0);
         assert_eq!(outs_b[0][0], 257.0);
@@ -3862,7 +4164,7 @@ mod tests {
 
         executor.project_f32_tokens(&q, &acts, true, &mut outs_a)?;
         // 5 tokens * 1 projection = 5 ops across 2 queue writes (4 + 1).
-        assert_eq!(executor.queue_writes_completed(), 7);
+        assert_eq!(executor.queue_writes_completed(), 6);
         assert_eq!(executor.statistics().operations_completed, 20);
         assert_eq!(outs_a[0][0], 256.0);
         assert_eq!(outs_a[3][0], 1027.0);
@@ -3877,17 +4179,17 @@ mod tests {
             &mut outs_b,
             &mut outs_c,
         )?;
-        // 5 tokens * 3 projections = 15 ops across 4 queue writes (4 + 4 + 4 + 3).
-        assert_eq!(executor.queue_writes_completed(), 11);
+        // 5 tokens * 3 projections = 15 ops across 3 queue writes (8 + 4 + 3).
+        assert_eq!(executor.queue_writes_completed(), 9);
         assert_eq!(executor.statistics().operations_completed, 35);
         assert_eq!(outs_a[0][0], 256.0);
         assert_eq!(outs_b[0][0], 257.0);
         assert_eq!(outs_c[0][0], 258.0);
         assert_eq!(outs_a[1][0], 515.0);
-        assert_eq!(outs_b[1][0], 512.0);
-        assert_eq!(outs_c[1][0], 513.0);
-        assert_eq!(outs_a[2][0], 770.0);
-        assert_eq!(outs_b[2][0], 771.0);
+        assert_eq!(outs_b[1][0], 516.0);
+        assert_eq!(outs_c[1][0], 517.0);
+        assert_eq!(outs_a[2][0], 774.0);
+        assert_eq!(outs_b[2][0], 775.0);
         assert_eq!(outs_c[2][0], 768.0);
         assert_eq!(outs_a[3][0], 1025.0);
         assert_eq!(outs_b[3][0], 1026.0);
@@ -3903,7 +4205,7 @@ mod tests {
         let mut outs8_b = vec![Vec::new(); 8];
         let mut outs8_c = vec![Vec::new(); 8];
         executor.project_f32_tokens(&q, &acts8, true, &mut outs8_a)?;
-        assert_eq!(executor.queue_writes_completed(), 12);
+        assert_eq!(executor.queue_writes_completed(), 10);
         assert_eq!(executor.statistics().operations_completed, 43);
         assert_eq!(outs8_a[0][0], 256.0);
         assert_eq!(outs8_a[7][0], 2048.0 + 7.0);
@@ -3915,8 +4217,8 @@ mod tests {
             &mut outs8_a,
             &mut outs8_b,
         )?;
-        // 8 tokens * 2 projections = 16 ops in 2 queue writes (8 + 4 + 4 -> 8 via multi8 + 2*multi4 for remaining 4).
-        assert_eq!(executor.queue_writes_completed(), 15);
+        // 8 tokens * 2 projections = 16 ops in 2 queue writes (8 + 8).
+        assert_eq!(executor.queue_writes_completed(), 12);
         assert_eq!(executor.statistics().operations_completed, 59);
 
         executor.project_f32_triple_tokens(
@@ -3928,7 +4230,7 @@ mod tests {
             &mut outs8_c,
         )?;
         // 8 tokens * 3 projections = 24 ops in 3 queue writes (8 + 8 + 8).
-        assert_eq!(executor.queue_writes_completed(), 18);
+        assert_eq!(executor.queue_writes_completed(), 15);
         assert_eq!(executor.statistics().operations_completed, 83);
 
         let ffn_gate = make_tensor("blk.0.ffn_gate.weight", 64);

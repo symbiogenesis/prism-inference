@@ -15,9 +15,10 @@ hits reuse values; changed tokens or `invalidate()` refill that same buffer.
 The synthetic regressions compare an owned numerical reference, cache hits,
 invalidation, empty vocabulary and unchanged storage address/capacity. They
 establish storage ownership/reuse, not allocation profiles, model parity or speed.
-The token-only cache key is not a production decoder's sequence state. This
-interface works on stable; changing it to return a cached borrow before refilling
-would introduce a nightly dependency without simplifying its current logic.
+The token-only cache key is not a production decoder's sequence state. `LogitsCache::evaluate`
+returns the cached slice on a hit before mutating storage on a miss (Polonius lending),
+and `with_logits` / `SupportsLogitsView` normalize higher-ranked associated views
+through the next-generation trait solver.
 
 ## Production pattern audit
 
@@ -34,9 +35,9 @@ reuse output and activation storage without new solver behavior. Saved-prefix
 restoration now also retains the runtime's token allocation; that optimization
 is expressible on stable. Checkpoints still own complete independent state.
 
-No current production trait bound needs the next solver's higher-ranked
-associated-view normalization. `next_solver.rs` below keeps that capability
-covered for future backend interfaces, without introducing an unused abstraction.
+Both Polonius lending and the next solver's higher-ranked associated-view
+normalization are also exercised in `src/text_output.rs`, `server/src/native_response.rs`
+and Cargo-compiled behavioral gates in `tools/rust-trial/tests/compiler.rs`.
 
 ## Compiler capability fixtures
 

@@ -62,36 +62,60 @@ impl LogitsSource for LogitsCache {
     type Output<'a> = &'a [f32];
 
     fn evaluate(&mut self, token: u16) -> Self::Output<'_> {
-        if self.cached_token != Some(token) {
-            for (logit, index) in self.logits.iter_mut().zip(0_u16..) {
-                *logit = f32::from(index).mul_add(0.5, f32::from(token));
-            }
-            self.cached_token = Some(token);
-            self.refills = self.refills.saturating_add(1);
+        if self.cached_token == Some(token) {
+            return &self.logits;
         }
+        for (logit, index) in self.logits.iter_mut().zip(0_u16..) {
+            *logit = f32::from(index).mul_add(0.5, f32::from(token));
+        }
+        self.cached_token = Some(token);
+        self.refills = self.refills.saturating_add(1);
         &self.logits
     }
+}
+
+/// Higher-ranked associated-view projection supported by the next trait solver.
+pub trait SupportsLogitsView {
+    /// Evaluate a token through a higher-ranked borrowed-output function pointer.
+    fn apply(&mut self, token: u16) -> Option<f32>;
+}
+
+impl<S: LogitsSource> SupportsLogitsView for (S, for<'a> fn(S::Output<'a>) -> Option<f32>) {
+    fn apply(&mut self, token: u16) -> Option<f32> {
+        let view = self.0.evaluate(token);
+        (self.1)(view)
+    }
+}
+
+/// Visit a borrowed logits view through a higher-ranked callback bound.
+pub fn with_logits<S: LogitsSource, R>(
+    source: &mut S,
+    token: u16,
+    consumer: impl for<'a> FnOnce(S::Output<'a>) -> R,
+) -> R {
+    consumer(source.evaluate(token))
 }
 
 /// Consume a borrowed output through a generic lending interface.
 #[must_use]
 pub fn maximum_logit<S: LogitsSource>(source: &mut S, token: u16) -> Option<f32> {
-    source
-        .evaluate(token)
-        .as_ref()
-        .iter()
-        .copied()
-        .reduce(f32::max)
+    with_logits(source, token, |output| {
+        output.as_ref().iter().copied().reduce(f32::max)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LogitsCache, LogitsSource, maximum_logit};
+    use super::{LogitsCache, LogitsSource, SupportsLogitsView, maximum_logit, with_logits};
 
     fn owned_reference(token: u16, vocabulary_size: u16) -> Vec<f32> {
         (0..vocabulary_size)
             .map(|index| f32::from(index).mul_add(0.5, f32::from(token)))
             .collect()
+    }
+
+    fn slice_max(values: &[f32]) -> Option<f32> {
+        values.iter().copied().reduce(f32::max)
     }
 
     #[test]
@@ -107,6 +131,10 @@ mod tests {
         assert_eq!(cache.evaluate(11), owned_reference(11, 8));
         assert_eq!(cache.refills(), 3);
         assert_eq!(maximum_logit(&mut cache, 11), Some(14.5));
+        assert_eq!(with_logits(&mut cache, 11, <[f32]>::len), 8);
+        let reduce: for<'a> fn(&'a [f32]) -> Option<f32> = slice_max;
+        let mut pair = (cache, reduce);
+        assert_eq!(pair.apply(11), Some(14.5));
         assert_eq!(maximum_logit(&mut LogitsCache::new(0), 11), None);
     }
 

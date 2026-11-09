@@ -146,7 +146,7 @@ members = ["tools/ternary", "tools/neon-dot", "tools/gguf", "tools/native-hash",
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# The pinned nightly is required for Polonius lending in the broker.
+# The pinned nightly provides Polonius lending and the next-generation trait solver.
 rust-version = "1.101"
 license = "Apache-2.0"
 repository = "https://github.com/symbiogenesis/prism-inference"

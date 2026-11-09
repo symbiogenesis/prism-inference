@@ -556,7 +556,7 @@ fn baseline(request: &Value, catalog: &Catalog<'_>) -> Result<Value> {
 /// # Errors
 /// Rejects malformed evidence and catalog provenance mismatches. Measured
 /// regressions return a baseline gate with `Passed` set to false.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "Maintenance command dispatch transfers ownership through the shared command API."
 )]

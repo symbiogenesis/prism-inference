@@ -4,7 +4,7 @@
 //! `b87ca7225456b06b0975b8239c66b5aecf07e37c`; attribution is retained in
 //! `tools/prism/upstream/LICENSE`. Templates are parsed into reusable syntax trees;
 //! runtime code has no source-test schedules, fixture access or expected outputs.
-#![allow(
+#![expect(
     clippy::similar_names,
     reason = "Retain conventional source slice start/stop/step names"
 )]
@@ -299,7 +299,7 @@ impl Runtime {
         self.depth -= 1;
         flow
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep statement variants and their scope/flow transitions in one exhaustive dispatch"
     )]
@@ -539,7 +539,7 @@ impl Runtime {
         value.check_graph()?;
         Ok(value)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep the AST's exhaustive expression dispatch together"
     )]
@@ -670,7 +670,7 @@ impl Runtime {
             Expr::Slice(..) => Err(invalid("Jinja slice outside indexing")),
         }
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep checked operator dispatch and all operand type branches together"
     )]

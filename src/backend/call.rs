@@ -92,7 +92,7 @@ fn convolution_extent(
 
 /// Resolve the pinned numerical operation name.
 #[must_use]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "All pinned operation discriminants are kept in one auditable mapping."
 )]
@@ -235,7 +235,7 @@ pub const fn unary_name(operation: i32) -> &'static str {
 }
 
 impl CpuBackend {
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Tensor construction keeps the complete pinned metadata contract explicit."
     )]
@@ -285,7 +285,7 @@ impl CpuBackend {
     /// # Errors
     /// Rejects unsupported calls, wrong argument types, invalid shapes, storage
     /// overflow, unknown identities, and numerical execution failures.
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "The allowlist keeps operation shape rules adjacent to their typed dispatch."
     )]
@@ -1871,7 +1871,7 @@ impl CpuBackend {
                 }
                 put_int(&mut p, 0, unary);
                 if name == "ggml_xielu" {
-                    #[allow(
+                    #[expect(
                         clippy::imprecise_flops,
                         reason = "The pinned softplus parameter transformation rounds the addition before logf."
                     )]

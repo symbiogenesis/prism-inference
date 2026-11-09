@@ -186,10 +186,6 @@ fn byte_tokens() -> Result<Vec<String>> {
         })
         .collect()
 }
-#[allow(
-    clippy::too_many_lines,
-    reason = "explicit synthetic target shapes stay alongside the pinned Qwen35 geometry"
-)]
 fn target() -> Result<(Vec<Entry>, Vec<Tensor>)> {
     let mut entries = vec![
         text("general.architecture", "qwen35")?,

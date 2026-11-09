@@ -83,7 +83,7 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Resul
     target_env = "msvc",
     target_feature = "neon"
 ))]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve original per-128 scalar multiply/add or pinned FMA rounding."
 )]
@@ -116,7 +116,7 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &[Activation]) -> 
     target_env = "msvc",
     target_feature = "neon"
 ))]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve original per-128 scalar multiply/add or pinned FMA rounding."
 )]

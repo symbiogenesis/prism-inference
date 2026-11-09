@@ -194,7 +194,7 @@ fn evidence(value: &Arc<Mutex<WeightEvidence>>) -> Result<Value> {
         json!({"TensorInitializers":state.tensors,"FloatInputBytes":state.bytes,"SourceF32TypeChecks":state.source_type_checks}),
     )
 }
-#[allow(
+#[expect(
     clippy::float_cmp,
     reason = "The original disabled-centering regression requires exact float equality for every logit."
 )]
@@ -262,7 +262,7 @@ fn gate(
     release(client, "model", model)?;
     Ok(json!({"Seed":2024,"TokenSeed":3,"Tokens":tokens,"Weights":evidence(&weights)?}))
 }
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Separate fp64 products and sums preserve the original numerical reference and tolerance."
 )]

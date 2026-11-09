@@ -64,10 +64,6 @@ fn entered(
     progress(report);
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep terminal queue ownership and ordered native setup explicit for review"
-)]
 pub(super) fn run(
     driver: Driver,
     package: &Path,
@@ -166,7 +162,7 @@ impl Mode {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "One shared terminal ownership protocol covers both fixed signed-source arithmetic modes"
 )]
@@ -659,7 +655,7 @@ enum BatchWeights<'a, const B: usize> {
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep both transient and immutable arena validation beside the shared correlated native submission"
     )]
@@ -919,7 +915,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep batch capacity reservation, descriptor regeneration and full-batch output checks together"
     )]
@@ -1081,7 +1077,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         self.submit_native_resident_multi::<B>(handles, [activation; B], outputs)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep resident native-Q2 multi-op validation, scoped flush size and output publication together"
     )]
@@ -1241,7 +1237,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep resident fused 3-op FFN SwiGLU validation, scoped flush size and output publication together"
     )]
@@ -1392,7 +1388,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep resident fused 2-token 6-op FFN SwiGLU validation, scoped flush size and output publication together"
     )]
@@ -1928,7 +1924,7 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Safe crate root wraps the native session handle."
 )]
@@ -1953,7 +1949,7 @@ pub(crate) struct NativeQ2Session {
     failed: bool,
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep module open, FastRPC mapping, queue startup and session construction auditable together"
 )]
@@ -2511,7 +2507,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep correlated single-op session assertions and queue-write checks together"
     )]
@@ -2630,7 +2626,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep eight-plane HMX session assertions and queue-write checks together"
     )]
@@ -2746,7 +2742,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Exercise one complete native owner across independent queue and identity failure cases"
     )]
@@ -2871,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Exercise batch-four streaming, resident, capacity, and per-member failure cases on one mock queue"
     )]
@@ -3009,7 +3005,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Exercise batch-ten streaming, resident, capacity, and per-member failure cases on one mock queue"
     )]

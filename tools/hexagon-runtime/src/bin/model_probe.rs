@@ -665,7 +665,7 @@ struct CheckedSubmitter<'a> {
     failed: bool,
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -745,7 +745,7 @@ impl GuardedQ2Submitter for CheckedSubmitter<'_> {
 /// Independent decoding of the serialized signed-kernel Q2 tiles and all eight
 /// binary activation planes. This does not reuse the production HMX packer or
 /// reconstruction helpers.
-#[allow(
+#[expect(
     clippy::float_cmp,
     reason = "Binary activation planes and bounded integer sums are exactly representable in F32."
 )]
@@ -1191,7 +1191,7 @@ fn top5_indices(values: &[f32]) -> [usize; 5] {
 }
 
 #[cfg(any(windows, test))]
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Vocabulary size (248,320) fits exactly in f64."
@@ -1341,7 +1341,7 @@ fn check_statistics(
 }
 
 #[cfg(windows)]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the complete terminal CPU/native comparison and post-cleanup publication sequence auditable together."
 )]
@@ -2672,7 +2672,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep native-q2 admission, multi-layer projection geometry and bounded tolerance checks together."
     )]

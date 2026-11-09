@@ -301,7 +301,7 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
 }
 
 impl Host for Production<'_, '_> {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Source helper dispatch explicitly separates Rust-owned policy from raw production calls."
     )]

@@ -1,4 +1,4 @@
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep the private contract explicit if the parent is reorganized later"
 )]
@@ -27,10 +27,6 @@ fn mul(a: u64, b: u64) -> Result<u64> {
         .ok_or_else(|| bad("descriptor/count arithmetic overflow."))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep streaming totals adjacent to their report fields for auditability"
-)]
 pub(crate) fn census(file: &mut File, inspection: &Inspection) -> Result<Value> {
     if inspection.report["Dialect"].as_str() != Some(PRISM_DIALECT) {
         return Err(bad(

@@ -4,12 +4,6 @@
 //! primitives to [`crate::backend::CpuBackend`]. Training graphs are ordinary
 //! differentiable tensor expressions, independent of source-test workloads.
 
-#![allow(
-    clippy::suboptimal_flops,
-    clippy::float_cmp,
-    reason = "Preserve native optimization operation ordering and exact identity parameters."
-)]
-
 use crate::backend::{Argument, CpuBackend, GraphId, Observation, TensorId};
 use crate::sampling::upstream::Random;
 use crate::{Result, invalid};
@@ -708,7 +702,7 @@ impl Optimizer {
         }
         Ok(())
     }
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "Native AdamW powf converts the integer update iteration to binary32."
@@ -770,10 +764,9 @@ fn validate_parameters(parameters: Parameters, kind: Kind) -> Result<()> {
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
     reason = "Native loss scaling converts period and output element count to binary32."
 )]
 fn build_loss(graph: &mut Graph, training: Training, labels: Option<TensorId>) -> Result<TensorId> {
@@ -819,7 +812,7 @@ fn build_loss(graph: &mut Graph, training: Training, labels: Option<TensorId>) -
     )
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -951,7 +944,7 @@ pub struct Fit {
 /// # Errors
 /// Rejects invalid epochs, physical/logical batch geometry, validation splits,
 /// parameter schedules and graph/data execution failures.
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1049,7 +1042,7 @@ impl Metrics {
     }
     /// Native aggregated loss and standard uncertainty.
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "Native statistics convert bounded counts and periods to floating point."
@@ -1085,7 +1078,7 @@ impl Metrics {
     }
     /// Classification accuracy and binomial uncertainty, otherwise NaN.
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "Native accuracy uses binary64 count ratios."

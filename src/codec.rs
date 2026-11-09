@@ -21,7 +21,7 @@ pub const MAX_BUFFERS: usize = 32;
 const HANDLE_LIMIT: u32 = 1_000_000;
 
 /// Independently available codec operations, never inferred from the layout.
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Each field represents an independent native function pointer or Rust implementation."
 )]
@@ -77,7 +77,7 @@ impl CodecTraits {
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Pinned tensor_layout block and byte widths are all at most 292, representable by every Rust usize."
@@ -327,10 +327,6 @@ impl CodecBuffers {
     /// # Errors
     /// Rejects unsupported operations, empty/partial/oversized rows, malformed
     /// regions, unexpected/missing right-hand side, numerical and allocation errors.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "One typed primitive mirrors the native codec call and its three distinct regions."
-    )]
     pub fn call(
         &mut self,
         function: CodecFunction,

@@ -62,7 +62,7 @@ struct ContentDelta<'a> {
 struct EmptyDelta {}
 
 #[derive(Clone, Copy, Serialize)]
-#[allow(
+#[expect(
     clippy::struct_field_names,
     reason = "OpenAI-compatible usage payload field names."
 )]

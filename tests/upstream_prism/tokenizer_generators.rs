@@ -96,7 +96,7 @@ impl PythonRandom {
             }
         }
     }
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::as_conversions,
@@ -172,7 +172,7 @@ fn special_words(vocabulary: &Vocabulary) -> Vec<String> {
 pub(super) fn python_strip(text: &str) -> &str {
     text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "preserve the original source's complete generator families and loop nesting"
 )]

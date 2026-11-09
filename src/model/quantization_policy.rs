@@ -167,7 +167,7 @@ impl TensorDescriptor {
 
 /// Explicit native policy parameters; defaults match the production quantizer.
 #[derive(Clone, Debug)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "These are independent native quantization flags, not mutually exclusive state transitions."
 )]

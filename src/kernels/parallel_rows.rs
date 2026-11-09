@@ -342,7 +342,7 @@ impl RowParallelism {
         update(0, first, second)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Triple-slice partition passes three slices, their unit sizes, and the task callback."
     )]
@@ -485,7 +485,7 @@ impl RowParallelism {
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Batch eight-row, four-row, and single-row kernels without allocating a wrapper."
     )]

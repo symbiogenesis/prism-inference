@@ -4,7 +4,7 @@
 //! regression RNG, parameter schedules and comparisons. Native code calls only
 //! production optimizer primitives. Upstream MIT attribution: tools/prism/upstream/LICENSE.
 
-#![allow(
+#![expect(
     clippy::float_cmp,
     clippy::suboptimal_flops,
     clippy::too_many_lines,
@@ -752,7 +752,7 @@ fn regression(
     )
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The source computes the scheduled learning rate in double precision then assigns its float32 parameter."

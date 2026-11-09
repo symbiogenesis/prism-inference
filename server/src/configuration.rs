@@ -1,5 +1,5 @@
 //! Pinned Swift process admission and guarded private key reading.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Explicit parent scope keeps these implementation helpers private."
 )]

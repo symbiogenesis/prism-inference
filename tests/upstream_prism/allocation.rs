@@ -12,7 +12,7 @@ const ID: &str = "tests/test-alloc.cpp";
 const SOURCE_SHA: &str = "89de1c9549888a37b388474aca89cad3052c1751fbdace09c81e79d5844633db";
 
 /// Construct caller-supplied tensors and serialize production allocator observations.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The adapter only marshals graph calls and raw allocation metadata."
 )]
@@ -280,7 +280,7 @@ impl Case {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep all literal source graph scenarios and bounds in source order for parity review."
 )]

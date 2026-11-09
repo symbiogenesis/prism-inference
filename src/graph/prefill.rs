@@ -342,7 +342,7 @@ impl Qwen35 {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep causal attention commits, FFN tile consumption and cancellation visibly ordered."
     )]
@@ -633,7 +633,7 @@ impl Qwen35 {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep causal KV append ordering and tile scratch explicit."
 )]
@@ -736,10 +736,9 @@ fn full_attention_kv_only_tile(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::suboptimal_flops,
     reason = "Keep causal KV append ordering, exact FP16 score/value rounding and tile scratch explicit."
 )]
 fn full_attention_tile(
@@ -1459,7 +1458,7 @@ fn full_attention_tile(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep tile RMSNorm, fused Hadamard rotation and bounded tile scratch explicit."
 )]
@@ -1563,7 +1562,7 @@ fn normalize_for_tile_into<'a>(
     Ok(TileReuse::default())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Keep fused tile residual-add, RMSNorm, Hadamard rotation and bounded tile scratch explicit."
@@ -1757,9 +1756,8 @@ fn transform_tile_inputs<'a>(
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
 )]
 fn project_tile_pair<'a>(
@@ -1879,7 +1877,7 @@ fn project_tile_pair<'a>(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep exact transforms, residual chaining and bounded tile storage explicit."
 )]
@@ -1950,7 +1948,7 @@ fn try_project_tile_ffn_chain(
     Ok(true)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
@@ -2119,7 +2117,7 @@ fn project_tile_ffn_swiglu<'a>(
     Ok(TileReuse::default())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
@@ -2251,7 +2249,7 @@ fn project_tile_triple<'a>(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
 )]

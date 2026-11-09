@@ -23,7 +23,7 @@ mod session_mapping_native;
 #[path = "session_native.rs"]
 mod session_native;
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Safe crate root owns the read-only native observation."
 )]
@@ -31,7 +31,7 @@ pub(super) fn power_status() -> Result<crate::PowerStatus, Error> {
     power_native::query()
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe crate root consumes the native driver"
 )]
@@ -45,7 +45,7 @@ pub(super) fn reference_q2_projection(
     compute_native::projection(driver, package, limits, progress, work)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe crate root consumes the native driver"
 )]
@@ -59,13 +59,13 @@ pub(super) fn reference_hmx_q2_projection(
     compute_native::hmx_projection(driver, package, limits, progress, work)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe crate root consumes the native driver"
 )]
 pub(crate) use compute_native::NativeQ2Session;
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe crate root consumes the native driver"
 )]
@@ -79,7 +79,7 @@ pub(super) fn reference_native_q2_projection(
     compute_native::native_q2_projection(driver, package, limits, progress, work)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe crate root consumes the native driver"
 )]
@@ -264,7 +264,7 @@ fn no_reparse(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Native helpers stay restricted to their safe parent rather than becoming unreachable public API"
 )]
@@ -380,7 +380,7 @@ fn verify_signature(path: &Path, file: &File) -> Result<(), Error> {
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "The raw native owner is intentionally restricted to its safe parent API"
 )]
@@ -468,7 +468,7 @@ impl Driver {
     }
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent may consume the private native owner"
 )]
@@ -476,7 +476,7 @@ pub(super) fn mapping_probe(driver: Driver) -> Result<crate::MappingProbeReport,
     mapping::probe(driver)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent may consume the private native session owner"
 )]
@@ -488,7 +488,7 @@ pub(super) fn session_mapping_probe(
     session_mapping_native::probe(driver, package, progress)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent may select the separate fixed reference initializer"
 )]
@@ -499,7 +499,7 @@ pub(super) fn reference_session_mapping_probe(
 ) -> Result<crate::SessionMappingReport, Error> {
     session_mapping_native::reference_probe(driver, package, progress)
 }
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent may consume the private native compute owner"
 )]
@@ -511,7 +511,7 @@ pub(super) fn reference_queue_compute_probe(
     compute_native::probe(driver, package, progress)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent selects the private fixed guarded-Q2 control"
 )]
@@ -528,7 +528,7 @@ pub(super) fn reference_queue_q2_probe(
     )
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent selects the private fixed nonblocking F32 control"
 )]
@@ -545,7 +545,7 @@ pub(super) fn reference_queue_noblock_probe(
     )
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the safe parent selects the private fixed nonblocking guarded-Q2 control"
 )]

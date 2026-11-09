@@ -175,7 +175,7 @@ pub(super) fn source_prefix(reference: &str, output: &str) -> String {
         .trim_end_matches('\n')
         .into()
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "preserve original completion prompt/decode/accept/echo/free schedule as one source path"
 )]
@@ -330,7 +330,7 @@ fn generate(
     finish?;
     Ok(output)
 }
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "all source ports expose the same Result interface and retain measured failures"
 )]

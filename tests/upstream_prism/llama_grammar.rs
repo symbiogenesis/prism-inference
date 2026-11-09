@@ -167,7 +167,7 @@ fn runtime_piece(action: &Value) -> Result<Vec<u8>> {
     Ok(piece)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep protocol handles and saved-stack lifetime validation together; all grammar behavior is in the production runtime."
 )]

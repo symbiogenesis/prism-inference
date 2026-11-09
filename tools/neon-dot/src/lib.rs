@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::similar_names,
         reason = "Test compares 4x4, 8x4, and 8x8 lane and group variants side by side."
     )]

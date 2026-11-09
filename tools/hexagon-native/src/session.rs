@@ -1,5 +1,5 @@
 //! Fixed default-CDSP session metadata, without opening a remote module.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Private URI and receipt helpers must not become public native-boundary API"
 )]

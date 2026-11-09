@@ -325,7 +325,7 @@ impl Drop for WorkerThreadHexagonExecutor {
 }
 
 #[cfg(windows)]
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Re-exported by native_backend for native_child startup."
 )]

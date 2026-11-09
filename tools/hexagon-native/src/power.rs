@@ -44,7 +44,7 @@ pub fn power_status() -> Result<PowerStatus, Error> {
         reason = "Native decoder also has model-free hosted controls."
     )
 )]
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Only the audited native sibling and model-free controls consume the decoder."
 )]

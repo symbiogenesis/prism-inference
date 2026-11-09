@@ -15,7 +15,7 @@ struct CpuSubmitter {
     partial: bool,
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Independent fixture plane dots are exactly representable small integers."

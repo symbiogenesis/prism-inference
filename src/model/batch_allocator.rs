@@ -166,7 +166,7 @@ impl BatchAllocator {
     /// # Errors
     /// Rejects malformed extents, nonfinite embeddings, an empty batch, more
     /// than 1,048,576 rows, arithmetic overflow or invalid position sections.
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Preserve native fulfillment and semantic checks as one initialization transaction."
     )]
@@ -453,10 +453,6 @@ impl BatchAllocator {
     /// # Errors
     /// Rejects an uninitialized batch, invalid capacity, or a nonzero tail at
     /// least as large as capacity.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Preserve the native equal-split and keep-tail transaction as one operation."
-    )]
     pub fn split_equal(
         &mut self,
         capacity: usize,

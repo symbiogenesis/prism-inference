@@ -66,7 +66,7 @@ fn snapshot(chunk: Option<&Chunk>) -> Result<Value> {
     Ok(value)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Source-ordered chunk handle actions preserve borrowed and owned lifetime rules."
 )]

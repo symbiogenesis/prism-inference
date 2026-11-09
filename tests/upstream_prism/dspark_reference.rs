@@ -10,7 +10,7 @@ const EMBEDDING: usize = 64;
 const HEAD: usize = 32;
 const VOCABULARY: usize = 256;
 const RANK: usize = 8;
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "independent scalar reference rounds each tensor result to its source F32 dtype"
@@ -106,7 +106,7 @@ fn normalize(input: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
         .map(|(&x, &w)| f32_round(f64::from(x) * inverse * f64::from(w)))
         .collect())
 }
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "keep the published separate rotate-half products in the scalar reference"
 )]
@@ -182,7 +182,7 @@ impl Reference {
     fn norm(&self, name: &str, input: &[f32]) -> Result<Vec<f32>> {
         normalize(input, &self.get(name)?.values)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "independent published backbone equations and cache crop stay in one auditable sequence"
     )]

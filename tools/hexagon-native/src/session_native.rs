@@ -4,14 +4,10 @@ use super::{Driver, GetProcAddress, last_error};
 use crate::{Capability, Error, SessionPreparationReport, session};
 use std::ffi::{c_char, c_void};
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Only sibling fixed-session paths share this private ABI alias"
-)]
 pub(super) type SessionControl = unsafe extern "C" fn(u32, *mut c_void, u32) -> i32;
 
 #[repr(C)]
-#[allow(
+#[expect(
     clippy::struct_field_names,
     reason = "The pinned public C ABI names its output effective_domain_id"
 )]
@@ -42,18 +38,10 @@ const _: () = assert!(std::mem::offset_of!(GetUri, module_uri) == 16);
 const _: () = assert!(std::mem::offset_of!(GetUri, uri) == 32);
 const _: () = assert!(std::mem::offset_of!(GetUri, uri_len) == 40);
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "The native helper remains private to its safe parent API"
-)]
 pub(super) fn prepare(driver: &mut Driver) -> Result<SessionPreparationReport, Error> {
     prepare_with_uri(driver, &mut [0xa5; 256])
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "The validated returned URI is private input to the fixed native open"
-)]
 pub(super) fn prepare_with_uri(
     driver: &mut Driver,
     uri: &mut [u8; 256],
@@ -66,10 +54,6 @@ pub(super) fn prepare_with_uri(
     prepare_fixed_metadata(raw, session_control(driver)?, uri)
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Only the private fixed session paths use this pinned export"
-)]
 pub(super) fn session_control(driver: &Driver) -> Result<SessionControl, Error> {
     // SAFETY: the retained driver owns the DLL and the fixed export is NUL terminated.
     let symbol =
@@ -89,10 +73,6 @@ fn prepare_fixed_metadata(
     prepare_fixed_uri(prepare_effective_domain(raw, control), control, uri)
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "The reference initializer must occur after domain metadata and before URI formatting"
-)]
 pub(super) fn prepare_effective_domain(
     raw: u32,
     control: SessionControl,
@@ -142,10 +122,6 @@ pub(super) fn prepare_effective_domain(
     report
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Only the two private fixed session paths may format this module URI"
-)]
 pub(super) fn prepare_fixed_uri(
     mut report: SessionPreparationReport,
     control: SessionControl,

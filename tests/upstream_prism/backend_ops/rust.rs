@@ -88,7 +88,7 @@ fn result_tensor(observation: &Observation) -> Result<TensorId> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Transport dispatch only constructs production calls and serializes their results."
 )]

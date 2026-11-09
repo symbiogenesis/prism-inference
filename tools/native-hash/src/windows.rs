@@ -1,5 +1,5 @@
 //! Thread-confined owner of a Windows CNG SHA-256 hash.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Explicit parent-only visibility keeps the platform owner inside its audited boundary."
 )]

@@ -4,7 +4,7 @@
 //! Rust. Production codecs remain the target. The CUDA-named source itself uses
 //! host stubs; this port makes no claim about GPU compilation or execution.
 //! Source attribution: tools/prism/upstream/LICENSE (upstream MIT).
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
     clippy::needless_range_loop,
     reason = "Preserve source scalar arithmetic association and explicit packed lane indexing."
@@ -217,7 +217,7 @@ fn half(bits: u16) -> f32 {
     if bits & 0x8000 == 0 { value } else { -value }
 }
 
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Mirror independent production function-pointer capabilities."
 )]
@@ -303,7 +303,7 @@ fn inventory(response: &Value) -> Result<Vec<Traits>> {
     Ok(traits)
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The C++ source narrows the double literal sum back to float after cosf."
@@ -313,7 +313,7 @@ fn generate_data(offset: f32, count: usize) -> Result<Vec<f32>> {
         .map(|i| Ok((0.1_f64 + f64::from(2.0 * (small(i)? + offset).cos())) as f32))
         .collect()
 }
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "Preserve C++ double accumulation followed by float return/sqrtf conversion."
@@ -332,7 +332,7 @@ fn source_rmse(left: &[f32], right: &[f32]) -> Result<f32> {
         .sum();
     Ok((sum as f32).sqrt() / small(left.len())?)
 }
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "Original dot_product multiplies in float, sums in double, and returns float."
@@ -552,7 +552,7 @@ fn pattern(id: usize, blocks: usize, value: usize) -> Result<Pattern> {
         expanded,
     })
 }
-#[allow(
+#[expect(
     clippy::float_cmp,
     reason = "The original packed-dot contract requires exact equality using power-of-two scales."
 )]
@@ -771,7 +771,7 @@ fn reference_sums(case: &HostCase, trits: &[i8; 128]) -> [i32; 4] {
             .sum()
     })
 }
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     clippy::as_conversions,
     reason = "The source explicitly converts bounded integer dot accumulators to float."
@@ -779,7 +779,7 @@ fn reference_sums(case: &HostCase, trits: &[i8; 128]) -> [i32; 4] {
 const fn integer_float(value: i32) -> f32 {
     value as f32
 }
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "Preserve llround after dividing the original float kernel result by its scales."
@@ -939,7 +939,7 @@ fn check_trial(
     );
     Ok(())
 }
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The original HIP float comparison explicitly casts the double scalar total to float."
@@ -947,7 +947,7 @@ fn check_trial(
 const fn narrow_float(value: f64) -> f32 {
     value as f32
 }
-#[allow(
+#[expect(
     clippy::float_cmp,
     reason = "Unit-scale trits and bounded integer dot sums are exactly representable in f32."
 )]

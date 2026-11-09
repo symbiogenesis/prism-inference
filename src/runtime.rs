@@ -448,7 +448,7 @@ impl<D: Decoder> Runtime<D> {
     ///
     /// # Errors
     /// Returns the errors of [`Self::generate_sampled`] or a timed-out error.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "explicit sampling extends the existing bounded deadline API"
     )]
@@ -482,7 +482,7 @@ impl<D: Decoder> Runtime<D> {
     ///
     /// # Errors
     /// Returns the same errors as [`Self::generate_sampled_until`].
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Optional attribution extends the existing explicit sampled deadline API."
     )]
@@ -914,7 +914,7 @@ impl<D: Decoder> Runtime<D> {
     /// # Errors
     /// Rejects invalid suffix draft configs, deadline expiry, or any
     /// [`Self::generate_until_with_prefill`] error.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Explicit suffix draft configuration extends the bounded deadline API."
     )]

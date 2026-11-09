@@ -8,7 +8,7 @@
 //! `ggml/src/ggml-{common.h,quants.c}` and `ggml/src/ggml-cpu/quants.c`
 //! (MIT; upstream LICENSE). Type 42 retains Prism's 64-element contract.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::suboptimal_flops,

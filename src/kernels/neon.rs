@@ -249,7 +249,7 @@ pub(super) fn dot_i16_block(weights: &[i16; 32], activations: &[i8; 32]) -> i32 
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Passes the eight pre-widened activation planes directly in NEON registers."
 )]
@@ -403,10 +403,6 @@ pub(super) fn f16_pair_x4_to_f32_x4(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve ggml_compute_fp32_to_fp16 separate multiply/add rounding."
-)]
 fn half_bits_u32x4(neon: Neon, v: f32x4<Neon>) -> u32x4<Neon> {
     let mut base = (v.abs() * f32x4::splat(neon, f32::from_bits(0x7780_0000)))
         * f32x4::splat(neon, f32::from_bits(0x0880_0000));
@@ -703,7 +699,7 @@ fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Each narrowed Q8_K lane and 16-element i8 sum is bounded within i16."
@@ -897,7 +893,7 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate binary32 product rounding and signed-zero normalization."
 )]
@@ -935,10 +931,6 @@ pub(super) fn lora_b_scale(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 scale and base addition roundings."
-)]
 pub(super) fn lora_finish_in_place(
     scale: f32,
     output: &mut [f32],
@@ -968,7 +960,7 @@ pub(super) fn lora_finish_in_place(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate binary32 product rounding, signed-zero normalization, scale and base addition."
 )]
@@ -1046,9 +1038,8 @@ pub(super) fn lora_b_scale_and_finish(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
-    clippy::too_many_lines,
     reason = "Preserve separate binary32 product rounding, signed-zero normalization, scale and base addition across multiple tokens."
 )]
 pub(super) fn lora_b_scale_and_finish_tokens<const TOKENS: usize>(
@@ -1410,7 +1401,7 @@ pub(super) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) -> bool {
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Preserve each channel's binary64 sum and final binary32 rounding."
@@ -1523,10 +1514,9 @@ pub(super) fn source_value_tile<'a>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::needless_range_loop,
     clippy::too_many_lines,
     reason = "Preserve each channel's binary64 sum and final binary32 rounding across 4 heads."
 )]
@@ -1660,12 +1650,10 @@ pub(super) fn source_value_tile_four<'a>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::needless_range_loop,
     clippy::similar_names,
-    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens and four heads."
 )]
@@ -1922,7 +1910,7 @@ pub(super) fn scale_slice_into(input: &[f32], scale: f32, output: &mut [f32]) ->
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate binary32 multiply and add roundings."
 )]
@@ -1946,7 +1934,7 @@ pub(super) fn add_scaled_slice_in_place(target: &mut [f32], input: &[f32], scale
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate binary32 multiply and add roundings matching scale_slice_into and add_scaled_slice_in_place."
 )]
@@ -2035,7 +2023,7 @@ pub(super) fn gdn_wy_update_four_rows(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate binary32 multiply and add roundings matching scale_slice_into and add_scaled_slice_in_place."
 )]
@@ -2121,7 +2109,7 @@ pub(super) fn gdn_wy_update_eight_rows(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
@@ -2322,10 +2310,6 @@ pub(super) fn add_rms_norm_squares(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for both RMS contracts."
-)]
 pub(super) fn rms_norm_scale_into<const PINNED: bool>(
     input: &[f32],
     weight: &[f32],
@@ -2375,10 +2359,6 @@ pub(super) fn rms_norm_scale_into<const PINNED: bool>(
 
 #[cfg(test)]
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for both RMS contracts."
-)]
 pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
     values: &mut [f32],
     weight: &[f32],
@@ -2418,10 +2398,6 @@ pub(super) fn rms_norm_scale_in_place<const PINNED: bool>(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for both RMSNorm and SwiGLU contracts."
-)]
 fn rms_norm_swiglu_x4<const PINNED: bool>(
     neon: Neon,
     v: f32x4<Neon>,
@@ -2452,10 +2428,6 @@ fn rms_norm_swiglu_x4<const PINNED: bool>(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for both RMSNorm and SwiGLU contracts."
-)]
 pub(super) fn rms_norm_scale_swiglu_in_place<const PINNED: bool>(
     values: &mut [f32],
     weight: &[f32],
@@ -2523,10 +2495,6 @@ pub(super) fn rms_norm_scale_swiglu_in_place<const PINNED: bool>(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for both RMSNorm and SwiGLU contracts."
-)]
 pub(super) fn rms_norm_scale_swiglu_into<const PINNED: bool>(
     input: &[f32],
     weight: &[f32],
@@ -2604,10 +2572,6 @@ pub(super) fn rms_norm_scale_swiglu_into<const PINNED: bool>(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for RMSNorm and Source RoPE while fusing PinnedSwift FMA RoPE and binary16 rounding."
-)]
 pub(super) fn rms_norm_rope_round_f16_256_into<const PINNED: bool>(
     input: &[f32; 256],
     weight: &[f32; 256],
@@ -2703,10 +2667,6 @@ pub(super) fn rms_norm_rope_round_f16_256_into<const PINNED: bool>(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for RMSNorm and Source RoPE while fusing PinnedSwift FMA RoPE and binary16 rounding."
-)]
 pub(super) fn rms_norm_rope_round_f16_256_in_place<const PINNED: bool>(
     values: &mut [f32; 256],
     weight: &[f32; 256],
@@ -2808,7 +2768,7 @@ pub(super) fn rms_norm_rope_round_f16_256_in_place<const PINNED: bool>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Passes the eight pre-widened activation planes directly in NEON registers."
 )]
@@ -2954,7 +2914,7 @@ const fn ptq1_scale_u16(block: &[u8; 28]) -> u16 {
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Passes the four 16-bit weight halves and four 16-bit activation halves in registers."
 )]
@@ -2974,7 +2934,7 @@ fn dot32_w16(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Passes the four 16-bit weight halves and four 16-bit activation halves in registers."
 )]
@@ -3053,7 +3013,7 @@ pub(in crate::kernels) fn decode_ptq1_i16(neon: Neon, packed: &[u8; 28]) -> [i16
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Streams the four 32-element PTQ1 groups against pre-widened Q8_0 activations without stack spills."
 )]
@@ -3116,7 +3076,7 @@ fn accumulate_ptq1_block_pinned(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Streams the four 32-element PTQ1 groups via ARMv8.2-A SDOT while preserving exact lane FMA order."
 )]
@@ -3284,7 +3244,7 @@ pub(super) fn dot_ptq1_row_pinned(bytes: &[u8], input: &[super::Q8Block]) -> Res
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across four rows."
 )]
@@ -3396,7 +3356,7 @@ pub(super) fn dot_ptq1_four_rows_pinned(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across eight rows."
 )]
@@ -3528,7 +3488,7 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::suboptimal_flops,
     reason = "Streams the four 32-element PTQ1 groups while preserving scalar reference multiply-then-add rounding."
@@ -3588,7 +3548,7 @@ fn accumulate_ptq1_block_source(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Streams the four 32-element PTQ1 groups via ARMv8.2-A SDOT while preserving scalar reference multiply-then-add rounding."
 )]
@@ -3677,7 +3637,7 @@ pub(super) fn dot_ptq1_row_source(bytes: &[u8], input: &[super::Q8Block]) -> Res
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add block accumulation order."
 )]
@@ -3783,7 +3743,7 @@ pub(super) fn dot_ptq1_four_rows_source(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across eight rows."
@@ -3910,7 +3870,7 @@ pub(super) fn dot_ptq1_eight_rows_source(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -3975,7 +3935,7 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -4049,7 +4009,7 @@ pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -4102,7 +4062,7 @@ pub(super) fn dot_q4_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -4164,7 +4124,7 @@ pub(super) fn dot_q4_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -4237,7 +4197,7 @@ pub(super) fn dot_q8_0_tile_row<const TOKENS: usize>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -4273,7 +4233,7 @@ pub(super) fn dot_q4_0_tile_row<const TOKENS: usize>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Preserve scalar reference multiply-then-add rounding across 4-row Q8_0 I8MM/SDOT tiles."
@@ -4400,7 +4360,7 @@ pub(super) fn dot_q8_0_four_rows_tile<const TOKENS: usize>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Preserve scalar reference multiply-then-add rounding across 8-row Q8_0 I8MM/SDOT tiles."
@@ -4537,7 +4497,7 @@ pub(super) fn dot_q8_0_eight_rows_tile<const TOKENS: usize>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding across 4-row Q4_0 tiles."
 )]
@@ -4599,7 +4559,7 @@ pub(super) fn dot_q4_0_four_rows_tile<const TOKENS: usize>(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding across 8-row Q4_0 tiles."
 )]
@@ -4670,7 +4630,7 @@ pub(super) fn dot_q4_0_eight_rows_tile<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4696,7 +4656,7 @@ pub(super) fn float_dot(weights: &[f32], input: &[f32]) -> Option<f32> {
     Some(sum as f32)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4730,7 +4690,7 @@ pub(super) fn float_dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Op
     Some((sum0 as f32, sum1 as f32))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4788,7 +4748,7 @@ pub(super) fn float_dot_pair_four_rows(
     ])
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4837,7 +4797,7 @@ pub(super) fn float_dot_pair_eight_rows(
     Some(std::array::from_fn(|r| (sum0[r] as f32, sum1[r] as f32)))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4868,7 +4828,7 @@ pub(super) fn f16_dot(first: &[f32], second: &[u16]) -> Option<f32> {
     Some(sum as f32)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4911,7 +4871,7 @@ pub(super) fn float_dot_four(queries: [&[f32]; 4], key: &[f32]) -> Option<[f32; 
     ])
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -4960,7 +4920,7 @@ pub(super) fn f16_dot_four(queries: [&[f32]; 4], key: &[u16]) -> Option<[f32; 4]
     ])
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5039,7 +4999,7 @@ pub(super) fn f16_dot_two_token_four_queries(
     ))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5098,7 +5058,7 @@ pub(super) fn f16_dot_two_keys_four_queries(
     Some(sums.map(|row| row.map(|v| v as f32)))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5185,7 +5145,7 @@ pub(super) fn f16_dot_two_keys_two_token_four_queries(
     ))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5248,7 +5208,7 @@ pub(super) fn f16_dot_four_keys_four_queries(
     Some(sums.map(|row| row.map(|v| v as f32)))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5339,7 +5299,7 @@ pub(super) fn f16_dot_four_keys_two_token_four_queries(
     ))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5380,7 +5340,7 @@ pub(super) fn bf16_dot(bytes: &[u8], input: &[f32]) -> Option<Result<f32>> {
     Some(super::finite(sum as f32))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -5699,7 +5659,7 @@ pub(super) fn hadamard(values: &mut [f32], normalization: f32) -> Option<Result<
 
 /// Fuses sign multiplication (or input load) with the normalized Sylvester Hadamard butterfly stages.
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep register-fused 16/64-element sign-multiplication and Hadamard stages together."
 )]
@@ -5819,7 +5779,7 @@ pub(super) fn hadamard_into(
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
 )]
@@ -5906,10 +5866,6 @@ pub(super) fn hadamard_grouped_strided_block_into(
 }
 
 #[inline]
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve separate binary32 product roundings for both RMS contracts."
-)]
 fn hadamard_16_registers_rms_norm<const PINNED: bool>(
     neon: Neon,
     in_block: &[f32],
@@ -5973,7 +5929,7 @@ fn hadamard_16_registers_rms_norm<const PINNED: bool>(
 /// Fuses weighted `RMSNorm` scaling, optional sign multiplication, and normalized
 /// Sylvester Hadamard butterfly stages for one power-of-two block (`>= 16` elements).
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep register-fused 16/64-element RMSNorm, sign multiplication, and Hadamard stages together."
 )]
@@ -6153,7 +6109,7 @@ fn hadamard_16_registers_swiglu_read(
 /// Fuses pinned `SwiGLU`, optional sign multiplication, and normalized Sylvester Hadamard
 /// butterfly stages for one power-of-two block (`>= 16` elements) without mutating `up`.
 #[inline]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep register-fused 16/64-element SwiGLU, sign multiplication, and Hadamard stages together."
 )]
@@ -6771,7 +6727,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Cover Q8_0, Q4_0, Q4_1, and i16 block dots plus 4/8-row NEON batching together."
     )]
@@ -6896,7 +6852,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::as_conversions,
         clippy::cast_precision_loss,
@@ -7261,7 +7217,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::as_conversions,
         clippy::suboptimal_flops,

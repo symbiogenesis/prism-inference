@@ -187,7 +187,7 @@ struct MergeScratch {
 
 /// Immutable production tokenizer loaded solely from bounded GGUF metadata.
 #[derive(Debug)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "GGUF independently declares these tokenizer flags"
 )]
@@ -257,7 +257,7 @@ impl GgufTokenizer {
     /// # Errors
     /// Rejects unsupported families, malformed metadata, inconsistent counts,
     /// nonfinite scores, and vocabulary or merge resource limits.
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Validate all bounded GGUF arrays before constructing the tokenizer"
     )]
@@ -1278,7 +1278,7 @@ fn unescape_rwkv(token: &str) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-#[allow(
+#[expect(
     clippy::unicode_not_nfc,
     reason = "Preserve the pinned upstream regex scalar ranges exactly"
 )]

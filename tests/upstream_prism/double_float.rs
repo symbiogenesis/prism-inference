@@ -67,7 +67,7 @@ impl Proof {
             for bits in (start..=end).rev() {
                 let value = f32::from_bits(bits);
                 let (double, single) = rounded(value);
-                #[allow(
+                #[expect(
                     clippy::float_cmp,
                     reason = "The original proof requires exact rounding equality, not approximate error."
                 )]
@@ -178,7 +178,7 @@ mod tests {
             proof.finite += 1;
             let (double, single) = rounded(value);
             proof.undefined_casts += u64::from(!(-128.0..128.0).contains(&double));
-            #[allow(
+            #[expect(
                 clippy::float_cmp,
                 reason = "This independent scalar oracle preserves the original exact comparison."
             )]

@@ -675,7 +675,7 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Each branch directly implements one source statement kind in a single bounded control-flow dispatch."
     )]

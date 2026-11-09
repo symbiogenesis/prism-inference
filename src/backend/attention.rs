@@ -42,7 +42,7 @@ impl CpuBackend {
         Ok(output)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "The pinned online softmax, half accumulator and sink updates retain their operation order."
     )]

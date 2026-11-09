@@ -135,10 +135,6 @@ fn fill_key_head_dots_head_major(
     Ok(())
 }
 
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Match the exact single-token GDN recurrence rounding order."
-)]
 fn exact_head_into(
     arithmetic: Arithmetic,
     previous: &[f32],
@@ -207,7 +203,7 @@ fn exact_head_into(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "The experimental FP32 chunk contract uses explicit separately rounded triangular arithmetic."
@@ -447,10 +443,9 @@ fn head_into(
     finite(output, "chunkwise GDN output")
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::suboptimal_flops,
     clippy::imprecise_flops,
     reason = "Keep unchanged graph preprocessing and the separately identified chunk algebra auditable."
 )]
@@ -1062,7 +1057,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Independent ordinary recurrence uses explicit multiply/add rather than chunk identities."
     )]
@@ -1136,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Verifies bit-for-bit parity against the single-row WY reference."
     )]

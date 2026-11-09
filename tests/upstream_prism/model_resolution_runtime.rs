@@ -53,7 +53,7 @@ fn file(file: &File) -> Value {
 fn plan(value: &Plan) -> Value {
     json!({"Primary":file(&value.primary),"ModelFiles":value.model_files.iter().map(file).collect::<Vec<_>>(),"Mmproj":file(&value.mmproj),"Mtp":file(&value.mtp),"Dflash":file(&value.dflash),"Eagle3":file(&value.eagle3),"Dspark":file(&value.dspark),"Preset":file(&value.preset)})
 }
-#[allow(
+#[expect(
     clippy::as_conversions,
     reason = "Serialize the explicit repr(u32) speculative policy enum into its native wire identifier."
 )]

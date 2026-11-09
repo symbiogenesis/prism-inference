@@ -4,7 +4,7 @@
 //! `ggml/src/ggml-cpu/vec.cpp`, `vec.h` and `simd-mappings.h`.
 //! Upstream MIT terms are retained in `PRISM-LICENSE.txt`.
 
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep graph-only GDN helpers crate scoped while satisfying unreachable_pub."
 )]
@@ -190,7 +190,7 @@ pub(crate) fn dot_pair_eight_rows(
 
 // Floating matrix projections deliberately retain scalar diagnostics and their
 // explicit scalar policy. Only the graph's pinned GDN helper selects NEON.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Keep the scalar oracle's exact multiply/add remainder rounding."
 )]
@@ -391,11 +391,6 @@ pub(crate) fn step_row_in_place(
 ///
 /// # Errors
 /// Rejects invalid geometry before mutation, or a nonfinite updated element or dot result.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::suboptimal_flops,
-    reason = "Keep multi-token row recurrence geometry and exact single-token rounding order explicit."
-)]
 pub(crate) fn step_row_tokens_from(
     previous: &[f32],
     state: &mut [f32],
@@ -499,10 +494,6 @@ pub(crate) fn step_four_rows_from(
 ///
 /// # Errors
 /// Rejects invalid geometry before mutation, or a nonfinite updated element or dot result.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Keep 4-row multi-token recurrence geometry and fallback arguments explicit."
-)]
 pub(crate) fn step_four_rows_tokens_from(
     previous: [&[f32]; 4],
     states: [&mut [f32]; 4],
@@ -609,10 +600,6 @@ pub(crate) fn step_eight_rows_from(
 ///
 /// # Errors
 /// Rejects invalid geometry before mutation, or a nonfinite updated element or dot result.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Keep 8-row multi-token recurrence geometry and fallback arguments explicit."
-)]
 pub(crate) fn step_eight_rows_tokens_from(
     previous: [&[f32]; 8],
     states: [&mut [f32]; 8],
@@ -671,7 +658,7 @@ pub(crate) fn step_eight_rows_tokens_from(
 ///
 /// # Errors
 /// Rejects invalid geometry or any non-finite intermediate/output value.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep 8-row, 4-row, and 1-row in-place head recurrence dispatch together."
 )]
@@ -793,7 +780,7 @@ pub(crate) fn step_head_tokens_in_place(
     }
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Keep the scalar oracle's exact multiply/add remainder rounding."
 )]
@@ -839,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Verifies single-token and multi-token GDN parity across all widths and decay/beta cases."
     )]
@@ -984,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "The regression must retain the unfused scalar remainder oracle."
     )]
@@ -1121,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::similar_names,
         reason = "Cover 4-row and 8-row GDN step and WY update bit parity and error rollback together."

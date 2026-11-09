@@ -1,5 +1,5 @@
 //! Literal prompts, dataset handling and source scalar oracle for real `DSpark` eval.
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
     reason = "Retain the original ordered scalar KLD reduction."
 )]
@@ -15,7 +15,7 @@ pub(super) const SOURCE_SHA: &str =
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Independent source command-line diagnostic switches."
 )]

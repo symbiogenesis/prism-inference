@@ -110,7 +110,7 @@ impl Arena {
         };
         self.expression(&expression, &std::collections::HashMap::new(), 0)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep source flat, nested and function-as-key tool layout construction together"
     )]

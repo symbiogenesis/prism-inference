@@ -1,15 +1,10 @@
 //! Fixed signed-module session and FD mapping receipt; no computation is submitted.
 
-#![allow(
-    clippy::redundant_pub_crate,
-    reason = "Private receipt construction must not become public native-boundary API"
-)]
-
 use crate::{MappingProbeReport, SessionPreparationReport};
 
 /// Terminal native session observation, never an inference/admission permit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Independent native steps must remain distinct in diagnostic evidence"
 )]

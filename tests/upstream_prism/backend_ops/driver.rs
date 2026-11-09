@@ -292,7 +292,7 @@ pub(super) fn run(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The complete source-extent proof checks every partition and ordered geometry against the committed plan in one transaction."
 )]

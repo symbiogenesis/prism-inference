@@ -83,7 +83,7 @@ impl Corpus {
         )?;
         Ok(Self { manifest })
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "keep the literal source metadata and independent binary writer together"
     )]

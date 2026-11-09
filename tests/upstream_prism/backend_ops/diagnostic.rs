@@ -257,7 +257,7 @@ fn diagnostic_vars(host: &mut Production<'_, '_>, geometry: &program::Geometry) 
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The diagnostic preserves constructor/parameter filter, graph/operation filter and source CRT sequencing in one ordered transaction."
 )]

@@ -268,7 +268,7 @@ impl Block {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Preserve scalar reference multiply-then-add rounding."
     )]

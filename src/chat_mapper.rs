@@ -129,7 +129,7 @@ impl Mapper {
             _ => &mut self.buffer,
         }
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Preserve source semantic tag order and tool/argument streaming transitions together"
     )]

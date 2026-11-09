@@ -1,5 +1,5 @@
 //! Private bounded Swift worker delivery and single-terminal ownership.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep shared worker/test delivery helpers explicitly crate scoped"
 )]

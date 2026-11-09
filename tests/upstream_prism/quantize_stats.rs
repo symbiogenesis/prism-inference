@@ -22,7 +22,7 @@ const TRANSPORT_CHUNKS: usize = 16;
 const BUCKETS: usize = 150;
 const RANGE: f64 = 0.03;
 #[derive(Default)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Original independent CLI flags are retained individually."
 )]
@@ -224,7 +224,7 @@ impl Default for Stats {
     }
 }
 impl Stats {
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -271,10 +271,9 @@ impl Stats {
             *a = a.wrapping_add(b);
         }
     }
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
-        clippy::suboptimal_flops,
         reason = "Source accumulate and reporting explicitly convert counters to double, preserving histogram order."
     )]
     fn quantile(&self, q: f64) -> f64 {
@@ -291,7 +290,7 @@ impl Stats {
         }
         f64::INFINITY
     }
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "Source RMSE and histogram interval display convert integer counts to double."
@@ -674,7 +673,7 @@ fn roundtrip_layer(work: &Work<'_>, target: Stats, max_thread: usize) -> Result<
 pub(super) fn run(engine: &Engine) -> Result<Value> {
     run_with_options(engine, &Options::default())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keeps source loading, eligibility, per-type loop and teardown in the original observable order."
 )]
@@ -935,7 +934,7 @@ mod tests {
         )
     }
     #[test]
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Checks the original separate multiply/add accumulation without FMA."
     )]

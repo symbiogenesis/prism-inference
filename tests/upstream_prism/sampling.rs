@@ -635,7 +635,7 @@ fn queue_actions(queue: &Value) -> Result<(Vec<Value>, Vec<usize>)> {
     Ok((actions, observations))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Mirror the original ceilf/floorf-to-int conversion after checking its finite int32 range."
@@ -771,7 +771,7 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     ))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The original Windows workload rounds its double rand/RAND_MAX expression once to binary32."

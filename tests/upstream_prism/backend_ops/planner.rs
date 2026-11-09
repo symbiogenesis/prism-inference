@@ -118,7 +118,7 @@ pub(super) fn plan(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "All partition, ordered geometry and CRT-prefix completeness checks remain in one aggregation transaction."
 )]

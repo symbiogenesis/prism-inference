@@ -176,7 +176,7 @@ fn sift_down_worst(heap: &mut [Candidate], mut index: usize) {
 ///
 /// Clamps negative bucket indices to `0..=15` and ignores non-finite values at any
 /// position (porting the `ik_llama.cpp` PR `#2857` bucketed top-k fixes).
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

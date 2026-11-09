@@ -443,7 +443,7 @@ fn index(arguments: &[Value], index: usize) -> Result<usize> {
     numeric(arguments, index)?.index().map_err(invalid)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Container methods are an explicit finite source-language dispatch with shared error and ownership rules."
 )]
@@ -746,7 +746,7 @@ fn iterator_call(name: &str, arguments: &[Value]) -> Result<Value> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The finite library dispatch records every source library operation in one reviewable match."
 )]

@@ -13,10 +13,6 @@ use super::{VALUE_TILE, VALUE_TILE_FOUR, VALUE_TILE_FOUR_TWO_TOKENS, padded_dot_
 /// any channel's token order. The accumulator remains exactly 2 KiB; decoded
 /// FP16 values exist only for one four-channel load. No FP16 arithmetic or
 /// optional instruction set is required.
-#[allow(
-    clippy::needless_range_loop,
-    reason = "Keep explicit temporal lane and channel group indices aligned across 2-row unrolling."
-)]
 pub(super) fn value_tile<'a>(
     neon: Neon,
     mut past: impl Iterator<Item = &'a [u16]>,
@@ -124,9 +120,8 @@ pub(super) fn value_tile<'a>(
 /// Each cached binary16 value row is read and converted to binary32 once for all
 /// four query heads, while retaining each head's independent sixteen-lane FMA
 /// accumulator and reduction tree.
-#[allow(
+#[expect(
     clippy::large_stack_arrays,
-    clippy::needless_range_loop,
     clippy::too_many_lines,
     reason = "Keep explicit 4-head and token indices aligned across the 32 KiB stack accumulator."
 )]
@@ -255,8 +250,7 @@ pub(super) fn value_tile_four<'a>(
 /// Both tokens share the first `weights0[0].len() - 1` cached binary16 value rows,
 /// which are read and converted to binary32 once for all eight `(token, head)`
 /// accumulators while preserving each head's independent sixteen-lane FMA tree.
-#[allow(
-    clippy::needless_range_loop,
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Keep explicit 2-token x 4-head indices aligned across fixed arrays."
@@ -1051,7 +1045,7 @@ mod tests {
     }
 
     #[derive(serde::Deserialize)]
-    #[allow(
+    #[expect(
         clippy::struct_field_names,
         reason = "Field names match the immutable JSON fixture schema."
     )]
@@ -1134,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Verify 1-token and 2-token 4-head value tiles across history lengths and tile widths."
     )]

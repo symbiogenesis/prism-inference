@@ -168,7 +168,7 @@ impl Val {
             _ => true,
         }
     }
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::as_conversions,
         reason = "Jinja explicitly widens integer operands for floating-point operations; integer-only arithmetic remains checked i64"
@@ -182,7 +182,7 @@ impl Val {
             _ => Err(invalid("Jinja value is not numeric")),
         }
     }
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::as_conversions,

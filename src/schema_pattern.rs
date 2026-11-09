@@ -74,7 +74,7 @@ struct Parser<'a> {
     subrules: HashMap<String, String>,
 }
 impl Parser<'_> {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Preserve the source regex transform's ordered token/quantifier behavior"
     )]

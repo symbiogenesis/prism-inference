@@ -17,7 +17,7 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
 }
 
 impl CpuBackend {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "GDN snapshot and replay state transitions retain their pinned output layout and arithmetic order."
     )]
@@ -145,7 +145,7 @@ impl CpuBackend {
                     if let (Some(bias), Some(weight)) = (&bias, &decay_weight) {
                         beta = 1.0 / (1.0 + (-beta).exp());
                         let value = gate + bias[head];
-                        #[allow(
+                        #[expect(
                             clippy::imprecise_flops,
                             reason = "The pinned raw gate helper rounds 1+exp before logf."
                         )]

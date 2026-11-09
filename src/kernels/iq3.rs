@@ -5,7 +5,7 @@
 //! The integer codebooks retain the original ggml-common.h values. Reference
 //! and importance encoders preserve the pinned native grid-fitting contracts.
 
-#![allow(
+#![expect(
     clippy::cast_precision_loss,
     clippy::as_conversions,
     clippy::suboptimal_flops,

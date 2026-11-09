@@ -354,7 +354,7 @@ fn one(engine: &Engine, options: &Options, label: &str) -> Result<Value> {
         json!({"Branch":label,"Limits":limits,"Metadata":metadata_receipt,"Phases":receipts,"UniqueOps":tests.len(),"Output":output}),
     )
 }
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "Shared source registry expects a Result; source failures remain measured case results."
 )]

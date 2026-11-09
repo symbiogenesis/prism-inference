@@ -1,5 +1,5 @@
 //! Portable Rust baseline for non-Windows targets.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Explicit parent-only visibility keeps the platform owner private."
 )]
@@ -11,7 +11,7 @@ use sha2::Digest;
 pub(super) struct Sha256(sha2::Sha256);
 
 impl Sha256 {
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "The platform-independent owner shares the fallible CNG boundary's API."
     )]
@@ -19,7 +19,7 @@ impl Sha256 {
         Ok(Self(sha2::Sha256::new()))
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "The platform-independent owner shares the fallible CNG boundary's API."
     )]
@@ -28,7 +28,7 @@ impl Sha256 {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "The platform-independent owner shares the fallible CNG boundary's API."
     )]

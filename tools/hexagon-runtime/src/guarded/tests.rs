@@ -14,7 +14,7 @@ struct CpuSubmitter {
     partial: bool,
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,

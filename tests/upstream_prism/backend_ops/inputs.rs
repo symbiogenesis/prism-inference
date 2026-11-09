@@ -220,7 +220,7 @@ impl Inputs {
         Ok(values)
     }
 
-    #[allow(
+    #[expect(
         clippy::manual_midpoint,
         reason = "The original input selector uses a separate binary32 addition and multiplication, including its rounding/overflow behavior."
     )]

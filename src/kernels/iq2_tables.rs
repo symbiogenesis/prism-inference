@@ -2,7 +2,7 @@
 //! Revision 73bfe6cc485554822f80c473a3c0c4f25e80f41b, source SHA-256
 //! 96539c9bd8e4544692bf242951180edaa2fd5775864fbc3e833f44111b96b934.
 
-#![allow(
+#![expect(
     clippy::unreadable_literal,
     reason = "Preserve mechanically extracted native codebook literals."
 )]

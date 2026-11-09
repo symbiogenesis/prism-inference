@@ -9,7 +9,7 @@
     unsafe_code,
     reason = "These tests exercise the pinned native ggml ABI through its documented safety contracts"
 )]
-#![allow(
+#![expect(
     clippy::expect_used,
     reason = "Test setup failures need an explanatory assertion"
 )]
@@ -291,7 +291,7 @@ impl Drop for GgufFixture {
 }
 
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "One fixture keeps the native object lifetimes and validation together"
 )]
@@ -506,7 +506,7 @@ fn native_storage_and_math() {
 }
 
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "One fixture documents fallback allocations and malformed native descriptors together"
 )]

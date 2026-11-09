@@ -1,4 +1,4 @@
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Explicit parent-only visibility keeps the ARM64 intrinsics inside the audited module boundary."
 )]
@@ -2212,7 +2212,7 @@ fn dot_ptq1_8x8_lanes_dotprod(
 }
 
 #[target_feature(enable = "neon,i8mm")]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep 8 weight rows in registers across both 4-token halves of the 8x8 I8MM tile."
 )]

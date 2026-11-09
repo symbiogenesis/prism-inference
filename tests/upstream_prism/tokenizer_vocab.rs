@@ -131,7 +131,7 @@ fn merge_list(tokenizer: &Value, directory: &Path) -> Result<Vec<String>> {
         })
         .collect())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Ordered source SpecialVocab metadata precedence is kept together"
 )]
@@ -340,7 +340,7 @@ fn added_descriptions(
     }
     Ok(added)
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The three original vocabulary conversion branches share metadata serialization"
 )]

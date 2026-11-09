@@ -380,7 +380,7 @@ fn decode_row_impl(kind: u32, columns: usize, bytes: &[u8], output: &mut Vec<f32
 
 // Bounded casts implement the native float quantizers, with checked finite
 // inputs and an explicit integer range check before conversion.
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The finite rounded activation is range checked before conversion to i8."
@@ -580,7 +580,7 @@ fn quantize_ternary(input: &[f32]) -> Result<[u8; 34]> {
 /// # Errors
 /// Rejects unsupported kinds, empty or incomplete blocks, nonfinite inputs,
 /// unrepresentable packed scales, inverse-scale overflow and allocation errors.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve native reference quantizer multiply-then-add rounding."
 )]
@@ -689,7 +689,7 @@ pub fn quantize_row(kind: u32, input: &[f32]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::suspicious_operation_groupings,
     reason = "Preserve weighted native quantizer search arithmetic association."
@@ -774,7 +774,7 @@ fn weighted_symmetric_block(
 /// # Errors
 /// Rejects unequal or empty extents, negative/nonfinite importance, malformed
 /// blocks, nonfinite inputs, numerical overflow and unsupported kinds.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve source row-wide sum of squares and per-element weighting association."
 )]
@@ -837,7 +837,7 @@ pub fn quantize_row_weighted(kind: u32, input: &[f32], importance: &[f32]) -> Re
     Ok(output)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Native row variance divides by a float-converted bounded element count."
@@ -846,7 +846,7 @@ const fn bounded_count_float(count: u32) -> f32 {
     count as f32
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Bounded dot sums and power-of-two transform lengths are exactly representable."
@@ -867,7 +867,7 @@ fn dot_integer(weights: &[i16], activations: &[i8]) -> f32 {
     )
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -894,7 +894,7 @@ fn dot_pq2<const FUSED: bool>(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
     target_env = "msvc",
     target_feature = "neon"
 ))]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -925,7 +925,7 @@ fn dot_pq2_neon<const FUSED: bool>(bytes: &[u8], input: &[Q8KBlock]) -> Result<f
 /// # Errors
 /// Rejects malformed or mismatched `PTQ1`/`Q8_K` extents, invalid ternary bytes,
 /// or non-finite scales.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -969,7 +969,7 @@ pub fn dot_ptq1_q8k(bytes: &[u8], input: &[Q8KBlock]) -> Result<f32> {
     finite(output)
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -1086,7 +1086,7 @@ fn dot_q8_groups_pinned<const NEON: bool>(
     target_env = "msvc",
     target_feature = "neon"
 ))]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -1116,10 +1116,6 @@ fn dot_q8_groups_neon(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32>
     finite(output)
 }
 
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve scalar reference multiply-then-add rounding."
-)]
 fn dot_additional(kind: u32, bytes: &[u8], q8: &[Q8Block], q8k: &[Q8KBlock]) -> Result<f32> {
     match kind {
         16 | 17 | 22 => iq2::dot(kind, bytes, q8k),
@@ -1134,7 +1130,7 @@ fn dot_additional(kind: u32, bytes: &[u8], q8: &[Q8Block], q8k: &[Q8KBlock]) -> 
     }
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
@@ -1185,7 +1181,7 @@ fn dot_legacy(kind: u32, bytes: &[u8], input: &[Q8Block]) -> Result<f32> {
     finite(output)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The scalar reference rounds the accumulated binary64 sum to binary32."
@@ -1273,7 +1269,7 @@ pub(crate) fn float_dot_pair_eight_rows(
     ]
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Preserve binary32 products and binary64 accumulation when reading the binary16 cache."
@@ -1424,7 +1420,7 @@ pub(crate) fn f16_dot_four_keys_two_token_four_queries(
     ([k0_0, k1_0, k2_0, k3_0], [k0_1, k1_1, k2_1, k3_1])
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
@@ -1920,7 +1916,7 @@ impl MatvecScratch {
         self.prepare_input_with_quantization(tensor, input, true)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep activation contract dispatch and NEON rounding fallbacks together."
     )]
@@ -2432,10 +2428,6 @@ pub(crate) fn lora_b_scale(
     })
 }
 
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "Preserve the native product, scale and add as separately rounded F32 stages."
-)]
 pub(crate) fn lora_finish_in_place(
     scale: f32,
     output: &mut [f32],
@@ -2499,7 +2491,7 @@ impl PreparedMatvec<'_> {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep checked format dispatch and its ordered arithmetic branches together."
     )]
@@ -2739,7 +2731,7 @@ impl PreparedMatvec<'_> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The converted binary16 sign and magnitude occupy at most sixteen bits."
@@ -2929,11 +2921,6 @@ pub(crate) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) {
     }
 }
 
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "Preserve each channel's binary64 sum and final binary32 rounding."
-)]
 pub(crate) fn source_value_tile<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
@@ -2977,12 +2964,6 @@ pub(crate) fn source_value_tile<'a>(
     }
 }
 
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::needless_range_loop,
-    reason = "Preserve each channel's binary64 sum and final binary32 rounding across 4 heads."
-)]
 pub(crate) fn source_value_tile_four<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
@@ -3033,13 +3014,6 @@ pub(crate) fn source_value_tile_four<'a>(
     }
 }
 
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens and four heads."
-)]
 pub(crate) fn source_value_tile_four_two_tokens<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     currents: [&[f32]; 2],
@@ -3155,7 +3129,7 @@ pub(crate) fn scale_slice_into(input: &[f32], scale: f32, output: &mut [f32]) {
     }
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate binary32 multiply and add roundings."
 )]
@@ -3241,7 +3215,7 @@ pub(crate) fn gdn_wy_update_eight_rows(
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
@@ -3553,8 +3527,7 @@ pub(crate) fn rms_norm_swiglu_into<const PINNED: bool>(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
+#[expect(
     clippy::suboptimal_flops,
     reason = "Keep explicit head/rotary geometry and separate multiply/add roundings for Source fallback."
 )]
@@ -3627,7 +3600,7 @@ pub(crate) fn rms_norm_rope_round_f16_into<const PINNED: bool>(
     Ok(round_f16_slice(output))
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Keep separate multiply/add roundings for Source fallback."
 )]
@@ -3693,7 +3666,7 @@ pub(crate) fn rms_norm_rope_round_f16_in_place<const PINNED: bool>(
     Ok(round_f16_slice(values))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The scalar normalization contract rounds the binary64 mean to binary32."
@@ -3747,7 +3720,7 @@ fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
     Ok(scale)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The scalar normalization contract rounds the binary64 mean to binary32."
@@ -3897,7 +3870,7 @@ pub(crate) fn hadamard_into(
     hadamard(output)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
 )]
@@ -3961,7 +3934,7 @@ pub(crate) fn hadamard_grouped_strided_block_into(
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."
 )]
@@ -3988,7 +3961,7 @@ pub(crate) fn hadamard_grouped_block_into(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Block slice helper passes explicit RMSNorm scale, optional Hadamard signs and output slices."
 )]
@@ -4050,7 +4023,7 @@ fn rms_norm_hadamard_blocks_into<const PINNED: bool>(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Fused RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
 )]
@@ -4133,7 +4106,7 @@ fn rms_norm_scale_hadamard_into<const PINNED: bool>(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Fused RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
 )]
@@ -4173,7 +4146,7 @@ pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
     result
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Fused residual-add, RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
 )]
@@ -4267,7 +4240,7 @@ pub(crate) fn swiglu_hadamard_block_read_into<const PINNED: bool>(
 ///
 /// # Errors
 /// Rejects empty vectors, NaNs, positive infinity, and all-masked rows.
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The scalar softmax contract rounds the binary64 inverse sum to binary32."
@@ -4295,7 +4268,7 @@ pub fn softmax(values: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The scalar softmax contract rounds the binary64 inverse sum to binary32 before binary16 rounding."
@@ -5014,7 +4987,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Test reference mirrors scalar non-fused multiply-then-add order."
     )]

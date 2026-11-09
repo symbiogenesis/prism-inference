@@ -8,7 +8,7 @@
     clippy::multiple_crate_versions,
     reason = "The pinned independent HF tokenizer reference requires syn2 via derive_builder; workspace serde derives require syn3."
 )]
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Sibling modules share adapters explicitly; unreachable_pub rejects unrestricted pub."
 )]

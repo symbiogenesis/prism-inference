@@ -444,7 +444,7 @@ enum Request<'a> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Wire readiness exposes independent fixed inference policy flags, not mutable client state"
 )]

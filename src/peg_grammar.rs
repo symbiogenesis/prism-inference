@@ -83,7 +83,7 @@ fn class(values: &[u32], negated: bool) -> String {
     result.push(']');
     result
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep trie construction, suffix links and deterministic DFA grammar emission together"
 )]
@@ -250,7 +250,7 @@ impl Arena {
         }
         Ok(())
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "One exhaustive lowering match preserves all PEG variant grouping and quantifier rules"
     )]

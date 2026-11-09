@@ -1,6 +1,6 @@
 //! Pinned deterministic reference K-block row quantizers.
 
-#![allow(
+#![expect(
     clippy::float_cmp,
     clippy::similar_names,
     clippy::suspicious_operation_groupings,
@@ -40,10 +40,6 @@ fn signed_maximum(input: &[f32]) -> f32 {
     maximum
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Preserve every pinned affine quantizer search parameter."
-)]
 fn affine(
     input: &[f32],
     weights: &[f32],
@@ -377,7 +373,7 @@ fn pack_affine(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep all native scale/code/bit-packing phases in one source-ordered dispatcher."
 )]

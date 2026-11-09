@@ -5,12 +5,11 @@
 //! below its 1e-15 cutoff. This safe implementation uses canonical zero nibbles
 //! for that zero-scale payload; numerical zero semantics are preserved.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::float_cmp,
     clippy::suboptimal_flops,
     clippy::similar_names,
     clippy::suspicious_operation_groupings,
@@ -146,7 +145,7 @@ pub(super) fn dot_q8k(weights: &[u8], input: &[Q8KBlock]) -> Result<f32> {
     finite(sum)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep native local fit, search, super-block fit and bit packing in source order."
 )]

@@ -22,19 +22,11 @@ struct MemoryFunctions {
     unmap: Unmap,
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Private native helpers remain accessible only to their safe parent"
-)]
 #[must_use]
 pub(super) fn terminal() -> bool {
     USED.load(Ordering::Acquire)
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "All terminal native probes share the same process-wide admission"
-)]
 pub(super) fn admit_terminal() -> Result<(), Error> {
     USED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map(|_| ())
@@ -78,10 +70,6 @@ fn memory_functions(driver: &Driver) -> Result<MemoryFunctions, Error> {
     })
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Private native mapping owner must not become public API"
-)]
 pub(super) fn probe(driver: Driver) -> Result<MappingProbeReport, Error> {
     admit_terminal()?;
     let MemoryFunctions {

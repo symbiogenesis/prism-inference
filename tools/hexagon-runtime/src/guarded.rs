@@ -3,7 +3,7 @@
 //! This implements the guarded HVX compatibility path, not HMX prefill or a
 //! qualified production backend. Native session limits and outer supervision
 //! remain mandatory. PTQ1 and PQ2's odd-block `Q8_0` path remain CPU-owned.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Share checked arithmetic helpers with the HMX sibling without exporting a new public API."
 )]
@@ -125,8 +125,7 @@ impl<'a> GuardedQ2Executor<'a> {
             .checked_add(2048)
     }
 
-    #[allow(
-        clippy::too_many_lines,
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Keep exact block ordering, bounded packing and nonfused source rounding together."
     )]

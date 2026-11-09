@@ -572,7 +572,7 @@ fn scratch_step_bits(decoder: &mut Qwen35, token: u32) -> Result<Vec<u32>> {
 }
 
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Retain the complete independent pre-sharing logits and state bit fixtures with their recovery assertions."
 )]
@@ -1467,7 +1467,7 @@ fn reusable_logits_clear_on_rejection_and_preserve_hybrid_state() -> Result<()> 
 }
 
 #[test]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::manual_midpoint,
     reason = "The hand calculation preserves scalar reference operation ordering on bounded fixture values."
@@ -2586,10 +2586,6 @@ impl Drop for DriverArtifact {
 
 #[cfg(feature = "cli")]
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete driver invocation and JSON output contract together."
-)]
 fn native_driver_executes_verified_synthetic_gguf_and_enforces_state_budget() -> Result<()> {
     let mut model = fixture(false);
     model.metadata.insert(

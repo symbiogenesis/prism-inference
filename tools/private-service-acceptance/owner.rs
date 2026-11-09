@@ -147,7 +147,7 @@ fn guard_release(data: &Path, receipt: &mut Receipt) -> io::Result<Vec<VerifiedF
     Ok(guards)
 }
 
-#[allow(
+#[expect(
     clippy::future_not_send,
     reason = "the reviewed launcher and shutdown are polled on one current-thread runtime"
 )]

@@ -17,11 +17,11 @@ fn relative(value: &Value) -> Result<&str> {
         .ok_or_else(|| invalid("invalid tokenizer repository relative path"))?;
     Ok(name)
 }
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "all source ports share a Result interface with measured failure records"
 )]
-#[allow(
+#[expect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the source Bash glob selects only literal lowercase .gguf"
 )]

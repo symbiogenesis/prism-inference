@@ -240,7 +240,7 @@ fn supports(
     Ok(supported)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The original gradient preparation includes ordered support checks, graph construction and parameter assertions which are kept together for review."
 )]
@@ -394,7 +394,7 @@ fn gradients(host: &mut Production<'_, '_>, prepared: &mut Prepared, class: &str
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Preparation follows the four original lifecycle branches in source order; no numerical work is performed here."
 )]

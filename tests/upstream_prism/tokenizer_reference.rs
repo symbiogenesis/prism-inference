@@ -24,7 +24,7 @@ enum Backend {
     Fast(Box<Tokenizer>),
     BaiChuan(Box<SentencePieceProcessor>),
 }
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Independent upstream tokenizer configuration flags"
 )]
@@ -185,7 +185,7 @@ fn add_descriptions(
     Ok(())
 }
 impl Reference {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::similar_names,
         clippy::collapsible_if,

@@ -12,7 +12,7 @@ use crate::Result;
 /// These are observations of the source's fixed probes, including its fallback
 /// and exception rules. They do not establish general support for every input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Expose the six independent capability flags of the native API"
 )]

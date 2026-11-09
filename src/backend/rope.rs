@@ -13,7 +13,7 @@ fn float(p: &[u8; 64], index: usize) -> f32 {
 }
 
 impl CpuBackend {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "The pinned rotary cache and pair traversal retain their numerical order."
     )]

@@ -4,7 +4,7 @@
 //! `ggml/src/ggml-cpu/vec.h` and `vec.cpp`. Upstream MIT terms are retained in
 //! `PRISM-LICENSE.txt`.
 
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep graph-only activation helpers crate scoped while satisfying unreachable_pub."
 )]

@@ -4,7 +4,7 @@
 //! `ggml/src/ggml-cpu/vec.cpp`, `simd-mappings.h` and `src/llama-kv-cache-73.cpp`.
 //! Upstream MIT terms are retained in `PRISM-LICENSE.txt`.
 
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep exact-model attention helpers crate scoped."
 )]
@@ -177,7 +177,7 @@ pub(crate) fn value_tile_four<'a>(
     value_tile_four_scalar(past, current, weights, &(offset..end), outputs)
 }
 
-#[allow(
+#[expect(
     clippy::large_stack_arrays,
     clippy::needless_range_loop,
     reason = "Keep explicit 4-head and token indices aligned across the 32 KiB stack accumulator."
@@ -250,10 +250,6 @@ fn value_tile_four_scalar<'a>(
 /// # Errors
 /// Rejects invalid widths, mismatched lengths, short/long iterators, offset overflow,
 /// and nonfinite outputs without writing partial results.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Pass explicit two-token current values, probability slices and output slices."
-)]
 pub(crate) fn value_tile_four_two_tokens<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     currents: [&[f32]; 2],
@@ -316,10 +312,8 @@ pub(crate) fn value_tile_four_two_tokens<'a>(
     )
 }
 
-#[allow(
+#[expect(
     clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "Keep explicit 2-token x 4-head indices aligned across fixed arrays."
 )]
 fn value_tile_four_two_tokens_scalar<'a>(
@@ -812,7 +806,7 @@ pub(crate) fn dot(mut values: impl Iterator<Item = f32>, weights: &[f32]) -> Res
 ///
 /// # Errors
 /// Rejects empty, oversized or nonfinite input before mutation.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "Match the native binary64 reciprocal rounded once to binary32."
@@ -1368,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Cover 4x4, 2x4, and 2x2x4 multi-key query dot products and error paths together."
     )]
@@ -1481,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Cover PinnedSwift and Source 2-token 4-head value tiles across even and odd row counts."
     )]

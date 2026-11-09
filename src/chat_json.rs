@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Number, Value};
 use std::fmt;
 #[derive(Clone, Debug)]
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Share ordered JSON with sibling PEG builders while keeping its representation private to the crate"
 )]

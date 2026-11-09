@@ -21,7 +21,7 @@ const DONE: u32 = 4;
 
 // Protocol adaptation only: all matching, budget state and logit mutation are
 // implemented by the independently usable production runtime sampler.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep typed action validation and handle ownership together; behavior is in the production sampler."
 )]

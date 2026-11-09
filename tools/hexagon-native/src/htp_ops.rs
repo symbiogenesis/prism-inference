@@ -100,7 +100,7 @@ pub const HTP_DMA32_MAX_STRIDE_BYTES: u32 = 0x00ff_ffff;
 
 /// Returns `true` when `stride_bytes` exceeds the 24-bit stride limit of a 32-bit Hexagon DMA descriptor.
 #[must_use]
-#[allow(
+#[expect(
     clippy::as_conversions,
     reason = "u32 -> u64 widening is lossless and const-compatible."
 )]
@@ -110,7 +110,7 @@ pub const fn requires_dma64_stride(stride_bytes: u64) -> bool {
 
 /// Compute the 64-bit `(shift << 32) | magic` fast-division constant used by `htp_kparams_solve`.
 #[must_use]
-#[allow(
+#[expect(
     clippy::as_conversions,
     reason = "u64::from(u32) is not yet usable in const fn on stable Rust; u32 -> u64 widening is lossless"
 )]

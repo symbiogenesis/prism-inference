@@ -2,9 +2,8 @@
 //!
 //! PrismML-Eng/llama.cpp b87ca7225456b06b0975b8239c66b5aecf07e37c;
 //! upstream MIT attribution is retained in tools/prism/upstream/LICENSE.
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
-    clippy::needless_range_loop,
     reason = "Preserve the original scalar arithmetic order and explicit tensor index formulas."
 )]
 
@@ -227,9 +226,8 @@ impl WindowsRandom {
 }
 struct ColRandom(u64);
 impl ColRandom {
-    #[allow(
+    #[expect(
         clippy::as_conversions,
-        clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
         reason = "The original cast converts a masked 24-bit integer, exactly representable as f32."
     )]

@@ -61,7 +61,7 @@ impl Random {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "The top24 unsigned bits fit exactly in IEEE binary32, matching MSVC generate_canonical<float,24>."
@@ -71,7 +71,7 @@ impl Random {
     }
 
     /// Reproduces MSVC's two-draw, 53-bit canonical double distribution.
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         clippy::suboptimal_flops,
@@ -82,7 +82,7 @@ impl Random {
         ((bits as f64) * (1.0 / 9_007_199_254_740_992.0)) * (high - low) + low
     }
     /// Reproduces the source `uniform_real_distribution<float>` evaluation order.
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Separate subtract, multiply and add preserve the C++ distribution's binary32 roundings."
     )]
@@ -109,7 +109,7 @@ impl Normal {
     }
 
     /// Draws one sample with the installed STL's rejection and scaling choices.
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "The installed STL explicitly rounds these multiply/add steps; fused arithmetic changes source inputs."
     )]
@@ -147,7 +147,7 @@ impl Normal {
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "The polar algorithm's bounded exponent -23..0 converts exactly to binary32."

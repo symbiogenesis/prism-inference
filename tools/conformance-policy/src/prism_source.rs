@@ -468,7 +468,7 @@ fn merge(request: &Value) -> Result<Value> {
 /// # Errors
 /// Rejects malformed identities, unsafe or oversized artifacts, foreign receipts,
 /// and missing, duplicate or misplaced source results.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "Maintenance command dispatch transfers ownership through the shared command API."
 )]

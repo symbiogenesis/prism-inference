@@ -71,10 +71,6 @@ fn functions(driver: &Driver) -> Result<Functions, Error> {
     })
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "The fixed compute sibling shares exactly the existing guarded package path policy"
-)]
 pub(super) fn package_guards(package: &Path, architecture: u32) -> Result<Vec<File>, Error> {
     if !package.is_absolute()
         || package.components().any(|part| match part {
@@ -118,10 +114,6 @@ pub(super) fn package_guards(package: &Path, architecture: u32) -> Result<Vec<Fi
         .collect()
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Only the safe parent can consume the private native driver"
-)]
 pub(super) fn probe(
     mut driver: Driver,
     package: &Path,
@@ -163,10 +155,6 @@ const _: () = assert!(size_of::<ReferenceProcessRequest>() == 8);
 const _: () = assert!(align_of::<ReferenceProcessRequest>() == 4);
 const _: () = assert!(std::mem::offset_of!(ReferenceProcessRequest, enable) == 4);
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "The safe API exposes a separately named fixed reference initialization only"
-)]
 pub(super) fn reference_probe(
     mut driver: Driver,
     package: &Path,

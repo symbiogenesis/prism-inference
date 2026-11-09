@@ -527,7 +527,7 @@ impl<F: FnMut(u64, &mut [u8]) -> Result<usize>> Reader<F> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the native GGUF header, key, tensor and blob transaction together so failures cannot expose partial contexts."
 )]

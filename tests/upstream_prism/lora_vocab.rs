@@ -125,7 +125,7 @@ fn added(token: &Value, phi: bool) -> Result<(String, i32)> {
 fn token_text(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value["content"].as_str())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "keep the ordered original special-token precedence in one auditable conversion"
 )]
@@ -260,7 +260,7 @@ fn special(
     }
     Ok(())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "three source vocabulary paths share the final production metadata serialization"
 )]

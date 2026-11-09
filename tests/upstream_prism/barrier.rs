@@ -28,7 +28,7 @@ fn array(value: &Value) -> Result<&[Value]> {
 }
 
 /// Marshal graph, plan and compute actions to the production persistent worker pool.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Only graph construction and supplied action serialization occur in this adapter."
 )]

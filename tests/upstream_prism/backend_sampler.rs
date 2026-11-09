@@ -1,6 +1,6 @@
 //! Complete Rust-owned backend-sampler source schedules and comparisons.
 //! Pinned upstream b87ca7225456b06b0975b8239c66b5aecf07e37c, MIT.
-#![allow(
+#![expect(
     clippy::many_single_char_names,
     clippy::similar_names,
     reason = "Source arithmetic and sampler/reference identifiers remain aligned with the original C++ comparisons."
@@ -164,7 +164,7 @@ impl Run {
         self.serial += 1;
         self.directory.join(format!("{label}-{}.bin", self.serial))
     }
-    #[allow(
+    #[expect(
         clippy::needless_pass_by_value,
         reason = "Temporary JSON constructor parameters are consumed semantically by the owned wire request."
     )]
@@ -318,7 +318,7 @@ impl Run {
     fn index(c: &Context, seq: i32) -> i32 {
         c.last.get(&seq).copied().unwrap_or(-1)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         clippy::fn_params_excessive_bools,
         reason = "Independent flags request exactly the source production getters without extra observations."
@@ -544,7 +544,7 @@ fn bias(n: usize, token: i32, value: f32) -> (&'static str, Value) {
     )
 }
 impl Run {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keeping each source scenario in one schedule makes its original ordering and checks reviewable."
     )]
@@ -923,7 +923,7 @@ impl Run {
         h.extend(self.tokenize_retry(prompt, 64)?);
         Ok(h)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Arguments mirror the original penalty comparison helper and its explicit schedule."
     )]
@@ -1018,7 +1018,7 @@ impl Run {
         )?;
         self.check(stats.mismatch == 0, "top-k penalties CPU/backend mismatch")
     }
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Parameters mirror the source's masking-penalties matrix without hidden defaults."
     )]
@@ -1150,7 +1150,7 @@ impl Run {
         self.check(failed == 0, "penalty parameter value comparison failures")
     }
 }
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The original double distribution is assigned to a float before each CDF comparison."
@@ -1325,7 +1325,7 @@ impl Run {
         self.release("context", c.id)?;
         self.free_sampler(s)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keeping each source scenario in one schedule makes its original ordering and checks reviewable."
     )]
@@ -1617,7 +1617,7 @@ pub(super) fn diagnostic(engine: &Engine, value: &Value) -> Result<Value> {
     exact_fields(value, &["Kind", "Options"])?;
     run_with_options(engine, &serde_json::from_value(value["Options"].clone())?)
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The bounded session initialization and full source-case dispatch share one explicit cleanup scope."
 )]

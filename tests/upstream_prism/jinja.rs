@@ -77,7 +77,7 @@ fn path(value: &Value) -> Result<Vec<PathSegment>> {
 }
 
 /// Observe the reusable production Jinja API without adding execution to the harness.
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "Keep the fallible optional-operation dispatch signature shared by engine adapters"
 )]
@@ -608,7 +608,7 @@ impl Random {
         value ^ (value >> 18)
     }
 
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_possible_truncation,
         reason = "The distribution explicitly splits the 64-bit product into low and high 32-bit words."

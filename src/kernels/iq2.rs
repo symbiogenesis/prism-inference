@@ -6,7 +6,7 @@
 //! no alignment, host endianness, or decoded matrix is assumed. `IQ2_S` also
 //! exposes the pinned reference and importance fit; `IQ2_XXS/XS` do not.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::suboptimal_flops,

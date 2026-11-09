@@ -5,7 +5,7 @@
 //! its original activation quantizer, ordered block accumulation and pinned
 //! PTQ1 four-lane reduction. No decoded matrix survives this call.
 
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep graph-consumed tile types crate scoped inside the private kernel module."
 )]
@@ -123,7 +123,7 @@ impl ProjectionTile {
         self.project_with_previous(None, tensor, inputs, outputs, pinned, check)
     }
 
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         clippy::too_many_lines,
         reason = "Retain the separately rounded source arithmetic and auditable packed block order."
@@ -579,10 +579,6 @@ mod tests {
 
     #[cfg(feature = "parallel-rows")]
     #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep exact format/backend/tile parity and malformed-row recovery in one control."
-    )]
     fn tiled_parallel_projection_matches_serial_and_recovers() -> Result<()> {
         for workers in [2, 4] {
             let parallelism = RowParallelism::new(workers)?;
@@ -809,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Cover 8-row and 4-row PQ2/PTQ1 GEMM groups, remainder rows and mid-group error/cancel recovery together."
     )]

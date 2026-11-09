@@ -36,7 +36,7 @@ pub(super) fn hmx_projection(
     projection_native::run_hmx(driver, package, limits, progress, work)
 }
 
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "Safe crate root wraps the native session handle."
 )]
@@ -265,10 +265,6 @@ fn entered(
     progress(report);
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Only the safe parent consumes the native driver"
-)]
 pub(super) fn probe(
     driver: Driver,
     package: &Path,
@@ -277,10 +273,6 @@ pub(super) fn probe(
     probe_fixture(driver, package, progress, compute::ComputeFixture::F32)
 }
 
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "Only the safe parent selects one of four private fixed compute controls"
-)]
 pub(super) fn probe_fixture(
     driver: Driver,
     package: &Path,
@@ -361,7 +353,7 @@ fn open_module(
     Ok((report, Some((handle, domain, calls))))
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep one fixed operation's registration, submission and completion sequence linear for ownership review"
 )]
@@ -596,7 +588,7 @@ fn read_reply(
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Cleanup consumes one fixed exact domain/FD/address tuple and its live owners"
 )]
@@ -622,7 +614,7 @@ struct ExtraExtent {
     allocation_bytes: usize,
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Explicit cleanup retains one exact mapped allocation tuple and its native owners"
 )]
@@ -651,7 +643,7 @@ fn cleanup_extent(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Explicit cleanup retains one exact primary mapped allocation tuple plus optional secondary weight arenas"
 )]

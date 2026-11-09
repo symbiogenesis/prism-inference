@@ -322,7 +322,7 @@ impl Arena {
         }
         self.expression(&graph["Root"], &locals, depth + 1)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep declarative builder operation ordering identical to the production bridge"
     )]

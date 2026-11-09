@@ -142,7 +142,7 @@ impl Runtime {
         pos.insert(0, value);
         self.builtin(name, pos, kw)
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::needless_pass_by_value,
         reason = "Keep source callable dispatch together with owned evaluated argument buffers"
@@ -835,7 +835,7 @@ impl Runtime {
             _ => Err(invalid(format!("unsupported Jinja builtin {name}"))),
         }
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep the exhaustive source predicate name dispatch together"
     )]

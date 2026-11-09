@@ -324,7 +324,7 @@ impl Totals {
         self.spec_seconds += other.spec_seconds;
     }
 }
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Original double ratios of counters bounded by256 prompts and2048 tokens; all counts are exactly representable."
@@ -342,7 +342,7 @@ struct SpecOutput {
     timing: Value,
     warning: bool,
 }
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Retain the source's single speculative round schedule and shared depth counters."
@@ -467,7 +467,7 @@ fn speculative(
 pub(super) fn run(engine: &Engine) -> Result<Value> {
     run_with_options(engine, &Options::default())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Retain the source's model ownership and ordered prompt loop in one scope."
 )]

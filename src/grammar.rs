@@ -320,7 +320,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "One source-ordered grammar sequence state machine retains the pinned lowering rules."
     )]

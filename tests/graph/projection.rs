@@ -50,7 +50,7 @@ impl Pq2ProjectionExecutor for ReferenceExecutor {
             .matvec_into(tensor, output)
     }
 
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         clippy::suboptimal_flops,
@@ -119,7 +119,7 @@ impl Pq2ProjectionExecutor for ReferenceExecutor {
         }
         Ok(())
     }
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         clippy::suboptimal_flops,

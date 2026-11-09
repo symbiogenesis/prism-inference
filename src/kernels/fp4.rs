@@ -1,12 +1,11 @@
 //! Pinned microscaled and NVIDIA FP4 reference codecs and packed `Q8_0` dots.
 //! Ported from ggml-quants.c, ggml-impl.h and ggml-cpu/quants.c (upstream MIT).
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::float_cmp,
     clippy::suboptimal_flops,
     reason = "Pinned FP4 bit encodings and native multiply/add association are explicit format arithmetic."
 )]

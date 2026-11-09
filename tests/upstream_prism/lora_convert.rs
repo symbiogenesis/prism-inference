@@ -137,7 +137,7 @@ fn float(config: &Value, key: &str) -> Result<f32> {
     let value = config[key]
         .as_f64()
         .ok_or_else(|| invalid(format!("HF float missing: {key}")))?;
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::as_conversions,
         reason = "GGUF F32 metadata matches the original converter's explicit float32 serialization"
@@ -348,7 +348,7 @@ pub(super) struct Converted {
     pub(super) adapter: PathBuf,
     pub(super) receipt: Value,
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "keep original base and paired adapter transformations together with full tensor coverage checks"
 )]

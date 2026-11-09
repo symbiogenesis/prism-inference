@@ -105,7 +105,7 @@ impl MetadataValueRef<'_> {
 
     /// Returns a number, promoting integers with ordinary binary64 rounding.
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::as_conversions,
         reason = "Numeric metadata access explicitly permits integer-to-binary64 rounding."

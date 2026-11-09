@@ -426,7 +426,7 @@ impl Converter {
         self.resolving.remove(reference);
         result
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Preserve both source object-order alternatives and optional-field recursion together"
     )]
@@ -622,7 +622,7 @@ impl Converter {
         self.depth -= 1;
         result
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Preserve the pinned converter's ordered schema keyword precedence"
     )]

@@ -107,7 +107,7 @@ fn verdict(variant: Variant, observed: &Value) -> Result<bool> {
         !loaded && guard
     })
 }
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "source adapter returns an explicit measured failure result"
 )]

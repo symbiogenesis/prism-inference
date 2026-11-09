@@ -1,7 +1,7 @@
 // Copyright (c) 2023-2026 The ggml/llama.cpp authors
 // SPDX-License-Identifier: MIT
 //! Native legacy affine and five-bit row codecs, without decoded matrix storage.
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
     clippy::suspicious_operation_groupings,
     reason = "Preserve the pinned scalar quantizer's separate binary32 arithmetic."

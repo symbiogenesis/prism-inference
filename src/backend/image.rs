@@ -20,9 +20,8 @@ fn cubic(values: [f32; 4], position: f32) -> f32 {
 }
 
 impl CpuBackend {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
-        clippy::many_single_char_names,
         reason = "Pinned image kernels retain conventional pixel coordinates and exact arithmetic order."
     )]
     pub(super) fn image_values(&self, info: &TensorInfo, input: &[f32]) -> Result<Vec<f32>> {

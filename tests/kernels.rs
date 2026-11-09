@@ -4,11 +4,6 @@
 //! Expected quantized results below follow the C reference integer sums,
 //! independently of float row decoding, and deliberately differ from float dots.
 
-#![allow(
-    clippy::float_cmp,
-    reason = "Fixtures require exact representable reference values."
-)]
-
 use std::sync::Arc;
 
 use bonsai_prism_runtime::kernels::{

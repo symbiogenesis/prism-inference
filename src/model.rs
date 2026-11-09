@@ -133,11 +133,6 @@ impl Model {
     /// # Errors
     /// Returns the same errors as [`Self::load`], plus callback failure or
     /// cancellation, including cancellation at the final callback.
-    #[allow(
-        clippy::as_conversions,
-        clippy::cast_precision_loss,
-        reason = "The pinned loader reports byte-weighted progress as binary32."
-    )]
     pub fn load_with_progress(
         path: &Path,
         expected_bytes: u64,
@@ -155,7 +150,7 @@ impl Model {
         Self::load_verified(reader, expected_sha256, memory_limit, progress)
     }
 
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "The pinned loader reports byte-weighted progress as binary32."

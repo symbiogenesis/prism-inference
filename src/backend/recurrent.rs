@@ -13,10 +13,6 @@ fn float(params: &[u8; 64], index: usize) -> f32 {
 }
 
 impl CpuBackend {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "The state scan retains source traversal, recurrence order, and reverse snapshot slots."
-    )]
     pub(super) fn scan_values(&self, info: &TensorInfo, mut output: Vec<f32>) -> Result<Vec<f32>> {
         let inputs = info
             .sources
@@ -52,7 +48,7 @@ impl CpuBackend {
                     let delta = if delta > 20.0 {
                         delta
                     } else {
-                        #[allow(
+                        #[expect(
                             clippy::imprecise_flops,
                             reason = "The pinned scan helper rounds 1+exp before logf."
                         )]

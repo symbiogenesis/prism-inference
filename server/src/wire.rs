@@ -1,6 +1,6 @@
 //! Shared HTTP wire mechanics; request and response policy stays with callers.
 
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep shared HTTP helpers explicitly crate scoped"
 )]

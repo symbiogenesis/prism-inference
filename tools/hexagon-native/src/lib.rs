@@ -185,7 +185,7 @@ pub struct CapabilityRequest {
 /// This observes allocation/host access/mapping APIs only, never DSP compute or
 /// DMA. A poisoned result pins uncertain resources until supervised process death.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "The diagnostic receipt must retain each independent completed or failed native step"
 )]

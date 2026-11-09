@@ -99,7 +99,7 @@ impl<'a> HmxQ8Executor<'a> {
             .checked_add(4096)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::suboptimal_flops,
         reason = "Keep prevalidation, complete tile verification and original float reduction order together."
@@ -308,7 +308,7 @@ fn pack_lanes(block: &[u8], kind: u32, group: usize, row: usize, output: &mut [u
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,

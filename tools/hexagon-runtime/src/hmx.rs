@@ -207,12 +207,8 @@ impl<'a> HmxQ2Executor<'a> {
         Ok(Some(cache.commit(tensor, first_handle)))
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
-        clippy::as_conversions,
-        clippy::cast_possible_truncation,
-        clippy::cast_precision_loss,
-        clippy::suboptimal_flops,
         reason = "Checked integral plane dots reconstruct an exact bounded i32 before declared fused/nonfused F32 reduction."
     )]
     fn project_inner(
@@ -521,7 +517,7 @@ impl Pq2ProjectionExecutor for HmxQ2Executor<'_> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -610,7 +606,7 @@ fn accumulate_batch<const B: usize>(
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::float_cmp,

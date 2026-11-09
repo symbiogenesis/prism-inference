@@ -66,7 +66,7 @@ pub(super) const NAMES: &[&str] = &[
 fn trim(value: &str) -> &str {
     value.trim_matches(|ch: char| ch.is_ascii_whitespace())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Preserve the source template detector's ordered precedence checks"
 )]
@@ -207,7 +207,7 @@ pub(super) fn detect(source: &str) -> Option<&'static str> {
     })
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the source legacy template format dispatch and stateful turn transitions together"
 )]

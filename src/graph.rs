@@ -206,7 +206,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Pass explicit RMSNorm parameters, Hadamard block geometry, and reusable output buffers."
     )]
@@ -245,7 +245,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Pass explicit residual delta, RMSNorm parameters, Hadamard block geometry, and reusable output buffers."
     )]
@@ -426,7 +426,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Preserve separate multiply/add rounding for generic graph convolution."
     )]
@@ -586,7 +586,7 @@ impl Arithmetic {
     }
 
     #[cfg(test)]
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::as_conversions,
         reason = "Preserve the generic graph's binary64 accumulation and final binary32 rounding."
@@ -679,7 +679,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens."
     )]
@@ -749,7 +749,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Keep immutable previous state, mutable state output and scalar GDN step parameters explicit."
     )]
@@ -796,9 +796,8 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
-        clippy::suboptimal_flops,
         reason = "Keep multi-token GDN row recurrence parameters and exact single-token rounding order explicit."
     )]
     fn gdn_step_row_tokens_from(
@@ -843,7 +842,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Keep 4-row GDN step parameters explicit."
     )]
@@ -873,7 +872,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Keep 4-row multi-token GDN recurrence parameters explicit."
     )]
@@ -925,7 +924,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Keep 8-row GDN step parameters explicit."
     )]
@@ -959,7 +958,7 @@ impl Arithmetic {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Keep 8-row multi-token GDN recurrence parameters explicit."
     )]
@@ -1272,7 +1271,7 @@ struct Transforms {
 }
 
 impl Transforms {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and graph operation order auditable together."
     )]
@@ -1451,7 +1450,7 @@ impl Transforms {
             && self.signs.get(&len).is_none_or(|signs| signs.len() >= len)
     }
 
-    #[allow(
+    #[expect(
         clippy::option_option,
         reason = "Outer Option indicates whether the FFN chain is eligible; inner Option<u32> carries the optional down-projection Hadamard block size."
     )]
@@ -1491,8 +1490,7 @@ impl Transforms {
         self.project_group_into_with_executor(weights, input, geometry, outputs, scratch, &mut None)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep scoped execution separate from CPU scratch and exact transform ownership."
     )]
@@ -1693,10 +1691,6 @@ impl Transforms {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep grouped-value permutation, fused sign-Hadamard blocks, and parallel chunking together."
-    )]
     fn transform_into_with_parallelism(
         &self,
         weight: &Tensor,
@@ -2071,7 +2065,7 @@ impl Qwen35 {
     /// Rejects zero budgets, budgets above [`MAX_STATE_BYTES`], a graph whose
     /// maximum live-state element payload exceeds the budget, and the same
     /// malformed model/allocation errors as [`Self::new`].
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and graph operation order auditable together."
     )]
@@ -2546,10 +2540,6 @@ impl Qwen35 {
         self.workspace.projection.matvec.statistics()
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep validation and transactional graph operation order auditable together."
-    )]
     fn evaluate_token_into(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
         const fn coerce_executor<'a>(
             executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
@@ -2566,7 +2556,7 @@ impl Qwen35 {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and transactional graph operation order auditable together."
     )]
@@ -3034,7 +3024,7 @@ impl Evaluation<'_, '_> {
         )
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Separate immutable committed state from reusable transactional scratch."
     )]
@@ -3120,12 +3110,9 @@ impl Evaluation<'_, '_> {
             })
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        clippy::suboptimal_flops,
-        clippy::cast_possible_truncation,
-        clippy::as_conversions,
         reason = "Preserve scalar nonflash F16 matmul inputs and binary64 accumulation rounded to binary32."
     )]
     fn full_attention_state(
@@ -3418,7 +3405,7 @@ impl Evaluation<'_, '_> {
             )
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Separate immutable committed state from reusable transactional scratch."
     )]
@@ -3488,16 +3475,15 @@ impl Evaluation<'_, '_> {
         )
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and graph operation order auditable together."
     )]
-    #[allow(
-        clippy::suboptimal_flops,
+    #[expect(
         clippy::imprecise_flops,
         reason = "Match the pinned scalar GDN operations, including logf(1+expf(x))."
     )]
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "Separate immutable committed state from reusable transactional scratch."
     )]
@@ -4131,7 +4117,7 @@ fn array<'a>(metadata: &'a Metadata, key: &str) -> Result<&'a MetadataArray> {
         .ok_or_else(|| invalid(format!("metadata must be an array: {key}")))
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
@@ -4396,7 +4382,7 @@ fn add_finite(target: &mut [f32], other: &[f32], operation: &str) -> Result<()> 
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     clippy::as_conversions,
     reason = "Bounded token positions are converted to the same binary32 RoPE input as Prism."
@@ -4424,7 +4410,7 @@ fn rope_frequencies(
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve separate multiply/add rounding in the scalar RoPE reference."
 )]

@@ -3,7 +3,7 @@
 //! All packet fields are encoded explicitly from ggml's pinned `htp-ops.h` at
 //! `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. This is an access diagnostic,
 //! never a Swift arithmetic, performance, deployment or admission qualification.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Private packet helpers remain accessible only to their safe parent and native sibling"
 )]
@@ -58,7 +58,7 @@ pub(crate) const STOP_SCALARS: u32 = 0x0300_0000;
 
 /// Independent observations of one consuming terminal queue operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Keep independently completed native operations separate in evidence"
 )]

@@ -100,7 +100,7 @@ fn uniform(from: &str, to: &str) -> Result<String> {
 }
 
 /// Preserves the upstream decimal grammar and unbounded `i64` sentinels.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The signed decimal branches retain the pinned converter's exact grammar formatting."
 )]

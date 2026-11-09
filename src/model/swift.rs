@@ -232,7 +232,7 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
     validate_metadata_for(metadata, Representation::Pq2)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the exact shared metadata contract and representation discriminator together."
 )]

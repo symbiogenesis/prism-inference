@@ -225,7 +225,7 @@ fn raw_equal(host: &Production<'_, '_>, a: &Path, b: &Path, bytes: u64) -> Resul
     Ok(true)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Every original callback branch and early-return condition is kept in source order in one comparison loop."
 )]

@@ -102,7 +102,7 @@ pub struct SpeculativeStats {
 impl SpeculativeStats {
     /// Fraction of proposed draft tokens accepted by the target verifier in `[0.0, 1.0]`.
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "Diagnostic acceptance ratio converts bounded token counts to f64."

@@ -3,7 +3,7 @@
 //! Candidate filters preserve backing storage and view offsets. Seeded draws
 //! reproduce the Windows MSVC MT19937 canonical float/double distributions.
 //! The experimental [`super::ReferenceSampler`] retains its independent contract.
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
     reason = "Keep the pinned native sampler's separate floating-point operation roundings."
 )]
@@ -342,7 +342,7 @@ impl State {
     ///
     /// # Errors
     /// Rejects an empty active candidate view or internal invalid random state.
-    #[allow(
+    #[expect(
         clippy::float_cmp,
         reason = "Native penalty identity values disable exactly, without an epsilon domain change."
     )]
@@ -590,7 +590,7 @@ fn temperature_filter(candidates: &mut Candidates, temperature: f32) {
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -628,7 +628,7 @@ fn extended_temperature(candidates: &mut Candidates, temperature: f32, delta: f3
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Native distribution stores double-normalized probabilities into binary32."
@@ -788,7 +788,7 @@ fn xtc(
     }
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Bounded native integer token counts convert to binary32 before penalties."
@@ -817,7 +817,7 @@ fn penalties(
     candidates.sorted = false;
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -917,7 +917,7 @@ fn repeat_lengths(reversed: &[i32], limit: usize) -> Vec<usize> {
     lengths
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1030,7 +1030,7 @@ impl Random {
             }
         }
     }
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "24-bit and 53-bit canonical integers are exactly representable in their destination floats."
@@ -1038,7 +1038,7 @@ impl Random {
     fn float(&mut self) -> f32 {
         (self.next() >> 8) as f32 * (1.0 / 16_777_216.0)
     }
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         reason = "MSVC canonical double uses low21+high32 bits, yielding an exact 53-bit integer."

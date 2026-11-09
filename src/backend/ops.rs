@@ -105,7 +105,7 @@ fn unary(op: i32, x: f32, p: &[u8; 64]) -> Result<f32> {
 }
 
 impl CpuBackend {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::many_single_char_names,
         reason = "Pinned numerical operation dispatch retains conventional operand and matrix-axis names."

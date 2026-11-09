@@ -66,11 +66,6 @@ fn wait_for_tile_tasks(
 impl RowParallelism {
     /// Fill disjoint token-major row slices without duplicating weight decoding.
     /// The callback stays on its calling thread and needs neither `Send` nor `Sync`.
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "Keep scoped borrows, joined cancellation and bounded stack task storage together."
-    )]
     pub(in crate::kernels) fn fill_tile<const TOKENS: usize>(
         &self,
         data: &[u8],
@@ -177,7 +172,7 @@ impl RowParallelism {
         check()
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "Keep scoped borrows, eight/four-row batching, joined cancellation and bounded stack task storage together."
@@ -523,10 +518,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep ordered numerical failure, joined callback cancellation and replay in one control."
-    )]
     fn tiled_parallel_rows_join_cancellation_and_select_first_row_failure() -> Result<()> {
         let policy = RowParallelism::new(2)?;
         let data = [0_u8, 1, 2, 3, 4, 5, 6, 7];
@@ -596,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::panic,
         reason = "Inject a worker unwind to verify its completion guard and joined scope."
     )]

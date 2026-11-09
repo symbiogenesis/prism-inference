@@ -1,12 +1,11 @@
 //! Native 256-element ternary codecs, `TL1` nibble lookup tables and packed `Q8_K` dot products.
 //! Ported from pinned ggml-quants.c and ggml-cpu/quants.c; upstream MIT LICENSE.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::float_cmp,
     clippy::suboptimal_flops,
     reason = "Pinned ternary encoding uses bounded integer casts and exact-zero scale branches."
 )]

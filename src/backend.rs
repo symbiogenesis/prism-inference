@@ -4,7 +4,7 @@
 //! graph execution writes through aliases. Unsupported operations are errors;
 //! support queries never advertise an operation without a numerical kernel.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

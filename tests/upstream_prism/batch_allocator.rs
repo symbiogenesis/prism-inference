@@ -317,7 +317,7 @@ struct Batch {
     token: Option<i32>,
 }
 impl Batch {
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "Preserve the source embedding fixture's arithmetic expression."
     )]
@@ -347,7 +347,7 @@ impl Batch {
             "MemoryRanges":options.memory.map(|ranges|ranges.into_iter().map(|(id,min,max)|json!({"Sequence":id,"Min":min,"Max":max})).collect::<Vec<_>>())})
     }
 }
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Independent source batch pointer-presence and output-all options."
 )]
@@ -428,7 +428,7 @@ impl Case {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Literal source case construction and expected assertions remain in the original order for parity review."
 )]

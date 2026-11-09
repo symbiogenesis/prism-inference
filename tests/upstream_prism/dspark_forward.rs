@@ -80,7 +80,7 @@ fn bytes(values: &[f32]) -> Vec<u8> {
         .flat_map(|v| v.to_bits().to_le_bytes())
         .collect()
 }
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "source scalar oracle explicitly rounds F64 dot sums to F32"
@@ -150,7 +150,7 @@ impl Harness {
             Err(invalid(message))
         }
     }
-    #[allow(
+    #[expect(
         clippy::needless_pass_by_value,
         reason = "wire composition accepts owned caller operations like the session client"
     )]
@@ -556,7 +556,7 @@ fn trace_value<'a>(traces: &'a BTreeMap<String, Vec<f32>>, name: &str) -> Result
         .map(Vec::as_slice)
         .ok_or_else(|| invalid(format!("required source trace absent {name}")))
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::float_cmp,
     clippy::suboptimal_flops,
@@ -841,7 +841,7 @@ fn best(logits: &[f32], vocabulary: usize) -> Result<Vec<i32>> {
     }
     logits.chunks_exact(vocabulary).map(argmax).collect()
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "preserve the source top-k/depth/variant/repetition nesting and negative-mask schedule"
 )]
@@ -962,7 +962,7 @@ fn runtime_ab(h: &mut Harness, path: &Path, options: &ForwardOptions) -> Result<
         json!({"Mode":"runtime-ab-cpu","Forwards":checks,"NegativeMaskCases":negative_checks,"Rows":rows,"Repetitions":3,"VariantOrder":[0,4,1,2,3]}),
     )
 }
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "wire composition accepts owned caller operations like the session client"
 )]
@@ -973,7 +973,7 @@ fn observed(h: &mut Harness, operation: Value, kind: &str, label: &str) -> Resul
     )?;
     h.check(value["Exception"]["Kind"] == kind, label)
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "full prefix shape/capture, positive replay and eight negative contracts preserve source order"
 )]
@@ -1351,8 +1351,7 @@ const fn phase_name(mode: ForwardMode) -> &'static str {
         ForwardMode::Tier2 => "tier2",
     }
 }
-#[allow(
-    clippy::too_many_lines,
+#[expect(
     clippy::unnecessary_wraps,
     reason = "bounded named source phases preserve all CPU modes and report failures through the shared case result API"
 )]

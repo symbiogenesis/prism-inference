@@ -1,5 +1,5 @@
 //! Fixed signed-source HMX bitplane packet and bounded terminal-session inputs.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Packet helpers are shared only with the audited native sibling"
 )]
@@ -681,10 +681,6 @@ pub(crate) fn image_batch_resident<const B: usize, const CMD_PAD: usize>(
     Ok(active)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep batched tensor descriptors, op descriptors and output poison regions auditable together"
-)]
 fn frame_batch<const B: usize, const CMD_PAD: usize>(
     bytes: &mut [u8],
     base: u64,
@@ -878,7 +874,7 @@ fn frame(
     Ok(active)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::float_cmp,
@@ -1047,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep both streaming and resident batch-four frame layout checks together"
     )]
@@ -1188,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep both streaming and resident batch-ten frame layout checks together"
     )]

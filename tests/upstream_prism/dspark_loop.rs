@@ -122,7 +122,7 @@ fn independent_reference() -> Result<Value> {
         json!({"n_embd_cap":128,"block_size":7,"vocab_size":256,"mask_token_id":255,"prefill_bonus":bonus(-1,256,255)?,"rounds":rounds,"ReferenceProvenance":{"Implementation":"safe scalar Rust; no SUT observations","DeepSpecRevision":"005e03b81cec38b7da6399833d609ee89a2587f2","Equations":["qwen3/modeling.py _forward_backbone","markov_head.py VanillaMarkov","eval/dspark/draft_ops.py cache crop"],"MissingOriginalGenerator":"dspark_phase2_py_ref.py is not present in pinned source or its introduction commit","Coverage":"one entire explicit seven-entry ACCEPT_SCHEDULE cycle","PublishedSources":super::dspark_reference::Reference::provenance()?}}),
     )
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::unnecessary_wraps,
     reason = "all source loop predicates and stage/accept ordering remain together"

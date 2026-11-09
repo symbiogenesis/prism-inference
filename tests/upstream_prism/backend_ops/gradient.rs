@@ -25,7 +25,7 @@ fn perturb(
     host.graph.push(json!({"Op":"tensor-set","Tensor":parameter,"File":input,"FileOffset":input_index*4,"TensorOffset":coordinate*4,"Bytes":4}));
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The ordered per-parameter and per-coordinate loop preserves the source's early returns, restores and two/four-point arithmetic."
 )]

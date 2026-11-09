@@ -298,7 +298,7 @@ impl RustState {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep primitive request validation and per-item error framing together"
     )]

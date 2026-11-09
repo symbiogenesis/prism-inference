@@ -14,7 +14,7 @@ pub(super) struct Driver {
     serial: Arc<AtomicU64>,
 }
 #[derive(Clone)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Independent production trait function availability is copied without inferred capabilities."
 )]

@@ -444,7 +444,7 @@ impl State {
         }
         Ok(json!({}))
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Each action only serializes a production backend observation."
     )]

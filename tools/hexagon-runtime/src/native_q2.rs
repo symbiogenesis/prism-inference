@@ -661,7 +661,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep resident cache lookup, pre-warmed first-hit evaluation and fallback tiling auditable together."
     )]
@@ -835,7 +835,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         self.validate_f32_group(tensors).is_some()
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep resident group preparation, 2/3-op dispatch and output validation together."
     )]
@@ -962,7 +962,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep multi-token 4/3/2/1-op resident dispatch and fallback together."
     )]
@@ -1145,7 +1145,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep 2-token sibling pair 4-op resident dispatch and odd-tail handling together."
     )]
@@ -1347,7 +1347,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep 4-token and 2-token sibling triple resident dispatch and tail handling together."
     )]
@@ -1845,7 +1845,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep 2-token 6-op fused FFN SwiGLU resident dispatch and odd-tail handling together."
     )]
@@ -2063,7 +2063,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         result
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep full intra-layer FFN VTCM chain validation, resident preparation and statistics together."
     )]
@@ -2594,7 +2594,7 @@ mod tests {
         residency_bytes: usize,
     }
 
-    #[allow(
+    #[expect(
         clippy::suspicious_operation_groupings,
         clippy::suboptimal_flops,
         reason = "Test mock compares handle geometry against activation/output slice lengths."
@@ -3018,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::similar_names,
         reason = "Keep single-token and multi-token 2/3-sibling batching assertions together."

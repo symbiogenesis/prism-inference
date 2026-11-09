@@ -16,7 +16,7 @@ struct CpuSubmitter {
     fail_member: Option<usize>,
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     reason = "Fixture dots are exact small integers and plane inputs are explicitly binary."

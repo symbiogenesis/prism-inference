@@ -127,11 +127,11 @@ fn new_output(path: &Path) -> Result<File> {
 
 /// Writes a new experimental export, retaining any partial file on failure.
 /// The caller verifies the independently pinned source and codec identities.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the validated streamed serialization and its receipt in one operation."
 )]
-#[allow(
+#[expect(
     clippy::redundant_pub_crate,
     reason = "The export helper is an internal operation behind the validated public API"
 )]

@@ -87,7 +87,7 @@ fn interval(host: &mut Production<'_, '_>, backend: u32, graph: u32) -> Result<i
     Ok(end - start)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "The original warmup, graph duplication, memory accounting and minimum-duration loop are preserved in source order."
 )]

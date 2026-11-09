@@ -688,7 +688,7 @@ fn original_dimensions(shape: &[u64; 4], variant: u32) -> usize {
     }
     if matches!(variant, 2040 | 2045) { 2 } else { 1 }
 }
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -706,7 +706,7 @@ struct Handcrafted {
     tensors: Vec<TensorInput>,
     data_offset: usize,
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep all original malformed input branches together for exact source generator parity review."
 )]
@@ -888,7 +888,7 @@ impl ContextInput {
         json!({"Entries":self.entries.iter().map(Entry::descriptor).collect::<Vec<_>>(),"Tensors":self.tensors.iter().map(TensorInput::descriptor).collect::<Vec<_>>()})
     }
 }
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     clippy::as_conversions,
     reason = "Windows mt19937 unsigned arithmetic is converted to float by the original setter expression."

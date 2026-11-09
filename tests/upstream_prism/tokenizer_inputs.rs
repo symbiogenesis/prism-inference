@@ -150,7 +150,7 @@ pub(super) fn materialize(bytes: &[u8], row: &Value) -> Result<Vec<u8>> {
     }
     Ok(output.into_bytes())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep complete26-case source and input identity verification together"
 )]

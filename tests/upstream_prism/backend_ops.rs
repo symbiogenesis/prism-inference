@@ -6,12 +6,12 @@
 //! production GGML calls; generation, references and every decision belong here.
 
 #![forbid(unsafe_code)]
-#![allow(
+#![expect(
     clippy::float_cmp,
     clippy::suboptimal_flops,
     reason = "Source comparisons are exact and its separate multiply/add rounding must be preserved."
 )]
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

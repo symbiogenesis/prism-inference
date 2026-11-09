@@ -273,7 +273,7 @@ pub(super) trait Provider {
 }
 
 /// Preserves the original helper's case-sensitive suffix and preference rules.
-#[allow(
+#[expect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "The original helper uses the exact lowercase .gguf suffix."
 )]

@@ -24,7 +24,7 @@ fn state_values(graph: &Qwen35) -> Result<Vec<f32>> {
     Ok(result)
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Retain the declared separately rounded absolute-plus-relative tolerance."
 )]

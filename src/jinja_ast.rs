@@ -442,7 +442,7 @@ enum Segment {
     Expression(String),
     Statement(String),
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep delimiter scanning and adjacent whitespace ownership in a single pass"
 )]
@@ -579,7 +579,7 @@ impl Statements {
         self.position += 1;
         Ok(())
     }
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep source statement block nesting and expression ownership together"
     )]

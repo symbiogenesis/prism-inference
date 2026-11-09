@@ -73,7 +73,7 @@ fn decode(packed: &[u8]) -> Result<Vec<f32>> {
     Ok(decoded)
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::suboptimal_flops,
@@ -96,7 +96,7 @@ fn reference(input: &Pq2Input) -> Result<Vec<f32>> {
 }
 
 // Preserve upstream rel_rms, including its all-zero reference behavior.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Preserve upstream separate multiplication and addition."
 )]

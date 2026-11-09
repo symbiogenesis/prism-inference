@@ -374,7 +374,7 @@ impl CpuBackend {
         self.expand(graph, result)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "The symbolic derivative dispatch follows the pinned GGML backward operation switch."
     )]

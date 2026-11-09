@@ -4,7 +4,7 @@
 //! `ggml/src/ggml-cpu/ops.cpp`, compiled `ggml_ssm_conv` arithmetic.
 //! Upstream MIT terms are retained in `PRISM-LICENSE.txt`.
 
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep the exact-model convolution helper crate scoped."
 )]
@@ -86,7 +86,7 @@ pub(crate) fn step_silu_into(
     step_into_inner::<true>(history, mixed, coefficients, width, next_history)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep NEON four-channel convolution, optional SiLU fusion and scalar fallback together."
 )]
@@ -309,7 +309,7 @@ pub(crate) fn step_silu_tokens_in_place(
     step_tokens_in_place_inner::<true>(history, tokens, channels, coefficients, width)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep multi-token NEON register-sliding convolution, optional SiLU fusion and fallback together."
 )]
@@ -479,7 +479,7 @@ fn step_tokens_in_place_inner<const SILU: bool>(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep in-place NEON four-channel convolution, optional SiLU fusion and scalar fallback together."
 )]
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Verify row, step_into, step_in_place, step_silu_into and step_silu_in_place together."
     )]
@@ -830,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
         clippy::suboptimal_flops,

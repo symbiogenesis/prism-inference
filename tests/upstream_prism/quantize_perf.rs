@@ -91,11 +91,10 @@ pub(super) fn parse_arguments(arguments: &[String]) -> Result<Option<Options>> {
     }
     Ok(Some(out))
 }
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::suboptimal_flops,
     reason = "Source converts size_t to binary32 before cosf, multiplies in binary32, then adds double0.1 before narrowing."
 )]
 fn generate(path: &Path, count: usize, offset: f32) -> Result<()> {
@@ -169,10 +168,9 @@ fn timed(driver: &Driver, operation: &Value, iterations: u32) -> Result<Timing> 
 fn number(value: f32) -> Value {
     json!({"Value":value.is_finite().then_some(value),"Bits":value.to_bits()})
 }
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
-    clippy::suboptimal_flops,
     reason = "Reported source metrics intentionally use binary32 integer conversions and separate operations."
 )]
 fn metrics(size: usize, quantized: usize, timing: &Timing) -> Value {

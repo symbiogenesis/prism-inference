@@ -4,7 +4,7 @@
 //! Upstream MIT attribution: tools/prism/upstream/LICENSE. Packed matrices remain
 //! packed; only one 256-element integer block is unpacked at a time.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

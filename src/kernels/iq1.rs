@@ -6,7 +6,7 @@
 //! `73bfe6cc485554822f80c473a3c0c4f25e80f41b`, ggml-common.h,
 //! ggml-quants.c and ggml-cpu/quants.c. Reference encoding is unavailable.
 
-#![allow(
+#![expect(
     clippy::cast_precision_loss,
     clippy::as_conversions,
     clippy::suboptimal_flops,

@@ -31,10 +31,6 @@ impl CpuBackend {
         }
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Pinned im2col backward retains its pixel and kernel loop ordering."
-    )]
     fn im2col_backward_values(
         &self,
         info: &TensorInfo,
@@ -135,10 +131,6 @@ impl CpuBackend {
         Ok(output)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Pinned pooling backward retains window visitation and first-maximum selection."
-    )]
     fn pool_backward_values(
         &self,
         info: &TensorInfo,

@@ -7,7 +7,7 @@ use crate::Result;
 /// Geometry is checked by the parent before any load. The fixed four-register
 /// tree is the scalar reference's tree, including adjacent horizontal pairs.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -43,7 +43,7 @@ pub(super) fn dot(first: &[f32], second: &[f32]) -> Option<f32> {
 /// Computes `(dot(state, first), dot(state, second))` in a single pass over `state`,
 /// reusing each `state` vector load across both four-register FMA reduction trees.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -94,7 +94,7 @@ pub(super) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Option<(
 /// Computes `[dot(state, inputs[0]), dot(state, inputs[1]), dot(state, inputs[2]), dot(state, inputs[3])]`
 /// in a single pass over `state`, reusing each `state` vector load across all four four-register FMA trees.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -130,7 +130,7 @@ pub(super) fn dot_four(state: &[f32], inputs: [&[f32]; 4]) -> Option<[f32; 4]> {
 /// Computes `(dot(states[r], first), dot(states[r], second))` across four state rows in one pass,
 /// sharing each `first` and `second` vector load across all four rows' four-register FMA trees.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -196,7 +196,7 @@ pub(super) fn dot_pair_four_rows(
 /// Computes `(dot(states[r], first), dot(states[r], second))` across eight state rows in one pass,
 /// sharing each `first` and `second` vector load across all eight rows' four-register FMA trees.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -264,7 +264,7 @@ pub(super) fn dot_pair_eight_rows(
 
 /// Scales `state` by `decay` and accumulates its four-register FMA dot product with `key` in one pass.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -305,7 +305,7 @@ pub(super) fn decay_and_dot(state: &mut [f32], key: &[f32], decay: f32) -> Optio
 
 /// Scales `previous` by `decay` into `state` and accumulates its four-register FMA dot product with `key` in one pass.
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -379,7 +379,7 @@ pub(super) fn update_and_dot(
 
 #[cfg(test)]
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -426,7 +426,7 @@ fn add_scaled_with_neon(neon: Neon, target: &mut [f32], input: &[f32], scale: f3
 }
 
 #[inline]
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
@@ -498,12 +498,6 @@ fn update_and_dot_with_neon(
 /// when `state.len() <= 256` and `state.len().is_multiple_of(16)`, keeping the
 /// decayed row in a register/L1 array across both dot-product passes.
 #[inline]
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::suboptimal_flops,
-    reason = "Keep two-pass fused NEON GDN row step and exact partial-mutation fallback together."
-)]
 pub(super) fn step_row_from(
     previous: &[f32],
     state: &mut [f32],
@@ -618,11 +612,6 @@ pub(super) fn step_row_from(
 /// Fuses in-place `decay_and_dot` and `update_and_dot` into a single read and single write of `state`
 /// when `state.len() <= 256` and `state.len().is_multiple_of(16)`.
 #[inline]
-#[allow(
-    clippy::too_many_lines,
-    clippy::suboptimal_flops,
-    reason = "Keep two-pass fused in-place NEON GDN row step and exact partial-mutation fallback together."
-)]
 pub(super) fn step_row_in_place(
     state: &mut [f32],
     key: &[f32],
@@ -753,10 +742,8 @@ fn flush_blocks(state: &mut [f32], blocks: &[[f32x4<Neon>; 4]], count: usize) {
 /// in `[[f32x4<Neon>; 4]; 16]` across tokens, writing `state` to memory only once
 /// after all tokens complete (or flushing exact partial state on a non-finite error).
 #[inline]
-#[allow(
-    clippy::too_many_arguments,
+#[expect(
     clippy::too_many_lines,
-    clippy::suboptimal_flops,
     reason = "Keep multi-token register-resident NEON GDN row recurrence and exact partial-mutation fallback together."
 )]
 pub(super) fn step_row_tokens_from(
@@ -876,11 +863,6 @@ pub(super) fn step_row_tokens_from(
 /// are unsupported or if any non-finite intermediate occurs before `states` is mutated,
 /// allowing the caller to fall back to the sequential per-row path for exact error state.
 #[inline]
-#[allow(
-    clippy::too_many_lines,
-    clippy::suboptimal_flops,
-    reason = "Keep 4-row fused NEON GDN recurrence in a single register-resident loop."
-)]
 pub(super) fn step_four_rows_from(
     previous: [&[f32]; 4],
     states: [&mut [f32]; 4],
@@ -991,10 +973,8 @@ pub(super) fn step_four_rows_from(
 /// `states` or `output` if any non-finite value occurs, allowing the caller to fall
 /// back to the sequential per-row path for exact partial-mutation semantics.
 #[inline]
-#[allow(
-    clippy::too_many_arguments,
+#[expect(
     clippy::too_many_lines,
-    clippy::suboptimal_flops,
     reason = "Keep 4-row multi-token register-resident NEON GDN recurrence together."
 )]
 pub(super) fn step_four_rows_tokens_from(
@@ -1122,11 +1102,6 @@ pub(super) fn step_four_rows_tokens_from(
 /// are unsupported or if any non-finite intermediate occurs before `states` is mutated,
 /// allowing the caller to fall back to the sequential per-row path for exact error state.
 #[inline]
-#[allow(
-    clippy::too_many_lines,
-    clippy::suboptimal_flops,
-    reason = "Keep 8-row fused NEON GDN recurrence in a single register-resident loop."
-)]
 pub(super) fn step_eight_rows_from(
     previous: [&[f32]; 8],
     states: [&mut [f32]; 8],
@@ -1237,10 +1212,8 @@ pub(super) fn step_eight_rows_from(
 /// `states` or `output` if any non-finite value occurs, allowing the caller to fall
 /// back to the sequential per-row path for exact partial-mutation semantics.
 #[inline]
-#[allow(
-    clippy::too_many_arguments,
+#[expect(
     clippy::too_many_lines,
-    clippy::suboptimal_flops,
     reason = "Keep 8-row multi-token register-resident NEON GDN recurrence together."
 )]
 pub(super) fn step_eight_rows_tokens_from(
@@ -1368,11 +1341,6 @@ pub(super) fn step_eight_rows_tokens_from(
 /// `key` and `query` vector loads across the 4 rows at every token. Returns `false`
 /// without mutating `states` if any non-finite value occurs.
 #[inline]
-#[allow(
-    clippy::too_many_lines,
-    clippy::suboptimal_flops,
-    reason = "Keep 4-row multi-token in-place register-resident NEON GDN recurrence together."
-)]
 pub(super) fn step_four_rows_tokens_in_place(
     states: [&mut [f32]; 4],
     inputs: &[super::ChunkInput<'_>],
@@ -1486,11 +1454,6 @@ pub(super) fn step_four_rows_tokens_in_place(
 /// `key` and `query` vector loads across the 8 rows at every token. Returns `false`
 /// without mutating `states` if any non-finite value occurs.
 #[inline]
-#[allow(
-    clippy::too_many_lines,
-    clippy::suboptimal_flops,
-    reason = "Keep 8-row multi-token in-place register-resident NEON GDN recurrence together."
-)]
 pub(super) fn step_eight_rows_tokens_in_place(
     states: [&mut [f32]; 8],
     inputs: &[super::ChunkInput<'_>],

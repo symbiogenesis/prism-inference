@@ -3,7 +3,7 @@
 //! Ports the selection policy in pinned `common/download.cpp`. Metadata comes
 //! from callers or a cache/HTTP owner, never from model-specific registries.
 
-#![allow(
+#![expect(
     clippy::struct_excessive_bools,
     clippy::case_sensitive_file_extension_comparisons,
     reason = "Independent native discovery flags and case-sensitive GGUF filename policy."

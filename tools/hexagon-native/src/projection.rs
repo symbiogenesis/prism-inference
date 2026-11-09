@@ -1,5 +1,5 @@
 //! Bounded signed-Q2 projection requests; no profile or model qualification.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Private packet helpers are shared only with the audited native sibling"
 )]

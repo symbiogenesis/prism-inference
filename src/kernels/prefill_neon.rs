@@ -478,7 +478,7 @@ fn dot128_four_rows_one_token(
     (reduce4_i32x4_vec(l0 + h0, l1 + h1, l2 + h2, l3 + h3) - sums).to_array()
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Preserve separately rounded source arithmetic and four-row × four-token register blocking."
@@ -715,7 +715,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Preserve separately rounded source arithmetic and eight-row × eight-token register blocking."
@@ -1222,7 +1222,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Preserve separately rounded source arithmetic and four-row Q8 activation sharing."
@@ -1562,7 +1562,7 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Preserve separately rounded source arithmetic and eight-row Q8 activation sharing."
@@ -2013,7 +2013,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::needless_range_loop,

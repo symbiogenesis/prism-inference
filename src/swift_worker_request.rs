@@ -1,5 +1,5 @@
 //! Private one-model Swift JSONL request schema shared by the worker and its tests.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep the shared worker/test schema explicitly crate scoped rather than publicly reachable"
 )]

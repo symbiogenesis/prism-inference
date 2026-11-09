@@ -287,7 +287,7 @@ impl GraphAllocator {
     ///
     /// # Errors
     /// Rejects invalid graphs, buffer references, cyclic views, overflow, or resource failures.
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keep the pinned allocate/count/execute/release stages in reviewable source order."
     )]

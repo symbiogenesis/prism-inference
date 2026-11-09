@@ -1,5 +1,5 @@
 //! Full-`K` native `HTP_TYPE_Q2_0` 1-op projection session and packet builder.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Packet helpers are shared only with the audited native sibling"
 )]
@@ -1162,7 +1162,7 @@ pub(crate) fn image_multi_resident<const B: usize>(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,
     reason = "Keep multi-arena batch descriptor assembly and poison region together"
@@ -1335,7 +1335,7 @@ pub(crate) struct FfnSwigluLayout {
 /// `OP_MUL_MAT(up)` + `HTP_OP_GLU_SWIGLU(gate_out, up_out) -> swiglu_out`)
 /// with VTCM intermediate residency chaining (`KEEP_DST_IN_VTCM` +
 /// `READ_SRC0_FROM_VTCM | READ_SRC1_FROM_VTCM`).
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,
     reason = "Keep 2x Q2_0 MulMat + 1x GluSwiglu descriptor assembly and VTCM pass flags together"
@@ -1484,7 +1484,7 @@ pub(crate) struct FfnSwigluMulti2Layout {
 /// Token 0 (`OP_MUL_MAT(gate)` + `OP_MUL_MAT(up)` + `HTP_OP_GLU_SWIGLU`) followed
 /// by Token 1 (`OP_MUL_MAT(gate)` + `OP_MUL_MAT(up)` + `HTP_OP_GLU_SWIGLU`),
 /// with per-token VTCM intermediate residency chaining.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,
     reason = "Keep 2-token 6-op FFN SwiGLU descriptor assembly and VTCM pass flags together"
@@ -1674,7 +1674,6 @@ pub(crate) struct FfnFullChainLayout {
 
 #[allow(
     dead_code,
-    clippy::too_many_arguments,
     reason = "Keep F32 2D tensor descriptor fields together for intra-layer VTCM chains"
 )]
 fn write_f32_2d_tensor_desc(
@@ -1723,6 +1722,9 @@ fn write_f32_2d_tensor_desc(
 /// with VTCM intermediate residency chaining across all stages.
 #[allow(
     dead_code,
+    reason = "Keep full intra-layer FFN 4/5/6-op descriptor assembly and VTCM pass flags together"
+)]
+#[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,
     reason = "Keep full intra-layer FFN 4/5/6-op descriptor assembly and VTCM pass flags together"
@@ -2124,7 +2126,7 @@ pub(crate) fn image_ffn_full_chain_resident(
     })
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep full-K Q2_0 tensor descriptors, HVX kparams and output poison region together"
 )]
@@ -2171,7 +2173,7 @@ fn write_frame(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep 1-op Q2_0 tensor descriptors and HVX kparams together"
 )]
@@ -2210,7 +2212,7 @@ fn write_descriptors(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "Keep member Q2_0 tensor descriptors and HVX kparams together"
 )]
@@ -2630,7 +2632,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::similar_names,
         reason = "Keep multi-arena deduplication, 4/8-op batching and 3/6-op FFN SwiGLU checks together"

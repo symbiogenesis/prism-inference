@@ -492,7 +492,7 @@ fn fixture_run(engine: &Engine, path: &Path) -> Result<Value> {
     finished?;
     Ok(value)
 }
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "source adapter returns explicit failed contract evidence"
 )]

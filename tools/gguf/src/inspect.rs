@@ -1,5 +1,5 @@
 // Keep the private contract explicit if the parent is reorganized later.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Keep explicit internal visibility if the parent module is reorganized."
 )]
@@ -536,10 +536,6 @@ pub(crate) fn inspect(file: &mut File, path: &Path, dialect: &str) -> Result<Ins
 
 // One parser serves inspection and execution; retention changes only what is
 // kept, never descriptor, format, identity, or extent validation.
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep descriptor validation and report assembly together in serialized order."
-)]
 pub(crate) fn inspect_retained(
     file: &mut File,
     path: &Path,
@@ -557,7 +553,7 @@ pub(crate) fn inspect_vocabulary(
     inspect_with_vocabulary_version(file, path, "Stock", Some(memory_limit), true)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep descriptor validation and report assembly together in serialized order."
 )]

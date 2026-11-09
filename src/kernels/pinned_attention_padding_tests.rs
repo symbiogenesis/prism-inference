@@ -19,7 +19,7 @@ fn full_padding_dot(values: impl Iterator<Item = f32>, weights: &[f32]) -> f32 {
     (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The frozen physical-padding control rounds the native binary64 reciprocal to f32."

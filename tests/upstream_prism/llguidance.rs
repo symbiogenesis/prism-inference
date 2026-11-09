@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires BONSAI_BACKEND_TRANSPORT_BRIDGE naming the checked native common bridge"]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "Keeps the complete native field-import equivalence and malformed-input schedule together."
     )]

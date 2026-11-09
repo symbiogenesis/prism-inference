@@ -255,7 +255,7 @@ pub unsafe extern "C" fn bonsai_prism_loader_new(path: *const c_char) -> *mut Na
     let Some(loader) = NativeLoader::open(path) else {
         return ptr::null_mut();
     };
-    #[allow(
+    #[expect(
         clippy::cast_ptr_alignment,
         reason = "Allocation requests handle alignment"
     )]

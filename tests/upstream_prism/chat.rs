@@ -343,7 +343,7 @@ fn diff_equal(e: &Value, a: &Value) -> Result<bool> {
     }
     Ok(true)
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the source helper control flow together for coverage review."
 )]
@@ -602,7 +602,7 @@ fn successful_message(v: &Value) -> Result<&Value> {
     Ok(message)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the source helper control flow together for coverage review."
 )]
@@ -832,7 +832,7 @@ fn check_grammar(
     }
     Ok(())
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the source helper control flow together for coverage review."
 )]
@@ -993,7 +993,7 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     run_with_options(engine, None, false)
 }
 /// Retains the source's optional template-filter and forced reconstruction modes.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Keep the original ordered group dispatch and source condition guards together."
 )]

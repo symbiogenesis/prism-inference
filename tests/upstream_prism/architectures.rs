@@ -113,7 +113,7 @@ impl Metadata<'_> {
 fn among(arch: &str, values: &[&str]) -> bool {
     values.contains(&arch)
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "literal source metadata branches stay together for parity review"
 )]
@@ -424,7 +424,7 @@ fn metadata(
     }
     m.u("WKV_HEAD_SIZE", dim)?;
     m.u("SHORTCONV_L_CACHE", 3)?;
-    #[allow(
+    #[expect(
         clippy::excessive_precision,
         reason = "preserve the source floating literal rounded to f32"
     )]
@@ -597,10 +597,6 @@ fn get_logits(c: &Client, ctx: u64, tokens: &[u32], encode: bool) -> Result<Vec<
     release(c, "batch", b)?;
     Ok(out)
 }
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "source calculates float products before accumulating doubles"
-)]
 fn nmse(a: &[f32], b: &[f32]) -> Result<f64> {
     check(a.len() == b.len(), "source NMSE shape assertion failed")?;
     let (mut delta, mut norm) = (0.0_f64, 0.0_f64);
@@ -610,7 +606,7 @@ fn nmse(a: &[f32], b: &[f32]) -> Result<f64> {
     }
     Ok(delta / norm)
 }
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "preserve the source backend and roundtrip schedule in order"
 )]
@@ -719,7 +715,7 @@ fn backend_variant(
                         restored.len() == logits.len(),
                         "roundtrip output shape differs",
                     )?;
-                    #[allow(
+                    #[expect(
                         clippy::float_cmp,
                         reason = "source roundtrip requires exact float equality"
                     )]
@@ -829,7 +825,7 @@ pub(super) fn export_selected(
     }
     Ok(paths)
 }
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "shared source adapter entrypoint returns a measured failure result"
 )]

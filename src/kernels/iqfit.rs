@@ -5,15 +5,13 @@
 //! index tie breaking, weighted refitting and source scalar association are
 //! retained. Search neighbours are cached only for the duration of one row.
 
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
-    clippy::float_cmp,
     clippy::similar_names,
     clippy::suboptimal_flops,
-    clippy::suspicious_operation_groupings,
     reason = "Pinned fitting specifies bounded integer bit fields and exact scalar multiply/add association."
 )]
 
@@ -239,7 +237,7 @@ impl Configuration {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "Retain native sign correction, scale search, refit and byte packing in their source order."
 )]

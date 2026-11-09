@@ -1,5 +1,5 @@
 //! Exclusive numeric-loopback socket binding shared with the owning launcher.
-#![allow(
+#![expect(
     clippy::redundant_pub_crate,
     reason = "Explicit parent scope keeps these implementation helpers private."
 )]

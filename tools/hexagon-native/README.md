@@ -318,6 +318,14 @@ speedup, persistent serving or increased operation/deadline capacity. The report
 retains mapped descriptor extent, prepared payload/count and resident write
 attempts as work/resource observations, not measured traffic.
 
+Native `Q2_0` resident handles also retain the immutable HVX solver result for
+their validated `(K, M)` geometry. Single, batched and fused resident packets
+reuse these parameters; transient packets still solve their active geometry.
+The registry holds no additional per-handle allocation. Callers must charge the
+larger handle payload; the runtime's existing `size_of`-based metadata reservation
+does so within its unchanged cap. Wire bytes, signed kernels, placement and
+session limits remain unchanged. Source work avoided is not measured latency.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

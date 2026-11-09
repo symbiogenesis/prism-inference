@@ -219,6 +219,9 @@ pub struct NativeQ2WeightHandle {
     range: Range<usize>,
     columns: usize,
     rows: usize,
+    // Geometry is immutable for the lifetime of the registry reservation. Keep
+    // its solver result with the handle instead of resolving it for every token.
+    hvx_params: (u8, u32, u32),
 }
 
 impl NativeQ2WeightHandle {
@@ -315,6 +318,7 @@ impl NativeQ2WeightRegistry {
         rows: usize,
         weight_bytes: usize,
     ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+        let hvx_params = hvx_mv_params(columns, rows)?;
         let mut arena_idx = self.active_arena;
         while arena_idx < self.arena_count {
             let start = self.used[arena_idx].next_multiple_of(128);
@@ -330,6 +334,7 @@ impl NativeQ2WeightRegistry {
                     range: start..end,
                     columns,
                     rows,
+                    hvx_params,
                 }));
             }
             arena_idx += 1;
@@ -1039,6 +1044,7 @@ pub(crate) fn image(
         weights_offset,
         active,
         activation,
+        hvx_mv_params(columns, rows)?,
     )?;
     bytes[weights_offset..weights_offset + weights.len()].copy_from_slice(weights);
     Ok(active)
@@ -1092,6 +1098,7 @@ pub(crate) fn image_resident(
             weight_offset,
             active,
             activation,
+            handle.hvx_params,
         )?;
         return Ok(ResidentLayout {
             output: active.output,
@@ -1139,6 +1146,7 @@ pub(crate) fn image_resident(
         active.weights,
         active.activation,
         active.output,
+        handle.hvx_params,
     )?;
     for (dst, &value) in working[active.activation..active.activation + act_bytes]
         .as_chunks_mut::<4>()
@@ -1349,6 +1357,7 @@ fn image_multi_resident_with_pad<const B: usize>(
             layout(columns, handle.rows).weights,
             act_offsets[member],
             output_offsets[member],
+            handle.hvx_params,
         )?;
     }
     for (member, &activation) in activations.iter().enumerate() {
@@ -1953,6 +1962,7 @@ pub(crate) fn image_ffn_full_chain_resident(
         layout(hidden, ffn_dim).weights,
         act_offset,
         gate_out_offset,
+        gate_handle.hvx_params,
     )?;
     put32(working, ops_base + 4, keep_vtcm.bits());
 
@@ -1968,6 +1978,7 @@ pub(crate) fn image_ffn_full_chain_resident(
         layout(hidden, ffn_dim).weights,
         act_offset,
         up_out_offset,
+        up_handle.hvx_params,
     )?;
     put32(working, ops_base + 232 + 4, keep_vtcm.bits());
 
@@ -2082,6 +2093,7 @@ pub(crate) fn image_ffn_full_chain_resident(
         layout(ffn_dim, hidden).weights,
         hadamard_out_offset,
         down_out_offset,
+        down_handle.hvx_params,
     )?;
     let down_flags = if vtcm_chain {
         let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM;
@@ -2192,6 +2204,7 @@ fn write_frame(
     weight_offset: usize,
     active: projection::Layout,
     activation: &[f32],
+    hvx_params: (u8, u32, u32),
 ) -> Result<(), Error> {
     if activation.len() != columns {
         return Err(Error::Contract);
@@ -2207,6 +2220,7 @@ fn write_frame(
         active.weights,
         active.activation,
         active.output,
+        hvx_params,
     )?;
     let act_bytes = columns * 4;
     let out_bytes = rows * 4;
@@ -2240,6 +2254,7 @@ fn write_descriptors(
     weight_bytes: usize,
     act_offset: usize,
     out_offset: usize,
+    hvx_params: (u8, u32, u32),
 ) -> Result<(), Error> {
     bytes[..1024].fill(0);
     put64(bytes, 0, base);
@@ -2261,6 +2276,7 @@ fn write_descriptors(
         weight_bytes,
         act_offset,
         out_offset,
+        hvx_params,
     )
 }
 
@@ -2280,8 +2296,9 @@ fn write_member_descriptors(
     weight_bytes: usize,
     act_offset: usize,
     out_offset: usize,
+    hvx_params: (u8, u32, u32),
 ) -> Result<(), Error> {
-    let (n_prefetch, src1_row_size, vtcm_size) = hvx_mv_params(columns, rows)?;
+    let (n_prefetch, src1_row_size, vtcm_size) = hvx_params;
     let weight_row_bytes = 36 * (columns / 128);
     let act_bytes = columns * 4;
     let out_bytes = rows * 4;
@@ -2466,6 +2483,87 @@ impl From<NativeQ2ProjectionLimits> for hmx_projection::HmxQ2ProjectionLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_hvx_params(columns: usize, rows: usize) -> Result<(u8, u32, u32), Error> {
+        // Independently expand the signed solver's allocations rather than call
+        // the production helper or reuse its bit-shift/prefetch loop.
+        let row_size = columns.div_ceil(128) * 5120;
+        let activation = (columns * 4).next_multiple_of(512);
+        let output = (rows * 4).div_ceil(8).next_multiple_of(128) * 8;
+        let budget = if columns > 6144 { 4 * 1024 * 1024 } else { 2 * 1024 * 1024 };
+        for prefetch in [16_u8, 8, 4, 2, 1] {
+            let weights = (usize::from(prefetch) * columns.div_ceil(64) * 640)
+                .next_multiple_of(256) * 8;
+            let total = row_size.next_multiple_of(256) + activation.max(output + weights);
+            if total <= budget {
+                return Ok((prefetch, u32::try_from(row_size).map_err(|_| Error::Contract)?,
+                    u32::try_from(total).map_err(|_| Error::Contract)?));
+            }
+        }
+        Err(Error::Contract)
+    }
+
+    #[test]
+    fn native_q2_resident_hvx_plans_match_independent_solver_and_wire() -> Result<(), Error> {
+        for columns in [128, 384, 5120, 6144, 6272, 17_408] {
+            for rows in [32, 96, 5120, 17_408] {
+                let expected = reference_hvx_params(columns, rows)?;
+                let extent = layout(columns, rows).weights;
+                let mut registry = NativeQ2WeightRegistry::new(extent)?;
+                let handle = registry.prepare_validated(columns, rows, extent)?
+                    .ok_or(Error::Contract)?;
+                assert_eq!(handle.hvx_params, expected);
+                let mut actual = [0_u8; 1024];
+                write_member_descriptors(&mut actual, 0, 0, 24, 192, columns, rows,
+                    1024, extent, 4096, 8192, handle.hvx_params)?;
+                let kernel = 192 + 72;
+                assert_eq!(actual[kernel], 7);
+                assert_eq!(actual[kernel + 4], 8);
+                assert_eq!(actual[kernel + 6], expected.0);
+                for (offset, value) in [(16, 576), (20, 640), (24, expected.1), (28, expected.2)] {
+                    assert_eq!(&actual[kernel + offset..kernel + offset + 4], &value.to_le_bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_cached_resident_frame_matches_transient_and_refuses_invalid_plan() -> Result<(), Error> {
+        for columns in [128, 384, 6272] {
+            for rows in [32, 96] {
+                let active = layout(columns, rows);
+                let mut weights = vec![0x55_u8; active.weights];
+                for tile in weights.as_chunks_mut::<576>().0 {
+                    tile[512..].fill(0);
+                }
+                let mut registry = NativeQ2WeightRegistry::new(weights.len())?;
+                let handle = registry.prepare(columns, rows, &weights)?.ok_or(Error::Contract)?;
+                let arena_start = (active.output + rows * 4).next_multiple_of(128);
+                let activation: Vec<_> = (0..columns)
+                    .map(|lane| [0.0, -0.0, f32::from_bits(1), -1.5][lane % 4]).collect();
+                let mut expected = vec![0xa5_u8; active.allocation];
+                image(&mut expected, 0x1_0000, 17, columns, rows, &weights, &activation)?;
+                let mut actual = vec![0xa5_u8; active.allocation];
+                actual[arena_start..arena_start + weights.len()].copy_from_slice(&weights);
+                let frame = image_resident(&mut actual, 0x1_0000, 17, arena_start, &[], &handle,
+                    &activation)?;
+                assert_eq!(frame.output, active.output);
+                assert_eq!(frame.n_bufs, 1);
+                assert_eq!(actual, expected);
+            }
+        }
+        let mut registry = NativeQ2WeightRegistry::new(8192)?;
+        for (columns, rows) in [(0, 32), (129, 32), (128, 0), (128, 33), (17_536, 32)] {
+            assert!(registry.prepare_validated(columns, rows, 1152).is_err());
+            assert_eq!(registry.used_bytes(), 0);
+            assert_eq!(registry.remaining_bytes(), 8192);
+        }
+        let weights = vec![0_u8; layout(128, 32).weights];
+        let handle = registry.prepare(128, 32, &weights)?.ok_or(Error::Contract)?;
+        assert_eq!(registry.range(&handle)?, 0..1152);
+        Ok(())
+    }
 
     #[test]
     fn hvx_mv_params_matches_signed_ggml_hexagon_solver() -> Result<(), Error> {

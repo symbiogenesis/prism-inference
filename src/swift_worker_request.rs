@@ -4,7 +4,7 @@
     reason = "Keep the shared worker/test schema explicitly crate scoped rather than publicly reachable"
 )]
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use bonsai_prism_runtime::swift_chat::{MAX_MESSAGE_BYTES, MAX_MESSAGES};
 use serde::{
@@ -67,8 +67,8 @@ impl<'de> Deserialize<'de> for TextMessage {
                 let mut role = None;
                 let mut content = None;
                 let mut reasoning_content = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
                         "role" if role.is_none() => role = Some(map.next_value::<String>()?),
                         "content" if content.is_none() => {
                             content = Some(map.next_value::<String>()?);
@@ -97,7 +97,7 @@ impl<'de> Deserialize<'de> for TextMessage {
 fn messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
     struct MessagesVisitor;
     impl<'de> Visitor<'de> for MessagesVisitor {
-        type Value = Vec<TextMessage>;
+        type Value = Vec<Value>;
         fn expecting(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
             output.write_str("a bounded array of Swift text message objects")
         }
@@ -118,7 +118,11 @@ fn messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Erro
                     })
                     .filter(|&bytes| bytes <= MAX_MESSAGE_BYTES)
                     .ok_or_else(|| de::Error::custom("Swift message bytes exceed bound"))?;
-                messages.push(message);
+                let mut value = json!({"role":message.role,"content":message.content});
+                if let Some(reasoning) = message.reasoning_content {
+                    value["reasoning_content"] = Value::String(reasoning);
+                }
+                messages.push(value);
             }
             if messages.is_empty() {
                 return Err(de::Error::custom("Swift messages must be nonempty"));
@@ -126,17 +130,5 @@ fn messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Erro
             Ok(messages)
         }
     }
-    let messages = deserializer.deserialize_seq(MessagesVisitor)?;
-    Ok(Value::Array(
-        messages
-            .into_iter()
-            .map(|message| {
-                let mut value = json!({"role":message.role,"content":message.content});
-                if let Some(reasoning) = message.reasoning_content {
-                    value["reasoning_content"] = Value::String(reasoning);
-                }
-                value
-            })
-            .collect(),
-    ))
+    Ok(Value::Array(deserializer.deserialize_seq(MessagesVisitor)?))
 }

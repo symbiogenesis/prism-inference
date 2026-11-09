@@ -16,6 +16,7 @@
 //! input and local request-size rejection leave it reusable. Errors contain only
 //! static descriptions, never prompt text, response content or I/O diagnostics.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, BufRead, Write};
 
@@ -139,7 +140,11 @@ impl<R: BufRead, W: Write> TokenClient<R, W> {
             .response
             .try_reserve_exact(client.response_limit)
             .map_err(|_| ClientError::Allocation)?;
-        match client.read_response()? {
+        match read_response(
+            &mut client.input,
+            &mut client.response,
+            client.response_limit,
+        )? {
             Response::Ready(ready)
                 if ready.protocol == "bonsai-token-worker-v1"
                     && ready.model_sha256 == expected.model_sha256
@@ -252,7 +257,7 @@ impl<R: BufRead, W: Write> TokenClient<R, W> {
         &mut self,
         operation: Operation,
         input: RequestInput<'_>,
-    ) -> Result<Response, ClientError> {
+    ) -> Result<Response<'_>, ClientError> {
         if !self.is_usable() {
             return Err(ClientError::Unavailable);
         }
@@ -289,7 +294,7 @@ impl<R: BufRead, W: Write> TokenClient<R, W> {
             .and_then(|()| self.output.write_all(b"\n"))
             .and_then(|()| self.output.flush())
             .map_err(|_| ClientError::Transport)?;
-        let response = self.read_response()?;
+        let response = read_response(&mut self.input, &mut self.response, self.response_limit)?;
         match &response {
             Response::Count {
                 id: response_id,
@@ -322,30 +327,34 @@ impl<R: BufRead, W: Write> TokenClient<R, W> {
         self.healthy = true;
         Ok(response)
     }
+}
 
-    fn read_response(&mut self) -> Result<Response, ClientError> {
-        self.response.clear();
-        loop {
-            let available = self.input.fill_buf().map_err(|_| ClientError::Transport)?;
-            if available.is_empty() {
-                return Err(ClientError::InvalidResponse);
-            }
-            let newline = available.iter().position(|&byte| byte == b'\n');
-            let count = newline.unwrap_or(available.len());
-            if count > self.response_limit - self.response.len() {
-                return Err(ClientError::InvalidResponse);
-            }
-            self.response.extend_from_slice(&available[..count]);
-            self.input.consume(count + usize::from(newline.is_some()));
-            if newline.is_some() {
-                break;
-            }
-        }
-        if self.response.trim_ascii_start().first() != Some(&b'{') {
+fn read_response<'a>(
+    input: &mut impl BufRead,
+    response: &'a mut Vec<u8>,
+    response_limit: usize,
+) -> Result<Response<'a>, ClientError> {
+    response.clear();
+    loop {
+        let available = input.fill_buf().map_err(|_| ClientError::Transport)?;
+        if available.is_empty() {
             return Err(ClientError::InvalidResponse);
         }
-        serde_json::from_slice(&self.response).map_err(|_| ClientError::InvalidResponse)
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let count = newline.unwrap_or(available.len());
+        if count > response_limit - response.len() {
+            return Err(ClientError::InvalidResponse);
+        }
+        response.extend_from_slice(&available[..count]);
+        input.consume(count + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
     }
+    if response.trim_ascii_start().first() != Some(&b'{') {
+        return Err(ClientError::InvalidResponse);
+    }
+    serde_json::from_slice(response).map_err(|_| ClientError::InvalidResponse)
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -383,21 +392,26 @@ impl<'a> RequestInput<'a> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Ready {
-    protocol: String,
-    model_sha256: String,
+struct Ready<'a> {
+    #[serde(borrow)]
+    protocol: Cow<'a, str>,
+    #[serde(borrow)]
+    model_sha256: Cow<'a, str>,
     vocab_size: usize,
     context: usize,
     reserved_output_tokens: usize,
     max_frame_bytes: usize,
-    special_input: String,
-    insert_special: String,
+    #[serde(borrow)]
+    special_input: Cow<'a, str>,
+    #[serde(borrow)]
+    insert_special: Cow<'a, str>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Response {
-    Ready(Ready),
+enum Response<'a> {
+    #[serde(borrow)]
+    Ready(Ready<'a>),
     Count {
         id: u64,
         prompt_token_count: usize,
@@ -409,7 +423,8 @@ enum Response {
     },
     Error {
         id: Option<u64>,
-        code: String,
+        #[serde(borrow)]
+        code: Cow<'a, str>,
     },
 }
 

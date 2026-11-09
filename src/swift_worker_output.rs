@@ -7,14 +7,26 @@
 use std::io::{self, Write};
 
 use bonsai_prism_runtime::{Result, runtime::Finish, swift_session::TextEvent};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::json;
 
 /// Write and flush one complete JSONL protocol record.
-pub(crate) fn write_record(output: &mut impl Write, value: &Value) -> Result<()> {
+pub(crate) fn write_record(
+    output: &mut impl Write,
+    value: &(impl Serialize + ?Sized),
+) -> Result<()> {
     serde_json::to_writer(&mut *output, value)?;
     output.write_all(b"\n")?;
     output.flush()?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct DeltaRecord<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: u64,
+    text: &'a str,
 }
 
 fn write_delta(output: &mut impl Write, id: u64, mut text: &str) -> Result<()> {
@@ -23,7 +35,14 @@ fn write_delta(output: &mut impl Write, id: u64, mut text: &str) -> Result<()> {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        write_record(output, &json!({"type":"delta","id":id,"text":&text[..end]}))?;
+        write_record(
+            output,
+            &DeltaRecord {
+                kind: "delta",
+                id,
+                text: &text[..end],
+            },
+        )?;
         text = &text[end..];
     }
     Ok(())

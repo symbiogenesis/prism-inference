@@ -8,6 +8,7 @@
 //! this client; callers must shut down the owned worker and replace its streams.
 
 use std::{
+    borrow::Cow,
     fmt,
     io::{self, BufRead, Write},
     time::{Duration, Instant},
@@ -387,7 +388,7 @@ impl<R: BufRead, W: Write> SwiftClient<R, W> {
         Ok(id)
     }
 
-    fn read_response(&mut self) -> Result<Response, ClientError> {
+    fn read_response(&mut self) -> Result<Response<'_>, ClientError> {
         self.response.clear();
         loop {
             let available = self.input.fill_buf().map_err(|_| ClientError::Transport)?;
@@ -447,15 +448,21 @@ enum Request<'a> {
     clippy::struct_excessive_bools,
     reason = "Wire readiness exposes independent fixed inference policy flags, not mutable client state"
 )]
-struct Ready {
-    protocol: String,
-    model_sha256: String,
-    template_sha256: String,
+struct Ready<'a> {
+    #[serde(borrow)]
+    protocol: Cow<'a, str>,
+    #[serde(borrow)]
+    model_sha256: Cow<'a, str>,
+    #[serde(borrow)]
+    template_sha256: Cow<'a, str>,
     vocab_size: usize,
-    runtime: String,
-    prism_commit: String,
+    #[serde(borrow)]
+    runtime: Cow<'a, str>,
+    #[serde(borrow)]
+    prism_commit: Cow<'a, str>,
     seed: u32,
-    backend: String,
+    #[serde(borrow)]
+    backend: Cow<'a, str>,
     max_frame_bytes: usize,
     max_output_bytes: usize,
     context_tokens: usize,
@@ -468,14 +475,16 @@ struct Ready {
     presence_penalty: u32,
     frequency_penalty: u32,
     thinking: bool,
-    reasoning_effort: String,
+    #[serde(borrow)]
+    reasoning_effort: Cow<'a, str>,
     preserve_thinking: bool,
     cache_reuse: bool,
     speculation: bool,
     adapters: bool,
-    qualification: String,
+    #[serde(borrow)]
+    qualification: Cow<'a, str>,
 }
-impl Ready {
+impl Ready<'_> {
     fn matches(&self, expected: ExpectedSwiftWorker) -> bool {
         self.protocol == "bonsai-swift-worker-v1"
             && self.model_sha256 == swift::MODEL_SHA256
@@ -515,8 +524,9 @@ enum FinishReason {
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Response {
-    Ready(Box<Ready>),
+enum Response<'a> {
+    #[serde(borrow)]
+    Ready(Box<Ready<'a>>),
     Count {
         id: u64,
         prompt_tokens: usize,
@@ -524,7 +534,8 @@ enum Response {
     },
     Delta {
         id: u64,
-        text: String,
+        #[serde(borrow)]
+        text: Cow<'a, str>,
     },
     Complete {
         id: u64,
@@ -538,7 +549,8 @@ enum Response {
     },
     Error {
         id: Option<u64>,
-        error: String,
+        #[serde(borrow)]
+        error: Cow<'a, str>,
         reset_required: Option<bool>,
     },
 }

@@ -5,6 +5,14 @@ separate from a qualified application release or a new five-executable GitHub
 bundle. Hosted conformance, complete model/state/adapter acceptance and measured
 request benefit remain pending; source reductions are not speed measurements.
 
+**Publication is pending.** The single local check on source `511c651` compiled
+the six selected targets and passed all 22 exact Rust controls and five receipt
+controls, then stopped on strict Clippy's incompatible `syn` versions. Its
+63.152-second clock is closed; no registry upload, portable-library check or
+normalized package verification ran. Subsequent analyzer-policy and hosted
+source-binding corrections require the owning checks. Do not rerun the closed
+local workload or treat the prepared version/pin as registry availability.
+
 ## Source changes
 
 The library includes the local CPU efficiency candidates documented in

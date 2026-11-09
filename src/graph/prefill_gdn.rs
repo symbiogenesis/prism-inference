@@ -418,12 +418,12 @@ pub(super) fn recurrent_tile<'a>(
     resize_into(previous.len(), matrix)?;
     let width = geometry.ssm_head;
     let hist_width = geometry.convolution - 1;
-    let parallelize_conv = hist_width > 0
-        && tile.projector.row_parallelism().workers() > 1
+    let conv_aligned = hist_width > 0
         && geometry.convolution_width().is_multiple_of(width)
         && width.is_multiple_of(4);
+    let parallelize_conv = conv_aligned && tile.projector.row_parallelism().workers() > 1;
     let parallelize_post_conv = tile.projector.row_parallelism().workers() > 1 && count > 1;
-    let conv_head_major = parallelize_conv && count > 1;
+    let conv_head_major = conv_aligned && count > 1;
     if conv_head_major {
         for attended in tile.attended.iter_mut().take(count) {
             check()?;
@@ -451,16 +451,19 @@ pub(super) fn recurrent_tile<'a>(
                     let head = base_head + offset;
                     let c_slice = &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
                     for (token, token_mixed) in mixed_ref.iter().enumerate() {
-                        let head_mixed = &mut head_out[token * width..(token + 1) * width];
-                        head_mixed.copy_from_slice(&token_mixed[head * width..(head + 1) * width]);
-                        if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                            crate::kernels::pinned_convolution::step_silu_in_place(
-                                head_conv,
-                                head_mixed,
-                                c_slice,
-                                geometry.convolution,
-                            )?;
-                        } else {
+                        head_out[token * width..(token + 1) * width]
+                            .copy_from_slice(&token_mixed[head * width..(head + 1) * width]);
+                    }
+                    if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                        crate::kernels::pinned_convolution::step_silu_tokens_in_place(
+                            head_conv,
+                            head_out,
+                            width,
+                            c_slice,
+                            geometry.convolution,
+                        )?;
+                    } else {
+                        for head_mixed in head_out.chunks_exact_mut(width) {
                             for (channel, value) in head_mixed.iter_mut().enumerate() {
                                 let projected = *value;
                                 let start = channel * hist_width;
@@ -476,7 +479,9 @@ pub(super) fn recurrent_tile<'a>(
                             }
                             arithmetic.silu(head_mixed);
                         }
-                        if head < qk_heads {
+                    }
+                    if head < qk_heads {
+                        for head_mixed in head_out.chunks_exact_mut(width) {
                             l2_norm(head_mixed, geometry.epsilon);
                         }
                     }
@@ -582,8 +587,8 @@ pub(super) fn recurrent_tile<'a>(
             check()?;
         }
     }
-    if parallelize_post_conv {
-        if !parallelize_conv {
+    if conv_head_major || parallelize_post_conv {
+        if !conv_head_major && !parallelize_conv {
             tile.projector.row_parallelism().update_chunks(
                 &mut tile.mixed[..count],
                 1,
@@ -797,17 +802,35 @@ pub(super) fn recurrent_tile<'a>(
                 check()?;
             }
             let key_head = head_index % geometry.ssm_keys;
-            for (token, slot) in inputs[..count].iter_mut().enumerate() {
-                let mixed = &tile.mixed[token];
-                *slot = Input {
-                    query: &mixed[key_head * width..(key_head + 1) * width],
-                    key: &mixed[geometry.key_width() + key_head * width
-                        ..geometry.key_width() + (key_head + 1) * width],
-                    value: &mixed[2 * geometry.key_width() + head_index * width
-                        ..2 * geometry.key_width() + (head_index + 1) * width],
-                    decay: tile.alpha[token][head_index],
-                    beta: tile.beta[token][head_index],
-                };
+            if conv_head_major {
+                let conv_ref: &[f32] = &tile.gdn_conv_outputs;
+                let q_head = &conv_ref[key_head * head_out_len..(key_head + 1) * head_out_len];
+                let k_head_idx = geometry.ssm_keys + key_head;
+                let k_head = &conv_ref[k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
+                let v_head_idx = 2 * geometry.ssm_keys + head_index;
+                let v_head = &conv_ref[v_head_idx * head_out_len..(v_head_idx + 1) * head_out_len];
+                for (token, slot) in inputs[..count].iter_mut().enumerate() {
+                    *slot = Input {
+                        query: &q_head[token * width..(token + 1) * width],
+                        key: &k_head[token * width..(token + 1) * width],
+                        value: &v_head[token * width..(token + 1) * width],
+                        decay: tile.alpha[token][head_index],
+                        beta: tile.beta[token][head_index],
+                    };
+                }
+            } else {
+                for (token, slot) in inputs[..count].iter_mut().enumerate() {
+                    let mixed = &tile.mixed[token];
+                    *slot = Input {
+                        query: &mixed[key_head * width..(key_head + 1) * width],
+                        key: &mixed[geometry.key_width() + key_head * width
+                            ..geometry.key_width() + (key_head + 1) * width],
+                        value: &mixed[2 * geometry.key_width() + head_index * width
+                            ..2 * geometry.key_width() + (head_index + 1) * width],
+                        decay: tile.alpha[token][head_index],
+                        beta: tile.beta[token][head_index],
+                    };
+                }
             }
             let range = head_index * width * width..(head_index + 1) * width * width;
             if chunkwise {

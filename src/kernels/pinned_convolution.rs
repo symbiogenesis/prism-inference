@@ -238,6 +238,124 @@ pub(crate) fn step_silu_in_place(
     step_in_place_inner::<true>(history, mixed, coefficients, width)
 }
 
+/// Evaluates `tokens.len() / channels` contiguous causal convolution steps,
+/// applying pinned `SiLU` in registers before storing each token slice and
+/// sliding history in NEON registers across tokens before writing updated
+/// history once per 4-channel group.
+///
+/// # Errors
+/// Rejects invalid geometry or nonfinite outputs.
+pub(crate) fn step_silu_tokens_in_place(
+    history: &mut [f32],
+    tokens: &mut [f32],
+    channels: usize,
+    coefficients: &[f32],
+    width: usize,
+) -> Result<()> {
+    step_tokens_in_place_inner::<true>(history, tokens, channels, coefficients, width)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep multi-token NEON register-sliding convolution, optional SiLU fusion and fallback together."
+)]
+fn step_tokens_in_place_inner<const SILU: bool>(
+    history: &mut [f32],
+    tokens: &mut [f32],
+    channels: usize,
+    coefficients: &[f32],
+    width: usize,
+) -> Result<()> {
+    if width == 0 {
+        return Err(invalid("pinned convolution requires coefficients"));
+    }
+    let hist_width = width - 1;
+    if channels == 0
+        || !tokens.len().is_multiple_of(channels)
+        || coefficients.len() != channels.saturating_mul(width)
+        || history.len() != channels.saturating_mul(hist_width)
+    {
+        return Err(invalid("pinned convolution history width mismatch"));
+    }
+    let count = tokens.len() / channels;
+    if count == 0 {
+        return Ok(());
+    }
+    if count == 1 {
+        return step_in_place_inner::<SILU>(history, tokens, coefficients, width);
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if width == 4
+        && channels.is_multiple_of(4)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        use fearless_simd::{f32x4, prelude::*};
+        let zero = f32x4::splat(neon, 0.0);
+        let one = f32x4::splat(neon, 1.0);
+        let mut finite_mask = zero.is_finite();
+        let (h_chunks, _) = history.as_chunks_mut::<12>();
+        let (c_chunks, _) = coefficients.as_chunks::<16>();
+        for (group, (h_chunk, c_chunk)) in h_chunks.iter_mut().zip(c_chunks).enumerate() {
+            let [tap0, tap1, tap2, tap3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_chunk[0..4]),
+                f32x4::from_slice(neon, &c_chunk[4..8]),
+                f32x4::from_slice(neon, &c_chunk[8..12]),
+                f32x4::from_slice(neon, &c_chunk[12..16]),
+            );
+            let mut h_t0 =
+                f32x4::load_array(neon, [h_chunk[0], h_chunk[3], h_chunk[6], h_chunk[9]]);
+            let mut h_t1 =
+                f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
+            let mut h_t2 =
+                f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
+            let col = group * 4;
+            for token in 0..count {
+                let offset = token * channels + col;
+                let m_chunk = &mut tokens[offset..offset + 4];
+                let p = f32x4::from_slice(neon, m_chunk);
+                let mut sum = zero;
+                sum = h_t0.mul_add_precise(tap0, sum);
+                sum = h_t1.mul_add_precise(tap1, sum);
+                sum = h_t2.mul_add_precise(tap2, sum);
+                let out = p.mul_add_precise(tap3, sum);
+                finite_mask &= out.is_finite();
+                if SILU {
+                    (out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out)))
+                        .store_slice(m_chunk);
+                } else {
+                    out.store_slice(m_chunk);
+                }
+                h_t0 = h_t1;
+                h_t1 = h_t2;
+                h_t2 = p;
+            }
+            let mut t0 = [0.0; 4];
+            let mut t1 = [0.0; 4];
+            let mut t2 = [0.0; 4];
+            h_t0.store_slice(&mut t0);
+            h_t1.store_slice(&mut t1);
+            h_t2.store_slice(&mut t2);
+            *h_chunk = [
+                t0[0], t1[0], t2[0], t0[1], t1[1], t2[1], t0[2], t1[2], t2[2], t0[3], t1[3], t2[3],
+            ];
+        }
+        if !finite_mask.all_true() {
+            return Err(invalid("nonfinite kernel output"));
+        }
+        return Ok(());
+    }
+    for token_slice in tokens.chunks_exact_mut(channels) {
+        step_in_place_inner::<SILU>(history, token_slice, coefficients, width)?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "Keep in-place NEON four-channel convolution, optional SiLU fusion and scalar fallback together."
@@ -360,7 +478,10 @@ mod tests {
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
-    use super::{row, step_in_place, step_into, step_silu_in_place, step_silu_into};
+    use super::{
+        row, step_in_place, step_into, step_silu_in_place, step_silu_into,
+        step_silu_tokens_in_place,
+    };
     use crate::Result;
 
     #[derive(Deserialize)]
@@ -532,5 +653,43 @@ mod tests {
         assert!(row(&[1.0], 2.0, &[3.0]).is_err());
         assert!(row(&[], f32::MAX, &[2.0]).is_err());
         assert!(row(&[f32::NAN], 1.0, &[1.0, 1.0]).is_err());
+    }
+
+    #[test]
+    fn pinned_convolution_multi_token_matches_single_token_steps_bit_for_bit() -> Result<()> {
+        for channels in [8, 128, 65] {
+            for width in [4, 2] {
+                let hist_width = width - 1;
+                let history: Vec<f32> = (0..channels * hist_width)
+                    .map(|idx| ((idx * 17 + 3) % 31) as f32 * 0.0625 - 0.5)
+                    .collect();
+                let coefficients: Vec<f32> = (0..channels * width)
+                    .map(|idx| ((idx * 23 + 7) % 29) as f32 * 0.03125 - 0.375)
+                    .collect();
+                let count = 8;
+                let tokens: Vec<f32> = (0..count * channels)
+                    .map(|idx| ((idx * 41 + 11) % 37) as f32 * 0.0625 - 0.75)
+                    .collect();
+
+                let mut expected_history = history.clone();
+                let mut expected_tokens = tokens.clone();
+                for token_slice in expected_tokens.chunks_exact_mut(channels) {
+                    step_silu_in_place(&mut expected_history, token_slice, &coefficients, width)?;
+                }
+
+                let mut actual_history = history;
+                let mut actual_tokens = tokens;
+                step_silu_tokens_in_place(
+                    &mut actual_history,
+                    &mut actual_tokens,
+                    channels,
+                    &coefficients,
+                    width,
+                )?;
+                assert_eq!(bits(&actual_tokens), bits(&expected_tokens));
+                assert_eq!(bits(&actual_history), bits(&expected_history));
+            }
+        }
+        Ok(())
     }
 }

@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use bonsai_gguf::{Metadata, MetadataArray};
+use bonsai_native_hash::hash_bytes;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::chat::ChatTemplate;
 use crate::model::swift::Representation;
@@ -182,7 +182,7 @@ impl SwiftChatSession {
             .get("tokenizer.chat_template")
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid("Swift chat requires its embedded template"))?;
-        let template_digest: String = Sha256::digest(source.as_bytes())
+        let template_digest: String = hash_bytes(source.as_bytes())?
             .into_iter()
             .flat_map(|byte| [byte >> 4, byte & 15])
             .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))

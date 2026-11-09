@@ -8,9 +8,9 @@ use bonsai_prism_runtime::{
     runtime::{Cancellation, Finish, Generation, Limits, Prefill, Runtime},
     sampling::Sampler,
 };
+use bonsai_native_hash::Hasher;
 use serde::Serialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek},
@@ -96,14 +96,14 @@ struct Capture {
 fn recorded_file(path: &Path, values: usize) -> Result<CaptureFile> {
     let mut file = File::open(path)?;
     let bytes = file.metadata()?.len();
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new()?;
     let mut buffer = [0; 16_384];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        digest.update(&buffer[..read]);
+        digest.update(&buffer[..read])?;
     }
     Ok(CaptureFile {
         file: path
@@ -114,7 +114,7 @@ fn recorded_file(path: &Path, values: usize) -> Result<CaptureFile> {
         values,
         bytes,
         sha256: digest
-            .finalize()
+            .finish()?
             .iter()
             .flat_map(|byte| [byte >> 4, byte & 15])
             .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))

@@ -8,8 +8,8 @@ use bonsai_prism_runtime::{
     runtime::{Cancellation, Completion, GenerationPhase, GenerationTimings},
     swift_session::SwiftSession,
 };
+use bonsai_native_hash::{Hasher, hash_bytes};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -102,7 +102,7 @@ fn read_input(path: &Path, deadline: Instant) -> Result<(Vec<u8>, String)> {
         return Err(reject("messages input exceeds its byte bound"));
     }
     // The exact same captured bytes are hashed before parsing; no reread race.
-    let digest = hex(Sha256::digest(&bytes));
+    let digest = hex(hash_bytes(&bytes)?);
     Ok((bytes, digest))
 }
 
@@ -111,7 +111,7 @@ fn executable_hash(deadline: Instant) -> Result<String> {
     if file.metadata()?.len() > MAX_EXECUTABLE_BYTES {
         return Err(reject("diagnostic executable exceeds its byte bound"));
     }
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new()?;
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 8_192];
     loop {
@@ -124,9 +124,9 @@ fn executable_hash(deadline: Instant) -> Result<String> {
         if bytes > MAX_EXECUTABLE_BYTES {
             return Err(reject("diagnostic executable exceeds its byte bound"));
         }
-        digest.update(&buffer[..count]);
+        digest.update(&buffer[..count])?;
     }
-    Ok(hex(digest.finalize()))
+    Ok(hex(digest.finish()?))
 }
 
 fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<()> {

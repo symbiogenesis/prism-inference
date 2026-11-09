@@ -41,9 +41,9 @@ use hexagon_native_rpc::{
     HmxQ2WeightHandle, NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle,
     Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
 };
+use bonsai_native_hash::{Hasher, hash_bytes};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 
 const PROJECTION: &str = "blk.0.ffn_up.weight";
 const MAX_REQUEST_BYTES: u64 = 8192;
@@ -424,53 +424,54 @@ fn emit(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+fn digest(bytes: &[u8]) -> Result<String> {
+    Ok(hash_bytes(bytes)?
         .iter()
         .flat_map(|byte| [byte >> 4, byte & 15])
         .map(|value| char::from(b"0123456789abcdef"[usize::from(value)]))
-        .collect()
+        .collect())
 }
 
-fn hash_values(hash: &mut Sha256, values: &[f32]) -> Result<()> {
+fn hash_values(hash: &mut Hasher, values: &[f32]) -> Result<()> {
     require(values.iter().all(|value| value.is_finite()))?;
-    hash.update(u64::try_from(values.len())?.to_le_bytes());
+    hash.update(&u64::try_from(values.len())?.to_le_bytes())?;
     for value in values {
-        hash.update(value.to_bits().to_le_bytes());
+        hash.update(&value.to_bits().to_le_bytes())?;
     }
     Ok(())
 }
 
 fn state_digest(graph: &Qwen35) -> Result<String> {
-    let mut hash = Sha256::new();
-    hash.update(b"hexagon-live-model-state-v1\0");
+    let mut hash = Hasher::new()?;
+    hash.update(b"hexagon-live-model-state-v1\0")?;
     graph.visit_state(&mut |block, component, values| {
-        hash.update(u64::try_from(block)?.to_le_bytes());
+        hash.update(&u64::try_from(block)?.to_le_bytes())?;
         let (tag, position) = match component {
             StateComponent::Key(position) => (0_u8, position),
             StateComponent::Value(position) => (1, position),
             StateComponent::Convolution => (2, 0),
             StateComponent::Recurrent => (3, 0),
         };
-        hash.update([tag]);
-        hash.update(u64::try_from(position)?.to_le_bytes());
+        hash.update(&[tag])?;
+        hash.update(&u64::try_from(position)?.to_le_bytes())?;
         hash_values(&mut hash, values)
     })?;
-    Ok(hex_digest(hash))
+    hex_digest(hash)
 }
 
-fn hex_digest(hash: Sha256) -> String {
-    hash.finalize()
+fn hex_digest(hash: Hasher) -> Result<String> {
+    Ok(hash
+        .finish()?
         .iter()
         .flat_map(|byte| [byte >> 4, byte & 15])
         .map(|value| char::from(b"0123456789abcdef"[usize::from(value)]))
-        .collect()
+        .collect())
 }
 
 fn logits_digest(logits: &[f32]) -> Result<String> {
-    let mut hash = Sha256::new();
+    let mut hash = Hasher::new()?;
     hash_values(&mut hash, logits)?;
-    Ok(hex_digest(hash))
+    hex_digest(hash)
 }
 
 fn shared_model(model: &Model) -> Model {
@@ -1817,11 +1818,11 @@ fn main_work() -> Result<()> {
     request.validate()?;
     #[cfg(windows)]
     {
-        run_request(&request, &digest(&bytes))
+        run_request(&request, &digest(&bytes)?)
     }
     #[cfg(not(windows))]
     {
-        let _ = (request, digest(&bytes));
+        let _ = (request, digest(&bytes)?);
         Err(Error::UnsupportedPlatform.into())
     }
 }

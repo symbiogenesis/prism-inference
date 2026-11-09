@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bonsai_native_hash::hash_bytes;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
 
 use crate::Result;
 
@@ -178,7 +178,8 @@ impl<'a> Catalog<'a> {
         // Field order matches PowerShell's ordered ConvertTo-Json contract. Every
         // canonical string is validated ASCII, with no escapable characters.
         let canonical = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        Ok(Sha256::digest(canonical)
+        Ok(hash_bytes(&canonical)
+            .map_err(|error| error.to_string())?
             .iter()
             .flat_map(|byte| {
                 const HEX: &[u8; 16] = b"0123456789abcdef";

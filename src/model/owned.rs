@@ -10,7 +10,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use bonsai_gguf::{Metadata, MetadataArray, MetadataValue};
-use sha2::{Digest, Sha256};
+use bonsai_native_hash::Hasher;
 
 use super::{Model, Tensor, gguf_context, validate_payload};
 use crate::{Result, invalid};
@@ -160,11 +160,11 @@ impl Model {
                 },
             );
         }
-        let mut output = HashWriter(Sha256::new());
+        let mut output = HashWriter(Hasher::new()?);
         model.write_to(&mut output)?;
         model.identity = output
             .0
-            .finalize()
+            .finish()?
             .into_iter()
             .flat_map(|byte| [byte >> 4, byte & 15])
             .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
@@ -284,11 +284,11 @@ impl Write for CountWriter {
     }
 }
 
-struct HashWriter(Sha256);
+struct HashWriter(Hasher);
 
 impl Write for HashWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.update(bytes);
+        self.0.update(bytes)?;
         Ok(bytes.len())
     }
 

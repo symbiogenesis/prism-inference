@@ -8,8 +8,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
+use bonsai_native_hash::hash_bytes;
 use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
 
 use crate::Result;
 
@@ -225,7 +225,8 @@ impl Inputs {
             u64::try_from(bytes.len()).map_err(|error| error.to_string())? <= maximum,
             "Prism source artifact exceeds its byte bound.",
         )?;
-        let digest: String = Sha256::digest(&bytes)
+        let digest: String = hash_bytes(&bytes)
+            .map_err(|error| error.to_string())?
             .iter()
             .flat_map(|byte| {
                 const HEX: &[u8; 16] = b"0123456789abcdef";

@@ -50,7 +50,7 @@ serde = { version = "=1.0.229", optional = true, features = ["derive"] }
 regex = "=1.13.1"
 fancy-regex = "=0.14.0"
 unicode-normalization-alignments = "=0.1.12"
-sha2 = { version = "=0.11.1", default-features = false }
+bonsai-native-hash = { version = "=0.1.1", path = "tools/native-hash" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))'.dependencies]
 fearless_simd = { version = "=1.1.0", optional = true }
@@ -59,6 +59,7 @@ bonsai-neon-dot = { version = "=0.1.0", path = "tools/neon-dot", optional = true
 [dev-dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+sha2.workspace = true
 # Independent Rust tokenizer references; native regex and C++ training are disabled.
 tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
 sentencepiece-rs = { version = "=0.2.2", default-features = false }

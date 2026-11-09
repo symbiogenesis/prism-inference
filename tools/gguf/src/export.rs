@@ -5,9 +5,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use bonsai_native_hash::Hasher;
 use bonsai_ternary::{pack_ptq, unpack_ptq};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::inspect::Inspection;
 use crate::{CODEC_COMMIT, Result, bad};
@@ -102,16 +102,16 @@ fn output_digest(
     deadline: &Deadline,
 ) -> Result<String> {
     output.seek(SeekFrom::Start(0))?;
-    let mut hash = Sha256::new();
+    let mut hash = Hasher::new()?;
     while bytes > 0 {
         deadline.check()?;
         let count = usize::try_from(bytes.min(u64::try_from(buffer.len())?))?;
         output.read_exact(&mut buffer[..count])?;
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])?;
         bytes -= u64::try_from(count)?;
     }
     deadline.check()?;
-    Ok(crate::digest_hex(hash))
+    crate::digest_hex(hash)
 }
 
 fn new_output(path: &Path) -> Result<File> {

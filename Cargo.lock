@@ -97,7 +97,6 @@ dependencies = [
  "prism-inference",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -601,9 +600,9 @@ dependencies = [
 name = "prism-conformance-policy"
 version = "0.1.0"
 dependencies = [
+ "bonsai-native-hash",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -612,6 +611,7 @@ version = "0.1.21"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
+ "bonsai-native-hash",
  "bonsai-neon-dot",
  "bonsai-prism",
  "bonsai-ternary",

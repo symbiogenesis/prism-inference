@@ -11,7 +11,7 @@ use bonsai_gguf::{
     Metadata, MetadataArray, MetadataValue, MetadataValueRef, PRISM_DIALECT, TensorDescriptor,
     VerifiedModel,
 };
-use sha2::{Digest, Sha256};
+use bonsai_native_hash::Hasher;
 
 use super::Model;
 use crate::{Result, invalid};
@@ -316,7 +316,7 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
         .get("tokenizer.chat_template")
         .and_then(MetadataValue::as_str)
         .ok_or_else(|| invalid("Swift embedded template is missing"))?;
-    if template.len() != 8_952 || digest([template.as_bytes()]) != TEMPLATE_SHA256 {
+    if template.len() != 8_952 || digest([template.as_bytes()])? != TEMPLATE_SHA256 {
         return Err(invalid("Swift embedded template identity mismatch"));
     }
     check_integers(metadata, "qwen35.rope.dimension_sections", &[11, 11, 10, 0])?;
@@ -329,7 +329,7 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
         .get("prism.hadamard.sign_values")
         .and_then(MetadataValue::as_array)
         .ok_or_else(|| invalid("Swift Hadamard signs are missing"))?;
-    let mut sign_hash = Sha256::new();
+    let mut sign_hash = Hasher::new()?;
     if signs.len() != 28_672 {
         return Err(invalid("Swift Hadamard sign count mismatch"));
     }
@@ -340,9 +340,9 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
         if value != -1 && value != 1 {
             return Err(invalid("Swift Hadamard signs must be +1 or -1"));
         }
-        sign_hash.update(i32::try_from(value)?.to_le_bytes());
+        sign_hash.update(&i32::try_from(value)?.to_le_bytes())?;
     }
-    if hex(sign_hash) != SIGN_SHA256 {
+    if hex(sign_hash)? != SIGN_SHA256 {
         return Err(invalid("Swift Hadamard sign identity mismatch"));
     }
     let expected = expected_tensors(representation);
@@ -411,20 +411,21 @@ fn check_integers(metadata: &Metadata, key: &str, expected: &[u64]) -> Result<()
     Ok(())
 }
 
-fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
-    let mut hash = Sha256::new();
+fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Result<String> {
+    let mut hash = Hasher::new()?;
     for part in parts {
-        hash.update(part);
+        hash.update(part)?;
     }
     hex(hash)
 }
 
-fn hex(hash: Sha256) -> String {
-    hash.finalize()
+fn hex(hash: Hasher) -> Result<String> {
+    Ok(hash
+        .finish()?
         .iter()
         .flat_map(|byte| [byte >> 4, byte & 15])
         .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+        .collect())
 }
 
 fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Vec<u64>)> {

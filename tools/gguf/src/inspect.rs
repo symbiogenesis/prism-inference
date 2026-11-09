@@ -7,9 +7,9 @@
 use crate::{Metadata, MetadataArray, MetadataValue};
 use crate::{PRISM_DIALECT, Result};
 #[cfg(feature = "report")]
-use serde_json::{Map, Value, json};
+use bonsai_native_hash::Hasher;
 #[cfg(feature = "report")]
-use sha2::{Digest, Sha256};
+use serde_json::{Map, Value, json};
 #[cfg(feature = "report")]
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -419,7 +419,7 @@ impl Parser<'_> {
     }
 
     #[cfg(feature = "report")]
-    fn hash_record(&mut self, hash: &mut Sha256, start: u64, length: u64) -> Result<()> {
+    fn hash_record(&mut self, hash: &mut Hasher, start: u64, length: u64) -> Result<()> {
         let restore = self.position();
         self.reader.seek(SeekFrom::Start(start))?;
         let result = (|| -> Result<()> {
@@ -430,7 +430,7 @@ impl Parser<'_> {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
                 }
                 let size = available.len().min(usize::try_from(remaining)?);
-                hash.update(&available[..size]);
+                hash.update(&available[..size])?;
                 self.reader.consume(size);
                 remaining -= u64::try_from(size)?;
             }
@@ -615,7 +615,7 @@ fn inspect_with_vocabulary_version(
     #[cfg(feature = "report")]
     let mut file_type_position = None;
     #[cfg(feature = "report")]
-    let mut tokenizer_hash = Sha256::new();
+    let mut tokenizer_hash = Hasher::new()?;
     #[cfg(feature = "report")]
     let mut tokenizer_bytes = 0;
     #[cfg(feature = "report")]
@@ -650,9 +650,9 @@ fn inspect_with_vocabulary_version(
             parser.skip(size)?;
             #[cfg(feature = "report")]
             {
-                let mut hash = Sha256::new();
+                let mut hash = Hasher::new()?;
                 parser.hash_record(&mut hash, add(value_start, 8)?, size)?;
-                let digest = crate::digest_hex(hash);
+                let digest = crate::digest_hex(hash)?;
                 templates.insert(key, json!({"Utf8Bytes": size, "Sha256": digest}));
             }
         } else {
@@ -887,7 +887,7 @@ fn inspect_with_vocabulary_version(
                 "MetadataEndOffset": metadata_end, "TensorDescriptorsEndOffset": descriptors_end, "TensorDataOffset": data_offset,
                 "TensorCount": tensor_count, "TensorTypeHistogram": histogram, "Scalars": scalar_report, "Arrays": arrays,
                 "SpecialTokenIds": special, "EmbeddedTemplates": templates, "MtpTensorCount": mtp.len(), "MtpTensorNames": mtp,
-                "TokenizerMetadataSha256": crate::digest_hex(tokenizer_hash), "TokenizerMetadataBytes": tokenizer_bytes,
+                "TokenizerMetadataSha256": crate::digest_hex(tokenizer_hash)?, "TokenizerMetadataBytes": tokenizer_bytes,
                 "TokenizerMetadataRecords": tokenizer_records,
                 "TokenizerDigestDefinition": "SHA-256 of complete raw serialized tokenizer.* KV records concatenated in file order, including chat templates",
                 "InspectionLimits": {"HeaderBytes": HEADER_LIMIT, "StringBytes": STRING_LIMIT, "ArrayElements": ARRAY_LIMIT,

@@ -12,9 +12,9 @@ keywords = ["prism", "validation", "testing"]
 categories = ["command-line-utilities", "development-tools::testing"]
 
 [dependencies]
+bonsai-native-hash = { path = "../native-hash", version = "=0.1.1" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json.workspace = true
-sha2.workspace = true
 
 [lints]
 workspace = true

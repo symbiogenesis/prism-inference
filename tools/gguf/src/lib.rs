@@ -23,8 +23,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "report")]
 use serde_json::Value;
-#[cfg(feature = "report")]
-use sha2::{Digest, Sha256};
 
 pub use inspect::TensorDescriptor;
 pub use metadata::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
@@ -58,8 +56,8 @@ fn open_read(path: &Path) -> Result<File> {
 }
 
 #[cfg(feature = "report")]
-pub(crate) fn digest_hex(hash: Sha256) -> String {
-    bytes_hex(hash.finalize().into())
+pub(crate) fn digest_hex(hash: bonsai_native_hash::Hasher) -> Result<String> {
+    Ok(bytes_hex(hash.finish()?))
 }
 
 fn bytes_hex(digest: [u8; 32]) -> String {

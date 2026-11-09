@@ -163,10 +163,10 @@ def source_hashes(root):
     """Bind all runtime source and selected fixtures rather than a display version."""
     files = {root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml"}
     for directory in ["src", "server/src", "tools/ternary/src", "tools/gguf/src", "tools/native-hash/src", "tools/prism/src",
-                      "tools/hexagon-native/src", "tools/hexagon-runtime/src"]:
+                      "tools/hexagon-native/src", "tools/hexagon-runtime/src", "tools/neon-dot/src"]:
         files.update((root / directory).rglob("*.rs"))
     for directory in ["server", "tools/ternary", "tools/gguf", "tools/native-hash", "tools/prism",
-                      "tools/hexagon-native", "tools/hexagon-runtime"]:
+                      "tools/hexagon-native", "tools/hexagon-runtime", "tools/neon-dot"]:
         files.add(root / directory / "Cargo.toml")
         build_script = root / directory / "build.rs"
         if build_script.is_file():

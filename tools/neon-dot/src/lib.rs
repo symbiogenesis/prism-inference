@@ -672,9 +672,7 @@ pub fn dot_pq2_four_rows_four_tokens_precomputed(
         return tile;
     }
     packed.map(|row| {
-        std::array::from_fn(|tok| {
-            dot_pq2_consumption_block(row, planes[tok], activation_sums[tok])
-        })
+        std::array::from_fn(|tok| dot_pq2_consumption_block(row, planes[tok], activation_sums[tok]))
     })
 }
 
@@ -695,9 +693,7 @@ pub fn dot_pq2_eight_rows_four_tokens_precomputed(
         return tile;
     }
     packed.map(|row| {
-        std::array::from_fn(|tok| {
-            dot_pq2_consumption_block(row, planes[tok], activation_sums[tok])
-        })
+        std::array::from_fn(|tok| dot_pq2_consumption_block(row, planes[tok], activation_sums[tok]))
     })
 }
 
@@ -718,9 +714,7 @@ pub fn dot_pq2_eight_rows_eight_tokens_precomputed(
         return tile;
     }
     packed.map(|row| {
-        std::array::from_fn(|tok| {
-            dot_pq2_consumption_block(row, planes[tok], activation_sums[tok])
-        })
+        std::array::from_fn(|tok| dot_pq2_consumption_block(row, planes[tok], activation_sums[tok]))
     })
 }
 
@@ -945,8 +939,14 @@ mod tests {
             assert_eq!(eight_1_lanes[r], tile8_lanes[r][0]);
             assert_eq!(eight_1_groups[r], tile8_groups[r][0]);
             for t in 0..4 {
-                assert_eq!(tile8_lanes[r][t], dot_ptq1_block_lanes(&rows8[r], act_refs[t]));
-                assert_eq!(tile8_groups[r][t], dot_ptq1_block_groups(&rows8[r], act_refs[t]));
+                assert_eq!(
+                    tile8_lanes[r][t],
+                    dot_ptq1_block_lanes(&rows8[r], act_refs[t])
+                );
+                assert_eq!(
+                    tile8_groups[r][t],
+                    dot_ptq1_block_groups(&rows8[r], act_refs[t])
+                );
             }
         }
         for r in 0..4 {

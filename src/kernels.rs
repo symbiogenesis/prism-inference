@@ -1342,6 +1342,46 @@ pub(crate) fn f16_dot_two_token_four_queries(
     (f16_dot_four(queries0, key), f16_dot_four(queries1, key))
 }
 
+pub(crate) fn f16_dot_two_keys_four_queries(
+    queries: [&[f32]; 4],
+    keys: [&[u16]; 2],
+) -> [[f32; 4]; 2] {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::f16_dot_two_keys_four_queries(queries, keys) {
+        return values;
+    }
+    keys.map(|key| f16_dot_four(queries, key))
+}
+
+pub(crate) fn f16_dot_two_keys_two_token_four_queries(
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+    keys: [&[u16]; 2],
+) -> (
+    pinned_attention::TwoKeyFourQueryScores,
+    pinned_attention::TwoKeyFourQueryScores,
+) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::f16_dot_two_keys_two_token_four_queries(queries0, queries1, keys) {
+        return values;
+    }
+    let (k0_0, k0_1) = f16_dot_two_token_four_queries(queries0, queries1, keys[0]);
+    let (k1_0, k1_1) = f16_dot_two_token_four_queries(queries0, queries1, keys[1]);
+    ([k0_0, k1_0], [k0_1, k1_1])
+}
+
 pub(crate) fn f16_dot_four_keys_four_queries(
     queries: [&[f32]; 4],
     keys: [&[u16]; 4],
@@ -3930,6 +3970,44 @@ pub fn softmax(values: &mut [f32]) -> Result<()> {
     let inverse_sum = (1.0 / total) as f32;
     for value in values {
         *value *= inverse_sum;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "The scalar softmax contract rounds the binary64 inverse sum to binary32 before binary16 rounding."
+)]
+pub(crate) fn softmax_round_f16(values: &mut [f32]) -> Result<()> {
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !maximum.is_finite()
+        || values
+            .iter()
+            .any(|value| value.is_nan() || *value == f32::INFINITY)
+    {
+        return Err(invalid(
+            "softmax requires at least one finite logit and no NaN or positive infinity",
+        ));
+    }
+    let mut total = 0.0_f64;
+    for value in &mut *values {
+        *value = (*value - maximum).exp();
+        total += f64::from(*value);
+    }
+    let inverse_sum = (1.0 / total) as f32;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::softmax_scale_round_f16_in_place(values, inverse_sum) {
+        return Ok(());
+    }
+    for value in values {
+        *value = round_f16(*value * inverse_sum);
     }
     Ok(())
 }

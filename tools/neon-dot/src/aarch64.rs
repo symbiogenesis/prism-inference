@@ -1585,10 +1585,30 @@ fn dot_ptq1_4x1_groups_dotprod(
     let act31 = load_s8x16(&a3[1]);
     let mut out = [[0_i32; 4]; 4];
     for r in 0..4 {
-        let g0 = sdot32_vec(load_s8x16(&trits[r][0]), load_s8x16(&trits[r][1]), act00, act01);
-        let g1 = sdot32_vec(load_s8x16(&trits[r][2]), load_s8x16(&trits[r][3]), act10, act11);
-        let g2 = sdot32_vec(load_s8x16(&trits[r][4]), load_s8x16(&trits[r][5]), act20, act21);
-        let g3 = sdot32_vec(load_s8x16(&trits[r][6]), load_s8x16(&trits[r][7]), act30, act31);
+        let g0 = sdot32_vec(
+            load_s8x16(&trits[r][0]),
+            load_s8x16(&trits[r][1]),
+            act00,
+            act01,
+        );
+        let g1 = sdot32_vec(
+            load_s8x16(&trits[r][2]),
+            load_s8x16(&trits[r][3]),
+            act10,
+            act11,
+        );
+        let g2 = sdot32_vec(
+            load_s8x16(&trits[r][4]),
+            load_s8x16(&trits[r][5]),
+            act20,
+            act21,
+        );
+        let g3 = sdot32_vec(
+            load_s8x16(&trits[r][6]),
+            load_s8x16(&trits[r][7]),
+            act30,
+            act31,
+        );
         store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[r]);
     }
     out
@@ -1643,10 +1663,30 @@ fn dot_ptq1_8x1_groups_dotprod(
     let act31 = load_s8x16(&a3[1]);
     let mut out = [[0_i32; 4]; 8];
     for r in 0..8 {
-        let g0 = sdot32_vec(load_s8x16(&trits[r][0]), load_s8x16(&trits[r][1]), act00, act01);
-        let g1 = sdot32_vec(load_s8x16(&trits[r][2]), load_s8x16(&trits[r][3]), act10, act11);
-        let g2 = sdot32_vec(load_s8x16(&trits[r][4]), load_s8x16(&trits[r][5]), act20, act21);
-        let g3 = sdot32_vec(load_s8x16(&trits[r][6]), load_s8x16(&trits[r][7]), act30, act31);
+        let g0 = sdot32_vec(
+            load_s8x16(&trits[r][0]),
+            load_s8x16(&trits[r][1]),
+            act00,
+            act01,
+        );
+        let g1 = sdot32_vec(
+            load_s8x16(&trits[r][2]),
+            load_s8x16(&trits[r][3]),
+            act10,
+            act11,
+        );
+        let g2 = sdot32_vec(
+            load_s8x16(&trits[r][4]),
+            load_s8x16(&trits[r][5]),
+            act20,
+            act21,
+        );
+        let g3 = sdot32_vec(
+            load_s8x16(&trits[r][6]),
+            load_s8x16(&trits[r][7]),
+            act30,
+            act31,
+        );
         store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[r]);
     }
     out

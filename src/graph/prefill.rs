@@ -936,9 +936,130 @@ fn full_attention_tile(
                 if head + 4 <= g.heads && kv_head == (head + 3) / heads_per_kv {
                     let shared_prefix_len = base + base_tok;
                     let total_past = shared_prefix_len + chunk_tokens.saturating_sub(1);
+                    let score_one_key = |scores_chunk: &mut [f32],
+                                         pos: usize,
+                                         past_key: &[u16],
+                                         start_t: usize,
+                                         end_t: usize|
+                     -> Result<()> {
+                        let mut t = start_t;
+                        while t + 2 <= end_t {
+                            let tok0 = base_tok + t;
+                            let tok1 = tok0 + 1;
+                            let queries0 = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                            });
+                            let queries1 = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                            });
+                            let (dots0, dots1) = arithmetic.attention_dot_two_token_four_queries(
+                                queries0, queries1, past_key,
+                            )?;
+                            {
+                                let tok0_scores = &mut scores_chunk
+                                    [t * token_score_stride..(t + 1) * token_score_stride];
+                                tok0_scores[pos] = dots0[0] * scale;
+                                tok0_scores[max_score_len + pos] = dots0[1] * scale;
+                                tok0_scores[2 * max_score_len + pos] = dots0[2] * scale;
+                                tok0_scores[3 * max_score_len + pos] = dots0[3] * scale;
+                            }
+                            {
+                                let tok1_scores = &mut scores_chunk
+                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                                tok1_scores[pos] = dots1[0] * scale;
+                                tok1_scores[max_score_len + pos] = dots1[1] * scale;
+                                tok1_scores[2 * max_score_len + pos] = dots1[2] * scale;
+                                tok1_scores[3 * max_score_len + pos] = dots1[3] * scale;
+                            }
+                            t += 2;
+                        }
+                        for rem_t in t..end_t {
+                            let tok = base_tok + rem_t;
+                            let queries = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok][h * g.head..(h + 1) * g.head]
+                            });
+                            let dots = arithmetic.attention_dot_four(queries, past_key)?;
+                            let tok_scores = &mut scores_chunk
+                                [rem_t * token_score_stride..(rem_t + 1) * token_score_stride];
+                            tok_scores[pos] = dots[0] * scale;
+                            tok_scores[max_score_len + pos] = dots[1] * scale;
+                            tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                        Ok(())
+                    };
+                    let score_two_keys = |scores_chunk: &mut [f32],
+                                          pos0: usize,
+                                          keys2: [&[u16]; 2],
+                                          start_t: usize,
+                                          end_t: usize|
+                     -> Result<()> {
+                        let mut t = start_t;
+                        while t + 2 <= end_t {
+                            let tok0 = base_tok + t;
+                            let tok1 = tok0 + 1;
+                            let queries0 = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                            });
+                            let queries1 = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                            });
+                            let (dots0_2, dots1_2) = arithmetic
+                                .attention_dot_two_keys_two_token_four_queries(
+                                    queries0, queries1, keys2,
+                                )?;
+                            {
+                                let tok0_scores = &mut scores_chunk
+                                    [t * token_score_stride..(t + 1) * token_score_stride];
+                                for (k_off, dots) in dots0_2.into_iter().enumerate() {
+                                    let pos = pos0 + k_off;
+                                    tok0_scores[pos] = dots[0] * scale;
+                                    tok0_scores[max_score_len + pos] = dots[1] * scale;
+                                    tok0_scores[2 * max_score_len + pos] = dots[2] * scale;
+                                    tok0_scores[3 * max_score_len + pos] = dots[3] * scale;
+                                }
+                            }
+                            {
+                                let tok1_scores = &mut scores_chunk
+                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                                for (k_off, dots) in dots1_2.into_iter().enumerate() {
+                                    let pos = pos0 + k_off;
+                                    tok1_scores[pos] = dots[0] * scale;
+                                    tok1_scores[max_score_len + pos] = dots[1] * scale;
+                                    tok1_scores[2 * max_score_len + pos] = dots[2] * scale;
+                                    tok1_scores[3 * max_score_len + pos] = dots[3] * scale;
+                                }
+                            }
+                            t += 2;
+                        }
+                        if t < end_t {
+                            let tok = base_tok + t;
+                            let queries = std::array::from_fn(|i| {
+                                let h = head + i;
+                                &query_ref[tok][h * g.head..(h + 1) * g.head]
+                            });
+                            let dots2 =
+                                arithmetic.attention_dot_two_keys_four_queries(queries, keys2)?;
+                            let tok_scores = &mut scores_chunk
+                                [t * token_score_stride..(t + 1) * token_score_stride];
+                            for (k_off, dots) in dots2.into_iter().enumerate() {
+                                let pos = pos0 + k_off;
+                                tok_scores[pos] = dots[0] * scale;
+                                tok_scores[max_score_len + pos] = dots[1] * scale;
+                                tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                                tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                            }
+                        }
+                        Ok(())
+                    };
                     let mut past_iter = key_cache.tokens().take(total_past).enumerate();
                     while let Some((pos0, p0)) = past_iter.next() {
-                        if pos0 + 4 <= shared_prefix_len
+                        if pos0 + 4 <= total_past
                             && let Some((_, p1)) = past_iter.next()
                             && let Some((_, p2)) = past_iter.next()
                             && let Some((_, p3)) = past_iter.next()
@@ -949,7 +1070,30 @@ fn full_attention_tile(
                                 &p2[offset..offset + g.head],
                                 &p3[offset..offset + g.head],
                             ];
-                            let mut t = 0;
+                            let common_t = (pos0 + 4)
+                                .saturating_sub(shared_prefix_len)
+                                .min(chunk_tokens);
+                            if common_t > 0 {
+                                let t0 = (pos0 + 1).saturating_sub(shared_prefix_len).min(common_t);
+                                let t1 = (pos0 + 2).saturating_sub(shared_prefix_len).min(common_t);
+                                if t0 < t1 {
+                                    score_one_key(scores_chunk, pos0, keys4[0], t0, t1)?;
+                                }
+                                if t1 < common_t {
+                                    score_two_keys(
+                                        scores_chunk,
+                                        pos0,
+                                        [keys4[0], keys4[1]],
+                                        t1,
+                                        common_t,
+                                    )?;
+                                }
+                                let t2 = (pos0 + 3).saturating_sub(shared_prefix_len).min(common_t);
+                                if t2 < common_t {
+                                    score_one_key(scores_chunk, pos0 + 2, keys4[2], t2, common_t)?;
+                                }
+                            }
+                            let mut t = common_t;
                             while t + 2 <= chunk_tokens {
                                 let tok0 = base_tok + t;
                                 let tok1 = tok0 + 1;
@@ -1007,55 +1151,24 @@ fn full_attention_tile(
                             }
                             continue;
                         }
+                        if pos0 + 2 <= total_past
+                            && let Some((_, p1)) = past_iter.next()
+                        {
+                            let keys2 =
+                                [&p0[offset..offset + g.head], &p1[offset..offset + g.head]];
+                            let common_t = (pos0 + 2)
+                                .saturating_sub(shared_prefix_len)
+                                .min(chunk_tokens);
+                            let t0 = (pos0 + 1).saturating_sub(shared_prefix_len).min(common_t);
+                            if t0 < common_t {
+                                score_one_key(scores_chunk, pos0, keys2[0], t0, common_t)?;
+                            }
+                            score_two_keys(scores_chunk, pos0, keys2, common_t, chunk_tokens)?;
+                            continue;
+                        }
                         let past_key = &p0[offset..offset + g.head];
                         let first_t = (pos0 + 1).saturating_sub(shared_prefix_len);
-                        let mut t = first_t;
-                        while t + 2 <= chunk_tokens {
-                            let tok0 = base_tok + t;
-                            let tok1 = tok0 + 1;
-                            let queries0 = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok0][h * g.head..(h + 1) * g.head]
-                            });
-                            let queries1 = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok1][h * g.head..(h + 1) * g.head]
-                            });
-                            let (dots0, dots1) = arithmetic.attention_dot_two_token_four_queries(
-                                queries0, queries1, past_key,
-                            )?;
-                            {
-                                let tok0_scores = &mut scores_chunk
-                                    [t * token_score_stride..(t + 1) * token_score_stride];
-                                tok0_scores[pos0] = dots0[0] * scale;
-                                tok0_scores[max_score_len + pos0] = dots0[1] * scale;
-                                tok0_scores[2 * max_score_len + pos0] = dots0[2] * scale;
-                                tok0_scores[3 * max_score_len + pos0] = dots0[3] * scale;
-                            }
-                            {
-                                let tok1_scores = &mut scores_chunk
-                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
-                                tok1_scores[pos0] = dots1[0] * scale;
-                                tok1_scores[max_score_len + pos0] = dots1[1] * scale;
-                                tok1_scores[2 * max_score_len + pos0] = dots1[2] * scale;
-                                tok1_scores[3 * max_score_len + pos0] = dots1[3] * scale;
-                            }
-                            t += 2;
-                        }
-                        for rem_t in t..chunk_tokens {
-                            let tok = base_tok + rem_t;
-                            let queries = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok][h * g.head..(h + 1) * g.head]
-                            });
-                            let dots = arithmetic.attention_dot_four(queries, past_key)?;
-                            let tok_scores = &mut scores_chunk
-                                [rem_t * token_score_stride..(rem_t + 1) * token_score_stride];
-                            tok_scores[pos0] = dots[0] * scale;
-                            tok_scores[max_score_len + pos0] = dots[1] * scale;
-                            tok_scores[2 * max_score_len + pos0] = dots[2] * scale;
-                            tok_scores[3 * max_score_len + pos0] = dots[3] * scale;
-                        }
+                        score_one_key(scores_chunk, pos0, past_key, first_t, chunk_tokens)?;
                     }
                     let (attended_pairs, attended_odd) = attended_chunk.as_chunks_mut::<2>();
                     for (pair_idx, [attended_tok0, attended_tok1]) in
@@ -1099,8 +1212,7 @@ fn full_attention_tile(
                         s0_2[score_len0 - 1] = current_dots0[2] * scale;
                         s0_3[score_len0 - 1] = current_dots0[3] * scale;
                         for scores in [&mut *s0_0, &mut *s0_1, &mut *s0_2, &mut *s0_3] {
-                            arithmetic.attention_softmax(scores)?;
-                            round_f16_slice(scores);
+                            arithmetic.attention_softmax_round_f16(scores)?;
                         }
                         let (s1_left, s1_right) = tok1_scores.split_at_mut(2 * max_score_len);
                         let (s1_0, s1_1) = s1_left.split_at_mut(max_score_len);
@@ -1114,8 +1226,7 @@ fn full_attention_tile(
                         s1_2[score_len1 - 1] = current_dots1[2] * scale;
                         s1_3[score_len1 - 1] = current_dots1[3] * scale;
                         for scores in [&mut *s1_0, &mut *s1_1, &mut *s1_2, &mut *s1_3] {
-                            arithmetic.attention_softmax(scores)?;
-                            round_f16_slice(scores);
+                            arithmetic.attention_softmax_round_f16(scores)?;
                         }
                         let probs0: [&[f32]; 4] = [s0_0, s0_1, s0_2, s0_3];
                         let probs1: [&[f32]; 4] = [s1_0, s1_1, s1_2, s1_3];
@@ -1215,8 +1326,7 @@ fn full_attention_tile(
                         s2[score_len - 1] = current_dots[2] * scale;
                         s3[score_len - 1] = current_dots[3] * scale;
                         for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
-                            arithmetic.attention_softmax(scores)?;
-                            round_f16_slice(scores);
+                            arithmetic.attention_softmax_round_f16(scores)?;
                         }
                         let probs: [&[f32]; 4] = [s0, s1, s2, s3];
                         let (r01, r23) = attended_tok[head * g.head..(head + 4) * g.head]
@@ -1272,8 +1382,7 @@ fn full_attention_tile(
                     scores[score_len - 1] = arithmetic
                         .attention_current_dot(q, &current_keys[tok][offset..offset + g.head])?
                         * scale;
-                    arithmetic.attention_softmax(scores)?;
-                    round_f16_slice(scores);
+                    arithmetic.attention_softmax_round_f16(scores)?;
                     let result = &mut attended_tok[head * g.head..(head + 1) * g.head];
                     for (tile_idx, out) in result
                         .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)

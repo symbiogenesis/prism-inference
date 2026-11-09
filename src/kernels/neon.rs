@@ -423,7 +423,7 @@ fn half_bits_u32x4(neon: Neon, v: f32x4<Neon>) -> u32x4<Neon> {
 }
 
 #[inline]
-fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
+pub(super) fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
     f16_u32x4_to_f32_x4(neon, half_bits_u32x4(neon, v))
 }
 
@@ -1045,6 +1045,22 @@ pub(super) fn round_f16_slice(values: &mut [f32]) -> Option<bool> {
         *value = rounded;
     }
     Some(all_finite)
+}
+
+#[inline]
+pub(super) fn softmax_scale_round_f16_in_place(values: &mut [f32], inverse_sum: f32) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let inv_vec = f32x4::splat(neon, inverse_sum);
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        round_f16_x4(neon, f32x4::from_slice(neon, chunk) * inv_vec).store_slice(chunk);
+    }
+    for value in tail {
+        *value = super::round_f16(*value * inverse_sum);
+    }
+    true
 }
 
 #[inline]
@@ -4357,6 +4373,152 @@ pub(super) fn f16_dot_two_token_four_queries(
             sums1[2] as f32,
             sums1[3] as f32,
         ],
+    ))
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn f16_dot_two_keys_four_queries(
+    queries: [&[f32]; 4],
+    keys: [&[u16]; 2],
+) -> Option<[[f32; 4]; 2]> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = keys[0].len();
+    if keys[1].len() != count || queries.iter().any(|q| q.len() != count) {
+        return None;
+    }
+    let k_chunks = keys.map(|k| k.as_chunks::<8>().0);
+    let k_rems = keys.map(|k| k.as_chunks::<8>().1);
+    let q_chunks = queries.map(|q| q.as_chunks::<8>().0);
+    let mut sums = [[-0.0_f64; 4]; 2];
+    for idx in 0..k_chunks[0].len() {
+        let (k0_0, k0_1) = f16_bits_to_f32_x8(neon, &k_chunks[0][idx]);
+        let (k1_0, k1_1) = f16_bits_to_f32_x8(neon, &k_chunks[1][idx]);
+        let k_low = [k0_0, k1_0];
+        let k_high = [k0_1, k1_1];
+        for h in 0..4 {
+            let q8 = &q_chunks[h][idx];
+            let q0 = f32x4::from_slice(neon, &q8[..4]);
+            let q1 = f32x4::from_slice(neon, &q8[4..]);
+            for k in 0..2 {
+                let prod0 = (q0 * k_low[k]).to_array();
+                let prod1 = (q1 * k_high[k]).to_array();
+                sums[k][h] += f64::from(prod0[0]);
+                sums[k][h] += f64::from(prod0[1]);
+                sums[k][h] += f64::from(prod0[2]);
+                sums[k][h] += f64::from(prod0[3]);
+                sums[k][h] += f64::from(prod1[0]);
+                sums[k][h] += f64::from(prod1[1]);
+                sums[k][h] += f64::from(prod1[2]);
+                sums[k][h] += f64::from(prod1[3]);
+            }
+        }
+    }
+    let rem_base = k_chunks[0].len() * 8;
+    for i in 0..k_rems[0].len() {
+        let idx = rem_base + i;
+        let decoded = [
+            super::half_to_float(k_rems[0][i]),
+            super::half_to_float(k_rems[1][i]),
+        ];
+        for h in 0..4 {
+            let q = queries[h][idx];
+            for k in 0..2 {
+                sums[k][h] += f64::from(q * decoded[k]);
+            }
+        }
+    }
+    Some(sums.map(|row| row.map(|v| v as f32)))
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn f16_dot_two_keys_two_token_four_queries(
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+    keys: [&[u16]; 2],
+) -> Option<(
+    super::pinned_attention::TwoKeyFourQueryScores,
+    super::pinned_attention::TwoKeyFourQueryScores,
+)> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = keys[0].len();
+    if keys[1].len() != count
+        || queries0.iter().any(|q| q.len() != count)
+        || queries1.iter().any(|q| q.len() != count)
+    {
+        return None;
+    }
+    let k_chunks = keys.map(|k| k.as_chunks::<8>().0);
+    let k_rems = keys.map(|k| k.as_chunks::<8>().1);
+    let q0_chunks = queries0.map(|q| q.as_chunks::<8>().0);
+    let q1_chunks = queries1.map(|q| q.as_chunks::<8>().0);
+    let mut sums0 = [[-0.0_f64; 4]; 2];
+    let mut sums1 = [[-0.0_f64; 4]; 2];
+    for idx in 0..k_chunks[0].len() {
+        let (k0_0, k0_1) = f16_bits_to_f32_x8(neon, &k_chunks[0][idx]);
+        let (k1_0, k1_1) = f16_bits_to_f32_x8(neon, &k_chunks[1][idx]);
+        let k_low = [k0_0, k1_0];
+        let k_high = [k0_1, k1_1];
+        for h in 0..4 {
+            let q8_0 = &q0_chunks[h][idx];
+            let q0_low = f32x4::from_slice(neon, &q8_0[..4]);
+            let q0_high = f32x4::from_slice(neon, &q8_0[4..]);
+            let q8_1 = &q1_chunks[h][idx];
+            let q1_low = f32x4::from_slice(neon, &q8_1[..4]);
+            let q1_high = f32x4::from_slice(neon, &q8_1[4..]);
+            for k in 0..2 {
+                let p0_0 = (q0_low * k_low[k]).to_array();
+                let p0_1 = (q0_high * k_high[k]).to_array();
+                sums0[k][h] += f64::from(p0_0[0]);
+                sums0[k][h] += f64::from(p0_0[1]);
+                sums0[k][h] += f64::from(p0_0[2]);
+                sums0[k][h] += f64::from(p0_0[3]);
+                sums0[k][h] += f64::from(p0_1[0]);
+                sums0[k][h] += f64::from(p0_1[1]);
+                sums0[k][h] += f64::from(p0_1[2]);
+                sums0[k][h] += f64::from(p0_1[3]);
+
+                let p1_0 = (q1_low * k_low[k]).to_array();
+                let p1_1 = (q1_high * k_high[k]).to_array();
+                sums1[k][h] += f64::from(p1_0[0]);
+                sums1[k][h] += f64::from(p1_0[1]);
+                sums1[k][h] += f64::from(p1_0[2]);
+                sums1[k][h] += f64::from(p1_0[3]);
+                sums1[k][h] += f64::from(p1_1[0]);
+                sums1[k][h] += f64::from(p1_1[1]);
+                sums1[k][h] += f64::from(p1_1[2]);
+                sums1[k][h] += f64::from(p1_1[3]);
+            }
+        }
+    }
+    let rem_base = k_chunks[0].len() * 8;
+    for i in 0..k_rems[0].len() {
+        let idx = rem_base + i;
+        let decoded = [
+            super::half_to_float(k_rems[0][i]),
+            super::half_to_float(k_rems[1][i]),
+        ];
+        for h in 0..4 {
+            let q0 = queries0[h][idx];
+            let q1 = queries1[h][idx];
+            for k in 0..2 {
+                sums0[k][h] += f64::from(q0 * decoded[k]);
+                sums1[k][h] += f64::from(q1 * decoded[k]);
+            }
+        }
+    }
+    Some((
+        sums0.map(|row| row.map(|v| v as f32)),
+        sums1.map(|row| row.map(|v| v as f32)),
     ))
 }
 

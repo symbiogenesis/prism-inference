@@ -479,8 +479,9 @@ pub(super) fn dot_f16_four(neon: Neon, key: &[u16], queries: [&[f32]; 4]) -> Res
     Ok(out)
 }
 
+/// Reduces two validated F16 key slices against four F32 query slices sharing the same KV head.
 #[inline]
-fn dot_f16_two_keys_four_queries(
+pub(super) fn dot_f16_two_keys_four_queries(
     neon: Neon,
     keys: [&[u16]; 2],
     queries: [&[f32]; 4],
@@ -488,9 +489,9 @@ fn dot_f16_two_keys_four_queries(
     let len = queries[0].len();
     let total_steps = padded_dot_steps(len);
     let (k0_chunks8, k0_rem) = keys[0].as_chunks::<8>();
-    let (k1_chunks8, _) = keys[1].as_chunks::<8>();
+    let (k1_chunks8, k1_rem) = keys[1].as_chunks::<8>();
     let vector_steps = k0_chunks8.len() * 8;
-    if vector_steps != total_steps || !k0_rem.is_empty() {
+    if vector_steps != total_steps || !k0_rem.is_empty() || !k1_rem.is_empty() {
         return Ok([
             dot_f16_four(neon, keys[0], queries)?,
             dot_f16_four(neon, keys[1], queries)?,
@@ -672,7 +673,6 @@ pub(super) fn dot_f16_two_token_four_queries(
 }
 
 type TwoKeyStreamPair = ([[f32x4<Neon>; 4]; 2], [[f32x4<Neon>; 4]; 2]);
-type TwoKeyScorePair = ([[f32; 4]; 2], [[f32; 4]; 2]);
 
 #[inline]
 fn dot_f16_two_keys_two_token_four_queries_stream(
@@ -705,13 +705,14 @@ fn dot_f16_two_keys_two_token_four_queries_stream(
     (acc0, acc1)
 }
 
+/// Reduces two validated F16 key slices against two tokens x four F32 query slices sharing a KV head.
 #[inline]
-fn dot_f16_two_keys_two_token_four_queries(
+pub(super) fn dot_f16_two_keys_two_token_four_queries(
     neon: Neon,
     keys: [&[u16]; 2],
     queries0: [&[f32]; 4],
     queries1: [&[f32]; 4],
-) -> Result<TwoKeyScorePair> {
+) -> Result<(super::TwoKeyFourQueryScores, super::TwoKeyFourQueryScores)> {
     let len = queries0[0].len();
     let total_steps = padded_dot_steps(len);
     let (k0_chunks8, k0_rem) = keys[0].as_chunks::<8>();

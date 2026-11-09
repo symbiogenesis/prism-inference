@@ -528,6 +528,89 @@ pub(crate) fn dot_f16_four(key: &[u16], queries: [&[f32]; 4]) -> Result<[f32; 4]
     ])
 }
 
+/// A 2-key by 4-query score tile.
+pub(crate) type TwoKeyFourQueryScores = [[f32; 4]; 2];
+
+/// Reduces two cached F16 key rows against four F32 query rows sharing the same KV head.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f16_two_keys_four_queries(
+    keys: [&[u16]; 2],
+    queries: [&[f32]; 4],
+) -> Result<TwoKeyFourQueryScores> {
+    let len = queries[0].len();
+    if len == 0
+        || len > crate::model::swift::CONTEXT_TOKENS
+        || queries.iter().any(|q| q.len() != len)
+    {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    for key in keys {
+        if key.len() < len {
+            return Err(invalid("pinned attention dot row is short"));
+        }
+        if key.len() > len {
+            return Err(invalid("pinned attention dot row is long"));
+        }
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f16_two_keys_four_queries(neon, keys, queries);
+    }
+    Ok([
+        dot_f16_four(keys[0], queries)?,
+        dot_f16_four(keys[1], queries)?,
+    ])
+}
+
+/// Reduces two cached F16 key rows against two tokens x four F32 query rows sharing the same KV head.
+///
+/// # Errors
+/// Rejects empty, unequal or oversized rows and nonfinite results.
+pub(crate) fn dot_f16_two_keys_two_token_four_queries(
+    keys: [&[u16]; 2],
+    queries0: [&[f32]; 4],
+    queries1: [&[f32]; 4],
+) -> Result<(TwoKeyFourQueryScores, TwoKeyFourQueryScores)> {
+    let len = queries0[0].len();
+    if len == 0
+        || len > crate::model::swift::CONTEXT_TOKENS
+        || queries0.iter().any(|q| q.len() != len)
+        || queries1.iter().any(|q| q.len() != len)
+    {
+        return Err(invalid("invalid pinned attention dot width"));
+    }
+    for key in keys {
+        if key.len() < len {
+            return Err(invalid("pinned attention dot row is short"));
+        }
+        if key.len() > len {
+            return Err(invalid("pinned attention dot row is long"));
+        }
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return neon::dot_f16_two_keys_two_token_four_queries(neon, keys, queries0, queries1);
+    }
+    Ok((
+        dot_f16_two_keys_four_queries(keys, queries0)?,
+        dot_f16_two_keys_four_queries(keys, queries1)?,
+    ))
+}
+
 /// Reduces four cached F16 key rows against four F32 query rows sharing the same KV head.
 ///
 /// # Errors
@@ -734,15 +817,10 @@ pub(crate) fn dot(mut values: impl Iterator<Item = f32>, weights: &[f32]) -> Res
     clippy::as_conversions,
     reason = "Match the native binary64 reciprocal rounded once to binary32."
 )]
-pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
-    if scores.is_empty()
-        || scores.len() > crate::model::swift::CONTEXT_TOKENS
-        || scores.iter().any(|score| !score.is_finite())
-    {
+fn softmax_with_rounding<const ROUND_F16: bool>(scores: &mut [f32]) -> Result<()> {
+    if scores.is_empty() || scores.len() > crate::model::swift::CONTEXT_TOKENS {
         return Err(invalid("invalid pinned attention softmax row"));
     }
-    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut total = 0.0_f64;
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -752,7 +830,27 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
     ))]
     if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
         use fearless_simd::{f32x4, prelude::*};
+        let mut max_vec = f32x4::splat(neon, f32::NEG_INFINITY);
+        let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+        let (chunks, tail) = scores.as_chunks::<4>();
+        for chunk in chunks {
+            let v = f32x4::from_slice(neon, chunk);
+            finite_mask &= v.is_finite();
+            max_vec = max_vec.max(v);
+        }
+        if !finite_mask.all_true() || tail.iter().any(|score| !score.is_finite()) {
+            return Err(invalid("invalid pinned attention softmax row"));
+        }
+        let max_lanes = max_vec.to_array();
+        let mut maximum = max_lanes[0]
+            .max(max_lanes[1])
+            .max(max_lanes[2])
+            .max(max_lanes[3]);
+        for &score in tail {
+            maximum = maximum.max(score);
+        }
         let max_vec = f32x4::splat(neon, maximum);
+        let mut total = 0.0_f64;
         let (chunks, tail) = scores.as_chunks_mut::<4>();
         for chunk in chunks {
             let exp = super::pinned_activations::vector_exp_x4(
@@ -774,13 +872,28 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
         let inv_vec = f32x4::splat(neon, inverse);
         let (chunks, tail) = scores.as_chunks_mut::<4>();
         for chunk in chunks {
-            (f32x4::from_slice(neon, chunk) * inv_vec).store_slice(chunk);
+            let scaled = f32x4::from_slice(neon, chunk) * inv_vec;
+            if ROUND_F16 {
+                super::neon::round_f16_x4(neon, scaled).store_slice(chunk);
+            } else {
+                scaled.store_slice(chunk);
+            }
         }
         for score in tail {
-            *score *= inverse;
+            let scaled = *score * inverse;
+            *score = if ROUND_F16 {
+                super::round_f16(scaled)
+            } else {
+                scaled
+            };
         }
         return Ok(());
     }
+    if scores.iter().any(|score| !score.is_finite()) {
+        return Err(invalid("invalid pinned attention softmax row"));
+    }
+    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut total = 0.0_f64;
     // Keep the final partial group's exact pairwise tree. Later physical
     // groups add only +0 to the positive total and cannot change its bits.
     for offset in (0..scores.len()).step_by(4) {
@@ -795,9 +908,37 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
     }
     let inverse = (1.0_f64 / total) as f32;
     for score in scores {
-        *score *= inverse;
+        let scaled = *score * inverse;
+        *score = if ROUND_F16 {
+            super::round_f16(scaled)
+        } else {
+            scaled
+        };
     }
     Ok(())
+}
+
+/// Normalizes a causal attention score slice with the pinned Windows ARM64 softmax contract.
+///
+/// The caller passes only the valid prefix `0..=position`. `ggml_soft_max_f32`
+/// masks `position + 1..physical_len` with `-inf`, whose `ggml_v_expf` lanes
+/// evaluate to `+0.0` without changing the max, four-lane group sums, or final
+/// probabilities.
+///
+/// # Errors
+/// Rejects empty, oversized or nonfinite input before mutation.
+#[cfg(test)]
+pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
+    softmax_with_rounding::<false>(scores)
+}
+
+/// Normalizes a causal attention score slice with the pinned Windows ARM64 softmax contract
+/// and fuses binary16 probability rounding into the reciprocal scaling pass.
+///
+/// # Errors
+/// Rejects empty, oversized or nonfinite input before mutation.
+pub(crate) fn softmax_round_f16(scores: &mut [f32]) -> Result<()> {
+    softmax_with_rounding::<true>(scores)
 }
 
 /// Retains the pinned out-of-place operator oracle for focused comparisons.
@@ -1072,15 +1213,42 @@ mod tests {
         for case in capture.cases {
             let mut scores = case
                 .input_bits
-                .into_iter()
+                .iter()
+                .copied()
                 .map(f32::from_bits)
                 .collect::<Vec<_>>();
+            let mut scores_f16 = scores.clone();
+            let mut source_scores = scores.clone();
+            let mut source_scores_f16 = scores.clone();
             assert_eq!(scores.len(), case.valid_keys);
             softmax(&mut scores)?;
             assert_eq!(
-                scores.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                scores.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
                 case.native_bits,
                 "{} valid keys",
+                case.valid_keys
+            );
+            super::super::round_f16_slice(&mut scores);
+            super::softmax_round_f16(&mut scores_f16)?;
+            assert_eq!(
+                scores_f16.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                scores.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                "{} valid keys f16",
+                case.valid_keys
+            );
+            super::super::softmax(&mut source_scores)?;
+            super::super::round_f16_slice(&mut source_scores);
+            super::super::softmax_round_f16(&mut source_scores_f16)?;
+            assert_eq!(
+                source_scores_f16
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                source_scores
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                "{} valid keys source f16",
                 case.valid_keys
             );
         }
@@ -1275,6 +1443,36 @@ mod tests {
         let expected_source_2t1 =
             keys4.map(|k| crate::kernels::f16_dot_four(queries1, k).map(f32::to_bits));
         assert_eq!(source_2t1.map(|r| r.map(f32::to_bits)), expected_source_2t1);
+        let keys2 = [keys4[0], keys4[1]];
+        let actual_2k4q =
+            super::dot_f16_two_keys_four_queries(keys2, queries0)?.map(|r| r.map(f32::to_bits));
+        assert_eq!(actual_2k4q, [expected_4k4q[0], expected_4k4q[1]]);
+        let (actual_2k_2t0, actual_2k_2t1) =
+            super::dot_f16_two_keys_two_token_four_queries(keys2, queries0, queries1)?;
+        assert_eq!(
+            actual_2k_2t0.map(|r| r.map(f32::to_bits)),
+            [expected_4k4q[0], expected_4k4q[1]]
+        );
+        assert_eq!(
+            actual_2k_2t1.map(|r| r.map(f32::to_bits)),
+            [expected_2t1[0], expected_2t1[1]]
+        );
+        let source_2k4q = crate::kernels::f16_dot_two_keys_four_queries(queries0, keys2)
+            .map(|r| r.map(f32::to_bits));
+        assert_eq!(
+            source_2k4q,
+            [expected_source_4k4q[0], expected_source_4k4q[1]]
+        );
+        let (source_2k_2t0, source_2k_2t1) =
+            crate::kernels::f16_dot_two_keys_two_token_four_queries(queries0, queries1, keys2);
+        assert_eq!(
+            source_2k_2t0.map(|r| r.map(f32::to_bits)),
+            [expected_source_4k4q[0], expected_source_4k4q[1]]
+        );
+        assert_eq!(
+            source_2k_2t1.map(|r| r.map(f32::to_bits)),
+            [expected_source_2t1[0], expected_source_2t1[1]]
+        );
         Ok(())
     }
 }

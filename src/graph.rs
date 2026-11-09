@@ -17,7 +17,7 @@ use crate::kernels::{
     add_scaled_slice_in_place, add_slice_in_place, append_half_bits, f16_dot, float_dot,
     is_finite_slice, l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into,
     rms_norm_into, rms_norm_pinned_into, rms_norm_swiglu_in_place, rms_norm_swiglu_into,
-    round_f16_slice, row, row_into, scale_slice_into, silu, softmax,
+    round_f16_slice, row, row_into, scale_slice_into, silu, softmax_round_f16,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -426,6 +426,40 @@ impl Arithmetic {
         }
     }
 
+    fn attention_dot_two_keys_four_queries(
+        self,
+        queries: [&[f32]; 4],
+        keys: [&[u16]; 2],
+    ) -> Result<[[f32; 4]; 2]> {
+        match self {
+            Self::Source => Ok(crate::kernels::f16_dot_two_keys_four_queries(queries, keys)),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_attention::dot_f16_two_keys_four_queries(keys, queries)
+            }
+        }
+    }
+
+    fn attention_dot_two_keys_two_token_four_queries(
+        self,
+        queries0: [&[f32]; 4],
+        queries1: [&[f32]; 4],
+        keys: [&[u16]; 2],
+    ) -> Result<(
+        crate::kernels::pinned_attention::TwoKeyFourQueryScores,
+        crate::kernels::pinned_attention::TwoKeyFourQueryScores,
+    )> {
+        match self {
+            Self::Source => Ok(crate::kernels::f16_dot_two_keys_two_token_four_queries(
+                queries0, queries1, keys,
+            )),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_attention::dot_f16_two_keys_two_token_four_queries(
+                    keys, queries0, queries1,
+                )
+            }
+        }
+    }
+
     fn attention_dot_four_keys_four_queries(
         self,
         queries: [&[f32]; 4],
@@ -469,10 +503,10 @@ impl Arithmetic {
         }
     }
 
-    fn attention_softmax(self, scores: &mut [f32]) -> Result<()> {
+    fn attention_softmax_round_f16(self, scores: &mut [f32]) -> Result<()> {
         match self {
-            Self::Source => softmax(scores),
-            Self::PinnedSwift => crate::kernels::pinned_attention::softmax(scores),
+            Self::Source => softmax_round_f16(scores),
+            Self::PinnedSwift => crate::kernels::pinned_attention::softmax_round_f16(scores),
         }
     }
 
@@ -3111,27 +3145,42 @@ impl Evaluation<'_, '_> {
                                                 s3[pos] = dots[3] * scale;
                                             }
                                         } else {
-                                            for (k_off, past) in
-                                                [p0, p1, p2].into_iter().enumerate()
-                                            {
-                                                let pos = pos0 + k_off;
-                                                let dots = arithmetic.attention_dot_four(
+                                            let dots2 = arithmetic
+                                                .attention_dot_two_keys_four_queries(
                                                     queries,
-                                                    &past[offset..offset + g.head],
+                                                    [
+                                                        &p0[offset..offset + g.head],
+                                                        &p1[offset..offset + g.head],
+                                                    ],
                                                 )?;
+                                            for (k_off, dots) in dots2.into_iter().enumerate() {
+                                                let pos = pos0 + k_off;
                                                 s0[pos] = dots[0] * scale;
                                                 s1[pos] = dots[1] * scale;
                                                 s2[pos] = dots[2] * scale;
                                                 s3[pos] = dots[3] * scale;
                                             }
-                                        }
-                                    } else {
-                                        for (k_off, past) in [p0, p1].into_iter().enumerate() {
-                                            let pos = pos0 + k_off;
+                                            let pos2 = pos0 + 2;
                                             let dots = arithmetic.attention_dot_four(
                                                 queries,
-                                                &past[offset..offset + g.head],
+                                                &p2[offset..offset + g.head],
                                             )?;
+                                            s0[pos2] = dots[0] * scale;
+                                            s1[pos2] = dots[1] * scale;
+                                            s2[pos2] = dots[2] * scale;
+                                            s3[pos2] = dots[3] * scale;
+                                        }
+                                    } else {
+                                        let dots2 = arithmetic
+                                            .attention_dot_two_keys_four_queries(
+                                                queries,
+                                                [
+                                                    &p0[offset..offset + g.head],
+                                                    &p1[offset..offset + g.head],
+                                                ],
+                                            )?;
+                                        for (k_off, dots) in dots2.into_iter().enumerate() {
+                                            let pos = pos0 + k_off;
                                             s0[pos] = dots[0] * scale;
                                             s1[pos] = dots[1] * scale;
                                             s2[pos] = dots[2] * scale;
@@ -3158,8 +3207,7 @@ impl Evaluation<'_, '_> {
                             s2[score_len - 1] = current_dots[2] * scale;
                             s3[score_len - 1] = current_dots[3] * scale;
                             for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
-                                arithmetic.attention_softmax(scores)?;
-                                round_f16_slice(scores);
+                                arithmetic.attention_softmax_round_f16(scores)?;
                             }
                             let probs: [&[f32]; 4] = [s0, s1, s2, s3];
                             for (tile, (((out0, out1), out2), out3)) in
@@ -3206,9 +3254,8 @@ impl Evaluation<'_, '_> {
                         scores[score_len - 1] = arithmetic
                             .attention_current_dot(q, &key_ref[offset..offset + g.head])?
                             * scale;
-                        arithmetic.attention_softmax(scores)?;
                         // Nonflash V(F16) x softmax(F32) also converts its RHS to F16.
-                        round_f16_slice(scores);
+                        arithmetic.attention_softmax_round_f16(scores)?;
                         for (tile, out) in result
                             .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
                             .enumerate()

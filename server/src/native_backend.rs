@@ -21,7 +21,7 @@ use crate::{
     wire,
 };
 use bonsai_prism_runtime::{runtime::Cancellation, swift_session::SwiftSession};
-use http::{HeaderValue, Method, Request as HttpRequest, Version};
+
 use profile::ModelProfile;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -398,40 +398,34 @@ fn parse_head(bytes: &[u8], policy: &RequestPolicy) -> Result<(Route, usize), Na
         (Some("POST"), Some("/reset")) => Route::Reset,
         _ => return Err(NativeBackendError::Configuration),
     };
-    let mut request = HttpRequest::builder()
-        .method(Method::POST)
-        .uri("/v1/chat/completions")
-        .version(Version::HTTP_11)
-        .body(())
-        .map_err(|_| NativeBackendError::Configuration)?;
-    wire::append_headers(request.headers_mut(), parsed.headers)
-        .map_err(|()| NativeBackendError::Configuration)?;
-    let empty = matches!(route, Route::Health | Route::Models | Route::Reset);
-    if empty {
+    if !wire::valid_headers(parsed.headers) {
+        return Err(NativeBackendError::Configuration);
+    }
+    let map_rejection = |error| {
+        if error == Rejection::Unauthorized {
+            NativeBackendError::Unauthorized
+        } else {
+            NativeBackendError::Configuration
+        }
+    };
+    if matches!(route, Route::Health | Route::Models | Route::Reset) {
         if !matches!(
-            singleton(request.headers(), "content-length"),
+            singleton(parsed.headers, "content-length"),
             Ok(None | Some(b"0"))
-        ) || request.headers().contains_key("content-type")
+        ) || crate::contains_header(parsed.headers, "content-type")
         {
             return Err(NativeBackendError::Configuration);
         }
-        request
-            .headers_mut()
-            .insert("content-length", HeaderValue::from_static("1"));
-        request
-            .headers_mut()
-            .insert("content-type", HeaderValue::from_static("application/json"));
+        policy
+            .check_common_head("POST", "/v1/chat/completions", 1, parsed.headers)
+            .map_err(map_rejection)?;
+        Ok((route, 0))
+    } else {
+        let authorized = policy
+            .check_head("POST", "/v1/chat/completions", 1, parsed.headers)
+            .map_err(map_rejection)?;
+        Ok((route, authorized.length))
     }
-    let authorized = policy
-        .check_head(&request.into_parts().0)
-        .map_err(|error| {
-            if error == Rejection::Unauthorized {
-                NativeBackendError::Unauthorized
-            } else {
-                NativeBackendError::Configuration
-            }
-        })?;
-    Ok((route, if empty { 0 } else { authorized.length }))
 }
 
 #[derive(Deserialize)]

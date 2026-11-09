@@ -5,8 +5,6 @@
     reason = "Keep shared HTTP helpers explicitly crate scoped"
 )]
 
-use http::{HeaderMap, HeaderName, HeaderValue};
-
 pub(super) fn valid_line_endings(raw: &[u8]) -> bool {
     !raw.iter().enumerate().any(|(i, byte)| match byte {
         b'\r' => raw.get(i + 1) != Some(&b'\n'),
@@ -15,15 +13,37 @@ pub(super) fn valid_line_endings(raw: &[u8]) -> bool {
     })
 }
 
-pub(super) fn append_headers(
-    target: &mut HeaderMap,
-    headers: &[httparse::Header<'_>],
-) -> Result<(), ()> {
-    for header in headers {
-        let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| ())?;
-        let value = HeaderValue::from_bytes(header.value).map_err(|_| ())?;
-        // insert() would hide duplicate critical headers, including identical CL.
-        target.append(name, value);
-    }
-    Ok(())
+const fn valid_header_name_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
+pub(super) fn valid_headers(headers: &[httparse::Header<'_>]) -> bool {
+    headers.iter().all(|header| {
+        !header.name.is_empty()
+            && header.name.bytes().all(valid_header_name_byte)
+            && header
+                .value
+                .iter()
+                .all(|&byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+    })
 }

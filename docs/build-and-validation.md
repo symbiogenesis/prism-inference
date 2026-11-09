@@ -540,11 +540,19 @@ include all five.
 
 For a separately authorized short packaging operation, the manually dispatched
 [Foundation bundle workflow](../.github/workflows/foundation-bundle.yml) builds
-only those five executables on hosted Windows ARM64. Its one job has a four-minute
+those five executables on hosted Windows ARM64 after nine focused receipt/version
+controls, formatting, strict Release all-target analyzers for the runtime, server
+and Hexagon crates, and a feature-disabled runtime library compilation check.
+It executes no numerical correctness suite or model. Its one job has a four-minute
 limit; the operator must also bound queueing, monitoring, cancellation and artifact
 retention in the declared total operation allowance. It derives the version from
 matching runtime/server manifests and the server's exact runtime pin, then uses
 the ordinary source-bound bundle producer and genuine GitHub run identity.
+Dispatch requires the exact expected main revision and a unique one-to-48-character
+operation ID containing letters, digits, underscores or hyphens and starting with
+a letter or digit. The first step rejects a source mismatch, and the run name
+includes the operation ID so an operator can identify and cancel only its own
+bounded operation.
 The retained `bundle-scope.json` explicitly leaves full Foundation correctness,
 model acceptance and performance unqualified. This separate workflow cannot serve
 as Foundation's successful-ancestor validation baseline. A missing cache or a

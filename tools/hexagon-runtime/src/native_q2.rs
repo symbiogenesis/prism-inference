@@ -306,6 +306,9 @@ impl ResidentCache {
 
 /// Full-`K` 1-op native `HTP_TYPE_Q2_0` executor using `libggml-htp-v81.so`'s
 /// signed 8-thread HVX `q2_0 x q8_1` (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`) kernel.
+/// Resident cache misses pack directly into supporting submitters' admitted arenas;
+/// copied preparation and nonresident execution allocate bounded packing scratch
+/// only after selecting those paths. Conservative payload admission is unchanged.
 pub struct NativeQ2Executor<S = &'static mut dyn NativeQ2Submitter> {
     submitter: S,
     maximum_columns: usize,
@@ -437,7 +440,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     fn prepare_resident(
         &mut self,
         tensor: &Tensor,
-        weights: &mut [u8],
+        weights: &mut Vec<u8>,
         evaluated: bool,
     ) -> Result<Option<usize>> {
         let Some(cache) = &mut self.residency else {
@@ -490,6 +493,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                         },
                     )?
                 } else {
+                    resize_packed_scratch(weights, packed_bytes)?;
                     let chunk_weights = weights
                         .get_mut(..packed_bytes)
                         .ok_or_else(|| invalid("native Q2 preparation scratch extent mismatch"))?;
@@ -567,16 +571,6 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             for block in tensor.data.as_chunks::<34>().0 {
                 scale(block)?;
             }
-        }
-        let max_chunk_cols = columns.min(self.maximum_columns);
-        let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
-        let required_bytes = max_mapped_rows * 36 * (max_chunk_cols / 128);
-        if !self.submitter.supports_in_place_weight_preparation() && weights.len() < required_bytes
-        {
-            weights
-                .try_reserve(required_bytes - weights.len())
-                .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-            weights.resize(required_bytes, 0_u8);
         }
         let result = self.prepare_resident(tensor, weights, false);
         if result.is_err() {
@@ -713,12 +707,10 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         finite_slice(activation)?;
         let max_chunk_cols = columns.min(self.maximum_columns);
         let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
-        let mut weights = if cached.is_none() {
-            zeroed(max_mapped_rows * 36 * (max_chunk_cols / 128), 0_u8)?
-        } else {
+        if cached.is_some() {
             self.scratch_weights = Vec::new();
-            Vec::new()
-        };
+        }
+        let mut weights = Vec::new();
         let resident = if let Some(index) = cached {
             if let Some(cache) = &mut self.residency {
                 if cache.projections[index].evaluated {
@@ -731,6 +723,12 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         } else {
             self.prepare_resident(tensor, &mut weights, true)?
         };
+        if resident.is_none() {
+            resize_packed_scratch(
+                &mut weights,
+                max_mapped_rows * 36 * (max_chunk_cols / 128),
+            )?;
+        }
         if single_op {
             return self.project_single_op(
                 tensor,
@@ -891,7 +889,6 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut indices = [0_usize; 3];
         let mut any_prepared = false;
         for (member, &tensor) in tensors.iter().enumerate() {
-            let rows = rows_per_member[member];
             let index = if let Some(idx) = cached_indices[member] {
                 if let Some(cache) = &mut self.residency {
                     if cache.projections[idx].evaluated {
@@ -903,15 +900,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 idx
             } else {
                 any_prepared = true;
-                let max_mapped_rows = rows.next_multiple_of(32);
-                let required_bytes = max_mapped_rows * 36 * (columns / 128);
-                if weights.len() < required_bytes {
-                    weights
-                        .try_reserve(required_bytes - weights.len())
-                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-                    weights.resize(required_bytes, 0_u8);
-                }
-                self.prepare_resident(tensor, &mut weights[..required_bytes], true)?
+                self.prepare_resident(tensor, &mut weights, true)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?
             };
             indices[member] = index;
@@ -1027,9 +1016,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let resident_index = if let Some(idx) = cached {
             idx
         } else {
-            let max_mapped_rows = rows.next_multiple_of(32);
-            let required_bytes = max_mapped_rows * 36 * (columns / 128);
-            let mut weights = zeroed(required_bytes, 0_u8)?;
+            let mut weights = Vec::new();
             let Some(idx) = self.prepare_resident(tensor, &mut weights, false)? else {
                 for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
                     self.project_f32_inner(tensor, activation, output)?;
@@ -1204,16 +1191,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut weights = Vec::new();
         for (member, &tensor) in tensors.iter().enumerate() {
             if cached_indices[member].is_none() {
-                let rows = rows_per_member[member];
-                let max_mapped_rows = rows.next_multiple_of(32);
-                let required_bytes = max_mapped_rows * 36 * (columns / 128);
-                if weights.len() < required_bytes {
-                    weights
-                        .try_reserve(required_bytes - weights.len())
-                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-                    weights.resize(required_bytes, 0_u8);
-                }
-                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                self.prepare_resident(tensor, &mut weights, false)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
             }
         }
@@ -1410,16 +1388,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut weights = Vec::new();
         for (member, &tensor) in tensors.iter().enumerate() {
             if cached_indices[member].is_none() {
-                let rows = rows_per_member[member];
-                let max_mapped_rows = rows.next_multiple_of(32);
-                let required_bytes = max_mapped_rows * 36 * (columns / 128);
-                if weights.len() < required_bytes {
-                    weights
-                        .try_reserve(required_bytes - weights.len())
-                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-                    weights.resize(required_bytes, 0_u8);
-                }
-                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                self.prepare_resident(tensor, &mut weights, false)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
             }
         }
@@ -1762,15 +1731,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut weights = Vec::new();
         for (member, &tensor) in tensors.iter().enumerate() {
             if cached_indices[member].is_none() {
-                let max_mapped_rows = rows.next_multiple_of(32);
-                let required_bytes = max_mapped_rows * 36 * (columns / 128);
-                if weights.len() < required_bytes {
-                    weights
-                        .try_reserve(required_bytes - weights.len())
-                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-                    weights.resize(required_bytes, 0_u8);
-                }
-                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                self.prepare_resident(tensor, &mut weights, false)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
             }
         }
@@ -1911,15 +1872,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut weights = Vec::new();
         for (member, &tensor) in tensors.iter().enumerate() {
             if cached_indices[member].is_none() {
-                let max_mapped_rows = rows.next_multiple_of(32);
-                let required_bytes = max_mapped_rows * 36 * (columns / 128);
-                if weights.len() < required_bytes {
-                    weights
-                        .try_reserve(required_bytes - weights.len())
-                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-                    weights.resize(required_bytes, 0_u8);
-                }
-                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                self.prepare_resident(tensor, &mut weights, false)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
             }
         }
@@ -2143,16 +2096,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut weights = Vec::new();
         for (member, &tensor) in tensors.iter().enumerate() {
             if cached_all[member].is_none() {
-                let (cols, rows) = native_dimensions(tensor)?;
-                let max_mapped_rows = rows.next_multiple_of(32);
-                let required_bytes = max_mapped_rows * 36 * (cols / 128);
-                if weights.len() < required_bytes {
-                    weights
-                        .try_reserve(required_bytes - weights.len())
-                        .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
-                    weights.resize(required_bytes, 0_u8);
-                }
-                self.prepare_resident(tensor, &mut weights[..required_bytes], false)?
+                self.prepare_resident(tensor, &mut weights, false)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
             }
         }
@@ -2446,6 +2390,16 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
     }
 }
 
+fn resize_packed_scratch(weights: &mut Vec<u8>, required_bytes: usize) -> Result<()> {
+    if weights.len() < required_bytes {
+        weights
+            .try_reserve_exact(required_bytes - weights.len())
+            .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
+        weights.resize(required_bytes, 0_u8);
+    }
+    Ok(())
+}
+
 fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
     if tensor.kind != 142 || tensor.dimensions.len() != 2 {
         return Err(invalid("unsupported Hexagon native Q2 tensor type or rank"));
@@ -2674,14 +2628,162 @@ mod tests {
     }
 
     fn arena_submitter(direct: bool) -> Result<ArenaSubmitter> {
+        arena_submitter_at_capacity(direct, 8192)
+    }
+
+    fn arena_submitter_at_capacity(direct: bool, capacity: usize) -> Result<ArenaSubmitter> {
         Ok(ArenaSubmitter {
-            registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(8192)
+            registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(capacity)
                 .map_err(|_| invalid("registry"))?,
-            memory: vec![0xa5; 8192],
+            memory: vec![0xa5; capacity],
             direct,
             copies: 0,
             initializations: 0,
         })
+    }
+
+    fn lazy_tensor(name: &str, columns: usize, rows: usize) -> Tensor {
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![columns, rows],
+            kind: 142,
+            data: Arc::from(vec![0x55; columns / 128 * rows * 34]),
+        }
+    }
+
+    #[test]
+    fn native_q2_lazy_preparation_allocates_only_copied_scratch_after_admission() -> Result<()> {
+        let tensor = lazy_tensor("blk.0.ffn_up.weight", 256, 49);
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?;
+        let mut copied = NativeQ2Executor::new(arena_submitter(false)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        let mut direct = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        let mut copied_weights = Vec::new();
+        let mut direct_weights = Vec::new();
+        assert!(copied.prepare_resident(&tensor, &mut copied_weights, false)?.is_some());
+        assert!(direct.prepare_resident(&tensor, &mut direct_weights, false)?.is_some());
+        assert_eq!(direct.submitter.memory, copied.submitter.memory);
+        assert_eq!(direct_weights.capacity(), 0);
+        assert_eq!(copied_weights.len(), 1152);
+        assert_eq!(direct.submitter.initializations, 4);
+        assert_eq!(copied.submitter.copies, 4);
+
+        let oversized = lazy_tensor("blk.0.ffn_gate.weight", 256, 81);
+        for executor in [&mut copied, &mut direct] {
+            let mut refused_weights = Vec::new();
+            let bytes_before = executor.submitter.registry.used_bytes();
+            assert!(executor.prepare_resident(&oversized, &mut refused_weights, false)?.is_none());
+            assert_eq!(refused_weights.capacity(), 0);
+            assert_eq!(executor.submitter.registry.used_bytes(), bytes_before);
+            assert_eq!(executor.residency_statistics().tensors_prepared, 1);
+        }
+        Ok(())
+    }
+
+    fn lazy_submit_failure(
+        executor: &mut NativeQ2Executor<ArenaSubmitter>,
+        tensors: [&Tensor; 3],
+        mode: u8,
+    ) -> Result<()> {
+        let activation = vec![1.0; 128];
+        let activations = vec![activation.clone(); 2];
+        let mut single = vec![9.0];
+        let mut second = vec![9.0];
+        let mut third = vec![9.0];
+        let mut first_tokens = vec![vec![9.0]; 2];
+        let mut second_tokens = first_tokens.clone();
+        let mut third_tokens = first_tokens.clone();
+        let result = match mode {
+            0 => executor.project_f32(tensors[0], &activation, true, &mut single),
+            1 => executor.project_f32_group(
+                &tensors,
+                &activation,
+                true,
+                &mut [&mut single, &mut second, &mut third],
+            ),
+            2 => executor.project_f32_tokens(tensors[0], &activations, true, &mut first_tokens),
+            3 => executor.project_f32_pair_tokens(
+                [tensors[0], tensors[1]], &activations, true,
+                &mut first_tokens, &mut second_tokens,
+            ),
+            4 => executor.project_f32_triple_tokens(
+                tensors, &activations, true,
+                &mut first_tokens, &mut second_tokens, &mut third_tokens,
+            ),
+            5 => executor.project_f32_ffn_swiglu(tensors[0], tensors[1], &activation, &mut single),
+            6 => executor.project_f32_ffn_swiglu_tokens(
+                tensors[0], tensors[1], &activations, &mut first_tokens,
+            ),
+            7 => executor.project_f32_ffn_chain(tensors, &activation, None, None, &mut single),
+            _ => return Err(invalid("invalid lazy projection test mode")),
+        };
+        assert!(result.is_err());
+        assert!(executor.is_faulted());
+        assert_eq!(executor.statistics().operations_completed, 0);
+        assert_eq!(executor.queue_writes_completed(), 0);
+        assert!(single.is_empty() || single == [9.0]);
+        assert!(second.is_empty() || second == [9.0]);
+        assert!(third.is_empty() || third == [9.0]);
+        for output in first_tokens.iter().chain(&second_tokens).chain(&third_tokens) {
+            assert!(output.is_empty() || output == &[9.0]);
+        }
+        // Every output selected for this entrypoint must be cleared on failure.
+        if matches!(mode, 0 | 1 | 5 | 7) { assert!(single.is_empty()); }
+        if mode == 1 { assert!(second.is_empty() && third.is_empty()); }
+        if matches!(mode, 2 | 3 | 4 | 6) { assert!(first_tokens.iter().all(Vec::is_empty)); }
+        if matches!(mode, 3 | 4) { assert!(second_tokens.iter().all(Vec::is_empty)); }
+        if mode == 4 { assert!(third_tokens.iter().all(Vec::is_empty)); }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_lazy_entrypoints_match_copied_bytes_and_clear_failed_publication() -> Result<()> {
+        let gate = lazy_tensor("blk.0.ffn_gate.weight", 128, 128);
+        let up = lazy_tensor("blk.0.ffn_up.weight", 128, 128);
+        let down = lazy_tensor("blk.0.ffn_down.weight", 128, 128);
+        let limits = NativeQ2ProjectionLimits::new(128, 128, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?;
+        for mode in 0..8 {
+            let mut copied = NativeQ2Executor::new(
+                arena_submitter_at_capacity(false, 32_768)?, limits, 1024 * 1024,
+            ).with_resident_weights(4096)?;
+            let mut direct = NativeQ2Executor::new(
+                arena_submitter_at_capacity(true, 32_768)?, limits, 1024 * 1024,
+            ).with_resident_weights(4096)?;
+            lazy_submit_failure(&mut copied, [&gate, &up, &down], mode)?;
+            lazy_submit_failure(&mut direct, [&gate, &up, &down], mode)?;
+            assert_eq!(direct.submitter.memory, copied.submitter.memory);
+            assert_eq!(direct.submitter.copies, 0);
+            assert_eq!(direct.submitter.initializations, copied.submitter.copies);
+            assert_eq!(direct.submitter.registry.used_bytes(), copied.submitter.registry.used_bytes());
+            let prepared = match mode { 0 | 2 => 1, 3 | 5 | 6 => 2, _ => 3 };
+            assert_eq!(direct.residency_statistics().tensors_prepared, prepared);
+            assert_eq!(direct.statistics().operations_attempted, copied.statistics().operations_attempted);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_lazy_direct_scale_failure_commits_no_handle_or_output() -> Result<()> {
+        let mut tensor = lazy_tensor("blk.0.ffn_up.weight", 128, 32);
+        let mut data = tensor.data.to_vec();
+        data[34..36].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        tensor.data = Arc::from(data);
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?;
+        let mut executor = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        let mut output = vec![9.0];
+        assert!(executor.project_f32(&tensor, &[1.0; 128], true, &mut output).is_err());
+        assert!(output.is_empty());
+        assert!(executor.is_faulted());
+        assert_eq!(executor.submitter.registry.used_bytes(), 0);
+        assert_eq!(executor.submitter.initializations, 1);
+        assert_eq!(executor.statistics().operations_attempted, 0);
+        assert_eq!(executor.residency_statistics().tensors_prepared, 0);
+        Ok(())
     }
 
     #[test]

@@ -17,10 +17,7 @@ fn values(count: usize) -> Vec<f32> {
         .collect()
 }
 
-fn mutable_rows<const ROWS: usize>(
-    state: &mut [f32],
-    width: usize,
-) -> Result<[&mut [f32]; ROWS]> {
+fn mutable_rows<const ROWS: usize>(state: &mut [f32], width: usize) -> Result<[&mut [f32]; ROWS]> {
     state
         .chunks_exact_mut(width)
         .collect::<Vec<_>>()
@@ -163,20 +160,29 @@ fn pinned_gdn_staged_group_failure_keeps_destinations_untouched() -> Result<()> 
                 decay: 0.875,
                 beta: 0.625,
             };
-            let inputs = [ordinary, ordinary, ChunkInput {
-                query: &failing_query,
-                key: &failing_key,
-                value: &failing_values,
-                beta: 1.0,
-                ..ordinary
-            }];
+            let inputs = [
+                ordinary,
+                ordinary,
+                ChunkInput {
+                    query: &failing_query,
+                    key: &failing_key,
+                    value: &failing_values,
+                    beta: 1.0,
+                    ..ordinary
+                },
+            ];
             let previous = values(width * rows);
             let mut state = vec![-5.0; width * rows];
             let original_state = bits(&state);
             let mut output = vec![-3.0; width * inputs.len()];
             let original_output = bits(&output);
             assert!(!grouped_from(
-                &previous, &mut state, rows, width, &inputs, &mut output,
+                &previous,
+                &mut state,
+                rows,
+                width,
+                &inputs,
+                &mut output,
             )?);
             assert_eq!(bits(&state), original_state);
             assert_eq!(bits(&output), original_output);
@@ -214,21 +220,32 @@ fn pinned_gdn_staged_single_row_retains_late_failure_bits() -> Result<()> {
                 decay: 0.875,
                 beta: 0.625,
             };
-            let inputs = [ordinary, ordinary, ChunkInput {
-                query: &failing_query,
-                key: &failing_key,
-                value: &failing_values,
-                beta: 1.0,
-                ..ordinary
-            }];
+            let inputs = [
+                ordinary,
+                ordinary,
+                ChunkInput {
+                    query: &failing_query,
+                    key: &failing_key,
+                    value: &failing_values,
+                    beta: 1.0,
+                    ..ordinary
+                },
+            ];
             let mut expected = previous.clone();
             let mut expected_output = vec![-3.0; width * inputs.len()];
             assert!(oracle_row(&mut expected, &inputs, 0, width, &mut expected_output).is_err());
             let mut actual = vec![-5.0; width];
             let mut actual_output = vec![-3.0; width * inputs.len()];
             let result = super::step_row_tokens_from(
-                &previous, &mut actual, &inputs, 0, width, 0.125, &mut actual_output,
-            ).ok_or_else(|| invalid("baseline NEON control was not selected"))?;
+                &previous,
+                &mut actual,
+                &inputs,
+                0,
+                width,
+                0.125,
+                &mut actual_output,
+            )
+            .ok_or_else(|| invalid("baseline NEON control was not selected"))?;
             assert!(result.is_err());
             assert_eq!(bits(&actual), bits(&expected));
             assert_eq!(bits(&actual_output), bits(&expected_output));

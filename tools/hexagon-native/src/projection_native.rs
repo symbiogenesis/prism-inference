@@ -1756,8 +1756,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             Err(_) => return Err(self.fail("projection-resident-reservation-refused-pinned")),
         };
         let range = pending_registry.range(&handle)?;
-        let destination;
-        if handle.arena_index() == 0 {
+        let destination = if handle.arena_index() == 0 {
             let working = self.mode.allocation_bytes(self.limits.rows);
             let Some(offset) = working.checked_add(range.start) else {
                 return Err(self.fail("projection-resident-reservation-refused-pinned"));
@@ -1771,12 +1770,12 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             // SAFETY: this fresh append-only reservation is inside the explicitly
             // admitted initialized primary allocation; no handle or DSP consumer
             // can refer to it before validation and publication below.
-            destination = unsafe {
+            unsafe {
                 std::slice::from_raw_parts_mut(
                     self.memory.cast::<u8>().wrapping_add(offset),
                     weight_bytes,
                 )
-            };
+            }
         } else {
             let extra_idx = usize::from(handle.arena_index() - 1);
             if extra_idx >= self.extra_arena_count
@@ -1788,22 +1787,23 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             // SAFETY: this fresh append-only reservation is inside the explicitly
             // admitted initialized secondary arena, disjoint from every published
             // handle. The callback borrow ends before any handle publication.
-            destination = unsafe {
+            unsafe {
                 std::slice::from_raw_parts_mut(
                     arena_ptr.cast::<u8>().wrapping_add(range.start),
                     weight_bytes,
                 )
-            };
-        }
+            }
+        };
         if initialize(destination).is_err()
-            || (validate_initialized && native_q2::validate_weights(
-                max_columns,
-                self.limits.rows,
-                columns,
-                rows,
-                destination,
-            )
-            .is_err())
+            || (validate_initialized
+                && native_q2::validate_weights(
+                    max_columns,
+                    self.limits.rows,
+                    columns,
+                    rows,
+                    destination,
+                )
+                .is_err())
         {
             return Err(self.fail("projection-resident-input-refused-pinned"));
         }
@@ -1821,7 +1821,6 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         self.report.resident_weight_preparations += 1;
         Ok(Some(handle))
     }
-
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
@@ -1870,10 +1869,15 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         {
             return Err(self.fail("projection-resident-input-refused-pinned"));
         }
-        self.initialize_native_weights(columns, rows, &mut |destination| {
-            destination.copy_from_slice(weights);
-            Ok(())
-        }, false)
+        self.initialize_native_weights(
+            columns,
+            rows,
+            &mut |destination| {
+                destination.copy_from_slice(weights);
+                Ok(())
+            },
+            false,
+        )
     }
 
     fn supports_in_place_weight_preparation(&self) -> bool {
@@ -3218,8 +3222,8 @@ mod tests {
         clippy::too_many_lines,
         reason = "One fake-arena lifecycle compares direct and copied preparation and all pre-publication failures."
     )]
-    fn native_q2_in_place_preparation_preserves_extents_and_atomic_publication()
-    -> Result<(), Error> {
+    fn native_q2_in_place_preparation_preserves_extents_and_atomic_publication() -> Result<(), Error>
+    {
         let mut weights = vec![0x55_u8; 1152];
         for tile in weights.as_chunks_mut::<576>().0 {
             for scale in tile[512..].as_chunks_mut::<2>().0 {
@@ -3285,10 +3289,12 @@ mod tests {
             };
             let columns = if case == 3 { usize::MAX } else { 128 };
             let result = if case == 5 {
-                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    session.prepare_weights_in_place(columns, 32, &mut initialize)
-                }))
-                .is_err());
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        session.prepare_weights_in_place(columns, 32, &mut initialize)
+                    }))
+                    .is_err()
+                );
                 // An unwound callback never publishes a handle or registry growth.
                 assert_eq!(session.native_resident_weights.used_bytes(), 1152);
                 session.prepare_weights_in_place(128, 32, &mut |destination| {

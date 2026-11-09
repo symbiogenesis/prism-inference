@@ -566,8 +566,8 @@ impl GdnVerifyTape {
 mod tests {
     use super::{
         DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, GdnVerifyTape,
-        MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS, SpeculativeStats,
-        SuffixDraftConfig, SuffixDrafter, mtp_first_decode_fits, verify_stochastic_step,
+        MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS, SpeculativeStats, SuffixDraftConfig,
+        SuffixDrafter, mtp_first_decode_fits, verify_stochastic_step,
     };
     use crate::Result;
 
@@ -646,7 +646,10 @@ mod tests {
         remaining: usize,
     ) -> Result<()> {
         let expected = reference_suffix_continuation(history, config, remaining);
-        assert_eq!(SuffixDrafter::propose(history, config, remaining)?, expected);
+        assert_eq!(
+            SuffixDrafter::propose(history, config, remaining)?,
+            expected
+        );
         let mut storage = [u32::MAX; MAX_SPECULATIVE_DRAFT_TOKENS];
         let length = SuffixDrafter::propose_into(history, config, remaining, &mut storage)?;
         assert_eq!(&storage[..length], expected);
@@ -660,7 +663,9 @@ mod tests {
         // competing match lengths, recent ties and histories shorter than a window.
         for length in 0..=10 {
             for bits in 0_u32..1 << length {
-                let history = (0..length).map(|index| (bits >> index) & 1).collect::<Vec<_>>();
+                let history = (0..length)
+                    .map(|index| (bits >> index) & 1)
+                    .collect::<Vec<_>>();
                 for min_match in 1..=5 {
                     for max_match in min_match..=5 {
                         for draft in [1, 4, MAX_SPECULATIVE_DRAFT_TOKENS] {
@@ -698,10 +703,22 @@ mod tests {
         }
         let valid = SuffixDraftConfig::default();
         for config in [
-            SuffixDraftConfig { min_match_tokens: 0, ..valid },
-            SuffixDraftConfig { min_match_tokens: 17, ..valid },
-            SuffixDraftConfig { max_match_tokens: MAX_SUFFIX_MATCH_TOKENS + 1, ..valid },
-            SuffixDraftConfig { max_draft_tokens: 0, ..valid },
+            SuffixDraftConfig {
+                min_match_tokens: 0,
+                ..valid
+            },
+            SuffixDraftConfig {
+                min_match_tokens: 17,
+                ..valid
+            },
+            SuffixDraftConfig {
+                max_match_tokens: MAX_SUFFIX_MATCH_TOKENS + 1,
+                ..valid
+            },
+            SuffixDraftConfig {
+                max_draft_tokens: 0,
+                ..valid
+            },
             SuffixDraftConfig {
                 max_draft_tokens: MAX_SPECULATIVE_DRAFT_TOKENS + 1,
                 ..valid

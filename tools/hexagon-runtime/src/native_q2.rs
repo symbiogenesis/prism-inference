@@ -502,10 +502,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                     self.submitter
                         .prepare_weights(active_cols, mapped_rows, chunk_weights)?
                 };
-                let handle = prepared
-                    .ok_or_else(|| {
-                        invalid("native Q2 resident preparation contradicted capacity")
-                    })?;
+                let handle = prepared.ok_or_else(|| {
+                    invalid("native Q2 resident preparation contradicted capacity")
+                })?;
                 if handle.columns() != active_cols
                     || handle.rows() != mapped_rows
                     || handle.packed_bytes() != packed_bytes
@@ -572,7 +571,8 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let max_chunk_cols = columns.min(self.maximum_columns);
         let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
         let required_bytes = max_mapped_rows * 36 * (max_chunk_cols / 128);
-        if !self.submitter.supports_in_place_weight_preparation() && weights.len() < required_bytes {
+        if !self.submitter.supports_in_place_weight_preparation() && weights.len() < required_bytes
+        {
             weights
                 .try_reserve(required_bytes - weights.len())
                 .map_err(|_| invalid("native Q2 scratch allocation failed"))?;
@@ -2647,7 +2647,8 @@ mod tests {
             rows: usize,
             initialize: &mut dyn FnMut(
                 &mut [u8],
-            ) -> std::result::Result<(), hexagon_native_rpc::Error>,
+            )
+                -> std::result::Result<(), hexagon_native_rpc::Error>,
         ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
             let start = self.registry.used_bytes().next_multiple_of(128);
             let end = start + rows * 36 * (columns / 128);
@@ -2713,7 +2714,10 @@ mod tests {
         assert_eq!(direct.submitter.initializations, 4);
         assert_eq!(direct.scratch_weights.capacity(), 0);
         assert!(!copied.scratch_weights.is_empty());
-        assert_eq!(direct.residency_statistics().weight_payload_bytes_prepared, 4608);
+        assert_eq!(
+            direct.residency_statistics().weight_payload_bytes_prepared,
+            4608
+        );
         assert_eq!(direct.statistics().operations_attempted, 0);
         assert!(direct.prewarm_tensor(&tensor)?);
         assert_eq!(direct.submitter.initializations, 4);

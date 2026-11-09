@@ -1714,12 +1714,19 @@ mod deadline_tests {
         for cancel in [false, true] {
             let (mut runtime, _) = seeded()?;
             let before_tokens = runtime.tokens.clone();
-            let before_logits = runtime.logits.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+            let before_logits = runtime
+                .logits
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
             let cancellation = Cancellation::default();
             let mut emitted = 0;
             let result = runtime.generate_speculative(
                 &[0, 0, 0, 0, 0],
-                &Generation { max_tokens: 6, stop_tokens: vec![] },
+                &Generation {
+                    max_tokens: 6,
+                    stop_tokens: vec![],
+                },
                 Prefill::default(),
                 SuffixDraftConfig::new(1, MAX_SUFFIX_MATCH_TOKENS, 1)?,
                 &cancellation,
@@ -1739,7 +1746,14 @@ mod deadline_tests {
             assert_eq!(emitted, 3);
             assert_eq!(runtime.tokens, before_tokens);
             assert_eq!(runtime.decoder.tokens, before_tokens);
-            assert_eq!(runtime.logits.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), before_logits);
+            assert_eq!(
+                runtime
+                    .logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                before_logits
+            );
             assert!(!runtime.is_faulted());
             assert_continues(&mut runtime)?;
         }

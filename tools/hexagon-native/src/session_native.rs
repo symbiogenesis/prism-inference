@@ -115,7 +115,7 @@ pub(super) fn prepare_effective_domain(
     let result = unsafe {
         control(
             session::GET_EFFECTIVE_DOMAIN_ID,
-            std::ptr::from_mut(&mut request).cast(),
+            (&raw mut request).cast(),
             24,
         )
     };
@@ -160,7 +160,7 @@ pub(super) fn prepare_fixed_uri(
     let module = session::module_uri(architecture).ok_or(Error::Contract)?;
     // The vendor ABI excludes the terminator from the declared input length,
     // while the independently writable backing allocation retains that NUL.
-    let module_len = u32::try_from(module.to_bytes().len()).map_err(|_| Error::Contract)?;
+    let module_len = u32::try_from(module.count_bytes()).map_err(|_| Error::Contract)?;
     let mut domain = *b"cdsp\0";
     let domain_ptr = domain.as_mut_ptr().cast::<c_char>();
     // Mutable owned storage satisfies the C ABI without allowing a provider to
@@ -180,13 +180,7 @@ pub(super) fn prepare_fixed_uri(
     };
     // SAFETY: this is the pinned 48-byte C layout, with writable and live input
     // and output arrays. GET_URI formats metadata; it does not load the module.
-    let result = unsafe {
-        control(
-            session::GET_URI,
-            std::ptr::from_mut(&mut request).cast(),
-            48,
-        )
-    };
+    let result = unsafe { control(session::GET_URI, (&raw mut request).cast(), 48) };
     report.uri_result = Some(result);
     if result != 0 {
         report.stage = "session-uri-refused";
@@ -237,7 +231,7 @@ mod tests {
                 // SAFETY: the tested caller supplies the exact 256-byte output array.
                 let output = unsafe { std::slice::from_raw_parts_mut(input.uri.cast::<u8>(), 256) };
                 output[..module.len()].copy_from_slice(module);
-                let suffix = b"&_dom=cdsp&_session=0\0";
+                let suffix = c"&_dom=cdsp&_session=0".to_bytes_with_nul();
                 output[module.len()..module.len() + suffix.len()].copy_from_slice(suffix);
             }
             _ => return 14,

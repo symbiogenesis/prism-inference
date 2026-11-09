@@ -85,7 +85,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn decode_response(bytes: &[u8], max_body: usize) -> Result<(u16, Vec<u8>)> {
     let end = bytes
-        .windows(4)
+        .array_windows()
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| invalid("HTTP response lacks header terminator"))?;
     if end > MAX_HEADER {
@@ -148,7 +148,7 @@ fn decode_response(bytes: &[u8], max_body: usize) -> Result<(u16, Vec<u8>)> {
     let mut at = 0;
     loop {
         let end = body[at..]
-            .windows(2)
+            .array_windows()
             .position(|w| w == b"\r\n")
             .ok_or_else(|| invalid("HTTP chunk header truncated"))?
             + at;
@@ -585,7 +585,7 @@ mod tests {
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut request = Vec::new();
             let mut buffer = [0_u8; 512];
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            while !request.array_windows().any(|bytes| bytes == b"\r\n\r\n") {
                 let count = stream.read(&mut buffer)?;
                 if count == 0 || request.len() > MAX_HEADER {
                     return Err(std::io::Error::other("invalid test request"));

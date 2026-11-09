@@ -42,7 +42,7 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
     let first = session.complete(
         &prompt,
         &Cancellation::default(),
-        Instant::now() + Duration::from_secs(600),
+        Instant::now() + Duration::from_mins(10),
         |event| {
             if let TextEvent::Delta(text) = event {
                 first_text.push_str(text);
@@ -60,7 +60,7 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
     let second = session.complete(
         &prompt,
         &Cancellation::default(),
-        Instant::now() + Duration::from_secs(600),
+        Instant::now() + Duration::from_mins(10),
         |event| {
             if let TextEvent::Delta(text) = event {
                 replay.push_str(text);
@@ -79,7 +79,7 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
             .complete(
                 &prompt,
                 &Cancellation::default(),
-                Instant::now() + Duration::from_secs(600),
+                Instant::now() + Duration::from_mins(10),
                 |event| {
                     if matches!(event, TextEvent::Complete(_)) {
                         return Err("abandoned final output".into());
@@ -103,7 +103,7 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
     let completion = session.complete(
         &multi_turn,
         &Cancellation::default(),
-        Instant::now() + Duration::from_secs(600),
+        Instant::now() + Duration::from_mins(10),
         |_| Ok(()),
     )?;
     assert_eq!(completion.reused_tokens, 0);
@@ -122,7 +122,7 @@ fn interrupted_generation_restores_session(
     let result = session.complete(
         prompt,
         &cancellation,
-        Instant::now() + Duration::from_secs(600),
+        Instant::now() + Duration::from_mins(10),
         |event| match event {
             TextEvent::Delta(text) => {
                 provisional.push_str(text);

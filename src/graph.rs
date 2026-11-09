@@ -1362,7 +1362,11 @@ impl Transforms {
                     let end = offset
                         .checked_add(width)
                         .ok_or_else(|| invalid("sign length overflow"))?;
-                    if width == 0 || width > MAX_WIDTH || width % block != 0 || end > values.len() {
+                    if width == 0
+                        || width > MAX_WIDTH
+                        || !width.is_multiple_of(block)
+                        || end > values.len()
+                    {
                         return Err(invalid("invalid Hadamard sign width"));
                     }
                     let vector = (offset..end)
@@ -1399,7 +1403,7 @@ impl Transforms {
                 .first()
                 .copied()
                 .ok_or_else(|| invalid("Hadamard tensor has no dimensions"))?;
-            if width % block != 0 || (!signs.is_empty() && !signs.contains_key(&width)) {
+            if !width.is_multiple_of(block) || (!signs.is_empty() && !signs.contains_key(&width)) {
                 return Err(invalid(format!(
                     "Hadamard width or signs do not match {name}"
                 )));
@@ -2187,7 +2191,7 @@ impl Qwen35 {
                 .collect::<Result<Vec<_>>>()?
         } else {
             (0..block_count)
-                .map(|index| index < layer_count && (index + 1) % full_interval != 0)
+                .map(|index| index < layer_count && !(index + 1).is_multiple_of(full_interval))
                 .collect()
         };
         let mut state_bytes = 0_usize;

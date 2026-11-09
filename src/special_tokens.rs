@@ -167,7 +167,7 @@ impl SpecialTokens {
         let mut stop_tokens = Vec::new();
         stop_tokens.try_reserve_exact(256)?;
         for &token in self.stop_tokens().iter().chain(caller_stops) {
-            if usize::try_from(token).map_or(true, |token| token >= self.vocab_size) {
+            if !usize::try_from(token).is_ok_and(|token| token < self.vocab_size) {
                 return Err(invalid("generation stop is outside the decoder vocabulary"));
             }
             if !stop_tokens.contains(&token) {
@@ -188,7 +188,7 @@ fn token(metadata: &Metadata, key: &str, vocab_size: usize) -> Result<Option<u32
     match metadata.get(key) {
         None => Ok(None),
         Some(MetadataValue::U32(token)) => {
-            if usize::try_from(*token).map_or(true, |token| token >= vocab_size) {
+            if !usize::try_from(*token).is_ok_and(|token| token < vocab_size) {
                 return Err(invalid(format!("{key} is outside the decoder vocabulary")));
             }
             Ok(Some(*token))

@@ -2442,9 +2442,8 @@ mod tests {
 
     #[test]
     fn native_q2_limits_and_resident_registry_validate_scales_and_extents() -> Result<(), Error> {
-        let limits =
-            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
-                .with_resident_weights(NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES)?;
+        let limits = NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_mins(1))?
+            .with_resident_weights(NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES)?;
         assert_eq!(limits.maximum_columns(), 17_408);
         assert_eq!(limits.maximum_rows(), 17_408);
         assert_eq!(
@@ -2458,7 +2457,7 @@ mod tests {
 
         // Verify 56-projection multi-arena split (962,887,680 bytes -> [502,824,960, 460,062,720]).
         let multi_limits =
-            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_mins(1))?
                 .with_resident_weights(962_887_680)?;
         let (caps, count) = arena_capacities(962_887_680).ok_or(Error::Contract)?;
         assert_eq!(count, 2);
@@ -2470,7 +2469,7 @@ mod tests {
 
         // Verify 112-projection 4-arena split (1,925,775,360 bytes -> alternating [502,824,960, 460,062,720, 502,824,960, 460,062,720]).
         let quad_limits =
-            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_mins(1))?
                 .with_resident_weights(1_925_775_360)?;
         let (quad_caps, quad_count) = arena_capacities(1_925_775_360).ok_or(Error::Contract)?;
         assert_eq!(quad_count, 4);
@@ -2485,7 +2484,7 @@ mod tests {
 
         // Verify 168-projection 6-arena split (2,888,663,040 bytes -> alternating 6-arena steps).
         let six_limits =
-            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_secs(60))?
+            NativeQ2ProjectionLimits::new(17_408, 17_408, 24_000, Duration::from_mins(1))?
                 .with_resident_weights(2_888_663_040)?;
         let (six_caps, six_count) = arena_capacities(2_888_663_040).ok_or(Error::Contract)?;
         assert_eq!(six_count, 6);

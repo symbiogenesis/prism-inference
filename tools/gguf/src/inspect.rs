@@ -777,7 +777,7 @@ fn inspect_with_vocabulary_version(
         let type_id = parser.u32()?;
         let kind = kind(type_id, dialect == PRISM_DIALECT)
             .ok_or_else(|| bad(format!("unknown/unsupported tensor type ID {type_id}.")))?;
-        if first % kind.block != 0 {
+        if !first.is_multiple_of(kind.block) {
             return Err(bad(
                 "tensor row is not divisible by quantization block size.",
             ));

@@ -221,10 +221,10 @@ impl Reference {
         }
         let mut specials = Vec::new();
         for key in SPECIAL_KEYS {
-            if let Some(value) = named.get(key).and_then(token_content) {
-                if !specials.iter().any(|token| token == value) {
-                    specials.push(value.to_owned());
-                }
+            if let Some(value) = named.get(key).and_then(token_content)
+                && !specials.iter().any(|token| token == value)
+            {
+                specials.push(value.to_owned());
             }
         }
         if let Some(values) = named

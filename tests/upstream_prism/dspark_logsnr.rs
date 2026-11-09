@@ -98,7 +98,9 @@ fn verdict(variant: Variant, observed: &Value) -> Result<bool> {
             .as_str()
             .ok_or_else(|| invalid("DSpark production load log absent"))?,
     )?;
-    let guard = log.windows(7).any(|s| s == b"log_snr" || s == b"log-SNR");
+    let guard = log
+        .array_windows()
+        .any(|s| s == b"log_snr" || s == b"log-SNR");
     Ok(if variant.load {
         loaded
     } else {

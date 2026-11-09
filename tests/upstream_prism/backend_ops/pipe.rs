@@ -372,9 +372,9 @@ impl Partition {
         let timeout = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             && std::env::var("GITHUB_REF").as_deref() == Ok("refs/heads/main")
         {
-            Duration::from_secs(3600)
+            Duration::from_hours(1)
         } else {
-            Duration::from_secs(60)
+            Duration::from_mins(1)
         };
         let deadline = Instant::now() + timeout;
         let Some(worker) = &self.worker else {

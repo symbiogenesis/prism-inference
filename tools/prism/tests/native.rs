@@ -175,7 +175,7 @@ impl LoaderHandle {
         assert!(!error.is_null());
         // SAFETY: The checked nonnull pointer names the live loader's unchanged
         // NUL-terminated error storage.
-        assert_ne!(unsafe { CStr::from_ptr(error) }.to_bytes(), b"");
+        assert!(!unsafe { CStr::from_ptr(error) }.is_empty());
     }
 }
 

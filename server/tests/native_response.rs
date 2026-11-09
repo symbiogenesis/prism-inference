@@ -132,7 +132,7 @@ fn native_thinking_off_stream_and_json_keep_all_generated_text_visible() -> Test
                 client,
                 streaming,
                 100,
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 false,
             );
             for character in text.chars() {
@@ -196,7 +196,7 @@ fn native_stream_and_json_preserve_reasoning_at_every_delimiter_boundary() -> Te
                     client,
                     streaming,
                     100,
-                    Instant::now() + Duration::from_secs(60),
+                    Instant::now() + Duration::from_mins(1),
                 );
                 output
                     .delta(&text[..boundary])
@@ -259,7 +259,7 @@ fn native_output_retains_partial_markers_and_never_completes_failed_terminal_del
     run(async {
         let (client, state) = writer();
         let mut output =
-            NativeResponse::new(client, false, 100, Instant::now() + Duration::from_secs(60));
+            NativeResponse::new(client, false, 100, Instant::now() + Duration::from_mins(1));
         output
             .delta("unfinished </thi")
             .await
@@ -278,7 +278,7 @@ fn native_output_retains_partial_markers_and_never_completes_failed_terminal_del
         let (mut client, _) = writer();
         client.fail_shutdown = true;
         let output =
-            NativeResponse::new(client, true, 100, Instant::now() + Duration::from_secs(60));
+            NativeResponse::new(client, true, 100, Instant::now() + Duration::from_mins(1));
         assert_eq!(
             output.complete(completion(Finish::Stop)).await,
             Err(ResponseError::ClientIo)
@@ -296,7 +296,7 @@ fn native_output_bounds_framing_expansion_and_client_write_time() -> TestResult 
                 client,
                 streaming,
                 100,
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
             );
             let text = "\0".repeat(MAX_RESPONSE_BYTES / 6 + 1);
             let delta = output.delta(&text).await;
@@ -312,7 +312,7 @@ fn native_output_bounds_framing_expansion_and_client_write_time() -> TestResult 
         let (mut client, _) = writer();
         client.stall = true;
         let mut output =
-            NativeResponse::new(client, true, 100, Instant::now() + Duration::from_secs(60));
+            NativeResponse::new(client, true, 100, Instant::now() + Duration::from_mins(1));
         let start = Instant::now();
         assert_eq!(
             output.delta("reasoning").await,

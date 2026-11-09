@@ -1,6 +1,7 @@
 //! One bounded production-session request, with value-free core attribution.
 
 use super::{AdapterSelection, Representation, evidence_backend, reject};
+use bonsai_native_hash::{Hasher, hash_bytes};
 use bonsai_prism_runtime::{
     Result,
     kernels::{MatvecBackend, RowParallelism},
@@ -8,7 +9,6 @@ use bonsai_prism_runtime::{
     runtime::{Cancellation, Completion, GenerationPhase, GenerationTimings},
     swift_session::SwiftSession,
 };
-use bonsai_native_hash::{Hasher, hash_bytes};
 use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
@@ -62,7 +62,7 @@ fn bounded_deadline(value: &str, started: Instant, now: SystemTime) -> Result<(u
     let remaining = absolute
         .duration_since(now)
         .map_err(|_| reject("request deadline already expired"))?;
-    if remaining < Duration::from_secs(1) || remaining > Duration::from_secs(240) {
+    if remaining < Duration::from_secs(1) || remaining > Duration::from_mins(4) {
         return Err(reject(
             "original deadline must leave from one through 240 seconds",
         ));
@@ -372,7 +372,7 @@ mod tests {
             output_tokens: 1,
             source_commit: "0000000000000000000000000000000000000000",
             deadline_unix_milliseconds: 1,
-            deadline: Instant::now() + Duration::from_secs(60),
+            deadline: Instant::now() + Duration::from_mins(1),
         }
     }
 

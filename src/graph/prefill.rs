@@ -305,7 +305,7 @@ impl Qwen35 {
             || tokens.len() > MAX_PREFILL_BLOCK_TOKENS
             || tokens
                 .iter()
-                .any(|&token| usize::try_from(token).map_or(true, |value| value >= self.vocabulary))
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
         {
             return Err(invalid("invalid native prefill block bounds or tokens"));
         }

@@ -114,8 +114,8 @@ impl<'a> PlacedProjectionExecutor<'a> {
         }
         selected.sort_unstable_by(|left, right| left.tensor.name.cmp(&right.tensor.name));
         if selected
-            .windows(2)
-            .any(|pair| pair[0].tensor.name == pair[1].tensor.name)
+            .array_windows()
+            .any(|[left, right]| left.tensor.name == right.tensor.name)
         {
             return Err(invalid("duplicate explicit projection placement tensor"));
         }

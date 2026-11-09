@@ -335,7 +335,7 @@ impl DFlash2DraftConfig {
             || self.block_tokens > MAX_SPECULATIVE_DRAFT_TOKENS
             || self.drafter_layers == 0
             || self.drafter_layers > 16
-            || self.tap_layers.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.tap_layers.array_windows().any(|[a, b]| a >= b)
             || self.tap_layers[4] >= target_layers
         {
             return Err(invalid(

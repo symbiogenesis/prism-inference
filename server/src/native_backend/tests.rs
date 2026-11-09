@@ -236,7 +236,7 @@ fn private_typed_context_rejection_clears_count_seal_without_faulting_owner() ->
             .await?;
             assert_eq!(result, Err(NativeBackendError::Admission(rejection)));
             let boundary = reply
-                .windows(4)
+                .array_windows()
                 .position(|part| part == b"\r\n\r\n")
                 .ok_or("missing HTTP framing")?;
             let head = std::str::from_utf8(&reply[..boundary])?;
@@ -791,7 +791,7 @@ fn private_disconnect_rolls_back_and_requires_reset_before_subsequent_success() 
                 .await?;
             let mut bytes = Vec::new();
             let mut buffer = [0; 17];
-            while !bytes.windows(5).any(|part| part == b"draft") {
+            while !bytes.array_windows().any(|part| part == b"draft") {
                 let count = client.read(&mut buffer).await?;
                 if count == 0 {
                     return Err(std::io::Error::other("generation ended before abandonment"));
@@ -869,7 +869,7 @@ fn private_dropped_exchange_cancels_and_recovers_only_after_reset() -> TestResul
             let receive = async {
                 let mut bytes = Vec::new();
                 let mut buffer = [0; 17];
-                while !bytes.windows(5).any(|part| part == b"draft") {
+                while !bytes.array_windows().any(|part| part == b"draft") {
                     let count = client.read(&mut buffer).await?;
                     if count == 0 {
                         return Err(std::io::Error::other("missing provisional output"));

@@ -10,7 +10,7 @@ use super::value::{Handle, Value};
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -30,8 +30,7 @@ struct Library {
 }
 
 fn library() -> Result<&'static Library> {
-    static LIBRARY: OnceLock<std::result::Result<Library, String>> = OnceLock::new();
-    match LIBRARY.get_or_init(|| {
+    static LIBRARY: LazyLock<std::result::Result<Library, String>> = LazyLock::new(|| {
         let library: Library = serde_json::from_str(include_str!("../backend-ops-intrinsics.json"))
             .map_err(|error| format!("backend production signatures: {error}"))?;
         if library.schema_version != 1
@@ -42,7 +41,8 @@ fn library() -> Result<&'static Library> {
             return Err("backend production signature provenance or extent differs".into());
         }
         Ok(library)
-    }) {
+    });
+    match &*LIBRARY {
         Ok(library) => Ok(library),
         Err(error) => Err(invalid(error.clone())),
     }

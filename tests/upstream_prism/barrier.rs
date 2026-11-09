@@ -308,7 +308,7 @@ pub(super) fn run_with_parameters(engine: &Engine, threads: usize, rounds: usize
 
 pub(super) fn run(engine: &Engine) -> Result<Value> {
     let threads = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
+        .map_or(1, std::num::NonZero::get)
         .clamp(1, 4);
     run_with_parameters(engine, threads, 100)
 }

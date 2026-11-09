@@ -109,7 +109,7 @@ fn expanded_path(path: &Path) -> Result<PathBuf> {
         .collect();
     require(
         path.is_absolute()
-            && !positions.windows(2).any(|pair| pair[1] > pair[0] + 1)
+            && !positions.array_windows().any(|&[a, b]| b > a + 1)
             && !namespace.starts_with("\\\\?\\")
             && !namespace.starts_with("\\\\.\\"),
         "Use an expanded absolute Prism source path without device syntax.",

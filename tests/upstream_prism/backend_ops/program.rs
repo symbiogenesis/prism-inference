@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 pub(super) const SOURCE_SHA256: &str =
     "8bf7a5cf29d3b3e88aa0c30611f5f1679f46a71ec00306908c44a73ec98ac425";
@@ -267,8 +267,7 @@ pub(super) struct Geometries {
 }
 
 pub(super) fn load() -> Result<(&'static Program, &'static Geometries), String> {
-    static SOURCE: OnceLock<Result<(Program, Geometries), String>> = OnceLock::new();
-    let loaded = SOURCE.get_or_init(|| {
+    static SOURCE: LazyLock<Result<(Program, Geometries), String>> = LazyLock::new(|| {
         let program: Program = serde_json::from_str(include_str!("../backend-ops-program.json"))
             .map_err(|error| format!("backend source program: {error}"))?;
         let geometries: Geometries =
@@ -336,7 +335,7 @@ pub(super) fn load() -> Result<(&'static Program, &'static Geometries), String> 
         }
         Ok((program, geometries))
     });
-    match loaded {
+    match &*SOURCE {
         Ok((program, geometries)) => Ok((program, geometries)),
         Err(error) => Err(error.clone()),
     }

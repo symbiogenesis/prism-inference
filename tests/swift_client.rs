@@ -40,7 +40,7 @@ fn messages() -> Value {
     json!([{"role":"user","content":"private \"question\" 🌱"}])
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(60)
+    Instant::now() + Duration::from_mins(1)
 }
 fn count(id: u64) -> Value {
     json!({"type":"count","id":id,"prompt_tokens":61,"reserved_output_tokens":3})

@@ -30,6 +30,7 @@ use std::{
 use bonsai_hexagon_runtime::{
     GuardedQ2Executor, HmxQ2Executor, NativeQ2Executor, PlacedProjectionExecutor,
 };
+use bonsai_native_hash::{Hasher, hash_bytes};
 use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{Qwen35, StateComponent},
@@ -41,7 +42,6 @@ use hexagon_native_rpc::{
     HmxQ2WeightHandle, NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle,
     Q2_PROJECTION_MAX_OPERATIONS, Q2ProjectionLimits,
 };
-use bonsai_native_hash::{Hasher, hash_bytes};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -410,7 +410,7 @@ fn external(path: &Path) -> Result<()> {
             require(metadata.file_attributes() & 0x400 == 0)?;
         }
         if metadata.is_dir() {
-            require(!ancestor.join(".git").try_exists()?)?;
+            require(!fs::exists(ancestor.join(".git"))?)?;
         }
     }
     Ok(())
@@ -1793,8 +1793,8 @@ fn main_work() -> Result<()> {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
     if arguments.len() == 1 && arguments[0] == "--self-test" {
         require(Q2_PROJECTION_MAX_OPERATIONS >= 24_000)?;
-        Q2ProjectionLimits::new(17_408, 24_000, Duration::from_secs(120))?;
-        require(Q2ProjectionLimits::new(17_408, 24_001, Duration::from_secs(120)).is_err())?;
+        Q2ProjectionLimits::new(17_408, 24_000, Duration::from_mins(2))?;
+        require(Q2ProjectionLimits::new(17_408, 24_001, Duration::from_mins(2)).is_err())?;
         return emit(
             &json!({"event":"self-test", "schemaVersion":1,"valid":true,"driverLoaded":false,"modelLoaded":false}),
         );

@@ -507,7 +507,7 @@ fn wait(
             Err(mpsc::TryRecvError::Empty) => {}
         }
         verify(
-            started.elapsed() < Duration::from_secs(3600),
+            started.elapsed() < Duration::from_hours(1),
             "statistics checkpoint wait exceeded bound",
         )?;
         thread::sleep(Duration::from_millis(1));
@@ -746,8 +746,7 @@ pub(super) fn run_with_options(engine: &Engine, options: &Options) -> Result<Val
     let mut total_chunks = 0_u64;
     let mut transport_groups = 0_u64;
     for t in &types {
-        if !options.types.is_empty() && !t.name.as_ref().is_some_and(|n| options.types.contains(n))
-        {
+        if !options.types.is_empty() && t.name.as_ref().is_none_or(|n| !options.types.contains(n)) {
             continue;
         }
         if !t.cpu || !t.decoder {

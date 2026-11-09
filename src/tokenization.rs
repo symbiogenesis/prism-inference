@@ -229,7 +229,7 @@ impl TokenizationSession {
         }
         if tokens
             .iter()
-            .any(|&token| usize::try_from(token).map_or(true, |token| token >= self.vocab_size))
+            .any(|&token| !usize::try_from(token).is_ok_and(|token| token < self.vocab_size))
         {
             return Err(invalid("input token is outside the model vocabulary"));
         }

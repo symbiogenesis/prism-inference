@@ -353,7 +353,7 @@ mod tests {
         let rendered = output("éx".as_bytes(), &failure);
         assert!(
             rendered
-                .windows(9)
+                .array_windows()
                 .any(|bytes| bytes == b"\xc3\x1b[1;31m\xa9")
         );
         assert_eq!(windows_text(b"a\r\nb\rc\x1aignored"), b"a\nb\rc");

@@ -223,7 +223,7 @@ impl RankOneAdapter {
 
     /// Number of complete admitted factor pairs.
     #[must_use]
-    pub fn target_count(&self) -> usize {
+    pub const fn target_count(&self) -> usize {
         self.factors.len()
     }
 

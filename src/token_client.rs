@@ -265,7 +265,7 @@ impl<R: BufRead, W: Write> TokenClient<R, W> {
         if raw_tokens.is_some_and(|tokens| {
             tokens.len() > self.prompt_limit
                 || tokens.iter().any(|&token| {
-                    usize::try_from(token).map_or(true, |token| token >= self.vocab_size)
+                    !usize::try_from(token).is_ok_and(|token| token < self.vocab_size)
                 })
         }) {
             return Err(ClientError::RejectedInput);

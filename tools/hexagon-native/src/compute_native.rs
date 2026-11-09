@@ -385,7 +385,7 @@ fn exercise(
         report.stage = "compute-fd-refused-pinned";
         return report;
     };
-    if memory.addr() % 4096 != 0 {
+    if !memory.addr().is_multiple_of(4096) {
         report.stage = "compute-allocation-not-aligned-pinned";
         return report;
     }

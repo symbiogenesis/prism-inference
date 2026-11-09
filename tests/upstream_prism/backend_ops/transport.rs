@@ -135,7 +135,7 @@ fn publish_actions(path: &Path, actions: &[Value]) -> Result<()> {
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
-    if path.try_exists()? {
+    if fs::exists(path)? {
         return Err(invalid("backend continuation input is not fresh"));
     }
     fs::rename(&temporary, path)?;
@@ -172,7 +172,7 @@ impl FileSession {
     fn wait_checkpoint(&mut self) -> Result<Option<Vec<Value>>> {
         let deadline = Instant::now() + self.timeout + Duration::from_secs(5);
         loop {
-            if self.output.try_exists()? {
+            if fs::exists(&self.output)? {
                 let value = read_observation(&self.output)?;
                 let object = value
                     .as_object()
@@ -240,7 +240,7 @@ impl FileSession {
     fn request_stop(&mut self) -> Result<()> {
         if !self.stopped {
             self.poll_worker()?;
-            if self.completed.is_none() && !self.next.try_exists()? {
+            if self.completed.is_none() && !fs::exists(&self.next)? {
                 publish_actions(&self.next, &[])?;
             }
             self.stopped = true;
@@ -294,11 +294,11 @@ pub(super) fn with_session<T>(
     let timeout = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
         && std::env::var("GITHUB_REF").as_deref() == Ok("refs/heads/main")
     {
-        Duration::from_secs(3600)
+        Duration::from_hours(1)
     } else {
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     };
-    let process_timeout = if timeout > Duration::from_secs(60) {
+    let process_timeout = if timeout > Duration::from_mins(1) {
         timeout
     } else {
         Duration::from_secs(90)

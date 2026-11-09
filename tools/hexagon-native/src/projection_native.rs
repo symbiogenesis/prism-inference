@@ -223,7 +223,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
     entered(&mut report, "projection-allocation-entered", &mut progress);
     // SAFETY: one explicitly bounded cached system-heap allocation, under i32 limits.
     let memory = unsafe { (calls.alloc)(25, 1, allocator_request) };
-    if memory.is_null() || memory.addr() % 4096 != 0 {
+    if memory.is_null() || !memory.addr().is_multiple_of(4096) {
         report.queue.stage = "projection-allocation-refused-pinned";
         return Ok(report);
     }
@@ -243,7 +243,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         let extra_req = i32::try_from(extra_bytes).map_err(|_| Error::Contract)?;
         // SAFETY: each secondary weight arena is bounded by 480 MiB (< i32::MAX).
         let extra_mem = unsafe { (calls.alloc)(25, 1, extra_req) };
-        if extra_mem.is_null() || extra_mem.addr() % 4096 != 0 {
+        if extra_mem.is_null() || !extra_mem.addr().is_multiple_of(4096) {
             report.queue.stage = "projection-allocation-refused-pinned";
             return Ok(report);
         }
@@ -1997,7 +1997,7 @@ pub(super) fn open_native_q2(
     let descriptor_size = u32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     // SAFETY: one explicitly bounded cached system-heap allocation, under i32 limits.
     let memory = unsafe { (calls.alloc)(25, 1, allocator_request) };
-    if memory.is_null() || memory.addr() % 4096 != 0 {
+    if memory.is_null() || !memory.addr().is_multiple_of(4096) {
         return Err(Error::Contract);
     }
     // SAFETY: fresh, exclusive, correctly aligned allocator-owned extent.
@@ -2013,7 +2013,7 @@ pub(super) fn open_native_q2(
         let extra_req = i32::try_from(extra_bytes).map_err(|_| Error::Contract)?;
         // SAFETY: each secondary weight arena is bounded by 480 MiB (< i32::MAX).
         let extra_mem = unsafe { (calls.alloc)(25, 1, extra_req) };
-        if extra_mem.is_null() || extra_mem.addr() % 4096 != 0 {
+        if extra_mem.is_null() || !extra_mem.addr().is_multiple_of(4096) {
             return Err(Error::Contract);
         }
         // SAFETY: fresh, exclusive, page-aligned allocator-owned secondary arena.

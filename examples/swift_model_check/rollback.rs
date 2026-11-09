@@ -1,6 +1,7 @@
 //! Source-graph cancellation evidence; never private HTTP service qualification.
 
 use super::{AdapterSelection, Representation, evidence_backend, load_graph, reject, valid_tokens};
+use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{Qwen35, StateComponent},
@@ -8,7 +9,6 @@ use bonsai_prism_runtime::{
     runtime::{Cancellation, Finish, Generation, Limits, Prefill, Runtime},
     sampling::Sampler,
 };
-use bonsai_native_hash::Hasher;
 use serde::Serialize;
 use serde_json::json;
 use std::{

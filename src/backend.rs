@@ -798,8 +798,9 @@ impl CpuBackend {
         let info = self.info(tensor)?;
         if matches!(info.kind, 16..=19 | 21 | 22 | 29)
             && matches!(info.operation, 1 | 34 | 35)
-            && !info.sources.first().is_some_and(|&source| {
-                self.info(source)
+            && info.sources.first().is_none_or(|&source| {
+                !self
+                    .info(source)
                     .is_ok_and(|source| source.kind == info.kind)
             })
         {

@@ -175,10 +175,10 @@ pub(super) fn top_k(
             difference += jdst(&lookup(&ia)?, &lookup(&ib)?);
             ia.sort_unstable();
             ib.sort_unstable();
-            if ia.windows(2).any(|pair| pair[0] == pair[1]) {
+            if ia.array_windows().any(|[a, b]| a == b) {
                 difference += 1.0;
             }
-            if ib.windows(2).any(|pair| pair[0] == pair[1]) {
+            if ib.array_windows().any(|[a, b]| a == b) {
                 difference += 1.0;
             }
         }

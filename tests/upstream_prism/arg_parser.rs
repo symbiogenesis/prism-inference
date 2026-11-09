@@ -350,7 +350,7 @@ fn download_checks(results: &[Value], checks: &mut Checks) -> Result<()> {
     );
     checks.check(
         good.as_ref()
-            .is_some_and(|b| b.windows(b"llama.cpp".len()).any(|w| w == b"llama.cpp")),
+            .is_some_and(|b| b.array_windows().any(|w| w == b"llama.cpp")),
         "good URL body omitted llama.cpp",
     );
     checks.check(

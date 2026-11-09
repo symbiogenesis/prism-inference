@@ -224,13 +224,7 @@ fn reference_after_domain(
     // SAFETY: the pinned eight-byte/two-int ABI selects the returned effective
     // default-CDSP domain, enable=1, before any module open. This is the exact
     // reference initializer, not an OS trust/certificate/boot-policy operation.
-    let result = unsafe {
-        control(
-            REFERENCE_PROCESS_REQUEST,
-            std::ptr::from_mut(&mut request).cast(),
-            8,
-        )
-    };
+    let result = unsafe { control(REFERENCE_PROCESS_REQUEST, (&raw mut request).cast(), 8) };
     report.process_initialization_result = Some(result);
     report.process_initialization_domain_after = Some(request.domain);
     report.process_initialization_enable_after = Some(request.enable);
@@ -324,7 +318,7 @@ fn exercise(
     let fd = unsafe { (calls.to_fd)(buffer) };
     report.mapping.descriptor_observed = fd >= 0;
     report.mapping.descriptor_error = (fd < 0).then_some(fd);
-    if fd < 0 || buffer.addr() % 4096 != 0 {
+    if fd < 0 || !buffer.addr().is_multiple_of(4096) {
         // SAFETY: this scratch has not been mapped or submitted to any consumer.
         unsafe { (calls.free)(buffer) };
         report.mapping.free_completed = true;
@@ -513,7 +507,7 @@ mod tests {
         metadata.uri_result = Some(0);
         metadata.uri_verified = true;
         let mut uri = [0; 256];
-        let bytes = b"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0\0";
+        let bytes = c"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0".to_bytes_with_nul();
         uri[..bytes.len()].copy_from_slice(bytes);
         for fail in ["", "open", "handle", "alloc", "fd", "map", "unmap", "close"] {
             *state() = State {
@@ -620,15 +614,13 @@ mod tests {
             let domain = unsafe { CStr::from_ptr(request.domain) };
             // SAFETY: the fixed caller owns its full terminated module URI array.
             let module = unsafe { CStr::from_ptr(request.module) };
-            if domain.to_bytes() != b"cdsp"
-                || module.to_bytes()
-                    != b"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0"
-                || usize::try_from(request.module_len).unwrap_or_default()
-                    != module.to_bytes().len()
+            if domain != c"cdsp"
+                || module != c"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0"
+                || usize::try_from(request.module_len).unwrap_or_default() != module.count_bytes()
             {
                 return 14;
             }
-            let uri = b"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0\0";
+            let uri = c"file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0".to_bytes_with_nul();
             if request.uri_len != 256 {
                 return 14;
             }

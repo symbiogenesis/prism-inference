@@ -26,12 +26,12 @@ const MAX_STDERR: u64 = 1024 * 1024;
 const MAX_REQUESTS: u64 = 65536;
 const MAX_CALLBACKS: usize = 65536;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(240);
+const SESSION_TIMEOUT: Duration = Duration::from_mins(4);
 const REAL_EVAL_SESSION_TIMEOUT: Duration = Duration::from_mins(15);
 const SAVE_LOAD_SESSION_TIMEOUT: Duration = Duration::from_mins(10);
 const THREAD_SAFETY_SESSION_TIMEOUT: Duration = Duration::from_mins(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const QUANTIZATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(3600);
+const QUANTIZATION_OPERATION_TIMEOUT: Duration = Duration::from_hours(1);
 const QUANTIZATION_SESSION_TIMEOUT: Duration = Duration::from_hours(4);
 
 fn operation_timeout(quantization: bool, operation: &Value) -> Duration {

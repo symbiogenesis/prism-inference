@@ -375,7 +375,7 @@ fn speculative(
         (0_u128, 0_u128, 0_u128, 0_usize);
     let mut warning = false;
     while output.len() < options.prediction_limit
-        && !output.last().is_some_and(|token| eog.contains(token))
+        && output.last().is_none_or(|token| !eog.contains(token))
     {
         let round_start = Instant::now();
         let draft_start = Instant::now();

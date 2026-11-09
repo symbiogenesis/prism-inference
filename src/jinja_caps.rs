@@ -156,7 +156,7 @@ pub(super) fn detect(mut render: impl FnMut(&str) -> Result<Observation>) -> Res
     let typed = observation.content_array_access;
     let marker = observation
         .rendered
-        .windows(b"STRING_MARKER".len())
+        .array_windows()
         .any(|bytes| bytes == b"STRING_MARKER");
     let string = observation.success && (!typed || marker);
     Ok((string, typed))

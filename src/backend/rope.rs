@@ -99,7 +99,7 @@ impl CpuBackend {
                         1
                     } else if sector % 3 == 2 && sector < 3 * sections[2] {
                         2
-                    } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                    } else if sector.is_multiple_of(3) && sector < 3 * sections[0] {
                         0
                     } else {
                         3

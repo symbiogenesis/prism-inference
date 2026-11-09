@@ -94,7 +94,7 @@ pub(crate) fn self_check() -> bool {
         return false;
     };
     let mut uri = module.to_bytes().to_vec();
-    uri.extend_from_slice(b"&_dom=cdsp&_session=0\0");
+    uri.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
     checked_uri(81, &uri)
         && !checked_uri(73, &uri)
         && !SessionPreparationReport::new(0x81).metadata_prepared()
@@ -110,7 +110,7 @@ mod tests {
     fn uri_is_bound_to_exact_architecture_domain_and_default_session() {
         assert!(self_check());
         let mut uri = module_uri(81).map_or_default(CStr::to_bytes).to_vec();
-        uri.extend_from_slice(b"&_dom=cdsp&_session=0\0");
+        uri.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
         assert!(checked_uri(81, &uri));
         assert!(!checked_uri(82, &uri));
         assert!(!checked_uri(81, &uri[..uri.len() - 1]));

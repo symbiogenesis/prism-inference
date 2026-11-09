@@ -20,7 +20,7 @@ impl CharsMap {
         let end = size
             .checked_add(4)
             .ok_or_else(|| invalid("tokenizer charsmap offset overflow"))?;
-        if size == 0 || size % 4 != 0 || end >= bytes.len() {
+        if size == 0 || !size.is_multiple_of(4) || end >= bytes.len() {
             return Err(invalid("tokenizer charsmap node extent invalid"));
         }
         let nodes = bytes[4..end]

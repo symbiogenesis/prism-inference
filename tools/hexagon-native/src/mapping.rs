@@ -109,7 +109,7 @@ pub(super) fn probe(driver: Driver) -> Result<MappingProbeReport, Error> {
     let fd = unsafe { to_fd(buffer) };
     report.descriptor_observed = fd >= 0;
     report.descriptor_error = (fd < 0).then_some(fd);
-    if fd < 0 || buffer.addr() % 4096 != 0 {
+    if fd < 0 || !buffer.addr().is_multiple_of(4096) {
         // SAFETY: no mapping or submission was attempted; this is our allocation.
         unsafe {
             free(buffer);

@@ -435,7 +435,7 @@ fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Ve
         tensors.insert(name.to_owned(), (packed, vec![5_120, 248_320]));
     }
     tensors.insert("output_norm.weight".to_owned(), (0, vec![5_120]));
-    for layer in 0..64 {
+    for layer in 0_usize..64 {
         let mut add = |name: &str, kind, dimensions: &[u64]| {
             tensors.insert(format!("blk.{layer}.{name}"), (kind, dimensions.to_vec()));
         };
@@ -446,7 +446,7 @@ fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Ve
             add(name, packed, &[5_120, 17_408]);
         }
         add("ffn_down.weight", packed, &[17_408, 5_120]);
-        if (layer + 1) % 4 == 0 {
+        if (layer + 1).is_multiple_of(4) {
             add("attn_q.weight", packed, &[5_120, 12_288]);
             for name in ["attn_k.weight", "attn_v.weight"] {
                 add(name, packed, &[5_120, 1_024]);

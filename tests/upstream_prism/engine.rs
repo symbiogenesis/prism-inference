@@ -250,7 +250,7 @@ impl Engine {
         request: &Value,
         timeout: Duration,
     ) -> Result<Option<Value>> {
-        if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+        if timeout.is_zero() || timeout > Duration::from_hours(1) {
             return Err(invalid(
                 "common bridge timeout must be positive and at most one hour",
             ));

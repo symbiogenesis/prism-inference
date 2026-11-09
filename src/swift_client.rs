@@ -244,7 +244,7 @@ impl<R: BufRead, W: Write> SwiftClient<R, W> {
     ) -> Result<Completion, ClientError> {
         self.admit(max_tokens)?;
         check(cancellation, deadline)?;
-        if deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(600) {
+        if deadline.saturating_duration_since(Instant::now()) > Duration::from_mins(10) {
             return Err(ClientError::InvalidConfiguration);
         }
         let prompt_tokens = self.count(messages, max_tokens)?;

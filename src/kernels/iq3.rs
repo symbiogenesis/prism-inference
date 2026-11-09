@@ -70,7 +70,7 @@ fn unpack(kind: u32, bytes: &[u8]) -> ([i16; 256], [i16; 8]) {
         for octet in 0..4 {
             let signs = if kind == 18 {
                 let low = (auxiliary >> (7 * octet)).to_le_bytes()[0] & 127;
-                low | (u8::from(low.count_ones() % 2 != 0) << 7)
+                low | (u8::from(!low.count_ones().is_multiple_of(2)) << 7)
             } else {
                 bytes[74 + group * 4 + octet]
             };

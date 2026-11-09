@@ -114,7 +114,7 @@ fn merged(
     let started = Instant::now();
     let mut limit = None;
     let status = loop {
-        if overflow.load(Ordering::Acquire) || started.elapsed() > Duration::from_secs(180) {
+        if overflow.load(Ordering::Acquire) || started.elapsed() > Duration::from_mins(3) {
             limit = Some("production LoRA exporter exceeded output/time bound");
             let _ = child.kill();
             break child.wait()?;

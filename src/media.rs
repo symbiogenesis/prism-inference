@@ -59,7 +59,7 @@ pub fn should_tile(
         let value = u64::from(dimension);
         let quotient = value / align;
         let remainder = value % align;
-        let up = remainder * 2 > align || (remainder * 2 == align && quotient % 2 != 0);
+        let up = remainder * 2 > align || (remainder * 2 == align && !quotient.is_multiple_of(2));
         u64::from(patch).max((quotient + u64::from(up)) * align)
     };
     Ok(round(width) * round(height) > align * align * u64::from(max_tokens) * 2)

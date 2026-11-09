@@ -216,7 +216,7 @@ impl State {
         if !path.is_absolute() {
             return Err(invalid("Rust backend file path must be absolute"));
         }
-        let path = if path.try_exists()? {
+        let path = if fs::exists(path)? {
             fs::canonicalize(path)?
         } else {
             fs::canonicalize(
@@ -818,7 +818,7 @@ pub(super) fn execute(operation: &Value) -> Result<Value> {
                 }
                 let output = state.file(&action["OutputFile"])?;
                 let next = state.file(&action["NextFile"])?;
-                if output == next || output.try_exists()? || next.try_exists()? {
+                if output == next || fs::exists(&output)? || fs::exists(&next)? {
                     return Err(invalid("Rust backend checkpoint files must be fresh"));
                 }
                 trace.push(json!({}));
@@ -840,14 +840,14 @@ pub(super) fn execute(operation: &Value) -> Result<Value> {
                     return Err(invalid("Rust backend continuation timeout outside bound"));
                 }
                 let deadline = Instant::now() + Duration::from_millis(milliseconds as u64);
-                while !next.try_exists()? {
+                while !fs::exists(&next)? {
                     if Instant::now() >= deadline {
                         return Err(invalid("Rust backend continuation timeout"));
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 continuation = Some(actions(&state, &json!(next))?);
-                trace = Vec::new();
+                trace.clear();
                 break;
             }
             trace.push(
@@ -983,21 +983,21 @@ mod tests {
         for (name, deadline, total, actions, success) in [
             (
                 "last-slot",
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 MAX_ACTIONS - 2,
                 vec![json!({"Op":"clock"})],
                 true,
             ),
             (
                 "overflow",
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 MAX_ACTIONS - 1,
                 vec![json!({"Op":"clock"})],
                 false,
             ),
             (
                 "empty",
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 1,
                 vec![],
                 false,

@@ -17,7 +17,7 @@ fn timing_preserves_sampled_output_state_rng_and_reused_prefix() -> Result<()> {
             _ => vec![7, 6, 5],
         };
         let (mut plain_output, mut timed_output) = (Vec::new(), Vec::new());
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let expected = plain.generate_sampled_until(
             &prompt,
             &options(),
@@ -104,7 +104,7 @@ fn timed_stop_draw_is_counted_without_decode_or_callback_work() -> Result<()> {
         },
         Prefill::default(),
         &Cancellation::default(),
-        Instant::now() + Duration::from_secs(60),
+        Instant::now() + Duration::from_mins(1),
         &mut sampler,
         &mut timings,
         |_| Err(std::io::Error::other("stop must not emit").into()),
@@ -145,7 +145,7 @@ fn failed_callback_retains_provisional_work_and_rolls_back_state_and_rng() -> Re
                     },
                     Prefill { block_tokens: 2 },
                     &Cancellation::default(),
-                    Instant::now() + Duration::from_secs(60),
+                    Instant::now() + Duration::from_mins(1),
                     &mut sampler,
                     &mut timings,
                     |_| Err(std::io::Error::other("failed delivery after possible output").into()),
@@ -203,7 +203,7 @@ fn timed_cancel_after_successful_callback_never_reports_committed_output() -> Re
                 &options(),
                 Prefill::default(),
                 &cancel,
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 &mut sampler,
                 &mut timings,
                 |_| {
@@ -258,7 +258,7 @@ fn failed_prefill_block_keeps_unknown_partial_work_distinct_from_zero() -> Resul
                 &options(),
                 Prefill { block_tokens: 2 },
                 &Cancellation::default(),
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 &mut SequenceSampler::default(),
                 &mut timings,
                 |_| Ok(()),

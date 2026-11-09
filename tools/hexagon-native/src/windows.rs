@@ -237,7 +237,11 @@ fn service_binary() -> Result<String, Error> {
     let binary = unsafe { (*config).binary_path };
     let start = storage.as_ptr().addr();
     let end = start + storage.len() * size_of::<usize>();
-    if binary.is_null() || binary.addr() < start || binary.addr() >= end || binary.addr() % 2 != 0 {
+    if binary.is_null()
+        || binary.addr() < start
+        || binary.addr() >= end
+        || !binary.addr().is_multiple_of(2)
+    {
         return Err(Error::InvalidDriverPath);
     }
     let count = (end - binary.addr()) / 2;
@@ -352,7 +356,7 @@ fn verify_signature(path: &Path, file: &File) -> Result<(), Error> {
         WinVerifyTrust(
             std::ptr::without_provenance_mut(usize::MAX),
             &raw mut action,
-            std::ptr::from_mut(&mut data).cast(),
+            (&raw mut data).cast(),
         )
     };
     data.action = 2;
@@ -361,7 +365,7 @@ fn verify_signature(path: &Path, file: &File) -> Result<(), Error> {
         WinVerifyTrust(
             std::ptr::without_provenance_mut(usize::MAX),
             &raw mut action,
-            std::ptr::from_mut(&mut data).cast(),
+            (&raw mut data).cast(),
         )
     };
     if result != 0 {
@@ -444,8 +448,7 @@ impl Driver {
         };
         // SAFETY: the only exposed request writes the fixed 12-byte C structure;
         // the library and deny-mutation file guard remain owned throughout.
-        let result =
-            unsafe { (self.control)(GET_DSP_INFO, std::ptr::from_mut(&mut query).cast(), 12) };
+        let result = unsafe { (self.control)(GET_DSP_INFO, (&raw mut query).cast(), 12) };
         if result != 0 {
             return Err(Error::Native("capability-query", i64::from(result)));
         }

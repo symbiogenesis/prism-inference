@@ -141,7 +141,7 @@ pub(super) fn export(
     inspection: &Inspection,
     timeout: Duration,
 ) -> Result<Value> {
-    if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(3600) {
+    if timeout < Duration::from_secs(1) || timeout > Duration::from_hours(1) {
         return Err(bad("export timeout must be between 1 and 3600 seconds."));
     }
     let file_type_position = inspection.file_type_position.ok_or_else(|| {

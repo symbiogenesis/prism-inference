@@ -149,7 +149,7 @@ pub(super) fn unicode_characters() -> Result<Vec<char>> {
             );
         }
     }
-    if values.len() != 145_595 || !values.windows(2).all(|v| v[0] < v[1]) {
+    if values.len() != 145_595 || !values.array_windows().all(|[a, b]| a < b) {
         return Err(invalid("Unicode domain extent/order differs"));
     }
     Ok(values)

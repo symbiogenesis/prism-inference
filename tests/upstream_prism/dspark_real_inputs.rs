@@ -147,12 +147,7 @@ pub(super) fn prompts(options: &Options) -> Result<Vec<Prompt>> {
                     Ok(json!({"role":role,"content":content}))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if messages
-                .last()
-                .is_some_and(|message| message["role"] == "assistant")
-            {
-                messages.pop();
-            }
+            messages.pop_if(|message| message["role"] == "assistant");
             if messages
                 .last()
                 .is_none_or(|message| message["role"] != "user")

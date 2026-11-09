@@ -383,7 +383,7 @@ mod driver {
         let mut fixture = Artifact::new(260)?;
         let offset = fixture
             .bytes
-            .windows(6)
+            .array_windows()
             .position(|bytes| bytes == b"qwen35")
             .ok_or("missing pretokenizer fixture")?;
         fixture.bytes[offset..offset + 6].copy_from_slice(b"broken");

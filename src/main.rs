@@ -685,46 +685,47 @@ fn execute(arguments: &Arguments) -> Result<()> {
 }
 
 fn tokenize_record(arguments: &Arguments) -> Result<serde_json::Value> {
-    let (tokens, identity) =
-        if let Some(prompt) = &arguments.prompt {
-            let session = TokenizationSession::load(
-                &arguments.path,
-                arguments.bytes,
-                &arguments.sha256,
-                arguments.memory,
-            )?;
-            let result = session.encode(
-                prompt,
-                TextTokenizationPolicy {
-                    special_input: arguments.special_input,
-                    insert_special: match arguments.insert_special {
-                        InsertSpecial::None => SpecialTokenInsertion::None,
-                        InsertSpecial::Model => SpecialTokenInsertion::Model,
-                    },
-                    budget: TokenBudget {
-                        context: arguments.context,
-                        reserved_output_tokens: arguments.generation.max_tokens,
-                    },
+    let (tokens, identity) = if let Some(prompt) = &arguments.prompt {
+        let session = TokenizationSession::load(
+            &arguments.path,
+            arguments.bytes,
+            &arguments.sha256,
+            arguments.memory,
+        )?;
+        let result = session.encode(
+            prompt,
+            TextTokenizationPolicy {
+                special_input: arguments.special_input,
+                insert_special: match arguments.insert_special {
+                    InsertSpecial::None => SpecialTokenInsertion::None,
+                    InsertSpecial::Model => SpecialTokenInsertion::Model,
                 },
-            )?;
-            (result.token_ids, session.identity().to_owned())
-        } else {
-            // Preserve raw-ID mode's metadata-only contract: unlike a text session,
-            // it does not require a supported pretokenizer or BPE merge metadata.
-            let model = ModelMetadata::load(
-                &arguments.path,
-                arguments.bytes,
-                &arguments.sha256,
-                arguments.memory,
-            )?;
-            let _special_tokens = SpecialTokens::from_metadata(&model.metadata, model.vocab_size)?;
-            if arguments.tokens.iter().any(|&token| {
-                usize::try_from(token).map_or(true, |token| token >= model.vocab_size)
-            }) {
-                return Err(bad("input token is outside the model vocabulary"));
-            }
-            (arguments.tokens.clone(), model.identity)
-        };
+                budget: TokenBudget {
+                    context: arguments.context,
+                    reserved_output_tokens: arguments.generation.max_tokens,
+                },
+            },
+        )?;
+        (result.token_ids, session.identity().to_owned())
+    } else {
+        // Preserve raw-ID mode's metadata-only contract: unlike a text session,
+        // it does not require a supported pretokenizer or BPE merge metadata.
+        let model = ModelMetadata::load(
+            &arguments.path,
+            arguments.bytes,
+            &arguments.sha256,
+            arguments.memory,
+        )?;
+        let _special_tokens = SpecialTokens::from_metadata(&model.metadata, model.vocab_size)?;
+        if arguments
+            .tokens
+            .iter()
+            .any(|&token| !usize::try_from(token).is_ok_and(|token| token < model.vocab_size))
+        {
+            return Err(bad("input token is outside the model vocabulary"));
+        }
+        (arguments.tokens.clone(), model.identity)
+    };
     Ok(json!({
         "mode": "tokenize",
         "input_mode": if arguments.prompt.is_some() { "text" } else { "tokens" },

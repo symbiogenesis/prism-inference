@@ -151,7 +151,7 @@ fn response(target: &str, repos: &Repositories, commit: &str) -> Result<(u16, St
 fn request(stream: &mut TcpStream) -> Result<(String, String)> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
-    while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+    while !bytes.array_windows().any(|w| w == b"\r\n\r\n") {
         let count = stream.read(&mut buffer)?;
         if count == 0 {
             return Err(invalid("truncated fixture HTTP request"));

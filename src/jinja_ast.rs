@@ -476,9 +476,7 @@ fn segments(source: &str) -> Result<Vec<Segment>> {
             let kind = bytes[start + 1];
             let trim = bytes.get(start + 2) == Some(&b'-');
             if trim {
-                while literal.last().is_some_and(u8::is_ascii_whitespace) {
-                    literal.pop();
-                }
+                while literal.pop_if(|byte| byte.is_ascii_whitespace()).is_some() {}
             } else if matches!(kind, b'%' | b'#') {
                 let line = bytes[..start]
                     .iter()

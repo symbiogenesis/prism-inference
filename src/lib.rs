@@ -193,9 +193,9 @@ pub trait Decoder {
     fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
         if tokens.is_empty()
             || tokens.len() > MAX_PREFILL_BLOCK_TOKENS
-            || tokens.iter().any(|&token| {
-                usize::try_from(token).map_or(true, |value| value >= self.vocab_size())
-            })
+            || tokens
+                .iter()
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocab_size()))
         {
             return Err(invalid("invalid native prefill block bounds or tokens"));
         }

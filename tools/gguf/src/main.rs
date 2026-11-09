@@ -100,14 +100,13 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Arguments, String> 
     let dialect = values
         .remove("--dialect")
         .map_or_else(|| Ok("Stock".into()), |value| text(value, "--dialect"))?;
-    let timeout = values.remove("--timeout-seconds").map_or_else(
-        || Ok(1800),
-        |value| {
+    let timeout = values
+        .remove("--timeout-seconds")
+        .map_or(Ok(1800), |value| {
             text(value, "--timeout-seconds")?
                 .parse::<u64>()
                 .map_err(|_| "--timeout-seconds must be an integer in 1..3600.".to_owned())
-        },
-    )?;
+        })?;
     if !(1..=3600).contains(&timeout) {
         return Err("--timeout-seconds must be an integer in 1..3600.".into());
     }

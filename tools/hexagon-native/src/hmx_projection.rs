@@ -911,12 +911,12 @@ mod tests {
     #[test]
     fn hmx_limits_share_the_authorized_cap_without_extending_time_or_allocation()
     -> Result<(), Error> {
-        let limits = HmxQ2ProjectionLimits::new(17_408, 24_000, Duration::from_secs(120))?;
+        let limits = HmxQ2ProjectionLimits::new(17_408, 24_000, Duration::from_mins(2))?;
         assert_eq!(
             limits.maximum_operations(),
             projection::Q2_PROJECTION_MAX_OPERATIONS
         );
-        assert_eq!(limits.maximum_duration(), Duration::from_secs(120));
+        assert_eq!(limits.maximum_duration(), Duration::from_mins(2));
         assert_eq!(limits.allocation_bytes(), 1_191_936);
         for operations in [0, 24_001, u32::MAX] {
             assert!(HmxQ2ProjectionLimits::new(32, operations, Duration::from_secs(4)).is_err());

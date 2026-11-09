@@ -156,7 +156,7 @@ fn sampled_success_commits_caller_rng_and_stop_draws_without_emitting_stops() ->
         },
         Prefill { block_tokens: 2 },
         &Cancellation::default(),
-        Instant::now() + Duration::from_secs(60),
+        Instant::now() + Duration::from_mins(1),
         &mut sampler,
         |token| {
             actual.push(token);
@@ -1136,7 +1136,7 @@ fn deadline_expired_admission_preserves_committed_state_and_snapshots() -> Resul
         &[1, 1],
         &options(),
         &cancellation,
-        Instant::now() + Duration::from_secs(60),
+        Instant::now() + Duration::from_mins(1),
         |_| Ok(()),
     )?;
     assert_eq!(completion.reused_tokens, 2);
@@ -1167,7 +1167,7 @@ fn deadline_generation_retains_cancellation_precedence_and_stream_rollback() -> 
                 &[2],
                 &options(),
                 &active,
-                Instant::now() + Duration::from_secs(60),
+                Instant::now() + Duration::from_mins(1),
                 |_| {
                     active.cancel();
                     Ok(())
@@ -1409,7 +1409,7 @@ fn bounded_prefill_invalid_sizes_reject_before_capture_or_decoder_mutation() -> 
                         &options(),
                         Prefill { block_tokens },
                         &cancellation,
-                        Instant::now() + Duration::from_secs(60),
+                        Instant::now() + Duration::from_mins(1),
                         |_| Ok(()),
                     )
                     .is_err()
@@ -1544,7 +1544,7 @@ fn bounded_prefill_final_prompt_logits_can_stop_without_evaluating_a_generated_t
         &stop,
         Prefill { block_tokens: 2 },
         &Cancellation::default(),
-        Instant::now() + Duration::from_secs(60),
+        Instant::now() + Duration::from_mins(1),
         |_| Err(std::io::Error::other("stop token must not emit").into()),
     )?;
     assert_eq!(completion.finish, Finish::Stop);

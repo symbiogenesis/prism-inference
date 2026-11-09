@@ -228,7 +228,7 @@ mod tests {
             Ok(())
         })?;
         assert_eq!(bridged, "雨!");
-        assert!(decoder.pending_bytes().is_empty());
+        assert_eq!(decoder.pending_bytes(), b"");
         assert_eq!(decoder.finish(), "");
         Ok(())
     }

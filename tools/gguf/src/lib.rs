@@ -262,12 +262,12 @@ pub fn export_ptq1(
     expected_sha256: &str,
     timeout: Duration,
 ) -> Result<Value> {
-    if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(3600) {
+    if timeout < Duration::from_secs(1) || timeout > Duration::from_hours(1) {
         return Err(bad(
             "GGUF: export deadline must be between one second and one hour.",
         ));
     }
-    if output.try_exists()? {
+    if fs::exists(output)? {
         return Err(bad("GGUF: output must name a new file."));
     }
     let mut file = open_read(source)?;

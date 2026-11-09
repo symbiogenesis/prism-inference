@@ -200,7 +200,7 @@ impl BatchAllocator {
         if input.tokens.as_ref().is_some_and(|tokens| {
             tokens
                 .iter()
-                .any(|token| usize::try_from(*token).map_or(true, |token| token >= vocabulary_size))
+                .any(|token| !usize::try_from(*token).is_ok_and(|token| token < vocabulary_size))
         }) {
             return Ok(false);
         }
@@ -211,7 +211,7 @@ impl BatchAllocator {
         if sequence_ids
             .iter()
             .flatten()
-            .any(|id| usize::try_from(*id).map_or(true, |id| id >= sequence_limit))
+            .any(|id| !usize::try_from(*id).is_ok_and(|id| id < sequence_limit))
         {
             return Ok(false);
         }

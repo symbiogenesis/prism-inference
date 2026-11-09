@@ -677,7 +677,7 @@ impl<D: Decoder> Runtime<D> {
             || length > self.limits.context_tokens
             || options.stop_tokens.len() > 256
             || prompt.iter().chain(&options.stop_tokens).any(|&token| {
-                usize::try_from(token).map_or(true, |value| value >= self.decoder.vocab_size())
+                !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size())
             })
         {
             return Err(invalid(
@@ -857,7 +857,7 @@ impl<D: Decoder> Runtime<D> {
                 effects.sampler.sample(&self.logits)
             })?;
             check()?;
-            if usize::try_from(token).map_or(true, |value| value >= self.decoder.vocab_size()) {
+            if !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size()) {
                 return Err(invalid(
                     "native sampler returned an out-of-vocabulary token",
                 ));
@@ -964,7 +964,7 @@ impl<D: Decoder> Runtime<D> {
         if draft.is_empty()
             || draft.len() > MAX_SPECULATIVE_DRAFT_TOKENS
             || draft.iter().any(|&token| {
-                usize::try_from(token).map_or(true, |value| value >= self.decoder.vocab_size())
+                !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size())
             })
         {
             return Err(invalid("invalid speculative draft block bounds or tokens"));

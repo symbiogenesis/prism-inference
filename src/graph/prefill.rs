@@ -386,39 +386,24 @@ impl Qwen35 {
             .zip(&mut self.workspace.deltas)
             .enumerate()
         {
-            if count > 1 && tile.projector.row_parallelism().workers() > 1 {
-                let hidden_ref = &tile.hidden[..count];
-                let arithmetic = self.arithmetic;
-                let norm = &layer.norm;
-                let epsilon = self.geometry.epsilon;
-                tile.projector.row_parallelism().update_chunks(
-                    &mut tile.normalized[..count],
-                    1,
-                    |base_tok, chunk| {
-                        for (offset, normalized) in chunk.iter_mut().enumerate() {
-                            arithmetic.normalize(
-                                &hidden_ref[base_tok + offset],
-                                norm,
-                                epsilon,
-                                normalized,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                )?;
-            } else {
-                for (hidden, normalized) in tile.hidden[..count]
-                    .iter()
-                    .zip(&mut tile.normalized[..count])
-                {
-                    self.arithmetic.normalize(
-                        hidden,
-                        &layer.norm,
-                        self.geometry.epsilon,
-                        normalized,
-                    )?;
+            let first_attn_target = match &layer.attention {
+                Attention::Recurrent(weights) => &weights.qkv,
+                Attention::Full(weights) if narrow_final && layer_idx + 1 == total_layers => {
+                    &weights.key
                 }
-            }
+                Attention::Full(weights) => &weights.query,
+            };
+            let norm_reuse = normalize_for_tile_into(
+                &self.transforms,
+                &self.geometry,
+                self.arithmetic,
+                &layer.norm,
+                first_attn_target,
+                &tile.hidden[..count],
+                &mut tile.normalized[..count],
+                &mut tile.transformed[..count],
+                tile.projector.row_parallelism(),
+            )?;
             if narrow_final && layer_idx + 1 == total_layers {
                 match (&layer.attention, &mut *state) {
                     (Attention::Recurrent(weights), _) => {
@@ -433,6 +418,7 @@ impl Qwen35 {
                             self.adapter_scale,
                             &mut self.workspace.adapter,
                             &mut self.workspace.projection.matvec,
+                            norm_reuse,
                             count,
                             check,
                             tile,
@@ -449,6 +435,7 @@ impl Qwen35 {
                             self.adapter_scale,
                             &mut self.workspace.adapter,
                             &mut self.workspace.projection.matvec,
+                            norm_reuse,
                             [&weights.key, &weights.value],
                             &tile.normalized[..count],
                             &mut tile.recurrent_gate[..count],
@@ -489,6 +476,7 @@ impl Qwen35 {
                         self.adapter_scale,
                         &mut self.workspace.adapter,
                         &mut self.workspace.projection.matvec,
+                        norm_reuse,
                         count,
                         check,
                         tile,
@@ -505,6 +493,7 @@ impl Qwen35 {
                         self.adapter_scale,
                         &mut self.workspace.adapter,
                         &mut self.workspace.projection.matvec,
+                        norm_reuse,
                         [&weights.query, &weights.key, &weights.value],
                         &tile.normalized[..count],
                         &mut tile.mixed[..count],
@@ -558,45 +547,24 @@ impl Qwen35 {
                 check()?;
                 add(&mut tile.hidden[index], &tile.attention[index]);
             }
-            if count > 1 && tile.projector.row_parallelism().workers() > 1 {
-                let hidden_ref = &tile.hidden[..count];
-                let arithmetic = self.arithmetic;
-                let post_norm = &layer.post_norm;
-                let epsilon = self.geometry.epsilon;
-                tile.projector.row_parallelism().update_chunks(
-                    &mut tile.normalized[..count],
-                    1,
-                    |base_tok, chunk| {
-                        for (offset, normalized) in chunk.iter_mut().enumerate() {
-                            arithmetic.normalize(
-                                &hidden_ref[base_tok + offset],
-                                post_norm,
-                                epsilon,
-                                normalized,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                )?;
-            } else {
-                for (hidden, normalized) in tile.hidden[..count]
-                    .iter()
-                    .zip(&mut tile.normalized[..count])
-                {
-                    self.arithmetic.normalize(
-                        hidden,
-                        &layer.post_norm,
-                        self.geometry.epsilon,
-                        normalized,
-                    )?;
-                }
-            }
+            let post_norm_reuse = normalize_for_tile_into(
+                &self.transforms,
+                &self.geometry,
+                self.arithmetic,
+                &layer.post_norm,
+                &layer.gate,
+                &tile.hidden[..count],
+                &mut tile.normalized[..count],
+                &mut tile.transformed[..count],
+                tile.projector.row_parallelism(),
+            )?;
             check()?;
             if try_project_tile_ffn_chain(
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
                 self.adapter.as_ref(),
+                post_norm_reuse,
                 [&layer.gate, &layer.up, &layer.down],
                 &tile.normalized[..count],
                 Some(&tile.hidden[..count]),
@@ -622,6 +590,7 @@ impl Qwen35 {
                     self.adapter_scale,
                     &mut self.workspace.adapter,
                     &mut self.workspace.projection.matvec,
+                    post_norm_reuse,
                     &layer.gate,
                     &layer.up,
                     &layer.down,
@@ -1098,6 +1067,108 @@ fn full_attention_tile(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep tile RMSNorm, fused Hadamard rotation and bounded tile scratch explicit."
+)]
+fn normalize_for_tile_into<'a>(
+    transforms: &Transforms,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    weight: &[f32],
+    first_target: &'a Tensor,
+    hidden: &[Vec<f32>],
+    normalized: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<TileReuse<'a>> {
+    let count = hidden.len();
+    let len = hidden.first().map_or(0, Vec::len);
+    if count > 0
+        && len > 0
+        && transforms.basis(first_target) == (true, false)
+        && transforms.can_block_hadamard(len)
+        && first_target.dimensions.first().copied() == Some(len)
+    {
+        let signs = transforms.signs.get(&len).map(Vec::as_slice);
+        let block = transforms.block;
+        let epsilon = geometry.epsilon;
+        let fused_ok = if count > 1 && parallelism.workers() > 1 {
+            let single_worker = RowParallelism::default();
+            parallelism
+                .update_paired_chunks(
+                    normalized,
+                    1,
+                    transformed,
+                    1,
+                    |base_tok, norm_chunk, trans_chunk| {
+                        for (offset, (norm_out, rot_out)) in
+                            norm_chunk.iter_mut().zip(trans_chunk.iter_mut()).enumerate()
+                        {
+                            arithmetic.normalize_hadamard_into(
+                                &hidden[base_tok + offset],
+                                weight,
+                                epsilon,
+                                block,
+                                signs,
+                                &single_worker,
+                                norm_out,
+                                rot_out,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )
+                .is_ok()
+        } else {
+            let mut ok = true;
+            for ((h, norm_out), rot_out) in hidden
+                .iter()
+                .zip(normalized.iter_mut())
+                .zip(transformed.iter_mut())
+            {
+                if arithmetic
+                    .normalize_hadamard_into(
+                        h,
+                        weight,
+                        epsilon,
+                        block,
+                        signs,
+                        parallelism,
+                        norm_out,
+                        rot_out,
+                    )
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        };
+        if fused_ok {
+            return Ok(TileReuse {
+                basis: Some(first_target),
+                prepared: None,
+            });
+        }
+    }
+    if count > 1 && parallelism.workers() > 1 {
+        let epsilon = geometry.epsilon;
+        parallelism.update_chunks(normalized, 1, |base_tok, chunk| {
+            for (offset, norm_out) in chunk.iter_mut().enumerate() {
+                arithmetic.normalize(&hidden[base_tok + offset], weight, epsilon, norm_out)?;
+            }
+            Ok(())
+        })?;
+    } else {
+        for (h, norm_out) in hidden.iter().zip(normalized.iter_mut()) {
+            arithmetic.normalize(h, weight, geometry.epsilon, norm_out)?;
+        }
+    }
+    Ok(TileReuse::default())
+}
+
 fn transform_tile_inputs<'a>(
     transforms: &Transforms,
     geometry: &Geometry,
@@ -1152,6 +1223,7 @@ fn project_tile_pair<'a>(
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous: TileReuse<'a>,
     tensors: [&'a Tensor; 2],
     inputs: &[Vec<f32>],
     outputs_a: &mut [Vec<f32>],
@@ -1167,11 +1239,14 @@ fn project_tile_pair<'a>(
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && exec.supports_f32_group(&tensors)
     {
+        let reuse_basis = previous
+            .basis
+            .is_some_and(|prev| transforms.basis(prev) == transforms.basis(tensors[0]));
         let activation = transform_tile_inputs(
             transforms,
             geometry,
             tensors[0],
-            false,
+            reuse_basis,
             inputs,
             transformed,
             projector.row_parallelism(),
@@ -1232,7 +1307,7 @@ fn project_tile_pair<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
-        TileReuse::default(),
+        previous,
         tensors[0],
         inputs,
         outputs_a,
@@ -1270,6 +1345,7 @@ fn try_project_tile_ffn_chain(
     geometry: &Geometry,
     arithmetic: Arithmetic,
     adapter: Option<&RankOneAdapter>,
+    previous: TileReuse<'_>,
     tensors: [&Tensor; 3],
     inputs: &[Vec<f32>],
     residuals: Option<&[Vec<f32>]>,
@@ -1297,11 +1373,14 @@ fn try_project_tile_ffn_chain(
     if !exec.supports_f32_ffn_chain(tensors) {
         return Ok(false);
     }
+    let reuse_basis = previous
+        .basis
+        .is_some_and(|prev| transforms.basis(prev) == transforms.basis(gate));
     let activation = transform_tile_inputs(
         transforms,
         geometry,
         gate,
-        false,
+        reuse_basis,
         inputs,
         transformed,
         projector.row_parallelism(),
@@ -1341,8 +1420,9 @@ fn project_tile_ffn_swiglu<'a>(
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
-    gate: &Tensor,
-    up: &Tensor,
+    previous: TileReuse<'a>,
+    gate: &'a Tensor,
+    up: &'a Tensor,
     down: &'a Tensor,
     inputs: &[Vec<f32>],
     gate_outputs: &mut [Vec<f32>],
@@ -1359,11 +1439,14 @@ fn project_tile_ffn_swiglu<'a>(
         && transforms.basis(gate) == transforms.basis(up)
         && exec.supports_f32_ffn_swiglu(gate, up)
     {
+        let reuse_basis = previous
+            .basis
+            .is_some_and(|prev| transforms.basis(prev) == transforms.basis(gate));
         let activation = transform_tile_inputs(
             transforms,
             geometry,
             gate,
-            false,
+            reuse_basis,
             inputs,
             transformed,
             projector.row_parallelism(),
@@ -1396,6 +1479,7 @@ fn project_tile_ffn_swiglu<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
+        previous,
         [up, gate],
         inputs,
         up_outputs,
@@ -1505,6 +1589,7 @@ fn project_tile_triple<'a>(
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous: TileReuse<'a>,
     tensors: [&'a Tensor; 3],
     inputs: &[Vec<f32>],
     outputs_a: &mut [Vec<f32>],
@@ -1523,11 +1608,14 @@ fn project_tile_triple<'a>(
         && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
         && exec.supports_f32_group(&tensors)
     {
+        let reuse_basis = previous
+            .basis
+            .is_some_and(|prev| transforms.basis(prev) == transforms.basis(tensors[0]));
         let activation = transform_tile_inputs(
             transforms,
             geometry,
             tensors[0],
-            false,
+            reuse_basis,
             inputs,
             transformed,
             projector.row_parallelism(),
@@ -1586,6 +1674,7 @@ fn project_tile_triple<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
+        previous,
         [tensors[0], tensors[1]],
         inputs,
         outputs_a,

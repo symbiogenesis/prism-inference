@@ -219,8 +219,8 @@ fn head_into(
     clippy::imprecise_flops,
     reason = "Keep unchanged graph preprocessing and the separately identified chunk algebra auditable."
 )]
-pub(super) fn recurrent_tile(
-    layer: &RecurrentAttention,
+pub(super) fn recurrent_tile<'a>(
+    layer: &'a RecurrentAttention,
     state: &mut LayerState,
     delta: &mut LayerDelta,
     geometry: &Geometry,
@@ -230,6 +230,7 @@ pub(super) fn recurrent_tile(
     adapter_scale: f32,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous_norm: TileReuse<'a>,
     count: usize,
     check: &dyn Fn() -> Result<()>,
     tile: &mut TiledPrefill,
@@ -257,6 +258,7 @@ pub(super) fn recurrent_tile(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
+        previous_norm,
         [&layer.qkv, &layer.gate],
         &tile.normalized[..count],
         &mut tile.mixed[..count],

@@ -1142,6 +1142,7 @@ impl<D: Decoder> Runtime<D> {
             )?;
             let draft = &draft_storage[..draft_len];
             let mut stopped = false;
+            let mut correction = None;
             if !draft.is_empty() {
                 stats.draft_rounds += 1;
                 stats.draft_tokens_proposed += draft.len();
@@ -1150,6 +1151,10 @@ impl<D: Decoder> Runtime<D> {
                     let target_token = greedy(&self.logits)?;
                     check()?;
                     if target_token != candidate {
+                        // No evaluation or callback occurs before correction,
+                        // so these same validated logits still select this token.
+                        // Avoid scanning the complete vocabulary a second time.
+                        correction = Some(target_token);
                         break;
                     }
                     stats.draft_tokens_accepted += 1;
@@ -1170,7 +1175,7 @@ impl<D: Decoder> Runtime<D> {
                 break;
             }
             check()?;
-            let token = greedy(&self.logits)?;
+            let token = correction.map_or_else(|| greedy(&self.logits), Ok)?;
             check()?;
             if options.stop_tokens.contains(&token) {
                 completion.finish = Finish::Stop;
@@ -1744,6 +1749,146 @@ mod deadline_tests {
             );
             assert!(result.is_err());
             assert_eq!(emitted, 3);
+            assert_eq!(runtime.tokens, before_tokens);
+            assert_eq!(runtime.decoder.tokens, before_tokens);
+            assert_eq!(
+                runtime
+                    .logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                before_logits
+            );
+            assert!(!runtime.is_faulted());
+            assert_continues(&mut runtime)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_rejected_suffix_correction_matches_independent_greedy_requests() -> Result<()> {
+        // The first prompt rejects its first proposed token. The second accepts
+        // historical token 1, then rejects historical token 0 against target 2.
+        // Later zero runs exercise accepted chains and ordinary bonus tokens.
+        for (prompt, expected) in [
+            (&[1, 2, 1, 2][..], &[6, 4, 0, 0, 0, 0][..]),
+            (&[0, 0, 1, 0, 0][..], &[1, 2, 4, 0, 0, 0][..]),
+        ] {
+            for stop in [None, Some(expected[0]), Some(expected[1]), Some(0)] {
+                for max_tokens in [1, 2, expected.len()] {
+                    let options = Generation {
+                        max_tokens,
+                        stop_tokens: stop.into_iter().collect(),
+                    };
+                    let (mut ordinary, ordinary_clock) = seeded()?;
+                    let (mut speculative, speculative_clock) = seeded()?;
+                    let mut ordinary_output = Vec::new();
+                    let ordinary_completion = ordinary.generate(
+                        prompt,
+                        &options,
+                        &Cancellation::default(),
+                        |token| {
+                            ordinary_output.push(token);
+                            Ok(())
+                        },
+                    )?;
+                    let mut speculative_output = Vec::new();
+                    let (speculative_completion, stats) = speculative.generate_speculative(
+                        prompt,
+                        &options,
+                        Prefill::default(),
+                        SuffixDraftConfig::new(2, 8, 3)?,
+                        &Cancellation::default(),
+                        |token| {
+                            speculative_output.push(token);
+                            Ok(())
+                        },
+                    )?;
+                    let expected_output = expected[..max_tokens]
+                        .iter()
+                        .copied()
+                        .take_while(|token| Some(*token) != stop)
+                        .collect::<Vec<_>>();
+                    assert_eq!(ordinary_output, expected_output);
+                    assert_eq!(speculative_output, expected_output);
+                    assert_eq!(speculative_completion, ordinary_completion);
+                    assert_eq!(speculative.tokens(), ordinary.tokens());
+                    assert_eq!(speculative.decoder.tokens, ordinary.decoder.tokens);
+                    assert_eq!(
+                        speculative
+                            .logits
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        ordinary
+                            .logits
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        *speculative_clock.operations.borrow(),
+                        *ordinary_clock.operations.borrow()
+                    );
+                    assert!(stats.draft_rounds > 0);
+                    assert_eq!(stats.rollback_restores, 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_rejected_suffix_keeps_both_correction_cancellation_boundaries() -> Result<()> {
+        // After the final prompt evaluation, checks 1..=4 cover publication,
+        // the round, the first candidate and its greedy selection. Checks 5
+        // and 6 are the boundaries before and after correction selection.
+        for fail_at in [5, 6] {
+            let (mut runtime, clock) = seeded()?;
+            let before_tokens = runtime.tokens.clone();
+            let before_logits = runtime
+                .logits
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            let checks_after_prompt = Cell::new(0);
+            let check = || {
+                if clock.operations.borrow().last() == Some(&Operation::Evaluate(2)) {
+                    let count = checks_after_prompt.get() + 1;
+                    checks_after_prompt.set(count);
+                    if count == fail_at {
+                        return Err(std::io::Error::new(
+                            ErrorKind::Interrupted,
+                            "injected correction cancellation",
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            };
+            let result = runtime.generate_speculative_checked(
+                &[1, 2, 1, 2],
+                &Generation {
+                    max_tokens: 6,
+                    stop_tokens: vec![],
+                },
+                Prefill::default(),
+                SuffixDraftConfig::new(2, 8, 3)?,
+                &check,
+                |_| Err(invalid("cancelled correction must not emit")),
+            );
+            let Err(error) = result else {
+                return Err(invalid("correction cancellation unexpectedly completed"));
+            };
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(ErrorKind::Interrupted)
+            );
+            assert_eq!(checks_after_prompt.get(), fail_at);
+            assert!(!clock.operations.borrow().contains(&Operation::Evaluate(6)));
+            assert_eq!(clock.operations.borrow().last(), Some(&Operation::Restore));
             assert_eq!(runtime.tokens, before_tokens);
             assert_eq!(runtime.decoder.tokens, before_tokens);
             assert_eq!(

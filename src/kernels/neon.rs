@@ -2900,6 +2900,386 @@ pub(super) fn dot_q4_0_tile_row<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::too_many_lines,
+    reason = "Preserve scalar reference multiply-then-add rounding across 4-row Q8_0 I8MM/SDOT tiles."
+)]
+pub(super) fn dot_q8_0_four_rows_tile<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[super::MatvecScratch],
+) -> Option<Result<[[f32; TOKENS]; 4]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_i8mm = bonsai_neon_dot::has_i8mm();
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
+    let mut sums = [[0.0_f32; TOKENS]; 4];
+    let chunks = rows.map(|row| row.as_chunks::<34>().0);
+    let block_count = chunks[0].len();
+    let token_count = preparations.len().min(TOKENS);
+    for index in 0..block_count {
+        let b0 = &chunks[0][index];
+        let b1 = &chunks[1][index];
+        let b2 = &chunks[2][index];
+        let b3 = &chunks[3][index];
+        let scales_vec = f16_bits_to_f32_x4(
+            neon,
+            [
+                u16::from_le_bytes([b0[0], b0[1]]),
+                u16::from_le_bytes([b1[0], b1[1]]),
+                u16::from_le_bytes([b2[0], b2[1]]),
+                u16::from_le_bytes([b3[0], b3[1]]),
+            ],
+        );
+        if !scales_vec.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let row_scales = scales_vec.to_array();
+        let [_, _, ref w0 @ ..] = *b0;
+        let [_, _, ref w1 @ ..] = *b1;
+        let [_, _, ref w2 @ ..] = *b2;
+        let [_, _, ref w3 @ ..] = *b3;
+        let weights = [w0, w1, w2, w3];
+        if use_i8mm && token_count >= 2 {
+            let mut t = 0;
+            while t + 2 <= token_count {
+                let a0 = &preparations[t].q8[index];
+                let a1 = &preparations[t + 1].q8[index];
+                let tile01 = bonsai_neon_dot::smmla_q8_0_2x2(w0, w1, &a0.values, &a1.values);
+                let tile23 = bonsai_neon_dot::smmla_q8_0_2x2(w2, w3, &a0.values, &a1.values);
+                for (pair, tile) in [(0, tile01), (2, tile23)] {
+                    sums[pair][t] +=
+                        (row_scales[pair] * a0.scale) * super::integer_float(tile[0][0]);
+                    sums[pair][t + 1] +=
+                        (row_scales[pair] * a1.scale) * super::integer_float(tile[0][1]);
+                    sums[pair + 1][t] +=
+                        (row_scales[pair + 1] * a0.scale) * super::integer_float(tile[1][0]);
+                    sums[pair + 1][t + 1] +=
+                        (row_scales[pair + 1] * a1.scale) * super::integer_float(tile[1][1]);
+                }
+                t += 2;
+            }
+            if t < token_count {
+                let activation = &preparations[t].q8[index];
+                for r in 0..4 {
+                    let int_dot = bonsai_neon_dot::dot_q8_0_block(weights[r], &activation.values);
+                    sums[r][t] +=
+                        (row_scales[r] * activation.scale) * super::integer_float(int_dot);
+                }
+            }
+        } else if use_dotprod {
+            for (t, scratch) in preparations.iter().take(token_count).enumerate() {
+                let activation = &scratch.q8[index];
+                for r in 0..4 {
+                    let int_dot = bonsai_neon_dot::dot_q8_0_block(weights[r], &activation.values);
+                    sums[r][t] +=
+                        (row_scales[r] * activation.scale) * super::integer_float(int_dot);
+                }
+            }
+        } else {
+            let widened_w: [_; 4] = std::array::from_fn(|r| {
+                let (w0_l, w0_h) = u8x16::from_slice(neon, &weights[r][..16])
+                    .bitcast::<i8x16<Neon>>()
+                    .widen();
+                let (w1_l, w1_h) = u8x16::from_slice(neon, &weights[r][16..])
+                    .bitcast::<i8x16<Neon>>()
+                    .widen();
+                (w0_l, w0_h, w1_l, w1_h)
+            });
+            for (t, scratch) in preparations.iter().take(token_count).enumerate() {
+                let activation = &scratch.q8[index];
+                let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+                let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+                for r in 0..4 {
+                    let (w0_l, w0_h, w1_l, w1_h) = widened_w[r];
+                    let (p00_l, p00_h) = (w0_l * a0_l).widen();
+                    let (p01_l, p01_h) = (w0_h * a0_h).widen();
+                    let (p10_l, p10_h) = (w1_l * a1_l).widen();
+                    let (p11_l, p11_h) = (w1_h * a1_h).widen();
+                    let int_dot =
+                        ((p00_l + p00_h) + (p01_l + p01_h) + (p10_l + p10_h) + (p11_l + p11_h))
+                            .reduce_sum();
+                    sums[r][t] +=
+                        (row_scales[r] * activation.scale) * super::integer_float(int_dot);
+                }
+            }
+        }
+    }
+    for row_sums in &mut sums {
+        for sum in row_sums.iter_mut().take(token_count) {
+            match super::finite(*sum) {
+                Ok(v) => *sum = v,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+    Some(Ok(sums))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::too_many_lines,
+    reason = "Preserve scalar reference multiply-then-add rounding across 8-row Q8_0 I8MM/SDOT tiles."
+)]
+pub(super) fn dot_q8_0_eight_rows_tile<const TOKENS: usize>(
+    rows: [&[u8]; 8],
+    preparations: &[super::MatvecScratch],
+) -> Option<Result<[[f32; TOKENS]; 8]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_i8mm = bonsai_neon_dot::has_i8mm();
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
+    let mut sums = [[0.0_f32; TOKENS]; 8];
+    let chunks = rows.map(|row| row.as_chunks::<34>().0);
+    let block_count = chunks[0].len();
+    let token_count = preparations.len().min(TOKENS);
+    for index in 0..block_count {
+        let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                u16::from_le_bytes([chunks[0][index][0], chunks[0][index][1]]),
+                u16::from_le_bytes([chunks[1][index][0], chunks[1][index][1]]),
+                u16::from_le_bytes([chunks[2][index][0], chunks[2][index][1]]),
+                u16::from_le_bytes([chunks[3][index][0], chunks[3][index][1]]),
+                u16::from_le_bytes([chunks[4][index][0], chunks[4][index][1]]),
+                u16::from_le_bytes([chunks[5][index][0], chunks[5][index][1]]),
+                u16::from_le_bytes([chunks[6][index][0], chunks[6][index][1]]),
+                u16::from_le_bytes([chunks[7][index][0], chunks[7][index][1]]),
+            ],
+        );
+        if !(scales_lo.is_finite() & scales_hi.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let scales_lo_arr = scales_lo.to_array();
+        let scales_hi_arr = scales_hi.to_array();
+        let row_scales = [
+            scales_lo_arr[0],
+            scales_lo_arr[1],
+            scales_lo_arr[2],
+            scales_lo_arr[3],
+            scales_hi_arr[0],
+            scales_hi_arr[1],
+            scales_hi_arr[2],
+            scales_hi_arr[3],
+        ];
+        let weights: [&[u8; 32]; 8] = std::array::from_fn(|r| {
+            let [_, _, ref w @ ..] = chunks[r][index];
+            w
+        });
+        if use_i8mm && token_count >= 2 {
+            let mut t = 0;
+            while t + 2 <= token_count {
+                let a0 = &preparations[t].q8[index];
+                let a1 = &preparations[t + 1].q8[index];
+                for pair in [0, 2, 4, 6] {
+                    let tile = bonsai_neon_dot::smmla_q8_0_2x2(
+                        weights[pair],
+                        weights[pair + 1],
+                        &a0.values,
+                        &a1.values,
+                    );
+                    sums[pair][t] +=
+                        (row_scales[pair] * a0.scale) * super::integer_float(tile[0][0]);
+                    sums[pair][t + 1] +=
+                        (row_scales[pair] * a1.scale) * super::integer_float(tile[0][1]);
+                    sums[pair + 1][t] +=
+                        (row_scales[pair + 1] * a0.scale) * super::integer_float(tile[1][0]);
+                    sums[pair + 1][t + 1] +=
+                        (row_scales[pair + 1] * a1.scale) * super::integer_float(tile[1][1]);
+                }
+                t += 2;
+            }
+            if t < token_count {
+                let activation = &preparations[t].q8[index];
+                for r in 0..8 {
+                    let int_dot = bonsai_neon_dot::dot_q8_0_block(weights[r], &activation.values);
+                    sums[r][t] +=
+                        (row_scales[r] * activation.scale) * super::integer_float(int_dot);
+                }
+            }
+        } else if use_dotprod {
+            for (t, scratch) in preparations.iter().take(token_count).enumerate() {
+                let activation = &scratch.q8[index];
+                for r in 0..8 {
+                    let int_dot = bonsai_neon_dot::dot_q8_0_block(weights[r], &activation.values);
+                    sums[r][t] +=
+                        (row_scales[r] * activation.scale) * super::integer_float(int_dot);
+                }
+            }
+        } else {
+            let widened_w: [_; 8] = std::array::from_fn(|r| {
+                let (w0_l, w0_h) = u8x16::from_slice(neon, &weights[r][..16])
+                    .bitcast::<i8x16<Neon>>()
+                    .widen();
+                let (w1_l, w1_h) = u8x16::from_slice(neon, &weights[r][16..])
+                    .bitcast::<i8x16<Neon>>()
+                    .widen();
+                (w0_l, w0_h, w1_l, w1_h)
+            });
+            for (t, scratch) in preparations.iter().take(token_count).enumerate() {
+                let activation = &scratch.q8[index];
+                let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+                let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+                for r in 0..8 {
+                    let (w0_l, w0_h, w1_l, w1_h) = widened_w[r];
+                    let (p00_l, p00_h) = (w0_l * a0_l).widen();
+                    let (p01_l, p01_h) = (w0_h * a0_h).widen();
+                    let (p10_l, p10_h) = (w1_l * a1_l).widen();
+                    let (p11_l, p11_h) = (w1_h * a1_h).widen();
+                    let int_dot =
+                        ((p00_l + p00_h) + (p01_l + p01_h) + (p10_l + p10_h) + (p11_l + p11_h))
+                            .reduce_sum();
+                    sums[r][t] +=
+                        (row_scales[r] * activation.scale) * super::integer_float(int_dot);
+                }
+            }
+        }
+    }
+    for row_sums in &mut sums {
+        for sum in row_sums.iter_mut().take(token_count) {
+            match super::finite(*sum) {
+                Ok(v) => *sum = v,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+    Some(Ok(sums))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding across 4-row Q4_0 tiles."
+)]
+pub(super) fn dot_q4_0_four_rows_tile<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[super::MatvecScratch],
+) -> Option<Result<[[f32; TOKENS]; 4]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sums = [[0.0_f32; TOKENS]; 4];
+    let chunks = rows.map(|row| row.as_chunks::<18>().0);
+    let block_count = chunks[0].len();
+    let token_count = preparations.len().min(TOKENS);
+    for index in 0..block_count {
+        let b0 = &chunks[0][index];
+        let b1 = &chunks[1][index];
+        let b2 = &chunks[2][index];
+        let b3 = &chunks[3][index];
+        let scales_vec = f16_bits_to_f32_x4(
+            neon,
+            [
+                u16::from_le_bytes([b0[0], b0[1]]),
+                u16::from_le_bytes([b1[0], b1[1]]),
+                u16::from_le_bytes([b2[0], b2[1]]),
+                u16::from_le_bytes([b3[0], b3[1]]),
+            ],
+        );
+        if !scales_vec.is_finite().all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let row_scales = scales_vec.to_array();
+        let blocks = [b0, b1, b2, b3];
+        let widened_w: [_; 4] = std::array::from_fn(|r| {
+            let raw = u8x16::from_slice(neon, &blocks[r][2..18]);
+            let (w0_l, w0_h) = ((raw & 15).bitcast::<i8x16<Neon>>() - 8).widen();
+            let (w1_l, w1_h) = ((raw >> 4).bitcast::<i8x16<Neon>>() - 8).widen();
+            (w0_l, w0_h, w1_l, w1_h)
+        });
+        for (t, scratch) in preparations.iter().take(token_count).enumerate() {
+            let activation = &scratch.q8[index];
+            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            for r in 0..4 {
+                let (w0_l, w0_h, w1_l, w1_h) = widened_w[r];
+                let pairs = (w0_l * a0_l + w0_h * a0_h) + (w1_l * a1_l + w1_h * a1_h);
+                sums[r][t] +=
+                    (row_scales[r] * activation.scale) * super::integer_float(pq2_reduce(pairs));
+            }
+        }
+    }
+    for row_sums in &mut sums {
+        for sum in row_sums.iter_mut().take(token_count) {
+            match super::finite(*sum) {
+                Ok(v) => *sum = v,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+    Some(Ok(sums))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add rounding across 8-row Q4_0 tiles."
+)]
+pub(super) fn dot_q4_0_eight_rows_tile<const TOKENS: usize>(
+    rows: [&[u8]; 8],
+    preparations: &[super::MatvecScratch],
+) -> Option<Result<[[f32; TOKENS]; 8]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sums = [[0.0_f32; TOKENS]; 8];
+    let chunks = rows.map(|row| row.as_chunks::<18>().0);
+    let block_count = chunks[0].len();
+    let token_count = preparations.len().min(TOKENS);
+    for index in 0..block_count {
+        let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                u16::from_le_bytes([chunks[0][index][0], chunks[0][index][1]]),
+                u16::from_le_bytes([chunks[1][index][0], chunks[1][index][1]]),
+                u16::from_le_bytes([chunks[2][index][0], chunks[2][index][1]]),
+                u16::from_le_bytes([chunks[3][index][0], chunks[3][index][1]]),
+                u16::from_le_bytes([chunks[4][index][0], chunks[4][index][1]]),
+                u16::from_le_bytes([chunks[5][index][0], chunks[5][index][1]]),
+                u16::from_le_bytes([chunks[6][index][0], chunks[6][index][1]]),
+                u16::from_le_bytes([chunks[7][index][0], chunks[7][index][1]]),
+            ],
+        );
+        if !(scales_lo.is_finite() & scales_hi.is_finite()).all_true() {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        }
+        let scales_lo_arr = scales_lo.to_array();
+        let scales_hi_arr = scales_hi.to_array();
+        let row_scales = [
+            scales_lo_arr[0],
+            scales_lo_arr[1],
+            scales_lo_arr[2],
+            scales_lo_arr[3],
+            scales_hi_arr[0],
+            scales_hi_arr[1],
+            scales_hi_arr[2],
+            scales_hi_arr[3],
+        ];
+        let widened_w: [_; 8] = std::array::from_fn(|r| {
+            let raw = u8x16::from_slice(neon, &chunks[r][index][2..18]);
+            let (w0_l, w0_h) = ((raw & 15).bitcast::<i8x16<Neon>>() - 8).widen();
+            let (w1_l, w1_h) = ((raw >> 4).bitcast::<i8x16<Neon>>() - 8).widen();
+            (w0_l, w0_h, w1_l, w1_h)
+        });
+        for (t, scratch) in preparations.iter().take(token_count).enumerate() {
+            let activation = &scratch.q8[index];
+            let (a0_l, a0_h) = i8x16::from_slice(neon, &activation.values[..16]).widen();
+            let (a1_l, a1_h) = i8x16::from_slice(neon, &activation.values[16..]).widen();
+            for r in 0..8 {
+                let (w0_l, w0_h, w1_l, w1_h) = widened_w[r];
+                let pairs = (w0_l * a0_l + w0_h * a0_h) + (w1_l * a1_l + w1_h * a1_h);
+                sums[r][t] +=
+                    (row_scales[r] * activation.scale) * super::integer_float(pq2_reduce(pairs));
+            }
+        }
+    }
+    for row_sums in &mut sums {
+        for sum in row_sums.iter_mut().take(token_count) {
+            match super::finite(*sum) {
+                Ok(v) => *sum = v,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+    Some(Ok(sums))
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,

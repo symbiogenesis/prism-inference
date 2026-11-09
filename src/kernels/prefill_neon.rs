@@ -1061,7 +1061,76 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
                 bonsai_neon_dot::decode_ptq1_trits_i8(b2.try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(b3.try_into().ok()?),
             ];
-            for (token, scratch) in preparations.iter().enumerate() {
+            let mut token = 0;
+            while token + 4 <= preparations.len() {
+                let acts: [&[crate::kernels::Q8Block; 4]; 4] = [
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 1].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 2].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 3].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                ];
+                let act_values: [[&[i8; 32]; 4]; 4] = std::array::from_fn(|t| {
+                    [
+                        &acts[t][0].values,
+                        &acts[t][1].values,
+                        &acts[t][2].values,
+                        &acts[t][3].values,
+                    ]
+                });
+                if pinned {
+                    let tile_lanes = bonsai_neon_dot::dot_ptq1_4x4_lanes(&trits, act_values);
+                    for r in 0..4 {
+                        let rs = row_scales[r];
+                        for t in 0..4 {
+                            let mut acc = lanes[r][token + t];
+                            for (group, lane_sums) in tile_lanes[r][t].iter().enumerate() {
+                                let floats =
+                                    i32x4::from_slice(neon, lane_sums).to_float::<f32x4<Neon>>();
+                                let d = f32x4::splat(neon, rs * acts[t][group].scale);
+                                acc = floats.mul_add_precise(d, acc);
+                            }
+                            lanes[r][token + t] = acc;
+                        }
+                    }
+                } else {
+                    let tile_groups = bonsai_neon_dot::dot_ptq1_4x4_groups(&trits, act_values);
+                    let act_scales: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
+                        f32x4::from_slice(
+                            neon,
+                            &[
+                                acts[t][0].scale,
+                                acts[t][1].scale,
+                                acts[t][2].scale,
+                                acts[t][3].scale,
+                            ],
+                        )
+                    });
+                    for r in 0..4 {
+                        let rs = row_scales[r];
+                        for t in 0..4 {
+                            let dots = i32x4::from_slice(neon, &tile_groups[r][t])
+                                .to_float::<f32x4<Neon>>();
+                            let prod = (dots * act_scales[t]).to_array();
+                            let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                            sums[r][token + t] += rs * dot_sum;
+                        }
+                    }
+                }
+                token += 4;
+            }
+            for (token, scratch) in preparations.iter().enumerate().skip(token) {
                 let activations = <&[crate::kernels::Q8Block; 4]>::try_from(
                     &scratch.q8[index * 4..index * 4 + 4],
                 )
@@ -1348,39 +1417,121 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
         ];
         *decoded_blocks = decoded_blocks.saturating_add(8);
         if use_ptq1_dotprod {
-            let trits = [
+            let trits_lo = [
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[0].try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[1].try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[2].try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[3].try_into().ok()?),
+            ];
+            let trits_hi = [
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[4].try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[5].try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[6].try_into().ok()?),
                 bonsai_neon_dot::decode_ptq1_trits_i8(blocks[7].try_into().ok()?),
             ];
-            for (token, scratch) in preparations.iter().enumerate() {
+            let mut token = 0;
+            while token + 4 <= preparations.len() {
+                let acts: [&[crate::kernels::Q8Block; 4]; 4] = [
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 1].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 2].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                    <&[crate::kernels::Q8Block; 4]>::try_from(
+                        &preparations[token + 3].q8[index * 4..index * 4 + 4],
+                    )
+                    .ok()?,
+                ];
+                let act_values: [[&[i8; 32]; 4]; 4] = std::array::from_fn(|t| {
+                    [
+                        &acts[t][0].values,
+                        &acts[t][1].values,
+                        &acts[t][2].values,
+                        &acts[t][3].values,
+                    ]
+                });
+                if pinned {
+                    for (half_idx, trits_half) in [&trits_lo, &trits_hi].into_iter().enumerate() {
+                        let tile_lanes =
+                            bonsai_neon_dot::dot_ptq1_4x4_lanes(trits_half, act_values);
+                        let row_base = half_idx * 4;
+                        for r in 0..4 {
+                            let rs = row_scales[row_base + r];
+                            for t in 0..4 {
+                                let mut acc = lanes[row_base + r][token + t];
+                                for (group, lane_sums) in tile_lanes[r][t].iter().enumerate() {
+                                    let floats = i32x4::from_slice(neon, lane_sums)
+                                        .to_float::<f32x4<Neon>>();
+                                    let d = f32x4::splat(neon, rs * acts[t][group].scale);
+                                    acc = floats.mul_add_precise(d, acc);
+                                }
+                                lanes[row_base + r][token + t] = acc;
+                            }
+                        }
+                    }
+                } else {
+                    let act_scales: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
+                        f32x4::from_slice(
+                            neon,
+                            &[
+                                acts[t][0].scale,
+                                acts[t][1].scale,
+                                acts[t][2].scale,
+                                acts[t][3].scale,
+                            ],
+                        )
+                    });
+                    for (half_idx, trits_half) in [&trits_lo, &trits_hi].into_iter().enumerate() {
+                        let tile_groups =
+                            bonsai_neon_dot::dot_ptq1_4x4_groups(trits_half, act_values);
+                        let row_base = half_idx * 4;
+                        for r in 0..4 {
+                            let rs = row_scales[row_base + r];
+                            for t in 0..4 {
+                                let dots = i32x4::from_slice(neon, &tile_groups[r][t])
+                                    .to_float::<f32x4<Neon>>();
+                                let prod = (dots * act_scales[t]).to_array();
+                                let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                                sums[row_base + r][token + t] += rs * dot_sum;
+                            }
+                        }
+                    }
+                }
+                token += 4;
+            }
+            for (token, scratch) in preparations.iter().enumerate().skip(token) {
                 let activations = <&[crate::kernels::Q8Block; 4]>::try_from(
                     &scratch.q8[index * 4..index * 4 + 4],
                 )
                 .ok()?;
                 if pinned {
-                    for r in 0..8 {
-                        let rs = row_scales[r];
-                        let mut acc = lanes[r][token];
-                        for (group, act) in activations.iter().enumerate() {
-                            let a_halves = act.values.as_chunks::<16>().0;
-                            let lane_sums = bonsai_neon_dot::dot32_s8_lanes(
-                                &trits[r][group * 2],
-                                &trits[r][group * 2 + 1],
-                                &a_halves[0],
-                                &a_halves[1],
-                            );
-                            let floats =
-                                i32x4::from_slice(neon, &lane_sums).to_float::<f32x4<Neon>>();
-                            let d = f32x4::splat(neon, rs * act.scale);
-                            acc = floats.mul_add_precise(d, acc);
+                    for (half_idx, trits_half) in [&trits_lo, &trits_hi].into_iter().enumerate() {
+                        let row_base = half_idx * 4;
+                        for r in 0..4 {
+                            let rs = row_scales[row_base + r];
+                            let mut acc = lanes[row_base + r][token];
+                            for (group, act) in activations.iter().enumerate() {
+                                let a_halves = act.values.as_chunks::<16>().0;
+                                let lane_sums = bonsai_neon_dot::dot32_s8_lanes(
+                                    &trits_half[r][group * 2],
+                                    &trits_half[r][group * 2 + 1],
+                                    &a_halves[0],
+                                    &a_halves[1],
+                                );
+                                let floats =
+                                    i32x4::from_slice(neon, &lane_sums).to_float::<f32x4<Neon>>();
+                                let d = f32x4::splat(neon, rs * act.scale);
+                                acc = floats.mul_add_precise(d, acc);
+                            }
+                            lanes[row_base + r][token] = acc;
                         }
-                        lanes[r][token] = acc;
                     }
                 } else {
                     let act_scales = f32x4::from_slice(
@@ -1392,20 +1543,24 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
                             activations[3].scale,
                         ],
                     );
-                    for r in 0..8 {
-                        let group_sums: [i32; 4] = std::array::from_fn(|group| {
-                            let a_halves = activations[group].values.as_chunks::<16>().0;
-                            bonsai_neon_dot::dot32_s8_sum(
-                                &trits[r][group * 2],
-                                &trits[r][group * 2 + 1],
-                                &a_halves[0],
-                                &a_halves[1],
-                            )
-                        });
-                        let dots = i32x4::from_slice(neon, &group_sums).to_float::<f32x4<Neon>>();
-                        let prod = (dots * act_scales).to_array();
-                        let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
-                        sums[r][token] += row_scales[r] * dot_sum;
+                    for (half_idx, trits_half) in [&trits_lo, &trits_hi].into_iter().enumerate() {
+                        let row_base = half_idx * 4;
+                        for r in 0..4 {
+                            let group_sums: [i32; 4] = std::array::from_fn(|group| {
+                                let a_halves = activations[group].values.as_chunks::<16>().0;
+                                bonsai_neon_dot::dot32_s8_sum(
+                                    &trits_half[r][group * 2],
+                                    &trits_half[r][group * 2 + 1],
+                                    &a_halves[0],
+                                    &a_halves[1],
+                                )
+                            });
+                            let dots =
+                                i32x4::from_slice(neon, &group_sums).to_float::<f32x4<Neon>>();
+                            let prod = (dots * act_scales).to_array();
+                            let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                            sums[row_base + r][token] += row_scales[row_base + r] * dot_sum;
+                        }
                     }
                 }
             }

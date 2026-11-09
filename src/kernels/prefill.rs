@@ -251,6 +251,56 @@ impl ProjectionTile {
                 let backend = self.backend;
                 let preparations = &self.preparations[..inputs.len()];
                 let mut unused_blocks = 0_u64;
+                if matches!(tensor.kind, Q4_0 | Q8_0) {
+                    let dot_quant_one =
+                        |row: &[u8], _: &mut u64| -> Result<[f32; MAX_TILE_TOKENS]> {
+                            dot_quantized_tile_row(tensor.kind, row, preparations, backend)
+                        };
+                    return self.row_parallelism.fill_tile_four_rows(
+                        &tensor.data,
+                        block_bytes,
+                        outputs,
+                        &mut unused_blocks,
+                        check,
+                        |rows8, decoded| {
+                            if let Some(res) = dot::dot_quantized_eight_rows::<MAX_TILE_TOKENS>(
+                                tensor.kind,
+                                rows8,
+                                preparations,
+                                backend,
+                            ) {
+                                return res;
+                            }
+                            Ok([
+                                dot_quant_one(rows8[0], decoded)?,
+                                dot_quant_one(rows8[1], decoded)?,
+                                dot_quant_one(rows8[2], decoded)?,
+                                dot_quant_one(rows8[3], decoded)?,
+                                dot_quant_one(rows8[4], decoded)?,
+                                dot_quant_one(rows8[5], decoded)?,
+                                dot_quant_one(rows8[6], decoded)?,
+                                dot_quant_one(rows8[7], decoded)?,
+                            ])
+                        },
+                        |rows4, decoded| {
+                            if let Some(res) = dot::dot_quantized_four_rows::<MAX_TILE_TOKENS>(
+                                tensor.kind,
+                                rows4,
+                                preparations,
+                                backend,
+                            ) {
+                                return res;
+                            }
+                            Ok([
+                                dot_quant_one(rows4[0], decoded)?,
+                                dot_quant_one(rows4[1], decoded)?,
+                                dot_quant_one(rows4[2], decoded)?,
+                                dot_quant_one(rows4[3], decoded)?,
+                            ])
+                        },
+                        dot_quant_one,
+                    );
+                }
                 return self.row_parallelism.fill_tile(
                     &tensor.data,
                     block_bytes,
@@ -894,8 +944,8 @@ mod tests {
     #[test]
     fn tiled_quantized_projections_match_scalar_and_reuse_prepared_activations() -> Result<()> {
         let columns = 256_usize;
-        let rows = 11_usize;
-        let inputs: Vec<Vec<f32>> = (0..8)
+        let rows = 19_usize;
+        let inputs: Vec<Vec<f32>> = (0..9)
             .map(|token| {
                 (0..columns)
                     .map(|idx| [1.25, -3.5, 0.0, -0.0, 7.125, -0.375][(idx + token) % 6])

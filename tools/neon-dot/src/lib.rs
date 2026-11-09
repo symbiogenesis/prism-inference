@@ -192,6 +192,66 @@ pub fn dot_ptq1_four_rows_groups(
     packed.map(|row| dot_ptq1_block_groups(row, activations))
 }
 
+/// Four-row by four-token by four-group by four-lane `DOTPROD` sums (`[row][token][group][lane]`).
+pub type Ptq1FourRowFourTokenLanes = [[[[i32; 4]; 4]; 4]; 4];
+
+/// Four-row by four-token by four-group 32-element integer dot sums (`[row][token][group]`).
+pub type Ptq1FourRowFourTokenGroups = [[[i32; 4]; 4]; 4];
+
+/// Computes the 4-row by 4-token by 4-group 4-lane `DOTPROD` sums from
+/// pre-decoded `PTQ1_0` trit rows and four tokens of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_4x4_lanes(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> Ptq1FourRowFourTokenLanes {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_4x4_lanes(trits, activations) {
+        return lanes;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|group| {
+                let halves = activations[t][group].as_chunks::<16>().0;
+                dot32_s8_lanes(
+                    &trits[r][group * 2],
+                    &trits[r][group * 2 + 1],
+                    &halves[0],
+                    &halves[1],
+                )
+            })
+        })
+    })
+}
+
+/// Computes the 4-row by 4-token by 4-group 32-element integer dot sums from
+/// pre-decoded `PTQ1_0` trit rows and four tokens of `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_4x4_groups(
+    trits: &[[[i8; 16]; 8]; 4],
+    activations: [[&[i8; 32]; 4]; 4],
+) -> Ptq1FourRowFourTokenGroups {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_4x4_groups(trits, activations) {
+        return groups;
+    }
+    std::array::from_fn(|r| {
+        std::array::from_fn(|t| {
+            std::array::from_fn(|group| {
+                let halves = activations[t][group].as_chunks::<16>().0;
+                dot32_s8_sum(
+                    &trits[r][group * 2],
+                    &trits[r][group * 2 + 1],
+                    &halves[0],
+                    &halves[1],
+                )
+            })
+        })
+    })
+}
+
 /// Computes the 128-element `PQ2_0` dot product against digit-plane-ordered
 /// `i8` activations and their precomputed `activation_sum` using `SDOT`.
 #[inline]
@@ -542,6 +602,42 @@ mod tests {
         let col0 = dot_pq2_four_rows_one_token(row_refs4, &acts[0], sums[0]);
         for r in 0..4 {
             assert_eq!(col0[r], tile8[r][0]);
+        }
+    }
+
+    #[test]
+    fn ptq1_4x4_lanes_and_groups_match_single_row_single_token_primitives() {
+        let rows: [[u8; 28]; 4] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| {
+                r.to_le_bytes()[0]
+                    .wrapping_mul(41)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(89))
+                    .wrapping_add(13)
+            })
+        });
+        let trits = rows.map(|row| decode_ptq1_trits_i8(&row));
+        let acts: [[[i8; 32]; 4]; 4] = std::array::from_fn(|t| {
+            std::array::from_fn(|g| {
+                std::array::from_fn(|i| {
+                    i8::from_ne_bytes([t.to_le_bytes()[0]
+                        .wrapping_mul(67)
+                        .wrapping_add(g.to_le_bytes()[0].wrapping_mul(23))
+                        .wrapping_add(i.to_le_bytes()[0].wrapping_mul(113))
+                        .wrapping_add(7)])
+                })
+            })
+        });
+        let act_refs: [[&[i8; 32]; 4]; 4] =
+            std::array::from_fn(|t| std::array::from_fn(|g| &acts[t][g]));
+        let tile_lanes = dot_ptq1_4x4_lanes(&trits, act_refs);
+        let tile_groups = dot_ptq1_4x4_groups(&trits, act_refs);
+        for r in 0..4 {
+            for t in 0..4 {
+                let expected_lanes = dot_ptq1_block_lanes(&rows[r], act_refs[t]);
+                let expected_groups = dot_ptq1_block_groups(&rows[r], act_refs[t]);
+                assert_eq!(tile_lanes[r][t], expected_lanes);
+                assert_eq!(tile_groups[r][t], expected_groups);
+            }
         }
     }
 }

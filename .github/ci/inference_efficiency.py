@@ -50,6 +50,8 @@ CONTROLS = {
         "speculative::tests::suffix_drafter_maximum_windows_match_reference_and_reject_before_writing",
         "runtime::deadline_tests::speculative_suffix_buffered_rounds_restore_state_after_cancel_and_delivery_failure",
         "runtime::deadline_tests::speculative_suffix_generation_and_block_verifier_preserve_exact_greedy_state",
+        "runtime::deadline_tests::speculative_rejected_suffix_correction_matches_independent_greedy_requests",
+        "runtime::deadline_tests::speculative_rejected_suffix_keeps_both_correction_cancellation_boundaries",
     ],
     "graph": [
         "rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits",
@@ -81,6 +83,7 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
     "hexagon_runtime": [
+        "native_q2::tests::native_q2_batches_two_and_three_resident_sibling_projections_in_single_queue_writes",
         "native_q2::tests::native_q2_lazy_preparation_allocates_only_copied_scratch_after_admission",
         "native_q2::tests::native_q2_lazy_entrypoints_match_copied_bytes_and_clear_failed_publication",
         "native_q2::tests::native_q2_lazy_direct_scale_failure_commits_no_handle_or_output",
@@ -88,7 +91,10 @@ CONTROLS = {
         "native_q2::tests::native_q2_direct_prewarm_matches_copied_tiles_without_scratch",
         "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
     ],
-    "hexagon_native": [],
+    "hexagon_native": [
+        "native_q2::tests::native_q2_resident_hvx_plans_match_independent_solver_and_wire",
+        "native_q2::tests::native_q2_cached_resident_frame_matches_transient_and_refuses_invalid_plan",
+    ],
 }
 
 LIBRARY_TARGETS = {
@@ -112,6 +118,10 @@ WINDOWS_ARM64_NEON_CONTROLS = [
     "kernels::pinned_gdn::neon::tests::pinned_gdn_staged_rows_match_independent_scalar_bits",
     "kernels::pinned_gdn::neon::tests::pinned_gdn_staged_group_failure_keeps_destinations_untouched",
     "kernels::pinned_gdn::neon::tests::pinned_gdn_staged_single_row_retains_late_failure_bits",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_decode_capacities_match_independent_scalar_bits",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_decode_capacities_preserve_failure_and_refusal_bits",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_grouped_decode_capacities_match_independent_scalar_bits",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_grouped_decode_capacities_keep_failure_atomic",
 ]
 
 WINDOWS_ARM64_NATIVE_CONTROLS = [

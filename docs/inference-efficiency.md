@@ -77,6 +77,39 @@ These are source storage reductions; Release code generation, actual stack use,
 full-model parity and matched request benefit remain pending. No scratch or
 worker-stack admission reserve is reduced.
 
+Single-token NEON GDN steps, including normal four/eight-row groups, now select
+an eight-block private staging capacity
+for rows up to 128 elements, retaining sixteen blocks for eligible wider rows
+through 256 elements. Both capacities instantiate the same arithmetic and error
+publication implementation. Swift's 128-wide rows therefore declare 512 bytes
+of staging instead of 1,024 per row; four/eight-row groups halve their 4/8 KiB
+payloads to 2/4 KiB. This source payload reduction does not establish
+generated zero stores, actual stack use or memory traffic. Independent scalar
+bit controls cover both sides of the capacity boundary, exceptional values,
+late failures and unchanged unsupported-width refusal. Conservative resource
+reserves remain charged.
+
+Suffix generation retains the already validated target token when a proposal
+is rejected. The correction boundary consumes that token without a second
+full-vocabulary greedy scan; no evaluation or callback changes logits between
+the two points. Cancellation checks remain on both sides of correction
+selection. Independent fixed token sequences and ordinary-generation controls
+cover initial and partial rejection, accepted chains, bonus tokens, EOS,
+output limits, decoder traces, logits and transactional cancellation/recovery.
+This omits one greedy traversal per rejected round in the opt-in path; it
+does not qualify speculative benefit or alter selection defaults.
+
+Resident native-Q2 handles retain their immutable HVX solver parameters from
+weight preparation. Every resident descriptor reuses those parameters,
+including batched members, extra arenas and fused FFN projections; transient
+descriptors continue to solve their active geometry. Portable controls compare
+independent allocation algebra and kernel-parameter bytes across the 6,144-column
+VTCM threshold, complete resident/transient frames and rejected reservation
+publication. The runtime charges the larger handles through its existing
+`size_of`-based metadata reservation within the unchanged cap. No registry
+allocation, signed kernel, wire layout, placement or session limit changes.
+Avoiding repeated host solver searches does not establish end-to-end benefit.
+
 ## Exact hosted correctness gate
 
 The owner-operated [Inference efficiency candidate workflow](../.github/workflows/inference-efficiency.yml)

@@ -1006,7 +1006,12 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             return Ok(());
         }
         if cached.is_none() && self.residency.is_none() {
-            return self.project_transient_token_tile(tensor, (columns, rows), activations, outputs);
+            return self.project_transient_token_tile(
+                tensor,
+                (columns, rows),
+                activations,
+                outputs,
+            );
         }
         for activation in activations {
             if activation.len() != columns {
@@ -3298,8 +3303,11 @@ mod tests {
                     for index in 0..128 {
                         let group = (index % 32) / 4;
                         let lane = index % 4;
-                        let at = pair + (group / 4) * 576 + (group % 4) * 128
-                            + (row % 32) * 4 + index / 32;
+                        let at = pair
+                            + (group / 4) * 576
+                            + (group % 4) * 128
+                            + (row % 32) * 4
+                            + index / 32;
                         let code = (weights[at] >> (lane * 2)) & 3;
                         dot += f32::from(i16::from(code) - 1) * activation[block * 128 + index];
                     }
@@ -3318,7 +3326,11 @@ mod tests {
         let mut tensor = lazy_tensor("blk.0.ffn_up.weight", 256, rows);
         let mut data = tensor.data.to_vec();
         for (index, block) in data.as_chunks_mut::<34>().0.iter_mut().enumerate() {
-            let header = if index.is_multiple_of(3) { 0x3800_u16 } else { 0x3c00_u16 };
+            let header = if index.is_multiple_of(3) {
+                0x3800_u16
+            } else {
+                0x3c00_u16
+            };
             block[..2].copy_from_slice(&header.to_le_bytes());
             for (lane, byte) in block[2..].iter_mut().enumerate() {
                 *byte = u8::try_from((index * 13 + lane * 7) % 256).unwrap_or(0);
@@ -3346,8 +3358,8 @@ mod tests {
                 }
                 for group in 0..8 {
                     for digit in 0..4 {
-                        let at = pair + (group / 4) * 576 + (group % 4) * 128
-                            + (row % 32) * 4 + digit;
+                        let at =
+                            pair + (group / 4) * 576 + (group % 4) * 128 + (row % 32) * 4 + digit;
                         for lane in 0..4 {
                             let code = (original[2 + group * 4 + lane] >> (digit * 2)) & 3;
                             expected_weights[at] |= code << (lane * 2);
@@ -3369,7 +3381,11 @@ mod tests {
             nonfinite_call: None,
         };
         let executor = NativeQ2Executor::new(submitter, limits, payload);
-        if refused_residency { executor.with_resident_weights(metadata) } else { Ok(executor) }
+        if refused_residency {
+            executor.with_resident_weights(metadata)
+        } else {
+            Ok(executor)
+        }
     }
 
     #[test]
@@ -3377,17 +3393,24 @@ mod tests {
         clippy::suboptimal_flops,
         reason = "The independent original-PQ2 test oracle retains explicit multiply then add order."
     )]
-    fn native_q2_transient_token_tile_matches_independent_layout_and_scalar_outputs() -> Result<()> {
+    fn native_q2_transient_token_tile_matches_independent_layout_and_scalar_outputs() -> Result<()>
+    {
         for rows in [32, 64] {
             let tensor = transient_token_tensor(rows);
             for refused_residency in [false, true] {
                 for tokens in [0, 1, 8, 16, 32] {
                     let mut executor = transient_token_executor(&tensor, refused_residency)?;
-                    let activations: Vec<Vec<f32>> = (0..tokens).map(|token| {
-                        (0..256).map(|index| {
-                            f32::from(i16::try_from((token * 3 + index) % 17).unwrap_or(0) - 8)
-                        }).collect()
-                    }).collect();
+                    let activations: Vec<Vec<f32>> = (0..tokens)
+                        .map(|token| {
+                            (0..256)
+                                .map(|index| {
+                                    f32::from(
+                                        i16::try_from((token * 3 + index) % 17).unwrap_or(0) - 8,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
                     let mut outputs = vec![vec![91.0]; tokens];
                     executor.project_f32_tokens(&tensor, &activations, true, &mut outputs)?;
                     for (activation, output) in activations.iter().zip(&outputs) {
@@ -3398,7 +3421,8 @@ mod tests {
                                 let mut dot = 0.0_f32;
                                 for index in 0..128 {
                                     let code = (original[2 + index % 32] >> (2 * (index / 32))) & 3;
-                                    dot += f32::from(i16::from(code) - 1) * activation[block * 128 + index];
+                                    dot += f32::from(i16::from(code) - 1)
+                                        * activation[block * 128 + index];
                                 }
                                 expected += scale(original)? * dot;
                             }
@@ -3424,7 +3448,8 @@ mod tests {
     }
 
     #[test]
-    fn native_q2_transient_token_tile_preserves_failure_order_and_terminal_publication() -> Result<()> {
+    fn native_q2_transient_token_tile_preserves_failure_order_and_terminal_publication()
+    -> Result<()> {
         for refused_residency in [false, true] {
             for failure in 0..7 {
                 let mut tensor = transient_token_tensor(32);
@@ -3441,7 +3466,9 @@ mod tests {
                         let mut data = tensor.data.to_vec();
                         data[34..36].copy_from_slice(&0x7e00_u16.to_le_bytes());
                         tensor.data = Arc::from(data);
-                        if failure == 6 { activations[0][0] = f32::NAN; }
+                        if failure == 6 {
+                            activations[0][0] = f32::NAN;
+                        }
                     }
                     _ => return Err(invalid("unsupported test failure selection")),
                 }
@@ -3456,16 +3483,30 @@ mod tests {
                 };
                 assert_eq!(executor.submitter.activations.len(), expected_calls);
                 if failure == 6 {
-                    let error = result.err().ok_or_else(|| invalid("missing expected error"))?;
-                    assert!(error.to_string().contains("nonfinite Hexagon projection value"));
+                    let error = result
+                        .err()
+                        .ok_or_else(|| invalid("missing expected error"))?;
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("nonfinite Hexagon projection value")
+                    );
                 }
                 let attempted = u64::try_from(expected_calls)?;
-                let completed = if matches!(failure, 3 | 4) { 1 } else { attempted };
+                let completed = if matches!(failure, 3 | 4) {
+                    1
+                } else {
+                    attempted
+                };
                 assert_eq!(executor.statistics().operations_attempted, attempted);
                 assert_eq!(executor.statistics().operations_completed, completed);
                 assert_eq!(executor.queue_writes_attempted(), attempted);
                 assert_eq!(executor.queue_writes_completed(), completed);
-                assert!(executor.project_f32_tokens(&tensor, &activations, true, &mut outputs).is_err());
+                assert!(
+                    executor
+                        .project_f32_tokens(&tensor, &activations, true, &mut outputs)
+                        .is_err()
+                );
                 assert_eq!(executor.submitter.activations.len(), expected_calls);
                 assert_eq!(executor.residency_statistics().tensors_prepared, 0);
             }

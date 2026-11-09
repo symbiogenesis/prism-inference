@@ -308,8 +308,15 @@ pub(crate) fn step_silu_tokens_in_place(
     width: usize,
 ) -> Result<()> {
     step_tokens_inner::<true, false>(
-        history, tokens, channels, coefficients, width,
-        ProjectionRows { rows: &[], offset: 0 },
+        history,
+        tokens,
+        channels,
+        coefficients,
+        width,
+        ProjectionRows {
+            rows: &[],
+            offset: 0,
+        },
     )
 }
 
@@ -991,37 +998,64 @@ mod tests {
     #[test]
     fn pinned_convolution_projected_rows_match_independent_scalar_bits() -> Result<()> {
         let samples = [
-            -0.0, 0.0, f32::from_bits(1), -f32::from_bits(1),
-            0.125, -0.375, 100.0, -100.0, 0.75,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            0.125,
+            -0.375,
+            100.0,
+            -100.0,
+            0.75,
         ];
         for channels in [1, 4, 8, 12, 65, 128] {
             for width in [1, 2, 4, 5] {
                 for count in [0, 1, 2, 8, 16, 32] {
-                    let history: Vec<_> = samples.iter().copied().cycle()
-                        .take(channels * (width - 1)).collect();
+                    let history: Vec<_> = samples
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(channels * (width - 1))
+                        .collect();
                     let coefficients: Vec<_> = [0.125, -0.25, 0.5, 0.0, -0.0]
-                        .into_iter().cycle().take(channels * width).collect();
-                    let rows: Vec<Vec<_>> = (0..count).map(|token| {
-                        let mut row = vec![f32::NAN; 3];
-                        row.extend(samples.iter().copied().cycle().skip(token)
-                            .take(channels));
-                        row.extend([f32::INFINITY; 2]);
-                        row
-                    }).collect();
+                        .into_iter()
+                        .cycle()
+                        .take(channels * width)
+                        .collect();
+                    let rows: Vec<Vec<_>> = (0..count)
+                        .map(|token| {
+                            let mut row = vec![f32::NAN; 3];
+                            row.extend(samples.iter().copied().cycle().skip(token).take(channels));
+                            row.extend([f32::INFINITY; 2]);
+                            row
+                        })
+                        .collect();
                     let original_rows: Vec<_> = rows.iter().map(|row| bits(row)).collect();
                     let mut expected_history = history.clone();
                     let expected = scalar_projected_rows(
-                        &mut expected_history, &rows, 3, channels, &coefficients, width,
+                        &mut expected_history,
+                        &rows,
+                        3,
+                        channels,
+                        &coefficients,
+                        width,
                     );
                     let mut actual_history = history;
                     let mut actual = vec![f32::NAN; count * channels];
                     step_silu_token_rows_into(
-                        &mut actual_history, &rows, &(3..3 + channels),
-                        &coefficients, width, &mut actual,
+                        &mut actual_history,
+                        &rows,
+                        &(3..3 + channels),
+                        &coefficients,
+                        width,
+                        &mut actual,
                     )?;
                     assert_eq!(bits(&actual), bits(&expected), "{channels}/{width}/{count}");
                     assert_eq!(bits(&actual_history), bits(&expected_history));
-                    assert_eq!(rows.iter().map(|row| bits(row)).collect::<Vec<_>>(), original_rows);
+                    assert_eq!(
+                        rows.iter().map(|row| bits(row)).collect::<Vec<_>>(),
+                        original_rows
+                    );
                 }
             }
         }
@@ -1050,20 +1084,42 @@ mod tests {
                         }
                         let original_rows: Vec<_> = rows.iter().map(|row| bits(row)).collect();
                         let mut expected_history = history.clone();
-                        let mut expected: Vec<_> = rows.iter()
-                            .flat_map(|row| row[1..1 + channels].iter().copied()).collect();
-                        assert!(step_silu_tokens_in_place(
-                            &mut expected_history, &mut expected,
-                            channels, &coefficients, width,
-                        ).is_err());
+                        let mut expected: Vec<_> = rows
+                            .iter()
+                            .flat_map(|row| row[1..1 + channels].iter().copied())
+                            .collect();
+                        assert!(
+                            step_silu_tokens_in_place(
+                                &mut expected_history,
+                                &mut expected,
+                                channels,
+                                &coefficients,
+                                width,
+                            )
+                            .is_err()
+                        );
                         let mut actual = vec![-999.0; count * channels];
-                        assert!(step_silu_token_rows_into(
-                            &mut history, &rows, &(1..1 + channels),
-                            &coefficients, width, &mut actual,
-                        ).is_err());
-                        assert_eq!(bits(&actual), bits(&expected), "{channels}/{width}/{count}/{fault}");
+                        assert!(
+                            step_silu_token_rows_into(
+                                &mut history,
+                                &rows,
+                                &(1..1 + channels),
+                                &coefficients,
+                                width,
+                                &mut actual,
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(
+                            bits(&actual),
+                            bits(&expected),
+                            "{channels}/{width}/{count}/{fault}"
+                        );
                         assert_eq!(bits(&history), bits(&expected_history));
-                        assert_eq!(rows.iter().map(|row| bits(row)).collect::<Vec<_>>(), original_rows);
+                        assert_eq!(
+                            rows.iter().map(|row| bits(row)).collect::<Vec<_>>(),
+                            original_rows
+                        );
                     }
                 }
             }
@@ -1085,9 +1141,17 @@ mod tests {
             let mut history = vec![0.25; history_len];
             let coefficients = vec![0.125; coefficients_len];
             let mut output = vec![-999.0; output_len];
-            assert!(step_silu_token_rows_into(
-                &mut history, &rows, &(start..end), &coefficients, width, &mut output,
-            ).is_err());
+            assert!(
+                step_silu_token_rows_into(
+                    &mut history,
+                    &rows,
+                    &(start..end),
+                    &coefficients,
+                    width,
+                    &mut output,
+                )
+                .is_err()
+            );
             assert_eq!(history, vec![0.25; history_len]);
             assert_eq!(output, vec![-999.0; output_len]);
         }

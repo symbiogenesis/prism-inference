@@ -164,12 +164,11 @@ impl SuffixDrafter {
             return Ok(&[]);
         }
         let max_len = config.max_match_tokens.min(history.len() - 1);
-        let Some(continuation_start) = suffix_match_start(
-            history,
-            config.min_match_tokens,
-            max_len,
-            |left, right| left == right,
-        )? else {
+        let Some(continuation_start) =
+            suffix_match_start(history, config.min_match_tokens, max_len, |left, right| {
+                left == right
+            })?
+        else {
             return Ok(&[]);
         };
         let available = (history.len() - continuation_start).min(limit);
@@ -202,7 +201,10 @@ fn suffix_match_start(
             0
         };
         while matched < maximum - offset
-            && equal(history[length - matched - 1], history[length - offset - matched - 1])
+            && equal(
+                history[length - matched - 1],
+                history[length - offset - matched - 1],
+            )
         {
             matched += 1;
         }
@@ -860,15 +862,11 @@ mod tests {
                             }
                             let maximum = maximum.min(length - 1);
                             let mut comparisons = 0;
-                            let start = suffix_match_start(
-                                &history,
-                                minimum,
-                                maximum,
-                                |left, right| {
+                            let start =
+                                suffix_match_start(&history, minimum, maximum, |left, right| {
                                     comparisons += 1;
                                     left == right
-                                },
-                            )?;
+                                })?;
                             let actual = start.map_or(&[][..], |start| {
                                 &history[start..start + 8.min(length - start)]
                             });

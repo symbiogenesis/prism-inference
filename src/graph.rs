@@ -5134,7 +5134,7 @@ mod tests {
     #[test]
     fn full_attention_reads_original_interleaved_gates_across_worker_groups() -> Result<()> {
         let mut geometry = projection_geometry(4);
-        geometry.heads = 8;
+        geometry.heads = 12;
         geometry.kv_heads = 2;
         let layer = super::FullAttention {
             query: projection_weight("q", 0, 4),
@@ -5161,7 +5161,7 @@ mod tests {
             .enumerate()
             .map(|(index, &gate)| {
                 let head = index / 4;
-                let kv = head / 4;
+                let kv = head / (geometry.heads / geometry.kv_heads);
                 let value = half_to_float(half_bits(original_values[kv * 4 + index % 4]));
                 value * (1.0 / (1.0 + (-gate).exp()))
             })

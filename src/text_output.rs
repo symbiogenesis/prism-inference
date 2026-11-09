@@ -6,6 +6,8 @@
 //! reconstruct the original bytes. Control spellings and NUL bytes pass through
 //! unchanged; this module applies no token, chat-template, or display policy.
 
+use std::borrow::Cow;
+
 use crate::{Result, invalid};
 
 /// Maximum raw bytes accepted by one [`Utf8Output::push`] call.
@@ -13,6 +15,33 @@ use crate::{Result, invalid};
 /// This admits every validated vocabulary piece. Larger caller-owned streams
 /// must be split into bounded chunks; the display is independent of chunking.
 pub const MAX_TEXT_OUTPUT_BYTES: usize = crate::vocabulary::MAX_PIECE_BYTES;
+
+/// Incremental UTF-8 decoder whose display pieces may borrow the caller's input.
+pub trait LendingText {
+    /// A decoded piece tied to the input borrow.
+    type Piece<'a>: AsRef<str>
+    where
+        Self: 'a;
+
+    /// Decode one bounded input byte chunk and lend its display text.
+    ///
+    /// # Errors
+    /// Propagates input-bound or output-allocation errors from the decoder.
+    fn next_text<'a>(&'a mut self, bytes: &'a [u8]) -> Result<Self::Piece<'a>>;
+}
+
+/// Decode one bounded byte chunk and pass its borrowed or owned piece to a higher-ranked visitor.
+///
+/// # Errors
+/// Propagates decoder or visitor errors.
+pub fn push_with<T: LendingText>(
+    decoder: &mut T,
+    bytes: &[u8],
+    visit: impl for<'a> FnOnce(T::Piece<'a>) -> Result<()>,
+) -> Result<()> {
+    let piece = decoder.next_text(bytes)?;
+    visit(piece)
+}
 
 /// Incremental lossy UTF-8 display with at most three retained input bytes.
 ///
@@ -31,6 +60,14 @@ pub struct Utf8Output {
     pending_len: usize,
 }
 
+impl LendingText for Utf8Output {
+    type Piece<'a> = Cow<'a, str>;
+
+    fn next_text<'a>(&'a mut self, bytes: &'a [u8]) -> Result<Self::Piece<'a>> {
+        self.push_borrowed(bytes)
+    }
+}
+
 impl Utf8Output {
     /// Creates an empty display decoder without allocating.
     #[must_use]
@@ -39,6 +76,37 @@ impl Utf8Output {
             pending: [0; 3],
             pending_len: 0,
         }
+    }
+
+    /// Displays a bounded byte chunk, borrowing valid UTF-8 directly when no
+    /// incomplete prefix is pending.
+    ///
+    /// When `pending_len == 0` and `bytes` is valid UTF-8 (or valid UTF-8 up to
+    /// an incomplete trailing scalar suffix), returns [`Cow::Borrowed`] from
+    /// `bytes` without allocating. Falls back to [`Self::push`] only when bridging
+    /// a retained suffix or substituting replacement characters.
+    ///
+    /// # Errors
+    /// Rejects input exceeding [`MAX_TEXT_OUTPUT_BYTES`] and output-allocation
+    /// failures while leaving any pending suffix unchanged.
+    pub fn push_borrowed<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, str>> {
+        if bytes.len() > MAX_TEXT_OUTPUT_BYTES {
+            return Err(invalid("text output chunk exceeds bounded byte limit"));
+        }
+        if self.pending_len == 0 {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => return Ok(Cow::Borrowed(text)),
+                Err(error) if error.error_len().is_none() => {
+                    let (valid, suffix) = bytes.split_at(error.valid_up_to());
+                    let text = std::str::from_utf8(valid)?;
+                    self.pending_len = suffix.len();
+                    self.pending[..self.pending_len].copy_from_slice(suffix);
+                    return Ok(Cow::Borrowed(text));
+                }
+                Err(_) => {}
+            }
+        }
+        self.push(bytes).map(Cow::Owned)
     }
 
     /// Displays a bounded byte chunk, deferring only an incomplete UTF-8 suffix.
@@ -135,4 +203,33 @@ fn append_complete<'a>(mut bytes: &'a [u8], output: &mut String) -> Result<&'a [
         }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cow, Utf8Output, push_with};
+    use crate::Result;
+
+    #[test]
+    fn push_borrowed_lends_valid_prefixes_and_owns_bridged_or_lossy_chunks() -> Result<()> {
+        let mut decoder = Utf8Output::new();
+        let plain = decoder.push_borrowed(b"hello")?;
+        assert!(matches!(plain, Cow::Borrowed("hello")));
+
+        // Split "雨" (E9 9B A8) across two pieces: prefix "Rain " + E9 9B, then A8 + "!".
+        let prefix = decoder.push_borrowed(b"Rain \xe9\x9b")?;
+        assert!(matches!(prefix, Cow::Borrowed("Rain ")));
+        assert_eq!(decoder.pending_bytes(), b"\xe9\x9b");
+
+        let mut bridged = String::new();
+        push_with(&mut decoder, b"\xa8!", |piece| {
+            assert!(matches!(piece, Cow::Owned(_)));
+            bridged.push_str(piece.as_ref());
+            Ok(())
+        })?;
+        assert_eq!(bridged, "雨!");
+        assert!(decoder.pending_bytes().is_empty());
+        assert_eq!(decoder.finish(), "");
+        Ok(())
+    }
 }

@@ -427,12 +427,14 @@ impl SwiftSession {
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
         let consume = |token| {
-            let text = display.push(self.vocabulary.piece(token)?)?;
-            charge_output(&mut output_bytes, text.len())?;
-            if !text.is_empty() {
-                emit(TextEvent::Delta(&text))?;
-            }
-            Ok(())
+            crate::text_output::push_with(&mut display, self.vocabulary.piece(token)?, |piece| {
+                let text = piece.as_ref();
+                charge_output(&mut output_bytes, text.len())?;
+                if !text.is_empty() {
+                    emit(TextEvent::Delta(text))?;
+                }
+                Ok(())
+            })
         };
         let (completion, stats) = self.runtime.generate_speculative_until(
             &prompt.tokens,
@@ -478,12 +480,14 @@ impl SwiftSession {
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
         let consume = |token| {
-            let text = display.push(self.vocabulary.piece(token)?)?;
-            charge_output(&mut output_bytes, text.len())?;
-            if !text.is_empty() {
-                emit(TextEvent::Delta(&text))?;
-            }
-            Ok(())
+            crate::text_output::push_with(&mut display, self.vocabulary.piece(token)?, |piece| {
+                let text = piece.as_ref();
+                charge_output(&mut output_bytes, text.len())?;
+                if !text.is_empty() {
+                    emit(TextEvent::Delta(text))?;
+                }
+                Ok(())
+            })
         };
         let completion = if let Some(timings) = timings {
             self.runtime.generate_sampled_until_with_timings(

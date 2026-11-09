@@ -731,11 +731,7 @@ impl GgufTokenizer {
             input.to_owned()
         };
         let pieces = if self.pre == "qwen35" {
-            let metadata = Metadata::from([
-                ("tokenizer.ggml.model".into(), "gpt2".into()),
-                ("tokenizer.ggml.pre".into(), "qwen35".into()),
-            ]);
-            Qwen35PreTokenizer::from_metadata(&metadata)?.split(&text)?
+            Qwen35PreTokenizer::new().split(&text)?
         } else {
             let mut pieces = vec![text.as_str()];
             for regex in &self.regexes {

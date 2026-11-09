@@ -42,6 +42,10 @@ pub struct Qwen35Pieces<'a> {
 }
 
 impl Qwen35PreTokenizer {
+    pub(crate) const fn new() -> Self {
+        Self { _validated: () }
+    }
+
     /// Requires exact string metadata `tokenizer.ggml.model = "gpt2"` and
     /// `tokenizer.ggml.pre = "qwen35"`.
     ///

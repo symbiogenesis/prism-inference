@@ -48,7 +48,7 @@ function Get-BonsaiRustArgument {
     [OutputType([string], [array])]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][Collections.IDictionary[]]$Package,
-        [string]$Toolchain = 'nightly-2026-10-22-aarch64-pc-windows-msvc',
+        [string]$Toolchain = 'nightly-2026-11-02-aarch64-pc-windows-msvc',
         [Parameter(Mandatory)][ValidateSet('fmt', 'clippy', 'doc', 'test', 'build')][string]$Phase,
         [ValidateSet('Foundation', 'Compatibility', 'Native')][string]$CheckProfile = 'Foundation',
         [switch]$Offline
@@ -87,7 +87,7 @@ function Get-BonsaiRustCheckPlan {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][Collections.IDictionary[]]$Package,
-        [string]$Toolchain = 'nightly-2026-10-22-aarch64-pc-windows-msvc',
+        [string]$Toolchain = 'nightly-2026-11-02-aarch64-pc-windows-msvc',
         [Parameter(Mandatory)][ValidateSet('fmt', 'clippy', 'doc', 'test', 'build')][string[]]$Phase,
         [ValidateSet('Foundation', 'Compatibility', 'Native')][string]$CheckProfile = 'Foundation',
         [switch]$Offline
@@ -130,7 +130,7 @@ function Invoke-BonsaiRustCheck {
     param(
         [string[]]$Package = @(),
         [ValidateSet('All', 'Runtime', 'Broker')][string]$Group = 'All',
-        [string]$Toolchain = 'nightly-2026-10-22-aarch64-pc-windows-msvc',
+        [string]$Toolchain = 'nightly-2026-11-02-aarch64-pc-windows-msvc',
         [Parameter(Mandatory)][string]$TargetDirectory,
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [ValidateSet('Foundation', 'Compatibility', 'Native')][string]$CheckProfile = 'Foundation',

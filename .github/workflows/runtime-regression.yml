@@ -60,7 +60,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-02-aarch64-pc-windows-msvc
       - name: Identify native regression build storage
         shell: pwsh
         run: |
@@ -74,15 +74,15 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ env.CARGO_TARGET_DIR }}
-          key: prism-regression-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/native-hash/**', 'tools/prism/**', 'tests/upstream_prism/**', 'tests/fixtures/**') }}-content-v1
+          key: prism-regression-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-11-02-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/native-hash/**', 'tools/prism/**', 'tests/upstream_prism/**', 'tests/fixtures/**') }}-content-v1
           restore-keys: |
-            prism-regression-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-10-22-
+            prism-regression-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-11-02-
       - name: Build this revision's Rust source assertion harness
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo +nightly-2026-10-22-aarch64-pc-windows-msvc build --locked --release --package prism-inference --example upstream_prism
+          cargo +nightly-2026-11-02-aarch64-pc-windows-msvc build --locked --release --package prism-inference --example upstream_prism
       - name: Require every selected runtime regression
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -109,7 +109,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-02-aarch64-pc-windows-msvc
       - name: Reuse the immutable released runtime archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -140,7 +140,7 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           Start-Transcript -LiteralPath (Join-Path $checks 'codec-workflow.log') | Out-Null
           try {
-            cargo +nightly-2026-10-22-aarch64-pc-windows-msvc fetch --manifest-path $manifest --locked
+            cargo +nightly-2026-11-02-aarch64-pc-windows-msvc fetch --manifest-path $manifest --locked
             & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-codec-probe -Phase build -TargetDirectory $target -EvidenceDirectory (Join-Path $checks 'rust') -Offline | ConvertTo-Json -Depth 8
             Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
             $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/codec-probe/native.lock.json') -Raw | ConvertFrom-Json

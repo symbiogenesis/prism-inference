@@ -57,7 +57,7 @@ $previous = [Environment]::CurrentDirectory
 Push-Location $scratch
 try {
     [Environment]::CurrentDirectory = $scratch
-    cargo +nightly-2026-10-22 fetch --locked --manifest-path (Join-Path $repo 'tools/prism/Cargo.toml')
+    cargo +nightly-2026-11-02 fetch --locked --manifest-path (Join-Path $repo 'tools/prism/Cargo.toml')
     if ($LASTEXITCODE) { throw 'Prism dependency fetch failed.' }
     $result = & (Join-Path $repo 'scripts/Build-PrismEngine.ps1') -SourceArchive $absoluteZip -BuildMode All
     ctest --test-dir (Join-Path $result.EvidenceDirectory 'build-probe') -C Release -R '^prism-lora-storage-alias$' --output-on-failure
@@ -79,7 +79,7 @@ Visual Studio generators select ClangCL on Windows.
 For a focused policy check, use the external working-directory convention above:
 
 ```powershell
-cargo +nightly-2026-10-22 test --locked --offline --release --manifest-path <repo>/tools/prism/Cargo.toml --target-dir <temp>/build --test policy pool_policy_preserves_existing_cpp_cases -- --exact
+cargo +nightly-2026-11-02 test --locked --offline --release --manifest-path <repo>/tools/prism/Cargo.toml --target-dir <temp>/build --test policy pool_policy_preserves_existing_cpp_cases -- --exact
 ```
 
 Native tests require `--features native-tests --test native` and absolute ggml

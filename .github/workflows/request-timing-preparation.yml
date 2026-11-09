@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-02-aarch64-pc-windows-msvc
       - name: Check and build the exact native request timing tool without models
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -41,7 +41,7 @@ jobs:
           "REQUEST_TIMING_PACKAGE=$package" >> $env:GITHUB_ENV
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-          $compiler = @(& rustc +nightly-2026-10-22 -vV)
+          $compiler = @(& rustc +nightly-2026-11-02 -vV)
           if ($compiler -cnotcontains 'host: aarch64-pc-windows-msvc') { throw 'Native ARM64 compiler identity is required.' }
           $compiler | Set-Content -LiteralPath (Join-Path $logs 'compiler.txt') -Encoding utf8NoBOM
           if ((& git -C $env:GITHUB_WORKSPACE rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checkout differs from the owning source revision.' }
@@ -53,10 +53,10 @@ jobs:
             & $cargo @Arguments 2>&1 | Tee-Object -FilePath (Join-Path $logs "$Name.log")
             if ($LASTEXITCODE -ne 0) { throw "Required hosted check failed: $Name" }
           }
-          Invoke-CargoCheck 'format' @('+nightly-2026-10-22', 'fmt', '--manifest-path', $manifest, '-p', 'prism-inference', '--', '--check')
-          Invoke-CargoCheck 'clippy' @('+nightly-2026-10-22', 'clippy', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--lib', '--test', 'runtime', '--example', 'swift_model_check', '--', '-D', 'warnings')
+          Invoke-CargoCheck 'format' @('+nightly-2026-11-02', 'fmt', '--manifest-path', $manifest, '-p', 'prism-inference', '--', '--check')
+          Invoke-CargoCheck 'clippy' @('+nightly-2026-11-02', 'clippy', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--lib', '--test', 'runtime', '--example', 'swift_model_check', '--', '-D', 'warnings')
           $env:RUSTDOCFLAGS = '-D warnings'
-          Invoke-CargoCheck 'rustdoc' @('+nightly-2026-10-22', 'doc', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--no-deps', '--lib')
+          Invoke-CargoCheck 'rustdoc' @('+nightly-2026-11-02', 'doc', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--no-deps', '--lib')
           $runtimeCases = @(
             'timing::timing_preserves_sampled_output_state_rng_and_reused_prefix',
             'timing::timed_stop_draw_is_counted_without_decode_or_callback_work',
@@ -74,7 +74,7 @@ jobs:
             [ordered]@{ kind='--test'; name='runtime'; cases=$runtimeCases },
             [ordered]@{ kind='--example'; name='swift_model_check'; cases=$exampleCases }
           )) {
-            $testArguments = @('+nightly-2026-10-22', 'test', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', $target.kind, $target.name)
+            $testArguments = @('+nightly-2026-11-02', 'test', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', $target.kind, $target.name)
             $inventory = @(Invoke-CargoCheck ($target.name + '-inventory') ($testArguments + @('--', '--list')))
             foreach ($case in $target.cases) {
               if ($inventory -cnotcontains ($case + ': test')) { throw "Required model-free timing regression is missing: $case" }
@@ -82,7 +82,7 @@ jobs:
             }
           }
           $messages = Join-Path $logs 'example-build.jsonl'
-          $buildArguments = @('+nightly-2026-10-22', 'build', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--example', 'swift_model_check', '--message-format=json')
+          $buildArguments = @('+nightly-2026-11-02', 'build', '--manifest-path', $manifest, '-p', 'prism-inference', '--locked', '--release', '--features', 'parallel-rows', '--example', 'swift_model_check', '--message-format=json')
           $commands.Add([ordered]@{ name='example-build'; executable='cargo'; arguments=$buildArguments })
           $commands | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $logs 'commands.json') -Encoding utf8NoBOM
           & $cargo @buildArguments 2> (Join-Path $logs 'example-build-stderr.log') | Tee-Object -FilePath $messages
@@ -104,7 +104,7 @@ jobs:
             schemaVersion=1; kind='swift-request-timing-hosted-preparation'
             repository=$env:GITHUB_REPOSITORY; revision=$env:GITHUB_SHA; gitRef=$env:GITHUB_REF
             workflowPath='.github/workflows/request-timing-preparation.yml'; runId=$env:GITHUB_RUN_ID; runAttempt=[int]$env:GITHUB_RUN_ATTEMPT
-            target='aarch64-pc-windows-msvc'; toolchain='nightly-2026-10-22-aarch64-pc-windows-msvc'; compilerIdentity=($compiler -join "`n")
+            target='aarch64-pc-windows-msvc'; toolchain='nightly-2026-11-02-aarch64-pc-windows-msvc'; compilerIdentity=($compiler -join "`n")
             features=@('default', 'parallel-rows'); actualModelExecuted=$false; ownerDeviceJobCreated=$false
             scope='source-tool preparation only; no device, numerical, performance, service or promotion qualification'
             requiredRuntimeTests=$runtimeCases; requiredDiagnosticTests=$exampleCases; sourceFiles=$sourceFiles

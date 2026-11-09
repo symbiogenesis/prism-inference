@@ -11,7 +11,7 @@ After the [release gates](release-0.1.21.md#installation-and-provenance) pass an
 the tag is published, install its source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-10-22 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.21 prism-inference --locked
+cargo +nightly-2026-11-02 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.21 prism-inference --locked
 prism-inference --help
 ```
 
@@ -103,7 +103,7 @@ Publish the new hash dependency before a registry GGUF release that requires it.
 
 ## Build a checkout
 
-Use the pinned Rust nightly-2026-10-22 and an absolute manifest/target path from
+Use the pinned Rust nightly-2026-11-02 and an absolute manifest/target path from
 a unique system-temp working directory. After fetching locked dependencies:
 
 ```powershell
@@ -114,7 +114,7 @@ $previous = [Environment]::CurrentDirectory
 Push-Location $lane
 try {
     [Environment]::CurrentDirectory = $lane
-    cargo +nightly-2026-10-22-aarch64-pc-windows-msvc build --workspace --bins --locked --offline --release `
+    cargo +nightly-2026-11-02-aarch64-pc-windows-msvc build --workspace --bins --locked --offline --release `
         --manifest-path (Join-Path $repo 'Cargo.toml') `
         --target-dir (Join-Path $lane 'build')
     if ($LASTEXITCODE) { throw 'Prism Inference build failed.' }
@@ -152,7 +152,7 @@ run focused named regressions, from the same external working directory
 convention, for example:
 
 ```powershell
-cargo +nightly-2026-10-22-aarch64-pc-windows-msvc test --locked --offline --release `
+cargo +nightly-2026-11-02-aarch64-pc-windows-msvc test --locked --offline --release `
     --manifest-path <repo>/Cargo.toml --target-dir <temp>/build `
     --test runtime edited_turns_restore_complete_recurrent_prefix_and_failed_stream_rolls_back -- --exact
 ```
@@ -212,10 +212,13 @@ against [`.rumdl.toml`](../.rumdl.toml) when Markdown files or linter settings
 change. The
 [compiler acceptance workflow](../.github/workflows/rust-nightly.yml) compares
 isolated stable/nightly language probes and preserves the fail-closed
-`compatibility` check. It runs when probe inputs change or on manual dispatch.
-Dispatch Foundation to rerun complete workspace validation. Runner
-contains only app/provisioning/released-runtime integration gates; none of these
-runtime suites bootstrap through its maintenance executable or released source.
+`compatibility` check. It runs when probe inputs change or on manual dispatch;
+[`tools/rust-trial/tests/compiler.rs`](../tools/rust-trial/tests/compiler.rs)
+gates Polonius Alpha and the next-generation trait solver through ordinary Cargo
+compilation, and workspace packages prefer scoped `#[expect(..., reason = "...")]`
+for known diagnostics. Dispatch Foundation to rerun complete workspace validation.
+Runner contains only app/provisioning/released-runtime integration gates; none of
+these runtime suites bootstrap through its maintenance executable or released source.
 All full suites and every benchmark remain hosted-only.
 
 Automatic workflows skip pushes limited to root Markdown files and `docs/`.

@@ -73,8 +73,8 @@ $rustBuild = Join-Path $rustRoot 'engine-loader'
 # Opt-in native-test linking must never overwrite the policy archive used by
 # the engine or invalidate its already recorded hash.
 $rustNativeBuild = Join-Path $rustRoot 'native-tests'
-$rustVersion = Invoke-PrismBuildCommand -FilePath $cargo -Arguments @('+nightly-2026-10-22','--version')
-$cargoOutput = Invoke-PrismBuildCommand -FilePath $cargo -Arguments @('+nightly-2026-10-22','build','--locked','--offline','--release','--features','engine-loader','--message-format=json','--manifest-path',$manifest,'--target-dir',$rustBuild)
+$rustVersion = Invoke-PrismBuildCommand -FilePath $cargo -Arguments @('+nightly-2026-11-02','--version')
+$cargoOutput = Invoke-PrismBuildCommand -FilePath $cargo -Arguments @('+nightly-2026-11-02','build','--locked','--offline','--release','--features','engine-loader','--message-format=json','--manifest-path',$manifest,'--target-dir',$rustBuild)
 $records = @($cargoOutput -split "`n" | Where-Object { $_.StartsWith('{') } | ConvertFrom-Json -DateKind String)
 $packages = @($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'bonsai_prism' } | Select-Object -ExpandProperty package_id -Unique)
 if ($packages.Count -ne 1) { throw 'Expected one Rust library package identity.' }
@@ -174,7 +174,7 @@ if (-not $PrepareOnly) {
             $libraryDirectories = @($nativeLibraries.DirectoryName | Sort-Object -Unique)
             $nativeEnvironment = @{ BONSAI_PRISM_NATIVE_LIB_DIR = $libraryDirectories -join [IO.Path]::PathSeparator }
             $cargoOutput = Invoke-PrismBuildCommand -FilePath $cargo -Environment $nativeEnvironment -Arguments @(
-                '+nightly-2026-10-22','test','--locked','--offline','--release','--manifest-path',$manifest,'--target-dir',$rustNativeBuild,
+                '+nightly-2026-11-02','test','--locked','--offline','--release','--manifest-path',$manifest,'--target-dir',$rustNativeBuild,
                 '--features','native-tests','--test','native','--no-run','--message-format=json')
             $executables = @($cargoOutput -split "`n" | Where-Object { $_.StartsWith('{') } | ForEach-Object {
                 $record = $_ | ConvertFrom-Json -DateKind String

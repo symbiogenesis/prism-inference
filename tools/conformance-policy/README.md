@@ -5,7 +5,7 @@ ordinary-source partitioning and bounded revision-bound artifact fan-in. It
 preserves the policy and frozen fixtures moved from SwiftBonsai2Runner; no Runner
 binary, released runtime source archive, installer or model is needed.
 
-Build with `cargo +nightly-2026-10-22 build -p prism-conformance-policy --locked --release`.
+Build with `cargo +nightly-2026-11-02 build -p prism-conformance-policy --locked --release`.
 Invoke `prism-conformance-policy --version`, or pass `prism-baseline`/`prism-source`
 followed by `--request ABSOLUTE_JSON_PATH`. Requests are bounded to 16 MiB. Source
 result fan-in retains its separate 1 MiB receipt and 128 MiB report bounds.

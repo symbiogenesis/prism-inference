@@ -5,7 +5,7 @@ runs:
   steps:
     - uses: ./.github/actions/rust-toolchain
       with:
-        toolchain: nightly-2026-10-22-aarch64-pc-windows-msvc
+        toolchain: nightly-2026-11-02-aarch64-pc-windows-msvc
     - name: Select external policy build storage
       shell: pwsh
       working-directory: ${{ runner.temp }}
@@ -21,9 +21,9 @@ runs:
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ${{ env.PRISM_POLICY_TARGET }}
-        key: prism-policy-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_POLICY_CACHE_HOST }}-nightly-2026-10-22-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/conformance-policy/**', 'rust-toolchain.toml') }}-content-v1
+        key: prism-policy-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_POLICY_CACHE_HOST }}-nightly-2026-11-02-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/conformance-policy/**', 'rust-toolchain.toml') }}-content-v1
         restore-keys: |
-          prism-policy-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_POLICY_CACHE_HOST }}-nightly-2026-10-22-
+          prism-policy-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_POLICY_CACHE_HOST }}-nightly-2026-11-02-
     - name: Build the local policy without Runner tools or released source
       shell: pwsh
       working-directory: ${{ runner.temp }}
@@ -31,7 +31,7 @@ runs:
         Set-StrictMode -Version Latest
         $ErrorActionPreference = 'Stop'
         $PSNativeCommandUseErrorActionPreference = $true
-        cargo +nightly-2026-10-22-aarch64-pc-windows-msvc build --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package prism-conformance-policy --target-dir $env:PRISM_POLICY_TARGET --locked --release
+        cargo +nightly-2026-11-02-aarch64-pc-windows-msvc build --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package prism-conformance-policy --target-dir $env:PRISM_POLICY_TARGET --locked --release
         $tool = Join-Path $env:PRISM_POLICY_TARGET 'release/prism-conformance-policy.exe'
         Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
         Assert-Arm64PE -Path $tool

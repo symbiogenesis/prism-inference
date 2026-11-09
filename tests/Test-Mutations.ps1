@@ -108,7 +108,7 @@ $receipt = [ordered]@{
     Error = $null
 }
 $cargo = (Get-Command -Name cargo -CommandType Application -ErrorAction Stop).Source
-$arguments = @('+nightly-2026-10-22-aarch64-pc-windows-msvc', 'test', '--locked', '--offline', '--release', '--no-run', '--message-format=json',
+$arguments = @('+nightly-2026-11-02-aarch64-pc-windows-msvc', 'test', '--locked', '--offline', '--release', '--no-run', '--message-format=json',
     '--manifest-path', (Join-Path $crate 'Cargo.toml'), '--target-dir', (Join-Path $work 'target'),
     '--test', 'mutation_guards')
 $environment = @{ TEMP = $work; TMP = $work; CARGO_TERM_COLOR = 'never' }
@@ -158,7 +158,7 @@ function Invoke-MutationTest {
 
 try {
     $lockLog = Join-Path $evidence 'lockfile.log'
-    $lockResult = Invoke-BonsaiNativeProcess -Executable $cargo -ArgumentList @('+nightly-2026-10-22-aarch64-pc-windows-msvc',
+    $lockResult = Invoke-BonsaiNativeProcess -Executable $cargo -ArgumentList @('+nightly-2026-11-02-aarch64-pc-windows-msvc',
         'generate-lockfile', '--offline', '--manifest-path', (Join-Path $crate 'Cargo.toml')) `
         -WorkingDirectory $work -TimeoutSeconds $BaselineCompileTimeoutSeconds -Environment $environment -LogPath $lockLog
     $checks.Add([pscustomobject]@{ Name = 'lockfile'; ExitCode = $lockResult.ExitCode; Log = $lockLog })

@@ -51,7 +51,7 @@ jobs:
           "PRISM_PACKAGE_EVIDENCE=$(Join-Path $env:RUNNER_TEMP 'Prism-SourcePackage-Evidence')" >> $env:GITHUB_ENV
       - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-10-22-${{ matrix.target }}
+          toolchain: nightly-2026-11-02-${{ matrix.target }}
           components: ''
       - name: Reuse locked Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -154,7 +154,7 @@ def main():
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise SystemExit("Complete correctness shards run only in GitHub Actions on main")
     packages = json.loads(os.environ["PRISM_PACKAGES"])
-    toolchain = "+nightly-2026-10-22"
+    toolchain = "+nightly-2026-11-02"
     manifest = str(arguments.manifest.resolve(strict=True))
     metadata = json.loads(subprocess.check_output([
         "cargo", toolchain, "metadata", "--manifest-path", manifest,

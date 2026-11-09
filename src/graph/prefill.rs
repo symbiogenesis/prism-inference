@@ -4,7 +4,8 @@ use std::fmt::Write as _;
 
 use super::{
     Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
-    Transforms, add, checked_product, finite, resize_into, rope_frequencies, row_into, small_float,
+    Transforms, add, add_finite, checked_product, finite, resize_into, rope_frequencies, row_into,
+    small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -542,17 +543,17 @@ impl Qwen35 {
                 }
                 _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
             }
-            for index in 0..count {
+            for _ in 0..count {
                 check()?;
-                add(&mut tile.hidden[index], &tile.attention[index]);
             }
-            let post_norm_reuse = normalize_for_tile_into(
+            let post_norm_reuse = add_normalize_for_tile_into(
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
                 &layer.post_norm,
                 &layer.gate,
-                &tile.hidden[..count],
+                &mut tile.hidden[..count],
+                &tile.attention[..count],
                 &mut tile.normalized[..count],
                 &mut tile.transformed[..count],
                 tile.projector.row_parallelism(),
@@ -623,8 +624,7 @@ impl Qwen35 {
                     .iter_mut()
                     .zip(&tile.normalized[..count])
                 {
-                    add(hidden, output);
-                    finite(hidden, "CPU tiled decoder layer output")?;
+                    add_finite(hidden, output, "CPU tiled decoder layer output")?;
                 }
             }
             check()?;
@@ -1509,6 +1509,158 @@ fn normalize_for_tile_into<'a>(
     } else {
         for (h, norm_out) in hidden.iter().zip(normalized.iter_mut()) {
             arithmetic.normalize(h, weight, geometry.epsilon, norm_out)?;
+        }
+    }
+    Ok(TileReuse::default())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep fused tile residual-add, RMSNorm, Hadamard rotation and bounded tile scratch explicit."
+)]
+fn add_normalize_for_tile_into<'a>(
+    transforms: &Transforms,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    weight: &[f32],
+    first_target: &'a Tensor,
+    hidden: &mut [Vec<f32>],
+    delta: &[Vec<f32>],
+    normalized: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<TileReuse<'a>> {
+    let count = hidden.len();
+    let len = hidden.first().map_or(0, Vec::len);
+    let can_hadamard = count > 0
+        && len > 0
+        && transforms.basis(first_target) == (true, false)
+        && transforms.can_block_hadamard(len)
+        && first_target.dimensions.first().copied() == Some(len);
+    if can_hadamard {
+        let signs = transforms.signs.get(&len).map(Vec::as_slice);
+        let block = transforms.block;
+        let epsilon = geometry.epsilon;
+        let fused_ok = if count > 1 && parallelism.workers() > 1 {
+            let single_worker = RowParallelism::default();
+            parallelism
+                .update_triple_chunks(
+                    hidden,
+                    1,
+                    normalized,
+                    1,
+                    transformed,
+                    1,
+                    |base_tok, hidden_chunk, norm_chunk, trans_chunk| {
+                        let mut chunk_err = None;
+                        for (offset, ((h, norm_out), rot_out)) in hidden_chunk
+                            .iter_mut()
+                            .zip(norm_chunk.iter_mut())
+                            .zip(trans_chunk.iter_mut())
+                            .enumerate()
+                        {
+                            if chunk_err.is_some() {
+                                add(h, &delta[base_tok + offset]);
+                            } else if let Err(err) = arithmetic.add_normalize_hadamard_into(
+                                h,
+                                &delta[base_tok + offset],
+                                weight,
+                                epsilon,
+                                block,
+                                signs,
+                                &single_worker,
+                                norm_out,
+                                rot_out,
+                            ) {
+                                chunk_err = Some(err);
+                            }
+                        }
+                        chunk_err.map_or(Ok(()), Err)
+                    },
+                )
+                .is_ok()
+        } else {
+            let mut ok = true;
+            for (((h, d), norm_out), rot_out) in hidden
+                .iter_mut()
+                .zip(delta.iter())
+                .zip(normalized.iter_mut())
+                .zip(transformed.iter_mut())
+            {
+                if !ok {
+                    add(h, d);
+                } else if arithmetic
+                    .add_normalize_hadamard_into(
+                        h,
+                        d,
+                        weight,
+                        epsilon,
+                        block,
+                        signs,
+                        parallelism,
+                        norm_out,
+                        rot_out,
+                    )
+                    .is_err()
+                {
+                    ok = false;
+                }
+            }
+            ok
+        };
+        if fused_ok {
+            return Ok(TileReuse {
+                basis: Some(first_target),
+                prepared: None,
+            });
+        }
+        if count > 1 && parallelism.workers() > 1 {
+            let epsilon = geometry.epsilon;
+            parallelism.update_chunks(normalized, 1, |base_tok, chunk| {
+                for (offset, norm_out) in chunk.iter_mut().enumerate() {
+                    arithmetic.normalize(&hidden[base_tok + offset], weight, epsilon, norm_out)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            for (h, norm_out) in hidden.iter().zip(normalized.iter_mut()) {
+                arithmetic.normalize(h, weight, geometry.epsilon, norm_out)?;
+            }
+        }
+        return Ok(TileReuse::default());
+    }
+    if count > 1 && parallelism.workers() > 1 {
+        let epsilon = geometry.epsilon;
+        parallelism.update_paired_chunks(
+            hidden,
+            1,
+            normalized,
+            1,
+            |base_tok, hidden_chunk, norm_chunk| {
+                for (offset, (h, norm_out)) in hidden_chunk
+                    .iter_mut()
+                    .zip(norm_chunk.iter_mut())
+                    .enumerate()
+                {
+                    arithmetic.add_normalize(
+                        h,
+                        &delta[base_tok + offset],
+                        weight,
+                        epsilon,
+                        norm_out,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        for ((h, d), norm_out) in hidden
+            .iter_mut()
+            .zip(delta.iter())
+            .zip(normalized.iter_mut())
+        {
+            arithmetic.add_normalize(h, d, weight, geometry.epsilon, norm_out)?;
         }
     }
     Ok(TileReuse::default())

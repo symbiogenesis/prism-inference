@@ -14,10 +14,11 @@ use bonsai_ternary::half_to_float;
 use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place};
 use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism,
-    add_scaled_slice_in_place, add_slice_in_place, append_half_bits, f16_dot, float_dot,
-    is_finite_slice, l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into,
-    rms_norm_into, rms_norm_pinned_into, rms_norm_swiglu_in_place, rms_norm_swiglu_into,
-    round_f16_slice, row, row_into, scale_slice_into, silu, softmax_round_f16,
+    add_rms_norm_into, add_rms_norm_pinned_into, add_scaled_slice_in_place, add_slice_in_place,
+    add_slice_in_place_all_finite, append_half_bits, f16_dot, float_dot, is_finite_slice,
+    l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into, rms_norm_into,
+    rms_norm_pinned_into, rms_norm_swiglu_in_place, rms_norm_swiglu_into, round_f16_slice, row,
+    row_into, scale_slice_into, silu, softmax_round_f16,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -64,6 +65,20 @@ impl Arithmetic {
         match self {
             Self::Source => rms_norm_into(input, weight, epsilon, output),
             Self::PinnedSwift => rms_norm_pinned_into(input, weight, epsilon, output),
+        }
+    }
+
+    fn add_normalize(
+        self,
+        values: &mut [f32],
+        delta: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        match self {
+            Self::Source => add_rms_norm_into(values, delta, weight, epsilon, output),
+            Self::PinnedSwift => add_rms_norm_pinned_into(values, delta, weight, epsilon, output),
         }
     }
 
@@ -219,6 +234,48 @@ impl Arithmetic {
             ),
             Self::PinnedSwift => crate::kernels::rms_norm_hadamard_into::<true>(
                 input,
+                weight,
+                epsilon,
+                block,
+                signs,
+                parallelism,
+                norm_out,
+                rotated_out,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Pass explicit residual delta, RMSNorm parameters, Hadamard block geometry, and reusable output buffers."
+    )]
+    fn add_normalize_hadamard_into(
+        self,
+        values: &mut [f32],
+        delta: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        block: usize,
+        signs: Option<&[f32]>,
+        parallelism: &RowParallelism,
+        norm_out: &mut Vec<f32>,
+        rotated_out: &mut Vec<f32>,
+    ) -> Result<()> {
+        match self {
+            Self::Source => crate::kernels::add_rms_norm_hadamard_into::<false>(
+                values,
+                delta,
+                weight,
+                epsilon,
+                block,
+                signs,
+                parallelism,
+                norm_out,
+                rotated_out,
+            ),
+            Self::PinnedSwift => crate::kernels::add_rms_norm_hadamard_into::<true>(
+                values,
+                delta,
                 weight,
                 epsilon,
                 block,
@@ -2603,8 +2660,13 @@ impl Qwen35 {
                 )?,
                 _ => return Err(invalid("decoder layer/cache kind mismatch")),
             }
-            add(hidden, attention);
-            evaluation.normalize_for_into(hidden, &layer.post_norm, normalized, &layer.up)?;
+            evaluation.add_normalize_for_into(
+                hidden,
+                attention,
+                &layer.post_norm,
+                normalized,
+                &layer.up,
+            )?;
             // Attention no longer reads its projections or gates. Keep the
             // exact FFN operations while reusing their high-water allocations.
             let up = &mut attention_scratch.projected;
@@ -2618,6 +2680,7 @@ impl Qwen35 {
                 attention,
             )? {
                 std::mem::swap(hidden, attention);
+                finite(hidden, "decoder layer output")?;
             } else {
                 evaluation.project_ffn_swiglu_into(
                     &layer.gate,
@@ -2628,9 +2691,8 @@ impl Qwen35 {
                     up,
                 )?;
                 evaluation.project_into(&layer.down, up, attention)?;
-                add(hidden, attention);
+                add_finite(hidden, attention, "decoder layer output")?;
             }
-            finite(hidden, "decoder layer output")?;
         }
         if let Some(logits) = logits {
             evaluation.normalize_for_into(hidden, &self.output_norm, normalized, &self.output)?;
@@ -2753,6 +2815,47 @@ impl Evaluation<'_, '_> {
         }
         self.arithmetic
             .normalize(input, weight, self.geometry.epsilon, output)
+    }
+
+    fn add_normalize_for_into(
+        &mut self,
+        values: &mut [f32],
+        delta: &[f32],
+        weight: &[f32],
+        output: &mut Vec<f32>,
+        first_target: &Tensor,
+    ) -> Result<()> {
+        self.projection.pre_transformed_len = None;
+        if self.transforms.basis(first_target) == (true, false)
+            && self.transforms.can_block_hadamard(values.len())
+            && first_target.dimensions.first().copied() == Some(values.len())
+        {
+            let signs = self.transforms.signs.get(&values.len()).map(Vec::as_slice);
+            let parallelism = self.projection.matvec.clone_row_parallelism();
+            if self
+                .arithmetic
+                .add_normalize_hadamard_into(
+                    values,
+                    delta,
+                    weight,
+                    self.geometry.epsilon,
+                    self.transforms.block,
+                    signs,
+                    &parallelism,
+                    output,
+                    &mut self.projection.transformed,
+                )
+                .is_ok()
+            {
+                self.projection.pre_transformed_len = Some(values.len());
+                return Ok(());
+            }
+            return self
+                .arithmetic
+                .normalize(values, weight, self.geometry.epsilon, output);
+        }
+        self.arithmetic
+            .add_normalize(values, delta, weight, self.geometry.epsilon, output)
     }
 
     fn try_project_ffn_chain_into(
@@ -4246,6 +4349,13 @@ fn sigmoid(value: f32) -> f32 {
 
 fn add(target: &mut [f32], other: &[f32]) {
     add_slice_in_place(target, other);
+}
+
+fn add_finite(target: &mut [f32], other: &[f32], operation: &str) -> Result<()> {
+    if !add_slice_in_place_all_finite(target, other) {
+        return Err(invalid(format!("nonfinite values in {operation}")));
+    }
+    Ok(())
 }
 
 #[allow(

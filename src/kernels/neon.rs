@@ -1204,6 +1204,31 @@ pub(super) fn add_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
 }
 
 #[inline]
+pub(super) fn add_slice_in_place_all_finite(target: &mut [f32], other: &[f32]) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (t_chunks, t_tail) = target.as_chunks_mut::<4>();
+    let (o_chunks, o_tail) = other.as_chunks::<4>();
+    for (t_chunk, o_chunk) in t_chunks.iter_mut().zip(o_chunks) {
+        let sum = f32x4::from_slice(neon, t_chunk) + f32x4::from_slice(neon, o_chunk);
+        finite_mask &= sum.is_finite();
+        sum.store_slice(t_chunk);
+    }
+    let mut tail_finite = true;
+    for (t, &o) in t_tail.iter_mut().zip(o_tail) {
+        let sum = *t + o;
+        *t = sum;
+        tail_finite &= sum.is_finite();
+    }
+    if target.len() > other.len() {
+        for &t in &target[other.len()..] {
+            tail_finite &= t.is_finite();
+        }
+    }
+    Some(finite_mask.all_true() && tail_finite)
+}
+
+#[inline]
 pub(super) fn mul_slice_in_place(target: &mut [f32], other: &[f32]) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;
@@ -1772,6 +1797,45 @@ pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f
             return Some(Err(crate::invalid("nonfinite tensor or activation value")));
         }
         sum += f64::from(value * value);
+    }
+    Some(Ok(sum))
+}
+
+#[inline]
+pub(super) fn add_rms_norm_squares(
+    values: &mut [f32],
+    delta: &[f32],
+    weight: &[f32],
+) -> Option<Result<f64>> {
+    if values.len() != delta.len() || values.len() != weight.len() {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let mut sum = 0.0_f64;
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (val_chunks, val_tail) = values.as_chunks_mut::<4>();
+    let (d_chunks, d_tail) = delta.as_chunks::<4>();
+    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    for ((val_chunk, d_chunk), w_chunk) in val_chunks.iter_mut().zip(d_chunks).zip(w_chunks) {
+        let v = f32x4::from_slice(neon, val_chunk) + f32x4::from_slice(neon, d_chunk);
+        v.store_slice(val_chunk);
+        let w = f32x4::from_slice(neon, w_chunk);
+        finite_mask = finite_mask & v.is_finite() & w.is_finite();
+        let sq_lanes = (v * v).to_array();
+        sum += f64::from(sq_lanes[0]);
+        sum += f64::from(sq_lanes[1]);
+        sum += f64::from(sq_lanes[2]);
+        sum += f64::from(sq_lanes[3]);
+    }
+    let mut tail_finite = true;
+    for ((val, &d), &w) in val_tail.iter_mut().zip(d_tail).zip(w_tail) {
+        let v = *val + d;
+        *val = v;
+        tail_finite &= v.is_finite() && w.is_finite();
+        sum += f64::from(v * v);
+    }
+    if !finite_mask.all_true() || !tail_finite {
+        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     Some(Ok(sum))
 }
@@ -6306,6 +6370,113 @@ mod tests {
                     &mut fused_norm,
                     &mut fused_rot,
                 )?;
+                for (a, b) in fused_norm.iter().zip(&ref_norm) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_rot.iter().zip(&ref_rot) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+
+                let delta: Vec<f32> = (0..block * 2)
+                    .map(|i| {
+                        let raw = u16::try_from((i * 109 + 41) % 512).unwrap_or(0);
+                        (f32::from(raw) - 256.0) * 0.007_812_5
+                    })
+                    .collect();
+                let mut ref_added = input.clone();
+                assert!(super::super::add_slice_in_place_all_finite(
+                    &mut ref_added,
+                    &delta
+                ));
+                let mut unfused_added = input.clone();
+                super::super::add_slice_in_place(&mut unfused_added, &delta);
+                for (a, b) in ref_added.iter().zip(&unfused_added) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+
+                super::super::rms_norm_into(&ref_added, &weight, 1e-6, &mut ref_norm)?;
+                for (idx, out_b) in ref_rot.chunks_exact_mut(block).enumerate() {
+                    let off = idx * block;
+                    super::super::hadamard_into(
+                        &ref_norm[off..off + block],
+                        sign_opt.map(|s| &s[off..off + block]),
+                        out_b,
+                    )?;
+                }
+                let mut add_norm_vec = input.clone();
+                super::super::add_rms_norm_into(
+                    &mut add_norm_vec,
+                    &delta,
+                    &weight,
+                    1e-6,
+                    &mut fused_norm,
+                )?;
+                for (a, b) in add_norm_vec.iter().zip(&ref_added) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_norm.iter().zip(&ref_norm) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                let mut add_had_vec = input.clone();
+                super::super::add_rms_norm_hadamard_into::<false>(
+                    &mut add_had_vec,
+                    &delta,
+                    &weight,
+                    1e-6,
+                    block,
+                    sign_opt,
+                    &super::super::RowParallelism::default(),
+                    &mut fused_norm,
+                    &mut fused_rot,
+                )?;
+                for (a, b) in add_had_vec.iter().zip(&ref_added) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_norm.iter().zip(&ref_norm) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_rot.iter().zip(&ref_rot) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+
+                super::super::rms_norm_pinned_into(&ref_added, &weight, 1e-6, &mut ref_norm)?;
+                for (idx, out_b) in ref_rot.chunks_exact_mut(block).enumerate() {
+                    let off = idx * block;
+                    super::super::hadamard_into(
+                        &ref_norm[off..off + block],
+                        sign_opt.map(|s| &s[off..off + block]),
+                        out_b,
+                    )?;
+                }
+                let mut add_pinned_vec = input.clone();
+                super::super::add_rms_norm_pinned_into(
+                    &mut add_pinned_vec,
+                    &delta,
+                    &weight,
+                    1e-6,
+                    &mut fused_norm,
+                )?;
+                for (a, b) in add_pinned_vec.iter().zip(&ref_added) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in fused_norm.iter().zip(&ref_norm) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                let mut add_pinned_had_vec = input.clone();
+                super::super::add_rms_norm_hadamard_into::<true>(
+                    &mut add_pinned_had_vec,
+                    &delta,
+                    &weight,
+                    1e-6,
+                    block,
+                    sign_opt,
+                    &super::super::RowParallelism::default(),
+                    &mut fused_norm,
+                    &mut fused_rot,
+                )?;
+                for (a, b) in add_pinned_had_vec.iter().zip(&ref_added) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
                 for (a, b) in fused_norm.iter().zip(&ref_norm) {
                     assert_eq!(a.to_bits(), b.to_bits());
                 }

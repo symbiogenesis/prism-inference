@@ -961,6 +961,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::similar_names,
+        reason = "Cover 4-row and 8-row GDN step and WY update bit parity and error rollback together."
+    )]
     fn pinned_gdn_four_rows_matches_single_row_bits_and_error_state() -> Result<()> {
         for width in [16, 17, 64, 128, 129] {
             let (first, second) = vectors(width * 4);

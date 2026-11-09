@@ -2817,6 +2817,31 @@ pub(crate) fn add_slice_in_place(target: &mut [f32], other: &[f32]) {
     }
 }
 
+pub(crate) fn add_slice_in_place_all_finite(target: &mut [f32], other: &[f32]) -> bool {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(all_finite) = neon::add_slice_in_place_all_finite(target, other) {
+        return all_finite;
+    }
+    let mut all_finite = true;
+    for (target, &other) in target.iter_mut().zip(other) {
+        let sum = *target + other;
+        *target = sum;
+        all_finite &= sum.is_finite();
+    }
+    if target.len() > other.len() {
+        for &target in &target[other.len()..] {
+            all_finite &= target.is_finite();
+        }
+    }
+    all_finite
+}
+
 pub(crate) fn mul_slice_in_place(target: &mut [f32], other: &[f32]) {
     #[cfg(all(
         feature = "experimental-neon",
@@ -3290,6 +3315,72 @@ pub(crate) fn rms_norm_pinned_into(
     result
 }
 
+pub(crate) fn add_rms_norm_into(
+    values: &mut [f32],
+    delta: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    output: &mut Vec<f32>,
+) -> Result<()> {
+    let result = (|| {
+        let scale = add_rms_norm_scale(values, delta, weight, epsilon)?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(result) = neon::rms_norm_scale_into::<false>(values, weight, scale, output) {
+            return result;
+        }
+        collect_into(
+            values
+                .iter()
+                .zip(weight)
+                .map(|(&value, &w)| finite(value * scale * w)),
+            output,
+        )
+    })();
+    if result.is_err() {
+        output.clear();
+    }
+    result
+}
+
+pub(crate) fn add_rms_norm_pinned_into(
+    values: &mut [f32],
+    delta: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    output: &mut Vec<f32>,
+) -> Result<()> {
+    let result = (|| {
+        let scale = add_rms_norm_scale(values, delta, weight, epsilon)?;
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(result) = neon::rms_norm_scale_into::<true>(values, weight, scale, output) {
+            return result;
+        }
+        collect_into(
+            values
+                .iter()
+                .zip(weight)
+                .map(|(&value, &w)| finite((value * w) * scale)),
+            output,
+        )
+    })();
+    if result.is_err() {
+        output.clear();
+    }
+    result
+}
+
 #[cfg(test)]
 pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
     let scale = rms_norm_scale(values, weight, epsilon)?;
@@ -3603,6 +3694,84 @@ fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
     Ok(scale)
 }
 
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "The scalar normalization contract rounds the binary64 mean to binary32."
+)]
+fn add_rms_norm_scale(
+    values: &mut [f32],
+    delta: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+) -> Result<f32> {
+    if values.is_empty()
+        || values.len() != delta.len()
+        || values.len() != weight.len()
+        || !epsilon.is_finite()
+        || epsilon < 0.0
+    {
+        add_slice_in_place(values, delta);
+        return Err(invalid(
+            "RMS normalization requires equal nonempty vectors and nonnegative epsilon",
+        ));
+    }
+    let Ok(count) = u32::try_from(values.len()) else {
+        add_slice_in_place(values, delta);
+        return Err(invalid("RMS normalization vector length overflow"));
+    };
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    let sum = if let Some(sum) = neon::add_rms_norm_squares(values, delta, weight) {
+        sum?
+    } else {
+        let mut sum = 0.0_f64;
+        let mut all_finite = true;
+        for ((value, &d), &w) in values.iter_mut().zip(delta).zip(weight) {
+            let v = *value + d;
+            *value = v;
+            all_finite &= v.is_finite() && w.is_finite();
+            sum += f64::from(v * v);
+        }
+        if !all_finite {
+            return Err(invalid("nonfinite tensor or activation value"));
+        }
+        sum
+    };
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    let sum = {
+        let mut sum = 0.0_f64;
+        let mut all_finite = true;
+        for ((value, &d), &w) in values.iter_mut().zip(delta).zip(weight) {
+            let v = *value + d;
+            *value = v;
+            all_finite &= v.is_finite() && w.is_finite();
+            sum += f64::from(v * v);
+        }
+        if !all_finite {
+            return Err(invalid("nonfinite tensor or activation value"));
+        }
+        sum
+    };
+    let mean = (sum / f64::from(count)) as f32;
+    let scale = 1.0 / (mean + epsilon).sqrt();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(invalid("RMS normalization produced an invalid scale"));
+    }
+    Ok(scale)
+}
+
 /// Applies a normalized Sylvester Hadamard transform to one contiguous block.
 ///
 /// # Errors
@@ -3801,6 +3970,89 @@ fn rms_norm_hadamard_blocks_into<const PINNED: bool>(
     clippy::too_many_arguments,
     reason = "Fused RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
 )]
+fn rms_norm_scale_hadamard_into<const PINNED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    scale: f32,
+    block: usize,
+    signs: Option<&[f32]>,
+    parallelism: &RowParallelism,
+    norm_out: &mut Vec<f32>,
+    rotated_out: &mut Vec<f32>,
+) -> Result<()> {
+    if norm_out.len() != input.len() {
+        norm_out.clear();
+        norm_out.try_reserve_exact(input.len())?;
+        norm_out.resize(input.len(), 0.0);
+    }
+    if rotated_out.len() != input.len() {
+        rotated_out.clear();
+        rotated_out.try_reserve_exact(input.len())?;
+        rotated_out.resize(input.len(), 0.0);
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    let normalization = {
+        let count = u32::try_from(block)?;
+        1.0 / integer_float(i32::try_from(count)?).sqrt()
+    };
+    if parallelism.workers() > 1 && block >= 256 && input.len() >= block.saturating_mul(4) {
+        return parallelism.update_paired_chunks(
+            norm_out,
+            block,
+            rotated_out,
+            block,
+            |base_block, norm_chunk, rot_chunk| {
+                rms_norm_hadamard_blocks_into::<PINNED>(
+                    base_block,
+                    input,
+                    weight,
+                    scale,
+                    signs,
+                    block,
+                    norm_chunk,
+                    rot_chunk,
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    normalization,
+                )
+            },
+        );
+    }
+    rms_norm_hadamard_blocks_into::<PINNED>(
+        0,
+        input,
+        weight,
+        scale,
+        signs,
+        block,
+        norm_out,
+        rotated_out,
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        normalization,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Fused RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
+)]
 pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
     input: &[f32],
     weight: &[f32],
@@ -3819,72 +4071,57 @@ pub(crate) fn rms_norm_hadamard_into<const PINNED: bool>(
             return Err(invalid("Hadamard requires a finite power-of-two block"));
         }
         let scale = rms_norm_scale(input, weight, epsilon)?;
-        if norm_out.len() != input.len() {
-            norm_out.clear();
-            norm_out.try_reserve_exact(input.len())?;
-            norm_out.resize(input.len(), 0.0);
-        }
-        if rotated_out.len() != input.len() {
-            rotated_out.clear();
-            rotated_out.try_reserve_exact(input.len())?;
-            rotated_out.resize(input.len(), 0.0);
-        }
-        #[cfg(all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc",
-            target_feature = "neon"
-        ))]
-        let normalization = {
-            let count = u32::try_from(block)?;
-            1.0 / integer_float(i32::try_from(count)?).sqrt()
-        };
-        if parallelism.workers() > 1 && block >= 256 && input.len() >= block.saturating_mul(4) {
-            return parallelism.update_paired_chunks(
-                norm_out,
-                block,
-                rotated_out,
-                block,
-                |base_block, norm_chunk, rot_chunk| {
-                    rms_norm_hadamard_blocks_into::<PINNED>(
-                        base_block,
-                        input,
-                        weight,
-                        scale,
-                        signs,
-                        block,
-                        norm_chunk,
-                        rot_chunk,
-                        #[cfg(all(
-                            feature = "experimental-neon",
-                            target_arch = "aarch64",
-                            target_os = "windows",
-                            target_env = "msvc",
-                            target_feature = "neon"
-                        ))]
-                        normalization,
-                    )
-                },
-            );
-        }
-        rms_norm_hadamard_blocks_into::<PINNED>(
-            0,
+        rms_norm_scale_hadamard_into::<PINNED>(
             input,
             weight,
             scale,
-            signs,
             block,
+            signs,
+            parallelism,
             norm_out,
             rotated_out,
-            #[cfg(all(
-                feature = "experimental-neon",
-                target_arch = "aarch64",
-                target_os = "windows",
-                target_env = "msvc",
-                target_feature = "neon"
-            ))]
-            normalization,
+        )
+    })();
+    if result.is_err() {
+        norm_out.clear();
+        rotated_out.clear();
+    }
+    result
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Fused residual-add, RMSNorm and Hadamard rotation keeps explicit block geometry, parallelism and dual output buffers."
+)]
+pub(crate) fn add_rms_norm_hadamard_into<const PINNED: bool>(
+    values: &mut [f32],
+    delta: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    block: usize,
+    signs: Option<&[f32]>,
+    parallelism: &RowParallelism,
+    norm_out: &mut Vec<f32>,
+    rotated_out: &mut Vec<f32>,
+) -> Result<()> {
+    let result = (|| {
+        if !block.is_power_of_two()
+            || !values.len().is_multiple_of(block)
+            || signs.is_some_and(|s| s.len() < values.len())
+        {
+            add_slice_in_place(values, delta);
+            return Err(invalid("Hadamard requires a finite power-of-two block"));
+        }
+        let scale = add_rms_norm_scale(values, delta, weight, epsilon)?;
+        rms_norm_scale_hadamard_into::<PINNED>(
+            values,
+            weight,
+            scale,
+            block,
+            signs,
+            parallelism,
+            norm_out,
+            rotated_out,
         )
     })();
     if result.is_err() {

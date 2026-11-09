@@ -342,6 +342,78 @@ impl RowParallelism {
         update(0, first, second)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Triple-slice partition passes three slices, their unit sizes, and the task callback."
+    )]
+    pub(crate) fn update_triple_chunks<A: Send, B: Send, C: Send>(
+        &self,
+        first: &mut [A],
+        first_unit_size: usize,
+        second: &mut [B],
+        second_unit_size: usize,
+        third: &mut [C],
+        third_unit_size: usize,
+        update: impl Fn(usize, &mut [A], &mut [B], &mut [C]) -> Result<()> + Sync,
+    ) -> Result<()> {
+        if first_unit_size == 0
+            || second_unit_size == 0
+            || third_unit_size == 0
+            || !first.len().is_multiple_of(first_unit_size)
+            || !second.len().is_multiple_of(second_unit_size)
+            || !third.len().is_multiple_of(third_unit_size)
+        {
+            return Err(invalid(
+                "triple target lengths must be multiples of positive unit sizes",
+            ));
+        }
+        let units = first.len() / first_unit_size;
+        if second.len() / second_unit_size != units || third.len() / third_unit_size != units {
+            return Err(invalid("triple target unit counts must match"));
+        }
+        #[cfg(not(feature = "parallel-rows"))]
+        if self.uses_pool(units) {
+            return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool
+            && units > 1
+        {
+            use rayon::prelude::*;
+
+            let task_units = units.div_ceil(self.workers);
+            let first_task_elems = task_units * first_unit_size;
+            let second_task_elems = task_units * second_unit_size;
+            let third_task_elems = task_units * third_unit_size;
+            let tasks = units.div_ceil(task_units);
+            let mut errors = Vec::new();
+            errors.try_reserve_exact(tasks)?;
+            errors.resize_with(tasks, || None);
+            pool.install(|| {
+                first
+                    .par_chunks_mut(first_task_elems)
+                    .zip(second.par_chunks_mut(second_task_elems))
+                    .zip(third.par_chunks_mut(third_task_elems))
+                    .zip(errors.par_iter_mut())
+                    .enumerate()
+                    .for_each(
+                        |(task, (((first_chunk, second_chunk), third_chunk), error))| {
+                            if let Err(failure) =
+                                update(task * task_units, first_chunk, second_chunk, third_chunk)
+                            {
+                                *error = Some(failure);
+                            }
+                        },
+                    );
+            });
+            if let Some(failure) = errors.into_iter().flatten().next() {
+                return Err(failure);
+            }
+            return Ok(());
+        }
+        update(0, first, second, third)
+    }
+
     pub(super) const fn uses_pool(&self, rows: usize) -> bool {
         self.workers > 1 && rows > 1
     }

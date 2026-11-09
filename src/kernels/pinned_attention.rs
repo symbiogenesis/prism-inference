@@ -1368,6 +1368,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Cover 4x4, 2x4, and 2x2x4 multi-key query dot products and error paths together."
+    )]
     fn four_key_four_query_dot_matches_single_key_bits() -> crate::Result<()> {
         let capture: Capture = serde_json::from_str(include_str!(
             "../../tests/fixtures/swift-attention-dot.json"

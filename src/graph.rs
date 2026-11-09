@@ -3341,6 +3341,10 @@ impl Evaluation<'_, '_> {
                                 arithmetic.attention_softmax_round_f16(scores)?;
                             }
                             let probs: [&[f32]; 4] = [s0, s1, s2, s3];
+                            let g0 = &gate_ref[head * g.head..(head + 1) * g.head];
+                            let g1 = &gate_ref[(head + 1) * g.head..(head + 2) * g.head];
+                            let g2 = &gate_ref[(head + 2) * g.head..(head + 3) * g.head];
+                            let g3 = &gate_ref[(head + 3) * g.head..(head + 4) * g.head];
                             for (tile, (((out0, out1), out2), out3)) in
                                 r0.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
                                     .zip(r1.chunks_mut(
@@ -3356,19 +3360,19 @@ impl Evaluation<'_, '_> {
                             {
                                 let dimension =
                                     tile * crate::kernels::pinned_attention::VALUE_TILE_FOUR;
+                                let len = out0.len();
                                 arithmetic.attention_value_tile_four(
                                     values,
-                                    &value_ref[offset + dimension..offset + dimension + out0.len()],
+                                    &value_ref[offset + dimension..offset + dimension + len],
                                     offset + dimension,
                                     probs,
                                     [out0, out1, out2, out3],
                                 )?;
+                                mul_sigmoid_in_place(out0, &g0[dimension..dimension + len]);
+                                mul_sigmoid_in_place(out1, &g1[dimension..dimension + len]);
+                                mul_sigmoid_in_place(out2, &g2[dimension..dimension + len]);
+                                mul_sigmoid_in_place(out3, &g3[dimension..dimension + len]);
                             }
-                            mul_sigmoid_in_place(
-                                &mut attended_chunk
-                                    [head_offset * g.head..(head_offset + 4) * g.head],
-                                &gate_ref[head * g.head..(head + 4) * g.head],
-                            );
                             head_offset += 4;
                             continue;
                         }
@@ -3385,22 +3389,24 @@ impl Evaluation<'_, '_> {
                         scores[score_len - 1] = arithmetic
                             .attention_current_dot(q, &key_ref[offset..offset + g.head])?
                             * scale;
-                        // Nonflash V(F16) x softmax(F32) also converts its RHS to F16.
+                        // Nonflash V(F16) x softmax(F16) also converts its RHS to F16.
                         arithmetic.attention_softmax_round_f16(scores)?;
+                        let g_head = &gate_ref[head * g.head..(head + 1) * g.head];
                         for (tile, out) in result
                             .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
                             .enumerate()
                         {
                             let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
+                            let len = out.len();
                             arithmetic.attention_value_tile(
                                 values,
-                                &value_ref[offset + dimension..offset + dimension + out.len()],
+                                &value_ref[offset + dimension..offset + dimension + len],
                                 offset + dimension,
                                 scores,
                                 out,
                             )?;
+                            mul_sigmoid_in_place(out, &g_head[dimension..dimension + len]);
                         }
-                        mul_sigmoid_in_place(result, &gate_ref[head * g.head..(head + 1) * g.head]);
                         head_offset += 1;
                     }
                     Ok(())

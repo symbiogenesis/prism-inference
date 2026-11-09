@@ -13,6 +13,10 @@ use super::{VALUE_TILE, VALUE_TILE_FOUR, VALUE_TILE_FOUR_TWO_TOKENS, padded_dot_
 /// any channel's token order. The accumulator remains exactly 2 KiB; decoded
 /// FP16 values exist only for one four-channel load. No FP16 arithmetic or
 /// optional instruction set is required.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "Keep explicit temporal lane and channel group indices aligned across 2-row unrolling."
+)]
 pub(super) fn value_tile<'a>(
     neon: Neon,
     mut past: impl Iterator<Item = &'a [u16]>,
@@ -25,12 +29,54 @@ pub(super) fn value_tile<'a>(
     let mut sums = [[zero; VALUE_TILE / 4]; 16];
     let groups = output.len() / 4;
     let last = weights.len() - 1;
-    for (index, &weight) in weights[..last].iter().enumerate() {
+    let mut index = 0;
+    while index + 2 <= last {
+        let values0 = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let values1 = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let lane0 = index % 16;
+        let lane1 = (index + 1) % 16;
+        let w0 = f32x4::splat(neon, weights[index]);
+        let w1 = f32x4::splat(neon, weights[index + 1]);
+        let (val0_chunks8, val0_rem) = values0.as_chunks::<8>();
+        let (val1_chunks8, val1_rem) = values1.as_chunks::<8>();
+        for (pair_idx, (chunk0, chunk1)) in val0_chunks8.iter().zip(val1_chunks8).enumerate() {
+            let (v0_0, v0_1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk0);
+            let (v1_0, v1_1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk1);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            sums[lane0][g0] = v0_0.mul_add_precise(w0, sums[lane0][g0]);
+            sums[lane0][g1] = v0_1.mul_add_precise(w0, sums[lane0][g1]);
+            sums[lane1][g0] = v1_0.mul_add_precise(w1, sums[lane1][g0]);
+            sums[lane1][g1] = v1_1.mul_add_precise(w1, sums[lane1][g1]);
+        }
+        let rem_base = val0_chunks8.len() * 2;
+        for (rem_idx, (vals0, vals1)) in val0_rem
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(val1_rem.as_chunks::<4>().0)
+            .enumerate()
+        {
+            let v0 = super::super::neon::f16_bits_to_f32_x4(neon, *vals0);
+            let v1 = super::super::neon::f16_bits_to_f32_x4(neon, *vals1);
+            let g = rem_base + rem_idx;
+            sums[lane0][g] = v0.mul_add_precise(w0, sums[lane0][g]);
+            sums[lane1][g] = v1.mul_add_precise(w1, sums[lane1][g]);
+        }
+        index += 2;
+    }
+    if index < last {
         let values = past
             .next()
             .and_then(|row| row.get(range.start..range.end))
             .ok_or_else(|| invalid("pinned attention value row is short"))?;
-        let weight = f32x4::splat(neon, weight);
+        let weight = f32x4::splat(neon, weights[index]);
         let (sum_pairs, sum_tail) = sums[index % 16][..groups].as_chunks_mut::<2>();
         let (val_chunks8, val_rem) = values.as_chunks::<8>();
         for (pair, chunk8) in sum_pairs.iter_mut().zip(val_chunks8) {
@@ -81,6 +127,7 @@ pub(super) fn value_tile<'a>(
 #[allow(
     clippy::large_stack_arrays,
     clippy::needless_range_loop,
+    clippy::too_many_lines,
     reason = "Keep explicit 4-head and token indices aligned across the 32 KiB stack accumulator."
 )]
 pub(super) fn value_tile_four<'a>(
@@ -96,7 +143,54 @@ pub(super) fn value_tile_four<'a>(
     let groups = outputs[0].len() / 4;
     let token_count = weights[0].len();
     let last = token_count - 1;
-    for index in 0..last {
+    let mut index = 0;
+    while index + 2 <= last {
+        let values0 = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let values1 = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let lane0 = index % 16;
+        let lane1 = (index + 1) % 16;
+        let ws0: [f32x4<Neon>; 4] = std::array::from_fn(|h| f32x4::splat(neon, weights[h][index]));
+        let ws1: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, weights[h][index + 1]));
+        let (val0_chunks8, val0_rem) = values0.as_chunks::<8>();
+        let (val1_chunks8, val1_rem) = values1.as_chunks::<8>();
+        for (pair_idx, (chunk0, chunk1)) in val0_chunks8.iter().zip(val1_chunks8).enumerate() {
+            let (v0_0, v0_1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk0);
+            let (v1_0, v1_1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk1);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            for h in 0..4 {
+                sums[h][lane0][g0] = v0_0.mul_add_precise(ws0[h], sums[h][lane0][g0]);
+                sums[h][lane0][g1] = v0_1.mul_add_precise(ws0[h], sums[h][lane0][g1]);
+                sums[h][lane1][g0] = v1_0.mul_add_precise(ws1[h], sums[h][lane1][g0]);
+                sums[h][lane1][g1] = v1_1.mul_add_precise(ws1[h], sums[h][lane1][g1]);
+            }
+        }
+        let rem_base = val0_chunks8.len() * 2;
+        for (rem_idx, (vals0, vals1)) in val0_rem
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(val1_rem.as_chunks::<4>().0)
+            .enumerate()
+        {
+            let v0 = super::super::neon::f16_bits_to_f32_x4(neon, *vals0);
+            let v1 = super::super::neon::f16_bits_to_f32_x4(neon, *vals1);
+            let g = rem_base + rem_idx;
+            for h in 0..4 {
+                sums[h][lane0][g] = v0.mul_add_precise(ws0[h], sums[h][lane0][g]);
+                sums[h][lane1][g] = v1.mul_add_precise(ws1[h], sums[h][lane1][g]);
+            }
+        }
+        index += 2;
+    }
+    if index < last {
         let values = past
             .next()
             .and_then(|row| row.get(range.start..range.end))
@@ -185,7 +279,65 @@ pub(super) fn value_tile_four_two_tokens<'a>(
     let token_count1 = weights1[0].len();
     let last0 = token_count0 - 1;
     let last1 = token_count1 - 1;
-    for index in 0..last0 {
+    let mut index = 0;
+    while index + 2 <= last0 {
+        let values0 = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let values1 = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let lane0 = index % 16;
+        let lane1 = (index + 1) % 16;
+        let ws0_0: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, weights0[h][index]));
+        let ws0_1: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, weights0[h][index + 1]));
+        let ws1_0: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, weights1[h][index]));
+        let ws1_1: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, weights1[h][index + 1]));
+        let (val0_chunks8, val0_rem) = values0.as_chunks::<8>();
+        let (val1_chunks8, val1_rem) = values1.as_chunks::<8>();
+        for (pair_idx, (chunk0, chunk1)) in val0_chunks8.iter().zip(val1_chunks8).enumerate() {
+            let (v0_0, v0_1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk0);
+            let (v1_0, v1_1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk1);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            for h in 0..4 {
+                sums0[h][lane0][g0] = v0_0.mul_add_precise(ws0_0[h], sums0[h][lane0][g0]);
+                sums0[h][lane0][g1] = v0_1.mul_add_precise(ws0_0[h], sums0[h][lane0][g1]);
+                sums1[h][lane0][g0] = v0_0.mul_add_precise(ws1_0[h], sums1[h][lane0][g0]);
+                sums1[h][lane0][g1] = v0_1.mul_add_precise(ws1_0[h], sums1[h][lane0][g1]);
+                sums0[h][lane1][g0] = v1_0.mul_add_precise(ws0_1[h], sums0[h][lane1][g0]);
+                sums0[h][lane1][g1] = v1_1.mul_add_precise(ws0_1[h], sums0[h][lane1][g1]);
+                sums1[h][lane1][g0] = v1_0.mul_add_precise(ws1_1[h], sums1[h][lane1][g0]);
+                sums1[h][lane1][g1] = v1_1.mul_add_precise(ws1_1[h], sums1[h][lane1][g1]);
+            }
+        }
+        let rem_base = val0_chunks8.len() * 2;
+        for (rem_idx, (vals0, vals1)) in val0_rem
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(val1_rem.as_chunks::<4>().0)
+            .enumerate()
+        {
+            let v0 = super::super::neon::f16_bits_to_f32_x4(neon, *vals0);
+            let v1 = super::super::neon::f16_bits_to_f32_x4(neon, *vals1);
+            let g = rem_base + rem_idx;
+            for h in 0..4 {
+                sums0[h][lane0][g] = v0.mul_add_precise(ws0_0[h], sums0[h][lane0][g]);
+                sums1[h][lane0][g] = v0.mul_add_precise(ws1_0[h], sums1[h][lane0][g]);
+                sums0[h][lane1][g] = v1.mul_add_precise(ws0_1[h], sums0[h][lane1][g]);
+                sums1[h][lane1][g] = v1.mul_add_precise(ws1_1[h], sums1[h][lane1][g]);
+            }
+        }
+        index += 2;
+    }
+    if index < last0 {
         let values = past
             .next()
             .and_then(|row| row.get(range.start..range.end))

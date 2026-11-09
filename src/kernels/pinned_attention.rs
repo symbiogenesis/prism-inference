@@ -1479,4 +1479,139 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Cover PinnedSwift and Source 2-token 4-head value tiles across even and odd row counts."
+    )]
+    fn two_token_value_tiles_match_single_token_bits_for_even_and_odd_cached_rows()
+    -> crate::Result<()> {
+        let capture: Capture = serde_json::from_str(include_str!(
+            "../../tests/fixtures/swift-attention-dot.json"
+        ))?;
+        let values = capture.weighted_value;
+        let rows: Vec<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]> = (0..24)
+            .map(|r| {
+                let value = values.values[r % values.values.len()];
+                std::array::from_fn(|c| value.wrapping_add(u16::try_from((r + c) % 7).unwrap_or(0)))
+            })
+            .collect();
+        let current0: [f32; super::VALUE_TILE_FOUR_TWO_TOKENS] =
+            std::array::from_fn(|c| half_to_float(rows[rows.len() - 2][c]));
+        let current1: [f32; super::VALUE_TILE_FOUR_TWO_TOKENS] =
+            std::array::from_fn(|c| half_to_float(rows[rows.len() - 1][c]));
+        let probs_all: Vec<f32> = values
+            .probabilities
+            .into_iter()
+            .map(half_to_float)
+            .collect();
+        for len0 in [4_usize, 5, 19, 20] {
+            let len1 = len0 + 1;
+            let p0_heads: [[f32; 24]; 4] = std::array::from_fn(|h| {
+                let scale = f32::from(u8::try_from(h).unwrap_or(0)).mul_add(0.125, 0.75);
+                std::array::from_fn(|i| probs_all[i % probs_all.len()] * scale)
+            });
+            let p1_heads: [[f32; 24]; 4] = std::array::from_fn(|h| {
+                let scale = f32::from(u8::try_from(h).unwrap_or(0)).mul_add(-0.0625, 1.0);
+                std::array::from_fn(|i| probs_all[i % probs_all.len()] * scale)
+            });
+            let w0 = p0_heads.each_ref().map(|p| &p[..len0]);
+            let w1 = p1_heads.each_ref().map(|p| &p[..len1]);
+            let width = super::VALUE_TILE_FOUR_TWO_TOKENS;
+            let mut exp0 = [[0.0_f32; super::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+            let mut exp1 = [[0.0_f32; super::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+            let mut rows1 = rows[..len0 - 1].to_vec();
+            rows1.push(std::array::from_fn(|c| rows[rows.len() - 2][c]));
+            let mut act0 = [[f32::NAN; super::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+            let mut act1 = [[f32::NAN; super::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
+            {
+                let [e0_0, e0_1, e0_2, e0_3] = &mut exp0;
+                value_tile_four(
+                    rows[..len0 - 1]
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]>::as_slice),
+                    &current0[..width],
+                    w0,
+                    0,
+                    [e0_0, e0_1, e0_2, e0_3],
+                )?;
+                let [e1_0, e1_1, e1_2, e1_3] = &mut exp1;
+                value_tile_four(
+                    rows1
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]>::as_slice),
+                    &current1[..width],
+                    w1,
+                    0,
+                    [e1_0, e1_1, e1_2, e1_3],
+                )?;
+                let [a0_0, a0_1, a0_2, a0_3] = &mut act0;
+                let [a1_0, a1_1, a1_2, a1_3] = &mut act1;
+                super::value_tile_four_two_tokens(
+                    rows1
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]>::as_slice),
+                    [&current0[..width], &current1[..width]],
+                    w0,
+                    w1,
+                    0,
+                    [a0_0, a0_1, a0_2, a0_3],
+                    [a1_0, a1_1, a1_2, a1_3],
+                )?;
+            }
+            assert_eq!(
+                act0.map(|r| r.map(f32::to_bits)),
+                exp0.map(|r| r.map(f32::to_bits))
+            );
+            assert_eq!(
+                act1.map(|r| r.map(f32::to_bits)),
+                exp1.map(|r| r.map(f32::to_bits))
+            );
+            {
+                let [e0_0, e0_1, e0_2, e0_3] = &mut exp0;
+                crate::kernels::source_value_tile_four(
+                    rows[..len0 - 1]
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]>::as_slice),
+                    &current0[..width],
+                    0,
+                    w0,
+                    [e0_0, e0_1, e0_2, e0_3],
+                );
+                let [e1_0, e1_1, e1_2, e1_3] = &mut exp1;
+                crate::kernels::source_value_tile_four(
+                    rows1
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]>::as_slice),
+                    &current1[..width],
+                    0,
+                    w1,
+                    [e1_0, e1_1, e1_2, e1_3],
+                );
+                let [a0_0, a0_1, a0_2, a0_3] = &mut act0;
+                let [a1_0, a1_1, a1_2, a1_3] = &mut act1;
+                crate::kernels::source_value_tile_four_two_tokens(
+                    rows1
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR_TWO_TOKENS]>::as_slice),
+                    [&current0[..width], &current1[..width]],
+                    0,
+                    w0,
+                    w1,
+                    [a0_0, a0_1, a0_2, a0_3],
+                    [a1_0, a1_1, a1_2, a1_3],
+                );
+            }
+            assert_eq!(
+                act0.map(|r| r.map(f32::to_bits)),
+                exp0.map(|r| r.map(f32::to_bits))
+            );
+            assert_eq!(
+                act1.map(|r| r.map(f32::to_bits)),
+                exp1.map(|r| r.map(f32::to_bits))
+            );
+        }
+        Ok(())
+    }
 }

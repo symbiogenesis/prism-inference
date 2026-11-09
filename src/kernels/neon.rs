@@ -1362,9 +1362,35 @@ pub(super) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) -> bool {
     };
     let count = values.len().min(gate.len());
     let one = f32x4::splat(neon, 1.0);
-    let (v_chunks, v_tail) = values[..count].as_chunks_mut::<4>();
-    let (g_chunks, g_tail) = gate[..count].as_chunks::<4>();
-    for (v_chunk, g_chunk) in v_chunks.iter_mut().zip(g_chunks) {
+    let (v_chunks8, v_rem8) = values[..count].as_chunks_mut::<8>();
+    let (g_chunks8, g_rem8) = gate[..count].as_chunks::<8>();
+    for (v_chunk8, g_chunk8) in v_chunks8.iter_mut().zip(g_chunks8) {
+        let v0 = f32x4::from_slice(neon, &v_chunk8[..4]);
+        let v1 = f32x4::from_slice(neon, &v_chunk8[4..]);
+        let exp_neg0 = f32x4::load_array(
+            neon,
+            [
+                (-g_chunk8[0]).exp(),
+                (-g_chunk8[1]).exp(),
+                (-g_chunk8[2]).exp(),
+                (-g_chunk8[3]).exp(),
+            ],
+        );
+        let exp_neg1 = f32x4::load_array(
+            neon,
+            [
+                (-g_chunk8[4]).exp(),
+                (-g_chunk8[5]).exp(),
+                (-g_chunk8[6]).exp(),
+                (-g_chunk8[7]).exp(),
+            ],
+        );
+        (v0 * (one / (one + exp_neg0))).store_slice(&mut v_chunk8[..4]);
+        (v1 * (one / (one + exp_neg1))).store_slice(&mut v_chunk8[4..]);
+    }
+    let (v_chunks4, v_tail) = v_rem8.as_chunks_mut::<4>();
+    let (g_chunks4, g_tail) = g_rem8.as_chunks::<4>();
+    for (v_chunk, g_chunk) in v_chunks4.iter_mut().zip(g_chunks4) {
         let v = f32x4::from_slice(neon, v_chunk);
         let exp_neg = f32x4::load_array(
             neon,
@@ -1390,7 +1416,7 @@ pub(super) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) -> bool {
     reason = "Preserve each channel's binary64 sum and final binary32 rounding."
 )]
 pub(super) fn source_value_tile<'a>(
-    past: impl Iterator<Item = &'a [u16]>,
+    mut past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     offset: usize,
     probabilities: &[f32],
@@ -1402,7 +1428,70 @@ pub(super) fn source_value_tile<'a>(
     let out_len = output.len();
     let last = probabilities.len().saturating_sub(1);
     let mut sums = [-0.0_f64; super::pinned_attention::VALUE_TILE];
-    for (past_row, &prob) in past.zip(&probabilities[..last]) {
+    let mut pos = 0;
+    while pos + 2 <= last {
+        let Some(past_row0) = past.next() else {
+            break;
+        };
+        let row0 = &past_row0[offset..offset + out_len];
+        let prob0 = probabilities[pos];
+        let prob0_vec = f32x4::splat(neon, prob0);
+        let (chunks0, rem0) = row0.as_chunks::<8>();
+        let Some(past_row1) = past.next() else {
+            for (chunk_idx, chunk8) in chunks0.iter().enumerate() {
+                let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+                let p0 = (prob0_vec * v0).to_array();
+                let p1 = (prob0_vec * v1).to_array();
+                let base = chunk_idx * 8;
+                let s = &mut sums[base..base + 8];
+                s[0] += f64::from(p0[0]);
+                s[1] += f64::from(p0[1]);
+                s[2] += f64::from(p0[2]);
+                s[3] += f64::from(p0[3]);
+                s[4] += f64::from(p1[0]);
+                s[5] += f64::from(p1[1]);
+                s[6] += f64::from(p1[2]);
+                s[7] += f64::from(p1[3]);
+            }
+            let rem_base = chunks0.len() * 8;
+            for (i, &val) in rem0.iter().enumerate() {
+                sums[rem_base + i] += f64::from(prob0 * bonsai_ternary::half_to_float(val));
+            }
+            pos = last;
+            break;
+        };
+        let row1 = &past_row1[offset..offset + out_len];
+        let prob1 = probabilities[pos + 1];
+        let prob1_vec = f32x4::splat(neon, prob1);
+        let (chunks1, rem1) = row1.as_chunks::<8>();
+        for (chunk_idx, (chunk8_0, chunk8_1)) in chunks0.iter().zip(chunks1).enumerate() {
+            let (v0_0, v0_1) = f16_bits_to_f32_x8(neon, chunk8_0);
+            let (v1_0, v1_1) = f16_bits_to_f32_x8(neon, chunk8_1);
+            let p0_0 = (prob0_vec * v0_0).to_array();
+            let p0_1 = (prob0_vec * v0_1).to_array();
+            let p1_0 = (prob1_vec * v1_0).to_array();
+            let p1_1 = (prob1_vec * v1_1).to_array();
+            let base = chunk_idx * 8;
+            let s = &mut sums[base..base + 8];
+            s[0] = (s[0] + f64::from(p0_0[0])) + f64::from(p1_0[0]);
+            s[1] = (s[1] + f64::from(p0_0[1])) + f64::from(p1_0[1]);
+            s[2] = (s[2] + f64::from(p0_0[2])) + f64::from(p1_0[2]);
+            s[3] = (s[3] + f64::from(p0_0[3])) + f64::from(p1_0[3]);
+            s[4] = (s[4] + f64::from(p0_1[0])) + f64::from(p1_1[0]);
+            s[5] = (s[5] + f64::from(p0_1[1])) + f64::from(p1_1[1]);
+            s[6] = (s[6] + f64::from(p0_1[2])) + f64::from(p1_1[2]);
+            s[7] = (s[7] + f64::from(p0_1[3])) + f64::from(p1_1[3]);
+        }
+        let rem_base = chunks0.len() * 8;
+        for (i, (&val0, &val1)) in rem0.iter().zip(rem1).enumerate() {
+            let d0 = bonsai_ternary::half_to_float(val0);
+            let d1 = bonsai_ternary::half_to_float(val1);
+            sums[rem_base + i] =
+                (sums[rem_base + i] + f64::from(prob0 * d0)) + f64::from(prob1 * d1);
+        }
+        pos += 2;
+    }
+    for (past_row, &prob) in past.zip(&probabilities[pos..last]) {
         let row = &past_row[offset..offset + out_len];
         let prob_vec = f32x4::splat(neon, prob);
         let (chunks8, rem) = row.as_chunks::<8>();
@@ -1438,10 +1527,11 @@ pub(super) fn source_value_tile<'a>(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::needless_range_loop,
+    clippy::too_many_lines,
     reason = "Preserve each channel's binary64 sum and final binary32 rounding across 4 heads."
 )]
 pub(super) fn source_value_tile_four<'a>(
-    past: impl Iterator<Item = &'a [u16]>,
+    mut past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     offset: usize,
     probabilities: [&[f32]; 4],
@@ -1453,10 +1543,84 @@ pub(super) fn source_value_tile_four<'a>(
     let out_len = outputs[0].len();
     let last = probabilities[0].len().saturating_sub(1);
     let mut sums = [[-0.0_f64; super::pinned_attention::VALUE_TILE_FOUR]; 4];
-    for (pos, past_row) in past.enumerate() {
+    let mut pos = 0;
+    while pos + 2 <= last {
+        let Some(past_row0) = past.next() else {
+            break;
+        };
+        let row0 = &past_row0[offset..offset + out_len];
+        let probs0: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities[h][pos]));
+        let (chunks0, rem0) = row0.as_chunks::<8>();
+        let Some(past_row1) = past.next() else {
+            for (chunk_idx, chunk8) in chunks0.iter().enumerate() {
+                let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+                let base = chunk_idx * 8;
+                for h in 0..4 {
+                    let p0 = (probs0[h] * v0).to_array();
+                    let p1 = (probs0[h] * v1).to_array();
+                    let s = &mut sums[h][base..base + 8];
+                    s[0] += f64::from(p0[0]);
+                    s[1] += f64::from(p0[1]);
+                    s[2] += f64::from(p0[2]);
+                    s[3] += f64::from(p0[3]);
+                    s[4] += f64::from(p1[0]);
+                    s[5] += f64::from(p1[1]);
+                    s[6] += f64::from(p1[2]);
+                    s[7] += f64::from(p1[3]);
+                }
+            }
+            let rem_base = chunks0.len() * 8;
+            for (i, &val) in rem0.iter().enumerate() {
+                let decoded = bonsai_ternary::half_to_float(val);
+                for h in 0..4 {
+                    sums[h][rem_base + i] += f64::from(probabilities[h][pos] * decoded);
+                }
+            }
+            pos = last;
+            break;
+        };
+        let row1 = &past_row1[offset..offset + out_len];
+        let probs1: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities[h][pos + 1]));
+        let (chunks1, rem1) = row1.as_chunks::<8>();
+        for (chunk_idx, (chunk8_0, chunk8_1)) in chunks0.iter().zip(chunks1).enumerate() {
+            let (v0_0, v0_1) = f16_bits_to_f32_x8(neon, chunk8_0);
+            let (v1_0, v1_1) = f16_bits_to_f32_x8(neon, chunk8_1);
+            let base = chunk_idx * 8;
+            for h in 0..4 {
+                let p0_0 = (probs0[h] * v0_0).to_array();
+                let p0_1 = (probs0[h] * v0_1).to_array();
+                let p1_0 = (probs1[h] * v1_0).to_array();
+                let p1_1 = (probs1[h] * v1_1).to_array();
+                let s = &mut sums[h][base..base + 8];
+                s[0] = (s[0] + f64::from(p0_0[0])) + f64::from(p1_0[0]);
+                s[1] = (s[1] + f64::from(p0_0[1])) + f64::from(p1_0[1]);
+                s[2] = (s[2] + f64::from(p0_0[2])) + f64::from(p1_0[2]);
+                s[3] = (s[3] + f64::from(p0_0[3])) + f64::from(p1_0[3]);
+                s[4] = (s[4] + f64::from(p0_1[0])) + f64::from(p1_1[0]);
+                s[5] = (s[5] + f64::from(p0_1[1])) + f64::from(p1_1[1]);
+                s[6] = (s[6] + f64::from(p0_1[2])) + f64::from(p1_1[2]);
+                s[7] = (s[7] + f64::from(p0_1[3])) + f64::from(p1_1[3]);
+            }
+        }
+        let rem_base = chunks0.len() * 8;
+        for (i, (&val0, &val1)) in rem0.iter().zip(rem1).enumerate() {
+            let d0 = bonsai_ternary::half_to_float(val0);
+            let d1 = bonsai_ternary::half_to_float(val1);
+            for h in 0..4 {
+                sums[h][rem_base + i] = (sums[h][rem_base + i]
+                    + f64::from(probabilities[h][pos] * d0))
+                    + f64::from(probabilities[h][pos + 1] * d1);
+            }
+        }
+        pos += 2;
+    }
+    for (rem_idx, past_row) in past.enumerate() {
+        let p_idx = pos + rem_idx;
         let row = &past_row[offset..offset + out_len];
         let probs: [f32x4<Neon>; 4] =
-            std::array::from_fn(|h| f32x4::splat(neon, probabilities[h][pos]));
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities[h][p_idx]));
         let (chunks8, rem) = row.as_chunks::<8>();
         for (chunk_idx, chunk8) in chunks8.iter().enumerate() {
             let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
@@ -1479,7 +1643,7 @@ pub(super) fn source_value_tile_four<'a>(
         for (i, &val) in rem.iter().enumerate() {
             let decoded = bonsai_ternary::half_to_float(val);
             for h in 0..4 {
-                sums[h][rem_base + i] += f64::from(probabilities[h][pos] * decoded);
+                sums[h][rem_base + i] += f64::from(probabilities[h][p_idx] * decoded);
             }
         }
     }
@@ -1500,12 +1664,13 @@ pub(super) fn source_value_tile_four<'a>(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::needless_range_loop,
+    clippy::similar_names,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens and four heads."
 )]
 pub(super) fn source_value_tile_four_two_tokens<'a>(
-    past: impl Iterator<Item = &'a [u16]>,
+    mut past: impl Iterator<Item = &'a [u16]>,
     currents: [&[f32]; 2],
     offset: usize,
     probabilities0: [&[f32]; 4],
@@ -1521,14 +1686,121 @@ pub(super) fn source_value_tile_four_two_tokens<'a>(
     let last1 = probabilities1[0].len().saturating_sub(1);
     let mut sums0 = [[-0.0_f64; super::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
     let mut sums1 = [[-0.0_f64; super::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS]; 4];
-    for (pos, past_row) in past.enumerate() {
+    let mut pos = 0;
+    while pos + 2 <= last0 {
+        let Some(past_row0) = past.next() else {
+            break;
+        };
+        let row0 = &past_row0[offset..offset + out_len];
+        let probs0_a: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities0[h][pos]));
+        let probs1_a: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities1[h][pos]));
+        let (chunks0, rem0) = row0.as_chunks::<8>();
+        let Some(past_row1) = past.next() else {
+            for (chunk_idx, chunk8) in chunks0.iter().enumerate() {
+                let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
+                let base = chunk_idx * 8;
+                for h in 0..4 {
+                    let p0_0 = (probs0_a[h] * v0).to_array();
+                    let p0_1 = (probs0_a[h] * v1).to_array();
+                    let s0 = &mut sums0[h][base..base + 8];
+                    s0[0] += f64::from(p0_0[0]);
+                    s0[1] += f64::from(p0_0[1]);
+                    s0[2] += f64::from(p0_0[2]);
+                    s0[3] += f64::from(p0_0[3]);
+                    s0[4] += f64::from(p0_1[0]);
+                    s0[5] += f64::from(p0_1[1]);
+                    s0[6] += f64::from(p0_1[2]);
+                    s0[7] += f64::from(p0_1[3]);
+                    let p1_0 = (probs1_a[h] * v0).to_array();
+                    let p1_1 = (probs1_a[h] * v1).to_array();
+                    let s1 = &mut sums1[h][base..base + 8];
+                    s1[0] += f64::from(p1_0[0]);
+                    s1[1] += f64::from(p1_0[1]);
+                    s1[2] += f64::from(p1_0[2]);
+                    s1[3] += f64::from(p1_0[3]);
+                    s1[4] += f64::from(p1_1[0]);
+                    s1[5] += f64::from(p1_1[1]);
+                    s1[6] += f64::from(p1_1[2]);
+                    s1[7] += f64::from(p1_1[3]);
+                }
+            }
+            let rem_base = chunks0.len() * 8;
+            for (i, &val) in rem0.iter().enumerate() {
+                let decoded = bonsai_ternary::half_to_float(val);
+                for h in 0..4 {
+                    sums0[h][rem_base + i] += f64::from(probabilities0[h][pos] * decoded);
+                    sums1[h][rem_base + i] += f64::from(probabilities1[h][pos] * decoded);
+                }
+            }
+            pos = last1;
+            break;
+        };
+        let row1 = &past_row1[offset..offset + out_len];
+        let probs0_b: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities0[h][pos + 1]));
+        let probs1_b: [f32x4<Neon>; 4] =
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities1[h][pos + 1]));
+        let (chunks1, rem1) = row1.as_chunks::<8>();
+        for (chunk_idx, (chunk8_0, chunk8_1)) in chunks0.iter().zip(chunks1).enumerate() {
+            let (v0_0, v0_1) = f16_bits_to_f32_x8(neon, chunk8_0);
+            let (v1_0, v1_1) = f16_bits_to_f32_x8(neon, chunk8_1);
+            let base = chunk_idx * 8;
+            for h in 0..4 {
+                let p0a_0 = (probs0_a[h] * v0_0).to_array();
+                let p0a_1 = (probs0_a[h] * v0_1).to_array();
+                let p0b_0 = (probs0_b[h] * v1_0).to_array();
+                let p0b_1 = (probs0_b[h] * v1_1).to_array();
+                let s0 = &mut sums0[h][base..base + 8];
+                s0[0] = (s0[0] + f64::from(p0a_0[0])) + f64::from(p0b_0[0]);
+                s0[1] = (s0[1] + f64::from(p0a_0[1])) + f64::from(p0b_0[1]);
+                s0[2] = (s0[2] + f64::from(p0a_0[2])) + f64::from(p0b_0[2]);
+                s0[3] = (s0[3] + f64::from(p0a_0[3])) + f64::from(p0b_0[3]);
+                s0[4] = (s0[4] + f64::from(p0a_1[0])) + f64::from(p0b_1[0]);
+                s0[5] = (s0[5] + f64::from(p0a_1[1])) + f64::from(p0b_1[1]);
+                s0[6] = (s0[6] + f64::from(p0a_1[2])) + f64::from(p0b_1[2]);
+                s0[7] = (s0[7] + f64::from(p0a_1[3])) + f64::from(p0b_1[3]);
+
+                let p1a_0 = (probs1_a[h] * v0_0).to_array();
+                let p1a_1 = (probs1_a[h] * v0_1).to_array();
+                let p1b_0 = (probs1_b[h] * v1_0).to_array();
+                let p1b_1 = (probs1_b[h] * v1_1).to_array();
+                let s1 = &mut sums1[h][base..base + 8];
+                s1[0] = (s1[0] + f64::from(p1a_0[0])) + f64::from(p1b_0[0]);
+                s1[1] = (s1[1] + f64::from(p1a_0[1])) + f64::from(p1b_0[1]);
+                s1[2] = (s1[2] + f64::from(p1a_0[2])) + f64::from(p1b_0[2]);
+                s1[3] = (s1[3] + f64::from(p1a_0[3])) + f64::from(p1b_0[3]);
+                s1[4] = (s1[4] + f64::from(p1a_1[0])) + f64::from(p1b_1[0]);
+                s1[5] = (s1[5] + f64::from(p1a_1[1])) + f64::from(p1b_1[1]);
+                s1[6] = (s1[6] + f64::from(p1a_1[2])) + f64::from(p1b_1[2]);
+                s1[7] = (s1[7] + f64::from(p1a_1[3])) + f64::from(p1b_1[3]);
+            }
+        }
+        let rem_base = chunks0.len() * 8;
+        for (i, (&val0, &val1)) in rem0.iter().zip(rem1).enumerate() {
+            let d0 = bonsai_ternary::half_to_float(val0);
+            let d1 = bonsai_ternary::half_to_float(val1);
+            for h in 0..4 {
+                sums0[h][rem_base + i] = (sums0[h][rem_base + i]
+                    + f64::from(probabilities0[h][pos] * d0))
+                    + f64::from(probabilities0[h][pos + 1] * d1);
+                sums1[h][rem_base + i] = (sums1[h][rem_base + i]
+                    + f64::from(probabilities1[h][pos] * d0))
+                    + f64::from(probabilities1[h][pos + 1] * d1);
+            }
+        }
+        pos += 2;
+    }
+    for (rem_idx, past_row) in past.enumerate() {
+        let p_idx = pos + rem_idx;
         let row = &past_row[offset..offset + out_len];
         let probs1: [f32x4<Neon>; 4] =
-            std::array::from_fn(|h| f32x4::splat(neon, probabilities1[h][pos]));
+            std::array::from_fn(|h| f32x4::splat(neon, probabilities1[h][p_idx]));
         let (chunks8, rem) = row.as_chunks::<8>();
-        if pos < last0 {
+        if p_idx < last0 {
             let probs0: [f32x4<Neon>; 4] =
-                std::array::from_fn(|h| f32x4::splat(neon, probabilities0[h][pos]));
+                std::array::from_fn(|h| f32x4::splat(neon, probabilities0[h][p_idx]));
             for (chunk_idx, chunk8) in chunks8.iter().enumerate() {
                 let (v0, v1) = f16_bits_to_f32_x8(neon, chunk8);
                 let base = chunk_idx * 8;
@@ -1561,8 +1833,8 @@ pub(super) fn source_value_tile_four_two_tokens<'a>(
             for (i, &val) in rem.iter().enumerate() {
                 let decoded = bonsai_ternary::half_to_float(val);
                 for h in 0..4 {
-                    sums0[h][rem_base + i] += f64::from(probabilities0[h][pos] * decoded);
-                    sums1[h][rem_base + i] += f64::from(probabilities1[h][pos] * decoded);
+                    sums0[h][rem_base + i] += f64::from(probabilities0[h][p_idx] * decoded);
+                    sums1[h][rem_base + i] += f64::from(probabilities1[h][p_idx] * decoded);
                 }
             }
         } else {
@@ -1587,7 +1859,7 @@ pub(super) fn source_value_tile_four_two_tokens<'a>(
             for (i, &val) in rem.iter().enumerate() {
                 let decoded = bonsai_ternary::half_to_float(val);
                 for h in 0..4 {
-                    sums1[h][rem_base + i] += f64::from(probabilities1[h][pos] * decoded);
+                    sums1[h][rem_base + i] += f64::from(probabilities1[h][p_idx] * decoded);
                 }
             }
         }

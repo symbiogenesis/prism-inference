@@ -465,6 +465,10 @@ pub(super) struct Event {
 
 struct Command {
     input: Input,
+    context: CommandContext,
+}
+
+struct CommandContext {
     cancel: Cancellation,
     deadline: Instant,
     events: channel::Sender<Event>,
@@ -517,8 +521,9 @@ impl Worker {
                         busy: &active,
                         idle: &notified,
                     };
-                    let result = state.execute(&command);
-                    let _ = command.events.try_send(Event {
+                    let Command { input, context } = command;
+                    let result = state.execute(input, &context);
+                    let _ = context.events.try_send(Event {
                         output: Output::Done(result),
                         ack: None,
                     });
@@ -549,9 +554,11 @@ impl Worker {
         self.cancellation = Some(cancellation.clone());
         let command = Command {
             input,
-            cancel: cancellation,
-            deadline,
-            events,
+            context: CommandContext {
+                cancel: cancellation,
+                deadline,
+                events,
+            },
         };
         if self
             .commands
@@ -597,44 +604,45 @@ struct State<E: Engine> {
 }
 
 impl<E: Engine> State<E> {
-    fn execute(&mut self, command: &Command) -> Result<(), NativeBackendError> {
-        check(command)?;
-        match &command.input {
+    fn execute(
+        &mut self,
+        input: Input,
+        context: &CommandContext,
+    ) -> Result<(), NativeBackendError> {
+        check(context)?;
+        match input {
             Input::Reset => {
                 self.faulted = true;
                 self.counted = None;
                 self.engine
                     .reset()
                     .map_err(|_| NativeBackendError::Engine)?;
-                acknowledge(command, Output::Reset)?;
+                acknowledge(context, Output::Reset)?;
                 self.faulted = false;
                 Ok(())
             }
             Input::Count(_) if self.faulted => Err(NativeBackendError::Engine),
-            Input::Count(_) => self.count(command),
-            Input::Generate(pending) => self.generate(command, pending),
+            Input::Count(pending) => self.count(context, pending),
+            Input::Generate(pending) => self.generate(context, &pending),
         }
     }
 
-    fn count(&mut self, command: &Command) -> Result<(), NativeBackendError> {
+    fn count(
+        &mut self,
+        context: &CommandContext,
+        pending: PendingChat,
+    ) -> Result<(), NativeBackendError> {
         self.counted = None;
-        let Input::Count(pending) = &command.input else {
-            return Err(NativeBackendError::Engine);
-        };
-        let prepared = self.engine.prepare(PendingChat {
-            body: pending.body.clone(),
-            max_completion_tokens: pending.max_completion_tokens,
-            stream: pending.stream,
-        })?;
-        check(command)?;
-        acknowledge(command, Output::Count(E::properties(&prepared).0))?;
+        let prepared = self.engine.prepare(pending)?;
+        check(context)?;
+        acknowledge(context, Output::Count(E::properties(&prepared).0))?;
         self.counted = Some(prepared);
         Ok(())
     }
 
     fn generate(
         &mut self,
-        command: &Command,
+        context: &CommandContext,
         pending: &PendingChat,
     ) -> Result<(), NativeBackendError> {
         if self.faulted {
@@ -652,7 +660,7 @@ impl<E: Engine> State<E> {
         // successful reset, including missing write/terminal acknowledgements.
         self.faulted = true;
         acknowledge(
-            command,
+            context,
             Output::Started {
                 prompt,
                 streaming,
@@ -660,36 +668,36 @@ impl<E: Engine> State<E> {
             },
         )?;
         self.engine
-            .complete(&prepared, &command.cancel, command.deadline, |event| {
+            .complete(&prepared, &context.cancel, context.deadline, |event| {
                 let output = match event {
                     TextEvent::Delta(text) => Output::Delta(text.to_owned()),
                     TextEvent::Complete(value) => Output::Complete(value),
                 };
-                acknowledge(command, output).map_err(|_| {
+                acknowledge(context, output).map_err(|_| {
                     std::io::Error::other("native output acknowledgement failed").into()
                 })
             })
             .map_err(|_| NativeBackendError::Engine)?;
-        check(command)?;
+        check(context)?;
         self.faulted = false;
         Ok(())
     }
 }
 
-fn check(command: &Command) -> Result<(), NativeBackendError> {
-    if command.cancel.is_cancelled() {
+fn check(context: &CommandContext) -> Result<(), NativeBackendError> {
+    if context.cancel.is_cancelled() {
         return Err(NativeBackendError::ClientAbandoned);
     }
-    if Instant::now() >= command.deadline {
+    if Instant::now() >= context.deadline {
         return Err(NativeBackendError::Deadline);
     }
     Ok(())
 }
 
-fn acknowledge(command: &Command, output: Output) -> Result<(), NativeBackendError> {
-    check(command)?;
+fn acknowledge(context: &CommandContext, output: Output) -> Result<(), NativeBackendError> {
+    check(context)?;
     let (send, receive) = mpsc::sync_channel(1);
-    command
+    context
         .events
         .blocking_send(Event {
             output,
@@ -697,8 +705,8 @@ fn acknowledge(command: &Command, output: Output) -> Result<(), NativeBackendErr
         })
         .map_err(|_| NativeBackendError::ClientAbandoned)?;
     loop {
-        check(command)?;
-        let remaining = command
+        check(context)?;
+        let remaining = context
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(NativeBackendError::Deadline)?;
@@ -710,5 +718,5 @@ fn acknowledge(command: &Command, output: Output) -> Result<(), NativeBackendErr
             }
         }
     }
-    check(command)
+    check(context)
 }

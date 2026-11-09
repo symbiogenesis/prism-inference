@@ -323,6 +323,22 @@ impl Arithmetic {
         }
     }
 
+    fn gdn_dot_pair_eight_rows(
+        self,
+        states: [&[f32]; 8],
+        first: &[f32],
+        second: &[f32],
+    ) -> Result<[(f32, f32); 8]> {
+        match self {
+            Self::Source => Ok(crate::kernels::float_dot_pair_eight_rows(
+                states, first, second,
+            )),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_gdn::dot_pair_eight_rows(states, first, second)
+            }
+        }
+    }
+
     fn gdn_decay_and_dot(self, state: &mut [f32], key: &[f32], decay: f32) -> Result<f32> {
         match self {
             Self::Source => {
@@ -813,6 +829,75 @@ impl Arithmetic {
                 )
             }
             Self::PinnedSwift => crate::kernels::pinned_gdn::step_four_rows_tokens_from(
+                previous, states, inputs, row, stride, scale, output,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep 8-row GDN step parameters explicit."
+    )]
+    fn gdn_step_eight_rows_from(
+        self,
+        previous: [&[f32]; 8],
+        states: [&mut [f32]; 8],
+        key: &[f32],
+        query: &[f32],
+        decay: f32,
+        values: [f32; 8],
+        beta: f32,
+    ) -> Result<[f32; 8]> {
+        match self {
+            Self::Source => {
+                let [s0, s1, s2, s3, s4, s5, s6, s7] = states;
+                Ok([
+                    self.gdn_step_row_from(previous[0], s0, key, query, decay, values[0], beta)?,
+                    self.gdn_step_row_from(previous[1], s1, key, query, decay, values[1], beta)?,
+                    self.gdn_step_row_from(previous[2], s2, key, query, decay, values[2], beta)?,
+                    self.gdn_step_row_from(previous[3], s3, key, query, decay, values[3], beta)?,
+                    self.gdn_step_row_from(previous[4], s4, key, query, decay, values[4], beta)?,
+                    self.gdn_step_row_from(previous[5], s5, key, query, decay, values[5], beta)?,
+                    self.gdn_step_row_from(previous[6], s6, key, query, decay, values[6], beta)?,
+                    self.gdn_step_row_from(previous[7], s7, key, query, decay, values[7], beta)?,
+                ])
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::step_eight_rows_from(
+                previous, states, key, query, decay, values, beta,
+            ),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep 8-row multi-token GDN recurrence parameters explicit."
+    )]
+    fn gdn_step_eight_rows_tokens_from(
+        self,
+        previous: [&[f32]; 8],
+        states: [&mut [f32]; 8],
+        inputs: &[crate::kernels::pinned_gdn::ChunkInput<'_>],
+        row: usize,
+        stride: usize,
+        scale: f32,
+        output: &mut [f32],
+    ) -> Result<()> {
+        match self {
+            Self::Source => {
+                for (r, state_row) in states.into_iter().enumerate() {
+                    self.gdn_step_row_tokens_from(
+                        previous[r],
+                        state_row,
+                        inputs,
+                        row + r,
+                        stride,
+                        scale,
+                        output,
+                    )?;
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::step_eight_rows_tokens_from(
                 previous, states, inputs, row, stride, scale, output,
             ),
         }
@@ -3394,8 +3479,38 @@ impl Evaluation<'_, '_> {
                         let update = sigmoid(beta_ref[head]);
                         let row_stride = g.ssm_head;
                         let row_count = v.len();
+                        let eight_row_blocks = row_count / 8;
+                        for block_idx in 0..eight_row_blocks {
+                            let row_idx = block_idx * 8;
+                            let prev_rows: [&[f32]; 8] = std::array::from_fn(|r| {
+                                &prev_state
+                                    [(row_idx + r) * row_stride..(row_idx + r + 1) * row_stride]
+                            });
+                            let state_slice =
+                                &mut state[row_idx * row_stride..(row_idx + 8) * row_stride];
+                            let (h0, h1) = state_slice.split_at_mut(4 * row_stride);
+                            let (s01, s23) = h0.split_at_mut(2 * row_stride);
+                            let (s45, s67) = h1.split_at_mut(2 * row_stride);
+                            let (s0, s1) = s01.split_at_mut(row_stride);
+                            let (s2, s3) = s23.split_at_mut(row_stride);
+                            let (s4, s5) = s45.split_at_mut(row_stride);
+                            let (s6, s7) = s67.split_at_mut(row_stride);
+                            let values: [f32; 8] = std::array::from_fn(|r| v[row_idx + r]);
+                            let outs = arithmetic.gdn_step_eight_rows_from(
+                                prev_rows,
+                                [s0, s1, s2, s3, s4, s5, s6, s7],
+                                k,
+                                q,
+                                decay,
+                                values,
+                                update,
+                            )?;
+                            for (r, &out_val) in outs.iter().enumerate() {
+                                output[row_idx + r] = out_val * scale;
+                            }
+                        }
                         let four_row_blocks = row_count / 4;
-                        for block_idx in 0..four_row_blocks {
+                        for block_idx in (eight_row_blocks * 2)..four_row_blocks {
                             let row_idx = block_idx * 4;
                             let prev_rows = [
                                 &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride],

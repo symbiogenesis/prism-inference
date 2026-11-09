@@ -110,6 +110,51 @@ pub(crate) fn dot_pair_four_rows(
     ])
 }
 
+/// Computes `[(dot(states[r], first), dot(states[r], second)); 8]` in a single pass
+/// over `first` and `second`.
+///
+/// # Errors
+/// Rejects unequal vector lengths or a nonfinite result.
+pub(crate) fn dot_pair_eight_rows(
+    states: [&[f32]; 8],
+    first: &[f32],
+    second: &[f32],
+) -> Result<[(f32, f32); 8]> {
+    let width = first.len();
+    if second.len() != width || states.iter().any(|state| state.len() != width) {
+        return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(pairs) = neon::dot_pair_eight_rows(states, first, second) {
+        return Ok([
+            (super::finite(pairs[0].0)?, super::finite(pairs[0].1)?),
+            (super::finite(pairs[1].0)?, super::finite(pairs[1].1)?),
+            (super::finite(pairs[2].0)?, super::finite(pairs[2].1)?),
+            (super::finite(pairs[3].0)?, super::finite(pairs[3].1)?),
+            (super::finite(pairs[4].0)?, super::finite(pairs[4].1)?),
+            (super::finite(pairs[5].0)?, super::finite(pairs[5].1)?),
+            (super::finite(pairs[6].0)?, super::finite(pairs[6].1)?),
+            (super::finite(pairs[7].0)?, super::finite(pairs[7].1)?),
+        ]);
+    }
+    Ok([
+        dot_pair(states[0], first, second)?,
+        dot_pair(states[1], first, second)?,
+        dot_pair(states[2], first, second)?,
+        dot_pair(states[3], first, second)?,
+        dot_pair(states[4], first, second)?,
+        dot_pair(states[5], first, second)?,
+        dot_pair(states[6], first, second)?,
+        dot_pair(states[7], first, second)?,
+    ])
+}
+
 // Floating matrix projections deliberately retain scalar diagnostics and their
 // explicit scalar policy. Only the graph's pinned GDN helper selects NEON.
 #[allow(
@@ -474,6 +519,120 @@ pub(crate) fn step_four_rows_tokens_from(
     step_row_tokens_from(previous[3], s3, inputs, row + 3, stride, scale, output)
 }
 
+/// Steps 8 GDN state rows simultaneously from `previous` into `states`, sharing
+/// `key` and `query` vector loads across all 8 rows.
+///
+/// # Errors
+/// Rejects unequal vector lengths before mutation, or a nonfinite updated element or dot result.
+pub(crate) fn step_eight_rows_from(
+    previous: [&[f32]; 8],
+    states: [&mut [f32]; 8],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 8],
+    beta: f32,
+) -> Result<[f32; 8]> {
+    let width = key.len();
+    if query.len() != width
+        || previous.iter().any(|row| row.len() != width)
+        || states.iter().any(|row| row.len() != width)
+    {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = states;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(outputs) = neon::step_eight_rows_from(
+        previous,
+        [s0, s1, s2, s3, s4, s5, s6, s7],
+        key,
+        query,
+        decay,
+        values,
+        beta,
+    ) {
+        return Ok(outputs);
+    }
+    Ok([
+        step_row_from(previous[0], s0, key, query, decay, values[0], beta)?,
+        step_row_from(previous[1], s1, key, query, decay, values[1], beta)?,
+        step_row_from(previous[2], s2, key, query, decay, values[2], beta)?,
+        step_row_from(previous[3], s3, key, query, decay, values[3], beta)?,
+        step_row_from(previous[4], s4, key, query, decay, values[4], beta)?,
+        step_row_from(previous[5], s5, key, query, decay, values[5], beta)?,
+        step_row_from(previous[6], s6, key, query, decay, values[6], beta)?,
+        step_row_from(previous[7], s7, key, query, decay, values[7], beta)?,
+    ])
+}
+
+/// Steps 8 GDN state rows across `inputs.len()` tokens from `previous` into `states`,
+/// writing `out * scale` to `output[token * stride + row + r]` for each token and row `r in 0..8`.
+///
+/// # Errors
+/// Rejects invalid geometry before mutation, or a nonfinite updated element or dot result.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep 8-row multi-token recurrence geometry and fallback arguments explicit."
+)]
+pub(crate) fn step_eight_rows_tokens_from(
+    previous: [&[f32]; 8],
+    states: [&mut [f32]; 8],
+    inputs: &[ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> Result<()> {
+    if inputs.is_empty() {
+        return Err(invalid("empty GDN chunk"));
+    }
+    if row.checked_add(8).is_none_or(|end| end > stride)
+        || previous.iter().any(|prev| prev.len() != stride)
+        || states.iter().any(|state| state.len() != stride)
+        || inputs.len().checked_mul(stride) != Some(output.len())
+        || inputs.iter().any(|input| {
+            input.key.len() != stride
+                || input.query.len() != stride
+                || input.value.len() < row.saturating_add(8)
+        })
+    {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = states;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::step_eight_rows_tokens_from(
+        previous,
+        [s0, s1, s2, s3, s4, s5, s6, s7],
+        inputs,
+        row,
+        stride,
+        scale,
+        output,
+    ) {
+        return Ok(());
+    }
+    step_row_tokens_from(previous[0], s0, inputs, row, stride, scale, output)?;
+    step_row_tokens_from(previous[1], s1, inputs, row + 1, stride, scale, output)?;
+    step_row_tokens_from(previous[2], s2, inputs, row + 2, stride, scale, output)?;
+    step_row_tokens_from(previous[3], s3, inputs, row + 3, stride, scale, output)?;
+    step_row_tokens_from(previous[4], s4, inputs, row + 4, stride, scale, output)?;
+    step_row_tokens_from(previous[5], s5, inputs, row + 5, stride, scale, output)?;
+    step_row_tokens_from(previous[6], s6, inputs, row + 6, stride, scale, output)?;
+    step_row_tokens_from(previous[7], s7, inputs, row + 7, stride, scale, output)
+}
+
 #[allow(
     clippy::suboptimal_flops,
     reason = "Keep the scalar oracle's exact multiply/add remainder rounding."
@@ -494,7 +653,8 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 mod tests {
     use super::{
         ChunkInput, add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_pair,
-        dot_pair_four_rows, dot_scalar, scalar_add_scaled, step_four_rows_from,
+        dot_pair_eight_rows, dot_pair_four_rows, dot_scalar, scalar_add_scaled,
+        step_eight_rows_from, step_eight_rows_tokens_from, step_four_rows_from,
         step_four_rows_tokens_from, step_row_from, step_row_in_place, step_row_tokens_from,
         update_and_dot,
     };
@@ -888,6 +1048,82 @@ mod tests {
             }
             assert_eq!(bits(&tok_batch_states), bits(&tok_ref_states));
             assert_eq!(bits(&tok_batch_out), bits(&tok_ref_out));
+
+            let (first8, _) = vectors(width * 8);
+            let rows8: [&[f32]; 8] = std::array::from_fn(|r| &first8[r * width..(r + 1) * width]);
+            let pairs8 = dot_pair_eight_rows(rows8, k, q)?;
+            for (r, row) in rows8.iter().enumerate() {
+                let expected = dot_pair(row, k, q)?;
+                assert_eq!(pairs8[r].0.to_bits(), expected.0.to_bits());
+                assert_eq!(pairs8[r].1.to_bits(), expected.1.to_bits());
+            }
+
+            let values8 = [0.25, -0.5, 0.75, -0.125, 0.5, -0.25, 0.125, -0.75];
+            let mut batch8_states = vec![0.0_f32; width * 8];
+            let batch8_out = {
+                let (h0, h1) = batch8_states.split_at_mut(width * 4);
+                let (s01, s23) = h0.split_at_mut(width * 2);
+                let (s45, s67) = h1.split_at_mut(width * 2);
+                let (s0, s1) = s01.split_at_mut(width);
+                let (s2, s3) = s23.split_at_mut(width);
+                let (s4, s5) = s45.split_at_mut(width);
+                let (s6, s7) = s67.split_at_mut(width);
+                step_eight_rows_from(
+                    rows8,
+                    [s0, s1, s2, s3, s4, s5, s6, s7],
+                    k,
+                    q,
+                    decay,
+                    values8,
+                    beta,
+                )?
+            };
+            for r in 0..8 {
+                let mut ref_state = vec![0.0_f32; width];
+                let ref_out =
+                    step_row_from(rows8[r], &mut ref_state, k, q, decay, values8[r], beta)?;
+                assert_eq!(batch8_out[r].to_bits(), ref_out.to_bits());
+                assert_eq!(
+                    bits(&batch8_states[r * width..(r + 1) * width]),
+                    bits(&ref_state)
+                );
+            }
+
+            let mut tok8_states = vec![0.0_f32; width * 8];
+            let mut tok8_out = vec![0.0_f32; inputs.len() * width];
+            {
+                let (h0, h1) = tok8_states.split_at_mut(width * 4);
+                let (s01, s23) = h0.split_at_mut(width * 2);
+                let (s45, s67) = h1.split_at_mut(width * 2);
+                let (s0, s1) = s01.split_at_mut(width);
+                let (s2, s3) = s23.split_at_mut(width);
+                let (s4, s5) = s45.split_at_mut(width);
+                let (s6, s7) = s67.split_at_mut(width);
+                step_eight_rows_tokens_from(
+                    rows8,
+                    [s0, s1, s2, s3, s4, s5, s6, s7],
+                    &inputs,
+                    0,
+                    width,
+                    0.5,
+                    &mut tok8_out,
+                )?;
+            }
+            let mut tok8_ref_states = vec![0.0_f32; width * 8];
+            let mut tok8_ref_out = vec![0.0_f32; inputs.len() * width];
+            for r in 0..8 {
+                step_row_tokens_from(
+                    rows8[r],
+                    &mut tok8_ref_states[r * width..(r + 1) * width],
+                    &inputs,
+                    r,
+                    width,
+                    0.5,
+                    &mut tok8_ref_out,
+                )?;
+            }
+            assert_eq!(bits(&tok8_states), bits(&tok8_ref_states));
+            assert_eq!(bits(&tok8_out), bits(&tok8_ref_out));
         }
         Ok(())
     }

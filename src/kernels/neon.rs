@@ -1612,6 +1612,92 @@ pub(super) fn gdn_wy_update_four_rows(
 
 #[inline]
 #[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 multiply and add roundings matching scale_slice_into and add_scaled_slice_in_place."
+)]
+pub(super) fn gdn_wy_update_eight_rows(
+    states: [&[f32]; 8],
+    last_cumulative: f32,
+    inputs: &[super::pinned_gdn::ChunkInput<'_>],
+    scaled_deltas: &[[f32; 32]; 8],
+    matrix_rows: [&mut [f32]; 8],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let width = matrix_rows[0].len();
+    let count = inputs.len();
+    let scale_vec = f32x4::splat(neon, last_cumulative);
+    let vec16_blocks = width / 16;
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix_rows;
+    let mut rows = [m0, m1, m2, m3, m4, m5, m6, m7];
+    for b in 0..vec16_blocks {
+        let offset = b * 16;
+        let mut acc = [[f32x4::splat(neon, 0.0); 4]; 8];
+        for r in 0..8 {
+            let s = &states[r][offset..offset + 16];
+            acc[r] = [
+                scale_vec * f32x4::from_slice(neon, &s[0..4]),
+                scale_vec * f32x4::from_slice(neon, &s[4..8]),
+                scale_vec * f32x4::from_slice(neon, &s[8..12]),
+                scale_vec * f32x4::from_slice(neon, &s[12..16]),
+            ];
+        }
+        for (prior, input) in inputs[..count].iter().enumerate() {
+            let kb = &input.key[offset..offset + 16];
+            let k0 = f32x4::from_slice(neon, &kb[0..4]);
+            let k1 = f32x4::from_slice(neon, &kb[4..8]);
+            let k2 = f32x4::from_slice(neon, &kb[8..12]);
+            let k3 = f32x4::from_slice(neon, &kb[12..16]);
+            for r in 0..8 {
+                let sd = f32x4::splat(neon, scaled_deltas[r][prior]);
+                acc[r][0] += sd * k0;
+                acc[r][1] += sd * k1;
+                acc[r][2] += sd * k2;
+                acc[r][3] += sd * k3;
+            }
+        }
+        for (out_row, row_acc) in rows.iter_mut().zip(acc.iter()) {
+            let out_block = &mut out_row[offset..offset + 16];
+            row_acc[0].store_slice(&mut out_block[0..4]);
+            row_acc[1].store_slice(&mut out_block[4..8]);
+            row_acc[2].store_slice(&mut out_block[8..12]);
+            row_acc[3].store_slice(&mut out_block[12..16]);
+        }
+    }
+    let vec4_blocks = width / 4;
+    for b in (vec16_blocks * 4)..vec4_blocks {
+        let offset = b * 4;
+        let mut a: [f32x4<Neon>; 8] = std::array::from_fn(|r| {
+            scale_vec * f32x4::from_slice(neon, &states[r][offset..offset + 4])
+        });
+        for (prior, input) in inputs[..count].iter().enumerate() {
+            let k = f32x4::from_slice(neon, &input.key[offset..offset + 4]);
+            for r in 0..8 {
+                a[r] += f32x4::splat(neon, scaled_deltas[r][prior]) * k;
+            }
+        }
+        for (r, out_row) in rows.iter_mut().enumerate() {
+            a[r].store_slice(&mut out_row[offset..offset + 4]);
+        }
+    }
+    let rem_start = vec4_blocks * 4;
+    if rem_start < width {
+        for (r, out_row) in rows.iter_mut().enumerate() {
+            for (idx, out_elem) in out_row.iter_mut().enumerate().take(width).skip(rem_start) {
+                let mut acc = last_cumulative * states[r][idx];
+                for (prior, input) in inputs[..count].iter().enumerate() {
+                    acc += scaled_deltas[r][prior] * input.key[idx];
+                }
+                *out_elem = acc;
+            }
+        }
+    }
+    true
+}
+
+#[inline]
+#[allow(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
@@ -4021,6 +4107,55 @@ pub(super) fn float_dot_pair_four_rows(
         (sum0[2] as f32, sum1[2] as f32),
         (sum0[3] as f32, sum1[3] as f32),
     ])
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+#[inline]
+pub(super) fn float_dot_pair_eight_rows(
+    states: [&[f32]; 8],
+    first: &[f32],
+    second: &[f32],
+) -> Option<[(f32, f32); 8]> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let count = states
+        .iter()
+        .fold(first.len().min(second.len()), |acc, s| acc.min(s.len()));
+    let (f_chunks, f_rem) = first[..count].as_chunks::<4>();
+    let (sec_chunks, sec_rem) = second[..count].as_chunks::<4>();
+    let mut sum0 = [-0.0_f64; 8];
+    let mut sum1 = [-0.0_f64; 8];
+    for (idx, (f_chunk, sec_chunk)) in f_chunks.iter().zip(sec_chunks).enumerate() {
+        let f_vec = f32x4::from_slice(neon, f_chunk);
+        let sec_vec = f32x4::from_slice(neon, sec_chunk);
+        let offset = idx * 4;
+        for r in 0..8 {
+            let s_vec = f32x4::from_slice(neon, &states[r][offset..offset + 4]);
+            let prod0 = (s_vec * f_vec).to_array();
+            let prod1 = (s_vec * sec_vec).to_array();
+            sum0[r] += f64::from(prod0[0]);
+            sum0[r] += f64::from(prod0[1]);
+            sum0[r] += f64::from(prod0[2]);
+            sum0[r] += f64::from(prod0[3]);
+            sum1[r] += f64::from(prod1[0]);
+            sum1[r] += f64::from(prod1[1]);
+            sum1[r] += f64::from(prod1[2]);
+            sum1[r] += f64::from(prod1[3]);
+        }
+    }
+    let rem_base = f_chunks.len() * 4;
+    for (i, (&f, &sec)) in f_rem.iter().zip(sec_rem).enumerate() {
+        let idx = rem_base + i;
+        for r in 0..8 {
+            let s = states[r][idx];
+            sum0[r] += f64::from(s * f);
+            sum1[r] += f64::from(s * sec);
+        }
+    }
+    Some(std::array::from_fn(|r| (sum0[r] as f32, sum1[r] as f32)))
 }
 
 #[allow(

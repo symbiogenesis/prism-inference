@@ -6,7 +6,9 @@ use crate::graph::{
     finite, l2_norm, resize_into, sigmoid, small_float,
 };
 use crate::kernels::pinned_gdn::ChunkInput as Input;
-use crate::kernels::{add_scaled_slice_in_place, gdn_wy_update_four_rows, scale_slice_into};
+use crate::kernels::{
+    add_scaled_slice_in_place, gdn_wy_update_eight_rows, gdn_wy_update_four_rows, scale_slice_into,
+};
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::{Result, invalid};
 
@@ -48,8 +50,18 @@ fn fill_key_head_dots(
         let row_base = token * 32;
         let query_token = &token_mixed[q_range.clone()];
         let key_token = &token_mixed[k_range.clone()];
+        let eight_blocks = token / 8;
+        for b in 0..eight_blocks {
+            let p = b * 8;
+            let keys: [&[f32]; 8] = std::array::from_fn(|i| &mixed[p + i][k_range.clone()]);
+            let pairs = arithmetic.gdn_dot_pair_eight_rows(keys, query_token, key_token)?;
+            for (i, &(q_dot, k_dot)) in pairs.iter().enumerate() {
+                dots[row_base + p + i] = q_dot;
+                dots[1024 + row_base + p + i] = k_dot;
+            }
+        }
         let four_blocks = token / 4;
-        for b in 0..four_blocks {
+        for b in (eight_blocks * 2)..four_blocks {
             let p = b * 4;
             let keys = [
                 &mixed[p][k_range.clone()],
@@ -86,8 +98,19 @@ fn fill_key_head_dots_head_major(
         let row_base = token * 32;
         let query_token = &q_head[token * width..(token + 1) * width];
         let key_token = &k_head[token * width..(token + 1) * width];
+        let eight_blocks = token / 8;
+        for b in 0..eight_blocks {
+            let p = b * 8;
+            let keys: [&[f32]; 8] =
+                std::array::from_fn(|i| &k_head[(p + i) * width..(p + i + 1) * width]);
+            let pairs = arithmetic.gdn_dot_pair_eight_rows(keys, query_token, key_token)?;
+            for (i, &(q_dot, k_dot)) in pairs.iter().enumerate() {
+                dots[row_base + p + i] = q_dot;
+                dots[1024 + row_base + p + i] = k_dot;
+            }
+        }
         let four_blocks = token / 4;
-        for b in 0..four_blocks {
+        for b in (eight_blocks * 2)..four_blocks {
             let p = b * 4;
             let keys = [
                 &k_head[p * width..(p + 1) * width],
@@ -129,8 +152,31 @@ fn exact_head_into(
     let width = first.key.len();
     let scale = 1.0 / small_float(width)?.sqrt();
     let row_count = previous.len() / width;
+    let eight_row_blocks = row_count / 8;
+    for block_idx in 0..eight_row_blocks {
+        let r = block_idx * 8;
+        let prev_rows: [&[f32]; 8] =
+            std::array::from_fn(|i| &previous[(r + i) * width..(r + i + 1) * width]);
+        let state_slice = &mut matrix[r * width..(r + 8) * width];
+        let (h0, h1) = state_slice.split_at_mut(4 * width);
+        let (s01, s23) = h0.split_at_mut(2 * width);
+        let (s45, s67) = h1.split_at_mut(2 * width);
+        let (s0, s1) = s01.split_at_mut(width);
+        let (s2, s3) = s23.split_at_mut(width);
+        let (s4, s5) = s45.split_at_mut(width);
+        let (s6, s7) = s67.split_at_mut(width);
+        arithmetic.gdn_step_eight_rows_tokens_from(
+            prev_rows,
+            [s0, s1, s2, s3, s4, s5, s6, s7],
+            inputs,
+            r,
+            width,
+            scale,
+            output,
+        )?;
+    }
     let four_row_blocks = row_count / 4;
-    for block_idx in 0..four_row_blocks {
+    for block_idx in (eight_row_blocks * 2)..four_row_blocks {
         let r = block_idx * 4;
         let prev_rows = [
             &previous[r * width..(r + 1) * width],
@@ -220,8 +266,23 @@ fn head_into(
                 }
             }
         } else {
+            let eight_blocks = token / 8;
+            for b in 0..eight_blocks {
+                let p = b * 8;
+                let keys: [&[f32]; 8] = std::array::from_fn(|i| inputs[p + i].key);
+                let pairs = arithmetic.gdn_dot_pair_eight_rows(
+                    keys,
+                    inputs[token].query,
+                    inputs[token].key,
+                )?;
+                for (i, &(q_dot, k_dot)) in pairs.iter().enumerate() {
+                    let prior = p + i;
+                    cross_query[token][prior] = products[token][prior] * q_dot;
+                    cross_key[token][prior] = products[token][prior] * k_dot;
+                }
+            }
             let four_blocks = token / 4;
-            for b in 0..four_blocks {
+            for b in (eight_blocks * 2)..four_blocks {
                 let p = b * 4;
                 let keys = [
                     inputs[p].key,
@@ -256,8 +317,59 @@ fn head_into(
     let scale = 1.0 / small_float(width)?.sqrt();
     let last = count - 1;
     let last_cumulative = cumulative[last];
+    let eight_row_blocks = width / 8;
+    for block_idx in 0..eight_row_blocks {
+        let base_row = block_idx * 8;
+        let states: [&[f32]; 8] =
+            std::array::from_fn(|r| &previous[(base_row + r) * width..(base_row + r + 1) * width]);
+        let mut deltas = [[0.0_f32; 32]; 8];
+        for token in 0..count {
+            let pairs = arithmetic.gdn_dot_pair_eight_rows(
+                states,
+                inputs[token].key,
+                inputs[token].query,
+            )?;
+            let cum = cumulative[token];
+            let beta = inputs[token].beta;
+            let out_base = token * width + base_row;
+            for sub in 0..8 {
+                let (key_dot, query_dot) = pairs[sub];
+                let mut predicted = cum * key_dot;
+                for (prior, &delta) in deltas[sub][..token].iter().enumerate() {
+                    predicted += cross_key[token][prior] * delta;
+                }
+                deltas[sub][token] = (inputs[token].value[base_row + sub] - predicted) * beta;
+                let mut value = cum * query_dot;
+                for (prior, &delta) in deltas[sub][..=token].iter().enumerate() {
+                    value += cross_query[token][prior] * delta;
+                }
+                output[out_base + sub] = value * scale;
+            }
+        }
+        let mut scaled_deltas = [[0.0_f32; 32]; 8];
+        for sub in 0..8 {
+            for (prior, &delta) in deltas[sub][..count].iter().enumerate() {
+                scaled_deltas[sub][prior] = products[last][prior] * delta;
+            }
+        }
+        let matrix_slice = &mut matrix[base_row * width..(base_row + 8) * width];
+        let (h0, h1) = matrix_slice.split_at_mut(4 * width);
+        let (m01, m23) = h0.split_at_mut(2 * width);
+        let (m45, m67) = h1.split_at_mut(2 * width);
+        let (m0, m1) = m01.split_at_mut(width);
+        let (m2, m3) = m23.split_at_mut(width);
+        let (m4, m5) = m45.split_at_mut(width);
+        let (m6, m7) = m67.split_at_mut(width);
+        gdn_wy_update_eight_rows(
+            states,
+            last_cumulative,
+            inputs,
+            &scaled_deltas,
+            [m0, m1, m2, m3, m4, m5, m6, m7],
+        );
+    }
     let four_row_blocks = width / 4;
-    for block_idx in 0..four_row_blocks {
+    for block_idx in (eight_row_blocks * 2)..four_row_blocks {
         let base_row = block_idx * 4;
         let states = [
             &previous[base_row * width..(base_row + 1) * width],

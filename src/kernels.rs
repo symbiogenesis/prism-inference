@@ -1246,6 +1246,33 @@ pub(crate) fn float_dot_pair_four_rows(
     ]
 }
 
+pub(crate) fn float_dot_pair_eight_rows(
+    states: [&[f32]; 8],
+    first: &[f32],
+    second: &[f32],
+) -> [(f32, f32); 8] {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(pairs) = neon::float_dot_pair_eight_rows(states, first, second) {
+        return pairs;
+    }
+    [
+        float_dot_pair(states[0], first, second),
+        float_dot_pair(states[1], first, second),
+        float_dot_pair(states[2], first, second),
+        float_dot_pair(states[3], first, second),
+        float_dot_pair(states[4], first, second),
+        float_dot_pair(states[5], first, second),
+        float_dot_pair(states[6], first, second),
+        float_dot_pair(states[7], first, second),
+    ]
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -3053,6 +3080,39 @@ pub(crate) fn gdn_wy_update_four_rows(
         return;
     }
     let rows = [m0, m1, m2, m3];
+    for (r, matrix_row) in rows.into_iter().enumerate() {
+        scale_slice_into(states[r], last_cumulative, matrix_row);
+        for (prior, input) in inputs.iter().enumerate() {
+            add_scaled_slice_in_place(matrix_row, input.key, scaled_deltas[r][prior]);
+        }
+    }
+}
+
+pub(crate) fn gdn_wy_update_eight_rows(
+    states: [&[f32]; 8],
+    last_cumulative: f32,
+    inputs: &[pinned_gdn::ChunkInput<'_>],
+    scaled_deltas: &[[f32; 32]; 8],
+    matrix_rows: [&mut [f32]; 8],
+) {
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix_rows;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::gdn_wy_update_eight_rows(
+        states,
+        last_cumulative,
+        inputs,
+        scaled_deltas,
+        [m0, m1, m2, m3, m4, m5, m6, m7],
+    ) {
+        return;
+    }
+    let rows = [m0, m1, m2, m3, m4, m5, m6, m7];
     for (r, matrix_row) in rows.into_iter().enumerate() {
         scale_slice_into(states[r], last_cumulative, matrix_row);
         for (prior, input) in inputs.iter().enumerate() {

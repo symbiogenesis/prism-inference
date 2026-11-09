@@ -12,8 +12,8 @@ use super::{Model, Tensor};
 use crate::{
     Result, invalid,
     kernels::{
-        MatvecBackend, MatvecScratch, lora_a_dot, lora_a_dot_pair, lora_b_scale_and_finish,
-        row_into,
+        MatvecBackend, MatvecScratch, lora_a_dot, lora_a_dot_four, lora_a_dot_pair,
+        lora_b_scale_and_finish, lora_b_scale_and_finish_tokens, row_into,
     },
 };
 
@@ -277,6 +277,45 @@ impl RankOneAdapter {
         };
         let count = inputs.len().min(outputs.len());
         let mut idx = 0;
+        while idx + 4 <= count {
+            if let Some(ranks) = lora_a_dot_four(
+                &factors.a_values,
+                [
+                    &inputs[idx],
+                    &inputs[idx + 1],
+                    &inputs[idx + 2],
+                    &inputs[idx + 3],
+                ],
+                &scratch.matvec,
+            ) {
+                scratch.rank.clear();
+                scratch.rank.try_reserve_exact(1)?;
+                scratch.rank.push(ranks[3]);
+                let (first_pair, second_pair) = outputs[idx..idx + 4].split_at_mut(2);
+                let (out0, out1) = first_pair.split_at_mut(1);
+                let (out2, out3) = second_pair.split_at_mut(1);
+                if !lora_b_scale_and_finish_tokens(
+                    &factors.b_values,
+                    ranks,
+                    scale * self.alpha,
+                    [&mut out0[0], &mut out1[0], &mut out2[0], &mut out3[0]],
+                    &mut scratch.correction,
+                ) {
+                    for (tok_offset, &r) in ranks.iter().enumerate() {
+                        scratch.rank[0] = r;
+                        self.scale_and_finish(
+                            &factors.b_values,
+                            scale,
+                            &mut outputs[idx + tok_offset],
+                            scratch,
+                        )?;
+                    }
+                }
+                idx += 4;
+                continue;
+            }
+            break;
+        }
         while idx + 2 <= count {
             if let Some((r0, r1)) = lora_a_dot_pair(
                 &factors.a_values,
@@ -286,7 +325,19 @@ impl RankOneAdapter {
             ) {
                 scratch.rank.clear();
                 scratch.rank.try_reserve_exact(1)?;
-                scratch.rank.push(r0);
+                scratch.rank.push(r1);
+                let (out0, out1) = outputs[idx..idx + 2].split_at_mut(1);
+                if lora_b_scale_and_finish_tokens(
+                    &factors.b_values,
+                    [r0, r1],
+                    scale * self.alpha,
+                    [&mut out0[0], &mut out1[0]],
+                    &mut scratch.correction,
+                ) {
+                    idx += 2;
+                    continue;
+                }
+                scratch.rank[0] = r0;
                 self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx], scratch)?;
                 scratch.rank[0] = r1;
             } else {
@@ -307,7 +358,7 @@ impl RankOneAdapter {
             self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx + 1], scratch)?;
             idx += 2;
         }
-        if idx < count {
+        while idx < count {
             lora_a_dot(
                 &factors.a_values,
                 &inputs[idx],
@@ -315,6 +366,7 @@ impl RankOneAdapter {
                 &scratch.matvec,
             )?;
             self.scale_and_finish(&factors.b_values, scale, &mut outputs[idx], scratch)?;
+            idx += 1;
         }
         Ok(())
     }
@@ -567,11 +619,11 @@ mod tests {
     #[test]
     fn rank_one_linear_tokens_matches_single_token_bits() -> Result<()> {
         let target = "blk.0.ffn_down.weight";
-        let a_vals: Vec<f32> = (0..32)
-            .map(|i| f32::from(i8::try_from((i * 5) % 13 - 6).unwrap_or(0)) * 0.125)
+        let a_vals: Vec<f32> = (0..32_usize)
+            .map(|i| f32::from(i8::try_from((i * 5) % 13).unwrap_or(0) - 6) * 0.125)
             .collect();
-        let b_vals: Vec<f32> = (0..16)
-            .map(|i| f32::from(i8::try_from((i * 3) % 11 - 5).unwrap_or(0)) * 0.25)
+        let b_vals: Vec<f32> = (0..23_usize)
+            .map(|i| f32::from(i8::try_from((i * 3) % 11).unwrap_or(0) - 5) * 0.25)
             .collect();
         let base_tensor = Tensor {
             name: target.into(),
@@ -613,38 +665,49 @@ mod tests {
             ]),
         };
         let adapter = RankOneAdapter::from_model(factors, &base)?;
-        let inputs: Vec<Vec<f32>> = (0..3)
-            .map(|tok| {
-                (0..32)
-                    .map(|i| f32::from(i8::try_from((i + tok * 7) % 17 - 8).unwrap_or(0)) * 0.0625)
-                    .collect()
-            })
-            .collect();
-        for pinned in [false, true] {
-            let mut single_outputs: Vec<Vec<f32>> = (0..3)
+        for token_count in 1..=7 {
+            let inputs: Vec<Vec<f32>> = (0..token_count)
                 .map(|tok| {
-                    (0..16)
-                        .map(|i| f32::from(u8::try_from(i + tok).unwrap_or(0)))
+                    (0..32_usize)
+                        .map(|i| {
+                            f32::from(i8::try_from((i + tok * 7) % 17).unwrap_or(0) - 8) * 0.0625
+                        })
                         .collect()
                 })
                 .collect();
-            let mut batch_outputs = single_outputs.clone();
-            let mut scratch_single = Scratch::new(MatvecBackend::ExperimentalNeon, pinned);
-            let mut scratch_batch = Scratch::new(MatvecBackend::ExperimentalNeon, pinned);
-            for (inp, out) in inputs.iter().zip(&mut single_outputs) {
-                adapter.linear(target, inp, 0.75, out, &mut scratch_single)?;
-            }
-            adapter.linear_tokens(
-                target,
-                &inputs,
-                0.75,
-                &mut batch_outputs,
-                &mut scratch_batch,
-            )?;
-            for (actual, expected) in batch_outputs.iter().zip(&single_outputs) {
-                let actual_bits: Vec<u32> = actual.iter().copied().map(f32::to_bits).collect();
-                let expected_bits: Vec<u32> = expected.iter().copied().map(f32::to_bits).collect();
-                assert_eq!(actual_bits, expected_bits);
+            for pinned in [false, true] {
+                let mut single_outputs: Vec<Vec<f32>> = (0..token_count)
+                    .map(|tok| {
+                        (0..b_vals.len())
+                            .map(|i| f32::from(u8::try_from(i + tok).unwrap_or(0)))
+                            .collect()
+                    })
+                    .collect();
+                let mut batch_outputs = single_outputs.clone();
+                let mut scratch_single = Scratch::new(MatvecBackend::ExperimentalNeon, pinned);
+                let mut scratch_batch = Scratch::new(MatvecBackend::ExperimentalNeon, pinned);
+                for (inp, out) in inputs.iter().zip(&mut single_outputs) {
+                    adapter.linear(target, inp, 0.75, out, &mut scratch_single)?;
+                }
+                adapter.linear_tokens(
+                    target,
+                    &inputs,
+                    0.75,
+                    &mut batch_outputs,
+                    &mut scratch_batch,
+                )?;
+                for (actual, expected) in batch_outputs.iter().zip(&single_outputs) {
+                    let actual_bits: Vec<u32> = actual.iter().copied().map(f32::to_bits).collect();
+                    let expected_bits: Vec<u32> =
+                        expected.iter().copied().map(f32::to_bits).collect();
+                    assert_eq!(actual_bits, expected_bits);
+                }
+                let to_bits = |s: &[f32]| s.iter().copied().map(f32::to_bits).collect::<Vec<_>>();
+                assert_eq!(to_bits(&scratch_batch.rank), to_bits(&scratch_single.rank));
+                assert_eq!(
+                    to_bits(&scratch_batch.correction),
+                    to_bits(&scratch_single.correction)
+                );
             }
         }
         Ok(())

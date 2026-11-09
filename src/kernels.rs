@@ -2304,6 +2304,61 @@ pub(crate) fn lora_a_dot_pair(
     }
 }
 
+pub(crate) fn lora_a_dot_four(
+    a_values: &[f32],
+    inputs: [&[f32]; 4],
+    scratch: &MatvecScratch,
+) -> Option<[f32; 4]> {
+    let width = a_values.len();
+    if width == 0
+        || inputs
+            .iter()
+            .any(|input| input.len() != width || !is_finite_slice(input))
+    {
+        return None;
+    }
+    if scratch.pinned_accumulation && width.is_multiple_of(16) {
+        pinned_gdn::dot_four(a_values, inputs).ok()
+    } else {
+        let values = float_dot_four(inputs, a_values);
+        if values.iter().all(|v| v.is_finite()) {
+            Some(values)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) fn lora_b_scale_and_finish_tokens<const TOKENS: usize>(
+    b_values: &[f32],
+    ranks: [f32; TOKENS],
+    scale: f32,
+    outputs: [&mut [f32]; TOKENS],
+    correction: &mut Vec<f32>,
+) -> bool {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_b_scale_and_finish_tokens(b_values, ranks, scale, outputs, correction).is_some()
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        let _ = (b_values, ranks, scale, outputs, correction);
+        false
+    }
+}
+
 pub(crate) fn lora_b_scale_and_finish(
     b_values: &[f32],
     rank: &[f32],

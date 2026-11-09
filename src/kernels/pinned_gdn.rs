@@ -73,6 +73,39 @@ pub(crate) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Result<(
     Ok((dot_scalar(state, first)?, dot_scalar(state, second)?))
 }
 
+/// Computes `[dot(state, inputs[0]), dot(state, inputs[1]), dot(state, inputs[2]), dot(state, inputs[3])]`
+/// in a single pass over `state`.
+///
+/// # Errors
+/// Rejects unequal vector lengths or a nonfinite result.
+pub(crate) fn dot_four(state: &[f32], inputs: [&[f32]; 4]) -> Result<[f32; 4]> {
+    let width = state.len();
+    if inputs.iter().any(|input| input.len() != width) {
+        return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(values) = neon::dot_four(state, inputs) {
+        return Ok([
+            super::finite(values[0])?,
+            super::finite(values[1])?,
+            super::finite(values[2])?,
+            super::finite(values[3])?,
+        ]);
+    }
+    Ok([
+        dot_scalar(state, inputs[0])?,
+        dot_scalar(state, inputs[1])?,
+        dot_scalar(state, inputs[2])?,
+        dot_scalar(state, inputs[3])?,
+    ])
+}
+
 /// Computes `[(dot(states[r], first), dot(states[r], second)); 4]` in a single pass
 /// over `first` and `second`.
 ///
@@ -652,7 +685,7 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkInput, add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_pair,
+        ChunkInput, add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_four, dot_pair,
         dot_pair_eight_rows, dot_pair_four_rows, dot_scalar, scalar_add_scaled,
         step_eight_rows_from, step_eight_rows_tokens_from, step_four_rows_from,
         step_four_rows_tokens_from, step_row_from, step_row_in_place, step_row_tokens_from,
@@ -1061,6 +1094,11 @@ mod tests {
                 let expected = dot_pair(row, k, q)?;
                 assert_eq!(pairs8[r].0.to_bits(), expected.0.to_bits());
                 assert_eq!(pairs8[r].1.to_bits(), expected.1.to_bits());
+            }
+
+            let dots4 = dot_four(k, [rows8[0], rows8[1], rows8[2], rows8[3]])?;
+            for (r, &actual) in dots4.iter().enumerate() {
+                assert_eq!(actual.to_bits(), dot(k, rows8[r])?.to_bits());
             }
 
             let values8 = [0.25, -0.5, 0.75, -0.125, 0.5, -0.25, 0.125, -0.75];

@@ -989,9 +989,26 @@ pub(super) fn lora_b_scale_and_finish(
     let scale_vec = f32x4::splat(neon, scale);
     let mut prod_finite = zero_vec.is_finite();
     let mut corr_finite = zero_vec.is_finite();
-    let (b_chunks, b_tail) = b_values.as_chunks::<4>();
-    let (out_chunks, out_tail) = output.as_chunks::<4>();
-    let (c_chunks, c_tail) = correction.as_chunks_mut::<4>();
+    let (b_blocks8, b_rem8) = b_values.as_chunks::<8>();
+    let (out_blocks8, out_rem8) = output.as_chunks::<8>();
+    let (c_blocks8, c_rem8) = correction.as_chunks_mut::<8>();
+    for ((b_b, base_b), c_b) in b_blocks8.iter().zip(out_blocks8).zip(c_blocks8) {
+        let b0 = f32x4::from_slice(neon, &b_b[0..4]);
+        let b1 = f32x4::from_slice(neon, &b_b[4..8]);
+        let prod0 = (b0 * rank_vec) + zero_vec;
+        let prod1 = (b1 * rank_vec) + zero_vec;
+        prod_finite &= b0.is_finite() & b1.is_finite() & prod0.is_finite() & prod1.is_finite();
+        let base0 = f32x4::from_slice(neon, &base_b[0..4]);
+        let base1 = f32x4::from_slice(neon, &base_b[4..8]);
+        let corr0 = (prod0 * scale_vec) + base0;
+        let corr1 = (prod1 * scale_vec) + base1;
+        corr_finite &= corr0.is_finite() & corr1.is_finite();
+        corr0.store_slice(&mut c_b[0..4]);
+        corr1.store_slice(&mut c_b[4..8]);
+    }
+    let (b_chunks, b_tail) = b_rem8.as_chunks::<4>();
+    let (out_chunks, out_tail) = out_rem8.as_chunks::<4>();
+    let (c_chunks, c_tail) = c_rem8.as_chunks_mut::<4>();
     for ((b_chunk, base_chunk), c_chunk) in b_chunks.iter().zip(out_chunks).zip(c_chunks) {
         let b = f32x4::from_slice(neon, b_chunk);
         let prod = (b * rank_vec) + zero_vec;
@@ -1026,6 +1043,100 @@ pub(super) fn lora_b_scale_and_finish(
     }
     output.copy_from_slice(correction);
     Some(Ok(()))
+}
+
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::too_many_lines,
+    reason = "Preserve separate binary32 product rounding, signed-zero normalization, scale and base addition across multiple tokens."
+)]
+pub(super) fn lora_b_scale_and_finish_tokens<const TOKENS: usize>(
+    b_values: &[f32],
+    ranks: [f32; TOKENS],
+    scale: f32,
+    outputs: [&mut [f32]; TOKENS],
+    correction: &mut Vec<f32>,
+) -> Option<()> {
+    let len = b_values.len();
+    if len == 0
+        || !scale.is_finite()
+        || ranks.iter().any(|r| !r.is_finite())
+        || outputs.iter().any(|out| out.len() != len)
+    {
+        return None;
+    }
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let total_corr = len.checked_mul(TOKENS)?;
+    correction
+        .try_reserve_exact(total_corr.saturating_sub(correction.len()))
+        .ok()?;
+    correction.resize(total_corr, 0.0);
+    let rank_vecs: [f32x4<Neon>; TOKENS] = std::array::from_fn(|t| f32x4::splat(neon, ranks[t]));
+    let zero_vec = f32x4::splat(neon, 0.0);
+    let scale_vec = f32x4::splat(neon, scale);
+    let mut all_finite = zero_vec.is_finite();
+    let (b_blocks8, b_rem8) = b_values.as_chunks::<8>();
+    for (block_idx, b_b) in b_blocks8.iter().enumerate() {
+        let offset = block_idx * 8;
+        let b0 = f32x4::from_slice(neon, &b_b[0..4]);
+        let b1 = f32x4::from_slice(neon, &b_b[4..8]);
+        all_finite &= b0.is_finite() & b1.is_finite();
+        for (t, (&r_vec, out)) in rank_vecs.iter().zip(outputs.iter()).enumerate() {
+            let p0 = (b0 * r_vec) + zero_vec;
+            let p1 = (b1 * r_vec) + zero_vec;
+            let base = &out[offset..offset + 8];
+            let c0 = (p0 * scale_vec) + f32x4::from_slice(neon, &base[0..4]);
+            let c1 = (p1 * scale_vec) + f32x4::from_slice(neon, &base[4..8]);
+            all_finite &= p0.is_finite() & p1.is_finite() & c0.is_finite() & c1.is_finite();
+            let corr_slot = if t + 1 == TOKENS { 0 } else { (t + 1) * len } + offset;
+            c0.store_slice(&mut correction[corr_slot..corr_slot + 4]);
+            c1.store_slice(&mut correction[corr_slot + 4..corr_slot + 8]);
+        }
+    }
+    let rem8_base = b_blocks8.len() * 8;
+    let (b_chunks, b_tail) = b_rem8.as_chunks::<4>();
+    for (chunk_idx, b_chunk) in b_chunks.iter().enumerate() {
+        let offset = rem8_base + chunk_idx * 4;
+        let b = f32x4::from_slice(neon, b_chunk);
+        all_finite &= b.is_finite();
+        for (t, (&r_vec, out)) in rank_vecs.iter().zip(outputs.iter()).enumerate() {
+            let prod = (b * r_vec) + zero_vec;
+            let base = f32x4::from_slice(neon, &out[offset..offset + 4]);
+            let corr = (prod * scale_vec) + base;
+            all_finite &= prod.is_finite() & corr.is_finite();
+            let corr_slot = if t + 1 == TOKENS { 0 } else { (t + 1) * len } + offset;
+            corr.store_slice(&mut correction[corr_slot..corr_slot + 4]);
+        }
+    }
+    if !all_finite.all_true() {
+        correction.truncate(len);
+        return None;
+    }
+    let tail_base = rem8_base + b_chunks.len() * 4;
+    for (i, &b) in b_tail.iter().enumerate() {
+        if !b.is_finite() {
+            correction.truncate(len);
+            return None;
+        }
+        let col = tail_base + i;
+        for (t, (&r, out)) in ranks.iter().zip(outputs.iter()).enumerate() {
+            let prod = (b * r) + 0.0;
+            let corr = (prod * scale) + out[col];
+            if !prod.is_finite() || !corr.is_finite() {
+                correction.truncate(len);
+                return None;
+            }
+            let corr_slot = if t + 1 == TOKENS { 0 } else { (t + 1) * len } + col;
+            correction[corr_slot] = corr;
+        }
+    }
+    for (t, out) in outputs.into_iter().enumerate() {
+        let corr_slot = if t + 1 == TOKENS { 0 } else { (t + 1) * len };
+        out.copy_from_slice(&correction[corr_slot..corr_slot + len]);
+    }
+    correction.truncate(len);
+    Some(())
 }
 
 #[inline]

@@ -91,6 +91,42 @@ pub(super) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Option<(
     Some((first_result, second_result))
 }
 
+/// Computes `[dot(state, inputs[0]), dot(state, inputs[1]), dot(state, inputs[2]), dot(state, inputs[3])]`
+/// in a single pass over `state`, reusing each `state` vector load across all four four-register FMA trees.
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+pub(super) fn dot_four(state: &[f32], inputs: [&[f32]; 4]) -> Option<[f32; 4]> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let vectorized = state.len() / 16 * 16;
+    let mut acc = [[f32x4::splat(neon, 0.0); 4]; 4];
+    let in_chunks = inputs.map(|row| row[..vectorized].as_chunks::<16>().0);
+    for (b, st_block) in state[..vectorized].as_chunks::<16>().0.iter().enumerate() {
+        let st0 = f32x4::from_slice(neon, &st_block[0..4]);
+        let st1 = f32x4::from_slice(neon, &st_block[4..8]);
+        let st2 = f32x4::from_slice(neon, &st_block[8..12]);
+        let st3 = f32x4::from_slice(neon, &st_block[12..16]);
+        for t in 0..4 {
+            let in_block = &in_chunks[t][b];
+            acc[t][0] = st0.mul_add_precise(f32x4::from_slice(neon, &in_block[0..4]), acc[t][0]);
+            acc[t][1] = st1.mul_add_precise(f32x4::from_slice(neon, &in_block[4..8]), acc[t][1]);
+            acc[t][2] = st2.mul_add_precise(f32x4::from_slice(neon, &in_block[8..12]), acc[t][2]);
+            acc[t][3] = st3.mul_add_precise(f32x4::from_slice(neon, &in_block[12..16]), acc[t][3]);
+        }
+    }
+    let mut results: [f32; 4] =
+        std::array::from_fn(|t| ((acc[t][0] + acc[t][2]) + (acc[t][1] + acc[t][3])).reduce_sum());
+    for (idx, &st) in state[vectorized..].iter().enumerate() {
+        let col = vectorized + idx;
+        for (t, res) in results.iter_mut().enumerate() {
+            *res += st * inputs[t][col];
+        }
+    }
+    Some(results)
+}
+
 /// Computes `(dot(states[r], first), dot(states[r], second))` across four state rows in one pass,
 /// sharing each `first` and `second` vector load across all four rows' four-register FMA trees.
 #[inline]

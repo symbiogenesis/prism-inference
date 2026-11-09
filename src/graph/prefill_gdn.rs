@@ -485,7 +485,7 @@ pub(super) fn recurrent_tile<'a>(
         return Err(invalid("chunkwise GDN requires recurrent state"));
     };
     check()?;
-    let mut previous_weight = project_tile_pair(
+    let previous_weight = project_tile_pair(
         transforms,
         geometry,
         arithmetic,
@@ -503,29 +503,25 @@ pub(super) fn recurrent_tile<'a>(
         reborrow_executor(&mut executor),
         check,
     )?;
-    for (weight, outputs) in [
-        (&layer.beta, &mut tile.beta),
-        (&layer.alpha, &mut tile.alpha),
-    ] {
-        check()?;
-        previous_weight = project_tile(
-            transforms,
-            geometry,
-            arithmetic,
-            adapter,
-            adapter_scale,
-            adapter_scratch,
-            projection_scratch,
-            previous_weight,
-            weight,
-            &tile.normalized[..count],
-            &mut outputs[..count],
-            &mut tile.transformed[..count],
-            &mut tile.projector,
-            reborrow_executor(&mut executor),
-            check,
-        )?;
-    }
+    check()?;
+    let _ = project_tile_pair(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        previous_weight,
+        [&layer.beta, &layer.alpha],
+        &tile.normalized[..count],
+        &mut tile.beta[..count],
+        &mut tile.alpha[..count],
+        &mut tile.transformed[..count],
+        &mut tile.projector,
+        reborrow_executor(&mut executor),
+        check,
+    )?;
     copy_into(history, convolution)?;
     resize_into(previous.len(), matrix)?;
     let width = geometry.ssm_head;

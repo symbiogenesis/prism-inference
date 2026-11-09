@@ -15,7 +15,14 @@ import tarfile
 import tomllib
 
 
-PACKAGES = ("bonsai-native-hash", "bonsai-neon-dot", "bonsai-gguf", "prism-inference")
+PACKAGES = (
+    "bonsai-ternary",
+    "bonsai-prism",
+    "bonsai-native-hash",
+    "bonsai-neon-dot",
+    "bonsai-gguf",
+    "prism-inference",
+)
 
 CONSUMER = """use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, RowParallelism},
@@ -63,12 +70,18 @@ def main():
         str(root / "Cargo.toml"), "--registry", "crates-io", "--locked", *selection,
     )
     versions = {
+        "bonsai-ternary": tomllib.loads((root / "tools/ternary/Cargo.toml").read_text())[
+            "package"
+        ]["version"],
+        "bonsai-prism": tomllib.loads((root / "tools/prism/Cargo.toml").read_text())[
+            "package"
+        ]["version"],
         "bonsai-native-hash": tomllib.loads((root / "tools/native-hash/Cargo.toml").read_text())[
             "package"
         ]["version"],
-        "bonsai-neon-dot": tomllib.loads((root / "Cargo.toml").read_text())[
-            "workspace"
-        ]["package"]["version"],
+        "bonsai-neon-dot": tomllib.loads((root / "tools/neon-dot/Cargo.toml").read_text())[
+            "package"
+        ]["version"],
         "bonsai-gguf": tomllib.loads((root / "tools/gguf/Cargo.toml").read_text())[
             "package"
         ]["version"],
@@ -103,6 +116,8 @@ def main():
     consumer = evidence / "consumer"
     (consumer / "src").mkdir(parents=True)
     runtime = f"../archives/prism-inference-{versions['prism-inference']}"
+    ternary = f"../archives/bonsai-ternary-{versions['bonsai-ternary']}"
+    prism = f"../archives/bonsai-prism-{versions['bonsai-prism']}"
     gguf = f"../archives/bonsai-gguf-{versions['bonsai-gguf']}"
     native_hash = f"../archives/bonsai-native-hash-{versions['bonsai-native-hash']}"
     neon_dot = f"../archives/bonsai-neon-dot-{versions['bonsai-neon-dot']}"
@@ -121,6 +136,8 @@ parallel-rows = ["bonsai-prism-runtime/parallel-rows"]
 bonsai-prism-runtime = {{ package = "prism-inference", path = "{runtime}", default-features = false }}
 
 [patch.crates-io]
+bonsai-ternary = {{ path = "{ternary}" }}
+bonsai-prism = {{ path = "{prism}" }}
 bonsai-gguf = {{ path = "{gguf}" }}
 bonsai-native-hash = {{ path = "{native_hash}" }}
 bonsai-neon-dot = {{ path = "{neon_dot}" }}

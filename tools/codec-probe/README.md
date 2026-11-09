@@ -20,7 +20,7 @@ extracted file with its ZIP entry, verifies all native PE headers and retains
 read handles denying mutation through child completion. It uses neither the
 Runner installer nor its maintenance CLI. Version and codec children run in
 separate one-process kill-on-close Windows Jobs via the already published
-`bonsai-windows-process =0.1.0`, each capped to 1 GiB commit and 30 seconds, with
+`bonsai-windows-process =0.1.2`, each capped to 1 GiB commit and 30 seconds, with
 parent-process lifetime checks, inherited environment and an explicit external
 native working directory. Evidence includes exact package file hashes, version,
 ABI, corpus counts, stdout/stderr and peak Job memory.

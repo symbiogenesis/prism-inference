@@ -558,6 +558,53 @@ impl Arithmetic {
             }
         }
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::suboptimal_flops,
+        reason = "Keep multi-token GDN row recurrence parameters and exact single-token rounding order explicit."
+    )]
+    fn gdn_step_row_tokens_from(
+        self,
+        previous: &[f32],
+        state: &mut [f32],
+        inputs: &[crate::kernels::pinned_gdn::ChunkInput<'_>],
+        row: usize,
+        stride: usize,
+        scale: f32,
+        output: &mut [f32],
+    ) -> Result<()> {
+        match self {
+            Self::Source => {
+                let Some(first) = inputs.first() else {
+                    return Err(invalid("empty GDN chunk"));
+                };
+                output[row] = self.gdn_step_row_from(
+                    previous,
+                    state,
+                    first.key,
+                    first.query,
+                    first.decay,
+                    first.value[row],
+                    first.beta,
+                )? * scale;
+                for (token, input) in inputs.iter().enumerate().skip(1) {
+                    output[token * stride + row] = self.gdn_step_row_in_place(
+                        state,
+                        input.key,
+                        input.query,
+                        input.decay,
+                        input.value[row],
+                        input.beta,
+                    )? * scale;
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => crate::kernels::pinned_gdn::step_row_tokens_from(
+                previous, state, inputs, row, stride, scale, output,
+            ),
+        }
+    }
 }
 const MAX_LAYERS: usize = 256;
 const KV_PAGE_TOKENS: usize = 64;

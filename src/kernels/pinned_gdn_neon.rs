@@ -561,3 +561,141 @@ pub(super) fn step_row_in_place(
     }
     Some(super::super::finite(((q0 + q2) + (q1 + q3)).reduce_sum()))
 }
+
+#[inline]
+fn flush_blocks(state: &mut [f32], blocks: &[[f32x4<Neon>; 4]], count: usize) {
+    for (state_block, &[v0, v1, v2, v3]) in state
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(blocks.iter())
+        .take(count)
+    {
+        v0.store_slice(&mut state_block[0..4]);
+        v1.store_slice(&mut state_block[4..8]);
+        v2.store_slice(&mut state_block[8..12]);
+        v3.store_slice(&mut state_block[12..16]);
+    }
+}
+
+/// Steps one GDN state row across `inputs.len()` tokens while keeping the state row
+/// in `[[f32x4<Neon>; 4]; 16]` across tokens, writing `state` to memory only once
+/// after all tokens complete (or flushing exact partial state on a non-finite error).
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::suboptimal_flops,
+    reason = "Keep multi-token register-resident NEON GDN row recurrence and exact partial-mutation fallback together."
+)]
+pub(super) fn step_row_tokens_from(
+    previous: &[f32],
+    state: &mut [f32],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let width = state.len();
+    if width == 0 || width > 256 || !width.is_multiple_of(16) {
+        return None;
+    }
+    let blocks = width / 16;
+    let mut current = [[f32x4::splat(neon, 0.0); 4]; 16];
+    for (b, prev_block) in previous.as_chunks::<16>().0.iter().enumerate() {
+        current[b] = [
+            f32x4::from_slice(neon, &prev_block[0..4]),
+            f32x4::from_slice(neon, &prev_block[4..8]),
+            f32x4::from_slice(neon, &prev_block[8..12]),
+            f32x4::from_slice(neon, &prev_block[12..16]),
+        ];
+    }
+    let mut decayed = [[f32x4::splat(neon, 0.0); 4]; 16];
+    for (token, input) in inputs.iter().enumerate() {
+        let decays = f32x4::splat(neon, input.decay);
+        let mut s0 = f32x4::splat(neon, 0.0);
+        let mut s1 = f32x4::splat(neon, 0.0);
+        let mut s2 = f32x4::splat(neon, 0.0);
+        let mut s3 = f32x4::splat(neon, 0.0);
+        for (b, key_block) in input.key.as_chunks::<16>().0.iter().enumerate() {
+            let [c0, c1, c2, c3] = current[b];
+            let d0 = c0 * decays;
+            let d1 = c1 * decays;
+            let d2 = c2 * decays;
+            let d3 = c3 * decays;
+            decayed[b] = [d0, d1, d2, d3];
+            s0 = d0.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), s0);
+            s1 = d1.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), s1);
+            s2 = d2.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), s2);
+            s3 = d3.mul_add_precise(f32x4::from_slice(neon, &key_block[12..16]), s3);
+        }
+        let dot_k = match super::super::finite(((s0 + s2) + (s1 + s3)).reduce_sum()) {
+            Ok(val) => val,
+            Err(err) => {
+                flush_blocks(state, &decayed, blocks);
+                return Some(Err(err));
+            }
+        };
+        let delta = (input.value[row] - dot_k) * input.beta;
+        let scales = f32x4::splat(neon, delta);
+        let mut q0 = f32x4::splat(neon, 0.0);
+        let mut q1 = f32x4::splat(neon, 0.0);
+        let mut q2 = f32x4::splat(neon, 0.0);
+        let mut q3 = f32x4::splat(neon, 0.0);
+        for (b, (key_block, query_block)) in input
+            .key
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(input.query.as_chunks::<16>().0)
+            .enumerate()
+        {
+            let [d0, d1, d2, d3] = decayed[b];
+            let u0 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[0..4]), d0);
+            let u1 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[4..8]), d1);
+            let u2 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[8..12]), d2);
+            let u3 = scales.mul_add_precise(f32x4::from_slice(neon, &key_block[12..16]), d3);
+            if (u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+                current[b] = [u0, u1, u2, u3];
+                q0 = u0.mul_add_precise(f32x4::from_slice(neon, &query_block[0..4]), q0);
+                q1 = u1.mul_add_precise(f32x4::from_slice(neon, &query_block[4..8]), q1);
+                q2 = u2.mul_add_precise(f32x4::from_slice(neon, &query_block[8..12]), q2);
+                q3 = u3.mul_add_precise(f32x4::from_slice(neon, &query_block[12..16]), q3);
+            } else {
+                flush_blocks(state, &current, b);
+                for (rem_b, rem_state) in state
+                    .as_chunks_mut::<16>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                    .take(blocks)
+                    .skip(b)
+                {
+                    let [rd0, rd1, rd2, rd3] = decayed[rem_b];
+                    rd0.store_slice(&mut rem_state[0..4]);
+                    rd1.store_slice(&mut rem_state[4..8]);
+                    rd2.store_slice(&mut rem_state[8..12]);
+                    rd3.store_slice(&mut rem_state[12..16]);
+                }
+                let state_block = &mut state[b * 16..(b + 1) * 16];
+                for (target_elem, &key_elem) in state_block.iter_mut().zip(key_block) {
+                    match super::super::finite(delta.mul_add(key_elem, *target_elem)) {
+                        Ok(updated) => *target_elem = updated,
+                        Err(err) => return Some(Err(err)),
+                    }
+                }
+            }
+        }
+        match super::super::finite(((q0 + q2) + (q1 + q3)).reduce_sum()) {
+            Ok(out) => output[token * stride + row] = out * scale,
+            Err(err) => {
+                flush_blocks(state, &current, blocks);
+                return Some(Err(err));
+            }
+        }
+    }
+    flush_blocks(state, &current, blocks);
+    Some(Ok(()))
+}

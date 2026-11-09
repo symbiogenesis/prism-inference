@@ -11,6 +11,16 @@
 
 use crate::{Result, invalid};
 
+/// Per-token GDN recurrence inputs for a single head chunk.
+#[derive(Clone, Copy)]
+pub(crate) struct ChunkInput<'a> {
+    pub(crate) query: &'a [f32],
+    pub(crate) key: &'a [f32],
+    pub(crate) value: &'a [f32],
+    pub(crate) decay: f32,
+    pub(crate) beta: f32,
+}
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -261,6 +271,72 @@ pub(crate) fn step_row_in_place(
     update_and_dot(state, key, delta, query)
 }
 
+/// Steps one GDN state row across `inputs.len()` tokens from `previous` into `state`,
+/// writing `out * scale` to `output[token * stride + row]` for each token.
+///
+/// # Errors
+/// Rejects invalid geometry before mutation, or a nonfinite updated element or dot result.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops,
+    reason = "Keep multi-token row recurrence geometry and exact single-token rounding order explicit."
+)]
+pub(crate) fn step_row_tokens_from(
+    previous: &[f32],
+    state: &mut [f32],
+    inputs: &[ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> Result<()> {
+    let Some(first) = inputs.first() else {
+        return Err(invalid("empty GDN chunk"));
+    };
+    if previous.len() != state.len()
+        || state.len() != stride
+        || row >= stride
+        || inputs.len().checked_mul(stride) != Some(output.len())
+        || inputs.iter().any(|input| {
+            input.key.len() != stride || input.query.len() != stride || input.value.len() <= row
+        })
+    {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(result) =
+        neon::step_row_tokens_from(previous, state, inputs, row, stride, scale, output)
+    {
+        return result;
+    }
+    output[row] = step_row_from(
+        previous,
+        state,
+        first.key,
+        first.query,
+        first.decay,
+        first.value[row],
+        first.beta,
+    )? * scale;
+    for (token, input) in inputs.iter().enumerate().skip(1) {
+        output[token * stride + row] = step_row_in_place(
+            state,
+            input.key,
+            input.query,
+            input.decay,
+            input.value[row],
+            input.beta,
+        )? * scale;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::suboptimal_flops,
     reason = "Keep the scalar oracle's exact multiply/add remainder rounding."
@@ -280,8 +356,8 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_pair, dot_scalar,
-        scalar_add_scaled, step_row_from, step_row_in_place, update_and_dot,
+        ChunkInput, add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_pair, dot_scalar,
+        scalar_add_scaled, step_row_from, step_row_in_place, step_row_tokens_from, update_and_dot,
     };
     use crate::Result;
 
@@ -377,6 +453,68 @@ mod tests {
                 )?;
                 assert_eq!(in_place_out.to_bits(), ref_out.to_bits());
                 assert_eq!(bits(&step_in_place_state), bits(&step_ref_state));
+
+                if width > 0 {
+                    let row = width / 2;
+                    let out_scale = 0.125_f32;
+                    let chunk_inputs = [
+                        ChunkInput {
+                            query: &first,
+                            key: &second,
+                            value: &first,
+                            decay: scale,
+                            beta,
+                        },
+                        ChunkInput {
+                            query: &second,
+                            key: &first,
+                            value: &second,
+                            decay: 0.75,
+                            beta: 0.375,
+                        },
+                        ChunkInput {
+                            query: &first,
+                            key: &second,
+                            value: &first,
+                            decay: 0.5,
+                            beta: 0.875,
+                        },
+                    ];
+                    let mut seq_state = vec![f32::NAN; width];
+                    let mut seq_out = vec![0.0_f32; 3 * width];
+                    seq_out[row] = step_row_from(
+                        &first,
+                        &mut seq_state,
+                        chunk_inputs[0].key,
+                        chunk_inputs[0].query,
+                        chunk_inputs[0].decay,
+                        chunk_inputs[0].value[row],
+                        chunk_inputs[0].beta,
+                    )? * out_scale;
+                    for (tok, inp) in chunk_inputs.iter().enumerate().skip(1) {
+                        seq_out[tok * width + row] = step_row_in_place(
+                            &mut seq_state,
+                            inp.key,
+                            inp.query,
+                            inp.decay,
+                            inp.value[row],
+                            inp.beta,
+                        )? * out_scale;
+                    }
+                    let mut multi_state = vec![f32::NAN; width];
+                    let mut multi_out = vec![0.0_f32; 3 * width];
+                    step_row_tokens_from(
+                        &first,
+                        &mut multi_state,
+                        &chunk_inputs,
+                        row,
+                        width,
+                        out_scale,
+                        &mut multi_out,
+                    )?;
+                    assert_eq!(bits(&multi_state), bits(&seq_state));
+                    assert_eq!(bits(&multi_out), bits(&seq_out));
+                }
             }
         }
         Ok(())

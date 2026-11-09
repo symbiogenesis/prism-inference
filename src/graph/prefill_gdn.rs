@@ -5,17 +5,10 @@ use crate::graph::{
     Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms, copy_into,
     finite, l2_norm, resize_into, sigmoid, small_float,
 };
+use crate::kernels::pinned_gdn::ChunkInput as Input;
 use crate::kernels::{add_scaled_slice_in_place, scale_slice_into};
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::{Result, invalid};
-
-struct Input<'a> {
-    query: &'a [f32],
-    key: &'a [f32],
-    value: &'a [f32],
-    decay: f32,
-    beta: f32,
-}
 
 #[cfg(test)]
 fn head(
@@ -110,25 +103,9 @@ fn exact_head_into(
         .enumerate()
         .zip(matrix.chunks_exact_mut(width))
     {
-        output[row] = arithmetic.gdn_step_row_from(
-            prev_row,
-            state_row,
-            first.key,
-            first.query,
-            first.decay,
-            first.value[row],
-            first.beta,
-        )? * scale;
-        for (token, input) in inputs.iter().enumerate().skip(1) {
-            output[token * width + row] = arithmetic.gdn_step_row_in_place(
-                state_row,
-                input.key,
-                input.query,
-                input.decay,
-                input.value[row],
-                input.beta,
-            )? * scale;
-        }
+        arithmetic.gdn_step_row_tokens_from(
+            prev_row, state_row, inputs, row, width, scale, output,
+        )?;
     }
     Ok(())
 }

@@ -482,6 +482,85 @@ impl Arithmetic {
         }
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        clippy::too_many_arguments,
+        reason = "Preserve each channel's binary64 sum and final binary32 rounding across two tokens."
+    )]
+    fn attention_value_tile_four_two_tokens(
+        self,
+        values: &KvCache,
+        currents: [&[f32]; 2],
+        offset: usize,
+        probabilities0: [&[f32]; 4],
+        probabilities1: [&[f32]; 4],
+        outputs0: [&mut [f32]; 4],
+        outputs1: [&mut [f32]; 4],
+    ) -> Result<()> {
+        let last0 = probabilities0[0].len().saturating_sub(1);
+        let last1 = probabilities1[0].len().saturating_sub(1);
+        match self {
+            Self::Source => {
+                let zero = std::iter::empty::<f64>().sum::<f64>();
+                let out_len = outputs0[0].len();
+                let mut sums0 = [[zero; crate::kernels::pinned_attention::VALUE_TILE]; 4];
+                let mut sums1 = [[zero; crate::kernels::pinned_attention::VALUE_TILE]; 4];
+                for (pos, past) in values.tokens().take(last1).enumerate() {
+                    let row = &past[offset..offset + out_len];
+                    if pos < last0 {
+                        for (channel, &value) in row.iter().enumerate() {
+                            let decoded = half_to_float(value);
+                            for h in 0..4 {
+                                sums0[h][channel] += f64::from(probabilities0[h][pos] * decoded);
+                                sums1[h][channel] += f64::from(probabilities1[h][pos] * decoded);
+                            }
+                        }
+                    } else {
+                        for (channel, &value) in row.iter().enumerate() {
+                            let decoded = half_to_float(value);
+                            for h in 0..4 {
+                                sums1[h][channel] += f64::from(probabilities1[h][pos] * decoded);
+                            }
+                        }
+                    }
+                }
+                for (output, (prob_row, sum_row)) in outputs0
+                    .into_iter()
+                    .zip(probabilities0.into_iter().zip(&sums0))
+                {
+                    let probability = prob_row[last0];
+                    for ((out, &sum), &value) in
+                        output.iter_mut().zip(&sum_row[..out_len]).zip(currents[0])
+                    {
+                        *out = (sum + f64::from(probability * value)) as f32;
+                    }
+                }
+                for (output, (prob_row, sum_row)) in outputs1
+                    .into_iter()
+                    .zip(probabilities1.into_iter().zip(&sums1))
+                {
+                    let probability = prob_row[last1];
+                    for ((out, &sum), &value) in
+                        output.iter_mut().zip(&sum_row[..out_len]).zip(currents[1])
+                    {
+                        *out = (sum + f64::from(probability * value)) as f32;
+                    }
+                }
+                Ok(())
+            }
+            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four_two_tokens(
+                values.tokens().take(last1),
+                currents,
+                probabilities0,
+                probabilities1,
+                offset,
+                outputs0,
+                outputs1,
+            ),
+        }
+    }
+
     #[cfg(test)]
     fn gdn_add_scaled(self, target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
         match self {

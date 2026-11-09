@@ -155,18 +155,169 @@ pub(super) fn value_tile_four<'a>(
     Ok(())
 }
 
+/// Consumes a validated tile across two consecutive tokens and four query heads sharing a KV head.
+///
+/// Both tokens share the first `weights0[0].len() - 1` cached binary16 value rows,
+/// which are read and converted to binary32 once for all eight `(token, head)`
+/// accumulators while preserving each head's independent sixteen-lane FMA tree.
+#[allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep explicit 2-token x 4-head indices aligned across fixed arrays."
+)]
+pub(super) fn value_tile_four_two_tokens<'a>(
+    neon: Neon,
+    mut past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    weights0: [&[f32]; 4],
+    weights1: [&[f32]; 4],
+    range: &std::ops::Range<usize>,
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+) -> Result<()> {
+    let zero = f32x4::splat(neon, 0.0);
+    let mut sums0 = [[[zero; VALUE_TILE / 4]; 16]; 4];
+    let mut sums1 = [[[zero; VALUE_TILE / 4]; 16]; 4];
+    let groups = outputs0[0].len() / 4;
+    let token_count0 = weights0[0].len();
+    let token_count1 = weights1[0].len();
+    let last0 = token_count0 - 1;
+    let last1 = token_count1 - 1;
+    for index in 0..last0 {
+        let values = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let lane = index % 16;
+        let ws0: [f32x4<Neon>; 4] = std::array::from_fn(|h| f32x4::splat(neon, weights0[h][index]));
+        let ws1: [f32x4<Neon>; 4] = std::array::from_fn(|h| f32x4::splat(neon, weights1[h][index]));
+        let (val_chunks8, val_rem) = values.as_chunks::<8>();
+        for (pair_idx, chunk8) in val_chunks8.iter().enumerate() {
+            let (v0, v1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk8);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            for h in 0..4 {
+                sums0[h][lane][g0] = v0.mul_add_precise(ws0[h], sums0[h][lane][g0]);
+                sums0[h][lane][g1] = v1.mul_add_precise(ws0[h], sums0[h][lane][g1]);
+                sums1[h][lane][g0] = v0.mul_add_precise(ws1[h], sums1[h][lane][g0]);
+                sums1[h][lane][g1] = v1.mul_add_precise(ws1[h], sums1[h][lane][g1]);
+            }
+        }
+        let rem_base = val_chunks8.len() * 2;
+        for (rem_idx, vals4) in val_rem.as_chunks::<4>().0.iter().enumerate() {
+            let v = super::super::neon::f16_bits_to_f32_x4(neon, *vals4);
+            let g = rem_base + rem_idx;
+            for h in 0..4 {
+                sums0[h][lane][g] = v.mul_add_precise(ws0[h], sums0[h][lane][g]);
+                sums1[h][lane][g] = v.mul_add_precise(ws1[h], sums1[h][lane][g]);
+            }
+        }
+    }
+    let values_last0 = past
+        .next()
+        .and_then(|row| row.get(range.start..range.end))
+        .ok_or_else(|| invalid("pinned attention value row is short"))?;
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last0_lane = last0 % 16;
+    let ws0_last: [f32x4<Neon>; 4] =
+        std::array::from_fn(|h| f32x4::splat(neon, weights0[h][last0]));
+    for (g, values) in currents[0].as_chunks::<4>().0.iter().enumerate() {
+        let v = f32x4::load_array(neon, *values);
+        for h in 0..4 {
+            sums0[h][last0_lane][g] = v.mul_add_precise(ws0_last[h], sums0[h][last0_lane][g]);
+        }
+    }
+    let ws1_last0: [f32x4<Neon>; 4] =
+        std::array::from_fn(|h| f32x4::splat(neon, weights1[h][last0]));
+    let (val_chunks8, val_rem) = values_last0.as_chunks::<8>();
+    for (pair_idx, chunk8) in val_chunks8.iter().enumerate() {
+        let (v0, v1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk8);
+        let g0 = pair_idx * 2;
+        let g1 = g0 + 1;
+        for h in 0..4 {
+            sums1[h][last0_lane][g0] = v0.mul_add_precise(ws1_last0[h], sums1[h][last0_lane][g0]);
+            sums1[h][last0_lane][g1] = v1.mul_add_precise(ws1_last0[h], sums1[h][last0_lane][g1]);
+        }
+    }
+    let rem_base = val_chunks8.len() * 2;
+    for (rem_idx, vals4) in val_rem.as_chunks::<4>().0.iter().enumerate() {
+        let v = super::super::neon::f16_bits_to_f32_x4(neon, *vals4);
+        let g = rem_base + rem_idx;
+        for h in 0..4 {
+            sums1[h][last0_lane][g] = v.mul_add_precise(ws1_last0[h], sums1[h][last0_lane][g]);
+        }
+    }
+    let last1_lane = last1 % 16;
+    let ws1_last1: [f32x4<Neon>; 4] =
+        std::array::from_fn(|h| f32x4::splat(neon, weights1[h][last1]));
+    for (g, values) in currents[1].as_chunks::<4>().0.iter().enumerate() {
+        let v = f32x4::load_array(neon, *values);
+        for h in 0..4 {
+            sums1[h][last1_lane][g] = v.mul_add_precise(ws1_last1[h], sums1[h][last1_lane][g]);
+        }
+    }
+    for index in token_count0..padded_dot_steps(token_count0) {
+        let lane = index % 16;
+        for head_sums in &mut sums0 {
+            for sum in &mut head_sums[lane][..groups] {
+                *sum = zero.mul_add_precise(zero, *sum);
+            }
+        }
+    }
+    for index in token_count1..padded_dot_steps(token_count1) {
+        let lane = index % 16;
+        for head_sums in &mut sums1 {
+            for sum in &mut head_sums[lane][..groups] {
+                *sum = zero.mul_add_precise(zero, *sum);
+            }
+        }
+    }
+    for (outputs, sums) in [(outputs0, &sums0), (outputs1, &sums1)] {
+        for (h, output) in outputs.into_iter().enumerate() {
+            for (group, out) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
+                    (sums[h][lane][group] + sums[h][8 + lane][group])
+                        + (sums[h][4 + lane][group] + sums[h][12 + lane][group])
+                });
+                let result = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])).to_array();
+                for (out, value) in out.iter_mut().zip(result) {
+                    *out = super::super::finite(value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reduces a validated F16 key slice and F32 query slice with four NEON FMA registers.
 pub(super) fn dot_f16(neon: Neon, key: &[u16], query: &[f32]) -> Result<f32> {
     let mut sums = [f32x4::splat(neon, 0.0); 4];
     let (key_chunks8, key_rem) = key.as_chunks::<8>();
     let (query_chunks8, query_rem) = query.as_chunks::<8>();
-    for (pair_idx, (k8, q8)) in key_chunks8.iter().zip(query_chunks8).enumerate() {
-        let base = (pair_idx * 2) % 4;
+    let (key_pairs, key_odd) = key_chunks8.as_chunks::<2>();
+    let (query_pairs, query_odd) = query_chunks8.as_chunks::<2>();
+    for ([k8_0, k8_1], [q8_0, q8_1]) in key_pairs.iter().zip(query_pairs) {
+        let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, k8_0);
+        let qv0 = f32x4::from_slice(neon, &q8_0[..4]);
+        let qv1 = f32x4::from_slice(neon, &q8_0[4..]);
+        sums[0] = kv0.mul_add_precise(qv0, sums[0]);
+        sums[1] = kv1.mul_add_precise(qv1, sums[1]);
+
+        let (kv2, kv3) = super::super::neon::f16_bits_to_f32_x8(neon, k8_1);
+        let qv2 = f32x4::from_slice(neon, &q8_1[..4]);
+        let qv3 = f32x4::from_slice(neon, &q8_1[4..]);
+        sums[2] = kv2.mul_add_precise(qv2, sums[2]);
+        sums[3] = kv3.mul_add_precise(qv3, sums[3]);
+    }
+    for (k8, q8) in key_odd.iter().zip(query_odd) {
         let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, k8);
         let qv0 = f32x4::from_slice(neon, &q8[..4]);
         let qv1 = f32x4::from_slice(neon, &q8[4..]);
-        sums[base] = kv0.mul_add_precise(qv0, sums[base]);
-        sums[base + 1] = kv1.mul_add_precise(qv1, sums[base + 1]);
+        sums[0] = kv0.mul_add_precise(qv0, sums[0]);
+        sums[1] = kv1.mul_add_precise(qv1, sums[1]);
     }
     let rem_base = key_chunks8.len() * 2;
     let key_chunks4 = key_rem.as_chunks::<4>().0;
@@ -206,11 +357,22 @@ pub(super) fn dot_f32(neon: Neon, key: &[f32], query: &[f32]) -> Result<f32> {
     let mut sums = [f32x4::splat(neon, 0.0); 4];
     let key_chunks = key.as_chunks::<4>().0;
     let query_chunks = query.as_chunks::<4>().0;
-    for (chunk, (k, q)) in key_chunks.iter().zip(query_chunks).enumerate() {
-        let acc = &mut sums[chunk % 4];
+    let (key_quads, key_rem4) = key_chunks.as_chunks::<4>();
+    let (query_quads, query_rem4) = query_chunks.as_chunks::<4>();
+    for (k_quad, q_quad) in key_quads.iter().zip(query_quads) {
+        sums[0] = f32x4::load_array(neon, k_quad[0])
+            .mul_add_precise(f32x4::load_array(neon, q_quad[0]), sums[0]);
+        sums[1] = f32x4::load_array(neon, k_quad[1])
+            .mul_add_precise(f32x4::load_array(neon, q_quad[1]), sums[1]);
+        sums[2] = f32x4::load_array(neon, k_quad[2])
+            .mul_add_precise(f32x4::load_array(neon, q_quad[2]), sums[2]);
+        sums[3] = f32x4::load_array(neon, k_quad[3])
+            .mul_add_precise(f32x4::load_array(neon, q_quad[3]), sums[3]);
+    }
+    for (lane, (k, q)) in key_rem4.iter().zip(query_rem4).enumerate() {
         let kv = f32x4::load_array(neon, *k);
         let qv = f32x4::load_array(neon, *q);
-        *acc = kv.mul_add_precise(qv, *acc);
+        sums[lane] = kv.mul_add_precise(qv, sums[lane]);
     }
     let vector_steps = key_chunks.len() * 4;
     let total_steps = padded_dot_steps(query.len());
@@ -242,15 +404,35 @@ pub(super) fn dot_f16_four(neon: Neon, key: &[u16], queries: [&[f32]; 4]) -> Res
     let (key_chunks8, key_rem) = key.as_chunks::<8>();
     let q_chunks8 = queries.map(|q| q.as_chunks::<8>().0);
     let q_rems = queries.map(|q| q.as_chunks::<8>().1);
-    for (pair_idx, k8) in key_chunks8.iter().enumerate() {
-        let base = (pair_idx * 2) % 4;
+    let (key_pairs, key_odd) = key_chunks8.as_chunks::<2>();
+    for (pair2_idx, [k8_0, k8_1]) in key_pairs.iter().enumerate() {
+        let idx0 = pair2_idx * 2;
+        let idx1 = idx0 + 1;
+        let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, k8_0);
+        let (kv2, kv3) = super::super::neon::f16_bits_to_f32_x8(neon, k8_1);
+        for h in 0..4 {
+            let q8_0 = &q_chunks8[h][idx0];
+            let qv0 = f32x4::from_slice(neon, &q8_0[..4]);
+            let qv1 = f32x4::from_slice(neon, &q8_0[4..]);
+            sums[h][0] = kv0.mul_add_precise(qv0, sums[h][0]);
+            sums[h][1] = kv1.mul_add_precise(qv1, sums[h][1]);
+
+            let q8_1 = &q_chunks8[h][idx1];
+            let qv2 = f32x4::from_slice(neon, &q8_1[..4]);
+            let qv3 = f32x4::from_slice(neon, &q8_1[4..]);
+            sums[h][2] = kv2.mul_add_precise(qv2, sums[h][2]);
+            sums[h][3] = kv3.mul_add_precise(qv3, sums[h][3]);
+        }
+    }
+    if let Some(k8) = key_odd.first() {
+        let idx = key_pairs.len() * 2;
         let (kv0, kv1) = super::super::neon::f16_bits_to_f32_x8(neon, k8);
         for h in 0..4 {
-            let q8 = &q_chunks8[h][pair_idx];
+            let q8 = &q_chunks8[h][idx];
             let qv0 = f32x4::from_slice(neon, &q8[..4]);
             let qv1 = f32x4::from_slice(neon, &q8[4..]);
-            sums[h][base] = kv0.mul_add_precise(qv0, sums[h][base]);
-            sums[h][base + 1] = kv1.mul_add_precise(qv1, sums[h][base + 1]);
+            sums[h][0] = kv0.mul_add_precise(qv0, sums[h][0]);
+            sums[h][1] = kv1.mul_add_precise(qv1, sums[h][1]);
         }
     }
     let rem_base = key_chunks8.len() * 2;
@@ -370,8 +552,24 @@ pub(super) fn dot_f32_four(neon: Neon, key: &[f32], queries: [&[f32]; 4]) -> Res
     let mut sums = [[f32x4::splat(neon, 0.0); 4]; 4];
     let key_chunks = key.as_chunks::<4>().0;
     let q_chunks = queries.map(|q| q.as_chunks::<4>().0);
-    for (chunk, k) in key_chunks.iter().enumerate() {
-        let lane = chunk % 4;
+    let (key_quads, key_rem4) = key_chunks.as_chunks::<4>();
+    for (quad_idx, k_quad) in key_quads.iter().enumerate() {
+        let base = quad_idx * 4;
+        let kv0 = f32x4::load_array(neon, k_quad[0]);
+        let kv1 = f32x4::load_array(neon, k_quad[1]);
+        let kv2 = f32x4::load_array(neon, k_quad[2]);
+        let kv3 = f32x4::load_array(neon, k_quad[3]);
+        for h in 0..4 {
+            let qh = &q_chunks[h][base..base + 4];
+            sums[h][0] = kv0.mul_add_precise(f32x4::load_array(neon, qh[0]), sums[h][0]);
+            sums[h][1] = kv1.mul_add_precise(f32x4::load_array(neon, qh[1]), sums[h][1]);
+            sums[h][2] = kv2.mul_add_precise(f32x4::load_array(neon, qh[2]), sums[h][2]);
+            sums[h][3] = kv3.mul_add_precise(f32x4::load_array(neon, qh[3]), sums[h][3]);
+        }
+    }
+    let rem_base = key_quads.len() * 4;
+    for (lane, k) in key_rem4.iter().enumerate() {
+        let chunk = rem_base + lane;
         let kv = f32x4::load_array(neon, *k);
         for h in 0..4 {
             let qv = f32x4::load_array(neon, q_chunks[h][chunk]);
@@ -470,7 +668,7 @@ mod tests {
     use bonsai_ternary::half_to_float;
     use fearless_simd::{Neon, f32x4, prelude::*};
 
-    use super::{VALUE_TILE, value_tile};
+    use super::{VALUE_TILE, value_tile, value_tile_four, value_tile_four_two_tokens};
 
     #[derive(serde::Deserialize)]
     struct Capture {
@@ -555,6 +753,103 @@ mod tests {
                 assert_eq!(c0[lane].to_bits(), expected0);
                 assert_eq!(a1[lane].to_bits(), expected1);
                 assert_eq!(c1[lane].to_bits(), expected1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn neon_value_tile_four_two_tokens_matches_single_token_four_head_tiles() -> crate::Result<()> {
+        let neon = fearless_simd::Level::baseline()
+            .as_neon()
+            .ok_or_else(|| crate::invalid("required attention baseline NEON token is absent"))?;
+        let cases = [0_u16, 0x8000, 1, 0x0400, 0x3c00, 0xbc00, 0x3800, 0xb800];
+        for history in [0, 1, 7, 15, 16, 17, 31] {
+            let rows: Vec<[u16; VALUE_TILE]> = (0..=history)
+                .map(|pos| std::array::from_fn(|ch| cases[(pos * 3 + ch) % cases.len()]))
+                .collect();
+            let current0: [f32; VALUE_TILE] =
+                std::array::from_fn(|ch| half_to_float(rows[history][ch]));
+            let current1: [f32; VALUE_TILE] =
+                std::array::from_fn(|ch| half_to_float(cases[(history + ch + 5) % cases.len()]));
+            let weights0: [[f32; 33]; 4] = std::array::from_fn(|h| {
+                std::array::from_fn(|pos| [0.5_f32, -0.25, 0.125, -0.0, 0.0][(pos + h) % 5])
+            });
+            let weights1: [[f32; 33]; 4] = std::array::from_fn(|h| {
+                std::array::from_fn(|pos| [0.25_f32, 0.125, -0.5, 0.0, -0.0][(pos + h + 1) % 5])
+            });
+            let w0_refs: [&[f32]; 4] = std::array::from_fn(|h| &weights0[h][..=history]);
+            let w1_refs: [&[f32]; 4] = std::array::from_fn(|h| &weights1[h][..history + 2]);
+            for tile_len in [12, 24, VALUE_TILE] {
+                let mut exp0 = [[0.0_f32; VALUE_TILE]; 4];
+                let mut exp1 = [[0.0_f32; VALUE_TILE]; 4];
+                let (e0_0, e0_rest) = exp0.split_at_mut(1);
+                let (e0_1, e0_rest) = e0_rest.split_at_mut(1);
+                let (e0_2, e0_3) = e0_rest.split_at_mut(1);
+                value_tile_four(
+                    neon,
+                    rows[..history].iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    &current0[..tile_len],
+                    w0_refs,
+                    &(0..tile_len),
+                    [
+                        &mut e0_0[0][..tile_len],
+                        &mut e0_1[0][..tile_len],
+                        &mut e0_2[0][..tile_len],
+                        &mut e0_3[0][..tile_len],
+                    ],
+                )?;
+                let (e1_0, e1_rest) = exp1.split_at_mut(1);
+                let (e1_1, e1_rest) = e1_rest.split_at_mut(1);
+                let (e1_2, e1_3) = e1_rest.split_at_mut(1);
+                value_tile_four(
+                    neon,
+                    rows[..=history].iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    &current1[..tile_len],
+                    w1_refs,
+                    &(0..tile_len),
+                    [
+                        &mut e1_0[0][..tile_len],
+                        &mut e1_1[0][..tile_len],
+                        &mut e1_2[0][..tile_len],
+                        &mut e1_3[0][..tile_len],
+                    ],
+                )?;
+
+                let mut act0 = [[f32::NAN; VALUE_TILE]; 4];
+                let mut act1 = [[f32::NAN; VALUE_TILE]; 4];
+                let (a0_0, a0_rest) = act0.split_at_mut(1);
+                let (a0_1, a0_rest) = a0_rest.split_at_mut(1);
+                let (a0_2, a0_3) = a0_rest.split_at_mut(1);
+                let (a1_0, a1_rest) = act1.split_at_mut(1);
+                let (a1_1, a1_rest) = a1_rest.split_at_mut(1);
+                let (a1_2, a1_3) = a1_rest.split_at_mut(1);
+                value_tile_four_two_tokens(
+                    neon,
+                    rows[..=history].iter().map(<[u16; VALUE_TILE]>::as_slice),
+                    [&current0[..tile_len], &current1[..tile_len]],
+                    w0_refs,
+                    w1_refs,
+                    &(0..tile_len),
+                    [
+                        &mut a0_0[0][..tile_len],
+                        &mut a0_1[0][..tile_len],
+                        &mut a0_2[0][..tile_len],
+                        &mut a0_3[0][..tile_len],
+                    ],
+                    [
+                        &mut a1_0[0][..tile_len],
+                        &mut a1_1[0][..tile_len],
+                        &mut a1_2[0][..tile_len],
+                        &mut a1_3[0][..tile_len],
+                    ],
+                )?;
+                for h in 0..4 {
+                    for ch in 0..tile_len {
+                        assert_eq!(act0[h][ch].to_bits(), exp0[h][ch].to_bits());
+                        assert_eq!(act1[h][ch].to_bits(), exp1[h][ch].to_bits());
+                    }
+                }
             }
         }
         Ok(())

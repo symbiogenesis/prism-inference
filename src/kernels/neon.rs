@@ -2215,6 +2215,10 @@ pub(super) fn dot_ptq1_row_source(bytes: &[u8], input: &[super::Q8Block]) -> Res
 }
 
 #[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve scalar reference multiply-then-add block accumulation order."
+)]
 pub(super) fn dot_ptq1_four_rows_source(
     rows: [&[u8]; 4],
     input: &[super::Q8Block],
@@ -2318,6 +2322,7 @@ pub(super) fn dot_ptq1_four_rows_source(
 
 #[inline]
 #[allow(
+    clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "Dispatches between ARMv8.2-A SDOT and pre-widened baseline NEON across eight rows."
 )]

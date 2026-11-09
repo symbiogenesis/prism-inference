@@ -380,6 +380,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Verifies single-token and multi-token GDN parity across all widths and decay/beta cases."
+    )]
     fn pinned_gdn_dispatch_matches_scalar_bits_and_tail() -> Result<()> {
         for width in (0..=33).chain([63, 64, 65, 127, 128, 129, 255, 256, 257, 5120]) {
             let (first, second) = vectors(width);

@@ -103,9 +103,8 @@ fn exact_head_into(
         .enumerate()
         .zip(matrix.chunks_exact_mut(width))
     {
-        arithmetic.gdn_step_row_tokens_from(
-            prev_row, state_row, inputs, row, width, scale, output,
-        )?;
+        arithmetic
+            .gdn_step_row_tokens_from(prev_row, state_row, inputs, row, width, scale, output)?;
     }
     Ok(())
 }

@@ -240,6 +240,184 @@ fn value_tile_four_scalar<'a>(
     Ok(())
 }
 
+/// Reduces up to [`VALUE_TILE`] value channels across two consecutive tokens and four query heads.
+///
+/// # Errors
+/// Rejects invalid widths, mismatched lengths, short/long iterators, offset overflow,
+/// and nonfinite outputs without writing partial results.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Pass explicit two-token current values, probability slices and output slices."
+)]
+pub(crate) fn value_tile_four_two_tokens<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    weights0: [&[f32]; 4],
+    weights1: [&[f32]; 4],
+    offset: usize,
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+) -> Result<()> {
+    let out_len = outputs0[0].len();
+    let weight_len0 = weights0[0].len();
+    let weight_len1 = weights1[0].len();
+    if out_len == 0
+        || out_len > VALUE_TILE
+        || currents.iter().any(|c| c.len() != out_len)
+        || weight_len0 == 0
+        || weight_len1 != weight_len0.saturating_add(1)
+        || weight_len1 > crate::model::swift::CONTEXT_TOKENS
+        || outputs0.iter().any(|out| out.len() != out_len)
+        || outputs1.iter().any(|out| out.len() != out_len)
+        || weights0.iter().any(|w| w.len() != weight_len0)
+        || weights1.iter().any(|w| w.len() != weight_len1)
+    {
+        return Err(invalid("invalid pinned attention value tile"));
+    }
+    let end = offset
+        .checked_add(out_len)
+        .ok_or_else(|| invalid("pinned attention value offset overflow"))?;
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if out_len.is_multiple_of(4)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return neon::value_tile_four_two_tokens(
+            neon,
+            past,
+            currents,
+            weights0,
+            weights1,
+            &(offset..end),
+            outputs0,
+            outputs1,
+        );
+    }
+
+    value_tile_four_two_tokens_scalar(
+        past,
+        currents,
+        weights0,
+        weights1,
+        &(offset..end),
+        outputs0,
+        outputs1,
+    )
+}
+
+#[allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep explicit 2-token x 4-head indices aligned across fixed arrays."
+)]
+fn value_tile_four_two_tokens_scalar<'a>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    weights0: [&[f32]; 4],
+    weights1: [&[f32]; 4],
+    range: &std::ops::Range<usize>,
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+) -> Result<()> {
+    let out_len = outputs0[0].len();
+    let weight_len0 = weights0[0].len();
+    let weight_len1 = weights1[0].len();
+    let mut sums0 = [[[[0.0_f32; 4]; 4]; VALUE_TILE]; 4];
+    let mut sums1 = [[[[0.0_f32; 4]; 4]; VALUE_TILE]; 4];
+    let last0 = weight_len0 - 1;
+    let last1 = weight_len1 - 1;
+    for index in 0..last0 {
+        let values = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let r = index % 16 / 4;
+        let c = index % 4;
+        for (channel, &value) in values.iter().enumerate() {
+            let decoded = bonsai_ternary::half_to_float(value);
+            for h in 0..4 {
+                let lane0 = &mut sums0[h][channel][r][c];
+                *lane0 = decoded.mul_add(weights0[h][index], *lane0);
+                let lane1 = &mut sums1[h][channel][r][c];
+                *lane1 = decoded.mul_add(weights1[h][index], *lane1);
+            }
+        }
+    }
+    let values_last0 = past
+        .next()
+        .and_then(|row| row.get(range.start..range.end))
+        .ok_or_else(|| invalid("pinned attention value row is short"))?;
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last0_r = last0 % 16 / 4;
+    let last0_c = last0 % 4;
+    for (channel, (&val0_f32, &val0_f16)) in currents[0].iter().zip(values_last0).enumerate() {
+        let decoded = bonsai_ternary::half_to_float(val0_f16);
+        for h in 0..4 {
+            let lane0 = &mut sums0[h][channel][last0_r][last0_c];
+            *lane0 = val0_f32.mul_add(weights0[h][last0], *lane0);
+            let lane1 = &mut sums1[h][channel][last0_r][last0_c];
+            *lane1 = decoded.mul_add(weights1[h][last0], *lane1);
+        }
+    }
+    let last1_r = last1 % 16 / 4;
+    let last1_c = last1 % 4;
+    for (channel, &value) in currents[1].iter().enumerate() {
+        for h in 0..4 {
+            let lane1 = &mut sums1[h][channel][last1_r][last1_c];
+            *lane1 = value.mul_add(weights1[h][last1], *lane1);
+        }
+    }
+    for index in weight_len0..padded_dot_steps(weight_len0) {
+        let r = index % 16 / 4;
+        let c = index % 4;
+        for h in 0..4 {
+            for sum in &mut sums0[h][..out_len] {
+                let lane = &mut sum[r][c];
+                *lane = 0.0_f32.mul_add(0.0, *lane);
+            }
+        }
+    }
+    for index in weight_len1..padded_dot_steps(weight_len1) {
+        let r = index % 16 / 4;
+        let c = index % 4;
+        for h in 0..4 {
+            for sum in &mut sums1[h][..out_len] {
+                let lane = &mut sum[r][c];
+                *lane = 0.0_f32.mul_add(0.0, *lane);
+            }
+        }
+    }
+    let mut staged0 = [[0.0_f32; VALUE_TILE]; 4];
+    let mut staged1 = [[0.0_f32; VALUE_TILE]; 4];
+    for (staged, sums) in [(&mut staged0, &sums0), (&mut staged1, &sums1)] {
+        for h in 0..4 {
+            for (out, sum) in staged[h][..out_len].iter_mut().zip(&sums[h][..out_len]) {
+                let mut lanes = [0.0; 4];
+                for (index, lane) in lanes.iter_mut().enumerate() {
+                    *lane = (sum[0][index] + sum[2][index]) + (sum[1][index] + sum[3][index]);
+                }
+                *out = super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+            }
+        }
+    }
+    for (output, stage) in outputs0.into_iter().zip(&staged0) {
+        output.copy_from_slice(&stage[..out_len]);
+    }
+    for (output, stage) in outputs1.into_iter().zip(&staged1) {
+        output.copy_from_slice(&stage[..out_len]);
+    }
+    Ok(())
+}
+
 /// Reduces a cached F16 key row and F32 query row with the pinned four-register FMA tree.
 ///
 /// # Errors

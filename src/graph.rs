@@ -5077,6 +5077,60 @@ mod tests {
         );
     }
 
+    fn check_original_attention_gates(
+        geometry: &Geometry,
+        layer: &super::FullAttention,
+        projected: &[f32],
+        original_values: [f32; 8],
+        expected: &[f32],
+        arithmetic: Arithmetic,
+        workers: usize,
+    ) -> Result<()> {
+        let mut projection = ProjectionScratch::default();
+        projection.matvec.set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
+        let transforms = Transforms::default();
+        let mut adapter = crate::model::lora::Scratch::default();
+        let mut evaluation = super::Evaluation {
+            geometry,
+            arithmetic,
+            transforms: &transforms,
+            position: 0,
+            frequencies_ready: false,
+            projection: &mut projection,
+            adapter: None,
+            adapter_scale: 0.0,
+            adapter_scratch: &mut adapter,
+            executor: None,
+        };
+        let keys = KvCache::new(8, 2)?;
+        let values = KvCache::new(8, 2)?;
+        let mut scratch = super::AttentionScratch::default();
+        let mut key = [0.0; 8];
+        let mut value = original_values;
+        // A failed rounding attempt must not publish attended output
+        // or append state; reuse the same scratch for the valid retry.
+        value[0] = 70_000.0;
+        assert!(evaluation.full_attention_state(
+            layer, projected, &mut key, &mut value, &keys, &values,
+            &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
+            &mut scratch.attended,
+        ).is_err());
+        assert!(scratch.attended.is_empty());
+        assert!(scratch.gate.is_empty());
+        assert_eq!(keys.tokens().count(), 0);
+        assert_eq!(values.tokens().count(), 0);
+        let mut value = original_values;
+        evaluation.full_attention_state(
+            layer, projected, &mut key, &mut value, &keys, &values,
+            &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
+            &mut scratch.attended,
+        )?;
+        assert!(scratch.gate.is_empty());
+        assert!(scratch.attended.iter().map(|value| value.to_bits())
+            .eq(expected.iter().map(|value| value.to_bits())));
+        Ok(())
+    }
+
     #[test]
     fn full_attention_reads_original_interleaved_gates_across_worker_groups() -> Result<()> {
         let mut geometry = projection_geometry(4);
@@ -5118,48 +5172,9 @@ mod tests {
         let worker_counts = [1];
         for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
             for workers in worker_counts {
-                let mut projection = ProjectionScratch::default();
-                projection.matvec.set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
-                let transforms = Transforms::default();
-                let mut adapter = crate::model::lora::Scratch::default();
-                let mut evaluation = super::Evaluation {
-                    geometry: &geometry,
-                    arithmetic,
-                    transforms: &transforms,
-                    position: 0,
-                    frequencies_ready: false,
-                    projection: &mut projection,
-                    adapter: None,
-                    adapter_scale: 0.0,
-                    adapter_scratch: &mut adapter,
-                    executor: None,
-                };
-                let keys = KvCache::new(8, 2)?;
-                let values = KvCache::new(8, 2)?;
-                let mut scratch = super::AttentionScratch::default();
-                let mut key = [0.0; 8];
-                let mut value = original_values;
-                // A failed rounding attempt must not publish attended output
-                // or append state; reuse the same scratch for the valid retry.
-                value[0] = 70_000.0;
-                assert!(evaluation.full_attention_state(
-                    &layer, &projected, &mut key, &mut value, &keys, &values,
-                    &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
-                    &mut scratch.attended,
-                ).is_err());
-                assert!(scratch.attended.is_empty());
-                assert!(scratch.gate.is_empty());
-                assert_eq!(keys.tokens().count(), 0);
-                assert_eq!(values.tokens().count(), 0);
-                let mut value = original_values;
-                evaluation.full_attention_state(
-                    &layer, &projected, &mut key, &mut value, &keys, &values,
-                    &mut scratch.query, &mut scratch.scores, &mut scratch.frequencies,
-                    &mut scratch.attended,
+                check_original_attention_gates(
+                    &geometry, &layer, &projected, original_values, &expected, arithmetic, workers,
                 )?;
-                assert!(scratch.gate.is_empty());
-                assert!(scratch.attended.iter().map(|value| value.to_bits())
-                    .eq(expected.iter().map(|value| value.to_bits())));
             }
         }
         Ok(())

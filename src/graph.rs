@@ -5122,8 +5122,9 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(scratch.attended, [] as [f32; 0]);
-        assert_eq!(scratch.gate, [] as [f32; 0]);
+        let empty: [f32; 0] = [];
+        assert_eq!(scratch.attended, empty);
+        assert_eq!(scratch.gate, empty);
         assert_eq!(keys.tokens().count(), 0);
         assert_eq!(values.tokens().count(), 0);
         let mut value = original_values;
@@ -5139,7 +5140,7 @@ mod tests {
             &mut scratch.frequencies,
             &mut scratch.attended,
         )?;
-        assert_eq!(scratch.gate, [] as [f32; 0]);
+        assert_eq!(scratch.gate, empty);
         assert!(
             scratch
                 .attended

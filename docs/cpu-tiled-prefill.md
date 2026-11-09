@@ -37,8 +37,8 @@ interleaved query/gate projection. Only queries are normalized into separate
 scratch; the original gate values remain available until score/value work has
 finished. This omits one gate materialization without changing sigmoid, rounded
 probabilities, value accumulation, adapters or cancellation/rollback behavior.
-For Swift's 32 heads of width 128 across 16 full-attention layers, the omitted
-copy payload is 256 KiB per token (512 KiB of logical copy reads/writes), excluding
+For Swift's 24 heads of width 256 across 16 full-attention layers, the omitted
+copy payload is 384 KiB per token (768 KiB of logical copy reads/writes), excluding
 the unchanged later gate reads. Actual traffic, latency and peak RAM are
 unmeasured. Recurrent/FFN gate scratch and conservative admission remain charged.
 

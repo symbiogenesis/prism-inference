@@ -43,11 +43,15 @@ omitted while query normalization, sigmoid and attention arithmetic keep their
 order. See the [tiled-prefill contract](cpu-tiled-prefill.md) for source work
 counts and the unchanged resource and qualification boundaries.
 
-The explicit suffix drafter now visits historical match ends once, comparing
-backwards against the current suffix with the existing 64-token maximum window.
-It preserves overlapping matches, longest-match priority and the most recent
-start on ties, while avoiding a separate history scan for every permitted match
-length. Runtime generation copies at most eight continuation tokens into a fixed
+The explicit suffix drafter now uses reverse Z matching against the current
+suffix with the existing 64-token maximum window. Its private 64-byte prefix
+table reuses already proved matches instead of comparing a long common suffix
+again at every historical end. Prefix preparation and the history scan require
+fewer than `2 * (history tokens + maximum match tokens)` token equalities;
+this includes failed comparisons. It preserves overlapping matches,
+longest-match priority and the most recent start on ties. The previous
+backwards scan could repeat up to 64 comparisons per historical end.
+Runtime generation copies at most eight continuation tokens into a fixed
 stack buffer reused for the request; it no longer allocates a proposal vector for
 each round. The public `SuffixDrafter::propose` API still returns an independently
 owned, fallibly allocated vector. Invalid configurations reject before proposal
@@ -58,8 +62,12 @@ that serial greedy verification is faster than ordinary decoding. Decoder work,
 state checkpoints, cancellation checks around proposal/verification, output limits
 and exact greedy decisions retain their contracts. Exhaustive binary histories
 through ten tokens and 8K maximum-window controls compare both proposal routes
-against the retained original forward, length-first search. Owning hosted checks,
-actual-model state/adapter parity and matched complete-request benefit remain
+against the retained original forward, length-first search. Periodic, overlapping
+and adversarial near-match controls count the actual algorithm's equalities and
+check the linear bound. The 64-byte table is additional private source payload;
+actual stack use, code generation and typical-prompt costs remain unmeasured.
+Owning hosted checks, actual-model state/adapter parity and matched
+complete-request benefit remain
 pending before any performance qualification or default change.
 
 Exact NEON GDN multi-token helpers now reuse the private state staging array for

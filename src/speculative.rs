@@ -164,37 +164,89 @@ impl SuffixDrafter {
             return Ok(&[]);
         }
         let max_len = config.max_match_tokens.min(history.len() - 1);
-        let mut best_len = config.min_match_tokens - 1;
-        let mut continuation_start = 0;
-        // A match ending at `end` has a continuation only when end < history.len().
-        // Compare backwards once per end instead of rescanning the entire history
-        // for every permitted length. Overlapping historical matches remain valid.
-        for end in (config.min_match_tokens..history.len()).rev() {
-            if end <= best_len {
-                break;
-            }
-            let mut matched = 0;
-            while matched < max_len.min(end)
-                && history[end - matched - 1] == history[history.len() - matched - 1]
-            {
-                matched += 1;
-            }
-            // Ends are visited newest first, so equal lengths keep the most recent
-            // start. A maximum-length match cannot be improved by any earlier end.
-            if matched > best_len {
-                best_len = matched;
-                continuation_start = end;
-                if matched == max_len {
-                    break;
-                }
-            }
-        }
-        if continuation_start == 0 {
+        let Some(continuation_start) = suffix_match_start(
+            history,
+            config.min_match_tokens,
+            max_len,
+            |left, right| left == right,
+        )? else {
             return Ok(&[]);
-        }
+        };
         let available = (history.len() - continuation_start).min(limit);
         Ok(&history[continuation_start..continuation_start + available])
     }
+}
+
+// Search the reversed history against its bounded prefix (the current suffix
+// in forward order). A Z box reuses matches already proved by earlier starts;
+// only extensions beyond its right edge require new successful comparisons.
+// Each scan has at most one failed equality per start, hence fewer than
+// 2 * (history.len() + maximum) token comparisons including the prefix table.
+// The equality parameter lets controls count the actual production algorithm.
+fn suffix_match_start(
+    history: &[u32],
+    minimum: usize,
+    maximum: usize,
+    mut equal: impl FnMut(u32, u32) -> bool,
+) -> Result<Option<usize>> {
+    // Only validated private callers enter: 1 <= minimum <= maximum <= 64,
+    // and maximum < history.len(). Every table entry therefore fits in u8.
+    let length = history.len();
+    let mut prefix = [0_u8; MAX_SUFFIX_MATCH_TOKENS];
+    let mut box_start = 0;
+    let mut box_end = 0;
+    for offset in 1..maximum {
+        let mut matched = if offset < box_end {
+            usize::from(prefix[offset - box_start]).min(box_end - offset)
+        } else {
+            0
+        };
+        while matched < maximum - offset
+            && equal(history[length - matched - 1], history[length - offset - matched - 1])
+        {
+            matched += 1;
+        }
+        prefix[offset] = u8::try_from(matched)?;
+        if offset + matched > box_end {
+            box_start = offset;
+            box_end = offset + matched;
+        }
+    }
+    box_start = 0;
+    box_end = 0;
+    let mut best_len = minimum - 1;
+    let mut continuation_start = None;
+    // Reversed offsets grow from one, excluding the current suffix itself.
+    // Their forward match ends decrease, retaining the most recent equal-length
+    // match while allowing the same overlapping spans as the original search.
+    for offset in 1..=length - minimum {
+        let end = length - offset;
+        if end <= best_len {
+            break;
+        }
+        let mut matched = if offset < box_end {
+            usize::from(prefix[offset - box_start]).min(box_end - offset)
+        } else {
+            0
+        };
+        while matched < maximum.min(end)
+            && equal(history[length - matched - 1], history[end - matched - 1])
+        {
+            matched += 1;
+        }
+        if offset + matched > box_end {
+            box_start = offset;
+            box_end = offset + matched;
+        }
+        if matched > best_len {
+            best_len = matched;
+            continuation_start = Some(end);
+            if matched == maximum {
+                break;
+            }
+        }
+    }
+    Ok(continuation_start)
 }
 
 /// Verify one speculative draft token under the exact stochastic acceptance-rejection
@@ -567,7 +619,7 @@ mod tests {
     use super::{
         DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, GdnVerifyTape,
         MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS, SpeculativeStats, SuffixDraftConfig,
-        SuffixDrafter, mtp_first_decode_fits, verify_stochastic_step,
+        SuffixDrafter, mtp_first_decode_fits, suffix_match_start, verify_stochastic_step,
     };
     use crate::Result;
 
@@ -728,6 +780,104 @@ mod tests {
             assert!(SuffixDrafter::propose_into(&periodic, config, 0, &mut storage).is_err());
             assert_eq!(storage, [42; MAX_SPECULATIVE_DRAFT_TOKENS]);
             assert!(SuffixDrafter::propose(&periodic, config, 0).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_z_matcher_bounds_work_on_adversarial_near_matches() -> Result<()> {
+        // A single differing token near the tail prevents a full-window match.
+        // Most historical ends nevertheless share 63 trailing zeros, forcing
+        // the earlier independent backwards matcher to repeat those comparisons.
+        let mut history = vec![0; 8192];
+        let length = history.len();
+        history[length - MAX_SUFFIX_MATCH_TOKENS] = u32::MAX;
+        let config = SuffixDraftConfig::new(2, MAX_SUFFIX_MATCH_TOKENS, 8)?;
+        let expected = reference_suffix_continuation(&history, config, 8);
+        let mut comparisons = 0;
+        let start = suffix_match_start(
+            &history,
+            config.min_match_tokens,
+            config.max_match_tokens,
+            |left, right| {
+                comparisons += 1;
+                left == right
+            },
+        )?
+        .ok_or_else(|| crate::invalid("adversarial history must contain a suffix match"))?;
+        assert_eq!(&history[start..start + 8.min(length - start)], expected);
+        assert!(comparisons < 2 * (length + MAX_SUFFIX_MATCH_TOKENS));
+
+        // Count the previous one-pass search independently. Its token predicate
+        // is evaluated once for every comparison, including failed matches.
+        let mut old_comparisons = 0;
+        let mut best = config.min_match_tokens - 1;
+        let mut old_start = None;
+        for end in (config.min_match_tokens..length).rev() {
+            if end <= best {
+                break;
+            }
+            let mut matched = 0;
+            while matched < MAX_SUFFIX_MATCH_TOKENS.min(end) {
+                old_comparisons += 1;
+                if history[end - matched - 1] != history[length - matched - 1] {
+                    break;
+                }
+                matched += 1;
+            }
+            if matched > best {
+                best = matched;
+                old_start = Some(end);
+                if matched == MAX_SUFFIX_MATCH_TOKENS {
+                    break;
+                }
+            }
+        }
+        assert_eq!(Some(start), old_start);
+        assert!(old_comparisons > comparisons * 20);
+        check_suffix_apis(&history, config, usize::MAX)
+    }
+
+    #[test]
+    fn suffix_z_matcher_preserves_periodic_ties_overlap_and_linear_bound() -> Result<()> {
+        for length in [2, 15, 63, 64, 65, 129, 8192] {
+            for period in [1, 2, 3, 7, 31, 63, 64, 65, 97] {
+                let mut history = (0..length)
+                    .map(|index| u32::try_from(index % period).map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?;
+                // Exercise both exact periodic repeats and broken runs. The
+                // asymmetric marker can change the winning match and its tie.
+                for broken in [false, true] {
+                    if broken {
+                        history[length / 2] = u32::MAX;
+                    }
+                    for minimum in [1, 2, 16, 64] {
+                        for maximum in [minimum, MAX_SUFFIX_MATCH_TOKENS] {
+                            let config = SuffixDraftConfig::new(minimum, maximum, 8)?;
+                            check_suffix_apis(&history, config, 8)?;
+                            if length <= minimum {
+                                continue;
+                            }
+                            let maximum = maximum.min(length - 1);
+                            let mut comparisons = 0;
+                            let start = suffix_match_start(
+                                &history,
+                                minimum,
+                                maximum,
+                                |left, right| {
+                                    comparisons += 1;
+                                    left == right
+                                },
+                            )?;
+                            let actual = start.map_or(&[][..], |start| {
+                                &history[start..start + 8.min(length - start)]
+                            });
+                            assert_eq!(actual, reference_suffix_continuation(&history, config, 8));
+                            assert!(comparisons < 2 * (length + maximum));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

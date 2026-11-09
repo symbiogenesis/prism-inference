@@ -465,6 +465,75 @@ pub fn dot_pq2_four_rows_four_tokens(
     })
 }
 
+/// Computes a 4-row by 4-token 128-element `PQ2_0` dot tile against
+/// pre-deinterleaved digit-plane `i8` activations and their precomputed
+/// `activation_sums` using ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available.
+#[inline]
+#[must_use]
+pub fn dot_pq2_four_rows_four_tokens_precomputed(
+    packed: [&[u8; 32]; 4],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) =
+        aarch64::dot_pq2_four_rows_four_tokens_precomputed(packed, planes, activation_sums)
+    {
+        return tile;
+    }
+    packed.map(|row| {
+        std::array::from_fn(|tok| {
+            dot_pq2_consumption_block(row, planes[tok], activation_sums[tok])
+        })
+    })
+}
+
+/// Computes an 8-row by 4-token 128-element `PQ2_0` dot tile against
+/// pre-deinterleaved digit-plane `i8` activations and their precomputed
+/// `activation_sums` using ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available.
+#[inline]
+#[must_use]
+pub fn dot_pq2_eight_rows_four_tokens_precomputed(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) =
+        aarch64::dot_pq2_eight_rows_four_tokens_precomputed(packed, planes, activation_sums)
+    {
+        return tile;
+    }
+    packed.map(|row| {
+        std::array::from_fn(|tok| {
+            dot_pq2_consumption_block(row, planes[tok], activation_sums[tok])
+        })
+    })
+}
+
+/// Computes an 8-row by 8-token 128-element `PQ2_0` dot tile against
+/// pre-deinterleaved digit-plane `i8` activations and their precomputed
+/// `activation_sums` using ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available.
+#[inline]
+#[must_use]
+pub fn dot_pq2_eight_rows_eight_tokens_precomputed(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) =
+        aarch64::dot_pq2_eight_rows_eight_tokens_precomputed(packed, planes, activation_sums)
+    {
+        return tile;
+    }
+    packed.map(|row| {
+        std::array::from_fn(|tok| {
+            dot_pq2_consumption_block(row, planes[tok], activation_sums[tok])
+        })
+    })
+}
+
 /// Computes an 8-row by 8-token 128-element `PQ2_0` dot tile against sequential
 /// `Q8_K` 128-element activation slices and their precomputed `activation_sums`
 /// using ARMv8.2-A `I8MM` (`SMMLA`) or `SDOT` when available.
@@ -602,6 +671,29 @@ mod tests {
         let col0 = dot_pq2_four_rows_one_token(row_refs4, &acts[0], sums[0]);
         for r in 0..4 {
             assert_eq!(col0[r], tile8[r][0]);
+        }
+
+        let planes: [[i8; 128]; 8] = std::array::from_fn(|t| {
+            std::array::from_fn(|index| {
+                acts[t][(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
+            })
+        });
+        let plane_refs8: [&[i8; 128]; 8] = std::array::from_fn(|t| &planes[t]);
+        let plane_refs4: [&[i8; 128]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+        assert_eq!(
+            dot_pq2_eight_rows_eight_tokens_precomputed(row_refs8, plane_refs8, sums),
+            tile8
+        );
+        assert_eq!(
+            dot_pq2_four_rows_four_tokens_precomputed(row_refs4, plane_refs4, sums4),
+            tile4
+        );
+        let tile8x4 = dot_pq2_eight_rows_four_tokens_precomputed(row_refs8, plane_refs4, sums4);
+        for r in 0..8 {
+            assert_eq!(
+                tile8x4[r],
+                [tile8[r][0], tile8[r][1], tile8[r][2], tile8[r][3]]
+            );
         }
     }
 

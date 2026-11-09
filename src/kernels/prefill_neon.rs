@@ -336,6 +336,18 @@ fn q8k_half_sum(neon: Neon, sums: &[i16; 16], half: usize) -> i32 {
 }
 
 #[inline]
+fn load_pq2_activation_precomputed(
+    neon: Neon,
+    act: &crate::kernels::packed_pq2::Activation,
+) -> Pq2Activation {
+    let chunks = act.widened.as_chunks::<8>().0;
+    Pq2Activation {
+        planes: std::array::from_fn(|k| i16x8::from_slice(neon, &chunks[k])),
+        sum128: act.sum,
+    }
+}
+
+#[inline]
 fn prepare_pq2_activation(neon: Neon, values: &[i8; 128], sum128: i32) -> Pq2Activation {
     let mut planes = [i16x8::splat(neon, 0); 16];
     for (half, bytes) in values.as_chunks::<64>().0.iter().enumerate() {
@@ -484,6 +496,9 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
     let r1 = rows[1].as_chunks::<34>().0;
     let r2 = rows[2].as_chunks::<34>().0;
     let r3 = rows[3].as_chunks::<34>().0;
+    let has_precomputed = preparations
+        .iter()
+        .all(|scratch| scratch.pq2_consumption.len() >= r0.len());
     for (index, (((b0, b1), b2), b3)) in r0.iter().zip(r1).zip(r2).zip(r3).enumerate() {
         let scales_vec = crate::kernels::neon::f16_bits_to_f32_x4(
             neon,
@@ -512,26 +527,43 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
         if use_dotprod {
             for (chunk_idx, chunk) in chunks4.iter().enumerate() {
                 let base = chunk_idx * 4;
-                let a0 = &chunk[0].q8k[q8k_idx];
-                let a1 = &chunk[1].q8k[q8k_idx];
-                let a2 = &chunk[2].q8k[q8k_idx];
-                let a3 = &chunk[3].q8k[q8k_idx];
-                let dots = bonsai_neon_dot::dot_pq2_four_rows_four_tokens(
-                    packed_rows,
-                    [
-                        a0.values[start..start + 128].try_into().ok()?,
-                        a1.values[start..start + 128].try_into().ok()?,
-                        a2.values[start..start + 128].try_into().ok()?,
-                        a3.values[start..start + 128].try_into().ok()?,
-                    ],
-                    [
-                        q8k_half_sum(neon, &a0.sums, half),
-                        q8k_half_sum(neon, &a1.sums, half),
-                        q8k_half_sum(neon, &a2.sums, half),
-                        q8k_half_sum(neon, &a3.sums, half),
-                    ],
-                );
-                let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+                let (dots, act_scales) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    let a2 = &chunk[2].pq2_consumption[index];
+                    let a3 = &chunk[3].pq2_consumption[index];
+                    (
+                        bonsai_neon_dot::dot_pq2_four_rows_four_tokens_precomputed(
+                            packed_rows,
+                            [&a0.values, &a1.values, &a2.values, &a3.values],
+                            [a0.sum, a1.sum, a2.sum, a3.sum],
+                        ),
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    let a2 = &chunk[2].q8k[q8k_idx];
+                    let a3 = &chunk[3].q8k[q8k_idx];
+                    (
+                        bonsai_neon_dot::dot_pq2_four_rows_four_tokens(
+                            packed_rows,
+                            [
+                                a0.values[start..start + 128].try_into().ok()?,
+                                a1.values[start..start + 128].try_into().ok()?,
+                                a2.values[start..start + 128].try_into().ok()?,
+                                a3.values[start..start + 128].try_into().ok()?,
+                            ],
+                            [
+                                q8k_half_sum(neon, &a0.sums, half),
+                                q8k_half_sum(neon, &a1.sums, half),
+                                q8k_half_sum(neon, &a2.sums, half),
+                                q8k_half_sum(neon, &a3.sums, half),
+                            ],
+                        ),
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                    )
+                };
                 for r in 0..4 {
                     let d = f32x4::splat(neon, row_scales[r]) * act_scales;
                     let dot_f32 = i32x4::from_slice(neon, &dots[r]).to_float::<f32x4<Neon>>();
@@ -547,14 +579,29 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
             let rem_base = chunks4.len() * 4;
             for (offset, scratch) in rem4.iter().enumerate() {
                 let token = rem_base + offset;
-                let act_block = &scratch.q8k[q8k_idx];
-                let dots = bonsai_neon_dot::dot_pq2_four_rows_one_token(
-                    packed_rows,
-                    act_block.values[start..start + 128].try_into().ok()?,
-                    q8k_half_sum(neon, &act_block.sums, half),
-                );
+                let (dots, act_scale) = if has_precomputed {
+                    let act_block = &scratch.pq2_consumption[index];
+                    (
+                        bonsai_neon_dot::dot_pq2_four_consumption_precomputed(
+                            packed_rows,
+                            &act_block.values,
+                            act_block.sum,
+                        ),
+                        act_block.scale,
+                    )
+                } else {
+                    let act_block = &scratch.q8k[q8k_idx];
+                    (
+                        bonsai_neon_dot::dot_pq2_four_rows_one_token(
+                            packed_rows,
+                            act_block.values[start..start + 128].try_into().ok()?,
+                            q8k_half_sum(neon, &act_block.sums, half),
+                        ),
+                        act_block.scale,
+                    )
+                };
                 for r in 0..4 {
-                    let d = row_scales[r] * act_block.scale;
+                    let d = row_scales[r] * act_scale;
                     let dot_f32 = crate::kernels::integer_float(dots[r]);
                     sums[r][token] = if pinned {
                         d.mul_add(dot_f32, sums[r][token])
@@ -567,34 +614,52 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
             let weights = packed_rows.map(|row| decode_pq2_unsigned(neon, row));
             for (chunk_idx, chunk) in chunks4.iter().enumerate() {
                 let base = chunk_idx * 4;
-                let a0 = &chunk[0].q8k[q8k_idx];
-                let a1 = &chunk[1].q8k[q8k_idx];
-                let a2 = &chunk[2].q8k[q8k_idx];
-                let a3 = &chunk[3].q8k[q8k_idx];
-                let acts = [
-                    prepare_pq2_activation(
-                        neon,
-                        a0.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a0.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a1.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a1.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a2.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a2.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a3.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a3.sums, half),
-                    ),
-                ];
+                let (acts, act_scales) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    let a2 = &chunk[2].pq2_consumption[index];
+                    let a3 = &chunk[3].pq2_consumption[index];
+                    (
+                        [
+                            load_pq2_activation_precomputed(neon, a0),
+                            load_pq2_activation_precomputed(neon, a1),
+                            load_pq2_activation_precomputed(neon, a2),
+                            load_pq2_activation_precomputed(neon, a3),
+                        ],
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    let a2 = &chunk[2].q8k[q8k_idx];
+                    let a3 = &chunk[3].q8k[q8k_idx];
+                    (
+                        [
+                            prepare_pq2_activation(
+                                neon,
+                                a0.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a0.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a1.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a1.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a2.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a2.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a3.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a3.sums, half),
+                            ),
+                        ],
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                    )
+                };
                 let dots = dot128_four_rows_four_tokens(neon, &weights, &acts);
-                let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
                 for r in 0..4 {
                     let d = f32x4::splat(neon, row_scales[r]) * act_scales;
                     let dot_f32 = dots[r].to_float::<f32x4<Neon>>();
@@ -610,15 +675,26 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
             let rem_base = chunks4.len() * 4;
             for (offset, scratch) in rem4.iter().enumerate() {
                 let token = rem_base + offset;
-                let act_block = &scratch.q8k[q8k_idx];
-                let act = prepare_pq2_activation(
-                    neon,
-                    act_block.values[start..start + 128].try_into().ok()?,
-                    q8k_half_sum(neon, &act_block.sums, half),
-                );
+                let (act, act_scale) = if has_precomputed {
+                    let act_block = &scratch.pq2_consumption[index];
+                    (
+                        load_pq2_activation_precomputed(neon, act_block),
+                        act_block.scale,
+                    )
+                } else {
+                    let act_block = &scratch.q8k[q8k_idx];
+                    (
+                        prepare_pq2_activation(
+                            neon,
+                            act_block.values[start..start + 128].try_into().ok()?,
+                            q8k_half_sum(neon, &act_block.sums, half),
+                        ),
+                        act_block.scale,
+                    )
+                };
                 let dots = dot128_four_rows_one_token(neon, &weights, &act);
                 for r in 0..4 {
-                    let d = row_scales[r] * act_block.scale;
+                    let d = row_scales[r] * act_scale;
                     let dot_f32 = crate::kernels::integer_float(dots[r]);
                     sums[r][token] = if pinned {
                         d.mul_add(dot_f32, sums[r][token])
@@ -654,6 +730,9 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
     let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut sums = [[0.0_f32; TOKENS]; 8];
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
+    let has_precomputed = preparations
+        .iter()
+        .all(|scratch| scratch.pq2_consumption.len() >= chunks[0].len());
     for index in 0..chunks[0].len() {
         let b0 = &chunks[0][index];
         let b1 = &chunks[1][index];
@@ -721,41 +800,66 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             ];
             for (chunk_idx, chunk) in chunks8.iter().enumerate() {
                 let base = chunk_idx * 8;
-                let a0 = &chunk[0].q8k[q8k_idx];
-                let a1 = &chunk[1].q8k[q8k_idx];
-                let a2 = &chunk[2].q8k[q8k_idx];
-                let a3 = &chunk[3].q8k[q8k_idx];
-                let a4 = &chunk[4].q8k[q8k_idx];
-                let a5 = &chunk[5].q8k[q8k_idx];
-                let a6 = &chunk[6].q8k[q8k_idx];
-                let a7 = &chunk[7].q8k[q8k_idx];
-                let dots8 = bonsai_neon_dot::dot_pq2_eight_rows_eight_tokens(
-                    packed_all,
-                    [
-                        a0.values[start..start + 128].try_into().ok()?,
-                        a1.values[start..start + 128].try_into().ok()?,
-                        a2.values[start..start + 128].try_into().ok()?,
-                        a3.values[start..start + 128].try_into().ok()?,
-                        a4.values[start..start + 128].try_into().ok()?,
-                        a5.values[start..start + 128].try_into().ok()?,
-                        a6.values[start..start + 128].try_into().ok()?,
-                        a7.values[start..start + 128].try_into().ok()?,
-                    ],
-                    [
-                        q8k_half_sum(neon, &a0.sums, half),
-                        q8k_half_sum(neon, &a1.sums, half),
-                        q8k_half_sum(neon, &a2.sums, half),
-                        q8k_half_sum(neon, &a3.sums, half),
-                        q8k_half_sum(neon, &a4.sums, half),
-                        q8k_half_sum(neon, &a5.sums, half),
-                        q8k_half_sum(neon, &a6.sums, half),
-                        q8k_half_sum(neon, &a7.sums, half),
-                    ],
-                );
-                let act_scales_lo =
-                    f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
-                let act_scales_hi =
-                    f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]);
+                let (dots8, act_scales_lo, act_scales_hi) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    let a2 = &chunk[2].pq2_consumption[index];
+                    let a3 = &chunk[3].pq2_consumption[index];
+                    let a4 = &chunk[4].pq2_consumption[index];
+                    let a5 = &chunk[5].pq2_consumption[index];
+                    let a6 = &chunk[6].pq2_consumption[index];
+                    let a7 = &chunk[7].pq2_consumption[index];
+                    (
+                        bonsai_neon_dot::dot_pq2_eight_rows_eight_tokens_precomputed(
+                            packed_all,
+                            [
+                                &a0.values, &a1.values, &a2.values, &a3.values, &a4.values,
+                                &a5.values, &a6.values, &a7.values,
+                            ],
+                            [
+                                a0.sum, a1.sum, a2.sum, a3.sum, a4.sum, a5.sum, a6.sum, a7.sum,
+                            ],
+                        ),
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                        f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]),
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    let a2 = &chunk[2].q8k[q8k_idx];
+                    let a3 = &chunk[3].q8k[q8k_idx];
+                    let a4 = &chunk[4].q8k[q8k_idx];
+                    let a5 = &chunk[5].q8k[q8k_idx];
+                    let a6 = &chunk[6].q8k[q8k_idx];
+                    let a7 = &chunk[7].q8k[q8k_idx];
+                    (
+                        bonsai_neon_dot::dot_pq2_eight_rows_eight_tokens(
+                            packed_all,
+                            [
+                                a0.values[start..start + 128].try_into().ok()?,
+                                a1.values[start..start + 128].try_into().ok()?,
+                                a2.values[start..start + 128].try_into().ok()?,
+                                a3.values[start..start + 128].try_into().ok()?,
+                                a4.values[start..start + 128].try_into().ok()?,
+                                a5.values[start..start + 128].try_into().ok()?,
+                                a6.values[start..start + 128].try_into().ok()?,
+                                a7.values[start..start + 128].try_into().ok()?,
+                            ],
+                            [
+                                q8k_half_sum(neon, &a0.sums, half),
+                                q8k_half_sum(neon, &a1.sums, half),
+                                q8k_half_sum(neon, &a2.sums, half),
+                                q8k_half_sum(neon, &a3.sums, half),
+                                q8k_half_sum(neon, &a4.sums, half),
+                                q8k_half_sum(neon, &a5.sums, half),
+                                q8k_half_sum(neon, &a6.sums, half),
+                                q8k_half_sum(neon, &a7.sums, half),
+                            ],
+                        ),
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                        f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]),
+                    )
+                };
                 for row in 0..8 {
                     let r_scale = f32x4::splat(neon, row_scales[row]);
                     let d_lo = r_scale * act_scales_lo;
@@ -782,29 +886,19 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             let (chunks4, rem4) = rem8.as_chunks::<4>();
             for (chunk_idx, chunk) in chunks4.iter().enumerate() {
                 let base = base4 + chunk_idx * 4;
-                let a0 = &chunk[0].q8k[q8k_idx];
-                let a1 = &chunk[1].q8k[q8k_idx];
-                let a2 = &chunk[2].q8k[q8k_idx];
-                let a3 = &chunk[3].q8k[q8k_idx];
-                let act_slices: [&[i8; 128]; 4] = [
-                    a0.values[start..start + 128].try_into().ok()?,
-                    a1.values[start..start + 128].try_into().ok()?,
-                    a2.values[start..start + 128].try_into().ok()?,
-                    a3.values[start..start + 128].try_into().ok()?,
-                ];
-                let act_sums = [
-                    q8k_half_sum(neon, &a0.sums, half),
-                    q8k_half_sum(neon, &a1.sums, half),
-                    q8k_half_sum(neon, &a2.sums, half),
-                    q8k_half_sum(neon, &a3.sums, half),
-                ];
-                let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
-                for (row_group, weights_half) in [(packed_lo, 0_usize), (packed_hi, 4_usize)] {
-                    let dots = bonsai_neon_dot::dot_pq2_four_rows_four_tokens(
-                        row_group, act_slices, act_sums,
+                if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    let a2 = &chunk[2].pq2_consumption[index];
+                    let a3 = &chunk[3].pq2_consumption[index];
+                    let act_scales =
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+                    let dots8 = bonsai_neon_dot::dot_pq2_eight_rows_four_tokens_precomputed(
+                        packed_all,
+                        [&a0.values, &a1.values, &a2.values, &a3.values],
+                        [a0.sum, a1.sum, a2.sum, a3.sum],
                     );
-                    for (r, dot) in dots.iter().enumerate() {
-                        let row = weights_half + r;
+                    for (row, dot) in dots8.iter().enumerate() {
                         let d = f32x4::splat(neon, row_scales[row]) * act_scales;
                         let dot_f32 = i32x4::from_slice(neon, dot).to_float::<f32x4<Neon>>();
                         let cur = f32x4::from_slice(neon, &sums[row][base..base + 4]);
@@ -815,33 +909,88 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                         };
                         next.store_slice(&mut sums[row][base..base + 4]);
                     }
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    let a2 = &chunk[2].q8k[q8k_idx];
+                    let a3 = &chunk[3].q8k[q8k_idx];
+                    let act_slices: [&[i8; 128]; 4] = [
+                        a0.values[start..start + 128].try_into().ok()?,
+                        a1.values[start..start + 128].try_into().ok()?,
+                        a2.values[start..start + 128].try_into().ok()?,
+                        a3.values[start..start + 128].try_into().ok()?,
+                    ];
+                    let act_sums = [
+                        q8k_half_sum(neon, &a0.sums, half),
+                        q8k_half_sum(neon, &a1.sums, half),
+                        q8k_half_sum(neon, &a2.sums, half),
+                        q8k_half_sum(neon, &a3.sums, half),
+                    ];
+                    let act_scales =
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+                    for (row_group, weights_half) in [(packed_lo, 0_usize), (packed_hi, 4_usize)] {
+                        let dots = bonsai_neon_dot::dot_pq2_four_rows_four_tokens(
+                            row_group, act_slices, act_sums,
+                        );
+                        for (r, dot) in dots.iter().enumerate() {
+                            let row = weights_half + r;
+                            let d = f32x4::splat(neon, row_scales[row]) * act_scales;
+                            let dot_f32 = i32x4::from_slice(neon, dot).to_float::<f32x4<Neon>>();
+                            let cur = f32x4::from_slice(neon, &sums[row][base..base + 4]);
+                            let next = if pinned {
+                                d.mul_add_precise(dot_f32, cur)
+                            } else {
+                                cur + d * dot_f32
+                            };
+                            next.store_slice(&mut sums[row][base..base + 4]);
+                        }
+                    }
                 }
             }
             let rem_base = base4 + chunks4.len() * 4;
             for (offset, scratch) in rem4.iter().enumerate() {
                 let token = rem_base + offset;
-                let act_block = &scratch.q8k[q8k_idx];
-                let act_slice: &[i8; 128] = act_block.values[start..start + 128].try_into().ok()?;
-                let act_sum = q8k_half_sum(neon, &act_block.sums, half);
-                let dots_lo =
-                    bonsai_neon_dot::dot_pq2_four_rows_one_token(packed_lo, act_slice, act_sum);
-                let dots_hi =
-                    bonsai_neon_dot::dot_pq2_four_rows_one_token(packed_hi, act_slice, act_sum);
-                for r in 0..4 {
-                    let d_lo = row_scales[r] * act_block.scale;
-                    let d_hi = row_scales[r + 4] * act_block.scale;
-                    let dot_lo_f32 = crate::kernels::integer_float(dots_lo[r]);
-                    let dot_hi_f32 = crate::kernels::integer_float(dots_hi[r]);
-                    sums[r][token] = if pinned {
-                        d_lo.mul_add(dot_lo_f32, sums[r][token])
-                    } else {
-                        sums[r][token] + d_lo * dot_lo_f32
-                    };
-                    sums[r + 4][token] = if pinned {
-                        d_hi.mul_add(dot_hi_f32, sums[r + 4][token])
-                    } else {
-                        sums[r + 4][token] + d_hi * dot_hi_f32
-                    };
+                if has_precomputed {
+                    let act_block = &scratch.pq2_consumption[index];
+                    let dots8 = bonsai_neon_dot::dot_pq2_eight_consumption_precomputed(
+                        packed_all,
+                        &act_block.values,
+                        act_block.sum,
+                    );
+                    for row in 0..8 {
+                        let d = row_scales[row] * act_block.scale;
+                        let dot_f32 = crate::kernels::integer_float(dots8[row]);
+                        sums[row][token] = if pinned {
+                            d.mul_add(dot_f32, sums[row][token])
+                        } else {
+                            sums[row][token] + d * dot_f32
+                        };
+                    }
+                } else {
+                    let act_block = &scratch.q8k[q8k_idx];
+                    let act_slice: &[i8; 128] =
+                        act_block.values[start..start + 128].try_into().ok()?;
+                    let act_sum = q8k_half_sum(neon, &act_block.sums, half);
+                    let dots_lo =
+                        bonsai_neon_dot::dot_pq2_four_rows_one_token(packed_lo, act_slice, act_sum);
+                    let dots_hi =
+                        bonsai_neon_dot::dot_pq2_four_rows_one_token(packed_hi, act_slice, act_sum);
+                    for r in 0..4 {
+                        let d_lo = row_scales[r] * act_block.scale;
+                        let d_hi = row_scales[r + 4] * act_block.scale;
+                        let dot_lo_f32 = crate::kernels::integer_float(dots_lo[r]);
+                        let dot_hi_f32 = crate::kernels::integer_float(dots_hi[r]);
+                        sums[r][token] = if pinned {
+                            d_lo.mul_add(dot_lo_f32, sums[r][token])
+                        } else {
+                            sums[r][token] + d_lo * dot_lo_f32
+                        };
+                        sums[r + 4][token] = if pinned {
+                            d_hi.mul_add(dot_hi_f32, sums[r + 4][token])
+                        } else {
+                            sums[r + 4][token] + d_hi * dot_hi_f32
+                        };
+                    }
                 }
             }
         } else {
@@ -849,62 +998,89 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             let weights_hi = packed_hi.map(|row| decode_pq2_unsigned(neon, row));
             for (chunk_idx, chunk) in chunks8.iter().enumerate() {
                 let base = chunk_idx * 8;
-                let a0 = &chunk[0].q8k[q8k_idx];
-                let a1 = &chunk[1].q8k[q8k_idx];
-                let a2 = &chunk[2].q8k[q8k_idx];
-                let a3 = &chunk[3].q8k[q8k_idx];
-                let a4 = &chunk[4].q8k[q8k_idx];
-                let a5 = &chunk[5].q8k[q8k_idx];
-                let a6 = &chunk[6].q8k[q8k_idx];
-                let a7 = &chunk[7].q8k[q8k_idx];
-                let acts_lo = [
-                    prepare_pq2_activation(
-                        neon,
-                        a0.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a0.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a1.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a1.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a2.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a2.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a3.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a3.sums, half),
-                    ),
-                ];
-                let acts_hi = [
-                    prepare_pq2_activation(
-                        neon,
-                        a4.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a4.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a5.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a5.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a6.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a6.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a7.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a7.sums, half),
-                    ),
-                ];
-                let act_scales_lo =
-                    f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
-                let act_scales_hi =
-                    f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]);
+                let (acts_lo, acts_hi, act_scales_lo, act_scales_hi) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    let a2 = &chunk[2].pq2_consumption[index];
+                    let a3 = &chunk[3].pq2_consumption[index];
+                    let a4 = &chunk[4].pq2_consumption[index];
+                    let a5 = &chunk[5].pq2_consumption[index];
+                    let a6 = &chunk[6].pq2_consumption[index];
+                    let a7 = &chunk[7].pq2_consumption[index];
+                    (
+                        [
+                            load_pq2_activation_precomputed(neon, a0),
+                            load_pq2_activation_precomputed(neon, a1),
+                            load_pq2_activation_precomputed(neon, a2),
+                            load_pq2_activation_precomputed(neon, a3),
+                        ],
+                        [
+                            load_pq2_activation_precomputed(neon, a4),
+                            load_pq2_activation_precomputed(neon, a5),
+                            load_pq2_activation_precomputed(neon, a6),
+                            load_pq2_activation_precomputed(neon, a7),
+                        ],
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                        f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]),
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    let a2 = &chunk[2].q8k[q8k_idx];
+                    let a3 = &chunk[3].q8k[q8k_idx];
+                    let a4 = &chunk[4].q8k[q8k_idx];
+                    let a5 = &chunk[5].q8k[q8k_idx];
+                    let a6 = &chunk[6].q8k[q8k_idx];
+                    let a7 = &chunk[7].q8k[q8k_idx];
+                    (
+                        [
+                            prepare_pq2_activation(
+                                neon,
+                                a0.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a0.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a1.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a1.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a2.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a2.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a3.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a3.sums, half),
+                            ),
+                        ],
+                        [
+                            prepare_pq2_activation(
+                                neon,
+                                a4.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a4.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a5.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a5.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a6.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a6.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a7.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a7.sums, half),
+                            ),
+                        ],
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                        f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]),
+                    )
+                };
                 for (row_group, weights_half) in [(&weights_lo, 0_usize), (&weights_hi, 4_usize)] {
                     let dots_lo = dot128_four_rows_four_tokens(neon, row_group, &acts_lo);
                     let dots_hi = dot128_four_rows_four_tokens(neon, row_group, &acts_hi);
@@ -934,33 +1110,51 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             let (chunks4, rem4) = rem8.as_chunks::<4>();
             for (chunk_idx, chunk) in chunks4.iter().enumerate() {
                 let base = base4 + chunk_idx * 4;
-                let a0 = &chunk[0].q8k[q8k_idx];
-                let a1 = &chunk[1].q8k[q8k_idx];
-                let a2 = &chunk[2].q8k[q8k_idx];
-                let a3 = &chunk[3].q8k[q8k_idx];
-                let acts = [
-                    prepare_pq2_activation(
-                        neon,
-                        a0.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a0.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a1.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a1.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a2.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a2.sums, half),
-                    ),
-                    prepare_pq2_activation(
-                        neon,
-                        a3.values[start..start + 128].try_into().ok()?,
-                        q8k_half_sum(neon, &a3.sums, half),
-                    ),
-                ];
-                let act_scales = f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
+                let (acts, act_scales) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    let a2 = &chunk[2].pq2_consumption[index];
+                    let a3 = &chunk[3].pq2_consumption[index];
+                    (
+                        [
+                            load_pq2_activation_precomputed(neon, a0),
+                            load_pq2_activation_precomputed(neon, a1),
+                            load_pq2_activation_precomputed(neon, a2),
+                            load_pq2_activation_precomputed(neon, a3),
+                        ],
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    let a2 = &chunk[2].q8k[q8k_idx];
+                    let a3 = &chunk[3].q8k[q8k_idx];
+                    (
+                        [
+                            prepare_pq2_activation(
+                                neon,
+                                a0.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a0.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a1.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a1.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a2.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a2.sums, half),
+                            ),
+                            prepare_pq2_activation(
+                                neon,
+                                a3.values[start..start + 128].try_into().ok()?,
+                                q8k_half_sum(neon, &a3.sums, half),
+                            ),
+                        ],
+                        f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
+                    )
+                };
                 for (row_group, weights_half) in [(&weights_lo, 0_usize), (&weights_hi, 4_usize)] {
                     let dots = dot128_four_rows_four_tokens(neon, row_group, &acts);
                     for (r, &dot) in dots.iter().enumerate() {
@@ -980,17 +1174,28 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             let rem_base = base4 + chunks4.len() * 4;
             for (offset, scratch) in rem4.iter().enumerate() {
                 let token = rem_base + offset;
-                let act_block = &scratch.q8k[q8k_idx];
-                let act = prepare_pq2_activation(
-                    neon,
-                    act_block.values[start..start + 128].try_into().ok()?,
-                    q8k_half_sum(neon, &act_block.sums, half),
-                );
+                let (act, act_scale) = if has_precomputed {
+                    let act_block = &scratch.pq2_consumption[index];
+                    (
+                        load_pq2_activation_precomputed(neon, act_block),
+                        act_block.scale,
+                    )
+                } else {
+                    let act_block = &scratch.q8k[q8k_idx];
+                    (
+                        prepare_pq2_activation(
+                            neon,
+                            act_block.values[start..start + 128].try_into().ok()?,
+                            q8k_half_sum(neon, &act_block.sums, half),
+                        ),
+                        act_block.scale,
+                    )
+                };
                 let dots_lo = dot128_four_rows_one_token(neon, &weights_lo, &act);
                 let dots_hi = dot128_four_rows_one_token(neon, &weights_hi, &act);
                 for r in 0..4 {
-                    let d_lo = row_scales[r] * act_block.scale;
-                    let d_hi = row_scales[r + 4] * act_block.scale;
+                    let d_lo = row_scales[r] * act_scale;
+                    let d_hi = row_scales[r + 4] * act_scale;
                     let dot_lo_f32 = crate::kernels::integer_float(dots_lo[r]);
                     let dot_hi_f32 = crate::kernels::integer_float(dots_hi[r]);
                     sums[r][token] = if pinned {

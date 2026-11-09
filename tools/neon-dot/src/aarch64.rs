@@ -815,6 +815,236 @@ fn dot_pq2_4x4_tile_dotprod(
     out
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_pq2_planes_s8(planes: &[i8; 128]) -> [int8x16_t; 8] {
+    let chunks = planes.as_chunks::<16>().0;
+    [
+        load_s8x16(&chunks[0]),
+        load_s8x16(&chunks[1]),
+        load_s8x16(&chunks[2]),
+        load_s8x16(&chunks[3]),
+        load_s8x16(&chunks[4]),
+        load_s8x16(&chunks[5]),
+        load_s8x16(&chunks[6]),
+        load_s8x16(&chunks[7]),
+    ]
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn dot_pq2_four_rows_four_tokens_precomputed_i8mm(
+    packed: [&[u8; 32]; 4],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    let weights = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let acts = [
+        load_pq2_planes_s8(planes[0]),
+        load_pq2_planes_s8(planes[1]),
+        load_pq2_planes_s8(planes[2]),
+        load_pq2_planes_s8(planes[3]),
+    ];
+    dot_pq2_4x4_tile_i8mm(&weights, &acts, load_s32x4(&activation_sums))
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_four_rows_four_tokens_precomputed_dotprod(
+    packed: [&[u8; 32]; 4],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    let weights = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let acts = [
+        load_pq2_planes_s8(planes[0]),
+        load_pq2_planes_s8(planes[1]),
+        load_pq2_planes_s8(planes[2]),
+        load_pq2_planes_s8(planes[3]),
+    ];
+    dot_pq2_4x4_tile_dotprod(&weights, &acts, load_s32x4(&activation_sums))
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn dot_pq2_eight_rows_four_tokens_precomputed_i8mm(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 8] {
+    let weights_lo = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let weights_hi = [
+        unpack_pq2_unsigned_s8(packed[4]),
+        unpack_pq2_unsigned_s8(packed[5]),
+        unpack_pq2_unsigned_s8(packed[6]),
+        unpack_pq2_unsigned_s8(packed[7]),
+    ];
+    let acts = [
+        load_pq2_planes_s8(planes[0]),
+        load_pq2_planes_s8(planes[1]),
+        load_pq2_planes_s8(planes[2]),
+        load_pq2_planes_s8(planes[3]),
+    ];
+    let sums_vec = load_s32x4(&activation_sums);
+    let q0 = dot_pq2_4x4_tile_i8mm(&weights_lo, &acts, sums_vec);
+    let q1 = dot_pq2_4x4_tile_i8mm(&weights_hi, &acts, sums_vec);
+    [q0[0], q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3]]
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_eight_rows_four_tokens_precomputed_dotprod(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 8] {
+    let weights_lo = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let weights_hi = [
+        unpack_pq2_unsigned_s8(packed[4]),
+        unpack_pq2_unsigned_s8(packed[5]),
+        unpack_pq2_unsigned_s8(packed[6]),
+        unpack_pq2_unsigned_s8(packed[7]),
+    ];
+    let acts = [
+        load_pq2_planes_s8(planes[0]),
+        load_pq2_planes_s8(planes[1]),
+        load_pq2_planes_s8(planes[2]),
+        load_pq2_planes_s8(planes[3]),
+    ];
+    let sums_vec = load_s32x4(&activation_sums);
+    let q0 = dot_pq2_4x4_tile_dotprod(&weights_lo, &acts, sums_vec);
+    let q1 = dot_pq2_4x4_tile_dotprod(&weights_hi, &acts, sums_vec);
+    [q0[0], q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3]]
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn dot_pq2_eight_rows_eight_tokens_precomputed_i8mm(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    let weights_lo = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let weights_hi = [
+        unpack_pq2_unsigned_s8(packed[4]),
+        unpack_pq2_unsigned_s8(packed[5]),
+        unpack_pq2_unsigned_s8(packed[6]),
+        unpack_pq2_unsigned_s8(packed[7]),
+    ];
+    let acts_lo = [
+        load_pq2_planes_s8(planes[0]),
+        load_pq2_planes_s8(planes[1]),
+        load_pq2_planes_s8(planes[2]),
+        load_pq2_planes_s8(planes[3]),
+    ];
+    let acts_hi = [
+        load_pq2_planes_s8(planes[4]),
+        load_pq2_planes_s8(planes[5]),
+        load_pq2_planes_s8(planes[6]),
+        load_pq2_planes_s8(planes[7]),
+    ];
+    let sums_lo = load_s32x4(&[
+        activation_sums[0],
+        activation_sums[1],
+        activation_sums[2],
+        activation_sums[3],
+    ]);
+    let sums_hi = load_s32x4(&[
+        activation_sums[4],
+        activation_sums[5],
+        activation_sums[6],
+        activation_sums[7],
+    ]);
+    let q00 = dot_pq2_4x4_tile_i8mm(&weights_lo, &acts_lo, sums_lo);
+    let q01 = dot_pq2_4x4_tile_i8mm(&weights_lo, &acts_hi, sums_hi);
+    let q10 = dot_pq2_4x4_tile_i8mm(&weights_hi, &acts_lo, sums_lo);
+    let q11 = dot_pq2_4x4_tile_i8mm(&weights_hi, &acts_hi, sums_hi);
+    let mut out = [[0_i32; 8]; 8];
+    for r in 0..4 {
+        out[r][..4].copy_from_slice(&q00[r]);
+        out[r][4..].copy_from_slice(&q01[r]);
+        out[r + 4][..4].copy_from_slice(&q10[r]);
+        out[r + 4][4..].copy_from_slice(&q11[r]);
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_eight_rows_eight_tokens_precomputed_dotprod(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    let weights_lo = [
+        unpack_pq2_unsigned_s8(packed[0]),
+        unpack_pq2_unsigned_s8(packed[1]),
+        unpack_pq2_unsigned_s8(packed[2]),
+        unpack_pq2_unsigned_s8(packed[3]),
+    ];
+    let weights_hi = [
+        unpack_pq2_unsigned_s8(packed[4]),
+        unpack_pq2_unsigned_s8(packed[5]),
+        unpack_pq2_unsigned_s8(packed[6]),
+        unpack_pq2_unsigned_s8(packed[7]),
+    ];
+    let acts_lo = [
+        load_pq2_planes_s8(planes[0]),
+        load_pq2_planes_s8(planes[1]),
+        load_pq2_planes_s8(planes[2]),
+        load_pq2_planes_s8(planes[3]),
+    ];
+    let acts_hi = [
+        load_pq2_planes_s8(planes[4]),
+        load_pq2_planes_s8(planes[5]),
+        load_pq2_planes_s8(planes[6]),
+        load_pq2_planes_s8(planes[7]),
+    ];
+    let sums_lo = load_s32x4(&[
+        activation_sums[0],
+        activation_sums[1],
+        activation_sums[2],
+        activation_sums[3],
+    ]);
+    let sums_hi = load_s32x4(&[
+        activation_sums[4],
+        activation_sums[5],
+        activation_sums[6],
+        activation_sums[7],
+    ]);
+    let q00 = dot_pq2_4x4_tile_dotprod(&weights_lo, &acts_lo, sums_lo);
+    let q01 = dot_pq2_4x4_tile_dotprod(&weights_lo, &acts_hi, sums_hi);
+    let q10 = dot_pq2_4x4_tile_dotprod(&weights_hi, &acts_lo, sums_lo);
+    let q11 = dot_pq2_4x4_tile_dotprod(&weights_hi, &acts_hi, sums_hi);
+    let mut out = [[0_i32; 8]; 8];
+    for r in 0..4 {
+        out[r][..4].copy_from_slice(&q00[r]);
+        out[r][4..].copy_from_slice(&q01[r]);
+        out[r + 4][..4].copy_from_slice(&q10[r]);
+        out[r + 4][4..].copy_from_slice(&q11[r]);
+    }
+    out
+}
+
 #[target_feature(enable = "neon,i8mm")]
 fn dot_pq2_four_rows_four_tokens_i8mm(
     packed: [&[u8; 32]; 4],
@@ -998,6 +1228,69 @@ pub(super) fn dot_pq2_four_rows_four_tokens(
         // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
         return Some(unsafe {
             dot_pq2_four_rows_four_tokens_dotprod(packed, activations, activation_sums)
+        });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn dot_pq2_four_rows_four_tokens_precomputed(
+    packed: [&[u8; 32]; 4],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> Option<[[i32; 4]; 4]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_four_rows_four_tokens_precomputed_i8mm(packed, planes, activation_sums)
+        });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_four_rows_four_tokens_precomputed_dotprod(packed, planes, activation_sums)
+        });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn dot_pq2_eight_rows_four_tokens_precomputed(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> Option<[[i32; 4]; 8]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_eight_rows_four_tokens_precomputed_i8mm(packed, planes, activation_sums)
+        });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_eight_rows_four_tokens_precomputed_dotprod(packed, planes, activation_sums)
+        });
+    }
+    None
+}
+
+#[inline]
+pub(super) fn dot_pq2_eight_rows_eight_tokens_precomputed(
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> Option<[[i32; 8]; 8]> {
+    if has_i8mm() {
+        // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_eight_rows_eight_tokens_precomputed_i8mm(packed, planes, activation_sums)
+        });
+    }
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+        return Some(unsafe {
+            dot_pq2_eight_rows_eight_tokens_precomputed_dotprod(packed, planes, activation_sums)
         });
     }
     None

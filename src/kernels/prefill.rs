@@ -177,20 +177,77 @@ impl ProjectionTile {
                 scratch.pinned_accumulation = pinned;
                 if !reuse_prepared && !parallel_prepare {
                     scratch.prepare_input(tensor, input)?;
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    if tensor.kind == PQ2
+                        && rows >= 4
+                        && columns.is_multiple_of(256)
+                        && !matches!(self.backend, MatvecBackend::Scalar)
+                    {
+                        super::packed_pq2::prepare(&scratch.q8k, &mut scratch.pq2_consumption)?;
+                    }
                 }
                 output.try_reserve_exact(rows)?;
             }
             if parallel_prepare {
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                let prepare_pq2 = tensor.kind == PQ2
+                    && rows >= 4
+                    && columns.is_multiple_of(256)
+                    && !matches!(self.backend, MatvecBackend::Scalar);
                 self.row_parallelism.update_chunks(
                     &mut self.preparations[..inputs.len()],
                     1,
                     |base, chunk| {
                         for (offset, scratch) in chunk.iter_mut().enumerate() {
                             scratch.prepare_input(tensor, &inputs[base + offset])?;
+                            #[cfg(all(
+                                feature = "experimental-neon",
+                                target_arch = "aarch64",
+                                target_os = "windows",
+                                target_env = "msvc",
+                                target_feature = "neon"
+                            ))]
+                            if prepare_pq2 {
+                                super::packed_pq2::prepare(
+                                    &scratch.q8k,
+                                    &mut scratch.pq2_consumption,
+                                )?;
+                            }
                         }
                         Ok(())
                     },
                 )?;
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            if reuse_prepared
+                && tensor.kind == PQ2
+                && rows >= 4
+                && columns.is_multiple_of(256)
+                && !matches!(self.backend, MatvecBackend::Scalar)
+            {
+                for scratch in &mut self.preparations[..inputs.len()] {
+                    if scratch.pq2_consumption.is_empty() {
+                        super::packed_pq2::prepare(&scratch.q8k, &mut scratch.pq2_consumption)?;
+                    }
+                }
             }
             if tensor.kind == BF16 {
                 let backend = self.backend;
@@ -819,6 +876,23 @@ mod tests {
                         let mut actual = vec![Vec::new(); count];
                         tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
                         assert_eq!(tile.decoded_blocks, u64::try_from(rows * blocks_per_row)?);
+                        #[cfg(all(
+                            feature = "experimental-neon",
+                            target_arch = "aarch64",
+                            target_os = "windows",
+                            target_env = "msvc",
+                            target_feature = "neon"
+                        ))]
+                        if kind == PQ2
+                            && columns.is_multiple_of(256)
+                            && backend != MatvecBackend::Scalar
+                        {
+                            assert!(
+                                tile.preparations[..count]
+                                    .iter()
+                                    .all(|s| s.pq2_consumption.len() == blocks_per_row)
+                            );
+                        }
                         let actual_bits: Vec<Vec<u32>> = actual
                             .into_iter()
                             .map(|row| row.into_iter().map(f32::to_bits).collect())

@@ -493,25 +493,36 @@ impl GdnVerifyTape {
         if accepted_steps > self.steps.len() || base_state.len() != expected_state {
             return Err(invalid("invalid GDN verification tape replay bounds"));
         }
+        if accepted_steps == 0 {
+            return Ok(());
+        }
         let group = self.value_heads / self.key_heads;
         let head_stride = self.value_dim * self.key_dim;
-        for step in &self.steps[..accepted_steps] {
-            for v_head in 0..self.value_heads {
-                let k_head = v_head / group;
-                let key = &step.keys[k_head * self.key_dim..(k_head + 1) * self.key_dim];
-                let query = &step.queries[k_head * self.key_dim..(k_head + 1) * self.key_dim];
-                let v_slice = &step.values[v_head * self.value_dim..(v_head + 1) * self.value_dim];
-                let decay = step.decays[v_head];
-                let beta = step.betas[v_head];
-                let state_head = &mut base_state[v_head * head_stride..(v_head + 1) * head_stride];
-                for (row_idx, &v_elem) in v_slice.iter().enumerate() {
-                    let row_state =
-                        &mut state_head[row_idx * self.key_dim..(row_idx + 1) * self.key_dim];
-                    crate::kernels::pinned_gdn::step_row_in_place(
-                        row_state, key, query, decay, v_elem, beta,
-                    )?;
-                }
+        for v_head in 0..self.value_heads {
+            let k_head = v_head / group;
+            let mut inputs = [crate::kernels::pinned_gdn::ChunkInput {
+                query: &[],
+                key: &[],
+                value: &[],
+                decay: 0.0,
+                beta: 0.0,
+            }; MAX_SPECULATIVE_DRAFT_TOKENS];
+            for (token, step) in self.steps[..accepted_steps].iter().enumerate() {
+                inputs[token] = crate::kernels::pinned_gdn::ChunkInput {
+                    query: &step.queries[k_head * self.key_dim..(k_head + 1) * self.key_dim],
+                    key: &step.keys[k_head * self.key_dim..(k_head + 1) * self.key_dim],
+                    value: &step.values[v_head * self.value_dim..(v_head + 1) * self.value_dim],
+                    decay: step.decays[v_head],
+                    beta: step.betas[v_head],
+                };
             }
+            let state_head = &mut base_state[v_head * head_stride..(v_head + 1) * head_stride];
+            crate::kernels::pinned_gdn::step_head_tokens_in_place(
+                state_head,
+                self.value_dim,
+                self.key_dim,
+                &inputs[..accepted_steps],
+            )?;
         }
         Ok(())
     }
@@ -621,7 +632,7 @@ mod tests {
         let key_heads = 2;
         let value_heads = 4;
         let key_dim = 16;
-        let value_dim = 8;
+        let value_dim = 14;
         let state_len = value_heads * value_dim * key_dim;
         let mut sequential_state: Vec<f32> = (0..state_len)
             .map(|i| (f32::from(u16::try_from(i).unwrap_or(0)) - 128.0) * 0.005)

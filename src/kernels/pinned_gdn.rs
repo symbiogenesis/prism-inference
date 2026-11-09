@@ -666,6 +666,133 @@ pub(crate) fn step_eight_rows_tokens_from(
     step_row_tokens_from(previous[7], s7, inputs, row + 7, stride, scale, output)
 }
 
+/// Steps all `value_dim` rows of a GDN head state in-place across `inputs.len()` tokens,
+/// batching 8 rows and 4 rows in registers/L1 when supported.
+///
+/// # Errors
+/// Rejects invalid geometry or any non-finite intermediate/output value.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep 8-row, 4-row, and 1-row in-place head recurrence dispatch together."
+)]
+pub(crate) fn step_head_tokens_in_place(
+    state_head: &mut [f32],
+    value_dim: usize,
+    key_dim: usize,
+    inputs: &[ChunkInput<'_>],
+) -> Result<()> {
+    if inputs.is_empty()
+        || value_dim.checked_mul(key_dim) != Some(state_head.len())
+        || inputs.iter().any(|input| {
+            input.key.len() != key_dim
+                || input.query.len() != key_dim
+                || input.value.len() != value_dim
+        })
+    {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        let (rows8, rem8) = state_head.split_at_mut((value_dim / 8) * 8 * key_dim);
+        for (chunk8_idx, chunk8) in rows8.chunks_exact_mut(8 * key_dim).enumerate() {
+            let row = chunk8_idx * 8;
+            let stepped = {
+                let (s03, s47) = chunk8.split_at_mut(4 * key_dim);
+                let (s01, s23) = s03.split_at_mut(2 * key_dim);
+                let (s0, s1) = s01.split_at_mut(key_dim);
+                let (s2, s3) = s23.split_at_mut(key_dim);
+                let (s45, s67) = s47.split_at_mut(2 * key_dim);
+                let (s4, s5) = s45.split_at_mut(key_dim);
+                let (s6, s7) = s67.split_at_mut(key_dim);
+                neon::step_eight_rows_tokens_in_place([s0, s1, s2, s3, s4, s5, s6, s7], inputs, row)
+            };
+            if !stepped {
+                for input in inputs {
+                    for (r, state_row) in chunk8.chunks_exact_mut(key_dim).enumerate() {
+                        step_row_in_place(
+                            state_row,
+                            input.key,
+                            input.query,
+                            input.decay,
+                            input.value[row + r],
+                            input.beta,
+                        )?;
+                    }
+                }
+            }
+        }
+        let base4 = (value_dim / 8) * 8;
+        let rem_rows = value_dim - base4;
+        let (rows4, rem4) = rem8.split_at_mut((rem_rows / 4) * 4 * key_dim);
+        for (chunk4_idx, chunk4) in rows4.chunks_exact_mut(4 * key_dim).enumerate() {
+            let row = base4 + chunk4_idx * 4;
+            let stepped = {
+                let (s01, s23) = chunk4.split_at_mut(2 * key_dim);
+                let (s0, s1) = s01.split_at_mut(key_dim);
+                let (s2, s3) = s23.split_at_mut(key_dim);
+                neon::step_four_rows_tokens_in_place([s0, s1, s2, s3], inputs, row)
+            };
+            if !stepped {
+                for input in inputs {
+                    for (r, state_row) in chunk4.chunks_exact_mut(key_dim).enumerate() {
+                        step_row_in_place(
+                            state_row,
+                            input.key,
+                            input.query,
+                            input.decay,
+                            input.value[row + r],
+                            input.beta,
+                        )?;
+                    }
+                }
+            }
+        }
+        let base1 = base4 + (rem_rows / 4) * 4;
+        for input in inputs {
+            for (r, state_row) in rem4.chunks_exact_mut(key_dim).enumerate() {
+                step_row_in_place(
+                    state_row,
+                    input.key,
+                    input.query,
+                    input.decay,
+                    input.value[base1 + r],
+                    input.beta,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        for input in inputs {
+            for (row_idx, &v_elem) in input.value.iter().enumerate() {
+                let row_state = &mut state_head[row_idx * key_dim..(row_idx + 1) * key_dim];
+                step_row_in_place(
+                    row_state,
+                    input.key,
+                    input.query,
+                    input.decay,
+                    v_elem,
+                    input.beta,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(
     clippy::suboptimal_flops,
     reason = "Keep the scalar oracle's exact multiply/add remainder rounding."
@@ -1167,6 +1294,13 @@ mod tests {
             }
             assert_eq!(bits(&tok8_states), bits(&tok8_ref_states));
             assert_eq!(bits(&tok8_out), bits(&tok8_ref_out));
+            let inputs8 = inputs.map(|inp| ChunkInput {
+                value: &inp.value[..8],
+                ..inp
+            });
+            let mut in_place_head = first8.clone();
+            super::step_head_tokens_in_place(&mut in_place_head, 8, width, &inputs8)?;
+            assert_eq!(bits(&in_place_head), bits(&tok8_ref_states));
         }
         Ok(())
     }

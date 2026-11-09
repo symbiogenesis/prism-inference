@@ -2131,7 +2131,25 @@ pub(super) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) -> bool {
         return false;
     };
     let mut squares = 0.0_f64;
-    let (chunks, tail) = input.as_chunks::<4>();
+    let (blocks16, rem16) = input.as_chunks::<16>();
+    for block in blocks16 {
+        let v0 = f32x4::from_slice(neon, &block[0..4]);
+        let v1 = f32x4::from_slice(neon, &block[4..8]);
+        let v2 = f32x4::from_slice(neon, &block[8..12]);
+        let v3 = f32x4::from_slice(neon, &block[12..16]);
+        for sq in [
+            (v0 * v0).to_array(),
+            (v1 * v1).to_array(),
+            (v2 * v2).to_array(),
+            (v3 * v3).to_array(),
+        ] {
+            squares += f64::from(sq[0]);
+            squares += f64::from(sq[1]);
+            squares += f64::from(sq[2]);
+            squares += f64::from(sq[3]);
+        }
+    }
+    let (chunks, tail) = rem16.as_chunks::<4>();
     for chunk in chunks {
         let v = f32x4::from_slice(neon, chunk);
         let sq_lanes = (v * v).to_array();
@@ -2145,7 +2163,18 @@ pub(super) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) -> bool {
     }
     let scale = 1.0 / (squares as f32).sqrt().max(epsilon);
     let scale_vec = f32x4::splat(neon, scale);
-    let (chunks, tail) = input.as_chunks_mut::<4>();
+    let (blocks16, rem16) = input.as_chunks_mut::<16>();
+    for block in blocks16 {
+        let v0 = f32x4::from_slice(neon, &block[0..4]) * scale_vec;
+        let v1 = f32x4::from_slice(neon, &block[4..8]) * scale_vec;
+        let v2 = f32x4::from_slice(neon, &block[8..12]) * scale_vec;
+        let v3 = f32x4::from_slice(neon, &block[12..16]) * scale_vec;
+        v0.store_slice(&mut block[0..4]);
+        v1.store_slice(&mut block[4..8]);
+        v2.store_slice(&mut block[8..12]);
+        v3.store_slice(&mut block[12..16]);
+    }
+    let (chunks, tail) = rem16.as_chunks_mut::<4>();
     for chunk in chunks {
         (f32x4::from_slice(neon, chunk) * scale_vec).store_slice(chunk);
     }

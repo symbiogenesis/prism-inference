@@ -121,10 +121,64 @@ fn step_into_inner<const SILU: bool>(
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
         let mut finite_mask = zero.is_finite();
-        let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
-        let (h_chunks, h_rem) = history.as_chunks::<12>();
-        let (n_chunks, n_rem) = next_history.as_chunks_mut::<12>();
-        let (c_chunks, c_rem) = coefficients.as_chunks::<16>();
+        let (m_pairs, m_rem8) = mixed.as_chunks_mut::<8>();
+        let (h_pairs, h_rem24) = history.as_chunks::<24>();
+        let (n_pairs, n_rem24) = next_history.as_chunks_mut::<24>();
+        let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
+        for (((m_pair, h_pair), n_pair), c_pair) in
+            m_pairs.iter_mut().zip(h_pairs).zip(n_pairs).zip(c_pairs)
+        {
+            let [tap0_0, tap0_1, tap0_2, tap0_3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_pair[0..4]),
+                f32x4::from_slice(neon, &c_pair[4..8]),
+                f32x4::from_slice(neon, &c_pair[8..12]),
+                f32x4::from_slice(neon, &c_pair[12..16]),
+            );
+            let [tap1_0, tap1_1, tap1_2, tap1_3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_pair[16..20]),
+                f32x4::from_slice(neon, &c_pair[20..24]),
+                f32x4::from_slice(neon, &c_pair[24..28]),
+                f32x4::from_slice(neon, &c_pair[28..32]),
+            );
+            let h0_t0 = f32x4::load_array(neon, [h_pair[0], h_pair[3], h_pair[6], h_pair[9]]);
+            let h0_t1 = f32x4::load_array(neon, [h_pair[1], h_pair[4], h_pair[7], h_pair[10]]);
+            let h0_t2 = f32x4::load_array(neon, [h_pair[2], h_pair[5], h_pair[8], h_pair[11]]);
+            let h1_t0 = f32x4::load_array(neon, [h_pair[12], h_pair[15], h_pair[18], h_pair[21]]);
+            let h1_t1 = f32x4::load_array(neon, [h_pair[13], h_pair[16], h_pair[19], h_pair[22]]);
+            let h1_t2 = f32x4::load_array(neon, [h_pair[14], h_pair[17], h_pair[20], h_pair[23]]);
+            let p0 = f32x4::from_slice(neon, &m_pair[0..4]);
+            let p1 = f32x4::from_slice(neon, &m_pair[4..8]);
+            let mut sum0 = zero;
+            let mut sum1 = zero;
+            sum0 = h0_t0.mul_add_precise(tap0_0, sum0);
+            sum1 = h1_t0.mul_add_precise(tap1_0, sum1);
+            sum0 = h0_t1.mul_add_precise(tap0_1, sum0);
+            sum1 = h1_t1.mul_add_precise(tap1_1, sum1);
+            sum0 = h0_t2.mul_add_precise(tap0_2, sum0);
+            sum1 = h1_t2.mul_add_precise(tap1_2, sum1);
+            let out0 = p0.mul_add_precise(tap0_3, sum0);
+            let out1 = p1.mul_add_precise(tap1_3, sum1);
+            finite_mask = finite_mask & out0.is_finite() & out1.is_finite();
+            let [p0_0, p0_1, p0_2, p0_3, p1_0, p1_1, p1_2, p1_3] = *m_pair;
+            if SILU {
+                let s0 = out0 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out0));
+                let s1 = out1 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out1));
+                s0.store_slice(&mut m_pair[0..4]);
+                s1.store_slice(&mut m_pair[4..8]);
+            } else {
+                out0.store_slice(&mut m_pair[0..4]);
+                out1.store_slice(&mut m_pair[4..8]);
+            }
+            *n_pair = [
+                h_pair[1], h_pair[2], p0_0, h_pair[4], h_pair[5], p0_1, h_pair[7], h_pair[8], p0_2,
+                h_pair[10], h_pair[11], p0_3, h_pair[13], h_pair[14], p1_0, h_pair[16], h_pair[17],
+                p1_1, h_pair[19], h_pair[20], p1_2, h_pair[22], h_pair[23], p1_3,
+            ];
+        }
+        let (m_chunks, m_rem) = m_rem8.as_chunks_mut::<4>();
+        let (h_chunks, h_rem) = h_rem24.as_chunks::<12>();
+        let (n_chunks, n_rem) = n_rem24.as_chunks_mut::<12>();
+        let (c_chunks, c_rem) = c_rem32.as_chunks::<16>();
         for (((m_chunk, h_chunk), n_chunk), c_chunk) in m_chunks
             .iter_mut()
             .zip(h_chunks)
@@ -299,8 +353,80 @@ fn step_tokens_in_place_inner<const SILU: bool>(
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
         let mut finite_mask = zero.is_finite();
-        let (h_chunks, _) = history.as_chunks_mut::<12>();
-        let (c_chunks, _) = coefficients.as_chunks::<16>();
+        let (h_pairs, h_rem24) = history.as_chunks_mut::<24>();
+        let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
+        for (pair_idx, (h_pair, c_pair)) in h_pairs.iter_mut().zip(c_pairs).enumerate() {
+            let [tap0_0, tap0_1, tap0_2, tap0_3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_pair[0..4]),
+                f32x4::from_slice(neon, &c_pair[4..8]),
+                f32x4::from_slice(neon, &c_pair[8..12]),
+                f32x4::from_slice(neon, &c_pair[12..16]),
+            );
+            let [tap1_0, tap1_1, tap1_2, tap1_3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_pair[16..20]),
+                f32x4::from_slice(neon, &c_pair[20..24]),
+                f32x4::from_slice(neon, &c_pair[24..28]),
+                f32x4::from_slice(neon, &c_pair[28..32]),
+            );
+            let mut h0_t0 = f32x4::load_array(neon, [h_pair[0], h_pair[3], h_pair[6], h_pair[9]]);
+            let mut h0_t1 = f32x4::load_array(neon, [h_pair[1], h_pair[4], h_pair[7], h_pair[10]]);
+            let mut h0_t2 = f32x4::load_array(neon, [h_pair[2], h_pair[5], h_pair[8], h_pair[11]]);
+            let mut h1_t0 =
+                f32x4::load_array(neon, [h_pair[12], h_pair[15], h_pair[18], h_pair[21]]);
+            let mut h1_t1 =
+                f32x4::load_array(neon, [h_pair[13], h_pair[16], h_pair[19], h_pair[22]]);
+            let mut h1_t2 =
+                f32x4::load_array(neon, [h_pair[14], h_pair[17], h_pair[20], h_pair[23]]);
+            let col = pair_idx * 8;
+            for token in 0..count {
+                let offset = token * channels + col;
+                let m_slice = &mut tokens[offset..offset + 8];
+                let p0 = f32x4::from_slice(neon, &m_slice[0..4]);
+                let p1 = f32x4::from_slice(neon, &m_slice[4..8]);
+                let mut sum0 = zero;
+                let mut sum1 = zero;
+                sum0 = h0_t0.mul_add_precise(tap0_0, sum0);
+                sum1 = h1_t0.mul_add_precise(tap1_0, sum1);
+                sum0 = h0_t1.mul_add_precise(tap0_1, sum0);
+                sum1 = h1_t1.mul_add_precise(tap1_1, sum1);
+                sum0 = h0_t2.mul_add_precise(tap0_2, sum0);
+                sum1 = h1_t2.mul_add_precise(tap1_2, sum1);
+                let out0 = p0.mul_add_precise(tap0_3, sum0);
+                let out1 = p1.mul_add_precise(tap1_3, sum1);
+                finite_mask = finite_mask & out0.is_finite() & out1.is_finite();
+                if SILU {
+                    let s0 =
+                        out0 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out0));
+                    let s1 =
+                        out1 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out1));
+                    s0.store_slice(&mut m_slice[0..4]);
+                    s1.store_slice(&mut m_slice[4..8]);
+                } else {
+                    out0.store_slice(&mut m_slice[0..4]);
+                    out1.store_slice(&mut m_slice[4..8]);
+                }
+                h0_t0 = h0_t1;
+                h0_t1 = h0_t2;
+                h0_t2 = p0;
+                h1_t0 = h1_t1;
+                h1_t1 = h1_t2;
+                h1_t2 = p1;
+            }
+            let t0_0 = h0_t0.to_array();
+            let t0_1 = h0_t1.to_array();
+            let t0_2 = h0_t2.to_array();
+            let t1_0 = h1_t0.to_array();
+            let t1_1 = h1_t1.to_array();
+            let t1_2 = h1_t2.to_array();
+            *h_pair = [
+                t0_0[0], t0_1[0], t0_2[0], t0_0[1], t0_1[1], t0_2[1], t0_0[2], t0_1[2], t0_2[2],
+                t0_0[3], t0_1[3], t0_2[3], t1_0[0], t1_1[0], t1_2[0], t1_0[1], t1_1[1], t1_2[1],
+                t1_0[2], t1_1[2], t1_2[2], t1_0[3], t1_1[3], t1_2[3],
+            ];
+        }
+        let base_group = h_pairs.len() * 2;
+        let (h_chunks, _) = h_rem24.as_chunks_mut::<12>();
+        let (c_chunks, _) = c_rem32.as_chunks::<16>();
         for (group, (h_chunk, c_chunk)) in h_chunks.iter_mut().zip(c_chunks).enumerate() {
             let [tap0, tap1, tap2, tap3] = transpose_4x4(
                 f32x4::from_slice(neon, &c_chunk[0..4]),
@@ -314,7 +440,7 @@ fn step_tokens_in_place_inner<const SILU: bool>(
                 f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
             let mut h_t2 =
                 f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
-            let col = group * 4;
+            let col = (base_group + group) * 4;
             for token in 0..count {
                 let offset = token * channels + col;
                 let m_chunk = &mut tokens[offset..offset + 4];
@@ -335,12 +461,9 @@ fn step_tokens_in_place_inner<const SILU: bool>(
                 h_t1 = h_t2;
                 h_t2 = p;
             }
-            let mut t0 = [0.0; 4];
-            let mut t1 = [0.0; 4];
-            let mut t2 = [0.0; 4];
-            h_t0.store_slice(&mut t0);
-            h_t1.store_slice(&mut t1);
-            h_t2.store_slice(&mut t2);
+            let t0 = h_t0.to_array();
+            let t1 = h_t1.to_array();
+            let t2 = h_t2.to_array();
             *h_chunk = [
                 t0[0], t1[0], t2[0], t0[1], t1[1], t2[1], t0[2], t1[2], t2[2], t0[3], t1[3], t2[3],
             ];
@@ -389,9 +512,60 @@ fn step_in_place_inner<const SILU: bool>(
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
         let mut finite_mask = zero.is_finite();
-        let (m_chunks, m_rem) = mixed.as_chunks_mut::<4>();
-        let (h_chunks, h_rem) = history.as_chunks_mut::<12>();
-        let (c_chunks, c_rem) = coefficients.as_chunks::<16>();
+        let (m_pairs, m_rem8) = mixed.as_chunks_mut::<8>();
+        let (h_pairs, h_rem24) = history.as_chunks_mut::<24>();
+        let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
+        for ((m_pair, h_pair), c_pair) in m_pairs.iter_mut().zip(h_pairs).zip(c_pairs) {
+            let [tap0_0, tap0_1, tap0_2, tap0_3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_pair[0..4]),
+                f32x4::from_slice(neon, &c_pair[4..8]),
+                f32x4::from_slice(neon, &c_pair[8..12]),
+                f32x4::from_slice(neon, &c_pair[12..16]),
+            );
+            let [tap1_0, tap1_1, tap1_2, tap1_3] = transpose_4x4(
+                f32x4::from_slice(neon, &c_pair[16..20]),
+                f32x4::from_slice(neon, &c_pair[20..24]),
+                f32x4::from_slice(neon, &c_pair[24..28]),
+                f32x4::from_slice(neon, &c_pair[28..32]),
+            );
+            let h0_t0 = f32x4::load_array(neon, [h_pair[0], h_pair[3], h_pair[6], h_pair[9]]);
+            let h0_t1 = f32x4::load_array(neon, [h_pair[1], h_pair[4], h_pair[7], h_pair[10]]);
+            let h0_t2 = f32x4::load_array(neon, [h_pair[2], h_pair[5], h_pair[8], h_pair[11]]);
+            let h1_t0 = f32x4::load_array(neon, [h_pair[12], h_pair[15], h_pair[18], h_pair[21]]);
+            let h1_t1 = f32x4::load_array(neon, [h_pair[13], h_pair[16], h_pair[19], h_pair[22]]);
+            let h1_t2 = f32x4::load_array(neon, [h_pair[14], h_pair[17], h_pair[20], h_pair[23]]);
+            let p0 = f32x4::from_slice(neon, &m_pair[0..4]);
+            let p1 = f32x4::from_slice(neon, &m_pair[4..8]);
+            let mut sum0 = zero;
+            let mut sum1 = zero;
+            sum0 = h0_t0.mul_add_precise(tap0_0, sum0);
+            sum1 = h1_t0.mul_add_precise(tap1_0, sum1);
+            sum0 = h0_t1.mul_add_precise(tap0_1, sum0);
+            sum1 = h1_t1.mul_add_precise(tap1_1, sum1);
+            sum0 = h0_t2.mul_add_precise(tap0_2, sum0);
+            sum1 = h1_t2.mul_add_precise(tap1_2, sum1);
+            let out0 = p0.mul_add_precise(tap0_3, sum0);
+            let out1 = p1.mul_add_precise(tap1_3, sum1);
+            finite_mask = finite_mask & out0.is_finite() & out1.is_finite();
+            let [p0_0, p0_1, p0_2, p0_3, p1_0, p1_1, p1_2, p1_3] = *m_pair;
+            if SILU {
+                let s0 = out0 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out0));
+                let s1 = out1 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out1));
+                s0.store_slice(&mut m_pair[0..4]);
+                s1.store_slice(&mut m_pair[4..8]);
+            } else {
+                out0.store_slice(&mut m_pair[0..4]);
+                out1.store_slice(&mut m_pair[4..8]);
+            }
+            *h_pair = [
+                h_pair[1], h_pair[2], p0_0, h_pair[4], h_pair[5], p0_1, h_pair[7], h_pair[8], p0_2,
+                h_pair[10], h_pair[11], p0_3, h_pair[13], h_pair[14], p1_0, h_pair[16], h_pair[17],
+                p1_1, h_pair[19], h_pair[20], p1_2, h_pair[22], h_pair[23], p1_3,
+            ];
+        }
+        let (m_chunks, m_rem) = m_rem8.as_chunks_mut::<4>();
+        let (h_chunks, h_rem) = h_rem24.as_chunks_mut::<12>();
+        let (c_chunks, c_rem) = c_rem32.as_chunks::<16>();
         for ((m_chunk, h_chunk), c_chunk) in m_chunks.iter_mut().zip(h_chunks).zip(c_chunks) {
             let [tap0, tap1, tap2, tap3] = transpose_4x4(
                 f32x4::from_slice(neon, &c_chunk[0..4]),

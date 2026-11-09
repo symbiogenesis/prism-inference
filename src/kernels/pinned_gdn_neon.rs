@@ -1362,3 +1362,239 @@ pub(super) fn step_eight_rows_tokens_from(
     }
     true
 }
+
+/// Steps 4 GDN state rows in-place across `inputs.len()` tokens simultaneously,
+/// keeping all 4 state rows in registers/stack blocks across tokens and sharing
+/// `key` and `query` vector loads across the 4 rows at every token. Returns `false`
+/// without mutating `states` if any non-finite value occurs.
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    clippy::suboptimal_flops,
+    reason = "Keep 4-row multi-token in-place register-resident NEON GDN recurrence together."
+)]
+pub(super) fn step_four_rows_tokens_in_place(
+    states: [&mut [f32]; 4],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let width = states[0].len();
+    if width == 0 || width > 256 || !width.is_multiple_of(16) || inputs.len() > 64 {
+        return false;
+    }
+    let blocks = width / 16;
+    let mut current = [[[f32x4::splat(neon, 0.0); 4]; 16]; 4];
+    for (r, state) in states.iter().enumerate() {
+        for (b, state_block) in state.as_chunks::<16>().0.iter().enumerate() {
+            current[r][b] = [
+                f32x4::from_slice(neon, &state_block[0..4]),
+                f32x4::from_slice(neon, &state_block[4..8]),
+                f32x4::from_slice(neon, &state_block[8..12]),
+                f32x4::from_slice(neon, &state_block[12..16]),
+            ];
+        }
+    }
+    let mut decayed = [[[f32x4::splat(neon, 0.0); 4]; 16]; 4];
+
+    for input in inputs {
+        let decays = f32x4::splat(neon, input.decay);
+        let mut s0 = [f32x4::splat(neon, 0.0); 4];
+        let mut s1 = [f32x4::splat(neon, 0.0); 4];
+        let mut s2 = [f32x4::splat(neon, 0.0); 4];
+        let mut s3 = [f32x4::splat(neon, 0.0); 4];
+        for (b, key_block) in input.key.as_chunks::<16>().0.iter().enumerate() {
+            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+            for r in 0..4 {
+                let [c0, c1, c2, c3] = current[r][b];
+                let d0 = c0 * decays;
+                let d1 = c1 * decays;
+                let d2 = c2 * decays;
+                let d3 = c3 * decays;
+                decayed[r][b] = [d0, d1, d2, d3];
+                s0[r] = d0.mul_add_precise(k0, s0[r]);
+                s1[r] = d1.mul_add_precise(k1, s1[r]);
+                s2[r] = d2.mul_add_precise(k2, s2[r]);
+                s3[r] = d3.mul_add_precise(k3, s3[r]);
+            }
+        }
+        let mut scales = [f32x4::splat(neon, 0.0); 4];
+        for r in 0..4 {
+            let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
+            if !dot_k.is_finite() {
+                return false;
+            }
+            scales[r] = f32x4::splat(neon, (input.value[row + r] - dot_k) * input.beta);
+        }
+        let mut q0 = [f32x4::splat(neon, 0.0); 4];
+        let mut q1 = [f32x4::splat(neon, 0.0); 4];
+        let mut q2 = [f32x4::splat(neon, 0.0); 4];
+        let mut q3 = [f32x4::splat(neon, 0.0); 4];
+        for (b, (key_block, query_block)) in input
+            .key
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(input.query.as_chunks::<16>().0)
+            .enumerate()
+        {
+            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+            let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
+            let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
+            let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
+            let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
+            for r in 0..4 {
+                let [d0, d1, d2, d3] = decayed[r][b];
+                let delta = scales[r];
+                let u0 = delta.mul_add_precise(k0, d0);
+                let u1 = delta.mul_add_precise(k1, d1);
+                let u2 = delta.mul_add_precise(k2, d2);
+                let u3 = delta.mul_add_precise(k3, d3);
+                if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+                    return false;
+                }
+                current[r][b] = [u0, u1, u2, u3];
+                q0[r] = u0.mul_add_precise(qv0, q0[r]);
+                q1[r] = u1.mul_add_precise(qv1, q1[r]);
+                q2[r] = u2.mul_add_precise(qv2, q2[r]);
+                q3[r] = u3.mul_add_precise(qv3, q3[r]);
+            }
+        }
+        for r in 0..4 {
+            if !((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum().is_finite() {
+                return false;
+            }
+        }
+    }
+
+    for (state, row_blocks) in states.into_iter().zip(current.iter()) {
+        flush_blocks(state, row_blocks, blocks);
+    }
+    true
+}
+
+/// Steps 8 GDN state rows in-place across `inputs.len()` tokens simultaneously,
+/// keeping all 8 state rows in registers/stack blocks across tokens and sharing
+/// `key` and `query` vector loads across the 8 rows at every token. Returns `false`
+/// without mutating `states` if any non-finite value occurs.
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    clippy::suboptimal_flops,
+    reason = "Keep 8-row multi-token in-place register-resident NEON GDN recurrence together."
+)]
+pub(super) fn step_eight_rows_tokens_in_place(
+    states: [&mut [f32]; 8],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let width = states[0].len();
+    if width == 0 || width > 256 || !width.is_multiple_of(16) || inputs.len() > 64 {
+        return false;
+    }
+    let blocks = width / 16;
+    let mut current = [[[f32x4::splat(neon, 0.0); 4]; 16]; 8];
+    for (r, state) in states.iter().enumerate() {
+        for (b, state_block) in state.as_chunks::<16>().0.iter().enumerate() {
+            current[r][b] = [
+                f32x4::from_slice(neon, &state_block[0..4]),
+                f32x4::from_slice(neon, &state_block[4..8]),
+                f32x4::from_slice(neon, &state_block[8..12]),
+                f32x4::from_slice(neon, &state_block[12..16]),
+            ];
+        }
+    }
+    let mut decayed = [[[f32x4::splat(neon, 0.0); 4]; 16]; 8];
+
+    for input in inputs {
+        let decays = f32x4::splat(neon, input.decay);
+        let mut s0 = [f32x4::splat(neon, 0.0); 8];
+        let mut s1 = [f32x4::splat(neon, 0.0); 8];
+        let mut s2 = [f32x4::splat(neon, 0.0); 8];
+        let mut s3 = [f32x4::splat(neon, 0.0); 8];
+        for (b, key_block) in input.key.as_chunks::<16>().0.iter().enumerate() {
+            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+            for r in 0..8 {
+                let [c0, c1, c2, c3] = current[r][b];
+                let d0 = c0 * decays;
+                let d1 = c1 * decays;
+                let d2 = c2 * decays;
+                let d3 = c3 * decays;
+                decayed[r][b] = [d0, d1, d2, d3];
+                s0[r] = d0.mul_add_precise(k0, s0[r]);
+                s1[r] = d1.mul_add_precise(k1, s1[r]);
+                s2[r] = d2.mul_add_precise(k2, s2[r]);
+                s3[r] = d3.mul_add_precise(k3, s3[r]);
+            }
+        }
+        let mut scales = [f32x4::splat(neon, 0.0); 8];
+        for r in 0..8 {
+            let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
+            if !dot_k.is_finite() {
+                return false;
+            }
+            scales[r] = f32x4::splat(neon, (input.value[row + r] - dot_k) * input.beta);
+        }
+        let mut q0 = [f32x4::splat(neon, 0.0); 8];
+        let mut q1 = [f32x4::splat(neon, 0.0); 8];
+        let mut q2 = [f32x4::splat(neon, 0.0); 8];
+        let mut q3 = [f32x4::splat(neon, 0.0); 8];
+        for (b, (key_block, query_block)) in input
+            .key
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(input.query.as_chunks::<16>().0)
+            .enumerate()
+        {
+            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+            let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
+            let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
+            let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
+            let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
+            for r in 0..8 {
+                let [d0, d1, d2, d3] = decayed[r][b];
+                let delta = scales[r];
+                let u0 = delta.mul_add_precise(k0, d0);
+                let u1 = delta.mul_add_precise(k1, d1);
+                let u2 = delta.mul_add_precise(k2, d2);
+                let u3 = delta.mul_add_precise(k3, d3);
+                if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
+                    return false;
+                }
+                current[r][b] = [u0, u1, u2, u3];
+                q0[r] = u0.mul_add_precise(qv0, q0[r]);
+                q1[r] = u1.mul_add_precise(qv1, q1[r]);
+                q2[r] = u2.mul_add_precise(qv2, q2[r]);
+                q3[r] = u3.mul_add_precise(qv3, q3[r]);
+            }
+        }
+        for r in 0..8 {
+            if !((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum().is_finite() {
+                return false;
+            }
+        }
+    }
+
+    for (state, row_blocks) in states.into_iter().zip(current.iter()) {
+        flush_blocks(state, row_blocks, blocks);
+    }
+    true
+}

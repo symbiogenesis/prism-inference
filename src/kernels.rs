@@ -2368,7 +2368,7 @@ impl PreparedMatvec<'_> {
                     target_env = "msvc",
                     target_feature = "neon"
                 ))]
-                if matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon) {
+                if !matches!(scratch.requested_backend(), MatvecBackend::Scalar) {
                     if tensor.kind == Q8_0 {
                         return scratch.row_parallelism.fill_four_rows(
                             &tensor.data,

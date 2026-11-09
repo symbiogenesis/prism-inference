@@ -234,12 +234,71 @@ fn dot_ptq1_block_lanes_dotprod(packed: &[u8; 28], activations: [&[i8; 32]; 4]) 
 #[target_feature(enable = "neon,dotprod")]
 fn dot_ptq1_block_groups_dotprod(packed: &[u8; 28], activations: [&[i8; 32]; 4]) -> [i32; 4] {
     let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(packed);
-    let pairs = [(t0, t1), (t2, t3), (t4, t5), (t6, t7)];
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let g0 = sdot32_vec(t0, t1, load_s8x16(&a0[0]), load_s8x16(&a0[1]));
+    let g1 = sdot32_vec(t2, t3, load_s8x16(&a1[0]), load_s8x16(&a1[1]));
+    let g2 = sdot32_vec(t4, t5, load_s8x16(&a2[0]), load_s8x16(&a2[1]));
+    let g3 = sdot32_vec(t6, t7, load_s8x16(&a3[0]), load_s8x16(&a3[1]));
     let mut out = [0_i32; 4];
-    for (group, ((w0, w1), act)) in pairs.into_iter().zip(activations).enumerate() {
-        let a_halves = act.as_chunks::<16>().0;
-        let acc = sdot32_vec(w0, w1, load_s8x16(&a_halves[0]), load_s8x16(&a_halves[1]));
-        out[group] = vaddvq_s32(acc);
+    store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out);
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_four_rows_lanes_dotprod(
+    packed: [&[u8; 28]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 4] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act_pairs = [
+        (load_s8x16(&a0[0]), load_s8x16(&a0[1])),
+        (load_s8x16(&a1[0]), load_s8x16(&a1[1])),
+        (load_s8x16(&a2[0]), load_s8x16(&a2[1])),
+        (load_s8x16(&a3[0]), load_s8x16(&a3[1])),
+    ];
+    let mut out = [[[0_i32; 4]; 4]; 4];
+    for (row, block) in packed.into_iter().enumerate() {
+        let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
+        let pairs = [(t0, t1), (t2, t3), (t4, t5), (t6, t7)];
+        for (group, ((w0, w1), (act0, act1))) in pairs.into_iter().zip(act_pairs).enumerate() {
+            let acc = sdot32_vec(w0, w1, act0, act1);
+            store_s32x4(acc, &mut out[row][group]);
+        }
+    }
+    out
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_ptq1_four_rows_groups_dotprod(
+    packed: [&[u8; 28]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 4] {
+    let a0 = activations[0].as_chunks::<16>().0;
+    let a1 = activations[1].as_chunks::<16>().0;
+    let a2 = activations[2].as_chunks::<16>().0;
+    let a3 = activations[3].as_chunks::<16>().0;
+    let act00 = load_s8x16(&a0[0]);
+    let act01 = load_s8x16(&a0[1]);
+    let act10 = load_s8x16(&a1[0]);
+    let act11 = load_s8x16(&a1[1]);
+    let act20 = load_s8x16(&a2[0]);
+    let act21 = load_s8x16(&a2[1]);
+    let act30 = load_s8x16(&a3[0]);
+    let act31 = load_s8x16(&a3[1]);
+    let mut out = [[0_i32; 4]; 4];
+    for (row, block) in packed.into_iter().enumerate() {
+        let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
+        let g0 = sdot32_vec(t0, t1, act00, act01);
+        let g1 = sdot32_vec(t2, t3, act10, act11);
+        let g2 = sdot32_vec(t4, t5, act20, act21);
+        let g3 = sdot32_vec(t6, t7, act30, act31);
+        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[row]);
     }
     out
 }
@@ -266,6 +325,30 @@ pub(super) fn dot_ptq1_block_groups(
     }
     // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
     Some(unsafe { dot_ptq1_block_groups_dotprod(packed, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_four_rows_lanes(
+    packed: [&[u8; 28]; 4],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[[i32; 4]; 4]; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_four_rows_lanes_dotprod(packed, activations) })
+}
+
+#[inline]
+pub(super) fn dot_ptq1_four_rows_groups(
+    packed: [&[u8; 28]; 4],
+    activations: [&[i8; 32]; 4],
+) -> Option<[[i32; 4]; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_ptq1_four_rows_groups_dotprod(packed, activations) })
 }
 
 #[inline]
@@ -378,6 +461,49 @@ pub(super) fn dot_pq2_four_consumption_precomputed(
     }
     // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
     Some(unsafe { dot_pq2_four_consumption_dotprod(packed, planes, activation_sum) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn dot_pq2_eight_consumption_dotprod(
+    packed: [&[u8; 32]; 8],
+    planes: &[i8; 128],
+    activation_sum: i32,
+) -> [i32; 8] {
+    let mut acc = [vdupq_n_s32(0); 8];
+    for (half, half_planes) in planes.as_chunks::<64>().0.iter().enumerate() {
+        let p = half_planes.as_chunks::<16>().0;
+        let p0 = load_s8x16(&p[0]);
+        let p1 = load_s8x16(&p[1]);
+        let p2 = load_s8x16(&p[2]);
+        let p3 = load_s8x16(&p[3]);
+        for row in 0..8 {
+            let bytes = &packed[row].as_chunks::<16>().0[half];
+            acc[row] = pq2_half_unsigned_sdot(acc[row], load_u8x16(bytes), p0, p1, p2, p3);
+        }
+    }
+    let sum_vec = vdupq_n_s32(activation_sum);
+    let reduced_lo = vsubq_s32(reduce4_s32x4(acc[0], acc[1], acc[2], acc[3]), sum_vec);
+    let reduced_hi = vsubq_s32(reduce4_s32x4(acc[4], acc[5], acc[6], acc[7]), sum_vec);
+    let mut out_lo = [0_i32; 4];
+    let mut out_hi = [0_i32; 4];
+    store_s32x4(reduced_lo, &mut out_lo);
+    store_s32x4(reduced_hi, &mut out_hi);
+    [
+        out_lo[0], out_lo[1], out_lo[2], out_lo[3], out_hi[0], out_hi[1], out_hi[2], out_hi[3],
+    ]
+}
+
+#[inline]
+pub(super) fn dot_pq2_eight_consumption_precomputed(
+    packed: [&[u8; 32]; 8],
+    planes: &[i8; 128],
+    activation_sum: i32,
+) -> Option<[i32; 8]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { dot_pq2_eight_consumption_dotprod(packed, planes, activation_sum) })
 }
 
 #[inline]

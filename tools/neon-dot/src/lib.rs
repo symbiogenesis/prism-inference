@@ -162,6 +162,36 @@ pub fn dot_ptq1_block_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) -> 
     })
 }
 
+/// Unpacks four 28-byte `PTQ1_0` blocks and computes their four 4-lane
+/// `DOTPROD` sums against four shared 32-element `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_four_rows_lanes(
+    packed: [&[u8; 28]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_four_rows_lanes(packed, activations) {
+        return lanes;
+    }
+    packed.map(|row| dot_ptq1_block_lanes(row, activations))
+}
+
+/// Unpacks four 28-byte `PTQ1_0` blocks and computes their four 32-element
+/// group sums against four shared 32-element `Q8_0` activation groups.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_four_rows_groups(
+    packed: [&[u8; 28]; 4],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_four_rows_groups(packed, activations) {
+        return groups;
+    }
+    packed.map(|row| dot_ptq1_block_groups(row, activations))
+}
+
 /// Computes the 128-element `PQ2_0` dot product against digit-plane-ordered
 /// `i8` activations and their precomputed `activation_sum` using `SDOT`.
 #[inline]
@@ -210,6 +240,24 @@ pub fn dot_pq2_four_consumption_precomputed(
     #[cfg(target_arch = "aarch64")]
     if let Some(sums) =
         aarch64::dot_pq2_four_consumption_precomputed(packed, planes, activation_sum)
+    {
+        return sums;
+    }
+    packed.map(|row| dot_pq2_consumption_block(row, planes, activation_sum))
+}
+
+/// Computes eight 128-element `PQ2_0` dot products against shared digit-plane
+/// `i8` activations and their precomputed `activation_sum` using `SDOT`.
+#[inline]
+#[must_use]
+pub fn dot_pq2_eight_consumption_precomputed(
+    packed: [&[u8; 32]; 8],
+    planes: &[i8; 128],
+    activation_sum: i32,
+) -> [i32; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(sums) =
+        aarch64::dot_pq2_eight_consumption_precomputed(packed, planes, activation_sum)
     {
         return sums;
     }

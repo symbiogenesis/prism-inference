@@ -1030,6 +1030,7 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
     decoded_blocks: &mut u64,
 ) -> Option<crate::Result<[[f32; TOKENS]; 4]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_ptq1_dotprod = is_ptq1 && bonsai_neon_dot::has_dotprod();
     let mut sums = [[0.0_f32; TOKENS]; 4];
     let mut lanes = [[f32x4::splat(neon, 0.0); TOKENS]; 4];
     let block_bytes = if is_ptq1 { 28 } else { 34 };
@@ -1053,6 +1054,66 @@ pub(in crate::kernels::prefill) fn dot_q8_four_rows<const TOKENS: usize>(
         }
         let row_scales = scales_vec.to_array();
         *decoded_blocks = decoded_blocks.saturating_add(4);
+        if use_ptq1_dotprod {
+            let trits = [
+                bonsai_neon_dot::decode_ptq1_trits_i8(b0.try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(b1.try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(b2.try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(b3.try_into().ok()?),
+            ];
+            for (token, scratch) in preparations.iter().enumerate() {
+                let activations = <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &scratch.q8[index * 4..index * 4 + 4],
+                )
+                .ok()?;
+                if pinned {
+                    for r in 0..4 {
+                        let rs = row_scales[r];
+                        let mut acc = lanes[r][token];
+                        for (group, act) in activations.iter().enumerate() {
+                            let a_halves = act.values.as_chunks::<16>().0;
+                            let lane_sums = bonsai_neon_dot::dot32_s8_lanes(
+                                &trits[r][group * 2],
+                                &trits[r][group * 2 + 1],
+                                &a_halves[0],
+                                &a_halves[1],
+                            );
+                            let floats =
+                                i32x4::from_slice(neon, &lane_sums).to_float::<f32x4<Neon>>();
+                            let d = f32x4::splat(neon, rs * act.scale);
+                            acc = floats.mul_add_precise(d, acc);
+                        }
+                        lanes[r][token] = acc;
+                    }
+                } else {
+                    let act_scales = f32x4::from_slice(
+                        neon,
+                        &[
+                            activations[0].scale,
+                            activations[1].scale,
+                            activations[2].scale,
+                            activations[3].scale,
+                        ],
+                    );
+                    for r in 0..4 {
+                        let group_sums: [i32; 4] = std::array::from_fn(|group| {
+                            let a_halves = activations[group].values.as_chunks::<16>().0;
+                            bonsai_neon_dot::dot32_s8_sum(
+                                &trits[r][group * 2],
+                                &trits[r][group * 2 + 1],
+                                &a_halves[0],
+                                &a_halves[1],
+                            )
+                        });
+                        let dots = i32x4::from_slice(neon, &group_sums).to_float::<f32x4<Neon>>();
+                        let prod = (dots * act_scales).to_array();
+                        let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                        sums[r][token] += row_scales[r] * dot_sum;
+                    }
+                }
+            }
+            continue;
+        }
         let weights = if is_ptq1 {
             [
                 crate::kernels::neon::decode_ptq1_i16(neon, b0.try_into().ok()?),
@@ -1247,6 +1308,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
     decoded_blocks: &mut u64,
 ) -> Option<crate::Result<[[f32; TOKENS]; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
+    let use_ptq1_dotprod = is_ptq1 && bonsai_neon_dot::has_dotprod();
     let mut sums = [[0.0_f32; TOKENS]; 8];
     let mut lanes = [[f32x4::splat(neon, 0.0); TOKENS]; 8];
     let block_bytes = if is_ptq1 { 28 } else { 34 };
@@ -1285,6 +1347,70 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
             scales_hi_arr[3],
         ];
         *decoded_blocks = decoded_blocks.saturating_add(8);
+        if use_ptq1_dotprod {
+            let trits = [
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[0].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[1].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[2].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[3].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[4].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[5].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[6].try_into().ok()?),
+                bonsai_neon_dot::decode_ptq1_trits_i8(blocks[7].try_into().ok()?),
+            ];
+            for (token, scratch) in preparations.iter().enumerate() {
+                let activations = <&[crate::kernels::Q8Block; 4]>::try_from(
+                    &scratch.q8[index * 4..index * 4 + 4],
+                )
+                .ok()?;
+                if pinned {
+                    for r in 0..8 {
+                        let rs = row_scales[r];
+                        let mut acc = lanes[r][token];
+                        for (group, act) in activations.iter().enumerate() {
+                            let a_halves = act.values.as_chunks::<16>().0;
+                            let lane_sums = bonsai_neon_dot::dot32_s8_lanes(
+                                &trits[r][group * 2],
+                                &trits[r][group * 2 + 1],
+                                &a_halves[0],
+                                &a_halves[1],
+                            );
+                            let floats =
+                                i32x4::from_slice(neon, &lane_sums).to_float::<f32x4<Neon>>();
+                            let d = f32x4::splat(neon, rs * act.scale);
+                            acc = floats.mul_add_precise(d, acc);
+                        }
+                        lanes[r][token] = acc;
+                    }
+                } else {
+                    let act_scales = f32x4::from_slice(
+                        neon,
+                        &[
+                            activations[0].scale,
+                            activations[1].scale,
+                            activations[2].scale,
+                            activations[3].scale,
+                        ],
+                    );
+                    for r in 0..8 {
+                        let group_sums: [i32; 4] = std::array::from_fn(|group| {
+                            let a_halves = activations[group].values.as_chunks::<16>().0;
+                            bonsai_neon_dot::dot32_s8_sum(
+                                &trits[r][group * 2],
+                                &trits[r][group * 2 + 1],
+                                &a_halves[0],
+                                &a_halves[1],
+                            )
+                        });
+                        let dots = i32x4::from_slice(neon, &group_sums).to_float::<f32x4<Neon>>();
+                        let prod = (dots * act_scales).to_array();
+                        let dot_sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+                        sums[r][token] += row_scales[r] * dot_sum;
+                    }
+                }
+            }
+            continue;
+        }
         let weights = if is_ptq1 {
             [
                 crate::kernels::neon::decode_ptq1_i16(neon, blocks[0].try_into().ok()?),

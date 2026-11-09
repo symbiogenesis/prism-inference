@@ -12,6 +12,10 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "sampling::tests::finite_logits_preserves_bits_bounds_and_custom_sampler_dispatch",
+        "sampling::swift::tests::finite_selection_matches_checked_heap_bits_rng_reset_and_rejection",
+        "runtime::deadline_tests::finite_greedy_matches_checked_selection_across_tiles_and_ties",
+        "runtime::deadline_tests::sampled_deadline_during_sampling_delivery_or_snapshot_restores_caller_rng",
         "kernels::tests::scalar_column_projection_matches_decoded_rows_without_row_storage",
         "kernels::tests::scalar_column_projection_rejects_nonfinite_and_recovers_output",
         "kernels::tests::bf16_projection_matches_decoded_rows_without_row_storage",
@@ -58,6 +62,10 @@ CONTROLS = {
         "runtime::deadline_tests::speculative_rejected_suffix_correction_matches_independent_greedy_requests",
         "runtime::deadline_tests::speculative_rejected_suffix_keeps_both_correction_cancellation_boundaries",
     ],
+    "runtime": [
+        "validated_sampler_never_receives_invalid_decoder_outputs_and_rolls_back",
+        "reusable_logits_preserve_storage_prefixes_and_transaction_recovery",
+    ],
     "graph": [
         "rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits",
         "rank_one_checkpoint_and_failed_generation_preserve_complete_state",
@@ -88,6 +96,8 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
     "hexagon_runtime": [
+        "native_q2::tests::native_q2_resident_sibling_four_token_batches_preserve_order_and_tails",
+        "native_q2::tests::native_q2_resident_sibling_eight_op_failure_clears_entire_tile",
         "native_q2::tests::native_q2_batches_two_and_three_resident_sibling_projections_in_single_queue_writes",
         "native_q2::tests::native_q2_lazy_preparation_allocates_only_copied_scratch_after_admission",
         "native_q2::tests::native_q2_lazy_entrypoints_match_copied_bytes_and_clear_failed_publication",
@@ -115,6 +125,9 @@ LIBRARY_TARGETS = {
 # build. Keep its exact controls out of other targets instead of accepting
 # their zero-match results as numerical coverage.
 WINDOWS_ARM64_NEON_CONTROLS = [
+    "kernels::neon::tests::simd_neon_block16_all_le_matches_finite_thresholds",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_multitoken_single_row_capacities_match_independent_scalar_bits",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_multitoken_capacities_preserve_refusal",
     "kernels::neon::tests::simd_neon_integer_dot_exhaustive_packed_bytes",
     "kernels::neon::tests::simd_neon_integer_dot_each_lane_and_extremes",
     "kernels::neon::tests::simd_neon_integer_dot_unaligned_random_blocks",
@@ -247,7 +260,7 @@ def main():
                    "--locked", "--release", "--package", "prism-inference", "--package", "prism-inference-server",
                    "--package", "bonsai-hexagon-native", "--package", "bonsai-hexagon-runtime",
                    "--features", "prism-inference/parallel-rows,prism-inference-server/parallel-rows",
-                   "--lib", "--test", "graph", "--test", "swift_sampling", "--no-run", "--message-format=json"]
+                   "--lib", "--test", "graph", "--test", "runtime", "--test", "swift_sampling", "--no-run", "--message-format=json"]
         compiled = subprocess.run(command, capture_output=True, text=True, check=False)
         (evidence / "compile.log").write_text(compiled.stdout + compiled.stderr, encoding="utf-8")
         receipt["compile"] = {"arguments": command, "exitCode": compiled.returncode}

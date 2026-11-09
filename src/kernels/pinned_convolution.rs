@@ -299,6 +299,7 @@ pub(crate) fn step_silu_in_place(
 ///
 /// # Errors
 /// Rejects invalid geometry or nonfinite outputs.
+#[cfg(test)]
 pub(crate) fn step_silu_tokens_in_place(
     history: &mut [f32],
     tokens: &mut [f32],
@@ -306,19 +307,75 @@ pub(crate) fn step_silu_tokens_in_place(
     coefficients: &[f32],
     width: usize,
 ) -> Result<()> {
-    step_tokens_in_place_inner::<true>(history, tokens, channels, coefficients, width)
+    step_tokens_inner::<true, false>(
+        history, tokens, channels, coefficients, width,
+        ProjectionRows { rows: &[], offset: 0 },
+    )
+}
+
+/// Convolves a channel range directly from immutable token projection rows.
+///
+/// The head-major prefill consumer writes transformed values into `output`
+/// without first copying the raw projections there. Sliding history, FMA order
+/// and pinned `SiLU` retain the in-place kernel's arithmetic. No input row is
+/// changed, and the caller discards partial output and history on graph failure.
+///
+/// # Errors
+/// Rejects invalid row ranges or geometry before mutation, or nonfinite outputs.
+pub(crate) fn step_silu_token_rows_into(
+    history: &mut [f32],
+    rows: &[Vec<f32>],
+    channel_range: &std::ops::Range<usize>,
+    coefficients: &[f32],
+    width: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    let channels = channel_range
+        .end
+        .checked_sub(channel_range.start)
+        .filter(|&channels| channels != 0)
+        .ok_or_else(|| invalid("pinned convolution projection range mismatch"))?;
+    if rows.iter().any(|row| row.len() < channel_range.end)
+        || rows.len().checked_mul(channels) != Some(output.len())
+    {
+        return Err(invalid("pinned convolution projection row mismatch"));
+    }
+    step_tokens_inner::<true, true>(
+        history,
+        output,
+        channels,
+        coefficients,
+        width,
+        ProjectionRows {
+            rows,
+            offset: channel_range.start,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionRows<'a> {
+    rows: &'a [Vec<f32>],
+    offset: usize,
+}
+
+impl<'a> ProjectionRows<'a> {
+    fn chunk(self, token: usize, column: usize, width: usize) -> &'a [f32] {
+        &self.rows[token][self.offset + column..self.offset + column + width]
+    }
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "Keep multi-token NEON register-sliding convolution, optional SiLU fusion and fallback together."
 )]
-fn step_tokens_in_place_inner<const SILU: bool>(
+fn step_tokens_inner<const SILU: bool, const DIRECT: bool>(
     history: &mut [f32],
     tokens: &mut [f32],
     channels: usize,
     coefficients: &[f32],
     width: usize,
+    projections: ProjectionRows<'_>,
 ) -> Result<()> {
     if width == 0 {
         return Err(invalid("pinned convolution requires coefficients"));
@@ -336,6 +393,9 @@ fn step_tokens_in_place_inner<const SILU: bool>(
         return Ok(());
     }
     if count == 1 {
+        if DIRECT {
+            tokens.copy_from_slice(projections.chunk(0, 0, channels));
+        }
         return step_in_place_inner::<SILU>(history, tokens, coefficients, width);
     }
     #[cfg(all(
@@ -381,8 +441,13 @@ fn step_tokens_in_place_inner<const SILU: bool>(
             for token in 0..count {
                 let offset = token * channels + col;
                 let m_slice = &mut tokens[offset..offset + 8];
-                let p0 = f32x4::from_slice(neon, &m_slice[0..4]);
-                let p1 = f32x4::from_slice(neon, &m_slice[4..8]);
+                let projected = if DIRECT {
+                    projections.chunk(token, col, 8)
+                } else {
+                    &*m_slice
+                };
+                let p0 = f32x4::from_slice(neon, &projected[0..4]);
+                let p1 = f32x4::from_slice(neon, &projected[4..8]);
                 let mut sum0 = zero;
                 let mut sum1 = zero;
                 sum0 = h0_t0.mul_add_precise(tap0_0, sum0);
@@ -444,7 +509,12 @@ fn step_tokens_in_place_inner<const SILU: bool>(
             for token in 0..count {
                 let offset = token * channels + col;
                 let m_chunk = &mut tokens[offset..offset + 4];
-                let p = f32x4::from_slice(neon, m_chunk);
+                let projected = if DIRECT {
+                    projections.chunk(token, col, 4)
+                } else {
+                    &*m_chunk
+                };
+                let p = f32x4::from_slice(neon, projected);
                 let mut sum = zero;
                 sum = h_t0.mul_add_precise(tap0, sum);
                 sum = h_t1.mul_add_precise(tap1, sum);
@@ -472,6 +542,13 @@ fn step_tokens_in_place_inner<const SILU: bool>(
             return Err(invalid("nonfinite kernel output"));
         }
         return Ok(());
+    }
+    // Unsupported shapes and targets retain the original complete raw staging
+    // before scalar execution, including unchanged later tokens on failure.
+    if DIRECT {
+        for (token, token_slice) in tokens.chunks_exact_mut(channels).enumerate() {
+            token_slice.copy_from_slice(projections.chunk(token, 0, channels));
+        }
     }
     for token_slice in tokens.chunks_exact_mut(channels) {
         step_in_place_inner::<SILU>(history, token_slice, coefficients, width)?;
@@ -654,7 +731,7 @@ mod tests {
 
     use super::{
         row, step_in_place, step_into, step_silu_in_place, step_silu_into,
-        step_silu_tokens_in_place,
+        step_silu_token_rows_into, step_silu_tokens_in_place,
     };
     use crate::Result;
 
@@ -871,5 +948,157 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    fn scalar_projected_rows(
+        history: &mut [f32],
+        rows: &[Vec<f32>],
+        offset: usize,
+        channels: usize,
+        coefficients: &[f32],
+        width: usize,
+    ) -> Vec<f32> {
+        let mut output = Vec::new();
+        let history_width = width - 1;
+        for row in rows {
+            for channel in 0..channels {
+                let projected = row[offset + channel];
+                let history_base = channel * history_width;
+                let coefficient_base = channel * width;
+                let mut sum = 0.0_f32;
+                for tap in 0..history_width {
+                    sum = history[history_base + tap]
+                        .mul_add(coefficients[coefficient_base + tap], sum);
+                }
+                sum = projected.mul_add(coefficients[coefficient_base + history_width], sum);
+                let exponential = if channel < channels / 4 * 4 {
+                    crate::kernels::pinned_activations::vector_exp(0.0 - sum)
+                } else {
+                    (-sum).exp()
+                };
+                output.push(sum / (1.0 + exponential));
+                for tap in 1..history_width {
+                    history[history_base + tap - 1] = history[history_base + tap];
+                }
+                if history_width != 0 {
+                    history[history_base + history_width - 1] = projected;
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn pinned_convolution_projected_rows_match_independent_scalar_bits() -> Result<()> {
+        let samples = [
+            -0.0, 0.0, f32::from_bits(1), -f32::from_bits(1),
+            0.125, -0.375, 100.0, -100.0, 0.75,
+        ];
+        for channels in [1, 4, 8, 12, 65, 128] {
+            for width in [1, 2, 4, 5] {
+                for count in [0, 1, 2, 8, 16, 32] {
+                    let history: Vec<_> = samples.iter().copied().cycle()
+                        .take(channels * (width - 1)).collect();
+                    let coefficients: Vec<_> = [0.125, -0.25, 0.5, 0.0, -0.0]
+                        .into_iter().cycle().take(channels * width).collect();
+                    let rows: Vec<Vec<_>> = (0..count).map(|token| {
+                        let mut row = vec![f32::NAN; 3];
+                        row.extend(samples.iter().copied().cycle().skip(token)
+                            .take(channels));
+                        row.extend([f32::INFINITY; 2]);
+                        row
+                    }).collect();
+                    let original_rows: Vec<_> = rows.iter().map(|row| bits(row)).collect();
+                    let mut expected_history = history.clone();
+                    let expected = scalar_projected_rows(
+                        &mut expected_history, &rows, 3, channels, &coefficients, width,
+                    );
+                    let mut actual_history = history;
+                    let mut actual = vec![f32::NAN; count * channels];
+                    step_silu_token_rows_into(
+                        &mut actual_history, &rows, &(3..3 + channels),
+                        &coefficients, width, &mut actual,
+                    )?;
+                    assert_eq!(bits(&actual), bits(&expected), "{channels}/{width}/{count}");
+                    assert_eq!(bits(&actual_history), bits(&expected_history));
+                    assert_eq!(rows.iter().map(|row| bits(row)).collect::<Vec<_>>(), original_rows);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_convolution_projected_rows_preserve_failure_publication() {
+        for channels in [4, 8, 12, 65] {
+            for width in [1, 2, 4, 5] {
+                for count in [1, 3] {
+                    for fault in 0..3 {
+                        if fault == 2 && width == 1 {
+                            continue;
+                        }
+                        let mut rows = vec![vec![0.5; channels + 2]; count];
+                        let mut history = vec![0.25; channels * (width - 1)];
+                        let mut coefficients = vec![0.125; channels * width];
+                        match fault {
+                            0 => rows[count - 1][channels] = f32::INFINITY,
+                            1 => coefficients[channels * width - 1] = f32::MAX,
+                            _ => history[channels * (width - 1) - 1] = f32::NAN,
+                        }
+                        if fault == 1 {
+                            rows[count - 1][channels] = 2.0;
+                        }
+                        let original_rows: Vec<_> = rows.iter().map(|row| bits(row)).collect();
+                        let mut expected_history = history.clone();
+                        let mut expected: Vec<_> = rows.iter()
+                            .flat_map(|row| row[1..1 + channels].iter().copied()).collect();
+                        assert!(step_silu_tokens_in_place(
+                            &mut expected_history, &mut expected,
+                            channels, &coefficients, width,
+                        ).is_err());
+                        let mut actual = vec![-999.0; count * channels];
+                        assert!(step_silu_token_rows_into(
+                            &mut history, &rows, &(1..1 + channels),
+                            &coefficients, width, &mut actual,
+                        ).is_err());
+                        assert_eq!(bits(&actual), bits(&expected), "{channels}/{width}/{count}/{fault}");
+                        assert_eq!(bits(&history), bits(&expected_history));
+                        assert_eq!(rows.iter().map(|row| bits(row)).collect::<Vec<_>>(), original_rows);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_convolution_projected_rows_reject_geometry_before_mutation() {
+        let rows = vec![vec![0.5; 12]; 2];
+        for (start, end, width, history_len, coefficients_len, output_len) in [
+            (3, 2, 4, 24, 32, 16),
+            (3, 3, 4, 24, 32, 16),
+            (5, 13, 4, 24, 32, 16),
+            (3, 11, 0, 24, 32, 16),
+            (3, 11, 4, 23, 32, 16),
+            (3, 11, 4, 24, 31, 16),
+            (3, 11, 4, 24, 32, 15),
+        ] {
+            let mut history = vec![0.25; history_len];
+            let coefficients = vec![0.125; coefficients_len];
+            let mut output = vec![-999.0; output_len];
+            assert!(step_silu_token_rows_into(
+                &mut history, &rows, &(start..end), &coefficients, width, &mut output,
+            ).is_err());
+            assert_eq!(history, vec![0.25; history_len]);
+            assert_eq!(output, vec![-999.0; output_len]);
+        }
+        let mut short = rows;
+        short[1].truncate(10);
+        let mut history = [0.25; 24];
+        let mut output = [-999.0; 16];
+        assert!(step_silu_token_rows_into(
+            &mut history, &short, &(3..11), &[0.125; 32], 4, &mut output,
+        ).is_err());
+        assert_eq!(history, [0.25; 24]);
+        assert_eq!(output, [-999.0; 16]);
     }
 }

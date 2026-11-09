@@ -553,19 +553,20 @@ pub(super) fn recurrent_tile<'a>(
                 {
                     let head = base_head + offset;
                     let c_slice = &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
-                    for (token, token_mixed) in mixed_ref.iter().enumerate() {
-                        head_out[token * width..(token + 1) * width]
-                            .copy_from_slice(&token_mixed[head * width..(head + 1) * width]);
-                    }
                     if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                        crate::kernels::pinned_convolution::step_silu_tokens_in_place(
+                        crate::kernels::pinned_convolution::step_silu_token_rows_into(
                             head_conv,
-                            head_out,
-                            width,
+                            mixed_ref,
+                            &(head * width..(head + 1) * width),
                             c_slice,
                             geometry.convolution,
+                            head_out,
                         )?;
                     } else {
+                        for (token, token_mixed) in mixed_ref.iter().enumerate() {
+                            head_out[token * width..(token + 1) * width]
+                                .copy_from_slice(&token_mixed[head * width..(head + 1) * width]);
+                        }
                         for head_mixed in head_out.chunks_exact_mut(width) {
                             for (channel, value) in head_mixed.iter_mut().enumerate() {
                                 let projected = *value;

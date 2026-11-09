@@ -87,6 +87,27 @@ This changes floating evaluation order. Its initial qualification tolerance is
 long-prefix, adapter and restored-continuation evidence remains required before
 service selection. Different numerical identities cannot share prefix state.
 
+## Direct GDN convolution input
+
+The source candidate reads immutable original projection rows directly during
+head-major pinned GDN convolution. Eligible multi-token width-four NEON groups
+write only the convolved `SiLU` values into the existing output storage, rather
+than copying raw projections there and reading them back first. The shared
+kernel keeps the same FMA sequence, register-sliding history, finite-result
+checks and failure publication. Unsupported shapes and targets retain complete
+raw staging before their original scalar execution, including later token
+contents on an error. Input rows remain immutable and the graph's callbacks,
+request rollback and conservative scratch reservation are unchanged.
+
+For Swift's 10,240 convolution channels, a 32-token tile and 48 recurrent layers,
+the omitted copy accounts for 60 MiB of nominal raw staging writes and 60 MiB of
+matching reads. These are source payload counts, not measured memory traffic or
+latency. Independent scalar controls cover FMA/`SiLU`/history bits, signed zero
+and subnormal inputs, history sliding, unsupported widths and tails, geometry
+rejection and complete copied-route failure publication. Release code generation,
+complete-model logits/state/adapter recovery and whole-prompt benefit remain
+pending before release integration.
+
 ## Bounds and recovery
 
 The additional reservation conservatively charges all tile vectors, both packed

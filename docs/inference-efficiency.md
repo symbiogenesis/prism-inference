@@ -172,12 +172,26 @@ all-target Clippy and production executable linking are separate required steps;
 a correctness receipt alone does not imply that later steps passed. The complete
 workflow result is the model-free hosted gate.
 
-The source receipt also binds the root `clippy.toml` policy. Its one named
-duplicate-crate allowance covers the incompatible pinned `windows-sys` versions:
-containment's `mxc-sdk`/`winreg` route requires 0.59, while native hashing and
-other current consumers require 0.61.2. This does not replace dependencies or
-disable other duplicate-crate diagnostics; changing or removing the policy
-changes the admitted source identity.
+The source receipt also binds the root `clippy.toml` policy. Its two named
+duplicate-crate allowances cover incompatible pinned requirements:
+
+- `windows-sys`: containment's `mxc-sdk`/`winreg` route requires 0.59, while
+  native hashing and other current consumers require 0.61.2.
+- `syn`: `bonsai-hexagon-runtime -> serde 1.0.229 -> serde_derive 1.0.229`
+  requires major 3 (locked 3.0.9). Its Windows containment route through
+  `bonsai-windows-process =0.1.2 -> mxc-sdk =1.0.1 -> windows-core 0.62.2`
+  requires the nonoptional `windows-implement 0.60.2` and
+  `windows-interface 0.59.3` macros, which each require major 2 (locked
+  2.0.119). Static inspection of the lockfile and cached normalized manifests
+  establishes these incompatible requirements; it is not a compiled result.
+
+Neither allowance replaces dependencies or disables other duplicate-crate
+diagnostics. Clippy's policy names crates rather than individual versions, so
+future changes to either route require review. Changing or removing the policy
+changes the admitted source identity. The `syn` extension is source-only after
+the closed local check's strict analyzer failure and has not been compiled or
+checked. The earlier failure remains failed; final-source owning hosted
+validation is pending.
 
 The fixed inventory also covers suffix-search reference parity and speculative
 rollback, staged GDN row reuse on Windows ARM64, and direct native-Q2 resident

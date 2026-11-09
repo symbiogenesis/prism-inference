@@ -1188,6 +1188,95 @@ pub(super) fn add_scaled_slice_in_place(target: &mut [f32], input: &[f32], scale
 
 #[inline]
 #[allow(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 multiply and add roundings matching scale_slice_into and add_scaled_slice_in_place."
+)]
+pub(super) fn gdn_wy_update_four_rows(
+    states: [&[f32]; 4],
+    last_cumulative: f32,
+    inputs: &[super::pinned_gdn::ChunkInput<'_>],
+    scaled_deltas: &[[f32; 32]; 4],
+    matrix_rows: [&mut [f32]; 4],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let width = matrix_rows[0].len();
+    let count = inputs.len();
+    let scale_vec = f32x4::splat(neon, last_cumulative);
+    let vec16_blocks = width / 16;
+    let [m0, m1, m2, m3] = matrix_rows;
+    let mut rows = [m0, m1, m2, m3];
+    for b in 0..vec16_blocks {
+        let offset = b * 16;
+        let mut acc = [[f32x4::splat(neon, 0.0); 4]; 4];
+        for r in 0..4 {
+            let s = &states[r][offset..offset + 16];
+            acc[r] = [
+                scale_vec * f32x4::from_slice(neon, &s[0..4]),
+                scale_vec * f32x4::from_slice(neon, &s[4..8]),
+                scale_vec * f32x4::from_slice(neon, &s[8..12]),
+                scale_vec * f32x4::from_slice(neon, &s[12..16]),
+            ];
+        }
+        for (prior, input) in inputs[..count].iter().enumerate() {
+            let kb = &input.key[offset..offset + 16];
+            let k0 = f32x4::from_slice(neon, &kb[0..4]);
+            let k1 = f32x4::from_slice(neon, &kb[4..8]);
+            let k2 = f32x4::from_slice(neon, &kb[8..12]);
+            let k3 = f32x4::from_slice(neon, &kb[12..16]);
+            for r in 0..4 {
+                let sd = f32x4::splat(neon, scaled_deltas[r][prior]);
+                acc[r][0] += sd * k0;
+                acc[r][1] += sd * k1;
+                acc[r][2] += sd * k2;
+                acc[r][3] += sd * k3;
+            }
+        }
+        for (out_row, row_acc) in rows.iter_mut().zip(acc.iter()) {
+            let out_block = &mut out_row[offset..offset + 16];
+            row_acc[0].store_slice(&mut out_block[0..4]);
+            row_acc[1].store_slice(&mut out_block[4..8]);
+            row_acc[2].store_slice(&mut out_block[8..12]);
+            row_acc[3].store_slice(&mut out_block[12..16]);
+        }
+    }
+    let vec4_blocks = width / 4;
+    for b in (vec16_blocks * 4)..vec4_blocks {
+        let offset = b * 4;
+        let mut a0 = scale_vec * f32x4::from_slice(neon, &states[0][offset..offset + 4]);
+        let mut a1 = scale_vec * f32x4::from_slice(neon, &states[1][offset..offset + 4]);
+        let mut a2 = scale_vec * f32x4::from_slice(neon, &states[2][offset..offset + 4]);
+        let mut a3 = scale_vec * f32x4::from_slice(neon, &states[3][offset..offset + 4]);
+        for (prior, input) in inputs[..count].iter().enumerate() {
+            let k = f32x4::from_slice(neon, &input.key[offset..offset + 4]);
+            a0 += f32x4::splat(neon, scaled_deltas[0][prior]) * k;
+            a1 += f32x4::splat(neon, scaled_deltas[1][prior]) * k;
+            a2 += f32x4::splat(neon, scaled_deltas[2][prior]) * k;
+            a3 += f32x4::splat(neon, scaled_deltas[3][prior]) * k;
+        }
+        a0.store_slice(&mut rows[0][offset..offset + 4]);
+        a1.store_slice(&mut rows[1][offset..offset + 4]);
+        a2.store_slice(&mut rows[2][offset..offset + 4]);
+        a3.store_slice(&mut rows[3][offset..offset + 4]);
+    }
+    let rem_start = vec4_blocks * 4;
+    if rem_start < width {
+        for (r, out_row) in rows.iter_mut().enumerate() {
+            for (idx, out_elem) in out_row.iter_mut().enumerate().take(width).skip(rem_start) {
+                let mut acc = last_cumulative * states[r][idx];
+                for (prior, input) in inputs[..count].iter().enumerate() {
+                    acc += scaled_deltas[r][prior] * input.key[idx];
+                }
+                *out_elem = acc;
+            }
+        }
+    }
+    true
+}
+
+#[inline]
+#[allow(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."

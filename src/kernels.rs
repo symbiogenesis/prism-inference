@@ -2662,6 +2662,39 @@ pub(crate) fn add_scaled_slice_in_place(target: &mut [f32], input: &[f32], scale
     }
 }
 
+pub(crate) fn gdn_wy_update_four_rows(
+    states: [&[f32]; 4],
+    last_cumulative: f32,
+    inputs: &[pinned_gdn::ChunkInput<'_>],
+    scaled_deltas: &[[f32; 32]; 4],
+    matrix_rows: [&mut [f32]; 4],
+) {
+    let [m0, m1, m2, m3] = matrix_rows;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::gdn_wy_update_four_rows(
+        states,
+        last_cumulative,
+        inputs,
+        scaled_deltas,
+        [m0, m1, m2, m3],
+    ) {
+        return;
+    }
+    let rows = [m0, m1, m2, m3];
+    for (r, matrix_row) in rows.into_iter().enumerate() {
+        scale_slice_into(states[r], last_cumulative, matrix_row);
+        for (prior, input) in inputs.iter().enumerate() {
+            add_scaled_slice_in_place(matrix_row, input.key, scaled_deltas[r][prior]);
+        }
+    }
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::as_conversions,

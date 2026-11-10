@@ -12,6 +12,14 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "graph::attention_six::tests::six_head_decode_matches_single_head_recompute_across_pages",
+        "runtime::terminal_tests::terminal_state_only_matches_tokens_state_rng_and_counts_then_recomputes",
+        "runtime::terminal_tests::terminal_state_only_stop_draw_has_no_ingestion_or_output",
+        "runtime::terminal_tests::terminal_state_only_failure_cancellation_and_delivery_restore_state_and_sampler",
+        "runtime::terminal_tests::terminal_state_only_rejects_retained_snapshots_and_expired_requests_before_work",
+        "kernels::pinned_attention::six::tests::six_head_scores_match_independent_native_lanes_and_tails",
+        "kernels::pinned_attention::six::tests::six_head_values_match_independent_channels_and_visit_each_row_once",
+        "kernels::pinned_attention::six::tests::six_head_values_reject_invalid_geometry_and_late_failure_atomically",
         "kernels::pinned_attention::gated_tests::gated_two_token_tiles_never_gate_a_failed_partial_publication",
         "kernels::pinned_attention::gated_tests::gated_four_head_tiles_match_independent_channel_oracle",
         "kernels::pinned_attention::gated_tests::gated_two_token_tiles_match_independent_causal_oracle",
@@ -83,6 +91,9 @@ CONTROLS = {
         "reusable_logits_preserve_storage_prefixes_and_transaction_recovery",
     ],
     "graph": [
+        "state_only_ingestion_matches_hybrid_outputs_checkpoints_and_reset",
+        "state_only_ingestion_skips_only_output_validation",
+        "state_only_ingestion_rejects_invalid_tokens_without_advancing",
         "finite_decoder_output_preserves_hybrid_bits_storage_and_snapshot_ownership",
         "finite_decoder_output_clears_late_failure_without_publishing_hybrid_state",
         "projection::projection_scope_preserves_logits_state_adapter_basis_checkpoint_and_reset",
@@ -133,6 +144,8 @@ CONTROLS = {
         "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
     ],
     "hexagon_native": [
+        "projection::tests::full_ffn_request_correlates_exact_counts_and_rejects_other_shapes",
+        "native_q2_forwarding_tests::owned_session_forwards_full_ffn_chain_and_preserves_failure",
         "native_q2_forwarding_tests::owned_session_forwards_direct_resident_initialization_once",
         "native_q2_forwarding_tests::owned_session_keeps_eight_operations_in_one_native_call",
         "native_q2_forwarding_tests::owned_session_preserves_fused_swiglu_calls_and_rejection",
@@ -179,6 +192,14 @@ WINDOWS_ARM64_NEON_CONTROLS = [
 ]
 
 WINDOWS_ARM64_NATIVE_CONTROLS = [
+    "windows::compute_native::projection_native::tests::actual_session_reuses_only_correlated_results_and_never_retries_failure",
+    "windows::compute_native::projection_native::tests::hmx_session_checks_all_eight_planes_and_retains_uncertain_owners",
+    "windows::compute_native::projection_native::tests::resident_hmx_reuses_immutable_arena_and_never_reuses_a_faulted_owner",
+    "windows::compute_native::projection_native::tests::batch4_hmx_session_checks_all_twelve_tensors_four_outputs_and_capacity",
+    "windows::compute_native::projection_native::tests::batch10_hmx_session_checks_all_thirty_tensors_ten_outputs_and_capacity",
+    "windows::compute_native::projection_native::tests::resident_native_q2_multi4_executes_four_operations_in_single_queue_write",
+    "windows::compute_native::projection_native::tests::resident_native_q2_full_ffn_chain_executes_all_optional_shapes_and_reuses_flush",
+    "windows::compute_native::projection_native::tests::resident_native_q2_full_ffn_chain_failures_are_terminal_without_replay",
     "windows::compute_native::projection_native::tests::resident_native_q2_scopes_queue_buffer_flush_after_initial_dirty_submission",
     "windows::compute_native::projection_native::tests::resident_native_q2_batch2_and_batch3_share_activation_and_validate_mixed_rows",
     "windows::compute_native::projection_native::tests::native_q2_in_place_preparation_preserves_extents_and_atomic_publication",

@@ -212,6 +212,37 @@ fn text_encoding_keeps_unequal_pieces_independent_across_special_boundaries() ->
 }
 
 #[test]
+fn repeated_piece_preparation_preserves_special_boundaries_unicode_and_limits() -> Result<()> {
+    let values = metadata()?;
+    let tokenizer = Tokenizer::from_metadata(&values, 260)?;
+    let vocabulary = Vocabulary::from_metadata(&values, 260)?;
+    let unit = "ab ab ab<stop>ab ab 🌱 🌱";
+    let text = unit.repeat(16);
+    let expected_unit = [
+        256, 32, 256, 32, 256, 258, 256, 32, 256, 32, 240, 159, 140, 177, 32, 240, 159, 140, 177,
+    ];
+    let expected = expected_unit.repeat(16);
+    assert_eq!(
+        tokenizer.encode(&text, expected.len(), SpecialInputPolicy::Parse)?,
+        expected
+    );
+    assert_eq!(decoded(&vocabulary, &expected)?, text.as_bytes());
+    assert!(
+        tokenizer
+            .encode(&text, expected.len() - 1, SpecialInputPolicy::Parse)
+            .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
+    assert_eq!(
+        tokenizer.encode(&text, expected.len(), SpecialInputPolicy::Parse)?,
+        expected
+    );
+    let literal = tokenizer.encode(&text, text.len(), SpecialInputPolicy::Literal)?;
+    assert!(!literal.contains(&258));
+    assert_eq!(decoded(&vocabulary, &literal)?, text.as_bytes());
+    Ok(())
+}
+
+#[test]
 fn model_insertion_requires_explicit_true_flags_and_encode_stays_unchanged() -> Result<()> {
     for beginning in [None, Some(false), Some(true)] {
         for end in [None, Some(false), Some(true)] {

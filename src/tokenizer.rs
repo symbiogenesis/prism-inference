@@ -54,6 +54,8 @@ impl Tokenizer {
     /// pieces additionally obey BPE's 64 KiB piece limit. Merges never cross
     /// pretokenizer or recognized special-token boundaries. Empty input returns
     /// no IDs, including with a zero output allowance.
+    /// Repeated short ordinary pieces reuse exact merged IDs in the bounded
+    /// request-local BPE cache; no cached result survives this call.
     ///
     /// # Errors
     /// Rejects input/piece/output bounds, missing normal byte tokens and

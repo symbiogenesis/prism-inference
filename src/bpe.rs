@@ -42,12 +42,68 @@ struct Node {
 // deterministically merge at the leftmost surviving position.
 type Candidate = (usize, usize, usize, u32, u32, u32);
 
+const PIECE_CACHE_SLOTS: usize = 16;
+const PIECE_CACHE_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CachedPiece {
+    bytes: [u8; PIECE_CACHE_BYTES],
+    tokens: [u32; PIECE_CACHE_BYTES],
+    byte_len: usize,
+    token_len: usize,
+}
+
 // Owned by one encoding request: immutable BPE rules remain freely shareable.
 // Clearing between pieces retains capacity bounded by the largest piece seen.
+// The small inline cache never allocates or escapes this request. Retaining a
+// borrowed owner makes address equality safe even if callers change rule sets:
+// the original BPE cannot be dropped while this scratch retains its identity.
 #[derive(Debug, Default)]
-pub(crate) struct BpeScratch {
+pub(crate) struct BpeScratch<'a> {
     nodes: Vec<Node>,
     candidates: BinaryHeap<Reverse<Candidate>>,
+    owner: Option<&'a Bpe>,
+    pieces: [CachedPiece; PIECE_CACHE_SLOTS],
+    #[cfg(test)]
+    uncached_pieces: usize,
+}
+
+impl<'a> BpeScratch<'a> {
+    fn cached(&mut self, owner: &'a Bpe, bytes: &[u8]) -> Option<&[u32]> {
+        if self
+            .owner
+            .is_some_and(|previous| !std::ptr::eq(previous, owner))
+        {
+            self.pieces.fill(CachedPiece::default());
+        }
+        self.owner = Some(owner);
+        if bytes.len() > PIECE_CACHE_BYTES {
+            return None;
+        }
+        let entry = &self.pieces[piece_slot(bytes)];
+        (entry.byte_len == bytes.len() && entry.bytes[..entry.byte_len] == *bytes)
+            .then_some(&entry.tokens[..entry.token_len])
+    }
+
+    fn retain(&mut self, bytes: &[u8], tokens: &[u32]) {
+        if bytes.len() > PIECE_CACHE_BYTES {
+            return;
+        }
+        // Each byte begins as one token and merging only reduces that count.
+        let entry = &mut self.pieces[piece_slot(bytes)];
+        entry.bytes[..bytes.len()].copy_from_slice(bytes);
+        entry.tokens[..tokens.len()].copy_from_slice(tokens);
+        entry.byte_len = bytes.len();
+        entry.token_len = tokens.len();
+    }
+}
+
+fn piece_slot(bytes: &[u8]) -> usize {
+    // Mask each bounded step: multiplication cannot overflow even for hostile
+    // pieces. Full byte equality, never this hash, determines cache identity.
+    bytes.iter().fold(0, |slot, &byte| {
+        (slot * 31 + usize::from(byte)) & (PIECE_CACHE_SLOTS - 1)
+    })
 }
 
 /// Bounded normal-token BPE rules, independent of pretokenization and templates.
@@ -183,12 +239,12 @@ impl Bpe {
 
     // Append only after the complete piece passes validation. Callers composing
     // pieces can share output storage without allocating and copying each result.
-    pub(crate) fn encode_piece_into(
-        &self,
+    pub(crate) fn encode_piece_into<'a>(
+        &'a self,
         bytes: &[u8],
         max_tokens: usize,
         output: &mut Vec<u32>,
-        scratch: &mut BpeScratch,
+        scratch: &mut BpeScratch<'a>,
     ) -> Result<()> {
         if bytes.len() > MAX_BPE_PIECE_BYTES {
             return Err(invalid("BPE input piece exceeds byte limit"));
@@ -207,7 +263,34 @@ impl Bpe {
             }
             return Err(crate::TokenLimitExceeded.into());
         }
-        let BpeScratch { nodes, candidates } = scratch;
+        if let Some(tokens) = scratch.cached(self, bytes) {
+            if tokens.len() > max_tokens {
+                return Err(crate::TokenLimitExceeded.into());
+            }
+            output.try_reserve_exact(tokens.len())?;
+            output.extend_from_slice(tokens);
+            return Ok(());
+        }
+        let start = output.len();
+        self.encode_uncached(bytes, max_tokens, output, scratch)?;
+        scratch.retain(bytes, &output[start..]);
+        Ok(())
+    }
+
+    fn encode_uncached(
+        &self,
+        bytes: &[u8],
+        max_tokens: usize,
+        output: &mut Vec<u32>,
+        scratch: &mut BpeScratch<'_>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        {
+            scratch.uncached_pieces += 1;
+        }
+        let BpeScratch {
+            nodes, candidates, ..
+        } = scratch;
         nodes.clear();
         candidates.clear();
         nodes.try_reserve_exact(bytes.len())?;
@@ -273,7 +356,10 @@ impl Bpe {
     /// total bytes are admitted, with the same per-piece bound as
     /// [`Self::encode_piece`]. Empty pieces contribute no output.
     /// Node and candidate storage is reused across pieces, with capacity bounded
-    /// by the largest piece in this request.
+    /// by the largest piece in this request. Up to sixteen exact pieces of at
+    /// most 32 bytes reuse completed token IDs in fixed request-local storage;
+    /// collisions replace entries and larger pieces bypass the cache. The cache
+    /// adds 2,824 bytes on a 64-bit target, including its borrowed rule identity.
     ///
     /// # Errors
     /// Rejects input bounds, missing normal byte tokens, aggregate outputs above
@@ -316,3 +402,6 @@ impl Bpe {
         )))
     }
 }
+
+#[cfg(test)]
+mod piece_cache_tests;

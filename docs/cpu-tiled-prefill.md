@@ -136,6 +136,20 @@ update overflow.
 
 ## Bounds and recovery
 
+Pinned Swift's six query heads per KV head now share key/value conversion as a
+complete group during tiled prefill. Each token reads only its causal prefix
+from the already-appended tile cache; the current token keeps its original F32
+key/value arithmetic. Other geometries and source arithmetic retain their prior
+path. The six-head path removes the old two single-head tails, while the old
+four-head path also shared scans across tokens: total iterator sweeps are not
+uniformly lower and no measured prompt benefit is established.
+
+Six-head scores reserve two extra full-context rows per tile token:
+`2 * tile_tokens * context_limit * sizeof(f32)`, at most 2 MiB for 32 tokens at
+context 8192. The graph charges this even under serial execution. Complete-model
+state/logit/adapter and recovery parity, ARM64 code generation/resources and
+matched whole-prompt benefit remain required before release qualification.
+
 The additional reservation conservatively charges all tile vectors, both packed
 activation contracts, floating fallback high-water storage and small triangular
 matrices at once. The graph reports this reservation separately. It includes a

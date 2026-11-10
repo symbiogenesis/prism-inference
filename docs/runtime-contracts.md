@@ -95,7 +95,12 @@ for qualification that remains open.
 - `Decoder::evaluate_into` reuses caller-owned logits; `evaluate` remains
   available. Qwen35 retains bounded graph/kernel scratch and stages per-layer
   state deltas. Outputs are shape/finiteness checked; errors clear direct output.
-  Checkpoints own independent committed state/logits, never scratch aliases.
+  Checkpoints own committed state and share immutable complete logits, never
+  mutable scratch aliases. Capture and saved-prefix restore clone an `Arc`
+  rather than the vocabulary values. A later evaluation detaches shared output
+  without copying stale values, then reuses its unique buffer across steps.
+  Empty snapshots keep an independent empty owner so reset-only requests retain
+  reusable output capacity.
 - `Runtime::generate_sampled_until_with_timings` and
   `SwiftSession::complete_with_timings` opt into fixed-size request attribution.
   The ordinary entry points make no attribution clock reads. Separate brackets
@@ -243,6 +248,13 @@ not a bound on vector headers, allocator overhead, graph scratch or process RAM;
 Process/hardware admission remains the caller's responsibility. SwiftBonsai
 supplies its guarded development launcher; these payload bounds do not admit
 process memory.
+
+Runtime logits checkpoint charges include full retained vector capacity, its
+vector header and Arc counters for every snapshot owner, even when owners share
+the same immutable values. Shared snapshot/restore removes 993,280 logical copy
+bytes per Swift distribution; this is no process-memory or latency measurement.
+Tighter budgets can reject a rollback or retain fewer prefixes; sharing does
+not discount admission.
 
 Reset at position zero skips clearing already canonical empty live state. This
 avoids repeating the 149.625 MiB Swift recurrent/convolution zero fill during

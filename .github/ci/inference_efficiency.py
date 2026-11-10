@@ -12,6 +12,15 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "graph::prefill::six_tests::six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation",
+        "graph::attention_six::prefill_tests::six_head_prefill_tiles_match_causal_oracle_across_pages_and_workers",
+        "graph::attention_six::prefill_tests::six_head_prefill_excludes_future_nan_and_rejects_bad_prefix_before_output",
+        "runtime::logits_tests::shared_logits_capture_restore_and_unique_steps_preserve_storage_and_bits",
+        "runtime::logits_tests::shared_logits_complete_stop_and_output_caps_retain_immutable_distributions",
+        "runtime::logits_tests::shared_logits_failed_custom_outputs_delivery_and_cancellation_restore_exact_snapshot",
+        "runtime::logits_tests::shared_logits_failed_restore_keeps_committed_output_and_fault_latch",
+        "runtime::logits_tests::shared_logits_snapshot_budget_charges_full_capacity_for_every_owner",
+        "runtime::logits_tests::shared_logits_empty_snapshots_keep_reset_output_capacity_unique_and_reusable",
         "graph::attention_six::tests::six_head_decode_matches_single_head_recompute_across_pages",
         "runtime::terminal_tests::terminal_state_only_matches_tokens_state_rng_and_counts_then_recomputes",
         "runtime::terminal_tests::terminal_state_only_stop_draw_has_no_ingestion_or_output",
@@ -129,6 +138,7 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
     "hexagon_runtime": [
+        "native_q2::tests::native_q2_full_ffn_tiles_batch_pairs_and_preserve_tail_accounting",
         "native_q2::tests::native_q2_default_output_evidence_preserves_success_and_terminal_failures",
         "native_q2::tests::native_q2_unrelated_output_evidence_cannot_publish",
         "native_q2::tests::native_q2_resident_sibling_four_token_batches_preserve_order_and_tails",
@@ -144,6 +154,8 @@ CONTROLS = {
         "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
     ],
     "hexagon_native": [
+        "native_q2::tests::native_q2_two_chain_packets_preserve_single_token_descriptors_and_capacity",
+        "native_q2_forwarding_tests::owned_session_forwards_paired_chain_capability_and_one_call",
         "projection::tests::full_ffn_request_correlates_exact_counts_and_rejects_other_shapes",
         "native_q2_forwarding_tests::owned_session_forwards_full_ffn_chain_and_preserves_failure",
         "native_q2_forwarding_tests::owned_session_forwards_direct_resident_initialization_once",
@@ -192,6 +204,7 @@ WINDOWS_ARM64_NEON_CONTROLS = [
 ]
 
 WINDOWS_ARM64_NATIVE_CONTROLS = [
+    "windows::compute_native::projection_native::tests::resident_native_q2_two_ffn_chains_are_one_atomic_correlated_packet",
     "windows::compute_native::projection_native::tests::actual_session_reuses_only_correlated_results_and_never_retries_failure",
     "windows::compute_native::projection_native::tests::hmx_session_checks_all_eight_planes_and_retains_uncertain_owners",
     "windows::compute_native::projection_native::tests::resident_hmx_reuses_immutable_arena_and_never_reuses_a_faulted_owner",

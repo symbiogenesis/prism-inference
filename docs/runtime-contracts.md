@@ -206,6 +206,15 @@ logits, then streams them through the native top-k heap schedule, retaining only
 native tie ordering, probability arithmetic and seeded draw progression. Sampler
 clones copy options and RNG state without copying candidate scratch; the next
 sample visits logits in token-ID order. Reset preserves reusable capacity.
+Eligible Windows ARM64 NEON selection retains a sixteen-lane winner mask
+from each block comparison. Bounded Swift/reference heaps and greedy sampling
+visit only set lanes in increasing token-ID order, checking the updated heap
+root or maximum before replacement. Thresholds never decrease, so excluded lanes
+cannot become winners later in the same block. A nonfinite input block restores
+full scalar visitation and the original rejection/scratch/RNG behavior; tails
+and other targets keep their scalar traversal. The mask occupies one stack word
+and adds no retained storage. This source reduction establishes no measured
+whole-request benefit or new dispatch qualification.
 Request rollback may replace warmed scratch with an empty checkpoint sampler.
 Scratch is outside model/state/checkpoint payload budgets, and allocation reuse
 does not establish lower process peak memory or measured throughput.

@@ -1282,6 +1282,7 @@ pub(super) fn is_finite_slice(values: &[f32]) -> Option<bool> {
     Some(true)
 }
 
+#[cfg(test)]
 #[inline]
 pub(super) fn block16_all_finite_le(values: &[f32; 16], threshold: f32) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
@@ -1296,6 +1297,7 @@ pub(super) fn block16_all_finite_le(values: &[f32; 16], threshold: f32) -> bool 
         && !(v0.simd_gt(t) | v1.simd_gt(t) | v2.simd_gt(t) | v3.simd_gt(t)).any_true()
 }
 
+#[cfg(test)]
 #[inline]
 pub(super) fn block16_all_le(values: &[f32; 16], threshold: f32) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {

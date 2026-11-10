@@ -526,6 +526,83 @@ mod tests {
     }
 
     #[test]
+    fn lane_pruned_heap_preserves_native_ties_threshold_advances_and_tails() -> crate::Result<()> {
+        let mut bounded = Vec::new();
+        for keep in [1_usize, 2, 20, 128] {
+            for tail in 0..16 {
+                for pattern in 0..7 {
+                    let logits = (0..keep + 32 + tail)
+                        .map(|index| {
+                            let value = f32::from(u16::try_from(index)?);
+                            Ok(match pattern {
+                                0 => if index.is_multiple_of(2) { 0.0 } else { -0.0 },
+                                1 => value,
+                                2 => -value,
+                                3 => if index.is_multiple_of(16) { f32::MAX } else { f32::MIN },
+                                4 => f32::from(u8::try_from(index % 7)?),
+                                5 => f32::from_bits(u32::try_from(index % 5)?),
+                                _ => if index % 16 == 15 { value } else { -value },
+                            })
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    let backing = logits.iter().enumerate().map(|(index, &logit)| {
+                        Ok(Candidate { id: i32::try_from(index)?, logit, probability: 0.0 })
+                    }).collect::<crate::Result<Vec<_>>>()?;
+                    let mut reference = Candidates::new(backing, -1, false)?;
+                    State::new(Config::TopK(i32::try_from(keep)?))?.apply(&mut reference)?;
+                    top_k_logits(&logits, keep, &mut bounded)?;
+                    assert_eq!(bounded.len(), keep);
+                    for (actual, expected) in bounded.iter().zip(reference.data()) {
+                        assert_eq!(actual.id, expected.id);
+                        assert_eq!(actual.logit.to_bits(), expected.logit.to_bits());
+                        assert_eq!(actual.probability.to_bits(), expected.probability.to_bits());
+                    }
+                    let mut finite = Vec::new();
+                    super::top_k_finite_logits(super::FiniteLogits::new(&logits)?, keep, &mut finite)?;
+                    for (actual, expected) in finite.iter().zip(&bounded) {
+                        assert_eq!(actual.id, expected.id);
+                        assert_eq!(actual.logit.to_bits(), expected.logit.to_bits());
+                        assert_eq!(actual.probability.to_bits(), expected.probability.to_bits());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lane_pruned_heap_rejects_every_nonfinite_position_without_consuming_rng() -> crate::Result<()> {
+        let mut logits = vec![0.0_f32; SwiftSampler::VOCABULARY];
+        let mut sampler = SwiftSampler::new(4242)?;
+        let mut control = sampler.clone();
+        assert_eq!(sampler.sample(&logits)?, control.sample(&logits)?);
+        let allocation = sampler.backing.as_ptr();
+        // Initial heap, every SIMD lane after the heap, and every tail position
+        // of the private selector all retain complete-vocabulary rejection.
+        let mut small = vec![0.0_f32; SwiftSampler::TOP_K + 32 + 15];
+        for index in 0..small.len() {
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                small[index] = invalid;
+                assert!(top_k_logits(&small, SwiftSampler::TOP_K, &mut sampler.backing).is_err());
+                assert!(sampler.backing.is_empty());
+                assert_eq!(sampler.backing.as_ptr(), allocation);
+            }
+            small[index] = 0.0;
+        }
+        for lane in 0..16 {
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let index = SwiftSampler::TOP_K + lane;
+                logits[index] = invalid;
+                assert!(sampler.sample(&logits).is_err());
+                assert_eq!(sampler.backing.as_ptr(), allocation);
+                logits[index] = 0.0;
+            }
+        }
+        assert_eq!(sampler.sample(&logits)?, control.sample(&logits)?);
+        Ok(())
+    }
+
+    #[test]
     fn candidate_storage_reuses_top_k_backing_across_filters_rejection_and_reset()
     -> crate::Result<()> {
         let mut sampler = SwiftSampler::new(0)?;

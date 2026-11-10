@@ -7,6 +7,7 @@
 use crate::{Result, invalid, runtime::greedy};
 
 pub mod reasoning_budget;
+pub(crate) mod selection;
 mod swift;
 pub mod upstream;
 
@@ -321,11 +322,12 @@ fn populate_streaming_top_k(
     let tail = &logits[keep..];
     let (blocks, remainder) = tail.as_chunks::<16>();
     for (block_index, block) in blocks.iter().enumerate() {
-        if crate::kernels::block16_all_finite_le(block, candidates[0].logit) {
-            continue;
-        }
+        let mut lanes = selection::candidate_lanes::<true>(block, candidates[0].logit);
         let base = keep + block_index * 16;
-        for (offset, &logit) in block.iter().enumerate() {
+        while lanes != 0 {
+            let offset = usize::try_from(lanes.trailing_zeros())?;
+            lanes &= lanes - 1;
+            let logit = block[offset];
             if !logit.is_finite() {
                 candidates.clear();
                 return Err(invalid(

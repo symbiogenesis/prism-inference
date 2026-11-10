@@ -586,16 +586,12 @@ fn top_k_logits_inner<const VALIDATE: bool>(
     let tail = &logits[keep..];
     let (blocks, remainder) = tail.as_chunks::<16>();
     for (block_index, block) in blocks.iter().enumerate() {
-        let skip = if VALIDATE {
-            crate::kernels::block16_all_finite_le(block, backing[0].logit)
-        } else {
-            crate::kernels::block16_all_le(block, backing[0].logit)
-        };
-        if skip {
-            continue;
-        }
+        let mut lanes = super::selection::candidate_lanes::<VALIDATE>(block, backing[0].logit);
         let base = keep + block_index * 16;
-        for (offset, &logit) in block.iter().enumerate() {
+        while lanes != 0 {
+            let offset = usize::try_from(lanes.trailing_zeros())?;
+            lanes &= lanes - 1;
+            let logit = block[offset];
             if VALIDATE && !logit.is_finite() {
                 backing.clear();
                 return Err(invalid(

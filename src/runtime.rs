@@ -1243,16 +1243,12 @@ fn greedy_inner<const VALIDATE: bool>(logits: &[f32]) -> Result<usize> {
     }
     let (blocks, remainder) = logits.as_chunks::<16>();
     for (block_index, block) in blocks.iter().enumerate() {
-        let skip = if VALIDATE {
-            crate::kernels::block16_all_finite_le(block, maximum)
-        } else {
-            crate::kernels::block16_all_le(block, maximum)
-        };
-        if skip {
-            continue;
-        }
+        let mut lanes = crate::sampling::selection::candidate_lanes::<VALIDATE>(block, maximum);
         let base = block_index * 16;
-        for (offset, &value) in block.iter().enumerate() {
+        while lanes != 0 {
+            let offset = usize::try_from(lanes.trailing_zeros())?;
+            lanes &= lanes - 1;
+            let value = block[offset];
             // Validate every element even after finding an unbeatable maximum.
             // A strict comparison retains the lowest token ID for all ties,
             // including equal positive/negative zero values.

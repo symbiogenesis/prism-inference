@@ -173,6 +173,11 @@ fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error
     session.0.fail = true;
     assert!(session.submit_resident_multi8([&handle; 8], activations.each_ref().map(|row| row.as_slice()), outputs.each_mut().map(|row| row.as_mut_slice())).is_err());
     assert_eq!(session.0.calls, ["multi8", "multi8"]);
+    // A forwarding facade must preserve even the submitter's failure outputs;
+    // it must not replay a partial packet or replace its publication policy.
+    for (output, activation) in outputs.iter().zip(&activations) {
+        assert_eq!(*output, [activation[0]; 32]);
+    }
     Ok(())
 }
 
@@ -190,6 +195,10 @@ fn owned_session_preserves_fused_swiglu_calls_and_rejection() -> Result<(), Erro
     session.0.fail = true;
     assert!(session.submit_resident_ffn_swiglu(&handle, &handle, &activation, &mut output).is_err());
     assert!(output.iter().all(|value| value.is_nan()));
+    pair.fill([99.0; 32]);
+    assert!(session.submit_resident_ffn_swiglu_multi2(&handle, &handle, [&activation; 2], pair.each_mut().map(|row| row.as_mut_slice())).is_err());
+    assert_eq!(pair, [[3.0; 32]; 2]);
+    assert_eq!(session.0.calls, ["swiglu", "swiglu-multi2", "swiglu", "swiglu-multi2"]);
     // Forwarding does not manufacture support for the unfinished full-chain backend.
     assert!(session.submit_resident_ffn_chain([&handle; 3], &activation, None, None, &mut output).is_err());
     assert!(output.iter().all(|value| value.is_nan()));

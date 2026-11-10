@@ -1911,7 +1911,7 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         activation: &[f32],
         output: &'a mut [f32],
     ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
-        self.submit_resident(handle, activation, output)?;
+        NativeQ2Submitter::submit_resident(self, handle, activation, output)?;
         Ok(NativeQ2ValidatedOutputs::from_validated([output]))
     }
 

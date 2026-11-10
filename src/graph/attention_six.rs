@@ -1,4 +1,4 @@
-//! Complete six-head decode groups with no query-head tail cache rereads.
+//! Complete six-head decode and causal-prefill groups without tail cache rereads.
 
 use super::{Geometry, KvCache, attention_gate};
 use crate::kernels::pinned_attention::{self, six};
@@ -39,13 +39,65 @@ pub(super) fn attend(
     scores: &mut [f32],
     scale: f32,
 ) -> Result<()> {
+    attend_prefix(
+        geometry,
+        head,
+        queries,
+        projected,
+        keys,
+        values,
+        keys.len / keys.width,
+        current_key,
+        current_value,
+        output,
+        scores,
+        scale,
+    )
+}
+
+// Tiled prefill has appended the whole tile before attention. Restrict both
+// caches to the causal prefix; the current row retains its original F32 dot.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit causal extent keeps already-appended future KV rows unreachable."
+)]
+fn attend_prefix(
+    geometry: &Geometry,
+    head: usize,
+    queries: &[f32],
+    projected: &[f32],
+    keys: &KvCache,
+    values: &KvCache,
+    past_tokens: usize,
+    current_key: &[f32],
+    current_value: &[f32],
+    output: &mut [f32],
+    scores: &mut [f32],
+    scale: f32,
+) -> Result<()> {
     let width = geometry.head;
+    if width == 0
+        || !head.is_multiple_of(6)
+        || head + 6 > geometry.heads
+        || geometry.kv_heads == 0
+        || geometry.heads / geometry.kv_heads != 6
+        || keys.width != geometry.kv_heads * width
+        || values.width != keys.width
+        || past_tokens > keys.len / keys.width
+        || past_tokens > values.len / values.width
+        || queries.len() != geometry.heads * width
+        || projected.len() != 2 * geometry.heads * width
+        || current_key.len() != keys.width
+        || current_value.len() != values.width
+    {
+        return Err(invalid("invalid six-head attention causal geometry"));
+    }
     let offset = head / 6 * width;
     let query_rows: [&[f32]; 6] =
         std::array::from_fn(|index| &queries[(head + index) * width..(head + index + 1) * width]);
-    let score_len = keys.len / keys.width + 1;
+    let score_len = past_tokens + 1;
     let mut scores = rows(scores, score_len)?;
-    for (position, key) in keys.tokens().enumerate() {
+    for (position, key) in keys.tokens().take(past_tokens).enumerate() {
         let dots = six::dot(&key[offset..offset + width], query_rows)?;
         for (score, dot) in scores.iter_mut().zip(dots) {
             score[position] = dot * scale;
@@ -72,7 +124,7 @@ pub(super) fn attend(
         let start = tile * six::VALUE_TILE;
         let end = start + o0.len();
         six::value_tile_gated(
-            values.tokens(),
+            values.tokens().take(past_tokens),
             &current_value[offset + start..offset + end],
             scores,
             offset + start,
@@ -82,6 +134,72 @@ pub(super) fn attend(
     }
     Ok(())
 }
+
+// Each caller worker owns complete token rows and its six-head score storage.
+// Keep the cache owner immutable and reuse one six-head group at a time rather
+// than falling back to two independent tail heads in Swift's 6:1 GQA geometry.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrow the existing per-token tile rows and caller-owned score storage without staging copies."
+)]
+pub(super) fn attend_tile_chunk(
+    geometry: &Geometry,
+    first_position: usize,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    outputs: &mut [Vec<f32>],
+    scores: &mut [f32],
+    score_stride: usize,
+    scale: f32,
+) -> Result<()> {
+    let count = outputs.len();
+    if count == 0
+        || count > 32
+        || geometry.kv_heads == 0
+        || !geometry.heads.is_multiple_of(6)
+        || geometry.heads / geometry.kv_heads != 6
+        || queries.len() != count
+        || projected.len() != count
+        || current_keys.len() != count
+        || current_values.len() != count
+        || scores.len() != count * score_stride
+        || score_stride < 6 * (first_position + count)
+        || outputs
+            .iter()
+            .any(|output| output.len() != geometry.heads * geometry.head)
+    {
+        return Err(invalid("invalid six-head attention tile geometry"));
+    }
+    for (token, output) in outputs.iter_mut().enumerate() {
+        let position = first_position + token;
+        let token_scores = &mut scores[token * score_stride..(token + 1) * score_stride];
+        for head in (0..geometry.heads).step_by(6) {
+            attend_prefix(
+                geometry,
+                head,
+                &queries[token],
+                &projected[token],
+                keys,
+                values,
+                position,
+                &current_keys[token],
+                &current_values[token],
+                &mut output[head * geometry.head..(head + 6) * geometry.head],
+                &mut token_scores[..6 * (position + 1)],
+                scale,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "attention_six_prefill_tests.rs"]
+mod prefill_tests;
 
 #[cfg(test)]
 mod tests {

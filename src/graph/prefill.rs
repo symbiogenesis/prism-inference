@@ -171,8 +171,19 @@ impl Qwen35 {
             .max(self.geometry.value_width())
             .max(self.geometry.query_gate_width())
             .max(self.geometry.kv_width());
+        // Six-head prefill keeps two more score rows than the four-head
+        // path for each tile token. Charge their full-context high water even
+        // when the configured row policy later selects serial execution.
+        let six_head_scores = if matches!(self.arithmetic, Arithmetic::PinnedSwift)
+            && self.geometry.heads / self.geometry.kv_heads == 6
+        {
+            checked_product(&[tokens, self.context_limit, 2, size_of::<f32>()])?
+        } else {
+            0
+        };
         checked_product(&[tokens, width, 80])?
             .checked_add(checked_product(&[tokens, 2048])?)
+            .and_then(|bytes| bytes.checked_add(six_head_scores))
             // The four fixed 32x32 coefficient/product tables and their small
             // temporary vectors exist even for an eight-token, narrow graph.
             .and_then(|bytes| bytes.checked_add(64 * 1024))
@@ -899,7 +910,9 @@ fn full_attention_tile(
     }
     let scale = 1.0 / small_float(g.head)?.sqrt();
     let max_score_len = base + count;
-    let token_score_stride = 4 * max_score_len;
+    let six_head_groups =
+        matches!(arithmetic, Arithmetic::PinnedSwift) && g.heads / g.kv_heads == 6;
+    let token_score_stride = if six_head_groups { 6 } else { 4 } * max_score_len;
     resize_into(count * token_score_stride, &mut attention_scratch.scores)?;
     let query_ref: &[Vec<f32>] = &tile.up[..count];
     // The projected query/gate rows stay immutable through score/value work.
@@ -916,6 +929,23 @@ fn full_attention_tile(
         token_score_stride,
         |base_tok, attended_chunk, scores_chunk| {
             let chunk_tokens = attended_chunk.len();
+            if six_head_groups {
+                let end = base_tok + chunk_tokens;
+                return super::attention_six::attend_tile_chunk(
+                    g,
+                    base + base_tok,
+                    &query_ref[base_tok..end],
+                    &projected_ref[base_tok..end],
+                    key_cache,
+                    value_cache,
+                    &current_keys[base_tok..end],
+                    &current_values[base_tok..end],
+                    attended_chunk,
+                    scores_chunk,
+                    token_score_stride,
+                    scale,
+                );
+            }
             let mut head = 0;
             while head < g.heads {
                 let kv_head = head / heads_per_kv;

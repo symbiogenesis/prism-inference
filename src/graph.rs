@@ -655,26 +655,32 @@ impl Arithmetic {
         current: &[f32],
         offset: usize,
         probabilities: [&[f32]; 4],
-        outputs: [&mut [f32]; 4],
+        mut outputs: [&mut [f32]; 4],
+        gates: [&[f32]; 4],
     ) -> Result<()> {
         let last = probabilities[0].len().saturating_sub(1);
         match self {
             Self::Source => {
+                let [o0, o1, o2, o3] = &mut outputs;
                 crate::kernels::source_value_tile_four(
                     values.tokens().take(last),
                     current,
                     offset,
                     probabilities,
-                    outputs,
+                    [o0, o1, o2, o3],
                 );
+                for (output, gate) in outputs.into_iter().zip(gates) {
+                    mul_sigmoid_in_place(output, gate);
+                }
                 Ok(())
             }
-            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four(
+            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four_gated(
                 values.tokens().take(last),
                 current,
                 probabilities,
                 offset,
                 outputs,
+                gates,
             ),
         }
     }
@@ -690,24 +696,32 @@ impl Arithmetic {
         offset: usize,
         probabilities0: [&[f32]; 4],
         probabilities1: [&[f32]; 4],
-        outputs0: [&mut [f32]; 4],
-        outputs1: [&mut [f32]; 4],
+        mut outputs0: [&mut [f32]; 4],
+        mut outputs1: [&mut [f32]; 4],
+        gates: [[&[f32]; 4]; 2],
     ) -> Result<()> {
         let last1 = probabilities1[0].len().saturating_sub(1);
         match self {
             Self::Source => {
+                let [o00, o01, o02, o03] = &mut outputs0;
+                let [o10, o11, o12, o13] = &mut outputs1;
                 crate::kernels::source_value_tile_four_two_tokens(
                     values.tokens().take(last1),
                     currents,
                     offset,
                     probabilities0,
                     probabilities1,
-                    outputs0,
-                    outputs1,
+                    [o00, o01, o02, o03],
+                    [o10, o11, o12, o13],
                 );
+                for (outputs, gates) in [outputs0, outputs1].into_iter().zip(gates) {
+                    for (output, gate) in outputs.into_iter().zip(gates) {
+                        mul_sigmoid_in_place(output, gate);
+                    }
+                }
                 Ok(())
             }
-            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four_two_tokens(
+            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four_two_tokens_gated(
                 values.tokens().take(last1),
                 currents,
                 probabilities0,
@@ -715,6 +729,7 @@ impl Arithmetic {
                 offset,
                 outputs0,
                 outputs1,
+                gates,
             ),
         }
     }
@@ -3344,11 +3359,13 @@ impl Evaluation<'_, '_> {
                                     offset + dimension,
                                     probs,
                                     [out0, out1, out2, out3],
+                                    [
+                                        &g0[dimension..dimension + len],
+                                        &g1[dimension..dimension + len],
+                                        &g2[dimension..dimension + len],
+                                        &g3[dimension..dimension + len],
+                                    ],
                                 )?;
-                                mul_sigmoid_in_place(out0, &g0[dimension..dimension + len]);
-                                mul_sigmoid_in_place(out1, &g1[dimension..dimension + len]);
-                                mul_sigmoid_in_place(out2, &g2[dimension..dimension + len]);
-                                mul_sigmoid_in_place(out3, &g3[dimension..dimension + len]);
                             }
                             head_offset += 4;
                             continue;

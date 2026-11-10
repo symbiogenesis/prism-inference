@@ -27,6 +27,10 @@ mod padding_tests;
 #[path = "pinned_attention_tile_tests.rs"]
 mod tile_tests;
 
+#[cfg(test)]
+#[path = "pinned_attention_gated_tests.rs"]
+mod gated_tests;
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -138,12 +142,43 @@ fn value_tile_scalar<'a>(
 ///
 /// # Errors
 /// Rejects invalid tile/row geometry, unequal token counts and nonfinite results.
+#[cfg(test)]
 pub(crate) fn value_tile_four<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     weights: [&[f32]; 4],
     offset: usize,
     outputs: [&mut [f32]; 4],
+) -> Result<()> {
+    value_tile_four_inner(past, current, weights, offset, outputs, None)
+}
+
+/// Publishes each four-head value reduction with its original sigmoid gate.
+///
+/// Gates affect only discarded attention output, never the temporal FMA lanes,
+/// FP16 conversion, finite-result checks or committed KV state. Eligible NEON
+/// tiles gate the reduced vectors before their sole output store.
+///
+/// # Errors
+/// Rejects invalid value-tile geometry, gate widths and nonfinite reductions.
+pub(crate) fn value_tile_four_gated<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: [&[f32]; 4],
+    offset: usize,
+    outputs: [&mut [f32]; 4],
+    gates: [&[f32]; 4],
+) -> Result<()> {
+    value_tile_four_inner(past, current, weights, offset, outputs, Some(gates))
+}
+
+fn value_tile_four_inner<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: [&[f32]; 4],
+    offset: usize,
+    mut outputs: [&mut [f32]; 4],
+    gates: Option<[&[f32]; 4]>,
 ) -> Result<()> {
     let out_len = outputs[0].len();
     let weight_len = weights[0].len();
@@ -154,6 +189,7 @@ pub(crate) fn value_tile_four<'a>(
         || weight_len > crate::model::swift::CONTEXT_TOKENS
         || outputs.iter().any(|out| out.len() != out_len)
         || weights.iter().any(|w| w.len() != weight_len)
+        || gates.is_some_and(|g| g.iter().any(|gate| gate.len() != out_len))
     {
         return Err(invalid("invalid pinned attention value tile"));
     }
@@ -171,10 +207,19 @@ pub(crate) fn value_tile_four<'a>(
     if out_len.is_multiple_of(4)
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
-        return neon::value_tile_four(neon, past, current, weights, &(offset..end), outputs);
+        return neon::value_tile_four_inner(
+            neon, past, current, weights, &(offset..end), outputs, gates,
+        );
     }
 
-    value_tile_four_scalar(past, current, weights, &(offset..end), outputs)
+    let [o0, o1, o2, o3] = &mut outputs;
+    value_tile_four_scalar(past, current, weights, &(offset..end), [o0, o1, o2, o3])?;
+    if let Some(gates) = gates {
+        for (output, gate) in outputs.into_iter().zip(gates) {
+            super::mul_sigmoid_in_place(output, gate);
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -250,6 +295,7 @@ fn value_tile_four_scalar<'a>(
 /// # Errors
 /// Rejects invalid widths, mismatched lengths, short/long iterators, offset overflow,
 /// and nonfinite outputs without writing partial results.
+#[cfg(test)]
 pub(crate) fn value_tile_four_two_tokens<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     currents: [&[f32]; 2],
@@ -258,6 +304,48 @@ pub(crate) fn value_tile_four_two_tokens<'a>(
     offset: usize,
     outputs0: [&mut [f32]; 4],
     outputs1: [&mut [f32]; 4],
+) -> Result<()> {
+    value_tile_four_two_tokens_inner(
+        past, currents, weights0, weights1, offset, outputs0, outputs1, None,
+    )
+}
+
+/// Gates both tokens' four-head value tiles at their final publication store.
+///
+/// # Errors
+/// Rejects invalid value-tile geometry, gate widths and nonfinite reductions.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep two independent token/head gates aligned with their outputs."
+)]
+pub(crate) fn value_tile_four_two_tokens_gated<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    weights0: [&[f32]; 4],
+    weights1: [&[f32]; 4],
+    offset: usize,
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+    gates: [[&[f32]; 4]; 2],
+) -> Result<()> {
+    value_tile_four_two_tokens_inner(
+        past, currents, weights0, weights1, offset, outputs0, outputs1, Some(gates),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep two independent token/head gates aligned with their outputs."
+)]
+fn value_tile_four_two_tokens_inner<'a>(
+    past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    weights0: [&[f32]; 4],
+    weights1: [&[f32]; 4],
+    offset: usize,
+    mut outputs0: [&mut [f32]; 4],
+    mut outputs1: [&mut [f32]; 4],
+    gates: Option<[[&[f32]; 4]; 2]>,
 ) -> Result<()> {
     let out_len = outputs0[0].len();
     let weight_len0 = weights0[0].len();
@@ -272,6 +360,7 @@ pub(crate) fn value_tile_four_two_tokens<'a>(
         || outputs1.iter().any(|out| out.len() != out_len)
         || weights0.iter().any(|w| w.len() != weight_len0)
         || weights1.iter().any(|w| w.len() != weight_len1)
+        || gates.is_some_and(|g| g.iter().flatten().any(|gate| gate.len() != out_len))
     {
         return Err(invalid("invalid pinned attention value tile"));
     }
@@ -289,7 +378,7 @@ pub(crate) fn value_tile_four_two_tokens<'a>(
     if out_len.is_multiple_of(4)
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
-        return neon::value_tile_four_two_tokens(
+        return neon::value_tile_four_two_tokens_inner(
             neon,
             past,
             currents,
@@ -298,18 +387,29 @@ pub(crate) fn value_tile_four_two_tokens<'a>(
             &(offset..end),
             outputs0,
             outputs1,
+            gates,
         );
     }
 
+    let [o00, o01, o02, o03] = &mut outputs0;
+    let [o10, o11, o12, o13] = &mut outputs1;
     value_tile_four_two_tokens_scalar(
         past,
         currents,
         weights0,
         weights1,
         &(offset..end),
-        outputs0,
-        outputs1,
-    )
+        [o00, o01, o02, o03],
+        [o10, o11, o12, o13],
+    )?;
+    if let Some(gates) = gates {
+        for (outputs, gates) in [outputs0, outputs1].into_iter().zip(gates) {
+            for (output, gate) in outputs.into_iter().zip(gates) {
+                super::mul_sigmoid_in_place(output, gate);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[expect(

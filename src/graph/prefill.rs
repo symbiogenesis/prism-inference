@@ -1284,39 +1284,21 @@ fn full_attention_tile(
                                 probs1,
                                 [out0_0, out0_1, out0_2, out0_3],
                                 [out1_0, out1_1, out1_2, out1_3],
+                                [
+                                    [
+                                        &g0_0[dimension..dimension + len],
+                                        &g0_1[dimension..dimension + len],
+                                        &g0_2[dimension..dimension + len],
+                                        &g0_3[dimension..dimension + len],
+                                    ],
+                                    [
+                                        &g1_0[dimension..dimension + len],
+                                        &g1_1[dimension..dimension + len],
+                                        &g1_2[dimension..dimension + len],
+                                        &g1_3[dimension..dimension + len],
+                                    ],
+                                ],
                             )?;
-                            crate::kernels::mul_sigmoid_in_place(
-                                out0_0,
-                                &g0_0[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out0_1,
-                                &g0_1[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out0_2,
-                                &g0_2[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out0_3,
-                                &g0_3[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out1_0,
-                                &g1_0[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out1_1,
-                                &g1_1[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out1_2,
-                                &g1_2[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out1_3,
-                                &g1_3[dimension..dimension + len],
-                            );
                         }
                     }
                     if let Some(attended_tok) = attended_odd.first_mut() {
@@ -1372,23 +1354,13 @@ fn full_attention_tile(
                                 offset + dimension,
                                 probs,
                                 [out0, out1, out2, out3],
+                                [
+                                    &g0[dimension..dimension + len],
+                                    &g1[dimension..dimension + len],
+                                    &g2[dimension..dimension + len],
+                                    &g3[dimension..dimension + len],
+                                ],
                             )?;
-                            crate::kernels::mul_sigmoid_in_place(
-                                out0,
-                                &g0[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out1,
-                                &g1[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out2,
-                                &g2[dimension..dimension + len],
-                            );
-                            crate::kernels::mul_sigmoid_in_place(
-                                out3,
-                                &g3[dimension..dimension + len],
-                            );
                         }
                     }
                     head += 4;

@@ -167,6 +167,22 @@ state. Diagnostic counters include work later rolled back.
 
 ## Owning checks and pending acceptance
 
+Pinned full-attention four-head value tiles fuse the original sigmoid gate into
+their final NEON publication store, in both single-token decode and two-token
+tiled prefill. The reduced vectors reuse the now-dead first temporal accumulator
+lane; no additional output buffer or stack payload is reserved. Successful
+grouped tiles omit the separate attended-output reread and rewrite. Scalar,
+non-ARM and single-head tails retain their existing arithmetic paths.
+Every reduction must pass the complete finite mask before any gate is applied.
+Failed reductions publish the original ungated partial output in increasing
+token/head/channel order, so graph rollback and error behavior are preserved.
+The exponentials and separate binary32 add, divide and multiply operations match
+the original gate. Independent per-channel FMA controls cover channel tails,
+temporal padding, causal token boundaries and failed partial publication.
+These source-level store reductions establish no measured request-time benefit;
+actual-model state/logit/adapter, cancellation and matched performance acceptance
+remain required before release integration.
+
 Foundation already discovers the library unit tests and the `graph` integration
 target on its hosted platforms. Focused commands for this source are:
 

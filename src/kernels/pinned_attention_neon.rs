@@ -120,18 +120,33 @@ pub(super) fn value_tile<'a>(
 /// Each cached binary16 value row is read and converted to binary32 once for all
 /// four query heads, while retaining each head's independent sixteen-lane FMA
 /// accumulator and reduction tree.
+#[cfg(test)]
+pub(super) fn value_tile_four<'a>(
+    neon: Neon,
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: [&[f32]; 4],
+    range: &std::ops::Range<usize>,
+    outputs: [&mut [f32]; 4],
+) -> Result<()> {
+    value_tile_four_inner(neon, past, current, weights, range, outputs, None)
+}
+
+/// Reduces the tile and optionally applies its original gate before publication.
 #[expect(
     clippy::large_stack_arrays,
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "Keep explicit 4-head and token indices aligned across the 32 KiB stack accumulator."
+    reason = "Keep optional gates aligned with the fixed four-head accumulators."
 )]
-pub(super) fn value_tile_four<'a>(
+pub(super) fn value_tile_four_inner<'a>(
     neon: Neon,
     mut past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     weights: [&[f32]; 4],
     range: &std::ops::Range<usize>,
     outputs: [&mut [f32]; 4],
+    gates: Option<[&[f32]; 4]>,
 ) -> Result<()> {
     let zero = f32x4::splat(neon, 0.0);
     let mut sums = [[[zero; VALUE_TILE_FOUR / 4]; 16]; 4];
@@ -230,16 +245,15 @@ pub(super) fn value_tile_four<'a>(
             }
         }
     }
+    // Reuse the now-dead first temporal lane as compact result staging. Gate
+    // only after every reduction succeeds. On failure, ungated publication
+    // below reproduces the original increasing-head/channel partial writes.
+    let reductions_finite = reduce_four_heads(&mut sums, groups);
+    let gates = gates.filter(|_| reductions_finite);
     for (h, output) in outputs.into_iter().enumerate() {
         for (group, out) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
-                (sums[h][lane][group] + sums[h][8 + lane][group])
-                    + (sums[h][4 + lane][group] + sums[h][12 + lane][group])
-            });
-            let result = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])).to_array();
-            for (out, value) in out.iter_mut().zip(result) {
-                *out = super::super::finite(value)?;
-            }
+            let result = sums[h][0][group];
+            publish_reduced(neon, result, gates.map(|g| &g[h][group * 4..group * 4 + 4]), out)?;
         }
     }
     Ok(())
@@ -252,10 +266,30 @@ pub(super) fn value_tile_four<'a>(
 /// accumulators while preserving each head's independent sixteen-lane FMA tree.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "Keep explicit 2-token x 4-head indices aligned across fixed arrays."
+    reason = "Keep independent token/head output parameters aligned."
 )]
+#[cfg(test)]
 pub(super) fn value_tile_four_two_tokens<'a>(
+    neon: Neon,
+    past: impl Iterator<Item = &'a [u16]>,
+    currents: [&[f32]; 2],
+    weights0: [&[f32]; 4],
+    weights1: [&[f32]; 4],
+    range: &std::ops::Range<usize>,
+    outputs0: [&mut [f32]; 4],
+    outputs1: [&mut [f32]; 4],
+) -> Result<()> {
+    value_tile_four_two_tokens_inner(
+        neon, past, currents, weights0, weights1, range, outputs0, outputs1, None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep two independent token/head gates aligned with fixed accumulators."
+)]
+pub(super) fn value_tile_four_two_tokens_inner<'a>(
     neon: Neon,
     mut past: impl Iterator<Item = &'a [u16]>,
     currents: [&[f32]; 2],
@@ -264,6 +298,7 @@ pub(super) fn value_tile_four_two_tokens<'a>(
     range: &std::ops::Range<usize>,
     outputs0: [&mut [f32]; 4],
     outputs1: [&mut [f32]; 4],
+    gates: Option<[[&[f32]; 4]; 2]>,
 ) -> Result<()> {
     let zero = f32x4::splat(neon, 0.0);
     let mut sums0 = [[[zero; VALUE_TILE_FOUR_TWO_TOKENS / 4]; 16]; 4];
@@ -422,18 +457,66 @@ pub(super) fn value_tile_four_two_tokens<'a>(
             }
         }
     }
-    for (outputs, sums) in [(outputs0, &sums0), (outputs1, &sums1)] {
+    let reductions0_finite = reduce_four_heads(&mut sums0, groups);
+    let reductions1_finite = reduce_four_heads(&mut sums1, groups);
+    let gates = gates.filter(|_| reductions0_finite && reductions1_finite);
+    for (token, (outputs, sums)) in [(outputs0, &sums0), (outputs1, &sums1)].into_iter().enumerate() {
         for (h, output) in outputs.into_iter().enumerate() {
             for (group, out) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
-                    (sums[h][lane][group] + sums[h][8 + lane][group])
-                        + (sums[h][4 + lane][group] + sums[h][12 + lane][group])
-                });
-                let result = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])).to_array();
-                for (out, value) in out.iter_mut().zip(result) {
-                    *out = super::super::finite(value)?;
-                }
+                let result = sums[h][0][group];
+                publish_reduced(
+                    neon,
+                    result,
+                    gates.map(|g| &g[token][h][group * 4..group * 4 + 4]),
+                    out,
+                )?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reuse dead accumulator storage instead of adding another output buffer.
+#[inline]
+#[expect(
+    clippy::needless_range_loop,
+    reason = "Each group reduces sixteen temporal lanes into its dead first lane."
+)]
+fn reduce_four_heads<const GROUPS: usize>(
+    sums: &mut [[[f32x4<Neon>; GROUPS]; 16]; 4],
+    groups: usize,
+) -> bool {
+    let mut finite = sums[0][0][0].is_finite();
+    for head in sums {
+        for group in 0..groups {
+            let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
+                (head[lane][group] + head[8 + lane][group])
+                    + (head[4 + lane][group] + head[12 + lane][group])
+            });
+            let result = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            finite &= result.is_finite();
+            head[0][group] = result;
+        }
+    }
+    finite.all_true()
+}
+
+/// Keep the pinned scalar exponentials and separate add/divide/multiply order.
+/// The ungated API retains its increasing-channel partial-publication contract.
+#[inline]
+fn publish_reduced(
+    neon: Neon,
+    result: f32x4<Neon>,
+    gate: Option<&[f32]>,
+    output: &mut [f32],
+) -> Result<()> {
+    if let Some(gate) = gate {
+        let exponentials = f32x4::load_array(neon, std::array::from_fn(|i| (-gate[i]).exp()));
+        let one = f32x4::splat(neon, 1.0);
+        (result * (one / (one + exponentials))).store_slice(output);
+    } else {
+        for (out, value) in output.iter_mut().zip(result.to_array()) {
+            *out = super::super::finite(value)?;
         }
     }
     Ok(())

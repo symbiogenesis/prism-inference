@@ -17,6 +17,8 @@ use crate::{Result, invalid};
 /// The fixed top-p configuration is validated once at construction. Native
 /// min-p zero and temperature one retain their exact identity semantics without
 /// constructing temporary sampler states for each generated token.
+/// Top-p's unnormalized binary32 exponentials are retained in 20 stack values
+/// for the following distribution, preserving its independent binary64 sum.
 /// Cloning independently copies the RNG without copying candidate scratch, so
 /// [`crate::runtime::Runtime`] can roll it back on any request error.
 pub struct SwiftSampler {
@@ -109,13 +111,22 @@ impl SwiftSampler {
 
 impl SwiftSampler {
     fn sample_candidates(&mut self, candidates: &mut Candidates) -> Result<u32> {
-        // This fixed filter has neither history nor RNG. Validate it once at
-        // construction instead of allocating configuration scratch per token.
-        self.top_p.apply(candidates)?;
+        if candidates.sorted() && candidates.data().len() <= Self::TOP_K {
+            let mut weights = [0.0_f32; Self::TOP_K];
+            self.distribution.apply_sorted_top_p_distribution(
+                &self.top_p,
+                candidates,
+                &mut weights,
+            )?;
+        } else {
+            // Keep the original independent stages for private unsorted inputs.
+            // Ordinary Swift selection always supplies the bounded sorted heap.
+            self.top_p.apply(candidates)?;
+            self.distribution.apply(candidates)?;
+        }
         // Native MinP(0) returns without mutation, and division by temperature
         // one preserves every finite logit bit (including signed zero). They
         // consume no draws and change no candidate metadata or probability.
-        self.distribution.apply(candidates)?;
         let selected = usize::try_from(candidates.selected())?;
         let token = candidates
             .data()
@@ -150,6 +161,111 @@ mod tests {
         distribution.apply(candidates)?;
         let selected = usize::try_from(candidates.selected())?;
         Ok(u32::try_from(candidates.data()[selected].id)?)
+    }
+
+    fn assert_candidate_bits(actual: &Candidates, expected: &Candidates) {
+        assert_eq!(actual.selected(), expected.selected());
+        assert_eq!(actual.sorted(), expected.sorted());
+        assert_eq!(actual.offset(), expected.offset());
+        assert_eq!(actual.data().len(), expected.data().len());
+        let actual = actual.clone().into_backing();
+        let expected = expected.clone().into_backing();
+        assert_eq!(actual.len(), expected.len());
+        for (observed, original) in actual.iter().zip(expected) {
+            assert_eq!(observed.id, original.id);
+            assert_eq!(observed.logit.to_bits(), original.logit.to_bits());
+            assert_eq!(observed.probability.to_bits(), original.probability.to_bits());
+        }
+    }
+
+    #[test]
+    fn cached_top_p_exponents_preserve_original_backing_bits_draws_and_reset() -> crate::Result<()> {
+        for width in [1_usize, 2, 19, 20] {
+            let mut sampler = SwiftSampler::new(4242)?;
+            let mut reference = State::new(Config::Distribution(4242))?;
+            for round in 0_usize..64 {
+                if round == 32 {
+                    sampler.reset();
+                    reference.reset();
+                }
+                let input = (0..width)
+                    .map(|index| {
+                        let value = f32::from(u16::try_from(index)?);
+                        Ok(Candidate {
+                            id: i32::try_from(index)?,
+                            logit: match round % 10 {
+                                0 => 0.0,
+                                1 => if index.is_multiple_of(2) { -0.0 } else { 0.0 },
+                                2 => -value,
+                                3 => -value * 5.0,
+                                4 => f32::MIN,
+                                5 => f32::MAX,
+                                6 => if index == 0 { f32::MAX } else { f32::MIN },
+                                7 => -value * 1000.0,
+                                8 => -value * f32::EPSILON,
+                                _ => -value * f32::from_bits(1),
+                            },
+                            probability: -0.0,
+                        })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                let mut original = Candidates::new(input, -1, true)?;
+                let mut actual = original.clone();
+                let mut independent = sampler.clone();
+                let mut cloned_candidates = original.clone();
+                let token = original_fixed_chain(&mut reference, &mut original)?;
+                assert_eq!(sampler.sample_candidates(&mut actual)?, token);
+                assert_eq!(independent.sample_candidates(&mut cloned_candidates)?, token);
+                assert_candidate_bits(&actual, &original);
+                assert_candidate_bits(&cloned_candidates, &original);
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_cached_rejected(
+        distribution: &mut State,
+        filter: &State,
+        original: &Candidates,
+        weights: &mut [f32],
+    ) {
+        let mut actual = original.clone();
+        assert!(distribution.apply_sorted_top_p_distribution(filter, &mut actual, weights).is_err());
+        assert_candidate_bits(&actual, original);
+    }
+
+    #[test]
+    fn cached_top_p_guards_preserve_candidates_and_rng_with_unsorted_fallback() -> crate::Result<()> {
+        let filter = State::new(Config::TopP {
+            probability: 0.95,
+            min_keep: 1,
+        })?;
+        let mut sampler = SwiftSampler::new(4242)?;
+        let mut reference = State::new(Config::Distribution(4242))?;
+        let backing = (0..20)
+            .map(|id| Candidate { id, logit: 0.0, probability: -0.0 })
+            .collect::<Vec<_>>();
+        let original = Candidates::new(backing, -1, true)?;
+        for capacity in [0, 19] {
+            let mut weights = vec![0.0_f32; capacity];
+            assert_cached_rejected(&mut sampler.distribution, &filter, &original, &mut weights);
+        }
+        for invalid in [Config::Temperature(1.0), Config::TopP { probability: 1.0, min_keep: 1 }] {
+            assert_cached_rejected(&mut sampler.distribution, &State::new(invalid)?, &original, &mut [0.0_f32; 20]);
+        }
+        let mut wrong_distribution = State::new(Config::TopK(20))?;
+        assert_cached_rejected(&mut wrong_distribution, &filter, &original, &mut [0.0_f32; 20]);
+        let mut candidates = original.clone();
+        let mut expected = original.clone();
+        assert_eq!(sampler.sample_candidates(&mut candidates)?, original_fixed_chain(&mut reference, &mut expected)?);
+        assert_candidate_bits(&candidates, &expected);
+        let mut unsorted = Candidates::new(original.into_backing(), -1, false)?;
+        let before = unsorted.clone();
+        assert_cached_rejected(&mut sampler.distribution, &filter, &unsorted, &mut [0.0_f32; 20]);
+        let mut expected = before;
+        assert_eq!(sampler.sample_candidates(&mut unsorted)?, original_fixed_chain(&mut reference, &mut expected)?);
+        assert_candidate_bits(&unsorted, &expected);
+        Ok(())
     }
 
     #[test]

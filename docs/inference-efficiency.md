@@ -69,6 +69,24 @@ bits, ties, signed zero, subnormals, extremes, RNG draws, cloning, reset and
 full-vocabulary rejection. This is a source allocation/work reduction; it does
 not establish lower process RAM, request latency or reduced admission.
 
+The fixed Swift top-p/distribution pair now retains its 20 binary32
+unnormalized softmax weights in an 80-byte stack array. Both stages use the
+same sorted maximum and separately rounded subtraction/exponential, so the
+distribution can reuse those values after top-p truncation. Top-p still divides
+every original candidate by its binary32 sum; the distribution independently
+sums retained raw weights in binary64, consumes its original draw and performs
+its original division/rounding. Candidates outside the retained view preserve
+their original top-p probability bits. The generic sampler stages and private
+unsorted fallback remain independent. This omits one exponential per retained
+candidate when there are at least two, at most 20 per generated token; the
+singleton distribution still consumes one draw and stores probability one.
+Independent original-chain controls cover all backing bits, singleton and
+truncated views, ties, signed zero, subnormals, extremes, underflow, clone/reset
+and RNG progression. Existing full-vocabulary rejection and transactional
+cancelled/abandoned-stream controls remain required. This is a source work
+reduction; actual stack frames, model parity and matched complete-request
+benefit remain pending without a latency, RAM or admission claim.
+
 Full-attention decode and tiled prefill also read immutable gate heads from
 their original interleaved projection output. The separate gate copy is
 omitted while query normalization, sigmoid and attention arithmetic keep their

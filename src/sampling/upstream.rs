@@ -302,6 +302,89 @@ pub struct State {
 }
 
 impl State {
+    // The fixed Swift chain supplies an already sorted, finite top-20 view.
+    // TopP and Distribution use the same maximum and binary32 exponential;
+    // retain those unnormalized weights before TopP divides by its f32 sum.
+    // Distribution must still sum the retained values in f64, draw once even
+    // for a singleton, and normalize in its original order. Generic apply and
+    // unsorted candidates keep the independent, uncached implementation below.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "Preserve the native distribution's f64 division and final f32 rounding."
+    )]
+    pub(super) fn apply_sorted_top_p_distribution(
+        &mut self,
+        filter: &Self,
+        candidates: &mut Candidates,
+        weights: &mut [f32],
+    ) -> Result<()> {
+        let Config::TopP {
+            probability,
+            min_keep,
+        } = filter.config
+        else {
+            return Err(invalid("cached distribution requires a top-p filter"));
+        };
+        if !matches!(self.config, Config::Distribution(_))
+            || !candidates.sorted
+            || candidates.size == 0
+            || candidates.size > weights.len()
+            || probability >= 1.0
+        {
+            return Err(invalid("cached distribution requires bounded sorted top-p candidates"));
+        }
+        let random = self
+            .random
+            .as_mut()
+            .ok_or_else(|| invalid("missing sampler random state"))?;
+        let maximum = candidates.data()[0].logit;
+        let mut sum = 0.0_f32;
+        for (entry, weight) in candidates.data_mut().iter_mut().zip(weights.iter_mut()) {
+            *weight = (entry.logit - maximum).exp();
+            entry.probability = *weight;
+            sum += *weight;
+        }
+        for entry in candidates.data_mut() {
+            entry.probability /= sum;
+        }
+        let mut cumulative = 0.0_f32;
+        let mut size = candidates.size;
+        for (index, entry) in candidates.data().iter().enumerate() {
+            cumulative += entry.probability;
+            if cumulative >= probability && index + 1 >= min_keep {
+                size = index + 1;
+                break;
+            }
+        }
+        candidates.size = size;
+        candidates.selected = 0;
+        let draw = random.double();
+        if candidates.size == 1 {
+            candidates.data_mut()[0].probability = 1.0;
+            return Ok(());
+        }
+        let weights = &weights[..candidates.size];
+        let mut sum = 0.0_f64;
+        for &weight in weights {
+            sum += f64::from(weight);
+        }
+        let target = sum * draw;
+        let mut cumulative = 0.0_f64;
+        let mut selected = None;
+        for (index, (entry, &weight)) in candidates.data_mut().iter_mut().zip(weights).enumerate() {
+            if selected.is_none() {
+                cumulative += f64::from(weight);
+                if cumulative >= target {
+                    selected = Some(index);
+                }
+            }
+            entry.probability = (f64::from(weight) / sum) as f32;
+        }
+        candidates.selected = i64::try_from(selected.unwrap_or(candidates.size - 1))?;
+        Ok(())
+    }
+
     /// Validates configuration and initializes independent random/history state.
     ///
     /// # Errors

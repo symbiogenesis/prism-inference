@@ -1232,14 +1232,14 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         }
         let mut chunk_output = zeroed(max_mapped_rows, f32::NAN)?;
         for output in outputs.iter_mut() {
-            if output.len() != rows {
+            if output.len() == rows {
+                output.fill(0.0);
+            } else {
                 output.clear();
                 output
                     .try_reserve(rows)
                     .map_err(|_| invalid("native Q2 output allocation failed"))?;
                 output.resize(rows, 0.0);
-            } else {
-                output.fill(0.0);
             }
         }
         let mut operation = 0;

@@ -174,8 +174,10 @@ lane; no additional output buffer or stack payload is reserved. Successful
 grouped tiles omit the separate attended-output reread and rewrite. Scalar,
 non-ARM and single-head tails retain their existing arithmetic paths.
 Every reduction must pass the complete finite mask before any gate is applied.
-Failed reductions publish the original ungated partial output in increasing
-token/head/channel order, so graph rollback and error behavior are preserved.
+On eligible NEON tiles, failed reductions publish the original ungated partial
+output in increasing token/head/channel order. Scalar fallback retains atomic
+staging and leaves all destinations untouched on reduction failure. Graph
+rollback and each dispatch path's original error behavior are preserved.
 The exponentials and separate binary32 add, divide and multiply operations match
 the original gate. Independent per-channel FMA controls cover channel tails,
 temporal padding, causal token boundaries and failed partial publication.

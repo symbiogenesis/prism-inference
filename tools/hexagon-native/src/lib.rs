@@ -964,6 +964,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 )
             }
 
+            fn maximum_resident_token_batch(&self) -> usize {
+                $dispatch!(self, maximum_resident_token_batch())
+            }
+
             fn supports_ffn_chain_multi2(&self) -> bool {
                 $dispatch!(self, supports_ffn_chain_multi2())
             }

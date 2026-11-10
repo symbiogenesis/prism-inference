@@ -10,6 +10,8 @@ struct TileSubmitter {
     resident_calls: usize,
     fail_at: Option<usize>,
     failure: u8,
+    batch_limit: usize,
+    packets: Vec<usize>,
 }
 
 impl TileSubmitter {
@@ -63,9 +65,62 @@ impl TileSubmitter {
         }
         Ok(())
     }
+
+    fn batch<const B: usize>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; B],
+        activations: [&[f32]; B],
+        outputs: [&mut [f32]; B],
+    ) -> std::result::Result<(), NativeError> {
+        self.packets.push(B);
+        for ((handle, activation), output) in handles.into_iter().zip(activations).zip(outputs) {
+            self.submit_resident(handle, activation, output)?;
+        }
+        Ok(())
+    }
 }
 
 impl NativeQ2Submitter for TileSubmitter {
+    fn maximum_resident_token_batch(&self) -> usize {
+        self.batch_limit
+    }
+
+    fn submit_resident_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activations: [&[f32]; 2],
+        outputs: [&mut [f32]; 2],
+    ) -> std::result::Result<(), NativeError> {
+        self.batch(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi3(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 3],
+        outputs: [&mut [f32]; 3],
+    ) -> std::result::Result<(), NativeError> {
+        self.batch(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi4(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 4],
+        activations: [&[f32]; 4],
+        outputs: [&mut [f32]; 4],
+    ) -> std::result::Result<(), NativeError> {
+        self.batch(handles, activations, outputs)
+    }
+
+    fn submit_resident_multi8(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 8],
+        activations: [&[f32]; 8],
+        outputs: [&mut [f32]; 8],
+    ) -> std::result::Result<(), NativeError> {
+        self.batch(handles, activations, outputs)
+    }
+
     fn residency_capacity_bytes(&self) -> usize {
         self.registry.remaining_bytes()
     }
@@ -144,6 +199,8 @@ fn executor(
         resident_calls: 0,
         fail_at: None,
         failure: 0,
+        batch_limit: 1,
+        packets: Vec::new(),
     };
     let limits = NativeQ2ProjectionLimits::new(max_columns, 32, 10_000, Duration::from_secs(10))?;
     let payload = tensor.dimensions[1] * 4 + 32 * 36 * (max_columns / 128) + 32 * 4 + metadata;
@@ -382,6 +439,107 @@ fn native_q2_multitile_tokens_reject_invalid_input_before_submission() -> Result
             assert_eq!(executor.residency_statistics().tensors_prepared, 0);
             assert!(executor.submitter.activations.is_empty());
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_q2_resident_multitile_batches_match_original_tiles_and_queue_counts() -> Result<()> {
+    let tensor = tensor(49);
+    for batch_limit in [1, 4, 8] {
+        for tokens in [2, 3, 5, 7, 8, 9, 16, 32] {
+            let mut executor = executor(&tensor, 256, true)?;
+            executor.submitter.batch_limit = batch_limit;
+            let activations = activations(tokens);
+            let mut outputs = vec![vec![91.0; 49]; tokens];
+            let addresses: Vec<_> = outputs.iter().map(Vec::as_ptr).collect();
+            executor.project_f32_tokens(&tensor, &activations, true, &mut outputs)?;
+            for (token, (activation, output)) in activations.iter().zip(&outputs).enumerate() {
+                assert_eq!(output.as_ptr(), addresses[token]);
+                assert_eq!(
+                    output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    oracle(&tensor, activation, 256)
+                        .iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            // Independent packet-count oracle: 8-op groups, then a <=4 tail.
+            let groups = if batch_limit == 8 {
+                tokens / 8 + (tokens % 8).div_ceil(4)
+            } else {
+                tokens.div_ceil(batch_limit)
+            };
+            assert_eq!(executor.queue_writes_completed(), u64::try_from(4 * groups)?);
+            assert_eq!(executor.queue_writes_attempted(), u64::try_from(4 * groups)?);
+            assert_eq!(executor.statistics().operations_completed, u64::try_from(4 * tokens)?);
+            assert_eq!(executor.statistics().projections_completed, u64::try_from(tokens)?);
+            assert_eq!(executor.submitter.resident_calls, 4 * tokens);
+            assert_eq!(executor.submitter.packets.len(), if batch_limit == 1 { 0 } else {
+                4 * groups - 4 * usize::from(tokens % 4 == 1)
+            });
+            for (tile, actual) in executor.submitter.activations.chunks_exact(tokens).enumerate() {
+                let start = (tile % 2) * 256;
+                let end = (start + 256).min(384);
+                for (row, original) in actual.iter().zip(&activations) {
+                    assert_eq!(row, &original[start..end]);
+                }
+            }
+            let used = executor.submitter.registry.used_bytes();
+            executor.project_f32_tokens(&tensor, &activations, true, &mut outputs)?;
+            assert_eq!(executor.submitter.registry.used_bytes(), used);
+            assert_eq!(executor.residency_statistics().cache_hits, u64::try_from(2 * tokens - 1)?);
+            assert_eq!(executor.queue_writes_completed(), u64::try_from(8 * groups)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_q2_resident_multitile_batch_failures_publish_nothing_and_never_replay() -> Result<()> {
+    let tensor = tensor(49);
+    let activations = activations(9);
+    // Four weight tiles, each dispatched as 8 + 1. Probe failures within the
+    // first and final packets, including the final partially padded row tile.
+    for (failure, fail_at) in [(0, 3), (0, 30), (1, 3), (1, 30), (2, 30), (2, 36)] {
+        let mut executor = executor(&tensor, 256, true)?;
+        executor.submitter.batch_limit = 8;
+        executor.submitter.failure = failure;
+        executor.submitter.fail_at = Some(fail_at);
+        let mut outputs = vec![vec![91.0; 49]; 9];
+        assert!(executor.project_f32_tokens(&tensor, &activations, true, &mut outputs).is_err());
+        assert!(outputs.iter().all(Vec::is_empty));
+        assert!(executor.is_faulted());
+        let completed_packets = if fail_at <= 8 { 0 } else if fail_at <= 35 { 6 } else { 7 };
+        assert_eq!(executor.queue_writes_attempted(), completed_packets + 1);
+        assert_eq!(executor.queue_writes_completed(), completed_packets);
+        assert_eq!(executor.statistics().operations_attempted, if fail_at <= 8 { 8 } else if fail_at <= 35 { 35 } else { 36 });
+        assert_eq!(executor.statistics().operations_completed, if fail_at <= 8 { 0 } else if fail_at <= 35 { 27 } else { 35 });
+        let calls = executor.submitter.activations.len();
+        assert!(executor.project_f32_tokens(&tensor, &activations, true, &mut outputs).is_err());
+        assert_eq!(executor.submitter.activations.len(), calls);
+    }
+    Ok(())
+}
+
+
+#[test]
+fn native_q2_resident_multitile_normalizes_capabilities_and_small_groups() -> Result<()> {
+    let tensor = tensor(49);
+    let activations = activations(3);
+    for (batch_limit, groups) in [(0, 3), (2, 2), (3, 1), (5, 3), (7, 3), (9, 3)] {
+        let mut executor = executor(&tensor, 256, true)?;
+        executor.submitter.batch_limit = batch_limit;
+        let mut outputs = vec![Vec::new(); 3];
+        executor.project_f32_tokens(&tensor, &activations, true, &mut outputs)?;
+        for (output, activation) in outputs.iter().zip(&activations) {
+            assert_eq!(
+                output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                oracle(&tensor, activation, 256)
+                    .iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(executor.queue_writes_completed(), 4 * groups);
+        assert_eq!(executor.statistics().operations_completed, 12);
+        assert_eq!(executor.statistics().projections_completed, 3);
     }
     Ok(())
 }

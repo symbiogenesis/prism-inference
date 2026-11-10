@@ -577,6 +577,15 @@ pub trait NativeQ2Submitter {
         NativeQ2ValidatedOutputs::validate([out0, out1, out2])
     }
 
+    /// Largest resident token group executed in exactly one queue write.
+    ///
+    /// Return 1, 2, 3, 4 or 8. Each supported group size (2, 3, 4, 8) at or
+    /// below that limit must have a real single-packet implementation. Other values select
+    /// the conservative scalar path, as does the default for arbitrary submitters.
+    fn maximum_resident_token_batch(&self) -> usize {
+        1
+    }
+
     /// Submit two resident `HTP_TYPE_Q2_0` projections with per-operation `F32`
     /// activation vectors in a single 2-op DSP queue submission.
     ///
@@ -787,6 +796,10 @@ pub trait NativeQ2Submitter {
 }
 
 impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
+    fn maximum_resident_token_batch(&self) -> usize {
+        (**self).maximum_resident_token_batch()
+    }
+
     fn remaining_operations(&self) -> Option<u64> {
         (**self).remaining_operations()
     }

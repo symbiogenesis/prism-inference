@@ -304,6 +304,51 @@ impl ResidentCache {
     }
 }
 
+// Split one bounded owned scratch allocation into disjoint native destinations.
+fn token_outputs<const B: usize>(scratch: &mut [f32], rows: usize) -> [&mut [f32]; B] {
+    let mut tail = scratch;
+    std::array::from_fn(|_| {
+        let (output, rest) = std::mem::take(&mut tail).split_at_mut(rows);
+        tail = rest;
+        output
+    })
+}
+
+fn submit_resident_token_tile<S: NativeQ2Submitter>(
+    submitter: &mut S,
+    handle: &NativeQ2WeightHandle,
+    activations: &[Vec<f32>],
+    columns: std::ops::Range<usize>,
+    scratch: &mut [f32],
+    rows: usize,
+) -> Result<()> {
+    match activations.len() {
+        8 => submitter.submit_resident_multi8(
+            [handle; 8],
+            std::array::from_fn(|token| &activations[token][columns.clone()]),
+            token_outputs::<8>(scratch, rows),
+        )?,
+        4 => submitter.submit_resident_multi4(
+            [handle; 4],
+            std::array::from_fn(|token| &activations[token][columns.clone()]),
+            token_outputs::<4>(scratch, rows),
+        )?,
+        3 => submitter.submit_resident_multi3(
+            [handle; 3],
+            std::array::from_fn(|token| &activations[token][columns.clone()]),
+            token_outputs::<3>(scratch, rows),
+        )?,
+        2 => submitter.submit_resident_multi2(
+            [handle; 2],
+            std::array::from_fn(|token| &activations[token][columns.clone()]),
+            token_outputs::<2>(scratch, rows),
+        )?,
+        1 => submitter.submit_resident(handle, &activations[0][columns], scratch)?,
+        _ => return Err(invalid("invalid native Q2 resident token batch")),
+    }
+    Ok(())
+}
+
 /// Full-`K` 1-op native `HTP_TYPE_Q2_0` executor using `libggml-htp-v81.so`'s
 /// signed 8-thread HVX `q2_0 x q8_1` (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`) kernel.
 ///
@@ -1230,7 +1275,20 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 max_mapped_rows * 36 * (columns.min(self.maximum_columns) / 128),
             )?;
         }
-        let mut chunk_output = zeroed(max_mapped_rows, f32::NAN)?;
+        // Resident tiles need no packing buffer after preparation. Eight
+        // padded outputs cost 32 bytes/row, within the existing reservation
+        // of at least 36 packed-weight bytes plus four output bytes per row.
+        // Keep that full conservative reservation; do not lower admission.
+        let batch_limit = if resident.is_some() {
+            self.scratch_weights = Vec::new();
+            weights = Vec::new();
+            let limit = self.submitter.maximum_resident_token_batch();
+            if matches!(limit, 2..=4 | 8) { limit } else { 1 }
+        } else {
+            1
+        };
+        let scratch_tokens = batch_limit.min(activations.len());
+        let mut chunk_output = zeroed(max_mapped_rows * scratch_tokens, f32::NAN)?;
         for output in outputs.iter_mut() {
             if output.len() == rows {
                 output.fill(0.0);
@@ -1264,15 +1322,23 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                         self.row_parallelism.as_ref(),
                     )?;
                 }
-                // Independent tokens share this immutable packed tile. Each
-                // token still consumes row/column tiles in the scalar order.
-                // The single output scratch stays within the existing charge.
-                for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
-                    let act_slice = &activation[col_start..col_start + active_cols];
-                    let out_slice = &mut chunk_output[..mapped_rows];
+                // Each token retains its original tile and addition order;
+                // a resident packet shares one response across bounded tokens.
+                let mut token = 0;
+                while token < activations.len() {
+                    let remaining = activations.len() - token;
+                    let batch = if remaining >= 8 && batch_limit == 8 {
+                        8
+                    } else {
+                        remaining.min(batch_limit.min(4))
+                    };
+                    let out_slice = &mut chunk_output[..batch * mapped_rows];
                     out_slice.fill(f32::NAN);
-                    self.statistics.operations_attempted =
-                        self.statistics.operations_attempted.saturating_add(1);
+                    let batch_u64 = u64::try_from(batch)?;
+                    self.statistics.operations_attempted = self
+                        .statistics
+                        .operations_attempted
+                        .saturating_add(batch_u64);
                     self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
                     if let Some(index) = resident {
                         let cache = self
@@ -1281,28 +1347,47 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                             .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
                         let handle =
                             &cache.handles[cache.projections[index].first_handle + operation];
-                        self.submitter
-                            .submit_resident(handle, act_slice, out_slice)?;
+                        submit_resident_token_tile(
+                            &mut self.submitter,
+                            handle,
+                            &activations[token..token + batch],
+                            col_start..col_start + active_cols,
+                            out_slice,
+                            mapped_rows,
+                        )?;
                     } else {
                         self.submitter.submit(
                             active_cols,
                             mapped_rows,
                             &weights[..packed_bytes],
-                            act_slice,
+                            &activations[token][col_start..col_start + active_cols],
                             out_slice,
                         )?;
                     }
-                    accumulate_tile_output(
-                        &mut output[row_start..row_start + active_rows],
-                        out_slice,
-                    )?;
-                    self.statistics.operations_completed =
-                        self.statistics.operations_completed.saturating_add(1);
+                    // Validate and accumulate every member, including padding,
+                    // before successful packet counters. The complete call's
+                    // outputs remain provisional until the outer publication.
+                    for (output, partial) in outputs[token..token + batch]
+                        .iter_mut()
+                        .zip(out_slice.chunks_exact(mapped_rows))
+                    {
+                        accumulate_tile_output(
+                            &mut output[row_start..row_start + active_rows],
+                            partial,
+                        )?;
+                    }
+                    self.statistics.operations_completed = self
+                        .statistics
+                        .operations_completed
+                        .saturating_add(batch_u64);
                     self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
                     if row_start + active_rows == rows && col_start + active_cols == columns {
-                        self.statistics.projections_completed =
-                            self.statistics.projections_completed.saturating_add(1);
+                        self.statistics.projections_completed = self
+                            .statistics
+                            .projections_completed
+                            .saturating_add(batch_u64);
                     }
+                    token += batch;
                 }
                 operation += 1;
             }

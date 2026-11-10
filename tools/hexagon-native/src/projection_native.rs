@@ -2349,6 +2349,14 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         Ok(NativeQ2ValidatedOutputs::from_validated([out0, out1, out2]))
     }
 
+    fn maximum_resident_token_batch(&self) -> usize {
+        if !self.failed && self.mode.is_native_q2() {
+            8
+        } else {
+            1
+        }
+    }
+
     fn submit_resident_multi2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 2],
@@ -2804,6 +2812,10 @@ impl NativeQ2Submitter for NativeQ2Session {
         let [out0, out1, out2] = outputs;
         self.submit_resident_batch3(handles, activation, [&mut *out0, &mut *out1, &mut *out2])?;
         Ok(NativeQ2ValidatedOutputs::from_validated([out0, out1, out2]))
+    }
+
+    fn maximum_resident_token_batch(&self) -> usize {
+        if self.failed { 1 } else { 8 }
     }
 
     fn submit_resident_multi2(
@@ -4660,6 +4672,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep real 4/8-op transport, fused chains and complete packet-cap refusal together"
+    )]
     fn resident_native_q2_multi4_executes_four_operations_in_single_queue_write()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
@@ -4677,7 +4693,7 @@ mod tests {
             state.bad_numeric = false;
             state.bad_member = None;
         }
-        let limits = NativeQ2ProjectionLimits::new(256, 32, 12, Duration::from_secs(4))?
+        let limits = NativeQ2ProjectionLimits::new(256, 32, 18, Duration::from_secs(4))?
             .with_resident_weights(4096)?;
         let mut memory = vec![0_u8; limits.allocation_bytes()];
         let pointer = memory.as_mut_ptr().cast::<c_void>();
@@ -4748,6 +4764,32 @@ mod tests {
         assert_eq!(session.report.operations_completed, 10);
         assert_eq!(session.report.queue_writes_completed, 2);
         assert_eq!(session.report.resident_submissions, 8);
+        assert_eq!(NativeQ2Submitter::maximum_resident_token_batch(&session), 8);
+        let activations = [&act0, &act1, &act0, &act1, &act0, &act1, &act0, &act1];
+        let mut outputs = [[99.0_f32; 32]; 8];
+        NativeQ2Submitter::submit_resident_multi8(
+            &mut session,
+            [&h_a; 8],
+            activations.map(|row| row.as_slice()),
+            outputs.each_mut().map(|row| row.as_mut_slice()),
+        )?;
+        for (member, output) in outputs.iter().enumerate() {
+            let step = u8::try_from(member).map_err(|_| Error::Contract)?;
+            assert_eq!(*output, [7.0 + f32::from(step); 32]);
+        }
+        assert_eq!(session.report.operations_completed, 18);
+        assert_eq!(session.report.queue_writes_completed, 3);
+        let writes = STATE.lock().map_err(|_| Error::Contract)?.writes;
+        assert!(NativeQ2Submitter::submit_resident_multi8(
+            &mut session,
+            [&h_a; 8],
+            activations.map(|row| row.as_slice()),
+            outputs.each_mut().map(|row| row.as_mut_slice()),
+        ).is_err());
+        assert!(outputs.iter().flatten().all(|value| value.is_nan()));
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, writes);
+        assert_eq!(session.report.operations_completed, 18);
+        assert_eq!(NativeQ2Submitter::maximum_resident_token_batch(&session), 1);
         Ok(())
     }
 }

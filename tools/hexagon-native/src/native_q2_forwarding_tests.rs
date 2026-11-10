@@ -29,6 +29,10 @@ impl RecordingSubmitter {
 }
 
 impl NativeQ2Submitter for RecordingSubmitter {
+    fn maximum_resident_token_batch(&self) -> usize {
+        if self.fail { 1 } else { 8 }
+    }
+
     fn remaining_operations(&self) -> Option<u64> {
         Some(321)
     }
@@ -238,7 +242,12 @@ fn owned_session_forwards_direct_resident_initialization_once() -> Result<(), Er
 
 #[test]
 fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error> {
+    fn borrowed_limit(submitter: impl NativeQ2Submitter) -> usize {
+        submitter.maximum_resident_token_batch()
+    }
     let (mut session, handle) = fixture()?;
+    assert_eq!(session.maximum_resident_token_batch(), 8);
+    assert_eq!(borrowed_limit(&mut session), 8);
     let activations = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].map(|value| [value; 128]);
     let mut outputs = [[f32::NAN; 32]; 8];
     session.submit_resident_multi8(
@@ -251,6 +260,7 @@ fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error
         assert_eq!(*output, [activation[0]; 32]);
     }
     session.0.fail = true;
+    assert_eq!(session.maximum_resident_token_batch(), 1);
     assert!(
         session
             .submit_resident_multi8(

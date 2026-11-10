@@ -63,10 +63,17 @@ CONTROLS = {
         "runtime::deadline_tests::speculative_rejected_suffix_keeps_both_correction_cancellation_boundaries",
     ],
     "runtime": [
+        "finite_decoder_default_checks_custom_outputs_and_clears_failures",
+        "runtime_consumes_finite_decoder_output_and_rejects_unrelated_proofs",
         "validated_sampler_never_receives_invalid_decoder_outputs_and_rolls_back",
         "reusable_logits_preserve_storage_prefixes_and_transaction_recovery",
     ],
     "graph": [
+        "finite_decoder_output_preserves_hybrid_bits_storage_and_snapshot_ownership",
+        "finite_decoder_output_clears_late_failure_without_publishing_hybrid_state",
+        "projection::projection_scope_preserves_logits_state_adapter_basis_checkpoint_and_reset",
+        "projection::projection_scope_device_loss_after_prepared_state_delta_never_replays_or_reopens",
+        "projection::projection_scope_keeps_q8_zero_and_ptq1_paths_on_cpu_and_checks_complete_output",
         "rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits",
         "rank_one_checkpoint_and_failed_generation_preserve_complete_state",
         "empty_reset_preserves_hybrid_state_after_late_failure_and_checkpoint_restore",
@@ -109,6 +116,9 @@ CONTROLS = {
         "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
     ],
     "hexagon_native": [
+        "native_q2::tests::native_q2_reused_packet_geometry_matches_complete_scalar_frames",
+        "native_q2::tests::native_q2_reused_packet_geometry_refuses_invalid_members_before_writing",
+        "native_q2::tests::multi_arena_resident_descriptors_deduplicate_buffers_and_route_bi",
         "native_q2::tests::native_q2_resident_hvx_plans_match_independent_solver_and_wire",
         "native_q2::tests::native_q2_cached_resident_frame_matches_transient_and_refuses_invalid_plan",
     ],
@@ -125,6 +135,8 @@ LIBRARY_TARGETS = {
 # build. Keep its exact controls out of other targets instead of accepting
 # their zero-match results as numerical coverage.
 WINDOWS_ARM64_NEON_CONTROLS = [
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_grouped_finite_masks_keep_late_failures_atomic",
+    "kernels::pinned_gdn::neon::tests::pinned_gdn_grouped_finite_masks_replay_original_row_failure_bits",
     "kernels::neon::tests::simd_neon_block16_all_le_matches_finite_thresholds",
     "kernels::pinned_gdn::neon::tests::pinned_gdn_multitoken_single_row_capacities_match_independent_scalar_bits",
     "kernels::pinned_gdn::neon::tests::pinned_gdn_multitoken_capacities_preserve_refusal",

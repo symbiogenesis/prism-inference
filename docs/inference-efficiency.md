@@ -28,7 +28,7 @@ The reusable allocation survives rejection, and ties, signed zeros, heap order,
 probability arithmetic and the distribution's draws retain their existing contract.
 
 Runtime-owned sampling now passes an immutable `FiniteLogits` view after the
-existing complete decoder-output validation. Public views validate the whole
+complete decoder-output validation. Public views validate the whole
 nonempty bounded slice once, and their borrow prevents subsequent mutation.
 Greedy selection and the fixed Swift top-20 heap omit finite predicates for
 that view, including the four vector finiteness masks per skipped 16-logit
@@ -37,15 +37,26 @@ public sampling still rejects nonfinite values anywhere. Custom `Sampler`
 implementations keep their existing `sample` entry point through the default
 `sample_finite` method; the CLI's sampler wrapper forwards the typed view.
 
-This retains the runtime's original output-size/finite validation before every
-prefix publication, including the last generated token. Only its private
-validated logits and independent snapshots create runtime views. Ingestion
+The additive `Decoder::evaluate_finite_into` boundary now carries that proof
+from native Qwen35 and scoped projected Qwen35 evaluation into Runtime. Both
+graphs already check every output before committing layer state; Runtime checks
+the proof's storage pointer, complete extent and current vocabulary size instead
+of scanning every float again. Its compatibility default independently checks
+custom `evaluate_into` implementations. A checked view of unrelated storage or
+only a slice of the output rejects before token publication or sampling.
+At Swift's 248,320-logit vocabulary, native evaluation omits one traversal of
+993,280 bytes per evaluated token, including the final generated token. This is
+a source traversal count, not measured cache traffic or latency.
+
+Every prefix publication still requires complete finite output, including the
+last generated token. Only its private validated logits and independent
+snapshots create runtime sampling views. Ingestion
 invalidates old logits; cancellation, malformed output and failed continuation
 restore the earlier validated snapshot and sampler state. Focused controls cover
 all NEON lanes, finite extremes, signed-zero/tie ordering, candidate/probability
 bits, seeded draws, clone/reset/rejection, custom dispatch and decoder failures
 before and after sampling. These are source work reductions, with unchanged
-vocabulary reads, storage, admission and qualification gates; no measured
+sampling vocabulary reads, storage, admission and qualification gates; no measured
 request-time or throughput benefit is asserted.
 
 The fixed Swift chain now retains its validated top-p state at sampler
@@ -153,6 +164,29 @@ publication. The runtime charges the larger handles through its existing
 `size_of`-based metadata reservation within the unchanged cap. No registry
 allocation, signed kernel, wire layout, placement or session limit changes.
 Avoiding repeated host solver searches does not establish end-to-end benefit.
+
+Grouped NEON GDN decode, multi-token prefill and state-only replay now combine
+updated-lane finite masks while their rows remain private, with one horizontal
+mask reduction before group publication. At width 128 this replaces 32 or 64
+update-mask reductions per four/eight-row token group with one per helper call;
+multi-token helpers combine the masks across their bounded token sequence.
+Floating arithmetic, key/query checks, single-row partial publication and scalar
+failure replay remain unchanged. Direct independent scalar-bit controls cover
+both staging capacities, late overflow and untouched grouped destinations.
+This source reduction needs Release ARM64 codegen, full-model state/adapter parity
+and matched whole-request benefit before performance qualification.
+
+Native-Q2 multi-operation packet construction now serializes each distinct
+resident geometry once per packet. Repeated geometry copies only populated
+immutable tensor/operation fields and relocates all member-specific offsets,
+buffer/tensor indices and operation references. It shares no template across
+packets and adds no persistent allocation or metadata charge. Handle/arena
+validation, activation deduplication, output poisoning, operation order and
+submission limits remain unchanged. Full-frame controls compare the original
+serial descriptors across packet widths, arenas, activation identities and
+fused wrappers; rejected geometry must preserve its original failure behavior.
+Avoiding repeated field conversions establishes no measured DSP or request speedup;
+the extra descriptor reads still need a matched total-cost comparison.
 
 ## Exact hosted correctness gate
 

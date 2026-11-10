@@ -1345,6 +1345,27 @@ fn image_multi_resident_with_pad<const B: usize>(
         let ti_base = u16::try_from(member * 3).map_err(|_| Error::Contract)?;
         let weight_desc = tensors_base + (member * 3) * 56;
         let operation_desc = operations_base + member * 232;
+        // Token and sibling packets repeat the same immutable geometry. Reuse
+        // its already serialized descriptors inside this command buffer, then
+        // relocate every member-specific field. Handles, arena validation and
+        // submission order remain unchanged; no template survives the packet.
+        if let Some(previous) = handles[..member].iter().position(|previous| {
+            previous.rows == handle.rows && previous.hvx_params == handle.hvx_params
+        }) {
+            copy_member_descriptors(
+                working,
+                tensors_base + previous * 3 * 56,
+                operations_base + previous * 232,
+                weight_desc,
+                operation_desc,
+                ti_base,
+                weight_bis[member],
+                weight_offsets[member],
+                act_offsets[member],
+                output_offsets[member],
+            )?;
+            continue;
+        }
         write_member_descriptors(
             working,
             ti_base,
@@ -2378,6 +2399,46 @@ fn write_member_descriptors(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep copied packet descriptor offsets and every relocated member field together"
+)]
+fn copy_member_descriptors(
+    bytes: &mut [u8],
+    previous_weight_desc: usize,
+    previous_op_desc: usize,
+    weight_desc: usize,
+    op_desc: usize,
+    ti_base: u16,
+    weight_bi: u16,
+    weight_offset: usize,
+    act_offset: usize,
+    out_offset: usize,
+) -> Result<(), Error> {
+    bytes.copy_within(
+        previous_weight_desc..previous_weight_desc + 3 * 56,
+        weight_desc,
+    );
+    bytes.copy_within(previous_op_desc..previous_op_desc + 232, op_desc);
+    for (descriptor, offset, tensor_index) in [
+        (weight_desc, weight_offset, ti_base),
+        (weight_desc + 56, act_offset, ti_base + 1),
+        (weight_desc + 2 * 56, out_offset, ti_base + 2),
+    ] {
+        put64(
+            bytes,
+            descriptor,
+            u64::try_from(offset).map_err(|_| Error::Contract)?,
+        );
+        put16(bytes, descriptor + 22, tensor_index);
+    }
+    put16(bytes, weight_desc + 20, weight_bi);
+    put16(bytes, op_desc + 200, ti_base);
+    put16(bytes, op_desc + 202, ti_base + 1);
+    put16(bytes, op_desc + 220, ti_base + 2);
+    Ok(())
+}
+
 #[cfg(test)]
 fn output_valid(bytes: &[u8]) -> bool {
     const EXP_MASK: u32 = 0x7f80_0000;
@@ -2483,6 +2544,224 @@ impl From<NativeQ2ProjectionLimits> for hmx_projection::HmxQ2ProjectionLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Deliberately serialize every member with the original scalar writer.
+    // This oracle does not use packet-local descriptor reuse or its relocation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The independent packet oracle binds all frame inputs explicitly"
+    )]
+    fn reference_multi_packet<const B: usize>(
+        bytes: &mut [u8],
+        base: u64,
+        fd: u32,
+        arena_start: usize,
+        extras: &[HtpBufferDesc],
+        handles: [&NativeQ2WeightHandle; B],
+        activations: [&[f32]; B],
+        command_bytes: usize,
+    ) -> Result<(), Error> {
+        let mut arenas = Vec::new();
+        for handle in handles {
+            if handle.arena_index != 0 && !arenas.contains(&handle.arena_index) {
+                arenas.push(handle.arena_index);
+            }
+        }
+        let allocation = bytes.len();
+        bytes[..command_bytes].fill(0);
+        for buffer in 0..=arenas.len() {
+            let descriptor = if buffer == 0 {
+                HtpBufferDesc {
+                    base,
+                    size: allocation,
+                    fd,
+                }
+            } else {
+                extras[usize::from(arenas[buffer - 1] - 1)]
+            };
+            put64(bytes, buffer * 24, descriptor.base);
+            put64(
+                bytes,
+                buffer * 24 + 8,
+                u64::try_from(descriptor.size).map_err(|_| Error::Contract)?,
+            );
+            put32(bytes, buffer * 24 + 20, descriptor.fd);
+        }
+        let mut offset = command_bytes;
+        let mut activation_offsets = [0_usize; B];
+        for (member, activation) in activations.iter().enumerate() {
+            let repeated = activations[..member]
+                .iter()
+                .position(|previous| std::ptr::eq(previous.as_ptr(), activation.as_ptr()));
+            if let Some(previous) = repeated {
+                activation_offsets[member] = activation_offsets[previous];
+            } else {
+                activation_offsets[member] = offset;
+                for &value in *activation {
+                    bytes[offset..offset + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+                    offset += 4;
+                }
+                offset = offset.next_multiple_of(128);
+            }
+        }
+        let tensors = (arenas.len() + 1) * 24;
+        let operations = tensors + B * 3 * 56;
+        for (member, handle) in handles.into_iter().enumerate() {
+            let weight_buffer = arenas.iter().position(|&arena| arena == handle.arena_index);
+            let weight_offset = handle.range.start
+                + if handle.arena_index == 0 {
+                    arena_start
+                } else {
+                    0
+                };
+            write_member_descriptors(
+                bytes,
+                u16::try_from(member * 3).map_err(|_| Error::Contract)?,
+                u16::try_from(weight_buffer.map_or(0, |index| index + 1))
+                    .map_err(|_| Error::Contract)?,
+                tensors + member * 3 * 56,
+                operations + member * 232,
+                handle.columns,
+                handle.rows,
+                weight_offset,
+                handle.packed_bytes(),
+                activation_offsets[member],
+                offset,
+                handle.hvx_params,
+            )?;
+            for word in bytes[offset..offset + handle.rows * 4]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                *word = 0x7fc0_ae51_u32.to_le_bytes();
+            }
+            offset = (offset + handle.rows * 4).next_multiple_of(128);
+        }
+        Ok(())
+    }
+
+    fn compare_reused_packet<const B: usize>(
+        columns: usize,
+        command_bytes: usize,
+    ) -> Result<(), Error> {
+        let mut registry = NativeQ2WeightRegistry::new(1024 * 1024)?;
+        let mut small = registry
+            .prepare_validated(columns, 32, layout(columns, 32).weights)?
+            .ok_or(Error::Contract)?;
+        let mut large = registry
+            .prepare_validated(columns, 96, layout(columns, 96).weights)?
+            .ok_or(Error::Contract)?;
+        small.arena_index = 2;
+        large.arena_index = 1;
+        let mut local = small.clone();
+        local.arena_index = 0;
+        let mut changed_solver = small.clone();
+        changed_solver.hvx_params.0 = 1;
+        let fixtures = [small, large, local, changed_solver];
+        let extras = [
+            HtpBufferDesc {
+                base: 0x2_0000,
+                size: 1024 * 1024,
+                fd: 31,
+            },
+            HtpBufferDesc {
+                base: 0x3_0000,
+                size: 1024 * 1024,
+                fd: 47,
+            },
+        ];
+        let inputs: Vec<Vec<f32>> = (0..B)
+            .map(|token| {
+                (0..columns)
+                    .map(|lane| [0.0, -0.0, f32::from_bits(1), -1.5][(token + lane) % 4])
+                    .collect()
+            })
+            .collect();
+        let arena_start = 256 * 1024;
+        for fixture_count in [1, 2, 3, 4] {
+            let handles: [&NativeQ2WeightHandle; B] =
+                std::array::from_fn(|member| &fixtures[member % fixture_count]);
+            for shared in [false, true] {
+                let activations: [&[f32]; B] = std::array::from_fn(|member| {
+                    inputs[if shared { member / 2 } else { member }].as_slice()
+                });
+                let mut actual = vec![0xa5_u8; arena_start + 256 * 1024];
+                let mut expected = actual.clone();
+                reference_multi_packet(
+                    &mut expected,
+                    0x1_0000,
+                    17,
+                    arena_start,
+                    &extras,
+                    handles,
+                    activations,
+                    command_bytes,
+                )?;
+                image_multi_resident_with_pad(
+                    &mut actual,
+                    0x1_0000,
+                    17,
+                    arena_start,
+                    &extras,
+                    handles,
+                    activations,
+                    command_bytes,
+                )?;
+                assert_eq!(actual, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_reused_packet_geometry_matches_complete_scalar_frames() -> Result<(), Error> {
+        for columns in [128, 384, 6272] {
+            compare_reused_packet::<2>(columns, 2048)?;
+            compare_reused_packet::<3>(columns, 2048)?;
+            compare_reused_packet::<4>(columns, 2048)?;
+            compare_reused_packet::<4>(columns, 4096)?;
+            compare_reused_packet::<8>(columns, 4096)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_reused_packet_geometry_refuses_invalid_members_before_writing() -> Result<(), Error>
+    {
+        let mut registry = NativeQ2WeightRegistry::new(4096)?;
+        let first = registry
+            .prepare_validated(128, 32, 1152)?
+            .ok_or(Error::Contract)?;
+        for failure in 0..5 {
+            let mut repeated = first.clone();
+            let activation = [1.0; 128];
+            let mut second_activation = activation.as_slice();
+            match failure {
+                0 => repeated.columns = 256,
+                1 => repeated.range.end -= 1,
+                2 => repeated.arena_index = 1,
+                3 => repeated.range = 8192..9344,
+                4 => second_activation = &activation[..127],
+                _ => return Err(Error::Contract),
+            }
+            let mut bytes = vec![0xa5_u8; 8192];
+            let before = bytes.clone();
+            assert!(
+                image_multi_resident(
+                    &mut bytes,
+                    0x1_0000,
+                    17,
+                    4096,
+                    &[],
+                    [&first, &repeated],
+                    [&activation, second_activation]
+                )
+                .is_err()
+            );
+            assert_eq!(bytes, before);
+        }
+        Ok(())
+    }
 
     fn reference_hvx_params(columns: usize, rows: usize) -> Result<(u8, u32, u32), Error> {
         // Independently expand the signed solver's allocations rather than call

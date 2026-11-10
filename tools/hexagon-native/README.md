@@ -326,6 +326,21 @@ larger handle payload; the runtime's existing `size_of`-based metadata reservati
 does so within its unchanged cap. Wire bytes, signed kernels, placement and
 session limits remain unchanged. Source work avoided is not measured latency.
 
+Resident multi-operation packets also reuse already serialized tensor and HVX
+operation geometry inside their own command buffer. Members with the same row
+count and retained solver parameters share the first member's descriptors after
+the existing common-column and complete arena/extent validation. Each copied
+member relocates all weight/activation/output offsets, weight buffer index and
+tensor indices. This reduces full descriptor construction from eight times to
+once for an eight-token projection packet, and shares matching sibling geometry
+in ordinary and fused SwiGLU packets. Mixed geometries retain the serial writer.
+No template or allocation survives the packet; metadata, command bounds, flush
+extents, submission order, numerics, failure handling and admission are unchanged.
+Complete-frame model-free controls compare the copied path with independent
+serial construction, including multiple arenas, changed solver parameters,
+activation sharing, padding, output poison and invalid later members. Source
+serialization counts establish no measured request or device benefit.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

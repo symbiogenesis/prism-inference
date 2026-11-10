@@ -14,7 +14,7 @@ class EfficiencyReceiptTests(unittest.TestCase):
     def test_source_identity_binds_runtime_controls_and_format_policy(self):
         root = Path(__file__).resolve().parents[2]
         original = efficiency.source_hashes(root)
-        selected = ["tests/runtime.rs", "tests/runtime/timing.rs", "rustfmt.toml"]
+        selected = ["tests/runtime.rs", "tests/runtime/timing.rs", "tests/tokenizer.rs", "rustfmt.toml"]
         for name in selected:
             self.assertIn(name, original)
         with tempfile.TemporaryDirectory() as temporary:

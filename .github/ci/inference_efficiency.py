@@ -12,6 +12,12 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "kernels::pinned_attention::six::tests::six_head_paired_scores_match_independent_native_lanes_and_reject_bad_rows",
+        "graph::attention_six::prefill_tests::six_head_paired_prefill_excludes_future_rows_and_rejects_malformed_input",
+        "bpe::piece_cache_tests::piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges",
+        "bpe::piece_cache_tests::piece_cache_collisions_owners_unicode_and_long_bypass_preserve_identity",
+        "bpe::piece_cache_tests::piece_cache_failures_preserve_output_bounds_and_missing_byte_precedence",
+        "bpe::piece_cache_tests::piece_cache_storage_and_public_piece_composition_remain_bounded",
         "graph::prefill::six_tests::six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation",
         "graph::attention_six::prefill_tests::six_head_prefill_tiles_match_causal_oracle_across_pages_and_workers",
         "graph::attention_six::prefill_tests::six_head_prefill_excludes_future_nan_and_rejects_bad_prefix_before_output",
@@ -129,6 +135,14 @@ CONTROLS = {
         "prefill::tiled_prefill_runtime_failure_restores_all_layer_state_before_replay",
         "prefill::tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance",
     ],
+    "tokenizer": [
+        "repeated_piece_preparation_preserves_special_boundaries_unicode_and_limits",
+        "text_encoding_respects_pretokenizer_boundaries_and_never_inserts_tokens",
+        "text_encoding_specials_require_explicit_opt_in_and_preserve_surrounding_bytes",
+        "text_encoding_unicode_and_control_bytes_round_trip_with_bounded_output",
+        "text_token_capacity_is_typed_without_reclassifying_byte_safety_limits",
+        "text_encoding_charges_piece_limits_across_special_boundaries",
+    ],
     "swift_sampling": [
         "swift_declared_stop_is_not_delivered_and_commits_its_draw",
         "swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",
@@ -138,6 +152,9 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
     "hexagon_runtime": [
+        "native_q2::multitile_tests::native_q2_multitile_tokens_match_scalar_transient_and_resident",
+        "native_q2::multitile_tests::native_q2_multitile_tokens_preserve_failure_and_publication",
+        "native_q2::multitile_tests::native_q2_multitile_tokens_reject_invalid_input_before_submission",
         "native_q2::tests::native_q2_full_ffn_tiles_batch_pairs_and_preserve_tail_accounting",
         "native_q2::tests::native_q2_default_output_evidence_preserves_success_and_terminal_failures",
         "native_q2::tests::native_q2_unrelated_output_evidence_cannot_publish",
@@ -284,7 +301,7 @@ def source_hashes(root):
     files.update((root / "tests/runtime").rglob("*.rs"))
     files.update(path for path in (root / "tests/fixtures").rglob("*") if path.is_file())
     files.update(root / path for path in [
-        "tests/graph.rs", "tests/runtime.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
+        "tests/graph.rs", "tests/runtime.rs", "tests/tokenizer.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
         ".github/ci/test_inference_efficiency.py", ".github/workflows/inference-efficiency.yml",
     ])
     return {str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -331,7 +348,7 @@ def main():
                    "--locked", "--release", "--package", "prism-inference", "--package", "prism-inference-server",
                    "--package", "bonsai-hexagon-native", "--package", "bonsai-hexagon-runtime",
                    "--features", "prism-inference/parallel-rows,prism-inference-server/parallel-rows",
-                   "--lib", "--test", "graph", "--test", "runtime", "--test", "swift_sampling", "--no-run", "--message-format=json"]
+                   "--lib", "--test", "graph", "--test", "runtime", "--test", "tokenizer", "--test", "swift_sampling", "--no-run", "--message-format=json"]
         compiled = subprocess.run(command, capture_output=True, text=True, check=False)
         (evidence / "compile.log").write_text(compiled.stdout + compiled.stderr, encoding="utf-8")
         receipt["compile"] = {"arguments": command, "exitCode": compiled.returncode}

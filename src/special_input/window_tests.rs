@@ -85,7 +85,7 @@ fn windowed_specials_match_independent_oracle_at_all_spelling_boundary_offsets()
 
 #[test]
 fn windowed_specials_keep_fixed_scratch_and_grow_only_emitted_segments() -> Result<()> {
-    assert_eq!(std::mem::size_of::<[u16; MATCH_WINDOW_BYTES]>(), 8192);
+    assert_eq!(size_of::<[u16; MATCH_WINDOW_BYTES]>(), 8192);
     let input = recognizer(&[("<stop>", 1)])?;
     let text = "a".repeat(MAX_SPECIAL_INPUT_BYTES);
     let segments = input.split(&text, SpecialInputPolicy::Parse, usize::MAX)?;

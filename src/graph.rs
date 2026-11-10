@@ -5135,7 +5135,7 @@ mod tests {
         geometry: &Geometry,
         layer: &super::FullAttention,
         projected: &[f32],
-        original_values: [f32; 8],
+        original_values: &[f32],
         expected: &[f32],
         arithmetic: Arithmetic,
         workers: usize,
@@ -5158,11 +5158,13 @@ mod tests {
             adapter_scratch: &mut adapter,
             executor: None,
         };
-        let keys = KvCache::new(8, 2)?;
-        let values = KvCache::new(8, 2)?;
+        let kv_width = geometry.kv_heads * geometry.head;
+        assert_eq!(original_values.len(), kv_width);
+        let keys = KvCache::new(kv_width, 2)?;
+        let values = KvCache::new(kv_width, 2)?;
         let mut scratch = super::AttentionScratch::default();
-        let mut key = [0.0; 8];
-        let mut value = original_values;
+        let mut key = vec![0.0; kv_width];
+        let mut value = original_values.to_vec();
         // A failed rounding attempt must not publish attended output
         // or append state; reuse the same scratch for the valid retry.
         value[0] = 70_000.0;
@@ -5180,14 +5182,14 @@ mod tests {
                     &mut scratch.frequencies,
                     &mut scratch.attended,
                 )
-                .is_err()
+                .is_err_and(|error| error.to_string() == "nonfinite values in binary16 value cache")
         );
         let empty: [f32; 0] = [];
         assert_eq!(scratch.attended, empty);
         assert_eq!(scratch.gate, empty);
         assert_eq!(keys.tokens().count(), 0);
         assert_eq!(values.tokens().count(), 0);
-        let mut value = original_values;
+        let mut value = original_values.to_vec();
         evaluation.full_attention_state(
             layer,
             projected,
@@ -5213,26 +5215,34 @@ mod tests {
 
     #[test]
     fn full_attention_reads_original_interleaved_gates_across_worker_groups() -> Result<()> {
-        let mut geometry = projection_geometry(4);
-        geometry.heads = 12;
-        geometry.kv_heads = 2;
+        // Pinned Swift RoPE admits 256-channel heads and 64 rotary channels;
+        // use its real 24-query/4-KV geometry instead of a source-only tiny head.
+        let mut geometry = projection_geometry(256);
+        geometry.heads = 24;
+        geometry.kv_heads = 4;
+        geometry.rope = 64;
+        geometry.rope_sections = [11, 11, 10, 0];
+        geometry.rope_base = 10_000_000.0;
         let layer = super::FullAttention {
-            query: projection_weight("q", 0, 4),
-            key: projection_weight("k", 0, 4),
-            value: projection_weight("v", 0, 4),
-            output: projection_weight("out", 0, 4),
-            query_norm: vec![1.0; 4],
-            key_norm: vec![1.0; 4],
+            query: projection_weight("q", 0, geometry.head),
+            key: projection_weight("k", 0, geometry.head),
+            value: projection_weight("v", 0, geometry.head),
+            output: projection_weight("out", 0, geometry.head),
+            query_norm: vec![1.0; geometry.head],
+            key_norm: vec![1.0; geometry.head],
         };
         let mut projected = vec![0.0_f32; geometry.query_gate_width()];
         let mut expected_gates = Vec::new();
-        for (head, pair) in projected.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-            for (channel, gate) in pair[4..].iter_mut().enumerate() {
+        for (head, pair) in projected.chunks_exact_mut(2 * geometry.head).enumerate() {
+            for (channel, gate) in pair[geometry.head..].iter_mut().enumerate() {
                 *gate = [-4.0, -1.0, 0.0, 1.0, 4.0][(head + channel) % 5];
                 expected_gates.push(*gate);
             }
         }
-        let original_values = [0.25, -0.5, 1.0, 2.0, -0.25, 0.5, -1.0, -2.0];
+        let value_pattern = [0.25, -0.5, 1.0, 2.0, -0.25, 0.5, -1.0, -2.0];
+        let original_values: Vec<f32> = (0..geometry.kv_heads * geometry.head)
+            .map(|index| value_pattern[(index + index / geometry.head) % value_pattern.len()])
+            .collect();
         // With zero Q/K and no prior tokens, attention has exactly unit
         // probability. Independently apply each head's known gate to its KV
         // head's rounded values; this exercises complete six-head groups in
@@ -5241,9 +5251,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, &gate)| {
-                let head = index / 4;
+                let head = index / geometry.head;
                 let kv = head / (geometry.heads / geometry.kv_heads);
-                let value = half_to_float(half_bits(original_values[kv * 4 + index % 4]));
+                let value = half_to_float(half_bits(
+                    original_values[kv * geometry.head + index % geometry.head],
+                ));
                 value * (1.0 / (1.0 + (-gate).exp()))
             })
             .collect();
@@ -5257,7 +5269,7 @@ mod tests {
                     &geometry,
                     &layer,
                     &projected,
-                    original_values,
+                    &original_values,
                     &expected,
                     arithmetic,
                     workers,

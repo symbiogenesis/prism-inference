@@ -31,6 +31,9 @@ mod tile_tests;
 #[path = "pinned_attention_gated_tests.rs"]
 mod gated_tests;
 
+#[path = "pinned_attention_six.rs"]
+pub(crate) mod six;
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",

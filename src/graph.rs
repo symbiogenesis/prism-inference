@@ -28,6 +28,7 @@ mod projection;
 pub use projection::ProjectedQwen35;
 mod prefill;
 pub use prefill::TiledPrefillStatistics;
+mod attention_six;
 
 /// Maximum admitted live KV/recurrent element payload, also the default budget.
 ///
@@ -3217,21 +3218,51 @@ impl Evaluation<'_, '_> {
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
         let heads_per_kv = g.heads / g.kv_heads;
+        // Preserve whole six-head KV groups when partitioning Swift decode.
+        // Other geometries and source-order arithmetic keep their old dispatch.
+        let head_unit = if matches!(arithmetic, Arithmetic::PinnedSwift)
+            && heads_per_kv == 6
+            && self.projection.matvec.row_parallelism().workers() <= g.kv_heads
+        {
+            6
+        } else {
+            1
+        };
         self.projection
             .matvec
             .row_parallelism()
             .update_paired_chunks(
                 attended,
-                g.head,
+                head_unit * g.head,
                 scores_scratch,
-                score_len,
-                |base_head, attended_chunk, scores_chunk| {
+                head_unit * score_len,
+                |base_unit, attended_chunk, scores_chunk| {
+                    let base_head = base_unit * head_unit;
                     let chunk_heads = attended_chunk.len() / g.head;
                     let mut head_offset = 0;
                     while head_offset < chunk_heads {
                         let head = base_head + head_offset;
                         let kv_head = head / heads_per_kv;
                         let offset = kv_head * g.head;
+                        if head_unit == 6 {
+                            attention_six::attend(
+                                g,
+                                head,
+                                query_ref,
+                                projected,
+                                keys,
+                                values,
+                                key_ref,
+                                value_ref,
+                                &mut attended_chunk
+                                    [head_offset * g.head..(head_offset + 6) * g.head],
+                                &mut scores_chunk
+                                    [head_offset * score_len..(head_offset + 6) * score_len],
+                                scale,
+                            )?;
+                            head_offset += 6;
+                            continue;
+                        }
                         if head_offset + 4 <= chunk_heads && kv_head == (head + 3) / heads_per_kv {
                             let (r01, r23) = attended_chunk
                                 [head_offset * g.head..(head_offset + 4) * g.head]
@@ -5204,7 +5235,8 @@ mod tests {
         let original_values = [0.25, -0.5, 1.0, 2.0, -0.25, 0.5, -1.0, -2.0];
         // With zero Q/K and no prior tokens, attention has exactly unit
         // probability. Independently apply each head's known gate to its KV
-        // head's rounded values; this exercises both 4-head and tail workers.
+        // head's rounded values; this exercises complete six-head groups in
+        // pinned decode and inherited grouped/tail workers in source order.
         let expected: Vec<f32> = expected_gates
             .iter()
             .enumerate()
@@ -5216,7 +5248,7 @@ mod tests {
             })
             .collect();
         #[cfg(feature = "parallel-rows")]
-        let worker_counts = [1, 2, 4];
+        let worker_counts = [1, 2, 3, 4, 7, 18];
         #[cfg(not(feature = "parallel-rows"))]
         let worker_counts = [1];
         for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {

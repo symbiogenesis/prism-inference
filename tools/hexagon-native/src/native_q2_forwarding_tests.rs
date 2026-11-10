@@ -96,6 +96,22 @@ impl NativeQ2Submitter for RecordingSubmitter {
         Ok(())
     }
 
+    fn submit_resident_ffn_chain(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        if residual.is_none_or(|values| values[0].to_bits() != 9.0_f32.to_bits())
+            || hadamard_block_size != Some(64)
+        {
+            return Err(Error::Contract);
+        }
+        self.complete("full-chain", output, activation[0])
+    }
+
     fn submit_resident_validated<'a>(
         &mut self,
         _handle: &NativeQ2WeightHandle,
@@ -269,13 +285,6 @@ fn owned_session_preserves_fused_swiglu_calls_and_rejection() -> Result<(), Erro
         session.0.calls,
         ["swiglu", "swiglu-multi2", "swiglu", "swiglu-multi2"]
     );
-    // Forwarding does not manufacture support for the unfinished full-chain backend.
-    assert!(
-        session
-            .submit_resident_ffn_chain([&handle; 3], &activation, None, None, &mut output)
-            .is_err()
-    );
-    assert!(output.iter().all(|value| value.is_nan()));
     Ok(())
 }
 
@@ -325,5 +334,37 @@ fn owned_session_preserves_borrowed_output_evidence_and_errors() -> Result<(), E
             .is_err()
     );
     assert!(output.iter().all(|value| value.is_nan()));
+    Ok(())
+}
+
+#[test]
+fn owned_session_forwards_full_ffn_chain_and_preserves_failure() -> Result<(), Error> {
+    let (mut session, handle) = fixture()?;
+    let activation = [3.0; 128];
+    let residual = [9.0; 128];
+    let mut output = [f32::NAN; 32];
+    session.submit_resident_ffn_chain(
+        [&handle; 3],
+        &activation,
+        Some(&residual),
+        Some(64),
+        &mut output,
+    )?;
+    assert_eq!(output, [3.0; 32]);
+    assert_eq!(session.0.calls, ["full-chain"]);
+    session.0.fail = true;
+    assert!(
+        session
+            .submit_resident_ffn_chain(
+                [&handle; 3],
+                &activation,
+                Some(&residual),
+                Some(64),
+                &mut output
+            )
+            .is_err()
+    );
+    assert!(output.iter().all(|value| value.is_nan()));
+    assert_eq!(session.0.calls, ["full-chain", "full-chain"]);
     Ok(())
 }

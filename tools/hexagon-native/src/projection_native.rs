@@ -555,6 +555,23 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         n_bufs: u32,
         expected_size: u32,
     ) -> bool {
+        self.read_counts(
+            sequence,
+            batch_operations,
+            batch_operations * 3,
+            n_bufs,
+            expected_size,
+        )
+    }
+
+    fn read_counts(
+        &mut self,
+        sequence: u64,
+        operations: u32,
+        tensors: u32,
+        buffers: u32,
+        expected_size: u32,
+    ) -> bool {
         let started = Instant::now();
         let op_deadline = started + Duration::from_secs(3);
         let deadline = if self.limits.persistent {
@@ -615,11 +632,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 && descriptor.offset == self.expected.offset
                 && descriptor.flags == self.expected.flags
                 && descriptor.pointer == self.expected.pointer
-                && projection::response_batch_buffers_valid(
-                    &reply,
-                    sequence,
-                    batch_operations,
-                    n_bufs,
+                && projection::response_counts_valid(
+                    &reply, sequence, operations, tensors, buffers,
                 );
             if !self.report.queue.response_validated {
                 let _ = self.fail("projection-response-refused-pinned");
@@ -1390,6 +1404,180 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
 
     #[expect(
         clippy::too_many_lines,
+        reason = "Keep resident full FFN chain validation, scoped flush size and output publication together"
+    )]
+    fn submit_native_resident_ffn_chain(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        let result = (|| {
+            let batch_u32 =
+                4_u32 + u32::from(hadamard_block_size.is_some()) + u32::from(residual.is_some());
+            let [gate_handle, up_handle, down_handle] = handles;
+            let Some(next_operations) = self
+                .report
+                .operations_submitted
+                .checked_add(batch_u32)
+                .filter(|&next| !self.failed && next <= self.limits.operations)
+            else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            let Some(next_writes) = self
+                .report
+                .queue_writes_submitted
+                .checked_add(1)
+                .filter(|&next| next <= self.limits.operations)
+            else {
+                return Err(self.fail("projection-session-bound-refused-pinned"));
+            };
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            let Mode::NativeQ2 {
+                columns: max_columns,
+            } = self.mode
+            else {
+                return Err(self.fail("projection-input-refused-pinned"));
+            };
+            let columns = gate_handle.columns();
+            let rows = gate_handle.rows();
+            if up_handle.columns() != columns
+                || up_handle.rows() != rows
+                || down_handle.columns() != rows
+                || down_handle.rows() != columns
+                || columns > max_columns
+                || rows > max_columns
+                || columns > self.limits.rows
+                || rows > self.limits.rows
+                || activation.len() != columns
+                || output.len() != columns
+                || !native_q2::is_finite_f32_slice(activation)
+                || residual.is_some_and(|values| {
+                    values.len() != columns || !native_q2::is_finite_f32_slice(values)
+                })
+            {
+                return Err(self.fail("projection-input-refused-pinned"));
+            }
+            for handle in handles {
+                if self.native_resident_weights.range(handle).is_err() {
+                    return Err(self.fail("projection-input-refused-pinned"));
+                }
+            }
+            for handle in handles {
+                self.flush_extra_arena(handle.arena_index())?;
+            }
+            let extra_descs = self.extra_buffer_descs()?;
+            let Ok(base) = u64::try_from(self.memory.addr()) else {
+                return Err(self.fail("projection-address-refused-pinned"));
+            };
+            let Ok(allocation_bytes) = usize::try_from(self.expected.size) else {
+                return Err(self.fail("projection-allocation-size-refused-pinned"));
+            };
+            let working_bytes = self.mode.allocation_bytes(self.limits.rows);
+            // SAFETY: the single previous operation completed and cache invalidation
+            // was validated before any allocation reuse.
+            let image = unsafe {
+                std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
+            };
+            let Ok(active) = native_q2::image_ffn_full_chain_resident(
+                image,
+                base,
+                self.expected.fd,
+                working_bytes,
+                &extra_descs[..self.extra_arena_count],
+                gate_handle,
+                up_handle,
+                down_handle,
+                activation,
+                residual,
+                hadamard_block_size,
+            ) else {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            };
+            if active.n_ops != batch_u32 {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            }
+            image[8..16].copy_from_slice(&u64::from(self.expected.size).to_le_bytes());
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            let sequence = u64::from(next_writes);
+            let Ok(request) =
+                projection::request_counts(sequence, active.n_ops, active.n_tensors, active.n_bufs)
+            else {
+                return Err(self.fail("projection-frame-refused-pinned"));
+            };
+            let active_descriptor_size = if self.dirty_resident_weights {
+                let dirty_end =
+                    working_bytes.saturating_add(self.native_resident_weights.arena_used_bytes(0));
+                let Ok(prefix) = u32::try_from(dirty_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            } else {
+                let Ok(prefix) = u32::try_from(active.output_end.next_multiple_of(4096)) else {
+                    return Err(self.fail("projection-allocation-size-refused-pinned"));
+                };
+                prefix.min(self.expected.size)
+            };
+            self.report.queue.response_validated = false;
+            self.report.queue.numeric_validated = false;
+            self.report.operations_submitted = next_operations;
+            self.report.queue_writes_submitted = next_writes;
+            self.report.resident_submissions += 3;
+            self.report.queue.compute_submitted = true;
+            let mut descriptor = self.expected;
+            descriptor.size = active_descriptor_size;
+            entered(self.report, "projection-queue-write-entered", self.progress);
+            let result = write_packet(self.queue_write, self.queue, &mut descriptor, &request);
+            self.report.queue.queue_write_result = Some(result);
+            if result != 0 {
+                return Err(self.fail("projection-write-refused-pinned"));
+            }
+            entered(self.report, "projection-queue-read-entered", self.progress);
+            if !self.read_counts(
+                sequence,
+                active.n_ops,
+                active.n_tensors,
+                active.n_bufs,
+                active_descriptor_size,
+            ) {
+                return Err(Error::Contract);
+            }
+            self.dirty_resident_weights = false;
+            let member_bytes = size_of_val(output);
+            // SAFETY: exact correlated response validated same FD, active prefix,
+            // pointer and the exact 12/14/15/17-tensor, 4/5/6-op chain geometry.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.memory.cast::<u8>().wrapping_add(active.output_offset),
+                    member_bytes,
+                )
+            };
+            if !native_q2::copy_and_validate_output(bytes, output) {
+                return Err(self.fail("projection-numeric-refused-pinned"));
+            }
+            if !self.within_deadline() {
+                return Err(Error::Contract);
+            }
+            self.report.queue.numeric_validated = true;
+            self.report.operations_completed = next_operations;
+            self.report.queue_writes_completed = next_writes;
+            entered(self.report, "projection-operation-complete", self.progress);
+            Ok(())
+        })();
+        if result.is_err() {
+            output.fill(f32::NAN);
+        }
+        result
+    }
+
+    #[expect(
+        clippy::too_many_lines,
         reason = "Keep resident fused 2-token 6-op FFN SwiGLU validation, scoped flush size and output publication together"
     )]
     fn submit_native_resident_ffn_swiglu_multi2(
@@ -2001,6 +2189,23 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         self.submit_native_resident_ffn_swiglu(gate_handle, up_handle, activation, output)
     }
 
+    fn submit_resident_ffn_chain(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.submit_native_resident_ffn_chain(
+            handles,
+            activation,
+            residual,
+            hadamard_block_size,
+            output,
+        )
+    }
+
     fn submit_resident_ffn_swiglu_multi2(
         &mut self,
         gate_handle: &NativeQ2WeightHandle,
@@ -2436,6 +2641,26 @@ impl NativeQ2Submitter for NativeQ2Session {
         })
     }
 
+    fn submit_resident_ffn_chain(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        output: &mut [f32],
+    ) -> Result<(), Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident_ffn_chain(
+                session,
+                handles,
+                activation,
+                residual,
+                hadamard_block_size,
+                output,
+            )
+        })
+    }
+
     fn submit_resident_ffn_swiglu_multi2(
         &mut self,
         gate_handle: &NativeQ2WeightHandle,
@@ -2499,6 +2724,7 @@ mod tests {
         sequence: u64,
         batch_operations: u32,
         n_bufs: u32,
+        n_tensors: u32,
         descriptor: [u32; 4],
         pointer: usize,
         write_error: bool,
@@ -2513,6 +2739,7 @@ mod tests {
         sequence: 0,
         batch_operations: 1,
         n_bufs: 1,
+        n_tensors: 3,
         descriptor: [0; 4],
         pointer: 0,
         write_error: false,
@@ -2544,6 +2771,10 @@ mod tests {
         let Ok(n_bufs) = request[8..12].try_into() else {
             return -77;
         };
+        let Ok(n_tensors) = request[12..16].try_into() else {
+            return -77;
+        };
+        let n_tensors = u32::from_le_bytes(n_tensors);
         let Ok(n_ops) = request[16..20].try_into() else {
             return -77;
         };
@@ -2552,6 +2783,7 @@ mod tests {
         state.sequence = u64::from_le_bytes(sequence);
         state.batch_operations = n_ops;
         state.n_bufs = n_bufs;
+        state.n_tensors = n_tensors;
         state.descriptor = [
             descriptor.fd,
             descriptor.size,
@@ -2573,9 +2805,18 @@ mod tests {
         let Ok(members) = usize::try_from(n_ops) else {
             return -77;
         };
+        let Ok(tensor_count) = usize::try_from(n_tensors) else {
+            return -77;
+        };
         let tensors_base = 24 * n_bufs_usize;
+        let ops_base = tensors_base + tensor_count * 56;
         for member in 0..members {
-            let desc_base = tensors_base + (3 * member + 2) * 56;
+            let output_index = ops_base + member * 232 + 220;
+            let Ok(output_index) = memory[output_index..output_index + 2].try_into() else {
+                return -77;
+            };
+            let output_index = usize::from(u16::from_le_bytes(output_index));
+            let desc_base = tensors_base + output_index * 56;
             let Ok(offset) = memory[desc_base..desc_base + 8].try_into() else {
                 return -77;
             };
@@ -2589,7 +2830,7 @@ mod tests {
                 return -77;
             };
             let value = if state.bad_numeric || state.bad_member == Some(member) {
-                7.5_f32
+                f32::NAN
             } else {
                 let Ok(step) = u8::try_from(member) else {
                     return -77;
@@ -2625,7 +2866,7 @@ mod tests {
         };
         let n_ops = state.batch_operations.max(1);
         let n_bufs = state.n_bufs.max(1);
-        let n_tensors = 3 * n_ops;
+        let n_tensors = state.n_tensors;
         response[..8].copy_from_slice(&sequence.to_le_bytes());
         for (offset, value) in [(24, 1_u32), (28, n_bufs), (32, n_tensors), (36, n_ops)] {
             response[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -3530,6 +3771,272 @@ mod tests {
             }
         }
         weights
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Exercise every optional chain shape through the actual borrowed session, including warm flushes and complete resource accounting"
+    )]
+    fn resident_native_q2_full_ffn_chain_executes_all_optional_shapes_and_reuses_flush()
+    -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let weights = resident_native_q2_weights_32().repeat(4);
+        let activation = [1.0_f32; 128];
+        let residual = [2.0_f32; 128];
+        for (hadamard, add, operations, tensors) in [
+            (None, false, 4_u32, 12_u32),
+            (Some(64), false, 5, 14),
+            (None, true, 5, 15),
+            (Some(64), true, 6, 17),
+        ] {
+            {
+                let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+                state.writes = 0;
+                state.write_error = false;
+                state.stale_reply = false;
+                state.bad_numeric = false;
+                state.bad_member = None;
+            }
+            let limits = NativeQ2ProjectionLimits::new(128, 128, 16, Duration::from_secs(4))?
+                .with_resident_weights(16_384)?;
+            let mut memory = vec![0_u8; limits.allocation_bytes()];
+            let pointer = memory.as_mut_ptr().cast::<c_void>();
+            let expected = QueueBuffer {
+                fd: 7,
+                size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+                offset: 0,
+                flags: 0x90,
+                pointer,
+            };
+            let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            report.queue.poisoned = true;
+            let queue_write = WriteCall::Nonblocking(write);
+            let mut progress = |_: &Q2ProjectionReport| {};
+            let mut session = Session {
+                report: &mut report,
+                queue_write: &queue_write,
+                queue_read: read,
+                queue: null_mut(),
+                memory: pointer,
+                expected,
+                extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+                extra_arena_count: 0,
+                mapper: None,
+                limits: limits.common,
+                mode: Mode::NativeQ2 { columns: 128 },
+                resident_weights: HmxQ2WeightRegistry::new(0)?,
+                native_resident_weights: NativeQ2WeightRegistry::new(
+                    limits.resident_weight_bytes(),
+                )?,
+                dirty_resident_weights: false,
+                work_deadline: Instant::now() + Duration::from_secs(1),
+                progress: &mut progress,
+                failed: false,
+            };
+            let handle = NativeQ2Submitter::prepare_weights(&mut session, 128, 128, &weights)?
+                .ok_or(Error::Contract)?;
+            let mut output = [99.0_f32; 128];
+            let selected_residual = add.then_some(residual.as_slice());
+            session.submit_resident_ffn_chain(
+                [&handle; 3],
+                &activation,
+                selected_residual,
+                hadamard,
+                &mut output,
+            )?;
+            let expected_value =
+                7.0 + f32::from(u8::try_from(operations - 1).map_err(|_| Error::Contract)?);
+            assert_eq!(output, [expected_value; 128]);
+            assert_eq!(session.report.operations_completed, operations);
+            assert_eq!(session.report.resident_submissions, 3);
+            assert_eq!(session.report.queue_writes_completed, 1);
+            assert!(!session.dirty_resident_weights);
+            {
+                let state = STATE.lock().map_err(|_| Error::Contract)?;
+                assert_eq!(state.n_tensors, tensors);
+                assert_eq!(state.batch_operations, operations);
+                assert_eq!(state.descriptor[1], expected.size);
+            }
+            session.submit_resident_ffn_chain(
+                [&handle; 3],
+                &activation,
+                selected_residual,
+                hadamard,
+                &mut output,
+            )?;
+            assert_eq!(output, [expected_value; 128]);
+            assert_eq!(session.report.operations_completed, operations * 2);
+            assert_eq!(session.report.operations_submitted, operations * 2);
+            assert_eq!(session.report.resident_submissions, 6);
+            assert_eq!(session.report.queue_writes_completed, 2);
+            assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 2);
+            let warm_size = STATE.lock().map_err(|_| Error::Contract)?.descriptor[1];
+            assert!(warm_size < expected.size);
+            assert!(!session.failed);
+            let arena_start = Mode::NativeQ2 { columns: 128 }.allocation_bytes(128);
+            assert_eq!(&memory[arena_start..arena_start + weights.len()], weights);
+        }
+        Ok(())
+    }
+
+    unsafe extern "C" fn read_wrong_tensor_count(
+        queue: *mut c_void,
+        flags: *mut u32,
+        capacity: u32,
+        count: *mut u32,
+        descriptor: *mut QueueBuffer,
+        maximum: u32,
+        bytes: *mut u32,
+        reply: *mut u8,
+    ) -> i32 {
+        // SAFETY: forwarded directly from the safe session with unchanged exact capacities.
+        let result = unsafe {
+            read(
+                queue, flags, capacity, count, descriptor, maximum, bytes, reply,
+            )
+        };
+        // SAFETY: the session lends a complete 88-byte response; corrupt only its tensor count.
+        unsafe { reply.wrapping_add(32).write(18) };
+        result
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Retain all pre-submit and post-write chain refusals under the real terminal ownership path"
+    )]
+    fn resident_native_q2_full_ffn_chain_failures_are_terminal_without_replay() -> Result<(), Error>
+    {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let weights = resident_native_q2_weights_32().repeat(4);
+        for case in 0..12 {
+            {
+                let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+                state.writes = 0;
+                state.write_error = case == 0;
+                state.stale_reply = case == 1;
+                state.bad_numeric = case == 2;
+                state.bad_member = None;
+            }
+            let limits = NativeQ2ProjectionLimits::new(128, 128, 16, Duration::from_secs(4))?
+                .with_resident_weights(16_384)?;
+            let mut memory = vec![0_u8; limits.allocation_bytes()];
+            let pointer = memory.as_mut_ptr().cast::<c_void>();
+            let expected = QueueBuffer {
+                fd: 7,
+                size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+                offset: 0,
+                flags: 0x90,
+                pointer,
+            };
+            let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            report.queue.poisoned = true;
+            let queue_write = WriteCall::Nonblocking(write);
+            let mut progress = |_: &Q2ProjectionReport| {};
+            let mut session = Session {
+                report: &mut report,
+                queue_write: &queue_write,
+                queue_read: if case == 3 {
+                    read_wrong_tensor_count
+                } else {
+                    read
+                },
+                queue: null_mut(),
+                memory: pointer,
+                expected,
+                extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+                extra_arena_count: 0,
+                mapper: None,
+                limits: limits.common,
+                mode: Mode::NativeQ2 { columns: 128 },
+                resident_weights: HmxQ2WeightRegistry::new(0)?,
+                native_resident_weights: NativeQ2WeightRegistry::new(
+                    limits.resident_weight_bytes(),
+                )?,
+                dirty_resident_weights: false,
+                work_deadline: Instant::now() + Duration::from_secs(1),
+                progress: &mut progress,
+                failed: false,
+            };
+            let handle = NativeQ2Submitter::prepare_weights(&mut session, 128, 128, &weights)?
+                .ok_or(Error::Contract)?;
+            let mut foreign = NativeQ2WeightRegistry::new(weights.len())?;
+            let foreign = foreign
+                .prepare(128, 128, &weights)?
+                .ok_or(Error::Contract)?;
+            let mismatched =
+                NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights[..1152])?
+                    .ok_or(Error::Contract)?;
+            let down = if case == 4 {
+                &foreign
+            } else if case == 10 {
+                &mismatched
+            } else {
+                &handle
+            };
+            if case == 5 {
+                session.work_deadline = Instant::now();
+            }
+            if case == 6 {
+                session.limits.operations = 3;
+            }
+            let mut activation = [1.0_f32; 128];
+            if case == 9 {
+                activation[127] = f32::INFINITY;
+            }
+            let residual = [1.0_f32; 128];
+            let residual = if case == 7 {
+                &residual[..127]
+            } else {
+                &residual[..]
+            };
+            let block = if case == 8 { 63 } else { 64 };
+            let mut output = [99.0_f32; 128];
+            let selected_output = if case == 11 {
+                &mut output[..127]
+            } else {
+                &mut output[..]
+            };
+            assert!(
+                session
+                    .submit_resident_ffn_chain(
+                        [&handle, &handle, down],
+                        &activation,
+                        Some(residual),
+                        Some(block),
+                        selected_output
+                    )
+                    .is_err()
+            );
+            assert!(selected_output.iter().all(|value| value.is_nan()));
+            assert!(session.failed);
+            assert_eq!(session.report.operations_completed, 0);
+            assert_eq!(session.report.queue_writes_completed, 0);
+            assert_eq!(NativeQ2Submitter::remaining_operations(&session), Some(0));
+            assert_eq!(
+                session.report.operations_submitted,
+                if case < 4 { 6 } else { 0 }
+            );
+            assert_eq!(
+                STATE.lock().map_err(|_| Error::Contract)?.writes,
+                u32::from(case < 4)
+            );
+            assert!(
+                session
+                    .submit_resident_ffn_chain([&handle; 3], &activation, None, None, &mut output)
+                    .is_err()
+            );
+            assert!(output.iter().all(|value| value.is_nan()));
+            assert_eq!(
+                STATE.lock().map_err(|_| Error::Contract)?.writes,
+                u32::from(case < 4)
+            );
+            assert_eq!(session.report.queue.queue_stop_result, None);
+            assert_eq!(session.report.queue.unmapping_result, None);
+            assert!(!session.report.completed_cycle());
+        }
+        Ok(())
     }
 
     #[test]

@@ -326,6 +326,32 @@ larger handle payload; the runtime's existing `size_of`-based metadata reservati
 does so within its unchanged cap. Wire bytes, signed kernels, placement and
 session limits remain unchanged. Source work avoided is not measured latency.
 
+The native borrowed session and owned session implement the complete single-token
+resident FFN chain: gate/up matmuls, `SwiGLU`, optional plain block Hadamard, down
+matmul and optional residual add. The four supported shapes have exactly
+`(operations, tensors) = (4, 12), (5, 14), (5, 15), (6, 17)`; Hadamard has two
+tensors, so a response assuming three tensors per operation cannot qualify it.
+Each chain validates all three session-owned weight handles and geometry before
+one nonblocking queue write, charges every operation and all three resident
+projections, flushes dirty secondary arenas, and retains the existing primary
+active-prefix cache and mapped-allocation bounds. Final output is copied only
+after the complete correlated response and finite-result check. Any malformed
+input, foreign handle, exhausted budget, deadline, write/reply or output failure
+poisons the owner and clears the caller output without replay or early teardown.
+Cancellation remains at the existing synchronous graph-operation boundary;
+requesting cancellation does not release an in-flight allocation.
+
+This is the existing explicit graph placement and supported transform subset.
+Adapters disable the chain, grouped rotations reject it, and down-projection
+Hadamard is eligible only when every authored sign is exactly positive one.
+The packet cannot encode arbitrary signs or adapter corrections. No new default,
+placement, resource discount, kernel, session allowance or release eligibility is
+introduced. Model-free queue controls cover all optional shapes, warm cache
+flushes, exact tensor counts and terminal failures; signed arithmetic, complete
+model/state/adapter parity, cancellation/teardown and measured request benefit
+remain separate qualification gates. True `N > 1` native-Q2 prefill remains open:
+the current native solver is specialized to the `N = 1` HVX matvec contract.
+
 Resident multi-operation packets also reuse already serialized tensor and HVX
 operation geometry inside their own command buffer. Members with the same row
 count and retained solver parameters share the first member's descriptors after

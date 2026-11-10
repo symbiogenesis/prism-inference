@@ -241,10 +241,31 @@ pub(crate) fn request_batch_buffers(
     {
         return Err(Error::Contract);
     }
+    request_counts(sequence, batch_operations, batch_operations * 3, n_bufs)
+}
+
+/// Only existing projection batches and the four explicit full-FFN chain shapes.
+const fn valid_counts(operations: u32, tensors: u32, buffers: u32) -> bool {
+    let batch = matches!(operations, 1 | 2 | 3 | 4 | 6 | 8 | 10)
+        && tensors == operations * 3
+        && buffers <= operations + 1;
+    let chain = matches!((operations, tensors), (4, 12) | (5, 14 | 15) | (6, 17)) && buffers <= 4;
+    buffers >= 1 && buffers <= 6 && (batch || chain)
+}
+
+pub(crate) fn request_counts(
+    sequence: u64,
+    operations: u32,
+    tensors: u32,
+    buffers: u32,
+) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
+    if !valid_counts(operations, tensors, buffers) {
+        return Err(Error::Contract);
+    }
     let mut result = request(sequence);
-    put32(&mut result, 8, n_bufs);
-    put32(&mut result, 12, batch_operations * 3);
-    put32(&mut result, 16, batch_operations);
+    put32(&mut result, 8, buffers);
+    put32(&mut result, 12, tensors);
+    put32(&mut result, 16, operations);
     Ok(result)
 }
 
@@ -258,6 +279,7 @@ pub(crate) fn response_batch_valid(bytes: &[u8], sequence: u64, batch_operations
     response_batch_buffers_valid(bytes, sequence, batch_operations, 1)
 }
 
+#[cfg(test)]
 pub(crate) fn response_batch_buffers_valid(
     bytes: &[u8],
     sequence: u64,
@@ -267,7 +289,27 @@ pub(crate) fn response_batch_buffers_valid(
     if !matches!(batch_operations, 1 | 2 | 3 | 4 | 6 | 8 | 10)
         || !(1..=6).contains(&n_bufs)
         || n_bufs > batch_operations + 1
-        || sequence == 0
+    {
+        return false;
+    }
+    response_counts_valid(
+        bytes,
+        sequence,
+        batch_operations,
+        batch_operations * 3,
+        n_bufs,
+    )
+}
+
+pub(crate) fn response_counts_valid(
+    bytes: &[u8],
+    sequence: u64,
+    operations: u32,
+    tensors: u32,
+    buffers: u32,
+) -> bool {
+    if sequence == 0
+        || !valid_counts(operations, tensors, buffers)
         || bytes.len() != compute::COMPUTE_RESPONSE_BYTES
     {
         return false;
@@ -275,9 +317,9 @@ pub(crate) fn response_batch_buffers_valid(
     let mut fixed = [0; compute::COMPUTE_RESPONSE_BYTES];
     fixed.copy_from_slice(bytes);
     let correlated = fixed[..8] == sequence.to_le_bytes()
-        && fixed[28..32] == n_bufs.to_le_bytes()
-        && fixed[32..36] == (batch_operations * 3).to_le_bytes()
-        && fixed[36..40] == batch_operations.to_le_bytes();
+        && fixed[28..32] == buffers.to_le_bytes()
+        && fixed[32..36] == tensors.to_le_bytes()
+        && fixed[36..40] == operations.to_le_bytes();
     fixed[..8].copy_from_slice(&1_u64.to_le_bytes());
     fixed[28..32].copy_from_slice(&1_u32.to_le_bytes());
     fixed[32..36].copy_from_slice(&3_u32.to_le_bytes());
@@ -494,6 +536,42 @@ mod tests {
         put32(&mut bytes, 36, 2);
         assert!(response_batch_buffers_valid(&bytes, 42, 2, 2));
         assert!(!response_batch_buffers_valid(&bytes, 42, 2, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn full_ffn_request_correlates_exact_counts_and_rejects_other_shapes() -> Result<(), Error> {
+        for (operations, tensors) in [(4_u32, 12_u32), (5, 14), (5, 15), (6, 17)] {
+            let request = request_counts(71, operations, tensors, 4)?;
+            assert_eq!(&request[8..12], &4_u32.to_le_bytes());
+            assert_eq!(&request[12..16], &tensors.to_le_bytes());
+            assert_eq!(&request[16..20], &operations.to_le_bytes());
+            let mut reply = [0; compute::COMPUTE_RESPONSE_BYTES];
+            reply[..8].copy_from_slice(&71_u64.to_le_bytes());
+            for (offset, value) in [(24, 1_u32), (28, 4), (32, tensors), (36, operations)] {
+                put32(&mut reply, offset, value);
+            }
+            assert!(response_counts_valid(&reply, 71, operations, tensors, 4));
+            assert!(!response_counts_valid(&reply, 72, operations, tensors, 4));
+            for offset in [24_usize, 28, 32, 36, 44] {
+                let mut corrupted = reply;
+                corrupted[offset] ^= 1;
+                assert!(!response_counts_valid(
+                    &corrupted, 71, operations, tensors, 4
+                ));
+            }
+        }
+        for (operations, tensors, buffers) in [
+            (5, 13, 1),
+            (5, 16, 1),
+            (6, 16, 1),
+            (6, 17, 5),
+            (4, 11, 1),
+            (4, 12, 0),
+            (7, 21, 1),
+        ] {
+            assert!(request_counts(71, operations, tensors, buffers).is_err());
+        }
         Ok(())
     }
 

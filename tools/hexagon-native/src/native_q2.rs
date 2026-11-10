@@ -1929,10 +1929,6 @@ fn write_f32_2d_tensor_desc(
 /// `OP_MUL_MAT(gate)` + `OP_MUL_MAT(up)` + `HTP_OP_GLU_SWIGLU` +
 /// optional `HTP_OP_HADAMARD` + `OP_MUL_MAT(down)` + optional `HTP_OP_ADD(residual)`
 /// with VTCM intermediate residency chaining across all stages.
-#[allow(
-    dead_code,
-    reason = "Keep full intra-layer FFN 4/5/6-op descriptor assembly and VTCM pass flags together"
-)]
 #[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,

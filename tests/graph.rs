@@ -1454,16 +1454,16 @@ fn finite_decoder_output_clears_late_failure_without_publishing_hybrid_state() -
     decoder.evaluate_finite_into(0, &mut output)?;
     let before = graph_bits(&decoder)?;
     assert!(decoder.evaluate_finite_into(1, &mut output).is_err());
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     assert_eq!(output.as_ptr(), allocation);
     assert_eq!(graph_bits(&decoder)?, before);
     assert!(decoder.evaluate_finite_into(2, &mut output).is_err());
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     assert_eq!(graph_bits(&decoder)?, before);
     decoder.evaluate_finite_into(0, &mut output)?;
     decoder.evaluate_finite_into(0, &mut output)?;
     assert!(decoder.evaluate_finite_into(0, &mut output).is_err());
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     assert_eq!(output.as_ptr(), allocation);
     Ok(())
 }

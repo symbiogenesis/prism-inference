@@ -807,7 +807,7 @@ fn finite_decoder_default_checks_custom_outputs_and_clears_failures() -> Result<
     ] {
         fault.set(failure);
         assert!(decoder.evaluate_finite_into(2, &mut output).is_err());
-        assert!(output.is_empty());
+        assert_eq!(output, Vec::<f32>::new());
         assert_eq!(output.as_ptr(), allocation);
     }
     Ok(())

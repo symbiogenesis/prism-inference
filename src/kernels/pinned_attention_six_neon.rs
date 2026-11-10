@@ -105,10 +105,6 @@ pub(super) fn value_tile_neon<'a>(
     publish(neon, &mut sums, outputs, gates, groups)
 }
 
-#[expect(
-    clippy::needless_range_loop,
-    reason = "Each channel group combines sixteen temporal lanes before reusing its first lane."
-)]
 fn publish(
     neon: Neon,
     sums: &mut [[[f32x4<Neon>; super::VALUE_TILE / 4]; 16]; 6],

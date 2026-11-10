@@ -485,10 +485,6 @@ pub(super) fn value_tile_four_two_tokens_inner<'a>(
 
 /// Reuse dead accumulator storage instead of adding another output buffer.
 #[inline]
-#[expect(
-    clippy::needless_range_loop,
-    reason = "Each group reduces sixteen temporal lanes into its dead first lane."
-)]
 fn reduce_four_heads<const GROUPS: usize>(
     sums: &mut [[[f32x4<Neon>; GROUPS]; 16]; 4],
     groups: usize,

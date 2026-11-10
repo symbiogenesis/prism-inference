@@ -54,6 +54,9 @@ mod pinned_float_tests;
 #[cfg(test)]
 mod pinned_q8_tests;
 
+#[cfg(test)]
+mod finite_activation_tests;
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -408,7 +411,43 @@ fn pinned_q8k_integer(value: f32, inverse_scale: f32) -> Result<i8> {
     Ok(i8::try_from(integer.min(127))?)
 }
 
+// A scoped immutable proof, created only after the original complete-input
+// preflight. Quantizers still validate their scales, codes and rounded outputs.
+// Keeping preflight ahead of quantization preserves failure precedence when a
+// later input is nonfinite and an earlier block would overflow its scale.
+#[derive(Clone, Copy)]
+struct FiniteActivations<'a>(&'a [f32]);
+
+impl<'a> FiniteActivations<'a> {
+    fn new(input: &'a [f32]) -> Result<Self> {
+        if !is_finite_slice(input) {
+            return Err(invalid(
+                "matvec requires a matching finite activation vector",
+            ));
+        }
+        Ok(Self(input))
+    }
+
+    fn q8k<const PINNED: bool>(self, output: &mut Vec<Q8KBlock>) -> Result<()> {
+        q8k_with_input::<PINNED, true>(self.0, output)
+    }
+
+    fn q8<const PINNED: bool, const NATIVE_SCALE: bool>(
+        self,
+        output: &mut Vec<Q8Block>,
+    ) -> Result<()> {
+        q8_with_input::<PINNED, NATIVE_SCALE, true>(self.0, output)
+    }
+}
+
 fn q8k_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8KBlock>) -> Result<()> {
+    q8k_with_input::<PINNED, false>(input, output)
+}
+
+fn q8k_with_input<const PINNED: bool, const FINITE_INPUT: bool>(
+    input: &[f32],
+    output: &mut Vec<Q8KBlock>,
+) -> Result<()> {
     if !input.len().is_multiple_of(256) {
         return Err(invalid(
             "Q8_K activations require a multiple of 256 columns",
@@ -423,12 +462,14 @@ fn q8k_with_rounding<const PINNED: bool>(input: &[f32], output: &mut Vec<Q8KBloc
                 target_env = "msvc",
                 target_feature = "neon"
             ))]
-            if let Some(result) = neon::q8k_block::<PINNED>(chunk) {
+            if let Some(result) = neon::q8k_block::<PINNED, FINITE_INPUT>(chunk) {
                 return result;
             }
             let mut maximum = 0.0_f32;
             for &value in chunk {
-                finite(value)?;
+                if !FINITE_INPUT {
+                    finite(value)?;
+                }
                 if value.abs() > maximum.abs() {
                     maximum = value;
                 }
@@ -489,6 +530,13 @@ fn q8_with_contract<const PINNED: bool, const NATIVE_SCALE: bool>(
     input: &[f32],
     output: &mut Vec<Q8Block>,
 ) -> Result<()> {
+    q8_with_input::<PINNED, NATIVE_SCALE, false>(input, output)
+}
+
+fn q8_with_input<const PINNED: bool, const NATIVE_SCALE: bool, const FINITE_INPUT: bool>(
+    input: &[f32],
+    output: &mut Vec<Q8Block>,
+) -> Result<()> {
     if !input.len().is_multiple_of(32) {
         return Err(invalid("Q8_0 activations require a multiple of 32 columns"));
     }
@@ -501,12 +549,15 @@ fn q8_with_contract<const PINNED: bool, const NATIVE_SCALE: bool>(
                 target_env = "msvc",
                 target_feature = "neon"
             ))]
-            if PINNED && let Some(result) = neon::q8_pinned_block::<NATIVE_SCALE>(chunk) {
+            if PINNED
+                && let Some(result) = neon::q8_pinned_block::<NATIVE_SCALE, FINITE_INPUT>(chunk)
+            {
                 return result;
             }
             let mut maximum = 0.0_f32;
             for &value in chunk {
-                maximum = maximum.max(finite(value)?.abs());
+                let value = if FINITE_INPUT { value } else { finite(value)? };
+                maximum = maximum.max(value.abs());
             }
             // The pinned ARM64 Q8_0 binary multiplies by this rounded
             // reciprocal for the stored scale, but divides 127 by the
@@ -1941,25 +1992,26 @@ impl MatvecScratch {
         ))]
         self.pq2_consumption.clear();
         let (columns, _, _) = dimensions(tensor)?;
-        if input.len() != columns || !is_finite_slice(input) {
+        if input.len() != columns {
             return Err(invalid(
                 "matvec requires a matching finite activation vector",
             ));
         }
+        let finite_input = FiniteActivations::new(input)?;
         let contract = ActivationContract::for_tensor(tensor, columns, self.pinned_accumulation);
         if quantized {
             match contract {
                 ActivationContract::PinnedPtq1Q8 => {
-                    q8_with_contract::<true, true>(input, &mut self.q8)?;
+                    finite_input.q8::<true, true>(&mut self.q8)?;
                 }
                 ActivationContract::Q8K if self.pinned_accumulation => {
-                    q8k_with_rounding::<true>(input, &mut self.q8k)?;
+                    finite_input.q8k::<true>(&mut self.q8k)?;
                 }
-                ActivationContract::Q8K => q8k_into(input, &mut self.q8k)?,
+                ActivationContract::Q8K => finite_input.q8k::<false>(&mut self.q8k)?,
                 ActivationContract::Q8 if self.pinned_accumulation => {
-                    q8_with_rounding::<true>(input, &mut self.q8)?;
+                    finite_input.q8::<true, false>(&mut self.q8)?;
                 }
-                ActivationContract::Q8 => q8_into(input, &mut self.q8)?,
+                ActivationContract::Q8 => finite_input.q8::<false, false>(&mut self.q8)?,
                 ActivationContract::F32 => {
                     if self.activations.len() == input.len() {
                         self.activations.copy_from_slice(input);

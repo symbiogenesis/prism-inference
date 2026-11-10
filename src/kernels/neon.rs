@@ -651,7 +651,10 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
 }
 
 #[inline]
-fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
+fn max_abs_with_sign_256<const FINITE_INPUT: bool>(
+    neon: Neon,
+    chunk: &[f32; 256],
+) -> Result<(f32, f32)> {
     let mut max_abs_vec = f32x4::splat(neon, 0.0);
     let mut finite_mask = max_abs_vec.is_finite();
     for group in chunk.as_chunks::<16>().0 {
@@ -659,14 +662,16 @@ fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
         let v1 = f32x4::from_slice(neon, &group[4..8]);
         let v2 = f32x4::from_slice(neon, &group[8..12]);
         let v3 = f32x4::from_slice(neon, &group[12..16]);
-        finite_mask &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
+        if !FINITE_INPUT {
+            finite_mask &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
+        }
         max_abs_vec = max_abs_vec
             .max(v0.abs())
             .max(v1.abs())
             .max(v2.abs())
             .max(v3.abs());
     }
-    if !finite_mask.all_true() {
+    if !FINITE_INPUT && !finite_mask.all_true() {
         return Err(crate::invalid("nonfinite tensor or activation value"));
     }
     let mut max_lanes = [0.0_f32; 4];
@@ -704,11 +709,11 @@ fn max_abs_with_sign_256(neon: Neon, chunk: &[f32; 256]) -> Result<(f32, f32)> {
     clippy::cast_possible_truncation,
     reason = "Each narrowed Q8_K lane and 16-element i8 sum is bounded within i16."
 )]
-pub(super) fn q8k_block<const PINNED: bool>(
+pub(super) fn q8k_block<const PINNED: bool, const FINITE_INPUT: bool>(
     chunk: &[f32; 256],
 ) -> Option<Result<bonsai_ternary::Q8KBlock>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let (max_abs, maximum) = match max_abs_with_sign_256(neon, chunk) {
+    let (max_abs, maximum) = match max_abs_with_sign_256::<FINITE_INPUT>(neon, chunk) {
         Ok(pair) => pair,
         Err(err) => return Some(Err(err)),
     };
@@ -793,7 +798,7 @@ pub(super) fn q8k_block<const PINNED: bool>(
 }
 
 #[inline]
-pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
+pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool, const FINITE_INPUT: bool>(
     chunk: &[f32; 32],
 ) -> Option<Result<super::Q8Block>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
@@ -804,14 +809,16 @@ pub(super) fn q8_pinned_block<const NATIVE_SCALE: bool>(
         let v1 = f32x4::from_slice(neon, &group[4..8]);
         let v2 = f32x4::from_slice(neon, &group[8..12]);
         let v3 = f32x4::from_slice(neon, &group[12..16]);
-        finite_mask &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
+        if !FINITE_INPUT {
+            finite_mask &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
+        }
         max_abs_vec = max_abs_vec
             .max(v0.abs())
             .max(v1.abs())
             .max(v2.abs())
             .max(v3.abs());
     }
-    if !finite_mask.all_true() {
+    if !FINITE_INPUT && !finite_mask.all_true() {
         return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     let max_lanes = max_abs_vec.to_array();

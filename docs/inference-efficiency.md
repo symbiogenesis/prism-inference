@@ -276,6 +276,21 @@ fourth-symbol values, token order, absent/refused residency, input and scale
 failure precedence, late failure, output clearing and terminal refusal. These
 host-only controls do not qualify signed-device arithmetic or prompt latency.
 
+Scoped matrix preparation now carries its existing complete-input finite proof
+into the Q8_K, Q8_0 and pinned PTQ1 quantizers. Their mandatory maximum scans
+omit duplicate finite predicates, including the baseline NEON input masks and
+their horizontal reductions. The original complete-input preflight still runs
+before any quantizer mutation, preserving malformed-shape, nonfinite-input and
+scale-overflow precedence. At 5,120 columns this omits 5,120 repeated input
+finite predicates per preparation; it does not omit the maximum traversal or
+measure a latency gain. Standalone row encoders retain their own input checks.
+Scale, code, output-rounding and finite-result checks remain in every path.
+The proof borrows immutable input only for the call and adds no retained storage.
+Controls compare every prepared scale/code/sum bit with the original quantizer
+entry points, preserve failure precedence and scratch invalidation, and cover
+overflow, subsequent recovery and external-executor validation. Defaults,
+arithmetic, admission and installed runtime identities remain unchanged.
+
 ## Device and delivery acceptance
 
 No workflow dispatch, source change or source check qualifies actual Swift

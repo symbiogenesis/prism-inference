@@ -178,8 +178,8 @@ fn apply_values_pair(
 ) -> Result<()> {
     let width = geometry.head;
     let offset = head / 6 * width;
-    let gates = projected
-        .map(|row| std::array::from_fn(|index| attention_gate(row, head + index, width)));
+    let gates =
+        projected.map(|row| std::array::from_fn(|index| attention_gate(row, head + index, width)));
     let [first, second] = outputs;
     let mut first_rows = rows(first, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
     let mut second_rows = rows(second, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
@@ -200,7 +200,10 @@ fn apply_values_pair(
             current.map(|row| &row[offset + start..offset + end]),
             scores,
             offset + start,
-            [[f0?, f1?, f2?, f3?, f4?, f5?], [s0?, s1?, s2?, s3?, s4?, s5?]],
+            [
+                [f0?, f1?, f2?, f3?, f4?, f5?],
+                [s0?, s1?, s2?, s3?, s4?, s5?],
+            ],
             gates.map(|row| row.map(|gate| &gate[start..end])),
         )?;
     }

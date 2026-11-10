@@ -4780,12 +4780,15 @@ mod tests {
         assert_eq!(session.report.operations_completed, 18);
         assert_eq!(session.report.queue_writes_completed, 3);
         let writes = STATE.lock().map_err(|_| Error::Contract)?.writes;
-        assert!(NativeQ2Submitter::submit_resident_multi8(
-            &mut session,
-            [&h_a; 8],
-            activations.map(|row| row.as_slice()),
-            outputs.each_mut().map(|row| row.as_mut_slice()),
-        ).is_err());
+        assert!(
+            NativeQ2Submitter::submit_resident_multi8(
+                &mut session,
+                [&h_a; 8],
+                activations.map(|row| row.as_slice()),
+                outputs.each_mut().map(|row| row.as_mut_slice()),
+            )
+            .is_err()
+        );
         assert!(outputs.iter().flatten().all(|value| value.is_nan()));
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, writes);
         assert_eq!(session.report.operations_completed, 18);

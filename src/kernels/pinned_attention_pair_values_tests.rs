@@ -47,8 +47,12 @@ fn paired_values_match_native_dot_and_share_common_cache_rows() -> crate::Result
                         .collect()
                 })
             });
-            let borrowed_weights = weights.each_ref().map(|row| row.each_ref().map(Vec::as_slice));
-            let borrowed_gates = gates.each_ref().map(|row| row.each_ref().map(Vec::as_slice));
+            let borrowed_weights = weights
+                .each_ref()
+                .map(|row| row.each_ref().map(Vec::as_slice));
+            let borrowed_gates = gates
+                .each_ref()
+                .map(|row| row.each_ref().map(Vec::as_slice));
             let mut actual: [[Vec<f32>; 6]; 2] =
                 std::array::from_fn(|_| std::array::from_fn(|_| vec![19.0; width]));
             let visits = Cell::new(0);

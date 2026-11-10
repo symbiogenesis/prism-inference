@@ -136,7 +136,7 @@ fn six_head_prefill_tiles_match_causal_oracle_across_pages_and_workers() -> crat
     let worker_counts = [1, 2, 3, 4, 7, 18];
     #[cfg(not(feature = "parallel-rows"))]
     let worker_counts = [1];
-    for count in [8, 16, 32] {
+    for count in [1, 2, 3, 8, 16, 32] {
         for base in [0, 63] {
             let fixture = fixture(base, count)?;
             let key_bits: Vec<u16> = fixture.keys.tokens().flatten().copied().collect();
@@ -249,5 +249,57 @@ fn six_head_prefill_excludes_future_nan_and_rejects_bad_prefix_before_output() -
     assert!(actual.iter().all(|&value| value == 19.0));
     assert!(fixture.keys.tokens().flatten().copied().eq(key_bits));
     assert!(fixture.values.tokens().flatten().copied().eq(value_bits));
+    Ok(())
+}
+
+#[test]
+fn six_head_paired_prefill_excludes_future_rows_and_rejects_malformed_input() -> crate::Result<()> {
+    let mut fixture = fixture(63, 3)?;
+    let poisoned = vec![f32::NAN; fixture.geometry.kv_heads * fixture.geometry.head];
+    fixture.keys.reserve_append()?;
+    fixture.values.reserve_append()?;
+    fixture.keys.append(&poisoned);
+    fixture.values.append(&poisoned);
+    let score_stride = 6 * 66;
+    let mut actual = vec![vec![19.0; fixture.geometry.heads * fixture.geometry.head]; 3];
+    let mut scores = vec![19.0; 3 * score_stride];
+    let run = |fixture: &Fixture, actual: &mut [Vec<f32>], scores: &mut [f32]| {
+        attend_tile_chunk(
+            &fixture.geometry,
+            63,
+            &fixture.queries,
+            &fixture.projected,
+            &fixture.keys,
+            &fixture.values,
+            &fixture.current_keys,
+            &fixture.current_values,
+            actual,
+            scores,
+            score_stride,
+            0.125,
+        )
+    };
+    run(&fixture, &mut actual, &mut scores)?;
+    for (token, actual) in actual.iter().enumerate() {
+        let expected = reference(&fixture, 63 + token, token)?;
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+        );
+    }
+    for row in &mut actual {
+        row.fill(19.0);
+    }
+    let retained_scores = scores.clone();
+    let original_query = fixture.queries[1].clone();
+    assert!(fixture.queries[1].pop().is_some());
+    assert!(run(&fixture, &mut actual, &mut scores).is_err());
+    assert_eq!(scores, retained_scores);
+    fixture.queries[1] = original_query;
+    fixture.queries[1][5 * fixture.geometry.head] = f32::NAN;
+    assert!(run(&fixture, &mut actual, &mut scores).is_err());
+    assert!(actual.iter().flatten().all(|&value| value == 19.0));
     Ok(())
 }

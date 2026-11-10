@@ -10,6 +10,35 @@ pub(crate) const VALUE_TILE: usize = 64;
 /// # Errors
 /// Rejects empty, mismatched or oversized rows and nonfinite reductions.
 pub(crate) fn dot(key: &[u16], queries: [&[f32]; 6]) -> Result<[f32; 6]> {
+    dot_many(key, queries)
+}
+
+/// Shares one cached key conversion across both tokens of a six-head pair.
+///
+/// Twelve native-lane accumulators occupy 768 bytes, below the existing value
+/// stage's 24 KiB high water. Register pressure and total benefit need separate
+/// ARM64 code-generation and whole-request qualification.
+///
+/// # Errors
+/// Rejects malformed rows and nonfinite reductions with the original lane tree.
+pub(crate) fn dot_pair(key: &[u16], queries: [[&[f32]; 6]; 2]) -> Result<[[f32; 6]; 2]> {
+    let [first, second] = queries;
+    let values = dot_many::<12>(
+        key,
+        std::array::from_fn(|head| {
+            if head < 6 {
+                first[head]
+            } else {
+                second[head - 6]
+            }
+        }),
+    )?;
+    Ok(std::array::from_fn(|token| {
+        std::array::from_fn(|head| values[token * 6 + head])
+    }))
+}
+
+fn dot_many<const HEADS: usize>(key: &[u16], queries: [&[f32]; HEADS]) -> Result<[f32; HEADS]> {
     let len = key.len();
     if len == 0
         || len > crate::model::swift::CONTEXT_TOKENS
@@ -27,7 +56,7 @@ pub(crate) fn dot(key: &[u16], queries: [&[f32]; 6]) -> Result<[f32; 6]> {
     if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
         return dot_neon(neon, key, queries);
     }
-    let mut sums = [[0.0_f32; 16]; 6];
+    let mut sums = [[0.0_f32; 16]; HEADS];
     for (index, &value) in key.iter().enumerate() {
         let value = bonsai_ternary::half_to_float(value);
         for (head, sum) in sums.iter_mut().enumerate() {
@@ -39,7 +68,7 @@ pub(crate) fn dot(key: &[u16], queries: [&[f32]; 6]) -> Result<[f32; 6]> {
             sum[index % 16] = 0.0_f32.mul_add(0.0, sum[index % 16]);
         }
     }
-    let mut output = [0.0; 6];
+    let mut output = [0.0; HEADS];
     for (output, sum) in output.iter_mut().zip(sums) {
         *output = reduce(&sum)?;
     }

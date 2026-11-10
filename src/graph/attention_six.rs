@@ -108,7 +108,34 @@ fn attend_prefix(
             pinned_attention::dot_f32(&current_key[offset..offset + width], query)? * scale;
         pinned_attention::softmax_round_f16(score)?;
     }
-    let scores = scores.each_ref().map(|score| &score[..]);
+    apply_values(
+        geometry,
+        head,
+        projected,
+        values,
+        current_value,
+        output,
+        scores.each_ref().map(|score| &score[..]),
+        past_tokens,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrow causal score rows and the original cache/projection without extra scratch."
+)]
+fn apply_values(
+    geometry: &Geometry,
+    head: usize,
+    projected: &[f32],
+    values: &KvCache,
+    current_value: &[f32],
+    output: &mut [f32],
+    scores: [&[f32]; 6],
+    past_tokens: usize,
+) -> Result<()> {
+    let width = geometry.head;
+    let offset = head / 6 * width;
     let gates: [&[f32]; 6] =
         std::array::from_fn(|index| attention_gate(projected, head + index, width));
     let [o0, o1, o2, o3, o4, o5] = rows(output, width)?;
@@ -140,7 +167,8 @@ fn attend_prefix(
 // than falling back to two independent tail heads in Swift's 6:1 GQA geometry.
 #[expect(
     clippy::too_many_arguments,
-    reason = "Borrow the existing per-token tile rows and caller-owned score storage without staging copies."
+    clippy::too_many_lines,
+    reason = "Paired causal scoring and publication retain borrowed token rows, exact extents and caller-owned score storage."
 )]
 pub(super) fn attend_tile_chunk(
     geometry: &Geometry,
@@ -157,6 +185,9 @@ pub(super) fn attend_tile_chunk(
     scale: f32,
 ) -> Result<()> {
     let count = outputs.len();
+    let score_extent = first_position
+        .checked_add(count)
+        .and_then(|positions| positions.checked_mul(6));
     if count == 0
         || count > 32
         || geometry.kv_heads == 0
@@ -166,31 +197,118 @@ pub(super) fn attend_tile_chunk(
         || projected.len() != count
         || current_keys.len() != count
         || current_values.len() != count
-        || scores.len() != count * score_stride
-        || score_stride < 6 * (first_position + count)
+        || count.checked_mul(score_stride) != Some(scores.len())
+        || score_extent.is_none_or(|extent| score_stride < extent)
         || outputs
             .iter()
             .any(|output| output.len() != geometry.heads * geometry.head)
     {
         return Err(invalid("invalid six-head attention tile geometry"));
     }
-    for (token, output) in outputs.iter_mut().enumerate() {
-        let position = first_position + token;
-        let token_scores = &mut scores[token * score_stride..(token + 1) * score_stride];
+    // Validate all borrowed rows before paired indexing or output publication.
+    let width = geometry.head;
+    let last_position = first_position
+        .checked_add(count - 1)
+        .ok_or_else(|| invalid("six-head attention position overflow"))?;
+    if width == 0
+        || keys.width != geometry.kv_heads * width
+        || values.width != keys.width
+        || last_position > keys.len / keys.width
+        || last_position > values.len / values.width
+        || queries
+            .iter()
+            .any(|row| row.len() != geometry.heads * width)
+        || projected
+            .iter()
+            .any(|row| row.len() != 2 * geometry.heads * width)
+        || current_keys.iter().any(|row| row.len() != keys.width)
+        || current_values.iter().any(|row| row.len() != values.width)
+    {
+        return Err(invalid("invalid six-head attention paired causal geometry"));
+    }
+    for (pair_index, pair_output) in outputs.chunks_mut(2).enumerate() {
+        let first = pair_index * 2;
+        let position = first_position + first;
+        let pair_scores =
+            &mut scores[first * score_stride..(first + pair_output.len()) * score_stride];
+        let [first_output, second_output] = pair_output else {
+            let output = &mut pair_output[0];
+            for head in (0..geometry.heads).step_by(6) {
+                attend_prefix(
+                    geometry,
+                    head,
+                    &queries[first],
+                    &projected[first],
+                    keys,
+                    values,
+                    position,
+                    &current_keys[first],
+                    &current_values[first],
+                    &mut output[head * width..(head + 6) * width],
+                    &mut pair_scores[..6 * (position + 1)],
+                    scale,
+                )?;
+            }
+            continue;
+        };
+        let (first_scores, second_scores) = pair_scores.split_at_mut(score_stride);
         for head in (0..geometry.heads).step_by(6) {
-            attend_prefix(
+            let offset = head / 6 * width;
+            let query_rows: [[&[f32]; 6]; 2] = std::array::from_fn(|token| {
+                std::array::from_fn(|index| {
+                    &queries[first + token][(head + index) * width..(head + index + 1) * width]
+                })
+            });
+            let mut score_rows = [
+                rows(&mut first_scores[..6 * (position + 1)], position + 1)?,
+                rows(&mut second_scores[..6 * (position + 2)], position + 2)?,
+            ];
+            for (cached, key) in keys.tokens().take(position + 1).enumerate() {
+                if cached == position {
+                    // Only the second token sees the first token's F16 key;
+                    // each token's own key retains the original F32 path.
+                    let dots = six::dot(&key[offset..offset + width], query_rows[1])?;
+                    for (score, dot) in score_rows[1].iter_mut().zip(dots) {
+                        score[cached] = dot * scale;
+                    }
+                } else {
+                    let dots = six::dot_pair(&key[offset..offset + width], query_rows)?;
+                    for (scores, dots) in score_rows.iter_mut().zip(dots) {
+                        for (score, dot) in scores.iter_mut().zip(dots) {
+                            score[cached] = dot * scale;
+                        }
+                    }
+                }
+            }
+            for (token, scores) in score_rows.iter_mut().enumerate() {
+                for (score, query) in scores.iter_mut().zip(query_rows[token]) {
+                    score[position + token] = pinned_attention::dot_f32(
+                        &current_keys[first + token][offset..offset + width],
+                        query,
+                    )? * scale;
+                    pinned_attention::softmax_round_f16(score)?;
+                }
+            }
+            let [first_rows, second_rows] = score_rows;
+            apply_values(
                 geometry,
                 head,
-                &queries[token],
-                &projected[token],
-                keys,
+                &projected[first],
                 values,
+                &current_values[first],
+                &mut first_output[head * width..(head + 6) * width],
+                first_rows.each_ref().map(|score| &score[..]),
                 position,
-                &current_keys[token],
-                &current_values[token],
-                &mut output[head * geometry.head..(head + 6) * geometry.head],
-                &mut token_scores[..6 * (position + 1)],
-                scale,
+            )?;
+            apply_values(
+                geometry,
+                head,
+                &projected[first + 1],
+                values,
+                &current_values[first + 1],
+                &mut second_output[head * width..(head + 6) * width],
+                second_rows.each_ref().map(|score| &score[..]),
+                position + 1,
             )?;
         }
     }

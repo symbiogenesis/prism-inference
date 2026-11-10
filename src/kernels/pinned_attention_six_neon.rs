@@ -6,9 +6,13 @@ use crate::{Result, invalid};
 
 use super::super::padded_dot_steps;
 
-pub(super) fn dot_neon(neon: Neon, key: &[u16], queries: [&[f32]; 6]) -> Result<[f32; 6]> {
+pub(super) fn dot_neon<const HEADS: usize>(
+    neon: Neon,
+    key: &[u16],
+    queries: [&[f32]; HEADS],
+) -> Result<[f32; HEADS]> {
     let zero = f32x4::splat(neon, 0.0);
-    let mut sums = [[zero; 4]; 6];
+    let mut sums = [[zero; 4]; HEADS];
     let (chunks, remainder) = key.as_chunks::<8>();
     for (index, chunk) in chunks.iter().enumerate() {
         let (first, second) = crate::kernels::neon::f16_bits_to_f32_x8(neon, chunk);
@@ -23,7 +27,7 @@ pub(super) fn dot_neon(neon: Neon, key: &[u16], queries: [&[f32]; 6]) -> Result<
         }
     }
     let vector_steps = key.len() - remainder.len();
-    let mut output = [0.0; 6];
+    let mut output = [0.0; HEADS];
     for (head, (sum, output)) in sums.into_iter().zip(&mut output).enumerate() {
         let mut scalar = sum.map(f32x4::to_array);
         for index in vector_steps..padded_dot_steps(key.len()) {

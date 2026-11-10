@@ -4,14 +4,14 @@
 
 ## Install from source
 
-GitHub bundles and crates.io packages are separate deliveries. This guide targets
-the prepared `0.1.22` GitHub/source release. The latest registry runtime is `0.1.22`;
-publication of the newer source and its dependencies remains separate work.
-After the [release gates](release-0.1.22.md#installation-and-provenance) pass and
-the tag is published, install its source with the pinned nightly:
+GitHub bundles and crates.io packages are separate deliveries. The published
+registry runtime is `0.1.23`; the matching GitHub tag supplies a Windows ARM64
+development prerelease. The [0.1.23 delivery scope](release-0.1.23.md) records
+its successful source checks and pending full Foundation, model and performance
+qualification. Install the published tagged source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-11-09 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.22 prism-inference --locked
+cargo +nightly-2026-11-09 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.23 prism-inference --locked
 prism-inference --help
 ```
 
@@ -28,7 +28,7 @@ The package name is `prism-inference`; the existing Rust import path remains
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.22", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.22", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.23", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.23", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
@@ -99,7 +99,9 @@ targets retain the portable Rust baseline. Every model byte is still checked
 through the retained handle before metadata parsing. The GGUF crate remains
 unsafe-free, and full-file reads, load progress and cancellation contracts are
 unchanged. This implementation alone establishes no startup timing improvement.
-Publish the new hash dependency before a registry GGUF release that requires it.
+The current delivery uses published `bonsai-native-hash 0.1.2` and
+`bonsai-gguf 0.1.4`; future helper changes still require their registry
+prerequisites before dependent package publication.
 
 ## Build a checkout
 
@@ -524,8 +526,8 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The checkout prepares version `0.1.22`; the source installation and library
-examples above select its release tag. Packaging rejects a changed or untracked source
+The published version is `0.1.23`; the source installation and library
+examples above select its exact tag. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
 records the resulting bytes; its source-to-binary trust still depends on the
@@ -563,28 +565,27 @@ model acceptance and performance unqualified. This separate workflow cannot serv
 as Foundation's successful-ancestor validation baseline. A missing cache or a
 timeout leaves packaging incomplete; it does not authorize another attempt.
 
-The prepared `0.1.22` GitHub/source release preserves all older full and prerelease artifacts. The
-[release scope](release-0.1.22.md) compares it with `0.1.21` and records its supported delivery, publication gates and
-qualification boundaries. Its Windows credential helper is pinned to Runner revision
-`abe04b4a8eff18388af96f0e75c8a8d180b81989`; the Git source is retained in the lockfile. The server
-temporarily sets `publish = false`, because a crates.io package cannot preserve that Git-only
-dependency and substituting registry `0.1.0` would omit the required read APIs. Checked GitHub
-bundles and exact source checkouts are the supported delivery paths for this server candidate. A
-reviewed helper registry release and server publication remain separate pending work. The hosted
+The published `0.1.23` runtime and Windows ARM64 development prerelease preserve
+all older full and prerelease artifacts. Its
+[delivery scope](release-0.1.23.md) records exact source
+`055c7430cb4771dfddb24ddaa30494af6ad182da`, the successful bounded bundle checks
+and independently pending qualification. The server pins registry
+`bonsai-windows-credentials =0.1.4` and retains `publish = false` because its
+Hexagon helpers are unpublished path dependencies. Verified GitHub bundles and
+exact source checkouts remain its supported delivery paths. The hosted
 [Source package workflow](../.github/workflows/source-package.yml) verifies normalized Cargo archives together before registry publication on
 Windows ARM64, Windows x64 and Linux ARM64. A separate application consumes the extracted runtime,
 GGUF and hash archives and runs model-free public API checks with scalar, default and parallel-row
 features. Its receipt retains archive digests, source identity, consumer lockfile and executed
 commands. This checks source delivery independently of building inside the original workspace.
 
-The new native hashing implementation needs `bonsai-native-hash` `0.1.0`
-published first, followed by `bonsai-gguf` `0.1.1` and the runtime. The runtime's
-exact GGUF pin selects the new dependency for future registry delivery; the path
-dependency builds that implementation in the reviewed checkout now. Registry
-publication remains separate. Source preparation and passing
-CI alone do not publish registry packages or qualify model serving.
+The five current registry helpers are already published and unchanged:
+`bonsai-native-hash =0.1.2`, `bonsai-neon-dot =0.1.1`, `bonsai-ternary =0.1.2`,
+`bonsai-gguf =0.1.4` and `bonsai-prism =0.1.4`. Only the runtime was newly
+published as `0.1.23`. Source preparation and hosted checks alone neither publish
+registry packages nor qualify model serving.
 
-The candidate release-bundle build explicitly enables
+The published development bundle build explicitly enables
 `prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the
 retained Foundation build command. The receipt's exact source revision, binary
 hashes and archive hash bind that build; its schema is unchanged. Library and

@@ -16,7 +16,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Add the Rust library to an application | [Library dependency and tokenizer example](build-and-validation.md#use-the-rust-library) |
 | Understand budgets and failure recovery | [Runtime contracts](runtime-contracts.md) |
 | Configure opt-in packed projection workers | [Explicit row workers](parallel-rows.md) |
-| Review prepared CPU work/storage reductions | [Inference efficiency candidate](inference-efficiency.md) |
+| Review CPU work/storage reductions and qualification limits | [Inference efficiency candidate](inference-efficiency.md) |
 | Review scoped packed activation preparation | [PQ2 consumption layout](packed-pq2-consumption.md) |
 | Select separately qualified CPU prompt tiles or GDN chunks | [CPU tiled prefill](cpu-tiled-prefill.md) |
 | Qualify exact latest-state service reuse | [Latest-prefix service](latest-prefix-service.md) |
@@ -24,7 +24,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |
 | Capture explicit rank-one adapter correctness evidence | [Adapter correctness path](rank-one-adapter.md) |
 | Check support and remaining qualification | [Roadmap](roadmap.md) |
-| Compare the prepared CPU release with its predecessor | [0.1.22 release scope](release-0.1.22.md) |
+| Review the published runtime and development prerelease | [0.1.23 delivery scope](release-0.1.23.md) |
 
 ## Technical reference
 

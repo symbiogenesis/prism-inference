@@ -135,7 +135,6 @@ pub(super) fn value_tile_four<'a>(
 /// Reduces the tile and optionally applies its original gate before publication.
 #[expect(
     clippy::large_stack_arrays,
-    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Keep optional gates aligned with the fixed four-head accumulators."
 )]

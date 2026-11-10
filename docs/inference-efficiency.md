@@ -291,6 +291,39 @@ entry points, preserve failure precedence and scratch invalidation, and cover
 overflow, subsequent recovery and external-executor validation. Defaults,
 arithmetic, admission and installed runtime identities remain unchanged.
 
+## Native-Q2 single-token finite-output evidence
+
+Scalar and two/three-sibling resident single-token projections now carry borrowed
+finite-output evidence from the native session's existing checked output copy.
+The executor consumes that evidence against the ordered pointer and length of
+every original output before publishing successful counters. An immutable borrow
+keeps those exact elements unchanged until consumption; another allocation,
+reordered siblings or a shortened member cannot waive validation. Arbitrary
+submitters use a conservative default that scans the returned elements. Only the
+native crate can construct evidence from an already validated checked copy, and
+borrowed, owned and public-session wrappers preserve that path.
+An arbitrary submitter that reports success but supplies nonfinite output now
+receives the evidence boundary's `native-rpc-contract-failed` diagnostic in place
+of `nonfinite Hexagon projection value`. Both outcomes remain terminal, clear all
+outputs and publish no completed counters. Errors returned by submission itself
+retain their original stage and diagnostic.
+
+This omits one extra host finite-validation traversal of each selected output
+element for those entry points, or `4 * output_rows` nominal bytes read per
+projection. The evidence itself contains a fixed stack array of slice borrows,
+with no heap allocation. Transient execution, multitoken batches, fused FFN and
+partial-row accumulation retain their existing validation. Signed kernels,
+floating-point bits, packets, operation order, resource admission and defaults
+are unchanged. No device speed or memory-traffic improvement is measured.
+
+Portable controls preserve signed zero, subnormals and finite extremes, reject
+NaNs/infinities and bind exact output regions. Custom-submitter controls cover
+scalar and both sibling families, success, malformed output, returned failures,
+foreign/reordered/partial evidence, output clearing and terminal rejection.
+Native fake-queue controls retain checked-copy bits and reject poisoned scalar
+and final-sibling responses without evidence or successful-counter publication.
+They open no driver and do not execute a DSP graph.
+
 ## Device and delivery acceptance
 
 No workflow dispatch, source change or source check qualifies actual Swift

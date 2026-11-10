@@ -42,7 +42,7 @@ pub use native_q2::{
     NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES, NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES,
     NATIVE_Q2_MAX_ROWS, NATIVE_Q2_MAX_WEIGHT_ARENAS, NATIVE_Q2_MAX_WEIGHT_BYTES,
     NATIVE_Q2_MAX_WORKING_BYTES, NATIVE_Q2_VTCM_REQUEST_BYTES, NativeQ2ProjectionLimits,
-    NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2WeightHandle, NativeQ2WeightRegistry,
+    NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle, NativeQ2WeightRegistry,
 };
 pub use power::{PowerStatus, power_status};
 pub use projection::{
@@ -837,6 +837,23 @@ impl NativeQ2Submitter for NativeQ2Session {
         }
     }
 
+    fn submit_resident_validated<'a>(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &'a mut [f32],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_validated(handle, activation, output)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handle, activation, output);
+            match self.0 {}
+        }
+    }
+
     fn submit_resident_batch2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 2],
@@ -854,6 +871,23 @@ impl NativeQ2Submitter for NativeQ2Session {
         }
     }
 
+    fn submit_resident_batch2_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 2],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_batch2_validated(handles, activation, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activation, outputs);
+            match self.0 {}
+        }
+    }
+
     fn submit_resident_batch3(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -863,6 +897,23 @@ impl NativeQ2Submitter for NativeQ2Session {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             self.0.submit_resident_batch3(handles, activation, outputs)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = (handles, activation, outputs);
+            match self.0 {}
+        }
+    }
+
+    fn submit_resident_batch3_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 3],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            self.0.submit_resident_batch3_validated(handles, activation, outputs)
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {

@@ -22,6 +22,55 @@ use std::time::Duration;
 
 static NEXT_NATIVE_REGISTRY_OWNER: AtomicU64 = AtomicU64::new(1);
 
+/// Borrowed finite-output evidence for one successful native-Q2 submission.
+///
+/// The immutable borrows keep the validated elements unchanged until the evidence
+/// is consumed. Consumers must bind it to every original destination with
+/// [`Self::validate_destinations`]; evidence for another slice cannot admit output.
+#[must_use = "Consume finite-output evidence against the original destination regions"]
+pub struct NativeQ2ValidatedOutputs<'a, const N: usize> {
+    outputs: [&'a [f32]; N],
+}
+
+impl<'a, const N: usize> NativeQ2ValidatedOutputs<'a, N> {
+    /// Validate arbitrary submitter outputs without changing their floating-point bits.
+    ///
+    /// # Errors
+    /// Rejects any nonfinite element, including every NaN payload and infinity.
+    pub fn validate(outputs: [&'a [f32]; N]) -> Result<Self, Error> {
+        if outputs.iter().all(|output| is_finite_f32_slice(output)) {
+            Ok(Self::from_validated(outputs))
+        } else {
+            Err(Error::Contract)
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn from_validated(outputs: [&'a [f32]; N]) -> Self {
+        Self { outputs }
+    }
+
+    /// Consume evidence only for the exact pointer and length of each destination.
+    ///
+    /// Capture these pairs before lending mutable outputs to the submitter. The
+    /// pointers are compared without dereferencing them. Order and lengths matter.
+    ///
+    /// # Errors
+    /// Rejects unrelated, reordered or partial destination evidence.
+    pub fn validate_destinations(
+        self,
+        destinations: [(*const f32, usize); N],
+    ) -> Result<(), Error> {
+        if self.outputs.iter().zip(destinations).all(|(output, (ptr, len))| {
+            std::ptr::eq(output.as_ptr(), ptr) && output.len() == len
+        }) {
+            Ok(())
+        } else {
+            Err(Error::Contract)
+        }
+    }
+}
+
 /// Largest input-column extent (`K`) for a single 1-op native `Q2_0` projection.
 pub const NATIVE_Q2_MAX_COLUMNS: usize = Q2_PROJECTION_MAX_ROWS;
 /// Largest weight-row extent (`M`) for a single 1-op native `Q2_0` projection.
@@ -442,6 +491,24 @@ pub trait NativeQ2Submitter {
         Err(Error::Contract)
     }
 
+    /// Submit one resident projection and retain finite-output evidence.
+    ///
+    /// Arbitrary submitters retain the conservative scan. Native sessions reuse
+    /// their checked copy's result. Consume the evidence against the original
+    /// destination before publishing output or successful operation statistics.
+    ///
+    /// # Errors
+    /// Propagates submission failures and rejects nonfinite output.
+    fn submit_resident_validated<'a>(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &'a mut [f32],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
+        self.submit_resident(handle, activation, output)?;
+        NativeQ2ValidatedOutputs::validate([output])
+    }
+
     /// Submit two resident `HTP_TYPE_Q2_0` projections sharing one `F32`
     /// activation vector in a single 2-op DSP queue submission.
     ///
@@ -460,6 +527,21 @@ pub trait NativeQ2Submitter {
         Err(Error::Contract)
     }
 
+    /// Submit two sibling projections and retain exact-destination finite evidence.
+    ///
+    /// # Errors
+    /// Propagates submission failures and rejects nonfinite output in either member.
+    fn submit_resident_batch2_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 2],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
+        let [out0, out1] = outputs;
+        self.submit_resident_batch2(handles, activation, [&mut *out0, &mut *out1])?;
+        NativeQ2ValidatedOutputs::validate([out0, out1])
+    }
+
     /// Submit three resident `HTP_TYPE_Q2_0` projections sharing one `F32`
     /// activation vector in a single 3-op DSP queue submission.
     ///
@@ -476,6 +558,21 @@ pub trait NativeQ2Submitter {
             output.fill(f32::NAN);
         }
         Err(Error::Contract)
+    }
+
+    /// Submit three sibling projections and retain exact-destination finite evidence.
+    ///
+    /// # Errors
+    /// Propagates submission failures and rejects nonfinite output in any member.
+    fn submit_resident_batch3_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 3],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
+        let [out0, out1, out2] = outputs;
+        self.submit_resident_batch3(handles, activation, [&mut *out0, &mut *out1, &mut *out2])?;
+        NativeQ2ValidatedOutputs::validate([out0, out1, out2])
     }
 
     /// Submit two resident `HTP_TYPE_Q2_0` projections with per-operation `F32`
@@ -680,6 +777,15 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         (**self).submit_resident(handle, activation, output)
     }
 
+    fn submit_resident_validated<'a>(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &'a mut [f32],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
+        (**self).submit_resident_validated(handle, activation, output)
+    }
+
     fn submit_resident_batch2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 2],
@@ -689,6 +795,15 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         (**self).submit_resident_batch2(handles, activation, outputs)
     }
 
+    fn submit_resident_batch2_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 2],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
+        (**self).submit_resident_batch2_validated(handles, activation, outputs)
+    }
+
     fn submit_resident_batch3(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -696,6 +811,15 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         outputs: [&mut [f32]; 3],
     ) -> Result<(), Error> {
         (**self).submit_resident_batch3(handles, activation, outputs)
+    }
+
+    fn submit_resident_batch3_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 3],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
+        (**self).submit_resident_batch3_validated(handles, activation, outputs)
     }
 
     fn submit_resident_multi2(
@@ -2570,6 +2694,40 @@ impl From<NativeQ2ProjectionLimits> for hmx_projection::HmxQ2ProjectionLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_q2_finite_output_evidence_binds_regions_and_preserves_bits() -> Result<(), Error> {
+        let bits = [0, 0x8000_0000, 1, 0x807f_ffff, 0x7f7f_ffff, 0xff7f_ffff];
+        let mut first = bits.map(f32::from_bits);
+        let second = bits.map(f32::from_bits);
+        let regions = [(first.as_ptr(), first.len()), (second.as_ptr(), second.len())];
+        NativeQ2ValidatedOutputs::validate([first.as_slice(), second.as_slice()])?
+            .validate_destinations(regions)?;
+        assert_eq!(first.map(f32::to_bits), bits);
+        assert_eq!(second.map(f32::to_bits), bits);
+        assert!(
+            NativeQ2ValidatedOutputs::validate([first.as_slice(), second.as_slice()])?
+                .validate_destinations([regions[1], regions[0]])
+                .is_err()
+        );
+        assert!(
+            NativeQ2ValidatedOutputs::validate([first.as_slice()])?
+                .validate_destinations([(first.as_ptr(), first.len() - 1)])
+                .is_err()
+        );
+        assert!(
+            NativeQ2ValidatedOutputs::validate([&first[..first.len() - 1]])?
+                .validate_destinations([regions[0]])
+                .is_err()
+        );
+        // Consuming evidence ends the immutable borrow; a later mutation needs
+        // its own validation and cannot reuse the consumed value.
+        for invalid in [0x7f80_0000, 0xff80_0000, 0x7f80_0001, 0xffc0_1234] {
+            first[5] = f32::from_bits(invalid);
+            assert!(NativeQ2ValidatedOutputs::validate([first.as_slice()]).is_err());
+        }
+        Ok(())
+    }
 
     // Deliberately serialize every member with the original scalar writer.
     // This oracle does not use packet-local descriptor reuse or its relocation.

@@ -7,7 +7,7 @@ use super::{
 use crate::{
     Error, GuardedQ2Submitter, HMX_Q2_BATCH_OPERATIONS, HMX_Q2_BATCH10_OPERATIONS,
     HmxQ2ProjectionLimits, HmxQ2Submitter, HmxQ2WeightHandle, HmxQ2WeightRegistry,
-    NATIVE_Q2_MAX_WEIGHT_ARENAS, NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle,
+    NATIVE_Q2_MAX_WEIGHT_ARENAS, NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle,
     NativeQ2WeightRegistry, Q2ProjectionLimits, Q2ProjectionReport, SessionPreparationReport,
     hmx_projection, native_q2, projection,
 };
@@ -1905,6 +1905,16 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         )
     }
 
+    fn submit_resident_validated<'a>(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &'a mut [f32],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
+        self.submit_resident(handle, activation, output)?;
+        Ok(NativeQ2ValidatedOutputs::from_validated([output]))
+    }
+
     fn submit_resident_batch2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 2],
@@ -1914,6 +1924,17 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         self.submit_native_resident_batch::<2>(handles, activation, outputs)
     }
 
+    fn submit_resident_batch2_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 2],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
+        let [out0, out1] = outputs;
+        self.submit_resident_batch2(handles, activation, [&mut *out0, &mut *out1])?;
+        Ok(NativeQ2ValidatedOutputs::from_validated([out0, out1]))
+    }
+
     fn submit_resident_batch3(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -1921,6 +1942,17 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         outputs: [&mut [f32]; 3],
     ) -> Result<(), Error> {
         self.submit_native_resident_batch::<3>(handles, activation, outputs)
+    }
+
+    fn submit_resident_batch3_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 3],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
+        let [out0, out1, out2] = outputs;
+        self.submit_resident_batch3(handles, activation, [&mut *out0, &mut *out1, &mut *out2])?;
+        Ok(NativeQ2ValidatedOutputs::from_validated([out0, out1, out2]))
     }
 
     fn submit_resident_multi2(
@@ -2288,6 +2320,16 @@ impl NativeQ2Submitter for NativeQ2Session {
         })
     }
 
+    fn submit_resident_validated<'a>(
+        &mut self,
+        handle: &NativeQ2WeightHandle,
+        activation: &[f32],
+        output: &'a mut [f32],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
+        self.submit_resident(handle, activation, output)?;
+        Ok(NativeQ2ValidatedOutputs::from_validated([output]))
+    }
+
     fn submit_resident_batch2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 2],
@@ -2299,6 +2341,17 @@ impl NativeQ2Submitter for NativeQ2Session {
         })
     }
 
+    fn submit_resident_batch2_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 2],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 2],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
+        let [out0, out1] = outputs;
+        self.submit_resident_batch2(handles, activation, [&mut *out0, &mut *out1])?;
+        Ok(NativeQ2ValidatedOutputs::from_validated([out0, out1]))
+    }
+
     fn submit_resident_batch3(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -2308,6 +2361,17 @@ impl NativeQ2Submitter for NativeQ2Session {
         self.with_session(|session| {
             NativeQ2Submitter::submit_resident_batch3(session, handles, activation, outputs)
         })
+    }
+
+    fn submit_resident_batch3_validated<'a>(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        outputs: [&'a mut [f32]; 3],
+    ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
+        let [out0, out1, out2] = outputs;
+        self.submit_resident_batch3(handles, activation, [&mut *out0, &mut *out1, &mut *out2])?;
+        Ok(NativeQ2ValidatedOutputs::from_validated([out0, out1, out2]))
     }
 
     fn submit_resident_multi2(
@@ -3337,6 +3401,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the complete fake native session, scoped flush and finite evidence failure lifecycle together"
+    )]
     fn resident_native_q2_scopes_queue_buffer_flush_after_initial_dirty_submission()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
@@ -3398,7 +3466,9 @@ mod tests {
             .ok_or(Error::Contract)?;
         assert!(session.dirty_resident_weights);
         let mut output = [99.0_f32; 32];
-        NativeQ2Submitter::submit_resident(&mut session, &handle, &activation, &mut output)?;
+        let destination = (output.as_ptr(), output.len());
+        NativeQ2Submitter::submit_resident_validated(&mut session, &handle, &activation, &mut output)?
+            .validate_destinations([destination])?;
         assert_eq!(output, [7.0_f32; 32]);
         assert!(!session.dirty_resident_weights);
         assert_eq!(
@@ -3407,12 +3477,26 @@ mod tests {
         );
 
         output.fill(99.0);
-        NativeQ2Submitter::submit_resident(&mut session, &handle, &activation, &mut output)?;
+        let destination = (output.as_ptr(), output.len());
+        NativeQ2Submitter::submit_resident_validated(&mut session, &handle, &activation, &mut output)?
+            .validate_destinations([destination])?;
         assert_eq!(output, [7.0_f32; 32]);
         assert_eq!(
             STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
             4096
         );
+        STATE.lock().map_err(|_| Error::Contract)?.bad_numeric = true;
+        assert!(NativeQ2Submitter::submit_resident_validated(
+            &mut session, &handle, &activation, &mut output,
+        ).is_err());
+        assert!(output.iter().all(|value| value.is_nan()));
+        assert!(session.failed);
+        assert_eq!(session.report.operations_completed, 2);
+        assert_eq!(session.report.queue_writes_completed, 2);
+        assert!(NativeQ2Submitter::submit_resident_validated(
+            &mut session, &handle, &activation, &mut output,
+        ).is_err());
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
         Ok(())
     }
 
@@ -3427,6 +3511,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the complete mixed-row fake session, sibling evidence and final-member numeric failure together"
+    )]
     fn resident_native_q2_batch2_and_batch3_share_activation_and_validate_mixed_rows()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
@@ -3444,7 +3532,7 @@ mod tests {
             state.bad_numeric = false;
             state.bad_member = None;
         }
-        let limits = NativeQ2ProjectionLimits::new(128, 64, 6, Duration::from_secs(4))?
+        let limits = NativeQ2ProjectionLimits::new(128, 64, 8, Duration::from_secs(4))?
             .with_resident_weights(16_384)?;
         let mut memory = vec![0_u8; limits.allocation_bytes()];
         let pointer = memory.as_mut_ptr().cast::<c_void>();
@@ -3485,12 +3573,13 @@ mod tests {
             .ok_or(Error::Contract)?;
         let mut out_a = [99.0_f32; 32];
         let mut out_b = [99.0_f32; 64];
-        NativeQ2Submitter::submit_resident_batch2(
+        let destinations = [(out_a.as_ptr(), out_a.len()), (out_b.as_ptr(), out_b.len())];
+        NativeQ2Submitter::submit_resident_batch2_validated(
             &mut session,
             [&h_32, &h_64],
             &activation,
             [&mut out_a, &mut out_b],
-        )?;
+        )?.validate_destinations(destinations)?;
         assert_eq!(out_a, [7.0_f32; 32]);
         assert_eq!(out_b, [8.0_f32; 64]);
         assert_eq!(session.report.operations_completed, 2);
@@ -3498,12 +3587,13 @@ mod tests {
         assert_eq!(session.report.resident_submissions, 2);
 
         let mut out_c = [99.0_f32; 32];
-        NativeQ2Submitter::submit_resident_batch3(
+        let destinations = [(out_b.as_ptr(), out_b.len()), (out_a.as_ptr(), out_a.len()), (out_c.as_ptr(), out_c.len())];
+        NativeQ2Submitter::submit_resident_batch3_validated(
             &mut session,
             [&h_64, &h_32, &h_32],
             &activation,
             [&mut out_b, &mut out_a, &mut out_c],
-        )?;
+        )?.validate_destinations(destinations)?;
         assert_eq!(out_b, [7.0_f32; 64]);
         assert_eq!(out_a, [8.0_f32; 32]);
         assert_eq!(out_c, [9.0_f32; 32]);
@@ -3511,6 +3601,18 @@ mod tests {
         assert_eq!(session.report.queue_writes_completed, 2);
         assert_eq!(session.report.resident_submissions, 5);
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 2);
+        STATE.lock().map_err(|_| Error::Contract)?.bad_member = Some(2);
+        assert!(NativeQ2Submitter::submit_resident_batch3_validated(
+            &mut session,
+            [&h_64, &h_32, &h_32],
+            &activation,
+            [&mut out_b, &mut out_a, &mut out_c],
+        ).is_err());
+        assert!(out_a.iter().chain(&out_b).chain(&out_c).all(|value| value.is_nan()));
+        assert!(session.failed);
+        assert_eq!(session.report.operations_completed, 5);
+        assert_eq!(session.report.queue_writes_completed, 2);
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
         Ok(())
     }
 

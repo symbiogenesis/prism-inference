@@ -139,6 +139,11 @@ fn gated_tiles_preserve_ungated_failure_publication_and_reject_bad_gates() {
                     0, output_refs(&mut actual), gates.each_ref().map(Vec::as_slice),
                 ).is_err());
                 assert_bits(&actual, &expected);
+                // Independent legacy contract: the first head publishes its
+                // finite prefix, then stops before the failing channel.
+                assert!(actual[0][..bad_channel].iter().all(|value| value.to_bits() == 2.0_f32.to_bits()));
+                assert!(actual[0][bad_channel..].iter().all(|value| value.to_bits() == 19.0_f32.to_bits()));
+                assert!(actual[1..].iter().flatten().all(|value| value.to_bits() == 19.0_f32.to_bits()));
             }
         }
     }

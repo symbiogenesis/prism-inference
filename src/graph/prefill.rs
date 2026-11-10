@@ -19,6 +19,10 @@ use crate::{MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
 #[path = "prefill_gdn.rs"]
 mod gdn;
 
+#[cfg(test)]
+#[path = "prefill_six_tests.rs"]
+mod six_tests;
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct TileReuse<'a> {
     basis: Option<&'a Tensor>,

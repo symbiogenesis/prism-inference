@@ -108,6 +108,32 @@ rejection and complete copied-route failure publication. Release code generation
 complete-model logits/state/adapter recovery and whole-prompt benefit remain
 pending before release integration.
 
+## Grouped GDN finite checks
+
+The staged baseline NEON four/eight-row GDN helpers combine all updated-lane
+finite masks before one horizontal predicate reduction at their existing
+publication boundary. Every updated vector is still checked. Key-dot and
+query-dot checks retain their order, and arithmetic, private staging capacities
+and output bits are unchanged. Any failure leaves all grouped destinations
+untouched, allowing the checked facade to replay the original row-ordered
+scalar failure path. Single-row helpers retain their earlier blockwise checks
+and exact partial-error publication.
+
+At Swift's width 128, an eight-row decode group has one updated-lane horizontal
+predicate reduction instead of 64. Across 48 recurrent layers, 48 value heads
+and 16 groups per head, this is 36,864 reductions instead of 2,359,296 per token.
+A 32-token exact tile combines 2,048 such predicates per group into one. These
+are source work counts; every vector finite predicate and separate dot-result
+check remains. They establish no instruction count or measured speedup. Release
+ARM64 code generation and spill review, complete-model state/logit/adapter and
+cancellation parity, and matched whole-request benefit remain required.
+
+Direct NEON controls compare successful state/output bits to independent scalar
+recurrence and reject early/late key, update and output failures without any
+publication across both staging capacities. A separate checked-facade control
+compares scalar replay's complete partial state and output bits after a late
+update overflow.
+
 ## Bounds and recovery
 
 The additional reservation conservatively charges all tile vectors, both packed

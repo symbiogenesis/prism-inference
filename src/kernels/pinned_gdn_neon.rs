@@ -5,6 +5,9 @@
 //! consumes that decayed block before replacing it with its checked update.
 //! Caller-owned rows remain untouched until the helper's existing publication
 //! point, so grouped fallback and single-row partial-error semantics are retained.
+//! Grouped rows combine every updated-lane finite predicate in a vector mask;
+//! its only horizontal reduction occurs before publication. Dot-result checks
+//! retain their original order. Single-row publication remains unchanged.
 
 use fearless_simd::{Neon, f32x4, prelude::*};
 
@@ -941,6 +944,9 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
         return None;
     }
     let blocks = width / 16;
+    // Every update remains private until the group commits. Preserve all lane
+    // predicates while reducing their combined mask once before publication.
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let decays = f32x4::splat(neon, decay);
     let mut work = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 4];
     let mut s0 = [f32x4::splat(neon, 0.0); 4];
@@ -1004,9 +1010,7 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
             let u1 = scale.mul_add_precise(k1, d1);
             let u2 = scale.mul_add_precise(k2, d2);
             let u3 = scale.mul_add_precise(k3, d3);
-            if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
-                return None;
-            }
+            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
             work[r][b] = [u0, u1, u2, u3];
             q0[r] = u0.mul_add_precise(qv0, q0[r]);
             q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1022,6 +1026,10 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
             return None;
         }
         outputs[r] = out;
+    }
+
+    if !finite_mask.all_true() {
+        return None;
     }
 
     for (state, row_blocks) in states.into_iter().zip(work.iter()) {
@@ -1076,6 +1084,9 @@ fn step_four_rows_tokens_from_blocks<const BLOCKS: usize>(
         return false;
     }
     let blocks = width / 16;
+    // Every update remains private until the group commits. Preserve all lane
+    // predicates while reducing their combined mask once before publication.
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 4];
     for (r, prev) in previous.iter().enumerate() {
         for (b, prev_block) in prev.as_chunks::<16>().0.iter().enumerate() {
@@ -1148,9 +1159,7 @@ fn step_four_rows_tokens_from_blocks<const BLOCKS: usize>(
                 let u1 = delta.mul_add_precise(k1, d1);
                 let u2 = delta.mul_add_precise(k2, d2);
                 let u3 = delta.mul_add_precise(k3, d3);
-                if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
-                    return false;
-                }
+                finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
                 current[r][b] = [u0, u1, u2, u3];
                 q0[r] = u0.mul_add_precise(qv0, q0[r]);
                 q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1165,6 +1174,10 @@ fn step_four_rows_tokens_from_blocks<const BLOCKS: usize>(
             }
             staged_out[r][token] = out * scale;
         }
+    }
+
+    if !finite_mask.all_true() {
+        return false;
     }
 
     for (state, row_blocks) in states.into_iter().zip(current.iter()) {
@@ -1215,6 +1228,9 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
         return None;
     }
     let blocks = width / 16;
+    // Every update remains private until the group commits. Preserve all lane
+    // predicates while reducing their combined mask once before publication.
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let decays = f32x4::splat(neon, decay);
     let mut work = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 8];
     let mut s0 = [f32x4::splat(neon, 0.0); 8];
@@ -1278,9 +1294,7 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
             let u1 = scale.mul_add_precise(k1, d1);
             let u2 = scale.mul_add_precise(k2, d2);
             let u3 = scale.mul_add_precise(k3, d3);
-            if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
-                return None;
-            }
+            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
             work[r][b] = [u0, u1, u2, u3];
             q0[r] = u0.mul_add_precise(qv0, q0[r]);
             q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1296,6 +1310,10 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
             return None;
         }
         outputs[r] = out;
+    }
+
+    if !finite_mask.all_true() {
+        return None;
     }
 
     for (state, row_blocks) in states.into_iter().zip(work.iter()) {
@@ -1352,6 +1370,9 @@ fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
         return false;
     }
     let blocks = width / 16;
+    // Every update remains private until the group commits. Preserve all lane
+    // predicates while reducing their combined mask once before publication.
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 8];
     for (r, prev) in previous.iter().enumerate() {
         for (b, prev_block) in prev.as_chunks::<16>().0.iter().enumerate() {
@@ -1424,9 +1445,7 @@ fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
                 let u1 = delta.mul_add_precise(k1, d1);
                 let u2 = delta.mul_add_precise(k2, d2);
                 let u3 = delta.mul_add_precise(k3, d3);
-                if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
-                    return false;
-                }
+                finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
                 current[r][b] = [u0, u1, u2, u3];
                 q0[r] = u0.mul_add_precise(qv0, q0[r]);
                 q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1441,6 +1460,10 @@ fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
             }
             staged_out[r][token] = out * scale;
         }
+    }
+
+    if !finite_mask.all_true() {
+        return false;
     }
 
     for (state, row_blocks) in states.into_iter().zip(current.iter()) {
@@ -1485,6 +1508,9 @@ fn step_four_rows_tokens_in_place_blocks<const BLOCKS: usize>(
         return false;
     }
     let blocks = width / 16;
+    // Every update remains private until the group commits. Preserve all lane
+    // predicates while reducing their combined mask once before publication.
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 4];
     for (r, state) in states.iter().enumerate() {
         for (b, state_block) in state.as_chunks::<16>().0.iter().enumerate() {
@@ -1556,9 +1582,7 @@ fn step_four_rows_tokens_in_place_blocks<const BLOCKS: usize>(
                 let u1 = delta.mul_add_precise(k1, d1);
                 let u2 = delta.mul_add_precise(k2, d2);
                 let u3 = delta.mul_add_precise(k3, d3);
-                if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
-                    return false;
-                }
+                finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
                 current[r][b] = [u0, u1, u2, u3];
                 q0[r] = u0.mul_add_precise(qv0, q0[r]);
                 q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1571,6 +1595,10 @@ fn step_four_rows_tokens_in_place_blocks<const BLOCKS: usize>(
                 return false;
             }
         }
+    }
+
+    if !finite_mask.all_true() {
+        return false;
     }
 
     for (state, row_blocks) in states.into_iter().zip(current.iter()) {
@@ -1610,6 +1638,9 @@ fn step_eight_rows_tokens_in_place_blocks<const BLOCKS: usize>(
         return false;
     }
     let blocks = width / 16;
+    // Every update remains private until the group commits. Preserve all lane
+    // predicates while reducing their combined mask once before publication.
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let mut current = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 8];
     for (r, state) in states.iter().enumerate() {
         for (b, state_block) in state.as_chunks::<16>().0.iter().enumerate() {
@@ -1681,9 +1712,7 @@ fn step_eight_rows_tokens_in_place_blocks<const BLOCKS: usize>(
                 let u1 = delta.mul_add_precise(k1, d1);
                 let u2 = delta.mul_add_precise(k2, d2);
                 let u3 = delta.mul_add_precise(k3, d3);
-                if !(u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite()).all_true() {
-                    return false;
-                }
+                finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
                 current[r][b] = [u0, u1, u2, u3];
                 q0[r] = u0.mul_add_precise(qv0, q0[r]);
                 q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1696,6 +1725,10 @@ fn step_eight_rows_tokens_in_place_blocks<const BLOCKS: usize>(
                 return false;
             }
         }
+    }
+
+    if !finite_mask.all_true() {
+        return false;
     }
 
     for (state, row_blocks) in states.into_iter().zip(current.iter()) {

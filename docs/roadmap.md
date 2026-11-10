@@ -14,7 +14,11 @@ worker, private HTTP server, GGUF tooling, ternary codecs and native storage
 overlay. SwiftBonsai consumes a prebuilt server inside its guarded Windows Job;
 ordinary SwiftBonsai builds do not compile this runtime.
 
-The [0.1.23 delivery scope](release-0.1.23.md) records the published CPU crate and
+The [0.1.24 registry delivery](release-0.1.24.md) records the newer published
+runtime package and its verified checksum. Its binary bundle and Runner repin
+remain pending owner source publication and source-bound hosted production.
+
+The [0.1.23 delivery scope](release-0.1.23.md) records the earlier CPU crate and
 Windows ARM64 development prerelease at `055c743`. Its bounded hosted operation
 passed source/receipt controls, analyzers, portable compilation and production
 linking. Complete Foundation, runtime conformance, platform/model/state/adapter

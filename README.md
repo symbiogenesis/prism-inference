@@ -56,7 +56,7 @@ setup and a guarded launcher that consumes the prebuilt private server.
 
 For source installation or Rust library integration, follow the
 [build and library guide](docs/build-and-validation.md#install-from-source).
-It pins the reviewed Git source and compiler. GitHub binary releases and
+It pins the registry package version and compiler. GitHub binary releases and
 crates.io versions are separate deliveries; an unpinned `cargo install` can
 select an older runtime.
 

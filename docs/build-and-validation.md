@@ -5,13 +5,13 @@
 ## Install from source
 
 GitHub bundles and crates.io packages are separate deliveries. The published
-registry runtime is `0.1.23`; the matching GitHub tag supplies a Windows ARM64
-development prerelease. The [0.1.23 delivery scope](release-0.1.23.md) records
-its successful source checks and pending full Foundation, model and performance
-qualification. Install the published tagged source with the pinned nightly:
+registry runtime is `0.1.24`; the latest verified Windows ARM64 development
+bundle remains `0.1.23`. The [0.1.24 registry delivery](release-0.1.24.md) and
+[0.1.23 binary delivery](release-0.1.23.md) retain their separate checks and
+pending qualification. Install the registry source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-11-09 install --git https://github.com/symbiogenesis/prism-inference --tag v0.1.23 prism-inference --locked
+cargo +nightly-2026-11-09 install prism-inference --version '=0.1.24' --locked
 prism-inference --help
 ```
 
@@ -24,15 +24,15 @@ for the five-executable distribution and registry prerequisites.
 ## Use the Rust library
 
 The package name is `prism-inference`; the existing Rust import path remains
-`bonsai_prism_runtime`. A tagged scalar library dependency is:
+`bonsai_prism_runtime`. An exact registry scalar library dependency is:
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.23", git = "https://github.com/symbiogenesis/prism-inference", tag = "v0.1.23", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.24", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
-and retain its `Cargo.lock`, which records the resolved Git revision. Enable
+and retain its `Cargo.lock`, which records the registry package checksum. Enable
 `experimental-neon` for eligible Windows
 ARM64 kernels, or retain default features when using `swift_session::SwiftSession`
 and the JSON-based chat APIs.
@@ -526,8 +526,8 @@ check and build their affected packages without rebuilding a complete bundle.
 The aggregate Foundation check requires both Windows targets when selected and
 the Linux native overlay gate when its inputs are selected.
 
-The published version is `0.1.23`; the source installation and library
-examples above select its exact tag. Packaging rejects a changed or untracked source
+The published binary bundle version is `0.1.23`; the source installation and
+library examples above independently select registry `0.1.24`. Packaging rejects a changed or untracked source
 checkout, a revision mismatch, inconsistent runtime/server versions or a
 toolchain string that differs from the pinned channel and target. The receipt
 records the resulting bytes; its source-to-binary trust still depends on the
@@ -582,7 +582,8 @@ commands. This checks source delivery independently of building inside the origi
 The five current registry helpers are already published and unchanged:
 `bonsai-native-hash =0.1.2`, `bonsai-neon-dot =0.1.1`, `bonsai-ternary =0.1.2`,
 `bonsai-gguf =0.1.4` and `bonsai-prism =0.1.4`. Only the runtime was newly
-published as `0.1.23`. Source preparation and hosted checks alone neither publish
+published as `0.1.24`; its normalized package and public checksum were verified
+separately from the still-pending binary delivery. Source preparation and hosted checks alone neither publish
 registry packages nor qualify model serving.
 
 The published development bundle build explicitly enables

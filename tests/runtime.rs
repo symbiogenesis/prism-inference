@@ -783,6 +783,127 @@ impl Decoder for Reusing {
 }
 
 #[test]
+fn finite_decoder_default_checks_custom_outputs_and_clears_failures() -> Result<()> {
+    let fault = Rc::new(Cell::new(OutputFault::None));
+    let mut decoder = Reusing {
+        inner: decoder(),
+        storage: Rc::new(RefCell::new(Vec::new())),
+        owned_calls: Rc::new(Cell::new(0)),
+        fault: fault.clone(),
+        cancellation: Cancellation::default(),
+    };
+    let mut output = Vec::with_capacity(8);
+    let allocation = output.as_ptr();
+    let checked = decoder.evaluate_finite_into(1, &mut output)?;
+    assert_eq!(
+        checked.as_slice(),
+        &[-1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+    );
+    assert_eq!(checked.as_slice().as_ptr(), allocation);
+    for failure in [
+        OutputFault::PartialFailure,
+        OutputFault::WrongSize,
+        OutputFault::Nonfinite,
+    ] {
+        fault.set(failure);
+        assert!(decoder.evaluate_finite_into(2, &mut output).is_err());
+        assert!(output.is_empty());
+        assert_eq!(output.as_ptr(), allocation);
+    }
+    Ok(())
+}
+
+struct FiniteDecoder {
+    inner: Recurrent,
+    calls: Rc<Cell<usize>>,
+    forged: Rc<Cell<usize>>,
+}
+impl Decoder for FiniteDecoder {
+    type Checkpoint = Vec<u32>;
+
+    fn identity(&self) -> &str {
+        self.inner.identity()
+    }
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+    fn checkpoint_bytes(&self) -> usize {
+        self.inner.checkpoint_bytes()
+    }
+    fn reset(&mut self) -> Result<()> {
+        self.inner.reset()
+    }
+    fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        self.inner.checkpoint()
+    }
+    fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        self.inner.restore(checkpoint)
+    }
+    fn evaluate(&mut self, _: u32) -> Result<Vec<f32>> {
+        Err(std::io::Error::other("runtime must request the finite output").into())
+    }
+    fn evaluate_finite_into<'a>(
+        &mut self,
+        token: u32,
+        output: &'a mut Vec<f32>,
+    ) -> Result<FiniteLogits<'a>> {
+        self.calls.set(self.calls.get() + 1);
+        *output = self.inner.evaluate(token)?;
+        match self.forged.replace(0) {
+            1 => {
+                output[0] = f32::NAN;
+                return FiniteLogits::new(&[0.0; 8]);
+            }
+            2 => return FiniteLogits::new(&output[..7]),
+            3 => {
+                output.push(f32::NAN);
+                return FiniteLogits::new(&output[..8]);
+            }
+            _ => {}
+        }
+        FiniteLogits::new(output)
+    }
+}
+#[test]
+fn runtime_consumes_finite_decoder_output_and_rejects_unrelated_proofs() -> Result<()> {
+    let calls = Rc::new(Cell::new(0));
+    let forged = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(
+        FiniteDecoder {
+            inner: decoder(),
+            calls: calls.clone(),
+            forged: forged.clone(),
+        },
+        LIMITS,
+    )?;
+    let cancellation = Cancellation::default();
+    runtime.generate(&[1], &options(), &cancellation, |_| Ok(()))?;
+    assert_eq!(calls.get(), 2);
+    assert_eq!(runtime.tokens(), &[1, 1]);
+    let delivered = Cell::new(0);
+    for proof in 1..=3 {
+        forged.set(proof);
+        assert!(
+            runtime
+                .generate(&[2], &options(), &cancellation, |_| {
+                    delivered.set(delivered.get() + 1);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2 + proof);
+        assert_eq!(delivered.get(), 0);
+        assert_eq!(runtime.tokens(), &[1, 1]);
+        assert!(!runtime.is_faulted());
+    }
+    let completion = runtime.generate(&[1, 1], &options(), &cancellation, |_| Ok(()))?;
+    assert_eq!(completion.reused_tokens, 2);
+    assert_eq!(calls.get(), 6);
+    assert_eq!(runtime.tokens(), &[1, 1, 2]);
+    Ok(())
+}
+
+#[test]
 fn validated_sampler_never_receives_invalid_decoder_outputs_and_rolls_back() -> Result<()> {
     #[derive(Clone)]
     struct ValidatedSampler {

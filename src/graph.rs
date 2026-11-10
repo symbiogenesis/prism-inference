@@ -3776,6 +3776,16 @@ impl Decoder for Qwen35 {
         }
         result
     }
+    fn evaluate_finite_into<'a>(
+        &mut self,
+        token: u32,
+        logits: &'a mut Vec<f32>,
+    ) -> Result<crate::sampling::FiniteLogits<'a>> {
+        self.evaluate_into(token, logits)?;
+        // evaluate_token_with_executor validates the complete output before
+        // committing any layer delta, including CPU and installed executors.
+        crate::sampling::FiniteLogits::from_validated(logits)
+    }
     fn ingest(&mut self, token: u32) -> Result<()> {
         self.evaluate_token_into(token, None)
     }

@@ -1403,6 +1403,72 @@ fn state_only_ingestion_rejects_invalid_tokens_without_advancing() -> Result<()>
 }
 
 #[test]
+fn finite_decoder_output_preserves_hybrid_bits_storage_and_snapshot_ownership() -> Result<()> {
+    let bits = |values: &[f32]| {
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let mut owned = Qwen35::new(hybrid_fixture(), 16)?;
+    let mut checked = Qwen35::new(hybrid_fixture(), 16)?;
+    let mut output = Vec::with_capacity(8);
+    let allocation = output.as_ptr();
+    for token in [0, 1, 1] {
+        let view = checked.evaluate_finite_into(token, &mut output)?;
+        assert_eq!(view.as_slice().as_ptr(), allocation);
+        assert_eq!(bits(view.as_slice()), bits(&owned.evaluate(token)?));
+        assert_eq!(graph_bits(&checked)?, graph_bits(&owned)?);
+    }
+    let checkpoint = checked.checkpoint()?;
+    let owned_checkpoint = owned.checkpoint()?;
+    checked.evaluate_finite_into(0, &mut output)?;
+    owned.evaluate(0)?;
+    output.fill(f32::NAN);
+    checked.restore(&checkpoint)?;
+    owned.restore(&owned_checkpoint)?;
+    assert_eq!(
+        bits(checked.evaluate_finite_into(1, &mut output)?.as_slice()),
+        bits(&owned.evaluate(1)?)
+    );
+    assert_eq!(graph_bits(&checked)?, graph_bits(&owned)?);
+    checked.reset()?;
+    owned.reset()?;
+    checked.evaluate_finite_into(0, &mut output)?;
+    owned.evaluate(0)?;
+    assert_eq!(graph_bits(&checked)?, graph_bits(&owned)?);
+    assert_eq!(output.as_ptr(), allocation);
+    Ok(())
+}
+
+#[test]
+fn finite_decoder_output_clears_late_failure_without_publishing_hybrid_state() -> Result<()> {
+    let mut model = hybrid_fixture();
+    model.tensors.insert(
+        "output.weight".to_owned(),
+        weight("output.weight", &[2, 2], &[0.0, f32::MAX, 0.0, 0.0]),
+    );
+    let mut decoder = Qwen35::new(model, 3)?;
+    let mut output = Vec::with_capacity(8);
+    let allocation = output.as_ptr();
+    decoder.evaluate_finite_into(0, &mut output)?;
+    let before = graph_bits(&decoder)?;
+    assert!(decoder.evaluate_finite_into(1, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(output.as_ptr(), allocation);
+    assert_eq!(graph_bits(&decoder)?, before);
+    assert!(decoder.evaluate_finite_into(2, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(graph_bits(&decoder)?, before);
+    decoder.evaluate_finite_into(0, &mut output)?;
+    decoder.evaluate_finite_into(0, &mut output)?;
+    assert!(decoder.evaluate_finite_into(0, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(output.as_ptr(), allocation);
+    Ok(())
+}
+
+#[test]
 fn reusable_logits_match_owned_evaluation_across_hybrid_restore_and_reset() -> Result<()> {
     let mut owned = Qwen35::new(hybrid_fixture(), 16)?;
     let mut reused = Qwen35::new(hybrid_fixture(), 16)?;

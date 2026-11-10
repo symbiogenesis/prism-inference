@@ -772,10 +772,14 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         let result = self
             .decoder
-            .evaluate_into(token, &mut self.logits)
-            .and_then(|()| {
-                if self.logits.len() != self.decoder.vocab_size()
-                    || !crate::kernels::is_finite_slice(&self.logits)
+            .evaluate_finite_into(token, &mut self.logits)
+            .map(|logits| (logits.as_slice().as_ptr(), logits.as_slice().len()))
+            .and_then(|(pointer, length)| {
+                // A public custom decoder can return a checked view of other
+                // storage. Admit only a proof covering this complete output.
+                if length != self.decoder.vocab_size()
+                    || length != self.logits.len()
+                    || !std::ptr::eq(pointer, self.logits.as_ptr())
                 {
                     return Err(invalid("native decoder returned invalid logits"));
                 }

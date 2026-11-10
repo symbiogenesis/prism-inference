@@ -260,6 +260,16 @@ impl Decoder for ProjectedQwen35<'_> {
         }
         result
     }
+    fn evaluate_finite_into<'a>(
+        &mut self,
+        token: u32,
+        output: &'a mut Vec<f32>,
+    ) -> Result<crate::sampling::FiniteLogits<'a>> {
+        self.evaluate_into(token, output)?;
+        // The scoped executor uses the same complete-output validation and
+        // atomic graph commit as Qwen35; device loss remains latched closed.
+        crate::sampling::FiniteLogits::from_validated(output)
+    }
     fn ingest(&mut self, token: u32) -> Result<()> {
         self.evaluate_token(token, None)
     }

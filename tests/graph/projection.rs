@@ -254,9 +254,14 @@ fn projection_scope_preserves_logits_state_adapter_basis_checkpoint_and_reset() 
             let mut control = build()?;
             let (mut executor, calls, _) = executor();
             let mut graph = build()?.with_projection_executor(&mut executor)?;
+            let mut output = Vec::new();
             assert_ne!(graph.identity(), control.identity());
             for token in [0, 1, 0] {
-                assert_eq!(bits(graph.evaluate(token)?), bits(control.evaluate(token)?));
+                let view = graph.evaluate_finite_into(token, &mut output)?;
+                assert_eq!(
+                    bits(view.as_slice().to_vec()),
+                    bits(control.evaluate(token)?)
+                );
                 assert_eq!(graph_bits(graph.decoder())?, graph_bits(&control)?);
             }
             let checkpoint = graph.checkpoint()?;
@@ -289,7 +294,7 @@ fn projection_scope_device_loss_after_prepared_state_delta_never_replays_or_reop
         let checkpoint = graph.checkpoint()?;
         fail.set(true);
         let mut output = vec![42.0];
-        assert!(graph.evaluate_into(1, &mut output).is_err());
+        assert!(graph.evaluate_finite_into(1, &mut output).is_err());
         assert_eq!(output, Vec::<f32>::new());
         assert_eq!(graph_bits(graph.decoder())?, before);
         assert!(graph.is_faulted());
@@ -316,7 +321,7 @@ fn projection_scope_keeps_q8_zero_and_ptq1_paths_on_cpu_and_checks_complete_outp
     let mut graph = Qwen35::new(backend_fixture(false, 142, 256)?, 16)?
         .with_projection_executor(&mut executor)?;
     let mut output = vec![42.0];
-    assert!(graph.evaluate_into(0, &mut output).is_err());
+    assert!(graph.evaluate_finite_into(0, &mut output).is_err());
     assert_eq!(output, Vec::<f32>::new());
     assert_eq!(calls.get(), 1);
     assert!(graph.is_faulted());

@@ -147,6 +147,40 @@ pub trait Decoder {
         output.extend_from_slice(&logits);
         Ok(())
     }
+    /// Include one token and borrow its checked finite output from reusable storage.
+    ///
+    /// The default independently checks the complete output of
+    /// [`Self::evaluate_into`], including custom implementations of that method.
+    /// Native decoders that already validate their complete output may return
+    /// the same immutable proof without repeating the vocabulary traversal.
+    /// The view borrows only `output`, preventing its mutation until the last
+    /// use of the view; checkpoints remain independent of that allocation.
+    /// The runtime still checks the view's storage identity, complete extent
+    /// and current vocabulary size before publishing the token.
+    ///
+    /// # Errors
+    /// Returns evaluation errors or rejects wrong-size, empty, oversized or
+    /// nonfinite output. The compatibility implementation empties `output` on
+    /// any error. Decoder state may require transaction restoration.
+    fn evaluate_finite_into<'a>(
+        &mut self,
+        token: u32,
+        output: &'a mut Vec<f32>,
+    ) -> Result<sampling::FiniteLogits<'a>> {
+        if let Err(error) = self.evaluate_into(token, output) {
+            output.clear();
+            return Err(error);
+        }
+        if output.len() != self.vocab_size()
+            || output.is_empty()
+            || output.len() > 1_048_576
+            || !kernels::is_finite_slice(output)
+        {
+            output.clear();
+            return Err(invalid("native decoder returned invalid logits"));
+        }
+        sampling::FiniteLogits::from_validated(output)
+    }
     /// Include one token in sequence state without retaining next-token logits.
     ///
     /// Success advances exactly the same recurrent/convolution/KV state and

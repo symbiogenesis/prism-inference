@@ -40,7 +40,8 @@ impl<'a> FiniteLogits<'a> {
         self.0
     }
 
-    // Runtime::evaluate validates every decoder value before assigning any
+    // Decoder::evaluate_finite_into checks every decoder value, or returns the
+    // native graph's existing complete-output proof, before Runtime assigns a
     // token to this prefix. Reuse and rollback restore only independent copies
     // of that validated output. Keep the O(1) bounds check here: a custom
     // Decoder may change its reported vocabulary size after Runtime::new.

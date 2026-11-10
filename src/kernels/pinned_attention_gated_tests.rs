@@ -176,15 +176,37 @@ fn gated_tiles_preserve_ungated_failure_publication_and_reject_bad_gates() {
                     .is_err()
                 );
                 assert_bits(&actual, &expected);
-                // Independent legacy contract: the first head publishes its
-                // finite prefix, then stops before the failing channel.
+                // Scalar fallback stages atomically. Eligible NEON publishes
+                // its ungated finite prefix before the first failed channel.
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                let published = if width.is_multiple_of(4)
+                    && fearless_simd::Level::baseline().as_neon().is_some()
+                {
+                    bad_channel
+                } else {
+                    0
+                };
+                #[cfg(not(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                )))]
+                let published = 0;
                 assert!(
-                    actual[0][..bad_channel]
+                    actual[0][..published]
                         .iter()
                         .all(|value| value.to_bits() == 2.0_f32.to_bits())
                 );
                 assert!(
-                    actual[0][bad_channel..]
+                    actual[0][published..]
                         .iter()
                         .all(|value| value.to_bits() == 19.0_f32.to_bits())
                 );

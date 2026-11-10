@@ -5,6 +5,11 @@ use crate::{Result, invalid};
 /// Six heads by 64 channels by sixteen temporal FMA lanes occupy 24 KiB.
 pub(crate) const VALUE_TILE: usize = 64;
 
+// Twice the query rows at half the channel width retain the 24 KiB bound.
+#[path = "pinned_attention_pair_values.rs"]
+mod pair_values;
+pub(crate) use pair_values::{PAIR_VALUE_TILE, value_pair_tile_gated};
+
 /// Reads and converts each cached F16 key element once across six query heads.
 ///
 /// # Errors

@@ -162,6 +162,51 @@ fn apply_values(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pair existing causal score, cache, projection and output borrows without retained scratch."
+)]
+fn apply_values_pair(
+    geometry: &Geometry,
+    head: usize,
+    projected: [&[f32]; 2],
+    values: &KvCache,
+    current: [&[f32]; 2],
+    outputs: [&mut [f32]; 2],
+    scores: [[&[f32]; 6]; 2],
+    past_tokens: usize,
+) -> Result<()> {
+    let width = geometry.head;
+    let offset = head / 6 * width;
+    let gates = projected
+        .map(|row| std::array::from_fn(|index| attention_gate(row, head + index, width)));
+    let [first, second] = outputs;
+    let mut first_rows = rows(first, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
+    let mut second_rows = rows(second, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
+    for start in (0..width).step_by(six::PAIR_VALUE_TILE) {
+        let end = (start + six::PAIR_VALUE_TILE).min(width);
+        let first = first_rows.each_mut().map(|row| {
+            row.next()
+                .ok_or_else(|| invalid("short paired value output tile"))
+        });
+        let second = second_rows.each_mut().map(|row| {
+            row.next()
+                .ok_or_else(|| invalid("short paired value output tile"))
+        });
+        let [f0, f1, f2, f3, f4, f5] = first;
+        let [s0, s1, s2, s3, s4, s5] = second;
+        six::value_pair_tile_gated(
+            values.tokens().take(past_tokens + 1),
+            current.map(|row| &row[offset + start..offset + end]),
+            scores,
+            offset + start,
+            [[f0?, f1?, f2?, f3?, f4?, f5?], [s0?, s1?, s2?, s3?, s4?, s5?]],
+            gates.map(|row| row.map(|gate| &gate[start..end])),
+        )?;
+    }
+    Ok(())
+}
+
 // Each caller worker owns complete token rows and its six-head score storage.
 // Keep the cache owner immutable and reuse one six-head group at a time rather
 // than falling back to two independent tail heads in Swift's 6:1 GQA geometry.
@@ -290,25 +335,21 @@ pub(super) fn attend_tile_chunk(
                 }
             }
             let [first_rows, second_rows] = score_rows;
-            apply_values(
+            apply_values_pair(
                 geometry,
                 head,
-                &projected[first],
+                [&projected[first], &projected[first + 1]],
                 values,
-                &current_values[first],
-                &mut first_output[head * width..(head + 6) * width],
-                first_rows.each_ref().map(|score| &score[..]),
+                [&current_values[first], &current_values[first + 1]],
+                [
+                    &mut first_output[head * width..(head + 6) * width],
+                    &mut second_output[head * width..(head + 6) * width],
+                ],
+                [
+                    first_rows.each_ref().map(|score| &score[..]),
+                    second_rows.each_ref().map(|score| &score[..]),
+                ],
                 position,
-            )?;
-            apply_values(
-                geometry,
-                head,
-                &projected[first + 1],
-                values,
-                &current_values[first + 1],
-                &mut second_output[head * width..(head + 6) * width],
-                second_rows.each_ref().map(|score| &score[..]),
-                position + 1,
             )?;
         }
     }

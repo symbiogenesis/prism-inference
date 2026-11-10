@@ -2415,11 +2415,37 @@ fn copy_member_descriptors(
     act_offset: usize,
     out_offset: usize,
 ) -> Result<(), Error> {
-    bytes.copy_within(
-        previous_weight_desc..previous_weight_desc + 3 * 56,
-        weight_desc,
-    );
-    bytes.copy_within(previous_op_desc..previous_op_desc + 232, op_desc);
+    // The complete command area was zeroed before any member was serialized.
+    // Copy only populated immutable fields: copying all 400 descriptor bytes
+    // would rewrite 213 bytes of zero padding or member fields relocated below.
+    for (tensor, geometry_end) in [(0, 20), (56, 12), (112, 12)] {
+        bytes.copy_within(
+            previous_weight_desc + tensor + 8..previous_weight_desc + tensor + geometry_end,
+            weight_desc + tensor + 8,
+        );
+        bytes.copy_within(
+            previous_weight_desc + tensor + 24..previous_weight_desc + tensor + 56,
+            weight_desc + tensor + 24,
+        );
+    }
+    for (offset, length) in [
+        (0, 4),
+        (72, 1),
+        (76, 1),
+        (78, 1),
+        (88, 16),
+        (108, 4),
+        (116, 4),
+        (124, 4),
+        (132, 4),
+        (140, 4),
+        (200, 28),
+    ] {
+        bytes.copy_within(
+            previous_op_desc + offset..previous_op_desc + offset + length,
+            op_desc + offset,
+        );
+    }
     for (descriptor, offset, tensor_index) in [
         (weight_desc, weight_offset, ti_base),
         (weight_desc + 56, act_offset, ti_base + 1),

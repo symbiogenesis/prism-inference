@@ -331,7 +331,11 @@ operation geometry inside their own command buffer. Members with the same row
 count and retained solver parameters share the first member's descriptors after
 the existing common-column and complete arena/extent validation. Each copied
 member relocates all weight/activation/output offsets, weight buffer index and
-tensor indices. This reduces full descriptor construction from eight times to
+tensor indices. Only the 187 populated immutable bytes are copied; the already
+zeroed command area supplies padding. Including relocation, each reused member
+writes the same 225 bytes as the original sparse serializer, rather than the
+438 bytes required by a complete 400-byte descriptor copy and relocation.
+This reduces full descriptor construction from eight times to
 once for an eight-token projection packet, and shares matching sibling geometry
 in ordinary and fused SwiGLU packets. Mixed geometries retain the serial writer.
 No template or allocation survives the packet; metadata, command bounds, flush

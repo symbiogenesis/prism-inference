@@ -489,7 +489,18 @@ impl SwiftSession {
                 Ok(())
             })
         };
-        let completion = if let Some(timings) = timings {
+        let completion = if self.prompt_reuse == PromptReuse::Disabled {
+            self.runtime.generate_sampled_until_for_reset(
+                &prompt.tokens,
+                &options,
+                Prefill { block_tokens: 64 },
+                cancellation,
+                deadline,
+                &mut self.sampler,
+                timings,
+                consume,
+            )?
+        } else if let Some(timings) = timings {
             self.runtime.generate_sampled_until_with_timings(
                 &prompt.tokens,
                 &options,

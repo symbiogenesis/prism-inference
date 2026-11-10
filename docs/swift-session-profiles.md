@@ -48,6 +48,11 @@ until successful explicit reset. A cancelled or expired request is checked befor
 request-state reset. Generation retains transactional model and sampler rollback;
 failed final text/accounting delivery closes session admission until reset.
 
+The reset-only sampled path omits unused next-token logits after the final emitted
+token at the output cap through [terminal state-only ingestion](terminal-state-only.md).
+Exact latest-prefix reuse retains terminal logits; stop-token behavior and the
+explicit greedy suffix path keep their existing contracts.
+
 Sampler draws retain the established session behavior across successful requests
 and scale changes. Scale reset does not silently reseed the sampler. Explicit
 `SwiftSession::reset` clears model state and restores the initial seeded sampler.

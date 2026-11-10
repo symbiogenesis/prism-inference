@@ -21,6 +21,7 @@ struct GenerationEffects<'a, S, E> {
     sampler: &'a mut S,
     emit: E,
     timings: Option<&'a mut GenerationTimings>,
+    terminal_state_only: bool,
 }
 
 /// Cancellation shared with the request owner; checked between decoder steps.
@@ -506,6 +507,48 @@ impl<D: Decoder> Runtime<D> {
                 sampler,
                 emit,
                 timings: Some(timings),
+                terminal_state_only: false,
+            },
+        )
+    }
+
+    /// Finish a reset-only service request without unused terminal logits.
+    ///
+    /// This is deliberately unavailable through the public generation API. The
+    /// service must reset before its next request, and cannot retain prefix
+    /// snapshots. Empty terminal logits also force fresh preparation if another
+    /// internal caller accidentally tries to continue this runtime directly.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The reset-only service keeps the existing deadline, sampler and optional attribution arguments."
+    )]
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn generate_sampled_until_for_reset<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: Instant,
+        sampler: &mut S,
+        timings: Option<&mut GenerationTimings>,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Completion> {
+        if self.limits.checkpoints != 0 {
+            return Err(invalid(
+                "reset-only generation cannot retain prefix checkpoints",
+            ));
+        }
+        self.generate_sampled_observed(
+            prompt,
+            options,
+            prefill,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            GenerationEffects {
+                sampler,
+                emit,
+                timings,
+                terminal_state_only: true,
             },
         )
     }
@@ -539,6 +582,7 @@ impl<D: Decoder> Runtime<D> {
                 sampler,
                 emit,
                 timings: None,
+                terminal_state_only: false,
             },
         )
     }
@@ -855,7 +899,7 @@ impl<D: Decoder> Runtime<D> {
             generated_tokens: 0,
             finish: Finish::Length,
         };
-        for _ in 0..options.max_tokens {
+        for index in 0..options.max_tokens {
             check()?;
             let token = measure(&mut effects.timings, GenerationPhase::Sampling, 1, || {
                 effects
@@ -872,12 +916,24 @@ impl<D: Decoder> Runtime<D> {
                 completion.finish = Finish::Stop;
                 break;
             }
-            measure(
-                &mut effects.timings,
-                GenerationPhase::DecodeEvaluation,
-                1,
-                || self.evaluate(token, check),
-            )?;
+            if effects.terminal_state_only && index + 1 == options.max_tokens {
+                // No subsequent sample can consume this token's logits, and
+                // the reset-only owner cannot reuse the finished prefix. Keep
+                // complete state and invalidate old logits before advancing.
+                measure(
+                    &mut effects.timings,
+                    GenerationPhase::TerminalIngestion,
+                    1,
+                    || self.ingest_block(&[token], check),
+                )?;
+            } else {
+                measure(
+                    &mut effects.timings,
+                    GenerationPhase::DecodeEvaluation,
+                    1,
+                    || self.evaluate(token, check),
+                )?;
+            }
             check()?;
             measure(&mut effects.timings, GenerationPhase::Callback, 1, || {
                 (effects.emit)(token)
@@ -1273,6 +1329,9 @@ fn greedy_inner<const VALIDATE: bool>(logits: &[f32]) -> Result<usize> {
     }
     Ok(best)
 }
+
+#[cfg(test)]
+mod terminal_tests;
 
 #[cfg(test)]
 mod deadline_tests {

@@ -103,6 +103,9 @@ for qualification that remains open.
   prefill, final prompt evaluation, decode evaluation, sampling, callbacks,
   optional completed-prefix snapshots and error restoration. These measure
   runtime operations including checks/allocation, not isolated kernels.
+  Reset-only sampled service completions append a distinct
+  [terminal-ingestion](terminal-state-only.md) phase for the last output-capped
+  token's state-only work, preserving the existing eleven phase indexes.
   Failed blocks retain completed lower bounds and explicitly unknown partial
   work. Successful callbacks remain provisional; stop draws are samples without
   decode/callback work. Runtime completion and later session terminal delivery

@@ -33,11 +33,14 @@ pub enum GenerationPhase {
     RollbackRestore,
     /// Restore the caller's sampler after any returned generation error.
     SamplerRestore,
+    /// Advance the final output token without unused next-token logits for a
+    /// reset-only service request. This is not a vocabulary evaluation.
+    TerminalIngestion,
 }
 
 impl GenerationPhase {
     /// Complete fixed phase inventory in stable diagnostic order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::SamplerSnapshot,
         Self::RollbackSnapshot,
         Self::PrefixPreparation,
@@ -49,6 +52,7 @@ impl GenerationPhase {
         Self::CompletionSnapshot,
         Self::RollbackRestore,
         Self::SamplerRestore,
+        Self::TerminalIngestion,
     ];
 
     /// Fixed diagnostic label containing no caller-provided values.
@@ -66,6 +70,7 @@ impl GenerationPhase {
             Self::CompletionSnapshot => "completion-snapshot",
             Self::RollbackRestore => "rollback-restore",
             Self::SamplerRestore => "sampler-restore",
+            Self::TerminalIngestion => "terminal-ingestion",
         }
     }
 
@@ -82,6 +87,7 @@ impl GenerationPhase {
             Self::CompletionSnapshot => 8,
             Self::RollbackRestore => 9,
             Self::SamplerRestore => 10,
+            Self::TerminalIngestion => 11,
         }
     }
 }
@@ -127,7 +133,7 @@ pub struct GenerationTimings {
     pub reused_tokens: Option<usize>,
     /// Committed generated count only on success; absent on every error.
     pub committed_generated_tokens: Option<usize>,
-    phases: [PhaseTiming; 11],
+    phases: [PhaseTiming; 12],
 }
 
 impl GenerationTimings {

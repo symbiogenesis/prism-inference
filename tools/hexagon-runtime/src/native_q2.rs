@@ -936,10 +936,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             [out0, out1] => {
                 let h0 = &cache.handles[cache.projections[indices[0]].first_handle];
                 let h1 = &cache.handles[cache.projections[indices[1]].first_handle];
-                let destinations = [
-                    (out0.as_ptr(), out0.len()),
-                    (out1.as_ptr(), out1.len()),
-                ];
+                let destinations = [(out0.as_ptr(), out0.len()), (out1.as_ptr(), out1.len())];
                 self.submitter
                     .submit_resident_batch2_validated(
                         [h0, h1],
@@ -3424,9 +3421,13 @@ mod tests {
                 executor.submitter.nonfinite_at = (case == 1).then_some(1);
                 executor.submitter.fail_at = (case == 2).then_some(1);
                 let mut outputs = [Vec::new(), Vec::new(), Vec::new()];
-                let result = project_output_evidence_family(&mut executor, &tensors, &mut outputs, members);
+                let result =
+                    project_output_evidence_family(&mut executor, &tensors, &mut outputs, members);
                 assert_eq!(result.is_ok(), case == 0);
-                assert_eq!(executor.statistics.operations_attempted, u64::try_from(members)?);
+                assert_eq!(
+                    executor.statistics.operations_attempted,
+                    u64::try_from(members)?
+                );
                 assert_eq!(executor.queue_writes_attempted, 1);
                 if case == 0 {
                     for (tensor, output) in tensors.iter().zip(&outputs).take(members) {
@@ -3435,14 +3436,25 @@ mod tests {
                         assert_eq!(output.len(), usize::from(rows));
                         assert!(output.iter().all(|value| value.to_bits() == expected));
                     }
-                    assert_eq!(executor.statistics.operations_completed, u64::try_from(members)?);
+                    assert_eq!(
+                        executor.statistics.operations_completed,
+                        u64::try_from(members)?
+                    );
                     assert_eq!(executor.queue_writes_completed, 1);
                 } else {
                     assert!(executor.is_faulted());
                     assert!(outputs.iter().all(Vec::is_empty));
                     assert_eq!(executor.statistics.operations_completed, 0);
                     assert_eq!(executor.queue_writes_completed, 0);
-                    assert!(project_output_evidence_family(&mut executor, &tensors, &mut outputs, members).is_err());
+                    assert!(
+                        project_output_evidence_family(
+                            &mut executor,
+                            &tensors,
+                            &mut outputs,
+                            members
+                        )
+                        .is_err()
+                    );
                     assert_eq!(executor.submitter.batches.len(), 1);
                 }
             }
@@ -3473,7 +3485,10 @@ mod tests {
             handle: &NativeQ2WeightHandle,
             activation: &[f32],
             output: &'a mut [f32],
-        ) -> std::result::Result<hexagon_native_rpc::NativeQ2ValidatedOutputs<'a, 1>, hexagon_native_rpc::Error> {
+        ) -> std::result::Result<
+            hexagon_native_rpc::NativeQ2ValidatedOutputs<'a, 1>,
+            hexagon_native_rpc::Error,
+        > {
             static OTHER: [f32; 32] = [0.0; 32];
             self.inner.submit_resident(handle, activation, output)?;
             hexagon_native_rpc::NativeQ2ValidatedOutputs::validate([&OTHER])
@@ -3484,9 +3499,13 @@ mod tests {
             handles: [&NativeQ2WeightHandle; 2],
             activation: &[f32],
             outputs: [&'a mut [f32]; 2],
-        ) -> std::result::Result<hexagon_native_rpc::NativeQ2ValidatedOutputs<'a, 2>, hexagon_native_rpc::Error> {
+        ) -> std::result::Result<
+            hexagon_native_rpc::NativeQ2ValidatedOutputs<'a, 2>,
+            hexagon_native_rpc::Error,
+        > {
             let [out0, out1] = outputs;
-            self.inner.submit_resident_batch2(handles, activation, [&mut *out0, &mut *out1])?;
+            self.inner
+                .submit_resident_batch2(handles, activation, [&mut *out0, &mut *out1])?;
             hexagon_native_rpc::NativeQ2ValidatedOutputs::validate([out1, out0])
         }
 
@@ -3495,10 +3514,21 @@ mod tests {
             handles: [&NativeQ2WeightHandle; 3],
             activation: &[f32],
             outputs: [&'a mut [f32]; 3],
-        ) -> std::result::Result<hexagon_native_rpc::NativeQ2ValidatedOutputs<'a, 3>, hexagon_native_rpc::Error> {
+        ) -> std::result::Result<
+            hexagon_native_rpc::NativeQ2ValidatedOutputs<'a, 3>,
+            hexagon_native_rpc::Error,
+        > {
             let [out0, out1, out2] = outputs;
-            self.inner.submit_resident_batch3(handles, activation, [&mut *out0, &mut *out1, &mut *out2])?;
-            hexagon_native_rpc::NativeQ2ValidatedOutputs::validate([out0, out1, &out2[..out2.len() - 1]])
+            self.inner.submit_resident_batch3(
+                handles,
+                activation,
+                [&mut *out0, &mut *out1, &mut *out2],
+            )?;
+            hexagon_native_rpc::NativeQ2ValidatedOutputs::validate([
+                out0,
+                out1,
+                &out2[..out2.len() - 1],
+            ])
         }
 
         fn submit(
@@ -3509,7 +3539,8 @@ mod tests {
             activation: &[f32],
             output: &mut [f32],
         ) -> std::result::Result<(), hexagon_native_rpc::Error> {
-            self.inner.submit(columns, rows, weights, activation, output)
+            self.inner
+                .submit(columns, rows, weights, activation, output)
         }
     }
 
@@ -3526,17 +3557,28 @@ mod tests {
                 .map_err(|_| invalid("limits"))?
                 .with_resident_weights(65_536)
                 .map_err(|_| invalid("residency"))?;
-            let submitter = UnrelatedOutputEvidence { inner: ordinary.submitter };
+            let submitter = UnrelatedOutputEvidence {
+                inner: ordinary.submitter,
+            };
             let mut executor = NativeQ2Executor::new(submitter, limits, 1024 * 1024)
                 .with_resident_weights(4096)?;
             let mut outputs = [Vec::new(), Vec::new(), Vec::new()];
-            assert!(project_output_evidence_family(&mut executor, &tensors, &mut outputs, members).is_err());
+            assert!(
+                project_output_evidence_family(&mut executor, &tensors, &mut outputs, members)
+                    .is_err()
+            );
             assert!(executor.is_faulted());
             assert!(outputs.iter().all(Vec::is_empty));
-            assert_eq!(executor.statistics.operations_attempted, u64::try_from(members)?);
+            assert_eq!(
+                executor.statistics.operations_attempted,
+                u64::try_from(members)?
+            );
             assert_eq!(executor.statistics.operations_completed, 0);
             assert_eq!(executor.queue_writes_completed, 0);
-            assert!(project_output_evidence_family(&mut executor, &tensors, &mut outputs, members).is_err());
+            assert!(
+                project_output_evidence_family(&mut executor, &tensors, &mut outputs, members)
+                    .is_err()
+            );
             assert_eq!(executor.submitter.inner.batches.len(), 1);
         }
         Ok(())

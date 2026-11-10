@@ -7,9 +7,9 @@ use super::{
 use crate::{
     Error, GuardedQ2Submitter, HMX_Q2_BATCH_OPERATIONS, HMX_Q2_BATCH10_OPERATIONS,
     HmxQ2ProjectionLimits, HmxQ2Submitter, HmxQ2WeightHandle, HmxQ2WeightRegistry,
-    NATIVE_Q2_MAX_WEIGHT_ARENAS, NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle,
-    NativeQ2WeightRegistry, Q2ProjectionLimits, Q2ProjectionReport, SessionPreparationReport,
-    hmx_projection, native_q2, projection,
+    NATIVE_Q2_MAX_WEIGHT_ARENAS, NativeQ2ProjectionLimits, NativeQ2Submitter,
+    NativeQ2ValidatedOutputs, NativeQ2WeightHandle, NativeQ2WeightRegistry, Q2ProjectionLimits,
+    Q2ProjectionReport, SessionPreparationReport, hmx_projection, native_q2, projection,
 };
 use std::ffi::c_void;
 use std::path::Path;
@@ -3467,8 +3467,13 @@ mod tests {
         assert!(session.dirty_resident_weights);
         let mut output = [99.0_f32; 32];
         let destination = (output.as_ptr(), output.len());
-        NativeQ2Submitter::submit_resident_validated(&mut session, &handle, &activation, &mut output)?
-            .validate_destinations([destination])?;
+        NativeQ2Submitter::submit_resident_validated(
+            &mut session,
+            &handle,
+            &activation,
+            &mut output,
+        )?
+        .validate_destinations([destination])?;
         assert_eq!(output, [7.0_f32; 32]);
         assert!(!session.dirty_resident_weights);
         assert_eq!(
@@ -3478,24 +3483,41 @@ mod tests {
 
         output.fill(99.0);
         let destination = (output.as_ptr(), output.len());
-        NativeQ2Submitter::submit_resident_validated(&mut session, &handle, &activation, &mut output)?
-            .validate_destinations([destination])?;
+        NativeQ2Submitter::submit_resident_validated(
+            &mut session,
+            &handle,
+            &activation,
+            &mut output,
+        )?
+        .validate_destinations([destination])?;
         assert_eq!(output, [7.0_f32; 32]);
         assert_eq!(
             STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
             4096
         );
         STATE.lock().map_err(|_| Error::Contract)?.bad_numeric = true;
-        assert!(NativeQ2Submitter::submit_resident_validated(
-            &mut session, &handle, &activation, &mut output,
-        ).is_err());
+        assert!(
+            NativeQ2Submitter::submit_resident_validated(
+                &mut session,
+                &handle,
+                &activation,
+                &mut output,
+            )
+            .is_err()
+        );
         assert!(output.iter().all(|value| value.is_nan()));
         assert!(session.failed);
         assert_eq!(session.report.operations_completed, 2);
         assert_eq!(session.report.queue_writes_completed, 2);
-        assert!(NativeQ2Submitter::submit_resident_validated(
-            &mut session, &handle, &activation, &mut output,
-        ).is_err());
+        assert!(
+            NativeQ2Submitter::submit_resident_validated(
+                &mut session,
+                &handle,
+                &activation,
+                &mut output,
+            )
+            .is_err()
+        );
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
         Ok(())
     }
@@ -3579,7 +3601,8 @@ mod tests {
             [&h_32, &h_64],
             &activation,
             [&mut out_a, &mut out_b],
-        )?.validate_destinations(destinations)?;
+        )?
+        .validate_destinations(destinations)?;
         assert_eq!(out_a, [7.0_f32; 32]);
         assert_eq!(out_b, [8.0_f32; 64]);
         assert_eq!(session.report.operations_completed, 2);
@@ -3587,13 +3610,18 @@ mod tests {
         assert_eq!(session.report.resident_submissions, 2);
 
         let mut out_c = [99.0_f32; 32];
-        let destinations = [(out_b.as_ptr(), out_b.len()), (out_a.as_ptr(), out_a.len()), (out_c.as_ptr(), out_c.len())];
+        let destinations = [
+            (out_b.as_ptr(), out_b.len()),
+            (out_a.as_ptr(), out_a.len()),
+            (out_c.as_ptr(), out_c.len()),
+        ];
         NativeQ2Submitter::submit_resident_batch3_validated(
             &mut session,
             [&h_64, &h_32, &h_32],
             &activation,
             [&mut out_b, &mut out_a, &mut out_c],
-        )?.validate_destinations(destinations)?;
+        )?
+        .validate_destinations(destinations)?;
         assert_eq!(out_b, [7.0_f32; 64]);
         assert_eq!(out_a, [8.0_f32; 32]);
         assert_eq!(out_c, [9.0_f32; 32]);
@@ -3602,13 +3630,22 @@ mod tests {
         assert_eq!(session.report.resident_submissions, 5);
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 2);
         STATE.lock().map_err(|_| Error::Contract)?.bad_member = Some(2);
-        assert!(NativeQ2Submitter::submit_resident_batch3_validated(
-            &mut session,
-            [&h_64, &h_32, &h_32],
-            &activation,
-            [&mut out_b, &mut out_a, &mut out_c],
-        ).is_err());
-        assert!(out_a.iter().chain(&out_b).chain(&out_c).all(|value| value.is_nan()));
+        assert!(
+            NativeQ2Submitter::submit_resident_batch3_validated(
+                &mut session,
+                [&h_64, &h_32, &h_32],
+                &activation,
+                [&mut out_b, &mut out_a, &mut out_c],
+            )
+            .is_err()
+        );
+        assert!(
+            out_a
+                .iter()
+                .chain(&out_b)
+                .chain(&out_c)
+                .all(|value| value.is_nan())
+        );
         assert!(session.failed);
         assert_eq!(session.report.operations_completed, 5);
         assert_eq!(session.report.queue_writes_completed, 2);

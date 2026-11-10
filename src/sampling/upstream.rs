@@ -332,7 +332,9 @@ impl State {
             || candidates.size > weights.len()
             || probability >= 1.0
         {
-            return Err(invalid("cached distribution requires bounded sorted top-p candidates"));
+            return Err(invalid(
+                "cached distribution requires bounded sorted top-p candidates",
+            ));
         }
         let random = self
             .random

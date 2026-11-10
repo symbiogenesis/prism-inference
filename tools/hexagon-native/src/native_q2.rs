@@ -61,9 +61,12 @@ impl<'a, const N: usize> NativeQ2ValidatedOutputs<'a, N> {
         self,
         destinations: [(*const f32, usize); N],
     ) -> Result<(), Error> {
-        if self.outputs.iter().zip(destinations).all(|(output, (ptr, len))| {
-            std::ptr::eq(output.as_ptr(), ptr) && output.len() == len
-        }) {
+        if self
+            .outputs
+            .iter()
+            .zip(destinations)
+            .all(|(output, (ptr, len))| std::ptr::eq(output.as_ptr(), ptr) && output.len() == len)
+        {
             Ok(())
         } else {
             Err(Error::Contract)
@@ -2700,7 +2703,10 @@ mod tests {
         let bits = [0, 0x8000_0000, 1, 0x807f_ffff, 0x7f7f_ffff, 0xff7f_ffff];
         let mut first = bits.map(f32::from_bits);
         let second = bits.map(f32::from_bits);
-        let regions = [(first.as_ptr(), first.len()), (second.as_ptr(), second.len())];
+        let regions = [
+            (first.as_ptr(), first.len()),
+            (second.as_ptr(), second.len()),
+        ];
         NativeQ2ValidatedOutputs::validate([first.as_slice(), second.as_slice()])?
             .validate_destinations(regions)?;
         assert_eq!(first.map(f32::to_bits), bits);

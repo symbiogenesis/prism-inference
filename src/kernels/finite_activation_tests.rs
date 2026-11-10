@@ -157,7 +157,11 @@ fn prepared_finite_proof_retains_q8_overflow_and_external_validation() -> Result
             assert!(!error(&mut scratch, &weights, &[f32::MAX; 256]).is_empty());
             assert!(scratch.q8.is_empty());
             assert_eq!(scratch.q8.as_ptr(), pointer);
-            assert!(scratch.prepare_f32_executor(&weights, &[f32::NAN; 256]).is_err());
+            assert!(
+                scratch
+                    .prepare_f32_executor(&weights, &[f32::NAN; 256])
+                    .is_err()
+            );
             scratch.prepare_f32_executor(&weights, &[127.0; 256])?;
             assert!(scratch.q8.is_empty());
             scratch.prepare(&weights, &[0.0; 256])?;

@@ -174,12 +174,16 @@ mod tests {
         for (observed, original) in actual.iter().zip(expected) {
             assert_eq!(observed.id, original.id);
             assert_eq!(observed.logit.to_bits(), original.logit.to_bits());
-            assert_eq!(observed.probability.to_bits(), original.probability.to_bits());
+            assert_eq!(
+                observed.probability.to_bits(),
+                original.probability.to_bits()
+            );
         }
     }
 
     #[test]
-    fn cached_top_p_exponents_preserve_original_backing_bits_draws_and_reset() -> crate::Result<()> {
+    fn cached_top_p_exponents_preserve_original_backing_bits_draws_and_reset() -> crate::Result<()>
+    {
         for width in [1_usize, 2, 19, 20] {
             let mut sampler = SwiftSampler::new(4242)?;
             let mut reference = State::new(Config::Distribution(4242))?;
@@ -195,12 +199,24 @@ mod tests {
                             id: i32::try_from(index)?,
                             logit: match round % 10 {
                                 0 => 0.0,
-                                1 => if index.is_multiple_of(2) { -0.0 } else { 0.0 },
+                                1 => {
+                                    if index.is_multiple_of(2) {
+                                        -0.0
+                                    } else {
+                                        0.0
+                                    }
+                                }
                                 2 => -value,
                                 3 => -value * 5.0,
                                 4 => f32::MIN,
                                 5 => f32::MAX,
-                                6 => if index == 0 { f32::MAX } else { f32::MIN },
+                                6 => {
+                                    if index == 0 {
+                                        f32::MAX
+                                    } else {
+                                        f32::MIN
+                                    }
+                                }
                                 7 => -value * 1000.0,
                                 8 => -value * f32::EPSILON,
                                 _ => -value * f32::from_bits(1),
@@ -215,7 +231,10 @@ mod tests {
                 let mut cloned_candidates = original.clone();
                 let token = original_fixed_chain(&mut reference, &mut original)?;
                 assert_eq!(sampler.sample_candidates(&mut actual)?, token);
-                assert_eq!(independent.sample_candidates(&mut cloned_candidates)?, token);
+                assert_eq!(
+                    independent.sample_candidates(&mut cloned_candidates)?,
+                    token
+                );
                 assert_candidate_bits(&actual, &original);
                 assert_candidate_bits(&cloned_candidates, &original);
             }
@@ -230,12 +249,17 @@ mod tests {
         weights: &mut [f32],
     ) {
         let mut actual = original.clone();
-        assert!(distribution.apply_sorted_top_p_distribution(filter, &mut actual, weights).is_err());
+        assert!(
+            distribution
+                .apply_sorted_top_p_distribution(filter, &mut actual, weights)
+                .is_err()
+        );
         assert_candidate_bits(&actual, original);
     }
 
     #[test]
-    fn cached_top_p_guards_preserve_candidates_and_rng_with_unsorted_fallback() -> crate::Result<()> {
+    fn cached_top_p_guards_preserve_candidates_and_rng_with_unsorted_fallback() -> crate::Result<()>
+    {
         let filter = State::new(Config::TopP {
             probability: 0.95,
             min_keep: 1,
@@ -243,27 +267,58 @@ mod tests {
         let mut sampler = SwiftSampler::new(4242)?;
         let mut reference = State::new(Config::Distribution(4242))?;
         let backing = (0..20)
-            .map(|id| Candidate { id, logit: 0.0, probability: -0.0 })
+            .map(|id| Candidate {
+                id,
+                logit: 0.0,
+                probability: -0.0,
+            })
             .collect::<Vec<_>>();
         let original = Candidates::new(backing, -1, true)?;
         for capacity in [0, 19] {
             let mut weights = vec![0.0_f32; capacity];
             assert_cached_rejected(&mut sampler.distribution, &filter, &original, &mut weights);
         }
-        for invalid in [Config::Temperature(1.0), Config::TopP { probability: 1.0, min_keep: 1 }] {
-            assert_cached_rejected(&mut sampler.distribution, &State::new(invalid)?, &original, &mut [0.0_f32; 20]);
+        for invalid in [
+            Config::Temperature(1.0),
+            Config::TopP {
+                probability: 1.0,
+                min_keep: 1,
+            },
+        ] {
+            assert_cached_rejected(
+                &mut sampler.distribution,
+                &State::new(invalid)?,
+                &original,
+                &mut [0.0_f32; 20],
+            );
         }
         let mut wrong_distribution = State::new(Config::TopK(20))?;
-        assert_cached_rejected(&mut wrong_distribution, &filter, &original, &mut [0.0_f32; 20]);
+        assert_cached_rejected(
+            &mut wrong_distribution,
+            &filter,
+            &original,
+            &mut [0.0_f32; 20],
+        );
         let mut candidates = original.clone();
         let mut expected = original.clone();
-        assert_eq!(sampler.sample_candidates(&mut candidates)?, original_fixed_chain(&mut reference, &mut expected)?);
+        assert_eq!(
+            sampler.sample_candidates(&mut candidates)?,
+            original_fixed_chain(&mut reference, &mut expected)?
+        );
         assert_candidate_bits(&candidates, &expected);
         let mut unsorted = Candidates::new(original.into_backing(), -1, false)?;
         let before = unsorted.clone();
-        assert_cached_rejected(&mut sampler.distribution, &filter, &unsorted, &mut [0.0_f32; 20]);
+        assert_cached_rejected(
+            &mut sampler.distribution,
+            &filter,
+            &unsorted,
+            &mut [0.0_f32; 20],
+        );
         let mut expected = before;
-        assert_eq!(sampler.sample_candidates(&mut unsorted)?, original_fixed_chain(&mut reference, &mut expected)?);
+        assert_eq!(
+            sampler.sample_candidates(&mut unsorted)?,
+            original_fixed_chain(&mut reference, &mut expected)?
+        );
         assert_candidate_bits(&unsorted, &expected);
         Ok(())
     }

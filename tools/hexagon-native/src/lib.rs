@@ -42,7 +42,8 @@ pub use native_q2::{
     NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES, NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES,
     NATIVE_Q2_MAX_ROWS, NATIVE_Q2_MAX_WEIGHT_ARENAS, NATIVE_Q2_MAX_WEIGHT_BYTES,
     NATIVE_Q2_MAX_WORKING_BYTES, NATIVE_Q2_VTCM_REQUEST_BYTES, NativeQ2ProjectionLimits,
-    NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle, NativeQ2WeightRegistry,
+    NativeQ2ProjectionReport, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle,
+    NativeQ2WeightRegistry,
 };
 pub use power::{PowerStatus, power_status};
 pub use projection::{
@@ -879,7 +880,8 @@ impl NativeQ2Submitter for NativeQ2Session {
     ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
-            self.0.submit_resident_batch2_validated(handles, activation, outputs)
+            self.0
+                .submit_resident_batch2_validated(handles, activation, outputs)
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {
@@ -913,7 +915,8 @@ impl NativeQ2Submitter for NativeQ2Session {
     ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
-            self.0.submit_resident_batch3_validated(handles, activation, outputs)
+            self.0
+                .submit_resident_batch3_validated(handles, activation, outputs)
         }
         #[cfg(not(all(windows, target_arch = "aarch64")))]
         {

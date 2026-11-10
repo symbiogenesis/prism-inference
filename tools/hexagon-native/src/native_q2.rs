@@ -45,7 +45,6 @@ impl<'a, const N: usize> NativeQ2ValidatedOutputs<'a, N> {
         }
     }
 
-    #[must_use]
     pub(crate) const fn from_validated(outputs: [&'a [f32]; N]) -> Self {
         Self { outputs }
     }

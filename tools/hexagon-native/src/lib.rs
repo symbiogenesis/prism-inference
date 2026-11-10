@@ -775,7 +775,7 @@ impl Driver {
 }
 
 /// Owned full-`K` native `HTP_TYPE_Q2_0` session with direct resident preparation,
-/// single/multi-operation projection and fused SwiGLU submission.
+/// single/multi-operation projection and fused `SwiGLU` submission.
 ///
 /// Cleans up its queue, module and `FastRPC` mapping when dropped. Submission
 /// support and terminal refusal remain defined by the native session; forwarding

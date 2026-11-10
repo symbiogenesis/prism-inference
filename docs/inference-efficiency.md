@@ -326,6 +326,34 @@ They open no driver and do not execute a DSP graph.
 
 ## Device and delivery acceptance
 
+Paired six-head prompt tokens now also share cached value conversion through
+the [paired value contract](paired-prefill-values.md). Their common FP16 prefix
+is read once per channel tile, while each current binary32 row and causal
+extent remains independent. Twelve 32-channel accumulator rows retain the
+existing 24 KiB temporal payload. Independent native-dot and atomic-publication
+controls join the existing full-model-shaped prefill/page/worker controls in
+the exact hosted inventory. ARM64 spills and actual-model benefit remain pending.
+
+Request preparation uses [bounded special-token windows](windowed-special-input.md)
+instead of input-wide match indexes and eager maximum-segment output storage.
+The fixed 8 KiB window retains longest/earliest reverse-trie semantics across
+UTF-8 and maximum-spelling boundaries. Three independent window/bounds controls
+and the composed tokenizer token/error-precedence control join the exact hosted
+inventory. This changes storage and bounded overlap work, and establishes no
+measured request-time or process-memory gain.
+
+Resident multi-operation projection tiles now use the submitter's explicit
+single-packet token capacity, conservatively one for arbitrary submitters and
+eight for the real native session. Existing `multi2`/`multi3`/`multi4`/`multi8`
+operations share the immutable tile across token rows; every token retains its
+original column-tile addition order. Partial packets and padded rows validate
+before successful counters, and failure clears the complete public output and
+faults the owner without replay. Bounded simultaneous outputs replace released
+packing scratch within its existing conservative reservation. Three independent
+layout/arithmetic/queue-count and failure controls join the hosted inventory,
+with the existing public forwarding and native transport controls. These are
+existing `N = 1` operations, not a qualified multi-token matrix solver.
+
 No workflow dispatch, source change or source check qualifies actual Swift
 logits, full live state, complete answers, resources or performance. Before release
 integration, retain exact-source PQ2 and independently scoped PTQ1/adapter checks,

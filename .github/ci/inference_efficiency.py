@@ -12,6 +12,11 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "kernels::pinned_attention::six::pair_values::tests::paired_values_match_native_dot_and_share_common_cache_rows",
+        "kernels::pinned_attention::six::pair_values::tests::paired_values_reject_malformed_and_late_second_token_failure_before_publication",
+        "special_input::window_tests::windowed_specials_match_independent_oracle_at_all_spelling_boundary_offsets",
+        "special_input::window_tests::windowed_specials_keep_fixed_scratch_and_grow_only_emitted_segments",
+        "special_input::window_tests::windowed_specials_retain_maximum_special_index_and_literal_limits",
         "kernels::pinned_attention::six::tests::six_head_paired_scores_match_independent_native_lanes_and_reject_bad_rows",
         "graph::attention_six::prefill_tests::six_head_paired_prefill_excludes_future_rows_and_rejects_malformed_input",
         "bpe::piece_cache_tests::piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges",
@@ -136,6 +141,7 @@ CONTROLS = {
         "prefill::tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance",
     ],
     "tokenizer": [
+        "text_encoding_windowed_specials_preserve_ids_bounds_and_failure_precedence",
         "repeated_piece_preparation_preserves_special_boundaries_unicode_and_limits",
         "text_encoding_respects_pretokenizer_boundaries_and_never_inserts_tokens",
         "text_encoding_specials_require_explicit_opt_in_and_preserve_surrounding_bytes",
@@ -152,6 +158,9 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
     "hexagon_runtime": [
+        "native_q2::multitile_tests::native_q2_resident_multitile_batches_match_original_tiles_and_queue_counts",
+        "native_q2::multitile_tests::native_q2_resident_multitile_batch_failures_publish_nothing_and_never_replay",
+        "native_q2::multitile_tests::native_q2_resident_multitile_normalizes_capabilities_and_small_groups",
         "native_q2::multitile_tests::native_q2_multitile_tokens_match_scalar_transient_and_resident",
         "native_q2::multitile_tests::native_q2_multitile_tokens_preserve_failure_and_publication",
         "native_q2::multitile_tests::native_q2_multitile_tokens_reject_invalid_input_before_submission",

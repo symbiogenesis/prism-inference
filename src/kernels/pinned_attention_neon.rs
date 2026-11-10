@@ -252,7 +252,12 @@ pub(super) fn value_tile_four_inner<'a>(
     for (h, output) in outputs.into_iter().enumerate() {
         for (group, out) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let result = sums[h][0][group];
-            publish_reduced(neon, result, gates.map(|g| &g[h][group * 4..group * 4 + 4]), out)?;
+            publish_reduced(
+                neon,
+                result,
+                gates.map(|g| &g[h][group * 4..group * 4 + 4]),
+                out,
+            )?;
         }
     }
     Ok(())
@@ -459,7 +464,10 @@ pub(super) fn value_tile_four_two_tokens_inner<'a>(
     let reductions0_finite = reduce_four_heads(&mut sums0, groups);
     let reductions1_finite = reduce_four_heads(&mut sums1, groups);
     let gates = gates.filter(|_| reductions0_finite && reductions1_finite);
-    for (token, (outputs, sums)) in [(outputs0, &sums0), (outputs1, &sums1)].into_iter().enumerate() {
+    for (token, (outputs, sums)) in [(outputs0, &sums0), (outputs1, &sums1)]
+        .into_iter()
+        .enumerate()
+    {
         for (h, output) in outputs.into_iter().enumerate() {
             for (group, out) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let result = sums[h][0][group];

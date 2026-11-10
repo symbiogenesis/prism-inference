@@ -792,21 +792,15 @@ pub struct NativeQ2Session(
 macro_rules! impl_native_q2_session_forwarding {
     ($session:ty, $dispatch:ident) => {
         impl NativeQ2Submitter for $session {
-            fn remaining_operations(
-                &self,
-            ) -> Option<u64> {
+            fn remaining_operations(&self) -> Option<u64> {
                 $dispatch!(self, remaining_operations())
             }
 
-            fn residency_capacity_bytes(
-                &self,
-            ) -> usize {
+            fn residency_capacity_bytes(&self) -> usize {
                 $dispatch!(self, residency_capacity_bytes())
             }
 
-            fn supports_in_place_weight_preparation(
-                &self,
-            ) -> bool {
+            fn supports_in_place_weight_preparation(&self) -> bool {
                 $dispatch!(self, supports_in_place_weight_preparation())
             }
 
@@ -861,7 +855,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 activation: &[f32],
                 outputs: [&'a mut [f32]; 2],
             ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
-                $dispatch!(self, submit_resident_batch2_validated(handles, activation, outputs))
+                $dispatch!(
+                    self,
+                    submit_resident_batch2_validated(handles, activation, outputs)
+                )
             }
 
             fn submit_resident_batch3(
@@ -879,7 +876,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 activation: &[f32],
                 outputs: [&'a mut [f32]; 3],
             ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
-                $dispatch!(self, submit_resident_batch3_validated(handles, activation, outputs))
+                $dispatch!(
+                    self,
+                    submit_resident_batch3_validated(handles, activation, outputs)
+                )
             }
 
             fn submit_resident_multi2(
@@ -925,7 +925,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 activation: &[f32],
                 output: &mut [f32],
             ) -> Result<(), Error> {
-                $dispatch!(self, submit_resident_ffn_swiglu(gate_handle, up_handle, activation, output))
+                $dispatch!(
+                    self,
+                    submit_resident_ffn_swiglu(gate_handle, up_handle, activation, output)
+                )
             }
 
             fn submit_resident_ffn_swiglu_multi2(
@@ -935,7 +938,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 activations: [&[f32]; 2],
                 outputs: [&mut [f32]; 2],
             ) -> Result<(), Error> {
-                $dispatch!(self, submit_resident_ffn_swiglu_multi2(gate_handle, up_handle, activations, outputs))
+                $dispatch!(
+                    self,
+                    submit_resident_ffn_swiglu_multi2(gate_handle, up_handle, activations, outputs)
+                )
             }
 
             fn submit_resident_ffn_chain(
@@ -946,7 +952,16 @@ macro_rules! impl_native_q2_session_forwarding {
                 hadamard_block_size: Option<u32>,
                 output: &mut [f32],
             ) -> Result<(), Error> {
-                $dispatch!(self, submit_resident_ffn_chain(handles, activation, residual, hadamard_block_size, output))
+                $dispatch!(
+                    self,
+                    submit_resident_ffn_chain(
+                        handles,
+                        activation,
+                        residual,
+                        hadamard_block_size,
+                        output
+                    )
+                )
             }
 
             fn submit(
@@ -959,7 +974,6 @@ macro_rules! impl_native_q2_session_forwarding {
             ) -> Result<(), Error> {
                 $dispatch!(self, submit(columns, rows, weights, activation, output))
             }
-
         }
     };
 }

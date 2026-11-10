@@ -721,16 +721,18 @@ impl Arithmetic {
                 }
                 Ok(())
             }
-            Self::PinnedSwift => crate::kernels::pinned_attention::value_tile_four_two_tokens_gated(
-                values.tokens().take(last1),
-                currents,
-                probabilities0,
-                probabilities1,
-                offset,
-                outputs0,
-                outputs1,
-                gates,
-            ),
+            Self::PinnedSwift => {
+                crate::kernels::pinned_attention::value_tile_four_two_tokens_gated(
+                    values.tokens().take(last1),
+                    currents,
+                    probabilities0,
+                    probabilities1,
+                    offset,
+                    outputs0,
+                    outputs1,
+                    gates,
+                )
+            }
         }
     }
 

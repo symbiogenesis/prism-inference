@@ -51,9 +51,7 @@ fn neon_candidate_lanes<const VALIDATE: bool>(values: &[f32; 16], threshold: f32
     let v1 = f32x4::from_slice(neon, &values[4..8]);
     let v2 = f32x4::from_slice(neon, &values[8..12]);
     let v3 = f32x4::from_slice(neon, &values[12..16]);
-    if VALIDATE
-        && !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true()
-    {
+    if VALIDATE && !(v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite()).all_true() {
         // Visit in original token order so the caller retains its original
         // first-error, scratch-clear and RNG semantics, including discarded NaNs.
         return Some(ALL_LANES);
@@ -66,7 +64,9 @@ fn neon_candidate_lanes<const VALIDATE: bool>(values: &[f32; 16], threshold: f32
     if !(m0 | m1 | m2 | m3).any_true() {
         return Some(0);
     }
-    Some(m0.to_bitmask() | (m1.to_bitmask() << 4) | (m2.to_bitmask() << 8) | (m3.to_bitmask() << 12))
+    Some(
+        m0.to_bitmask() | (m1.to_bitmask() << 4) | (m2.to_bitmask() << 8) | (m3.to_bitmask() << 12),
+    )
 }
 
 #[cfg(test)]
@@ -171,10 +171,22 @@ mod tests {
                 for (index, logit) in logits.iter_mut().enumerate() {
                     let value = f32::from(u16::try_from(index)?);
                     *logit = match pattern {
-                        0 => if index.is_multiple_of(2) { 0.0 } else { -0.0 },
+                        0 => {
+                            if index.is_multiple_of(2) {
+                                0.0
+                            } else {
+                                -0.0
+                            }
+                        }
                         1 => value,
                         2 => -value,
-                        3 => if index.is_multiple_of(16) { f32::MAX } else { f32::MIN },
+                        3 => {
+                            if index.is_multiple_of(16) {
+                                f32::MAX
+                            } else {
+                                f32::MIN
+                            }
+                        }
                         4 => f32::from(u8::try_from(index % 7)?),
                         _ => f32::from_bits(u32::try_from(index % 5)?),
                     };
@@ -186,7 +198,10 @@ mod tests {
                     }
                 }
                 assert_eq!(runtime::greedy(&logits)?, u32::try_from(expected)?);
-                assert_eq!(runtime::greedy_finite(FiniteLogits::new(&logits)?)?, u32::try_from(expected)?);
+                assert_eq!(
+                    runtime::greedy_finite(FiniteLogits::new(&logits)?)?,
+                    u32::try_from(expected)?
+                );
                 for index in 0..logits.len() {
                     let original = logits[index];
                     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

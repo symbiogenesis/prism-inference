@@ -208,7 +208,13 @@ fn value_tile_four_inner<'a>(
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
         return neon::value_tile_four_inner(
-            neon, past, current, weights, &(offset..end), outputs, gates,
+            neon,
+            past,
+            current,
+            weights,
+            &(offset..end),
+            outputs,
+            gates,
         );
     }
 
@@ -329,7 +335,14 @@ pub(crate) fn value_tile_four_two_tokens_gated<'a>(
     gates: [[&[f32]; 4]; 2],
 ) -> Result<()> {
     value_tile_four_two_tokens_inner(
-        past, currents, weights0, weights1, offset, outputs0, outputs1, Some(gates),
+        past,
+        currents,
+        weights0,
+        weights1,
+        offset,
+        outputs0,
+        outputs1,
+        Some(gates),
     )
 }
 

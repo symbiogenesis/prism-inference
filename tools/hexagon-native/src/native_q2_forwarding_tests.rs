@@ -1,6 +1,9 @@
 //! Model-free behavior of the same forwarding implementation used by the owned facade.
 
-use super::{Error, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle, NativeQ2WeightRegistry};
+use super::{
+    Error, NativeQ2Submitter, NativeQ2ValidatedOutputs, NativeQ2WeightHandle,
+    NativeQ2WeightRegistry,
+};
 
 struct RecordingSubmitter {
     registry: NativeQ2WeightRegistry,
@@ -9,7 +12,12 @@ struct RecordingSubmitter {
 }
 
 impl RecordingSubmitter {
-    fn complete(&mut self, method: &'static str, output: &mut [f32], value: f32) -> Result<(), Error> {
+    fn complete(
+        &mut self,
+        method: &'static str,
+        output: &mut [f32],
+        value: f32,
+    ) -> Result<(), Error> {
         self.calls.push(method);
         if self.fail {
             output.fill(f32::NAN);
@@ -21,11 +29,17 @@ impl RecordingSubmitter {
 }
 
 impl NativeQ2Submitter for RecordingSubmitter {
-    fn remaining_operations(&self) -> Option<u64> { Some(321) }
+    fn remaining_operations(&self) -> Option<u64> {
+        Some(321)
+    }
 
-    fn residency_capacity_bytes(&self) -> usize { self.registry.remaining_bytes() }
+    fn residency_capacity_bytes(&self) -> usize {
+        self.registry.remaining_bytes()
+    }
 
-    fn supports_in_place_weight_preparation(&self) -> bool { !self.fail }
+    fn supports_in_place_weight_preparation(&self) -> bool {
+        !self.fail
+    }
 
     fn prepare_weights_in_place(
         &mut self,
@@ -49,7 +63,9 @@ impl NativeQ2Submitter for RecordingSubmitter {
         for (output, activation) in outputs.into_iter().zip(activations) {
             output.fill(activation[0]);
         }
-        if self.fail { return Err(Error::Contract); }
+        if self.fail {
+            return Err(Error::Contract);
+        }
         Ok(())
     }
 
@@ -74,7 +90,9 @@ impl NativeQ2Submitter for RecordingSubmitter {
         for (output, activation) in outputs.into_iter().zip(activations) {
             output.fill(activation[0]);
         }
-        if self.fail { return Err(Error::Contract); }
+        if self.fail {
+            return Err(Error::Contract);
+        }
         Ok(())
     }
 
@@ -120,7 +138,9 @@ impl NativeQ2Submitter for RecordingSubmitter {
         _weights: &[u8],
         _activation: &[f32],
         _output: &mut [f32],
-    ) -> Result<(), Error> { Err(Error::Contract) }
+    ) -> Result<(), Error> {
+        Err(Error::Contract)
+    }
 }
 
 struct RecordingSession(RecordingSubmitter);
@@ -135,8 +155,17 @@ impl_native_q2_session_forwarding!(RecordingSession, dispatch_recording_session)
 
 fn fixture() -> Result<(RecordingSession, NativeQ2WeightHandle), Error> {
     let mut registry = NativeQ2WeightRegistry::new(4096)?;
-    let handle = registry.prepare(128, 32, &[0_u8; 1152])?.ok_or(Error::Contract)?;
-    Ok((RecordingSession(RecordingSubmitter { registry, calls: Vec::new(), fail: false }), handle))
+    let handle = registry
+        .prepare(128, 32, &[0_u8; 1152])?
+        .ok_or(Error::Contract)?;
+    Ok((
+        RecordingSession(RecordingSubmitter {
+            registry,
+            calls: Vec::new(),
+            fail: false,
+        }),
+        handle,
+    ))
 }
 
 #[test]
@@ -146,18 +175,24 @@ fn owned_session_forwards_direct_resident_initialization_once() -> Result<(), Er
     assert_eq!(session.remaining_operations(), Some(321));
     let before = session.residency_capacity_bytes();
     let mut callbacks = 0;
-    let handle = session.prepare_weights_in_place(128, 32, &mut |bytes| {
-        callbacks += 1;
-        assert_eq!(bytes.len(), 1152);
-        bytes.fill(0x55);
-        Ok(())
-    })?.ok_or(Error::Contract)?;
+    let handle = session
+        .prepare_weights_in_place(128, 32, &mut |bytes| {
+            callbacks += 1;
+            assert_eq!(bytes.len(), 1152);
+            bytes.fill(0x55);
+            Ok(())
+        })?
+        .ok_or(Error::Contract)?;
     assert_eq!(callbacks, 1);
     assert_eq!(handle.packed_bytes(), 1152);
     assert_eq!(session.residency_capacity_bytes(), before - 1152);
     assert_eq!(session.0.calls, ["prepare-in-place"]);
     let used = session.0.registry.used_bytes();
-    assert!(session.prepare_weights_in_place(128, 32, &mut |_| Err(Error::Contract)).is_err());
+    assert!(
+        session
+            .prepare_weights_in_place(128, 32, &mut |_| Err(Error::Contract))
+            .is_err()
+    );
     assert_eq!(session.0.registry.used_bytes(), used);
     Ok(())
 }
@@ -167,11 +202,25 @@ fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error
     let (mut session, handle) = fixture()?;
     let activations = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].map(|value| [value; 128]);
     let mut outputs = [[f32::NAN; 32]; 8];
-    session.submit_resident_multi8([&handle; 8], activations.each_ref().map(|row| row.as_slice()), outputs.each_mut().map(|row| row.as_mut_slice()))?;
+    session.submit_resident_multi8(
+        [&handle; 8],
+        activations.each_ref().map(|row| row.as_slice()),
+        outputs.each_mut().map(|row| row.as_mut_slice()),
+    )?;
     assert_eq!(session.0.calls, ["multi8"]);
-    for (output, activation) in outputs.iter().zip(&activations) { assert_eq!(*output, [activation[0]; 32]); }
+    for (output, activation) in outputs.iter().zip(&activations) {
+        assert_eq!(*output, [activation[0]; 32]);
+    }
     session.0.fail = true;
-    assert!(session.submit_resident_multi8([&handle; 8], activations.each_ref().map(|row| row.as_slice()), outputs.each_mut().map(|row| row.as_mut_slice())).is_err());
+    assert!(
+        session
+            .submit_resident_multi8(
+                [&handle; 8],
+                activations.each_ref().map(|row| row.as_slice()),
+                outputs.each_mut().map(|row| row.as_mut_slice())
+            )
+            .is_err()
+    );
     assert_eq!(session.0.calls, ["multi8", "multi8"]);
     // A forwarding facade must preserve even the submitter's failure outputs;
     // it must not replay a partial packet or replace its publication policy.
@@ -189,18 +238,43 @@ fn owned_session_preserves_fused_swiglu_calls_and_rejection() -> Result<(), Erro
     session.submit_resident_ffn_swiglu(&handle, &handle, &activation, &mut output)?;
     assert_eq!(output, [3.0; 32]);
     let mut pair = [[f32::NAN; 32]; 2];
-    session.submit_resident_ffn_swiglu_multi2(&handle, &handle, [&activation; 2], pair.each_mut().map(|row| row.as_mut_slice()))?;
+    session.submit_resident_ffn_swiglu_multi2(
+        &handle,
+        &handle,
+        [&activation; 2],
+        pair.each_mut().map(|row| row.as_mut_slice()),
+    )?;
     assert_eq!(pair, [[3.0; 32]; 2]);
     assert_eq!(session.0.calls, ["swiglu", "swiglu-multi2"]);
     session.0.fail = true;
-    assert!(session.submit_resident_ffn_swiglu(&handle, &handle, &activation, &mut output).is_err());
+    assert!(
+        session
+            .submit_resident_ffn_swiglu(&handle, &handle, &activation, &mut output)
+            .is_err()
+    );
     assert!(output.iter().all(|value| value.is_nan()));
     pair.fill([99.0; 32]);
-    assert!(session.submit_resident_ffn_swiglu_multi2(&handle, &handle, [&activation; 2], pair.each_mut().map(|row| row.as_mut_slice())).is_err());
+    assert!(
+        session
+            .submit_resident_ffn_swiglu_multi2(
+                &handle,
+                &handle,
+                [&activation; 2],
+                pair.each_mut().map(|row| row.as_mut_slice())
+            )
+            .is_err()
+    );
     assert_eq!(pair, [[3.0; 32]; 2]);
-    assert_eq!(session.0.calls, ["swiglu", "swiglu-multi2", "swiglu", "swiglu-multi2"]);
+    assert_eq!(
+        session.0.calls,
+        ["swiglu", "swiglu-multi2", "swiglu", "swiglu-multi2"]
+    );
     // Forwarding does not manufacture support for the unfinished full-chain backend.
-    assert!(session.submit_resident_ffn_chain([&handle; 3], &activation, None, None, &mut output).is_err());
+    assert!(
+        session
+            .submit_resident_ffn_chain([&handle; 3], &activation, None, None, &mut output)
+            .is_err()
+    );
     assert!(output.iter().all(|value| value.is_nan()));
     Ok(())
 }
@@ -211,20 +285,45 @@ fn owned_session_preserves_borrowed_output_evidence_and_errors() -> Result<(), E
     let activation = [-0.0, f32::from_bits(1), 1.0];
     let mut output = [f32::NAN; 32];
     let destination = (output.as_ptr(), output.len());
-    session.submit_resident_validated(&handle, &activation, &mut output)?.validate_destinations([destination])?;
-    assert!(output.iter().all(|value| value.to_bits() == (-0.0_f32).to_bits()));
+    session
+        .submit_resident_validated(&handle, &activation, &mut output)?
+        .validate_destinations([destination])?;
+    assert!(
+        output
+            .iter()
+            .all(|value| value.to_bits() == (-0.0_f32).to_bits())
+    );
     let mut pair = [[f32::NAN; 32]; 2];
     let destinations = pair.each_ref().map(|row| (row.as_ptr(), row.len()));
-    session.submit_resident_batch2_validated([&handle; 2], &activation, pair.each_mut().map(|row| row.as_mut_slice()))?.validate_destinations(destinations)?;
+    session
+        .submit_resident_batch2_validated(
+            [&handle; 2],
+            &activation,
+            pair.each_mut().map(|row| row.as_mut_slice()),
+        )?
+        .validate_destinations(destinations)?;
     let mut triple = [[f32::NAN; 32]; 3];
     let destinations = triple.each_ref().map(|row| (row.as_ptr(), row.len()));
-    session.submit_resident_batch3_validated([&handle; 3], &activation, triple.each_mut().map(|row| row.as_mut_slice()))?.validate_destinations(destinations)?;
-    assert_eq!(session.0.calls, ["validated", "validated-batch2", "validated-batch3"]);
+    session
+        .submit_resident_batch3_validated(
+            [&handle; 3],
+            &activation,
+            triple.each_mut().map(|row| row.as_mut_slice()),
+        )?
+        .validate_destinations(destinations)?;
+    assert_eq!(
+        session.0.calls,
+        ["validated", "validated-batch2", "validated-batch3"]
+    );
     assert!(pair[1].iter().all(|value| value.to_bits() == 1));
     assert_eq!(triple[2], [1.0; 32]);
     session.0.fail = true;
     assert!(!session.supports_in_place_weight_preparation());
-    assert!(session.submit_resident_validated(&handle, &activation, &mut output).is_err());
+    assert!(
+        session
+            .submit_resident_validated(&handle, &activation, &mut output)
+            .is_err()
+    );
     assert!(output.iter().all(|value| value.is_nan()));
     Ok(())
 }

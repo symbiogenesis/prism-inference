@@ -535,19 +535,45 @@ mod tests {
                         .map(|index| {
                             let value = f32::from(u16::try_from(index)?);
                             Ok(match pattern {
-                                0 => if index.is_multiple_of(2) { 0.0 } else { -0.0 },
+                                0 => {
+                                    if index.is_multiple_of(2) {
+                                        0.0
+                                    } else {
+                                        -0.0
+                                    }
+                                }
                                 1 => value,
                                 2 => -value,
-                                3 => if index.is_multiple_of(16) { f32::MAX } else { f32::MIN },
+                                3 => {
+                                    if index.is_multiple_of(16) {
+                                        f32::MAX
+                                    } else {
+                                        f32::MIN
+                                    }
+                                }
                                 4 => f32::from(u8::try_from(index % 7)?),
                                 5 => f32::from_bits(u32::try_from(index % 5)?),
-                                _ => if index % 16 == 15 { value } else { -value },
+                                _ => {
+                                    if index % 16 == 15 {
+                                        value
+                                    } else {
+                                        -value
+                                    }
+                                }
                             })
                         })
                         .collect::<crate::Result<Vec<_>>>()?;
-                    let backing = logits.iter().enumerate().map(|(index, &logit)| {
-                        Ok(Candidate { id: i32::try_from(index)?, logit, probability: 0.0 })
-                    }).collect::<crate::Result<Vec<_>>>()?;
+                    let backing = logits
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &logit)| {
+                            Ok(Candidate {
+                                id: i32::try_from(index)?,
+                                logit,
+                                probability: 0.0,
+                            })
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?;
                     let mut reference = Candidates::new(backing, -1, false)?;
                     State::new(Config::TopK(i32::try_from(keep)?))?.apply(&mut reference)?;
                     top_k_logits(&logits, keep, &mut bounded)?;
@@ -558,7 +584,11 @@ mod tests {
                         assert_eq!(actual.probability.to_bits(), expected.probability.to_bits());
                     }
                     let mut finite = Vec::new();
-                    super::top_k_finite_logits(super::FiniteLogits::new(&logits)?, keep, &mut finite)?;
+                    super::top_k_finite_logits(
+                        super::FiniteLogits::new(&logits)?,
+                        keep,
+                        &mut finite,
+                    )?;
                     for (actual, expected) in finite.iter().zip(&bounded) {
                         assert_eq!(actual.id, expected.id);
                         assert_eq!(actual.logit.to_bits(), expected.logit.to_bits());
@@ -571,7 +601,8 @@ mod tests {
     }
 
     #[test]
-    fn lane_pruned_heap_rejects_every_nonfinite_position_without_consuming_rng() -> crate::Result<()> {
+    fn lane_pruned_heap_rejects_every_nonfinite_position_without_consuming_rng() -> crate::Result<()>
+    {
         let mut logits = vec![0.0_f32; SwiftSampler::VOCABULARY];
         let mut sampler = SwiftSampler::new(4242)?;
         let mut control = sampler.clone();

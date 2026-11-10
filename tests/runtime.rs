@@ -674,10 +674,11 @@ fn failed_optional_checkpoint_preserves_a_full_prefix_cache() -> Result<()> {
 fn oversized_optional_checkpoint_preserves_an_older_prefix() -> Result<()> {
     let decoder = decoder();
     let checkpoint_fail = decoder.checkpoint_fail.clone();
-    // Each snapshot owns three Vec headers and a byte count, plus two copies
-    // of its token IDs and eight logits. Allow the long rollback and the small
-    // saved prefix together, but not the medium rollback and a long replacement.
-    let snapshot_metadata = 3 * size_of::<Vec<u32>>() + size_of::<usize>();
+    // Charge the state/token Vecs, shared-logits Vec and Arc pointer/counts,
+    // plus the snapshot byte count. Every snapshot still charges its full token
+    // and logits payload despite sharing. Allow the long rollback and small
+    // prefix together, but not the medium rollback and a long replacement.
+    let snapshot_metadata = 3 * size_of::<Vec<u32>>() + 4 * size_of::<usize>();
     let mut runtime = Runtime::new(
         decoder,
         Limits {
@@ -1031,8 +1032,19 @@ fn reusable_logits_preserve_storage_prefixes_and_transaction_recovery() -> Resul
     assert_eq!(runtime.tokens(), &[1, 1, 3, 5]);
     runtime.reset()?;
     runtime.generate(&[1], &options(), &active, |_| Ok(()))?;
-    let first_storage = storage.borrow()[0];
-    assert!(storage.borrow().iter().all(|&entry| entry == first_storage));
+    let captured = storage.borrow();
+    // Retained immutable snapshots keep their own distribution. Each request
+    // detaches once, then all of its decoder steps reuse the unique allocation.
+    assert_eq!(captured.len(), 8);
+    for pair in captured.chunks_exact(2) {
+        assert_eq!(pair[0], pair[1]);
+        assert_eq!(pair[0].1, 8);
+    }
+    assert_ne!(captured[0].0, captured[2].0);
+    assert_ne!(captured[2].0, captured[4].0);
+    // Explicit reset discards snapshots and retains the now-unique allocation.
+    assert_eq!(captured[4], captured[6]);
+    drop(captured);
     assert_eq!(owned_calls.get(), 0);
 
     for failure in [
@@ -1222,8 +1234,19 @@ fn prompt_ingestion_skips_only_intermediate_uncached_logits_and_preserves_storag
         operations.replace(Vec::new()),
         [Ingest(7), Evaluate(1), Evaluate(0)]
     );
-    let first_storage = storage.borrow()[0];
-    assert!(storage.borrow().iter().all(|&entry| entry == first_storage));
+    let captured = storage.borrow();
+    // Each request's immutable rollback/completion distributions stay alive;
+    // all evaluated tokens within one request reuse the detached allocation.
+    assert_eq!(captured.len(), 8);
+    for [start, end] in [[0, 3], [3, 4], [4, 6], [6, 8]] {
+        let first = captured[start];
+        assert_eq!(first.1, 8);
+        assert!(captured[start..end].iter().all(|&entry| entry == first));
+    }
+    assert_ne!(captured[0].0, captured[3].0);
+    assert_ne!(captured[3].0, captured[4].0);
+    assert_ne!(captured[4].0, captured[6].0);
+    drop(captured);
     assert_eq!(owned_calls.get(), 0);
     Ok(())
 }

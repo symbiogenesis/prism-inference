@@ -129,7 +129,7 @@ pub enum PromptReuse {
 struct Snapshot<S> {
     state: S,
     tokens: Vec<u32>,
-    logits: Vec<f32>,
+    logits: Arc<Vec<f32>>,
     bytes: usize,
 }
 
@@ -139,13 +139,16 @@ struct Snapshot<S> {
 /// never truncated as though it were a KV-only cache. A failed stream callback
 /// rolls back the entire request, including prefill; already emitted output is
 /// provisional until this call succeeds. Failed restoration latches the runtime
-/// closed until [`Self::reset`] succeeds. No task or background work is spawned.
+/// closed until [`Self::reset`] succeeds. Snapshots share immutable logits; a
+/// subsequent evaluation detaches without copying and reuses its output buffer.
+/// No task or background work is spawned.
 pub struct Runtime<D: Decoder> {
     decoder: D,
     limits: Limits,
     tokens: Vec<u32>,
     // Empty means invalid; a valid decoder vocabulary is always nonempty.
-    logits: Vec<f32>,
+    // Captures/restores share immutable output. Mutation detaches without copying.
+    logits: Arc<Vec<f32>>,
     checkpoints: Vec<Snapshot<D::Checkpoint>>,
     faulted: bool,
 }
@@ -225,7 +228,7 @@ impl Runtime<crate::graph::Qwen35> {
         self.decoder.reset_with_adapter_scale(scale)?;
         self.checkpoints.clear();
         self.tokens.clear();
-        self.logits.clear();
+        mutable_logits(&mut self.logits).clear();
         self.faulted = false;
         Ok(())
     }
@@ -259,7 +262,7 @@ impl<D: Decoder> Runtime<D> {
             decoder,
             limits,
             tokens,
-            logits: Vec::new(),
+            logits: Arc::new(Vec::new()),
             checkpoints,
             faulted: false,
         })
@@ -304,7 +307,7 @@ impl<D: Decoder> Runtime<D> {
         self.decoder.reset()?;
         self.checkpoints.clear();
         self.tokens.clear();
-        self.logits.clear();
+        mutable_logits(&mut self.logits).clear();
         self.faulted = false;
         Ok(())
     }
@@ -736,12 +739,23 @@ impl<D: Decoder> Runtime<D> {
         reserved: usize,
         check: &impl Fn() -> Result<()>,
     ) -> Result<Snapshot<D::Checkpoint>> {
-        let logits_len = self.logits.len();
+        // Charge every shared payload in full, plus its Vec and Arc metadata.
+        // Sharing removes copies without lowering the conservative cache bound.
+        let logits_capacity = if self.logits.is_empty() {
+            0
+        } else {
+            self.logits.capacity()
+        };
+        let logits_bytes = logits_capacity
+            .checked_mul(size_of::<f32>())
+            .and_then(|bytes| bytes.checked_add(size_of::<Vec<f32>>()))
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+            .ok_or_else(|| invalid("native logits checkpoint byte count overflow"))?;
         let bytes = self
             .tokens
             .len()
-            .checked_add(logits_len)
-            .and_then(|length| length.checked_mul(4))
+            .checked_mul(size_of::<u32>())
+            .and_then(|size| size.checked_add(logits_bytes))
             .and_then(|size| size.checked_add(self.decoder.checkpoint_bytes()))
             .and_then(|size| size.checked_add(size_of::<Snapshot<D::Checkpoint>>()))
             .ok_or_else(|| invalid("native checkpoint byte count overflow"))?;
@@ -763,7 +777,13 @@ impl<D: Decoder> Runtime<D> {
             self.checkpoints.remove(0);
         }
         let tokens = copy(&self.tokens)?;
-        let logits = copy(&self.logits)?;
+        // Invalid/empty output needs no retained backing storage. Keep its
+        // dormant allocation unique so reset-only requests can reuse it.
+        let logits = if self.logits.is_empty() {
+            Arc::new(Vec::new())
+        } else {
+            Arc::clone(&self.logits)
+        };
         check()?;
         let state = self.decoder.checkpoint()?;
         Ok(Snapshot {
@@ -789,20 +809,18 @@ impl<D: Decoder> Runtime<D> {
             let snapshot = &self.checkpoints[index];
             self.tokens
                 .try_reserve_exact(snapshot.tokens.len().saturating_sub(self.tokens.len()))?;
-            self.logits.clear();
-            self.logits.try_reserve_exact(snapshot.logits.len())?;
             check()?;
             self.decoder.restore(&snapshot.state)?;
             check()?;
             self.tokens.clear();
             self.tokens.extend_from_slice(&snapshot.tokens);
-            self.logits.extend_from_slice(&snapshot.logits);
+            self.logits = Arc::clone(&snapshot.logits);
         } else {
             check()?;
             self.decoder.reset()?;
             check()?;
             self.tokens.clear();
-            self.logits.clear();
+            mutable_logits(&mut self.logits).clear();
         }
         Ok(self.tokens.len())
     }
@@ -812,25 +830,26 @@ impl<D: Decoder> Runtime<D> {
         // Reserve before mutating decoder state; rollback is still available if
         // a decoder allocation or arithmetic operation subsequently fails.
         self.tokens.try_reserve(1)?;
-        self.logits.clear();
+        let output = mutable_logits(&mut self.logits);
+        output.clear();
         check()?;
         let result = self
             .decoder
-            .evaluate_finite_into(token, &mut self.logits)
+            .evaluate_finite_into(token, output)
             .map(|logits| (logits.as_slice().as_ptr(), logits.as_slice().len()))
             .and_then(|(pointer, length)| {
                 // A public custom decoder can return a checked view of other
                 // storage. Admit only a proof covering this complete output.
                 if length != self.decoder.vocab_size()
-                    || length != self.logits.len()
-                    || !std::ptr::eq(pointer, self.logits.as_ptr())
+                    || length != output.len()
+                    || !std::ptr::eq(pointer, output.as_ptr())
                 {
                     return Err(invalid("native decoder returned invalid logits"));
                 }
                 check()
             });
         if let Err(error) = result {
-            self.logits.clear();
+            output.clear();
             return Err(error);
         }
         self.tokens.push(token);
@@ -842,7 +861,7 @@ impl<D: Decoder> Runtime<D> {
         self.tokens.try_reserve(tokens.len())?;
         // Preserve the reusable allocation, but invalidate logits for the old
         // prefix before advancing state without producing a new distribution.
-        self.logits.clear();
+        mutable_logits(&mut self.logits).clear();
         check()?;
         self.decoder.ingest_block(tokens, check)?;
         check()?;
@@ -1269,6 +1288,17 @@ fn check_deadline(cancellation: &Cancellation, deadline: Instant, now: Instant) 
     Ok(())
 }
 
+// A snapshot owns only an immutable Arc. Before writing a new distribution,
+// detach shared output without cloning values that will immediately be cleared.
+// The fresh allocation then remains unique and reusable across decoder steps.
+// No Weak references escape, and Arc::make_mut therefore never copies payload.
+fn mutable_logits(logits: &mut Arc<Vec<f32>>) -> &mut Vec<f32> {
+    if Arc::get_mut(logits).is_none() {
+        *logits = Arc::new(Vec::new());
+    }
+    Arc::make_mut(logits)
+}
+
 fn copy<T: Copy>(source: &[T]) -> Result<Vec<T>> {
     let mut output = Vec::new();
     output.try_reserve_exact(source.len())?;
@@ -1332,6 +1362,9 @@ fn greedy_inner<const VALIDATE: bool>(logits: &[f32]) -> Result<usize> {
 
 #[cfg(test)]
 mod terminal_tests;
+
+#[cfg(test)]
+mod logits_tests;
 
 #[cfg(test)]
 mod deadline_tests {

@@ -56,6 +56,8 @@ impl Tokenizer {
     /// no IDs, including with a zero output allowance.
     /// Repeated short ordinary pieces reuse exact merged IDs in the bounded
     /// request-local BPE cache; no cached result survives this call.
+    /// Parsed special recognition uses fixed 8 KiB match scratch and grows its
+    /// borrowed segment storage with emitted ranges, rather than input bytes.
     ///
     /// # Errors
     /// Rejects input/piece/output bounds, missing normal byte tokens and

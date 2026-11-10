@@ -108,6 +108,46 @@ fn text_encoding_specials_require_explicit_opt_in_and_preserve_surrounding_bytes
 }
 
 #[test]
+fn text_encoding_windowed_specials_preserve_ids_bounds_and_failure_precedence() -> Result<()> {
+    let values = metadata()?;
+    let tokenizer = Tokenizer::from_metadata(&values, 260)?;
+    let vocabulary = Vocabulary::from_metadata(&values, 260)?;
+    for offset in 0..8 {
+        let prefix = "ab ".repeat(1364) + &"x".repeat(offset);
+        let suffix = "\u{3bb}\u{1f980}ab a!";
+        let text = format!("{prefix}<stop><tag>{suffix}");
+        let mut expected = tokenizer.encode(&prefix, prefix.len(), SpecialInputPolicy::Literal)?;
+        expected.extend([258, 259]);
+        expected.extend(tokenizer.encode(suffix, suffix.len(), SpecialInputPolicy::Literal)?);
+        let actual = tokenizer.encode(&text, expected.len(), SpecialInputPolicy::Parse)?;
+        assert_eq!(actual, expected);
+        assert_eq!(decoded(&vocabulary, &actual)?, text.as_bytes());
+        assert!(
+            tokenizer
+                .encode(&text, expected.len() - 1, SpecialInputPolicy::Parse)
+                .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+        );
+        assert_eq!(
+            tokenizer.encode(&text, expected.len(), SpecialInputPolicy::Parse)?,
+            expected
+        );
+    }
+    // Segmentation rejects a full-input bound before a zero token allowance.
+    // Windowed recognition must not expose partial encoding or change that order.
+    let too_many = "<stop>".repeat(65_537);
+    assert!(
+        tokenizer
+            .encode(&too_many, 0, SpecialInputPolicy::Parse)
+            .is_err_and(|error| !error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
+    assert_eq!(
+        tokenizer.encode("<stop><tag>ab", 3, SpecialInputPolicy::Parse)?,
+        [258, 259, 256]
+    );
+    Ok(())
+}
+
+#[test]
 fn text_token_capacity_is_typed_without_reclassifying_byte_safety_limits() -> Result<()> {
     let values = metadata()?;
     let tokenizer = Tokenizer::from_metadata(&values, 260)?;

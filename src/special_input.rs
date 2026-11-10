@@ -20,7 +20,8 @@ pub const MAX_SPECIAL_INPUT_BYTES: usize = 1024 * 1024;
 /// Maximum returned text and special segments, independently of caller limits.
 pub const MAX_SPECIAL_INPUT_SEGMENTS: usize = 64 * 1024;
 
-const NO_MATCH: usize = usize::MAX;
+const NO_MATCH: u16 = u16::MAX;
+const MATCH_WINDOW_BYTES: usize = 4096;
 const MAX_BUILD_TRANSITIONS: usize = 16 * 1024 * 1024;
 
 /// Explicit interpretation of special-token spellings in caller-provided text.
@@ -45,7 +46,7 @@ pub enum InputSegment<'a> {
 struct Node {
     edges: std::ops::Range<usize>,
     failure: usize,
-    best: usize,
+    best: u16,
 }
 
 impl Node {
@@ -86,16 +87,19 @@ struct BuildRange {
 /// start. An overlapping match beginning later never displaces an earlier one.
 ///
 /// A sparse reverse-byte Aho-Corasick trie finds the longest match for each
-/// starting byte in one reverse scan. It retains at most `1 + MAX_SPECIAL_BYTES`
-/// nodes, `MAX_SPECIAL_BYTES` edges, and `MAX_SPECIAL_TOKENS` length/ID entries;
+/// starting byte in bounded reverse windows. It retains at most
+/// `1 + MAX_SPECIAL_BYTES` nodes, `MAX_SPECIAL_BYTES` edges, and
+/// `MAX_SPECIAL_TOKENS` length/ID entries;
 /// original metadata and spelling strings are not retained. Edge lookup uses
 /// binary search over at most 256 children. Failure transitions amortize to at
-/// most twice the input length, independently of the number of special tokens.
+/// most twice the scanned bytes, independently of the number of special tokens.
+/// Each window scans at most 255 extra bytes beyond its 4096 owned positions.
 #[derive(Debug)]
 pub struct SpecialInput {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     specials: Vec<Special>,
+    lookahead: usize,
 }
 
 impl SpecialInput {
@@ -151,6 +155,11 @@ impl SpecialInput {
 
     fn build(mut entries: Vec<(&[u8], u32)>) -> Result<Self> {
         let count = entries.len();
+        let lookahead = entries
+            .iter()
+            .map(|(spelling, _)| spelling.len().saturating_sub(1))
+            .max()
+            .unwrap_or_default();
         entries.sort_unstable_by(|left, right| left.0.iter().rev().cmp(right.0.iter().rev()));
 
         let mut node_count = 1_usize;
@@ -185,7 +194,7 @@ impl SpecialInput {
             let range = ranges[cursor];
             let mut start = range.start;
             if start < range.end && entries[start].0.len() == range.depth {
-                nodes[cursor].best = start;
+                nodes[cursor].best = u16::try_from(start)?;
                 start += 1;
             }
             let edge_start = edges.len();
@@ -228,6 +237,7 @@ impl SpecialInput {
             nodes,
             edges,
             specials,
+            lookahead,
         };
         result.build_failure_links()?;
         Ok(result)
@@ -241,10 +251,11 @@ impl SpecialInput {
     /// other ID. Output is bounded by both `max_segments` and
     /// [`MAX_SPECIAL_INPUT_SEGMENTS`], without returning partial output on error.
     ///
-    /// Input is limited to [`MAX_SPECIAL_INPUT_BYTES`]. Parsing temporarily uses
-    /// one machine-sized match index per input byte; literal input needs none.
-    /// Output reserves at most `min(input bytes, segment limit)` entries, and
-    /// borrows text directly from `text`, independently of metadata lifetime.
+    /// Input is limited to [`MAX_SPECIAL_INPUT_BYTES`]. Parsing uses an 8 KiB
+    /// fixed match window, independent of input length; literal input needs none.
+    /// Windows rescan at most 255 following bytes to recognize boundary-spanning
+    /// spellings. Output grows fallibly with emitted segments, up to the segment
+    /// limit, and borrows text independently of metadata lifetime.
     ///
     /// # Errors
     /// Rejects oversized input, output above either segment bound, or allocation
@@ -271,11 +282,61 @@ impl SpecialInput {
             output.push(InputSegment::Text(text));
             return Ok(output);
         }
-        let mut starting_specials = Vec::new();
-        starting_specials.try_reserve_exact(text.len())?;
-        starting_specials.resize(text.len(), NO_MATCH);
+        let mut output = Vec::new();
+        let mut starting_specials = [NO_MATCH; MATCH_WINDOW_BYTES];
+        let mut position = 0;
+        let mut text_start = 0;
+        while position < text.len() {
+            let window_start = position;
+            let window_end = (window_start + MATCH_WINDOW_BYTES).min(text.len());
+            self.match_window(
+                text.as_bytes(),
+                window_start,
+                window_end,
+                &mut starting_specials,
+            );
+            while position < window_end {
+                let index = starting_specials[position - window_start];
+                if index == NO_MATCH {
+                    position += 1;
+                    continue;
+                }
+                if text_start < position {
+                    push_segment(
+                        &mut output,
+                        InputSegment::Text(&text[text_start..position]),
+                        limit,
+                    )?;
+                }
+                let special = &self.specials[usize::from(index)];
+                push_segment(&mut output, InputSegment::Special(special.token), limit)?;
+                // A match can cross the window boundary. The next window begins
+                // after it, so overlapping matches remain unreachable. UTF-8
+                // spellings only match complete scalars in valid UTF-8 input.
+                position += special.length;
+                text_start = position;
+            }
+        }
+        if text_start < text.len() {
+            push_segment(&mut output, InputSegment::Text(&text[text_start..]), limit)?;
+        }
+        Ok(output)
+    }
+
+    fn match_window(
+        &self,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        matches: &mut [u16; MATCH_WINDOW_BYTES],
+    ) {
+        // A spelling beginning inside this window needs at most lookahead
+        // bytes after its last position. Restarting from the root there yields
+        // the same longest output as the full reverse scan at every owned byte.
+        let scan_end = (end + self.lookahead).min(bytes.len());
         let mut node = 0;
-        for (position, &byte) in text.as_bytes().iter().enumerate().rev() {
+        for (offset, &byte) in bytes[start..scan_end].iter().enumerate().rev() {
+            let position = start + offset;
             loop {
                 if let Some(next) = self.transition(node, byte) {
                     node = next;
@@ -286,36 +347,10 @@ impl SpecialInput {
                 }
                 node = self.nodes[node].failure;
             }
-            starting_specials[position] = self.nodes[node].best;
-        }
-        let mut output = Vec::new();
-        output.try_reserve_exact(text.len().min(limit))?;
-        let mut position = 0;
-        let mut text_start = 0;
-        while position < text.len() {
-            let index = starting_specials[position];
-            if index == NO_MATCH {
-                position += 1;
-                continue;
+            if position < end {
+                matches[position - start] = self.nodes[node].best;
             }
-            if text_start < position {
-                push_segment(
-                    &mut output,
-                    InputSegment::Text(&text[text_start..position]),
-                    limit,
-                )?;
-            }
-            let special = &self.specials[index];
-            push_segment(&mut output, InputSegment::Special(special.token), limit)?;
-            // UTF-8 spellings can only match complete scalars in valid UTF-8
-            // input, so both slice boundaries remain character boundaries.
-            position += special.length;
-            text_start = position;
         }
-        if text_start < text.len() {
-            push_segment(&mut output, InputSegment::Text(&text[text_start..]), limit)?;
-        }
-        Ok(output)
     }
 
     fn transition(&self, node: usize, byte: u8) -> Option<usize> {
@@ -370,6 +405,14 @@ fn push_segment<'a>(
     if output.len() == limit {
         return Err(invalid("special input exceeds segment limit"));
     }
+    if output.len() == output.capacity() {
+        let additional = output.capacity().max(4).min(limit - output.len());
+        output.try_reserve_exact(additional)?;
+    }
     output.push(segment);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "special_input/window_tests.rs"]
+mod window_tests;

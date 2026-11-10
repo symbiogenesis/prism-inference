@@ -20,6 +20,10 @@ const ALL_LANES: u64 = (1 << 16) - 1;
         reason = "Portable signature matches the dynamically selected NEON implementation."
     )
 )]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "The private sampler module shares this helper with Runtime while retaining the explicit crate boundary."
+)]
 pub(crate) fn candidate_lanes<const VALIDATE: bool>(values: &[f32; 16], threshold: f32) -> u64 {
     #[cfg(all(
         feature = "experimental-neon",

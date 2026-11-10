@@ -1009,10 +1009,13 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
         let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
         if !single_op {
-            for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
-                self.project_f32_inner(tensor, activation, output)?;
-            }
-            return Ok(());
+            return self.project_multitile_tokens(
+                tensor,
+                (columns, rows),
+                cached,
+                activations,
+                outputs,
+            );
         }
         if cached.is_none() && self.residency.is_none() {
             return self.project_transient_token_tile(
@@ -1167,6 +1170,142 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 .statistics
                 .projections_completed
                 .saturating_add(chunk_u64);
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep bounded tile scratch, immutable weight reuse and transactional token accumulation together"
+    )]
+    fn project_multitile_tokens(
+        &mut self,
+        tensor: &Tensor,
+        (columns, rows): (usize, usize),
+        cached: Option<usize>,
+        activations: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if activations[0].len() != columns {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        // Retain the scalar tiled path's first-shape/scale/finite precedence.
+        // No token is submitted before the complete tile's inputs are valid.
+        if cached.is_none() {
+            for block in tensor.data.as_chunks::<34>().0 {
+                scale(block)?;
+            }
+        }
+        for activation in activations {
+            if activation.len() != columns {
+                return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+            }
+            finite_slice(activation)?;
+        }
+        let mut weights = Vec::new();
+        let resident = if let Some(index) = cached {
+            self.scratch_weights = Vec::new();
+            Some(index)
+        } else {
+            self.prepare_resident(tensor, &mut weights, false)?
+        };
+        if let Some(index) = resident
+            && let Some(cache) = &mut self.residency
+        {
+            let hits = if cache.projections[index].evaluated {
+                activations.len()
+            } else {
+                cache.projections[index].evaluated = true;
+                activations.len() - 1
+            };
+            cache.statistics.cache_hits = cache
+                .statistics
+                .cache_hits
+                .saturating_add(u64::try_from(hits)?);
+        }
+        let max_mapped_rows = rows.min(self.maximum_rows).next_multiple_of(32);
+        if resident.is_none() {
+            resize_packed_scratch(
+                &mut weights,
+                max_mapped_rows * 36 * (columns.min(self.maximum_columns) / 128),
+            )?;
+        }
+        let mut chunk_output = zeroed(max_mapped_rows, f32::NAN)?;
+        for output in outputs.iter_mut() {
+            if output.len() != rows {
+                output.clear();
+                output
+                    .try_reserve(rows)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(rows, 0.0);
+            } else {
+                output.fill(0.0);
+            }
+        }
+        let mut operation = 0;
+        for row_start in (0..rows).step_by(self.maximum_rows) {
+            let active_rows = (rows - row_start).min(self.maximum_rows);
+            let mapped_rows = active_rows.next_multiple_of(32);
+            for col_start in (0..columns).step_by(self.maximum_columns) {
+                let active_cols = (columns - col_start).min(self.maximum_columns);
+                let chunk_blocks = active_cols / 128;
+                let packed_bytes = mapped_rows * 36 * chunk_blocks;
+                if resident.is_none() {
+                    pack_native_chunk(
+                        &tensor.data,
+                        ChunkGeometry {
+                            total_blocks: columns / 128,
+                            row_start,
+                            active_rows,
+                            block_start: col_start / 128,
+                            chunk_blocks,
+                        },
+                        &mut weights[..packed_bytes],
+                        self.row_parallelism.as_ref(),
+                    )?;
+                }
+                // Independent tokens share this immutable packed tile. Each
+                // token still consumes row/column tiles in the scalar order.
+                // The single output scratch stays within the existing charge.
+                for (activation, output) in activations.iter().zip(outputs.iter_mut()) {
+                    let act_slice = &activation[col_start..col_start + active_cols];
+                    let out_slice = &mut chunk_output[..mapped_rows];
+                    out_slice.fill(f32::NAN);
+                    self.statistics.operations_attempted =
+                        self.statistics.operations_attempted.saturating_add(1);
+                    self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+                    if let Some(index) = resident {
+                        let cache = self
+                            .residency
+                            .as_ref()
+                            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+                        let handle =
+                            &cache.handles[cache.projections[index].first_handle + operation];
+                        self.submitter
+                            .submit_resident(handle, act_slice, out_slice)?;
+                    } else {
+                        self.submitter.submit(
+                            active_cols,
+                            mapped_rows,
+                            &weights[..packed_bytes],
+                            act_slice,
+                            out_slice,
+                        )?;
+                    }
+                    accumulate_tile_output(
+                        &mut output[row_start..row_start + active_rows],
+                        out_slice,
+                    )?;
+                    self.statistics.operations_completed =
+                        self.statistics.operations_completed.saturating_add(1);
+                    self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+                    if row_start + active_rows == rows && col_start + active_cols == columns {
+                        self.statistics.projections_completed =
+                            self.statistics.projections_completed.saturating_add(1);
+                    }
+                }
+                operation += 1;
+            }
         }
         Ok(())
     }
@@ -2816,6 +2955,10 @@ fn pack_native_chunk(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "native_q2/multitile_tests.rs"]
+mod multitile_tests;
 
 #[cfg(test)]
 mod tests {

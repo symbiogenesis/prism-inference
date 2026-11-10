@@ -774,227 +774,214 @@ impl Driver {
     }
 }
 
-/// Owned full-`K` 1-op native `HTP_TYPE_Q2_0` session that cleans up its queue,
-/// module and `FastRPC` mapping when dropped.
+/// Owned full-`K` native `HTP_TYPE_Q2_0` session with direct resident preparation,
+/// single/multi-operation projection and fused SwiGLU submission.
+///
+/// Cleans up its queue, module and `FastRPC` mapping when dropped. Submission
+/// support and terminal refusal remain defined by the native session; forwarding
+/// does not enable the unfinished full-FFN-chain backend.
 pub struct NativeQ2Session(
     #[cfg(all(windows, target_arch = "aarch64"))] windows::NativeQ2Session,
     #[cfg(not(all(windows, target_arch = "aarch64")))] std::convert::Infallible,
 );
 
-impl NativeQ2Submitter for NativeQ2Session {
-    fn remaining_operations(&self) -> Option<u64> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.remaining_operations()
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            match self.0 {}
-        }
-    }
+// Keep the owned facade's complete submission contract in one implementation.
+// The model-free probe below instantiates this same forwarding implementation
+// with a recording submitter, including optimized overrides whose trait defaults
+// deliberately use slower fallbacks or reject unsupported work.
+macro_rules! impl_native_q2_session_forwarding {
+    ($session:ty, $dispatch:ident) => {
+        impl NativeQ2Submitter for $session {
+            fn remaining_operations(
+                &self,
+            ) -> Option<u64> {
+                $dispatch!(self, remaining_operations())
+            }
 
-    fn residency_capacity_bytes(&self) -> usize {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.residency_capacity_bytes()
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            match self.0 {}
-        }
-    }
+            fn residency_capacity_bytes(
+                &self,
+            ) -> usize {
+                $dispatch!(self, residency_capacity_bytes())
+            }
 
-    fn prepare_weights(
-        &mut self,
-        columns: usize,
-        rows: usize,
-        weights: &[u8],
-    ) -> Result<Option<NativeQ2WeightHandle>, Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.prepare_weights(columns, rows, weights)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (columns, rows, weights);
-            match self.0 {}
-        }
-    }
+            fn supports_in_place_weight_preparation(
+                &self,
+            ) -> bool {
+                $dispatch!(self, supports_in_place_weight_preparation())
+            }
 
-    fn submit_resident(
-        &mut self,
-        handle: &NativeQ2WeightHandle,
-        activation: &[f32],
-        output: &mut [f32],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident(handle, activation, output)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handle, activation, output);
-            match self.0 {}
-        }
-    }
+            fn prepare_weights(
+                &mut self,
+                columns: usize,
+                rows: usize,
+                weights: &[u8],
+            ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+                $dispatch!(self, prepare_weights(columns, rows, weights))
+            }
 
-    fn submit_resident_validated<'a>(
-        &mut self,
-        handle: &NativeQ2WeightHandle,
-        activation: &[f32],
-        output: &'a mut [f32],
-    ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident_validated(handle, activation, output)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handle, activation, output);
-            match self.0 {}
-        }
-    }
+            fn prepare_weights_in_place(
+                &mut self,
+                columns: usize,
+                rows: usize,
+                initialize: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
+            ) -> Result<Option<NativeQ2WeightHandle>, Error> {
+                $dispatch!(self, prepare_weights_in_place(columns, rows, initialize))
+            }
 
-    fn submit_resident_batch2(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 2],
-        activation: &[f32],
-        outputs: [&mut [f32]; 2],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident_batch2(handles, activation, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activation, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident(
+                &mut self,
+                handle: &NativeQ2WeightHandle,
+                activation: &[f32],
+                output: &mut [f32],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident(handle, activation, output))
+            }
 
-    fn submit_resident_batch2_validated<'a>(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 2],
-        activation: &[f32],
-        outputs: [&'a mut [f32]; 2],
-    ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0
-                .submit_resident_batch2_validated(handles, activation, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activation, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident_validated<'a>(
+                &mut self,
+                handle: &NativeQ2WeightHandle,
+                activation: &[f32],
+                output: &'a mut [f32],
+            ) -> Result<NativeQ2ValidatedOutputs<'a, 1>, Error> {
+                $dispatch!(self, submit_resident_validated(handle, activation, output))
+            }
 
-    fn submit_resident_batch3(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 3],
-        activation: &[f32],
-        outputs: [&mut [f32]; 3],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident_batch3(handles, activation, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activation, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident_batch2(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 2],
+                activation: &[f32],
+                outputs: [&mut [f32]; 2],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_batch2(handles, activation, outputs))
+            }
 
-    fn submit_resident_batch3_validated<'a>(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 3],
-        activation: &[f32],
-        outputs: [&'a mut [f32]; 3],
-    ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0
-                .submit_resident_batch3_validated(handles, activation, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activation, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident_batch2_validated<'a>(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 2],
+                activation: &[f32],
+                outputs: [&'a mut [f32]; 2],
+            ) -> Result<NativeQ2ValidatedOutputs<'a, 2>, Error> {
+                $dispatch!(self, submit_resident_batch2_validated(handles, activation, outputs))
+            }
 
-    fn submit_resident_multi2(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 2],
-        activations: [&[f32]; 2],
-        outputs: [&mut [f32]; 2],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident_multi2(handles, activations, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activations, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident_batch3(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 3],
+                activation: &[f32],
+                outputs: [&mut [f32]; 3],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_batch3(handles, activation, outputs))
+            }
 
-    fn submit_resident_multi3(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 3],
-        activations: [&[f32]; 3],
-        outputs: [&mut [f32]; 3],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident_multi3(handles, activations, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activations, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident_batch3_validated<'a>(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 3],
+                activation: &[f32],
+                outputs: [&'a mut [f32]; 3],
+            ) -> Result<NativeQ2ValidatedOutputs<'a, 3>, Error> {
+                $dispatch!(self, submit_resident_batch3_validated(handles, activation, outputs))
+            }
 
-    fn submit_resident_multi4(
-        &mut self,
-        handles: [&NativeQ2WeightHandle; 4],
-        activations: [&[f32]; 4],
-        outputs: [&mut [f32]; 4],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit_resident_multi4(handles, activations, outputs)
-        }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (handles, activations, outputs);
-            match self.0 {}
-        }
-    }
+            fn submit_resident_multi2(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 2],
+                activations: [&[f32]; 2],
+                outputs: [&mut [f32]; 2],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_multi2(handles, activations, outputs))
+            }
 
-    fn submit(
-        &mut self,
-        columns: usize,
-        rows: usize,
-        weights: &[u8],
-        activation: &[f32],
-        output: &mut [f32],
-    ) -> Result<(), Error> {
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            self.0.submit(columns, rows, weights, activation, output)
+            fn submit_resident_multi3(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 3],
+                activations: [&[f32]; 3],
+                outputs: [&mut [f32]; 3],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_multi3(handles, activations, outputs))
+            }
+
+            fn submit_resident_multi4(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 4],
+                activations: [&[f32]; 4],
+                outputs: [&mut [f32]; 4],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_multi4(handles, activations, outputs))
+            }
+
+            fn submit_resident_multi8(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 8],
+                activations: [&[f32]; 8],
+                outputs: [&mut [f32]; 8],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_multi8(handles, activations, outputs))
+            }
+
+            fn submit_resident_ffn_swiglu(
+                &mut self,
+                gate_handle: &NativeQ2WeightHandle,
+                up_handle: &NativeQ2WeightHandle,
+                activation: &[f32],
+                output: &mut [f32],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_ffn_swiglu(gate_handle, up_handle, activation, output))
+            }
+
+            fn submit_resident_ffn_swiglu_multi2(
+                &mut self,
+                gate_handle: &NativeQ2WeightHandle,
+                up_handle: &NativeQ2WeightHandle,
+                activations: [&[f32]; 2],
+                outputs: [&mut [f32]; 2],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_ffn_swiglu_multi2(gate_handle, up_handle, activations, outputs))
+            }
+
+            fn submit_resident_ffn_chain(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 3],
+                activation: &[f32],
+                residual: Option<&[f32]>,
+                hadamard_block_size: Option<u32>,
+                output: &mut [f32],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit_resident_ffn_chain(handles, activation, residual, hadamard_block_size, output))
+            }
+
+            fn submit(
+                &mut self,
+                columns: usize,
+                rows: usize,
+                weights: &[u8],
+                activation: &[f32],
+                output: &mut [f32],
+            ) -> Result<(), Error> {
+                $dispatch!(self, submit(columns, rows, weights, activation, output))
+            }
+
         }
-        #[cfg(not(all(windows, target_arch = "aarch64")))]
-        {
-            let _ = (columns, rows, weights, activation, output);
-            match self.0 {}
-        }
-    }
+    };
 }
+
+macro_rules! dispatch_native_q2_session {
+    ($session:ident, $method:ident($($argument:expr),*)) => {{
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            $session.0.$method($($argument),*)
+        }
+        #[cfg(not(all(windows, target_arch = "aarch64")))]
+        {
+            let _ = ($($argument,)*);
+            match $session.0 {}
+        }
+    }};
+}
+
+impl_native_q2_session_forwarding!(NativeQ2Session, dispatch_native_q2_session);
+
+#[cfg(test)]
+mod native_q2_forwarding_tests;
 
 #[cfg(test)]
 mod tests {

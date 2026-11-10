@@ -373,7 +373,7 @@ serialization counts establish no measured request or device benefit.
 
 The public owned `NativeQ2Session` forwards the complete submitter contract to
 its native owner, including direct in-place weight preparation, eight-operation
-projection packets and single/two-token fused SwiGLU chains. Previously its
+projection packets, single/two-token fused SwiGLU and complete FFN chains. Previously its
 inherited trait defaults reported direct preparation unavailable, split an
 8-operation packet into two 4-operation submissions, and refused fused SwiGLU
 before reaching the existing backend. Normal owned-session prewarm can now use
@@ -386,9 +386,9 @@ remain ordered `N = 1` projections, not true multi-token matrix multiplication.
 Portable model-free controls instantiate the identical forwarding implementation
 with a recording submitter. They require exactly one direct initializer and one
 8-operation call, preserve fused call boundaries, original output bits and
-slice-bound finite-output evidence, and propagate native refusals. Forwarding
-also preserves the current full-FFN-chain refusal: its packet builder alone does
-not implement session execution. These source fixes do not qualify signed-device
+slice-bound finite-output evidence, and propagate native refusals. Full FFN
+calls reach the native session execution and exact packet-correlation path
+described above. These source fixes do not qualify signed-device
 execution, end-to-end performance, reduced admission or a release/default change.
 
 ## Explicit reference process initialization

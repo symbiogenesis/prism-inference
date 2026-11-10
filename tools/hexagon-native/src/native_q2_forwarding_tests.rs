@@ -96,6 +96,29 @@ impl NativeQ2Submitter for RecordingSubmitter {
         Ok(())
     }
 
+    fn supports_ffn_chain_multi2(&self) -> bool {
+        !self.fail
+    }
+
+    fn submit_resident_ffn_chain_multi2(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 2],
+        _residuals: [Option<&[f32]>; 2],
+        _hadamard_block_size: Option<u32>,
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        self.calls.push("chain-multi2");
+        for (activation, output) in activations.into_iter().zip(outputs) {
+            output.fill(activation[0]);
+        }
+        if self.fail {
+            Err(Error::Contract)
+        } else {
+            Ok(())
+        }
+    }
+
     fn submit_resident_ffn_chain(
         &mut self,
         _handles: [&NativeQ2WeightHandle; 3],
@@ -366,5 +389,37 @@ fn owned_session_forwards_full_ffn_chain_and_preserves_failure() -> Result<(), E
     );
     assert!(output.iter().all(|value| value.is_nan()));
     assert_eq!(session.0.calls, ["full-chain", "full-chain"]);
+    Ok(())
+}
+
+#[test]
+fn owned_session_forwards_paired_chain_capability_and_one_call() -> Result<(), Error> {
+    let (mut session, handle) = fixture()?;
+    assert!(session.supports_ffn_chain_multi2());
+    let activations = [[1.0_f32; 128], [2.0; 128]];
+    let mut outputs = [[f32::NAN; 32]; 2];
+    session.submit_resident_ffn_chain_multi2(
+        [&handle; 3],
+        activations.each_ref().map(|row| row.as_slice()),
+        [None; 2],
+        None,
+        outputs.each_mut().map(|row| row.as_mut_slice()),
+    )?;
+    assert_eq!(session.0.calls, ["chain-multi2"]);
+    assert_eq!(outputs, [[1.0; 32], [2.0; 32]]);
+    session.0.fail = true;
+    assert!(!session.supports_ffn_chain_multi2());
+    assert!(
+        session
+            .submit_resident_ffn_chain_multi2(
+                [&handle; 3],
+                activations.each_ref().map(|row| row.as_slice()),
+                [None; 2],
+                None,
+                outputs.each_mut().map(|row| row.as_mut_slice())
+            )
+            .is_err()
+    );
+    assert_eq!(session.0.calls, ["chain-multi2", "chain-multi2"]);
     Ok(())
 }

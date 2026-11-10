@@ -192,7 +192,7 @@ impl Q2ProjectionReport {
                     && self.batch_operations == 1
                     && self.resident_submissions > 0
                     && self.operations_submitted >= self.queue_writes_submitted
-                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(8)))
+                    && self.operations_submitted <= self.queue_writes_submitted.saturating_mul(12)))
             && self.queue.completed_cycle()
     }
 }
@@ -244,12 +244,15 @@ pub(crate) fn request_batch_buffers(
     request_counts(sequence, batch_operations, batch_operations * 3, n_bufs)
 }
 
-/// Only existing projection batches and the four explicit full-FFN chain shapes.
+/// Only existing projection batches and explicit single/two-token full-FFN chain shapes.
 const fn valid_counts(operations: u32, tensors: u32, buffers: u32) -> bool {
     let batch = matches!(operations, 1 | 2 | 3 | 4 | 6 | 8 | 10)
         && tensors == operations * 3
         && buffers <= operations + 1;
-    let chain = matches!((operations, tensors), (4, 12) | (5, 14 | 15) | (6, 17)) && buffers <= 4;
+    let chain = matches!(
+        (operations, tensors),
+        (4, 12) | (5, 14 | 15) | (6, 17) | (8, 24) | (10, 28 | 30) | (12, 34)
+    ) && buffers <= 4;
     buffers >= 1 && buffers <= 6 && (batch || chain)
 }
 
@@ -541,7 +544,16 @@ mod tests {
 
     #[test]
     fn full_ffn_request_correlates_exact_counts_and_rejects_other_shapes() -> Result<(), Error> {
-        for (operations, tensors) in [(4_u32, 12_u32), (5, 14), (5, 15), (6, 17)] {
+        for (operations, tensors) in [
+            (4_u32, 12_u32),
+            (5, 14),
+            (5, 15),
+            (6, 17),
+            (8, 24),
+            (10, 28),
+            (10, 30),
+            (12, 34),
+        ] {
             let request = request_counts(71, operations, tensors, 4)?;
             assert_eq!(&request[8..12], &4_u32.to_le_bytes());
             assert_eq!(&request[12..16], &tensors.to_le_bytes());
@@ -569,6 +581,9 @@ mod tests {
             (4, 11, 1),
             (4, 12, 0),
             (7, 21, 1),
+            (12, 33, 1),
+            (12, 34, 5),
+            (10, 29, 1),
         ] {
             assert!(request_counts(71, operations, tensors, buffers).is_err());
         }

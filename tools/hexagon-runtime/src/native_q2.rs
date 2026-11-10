@@ -2222,6 +2222,171 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             self.statistics.projections_completed.saturating_add(3);
         Ok(())
     }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep tile-wide validation, residency, bounded paired submissions and counters together"
+    )]
+    fn project_f32_ffn_chain_tokens_inner(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+        hadamard_block_size: Option<u32>,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid(
+                "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if activations.len() != outputs.len()
+            || residuals.is_some_and(|res| res.len() != activations.len())
+        {
+            return Err(invalid("mismatched F32 FFN chain token projection outputs"));
+        }
+        if activations.is_empty() {
+            return Ok(());
+        }
+        let [gate, up, down] = tensors;
+        let Some((hidden, gate_up_rows, cached_gate_up)) = self.validate_f32_group(&[gate, up])
+        else {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon fused FFN chain projection group",
+            ));
+        };
+        let ffn_dim = gate_up_rows[0];
+        if gate_up_rows[1] != ffn_dim
+            || activations.iter().any(|act| act.len() != hidden)
+            || !self.supports_f32(down)
+        {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        let (down_cols, down_rows) = native_dimensions(down)?;
+        if down_cols != ffn_dim
+            || down_rows != hidden
+            || down_cols > self.maximum_columns
+            || down_rows > self.maximum_rows
+            || !down_rows.is_multiple_of(32)
+        {
+            return Err(invalid("unsupported native Q2 Hexagon projection contract"));
+        }
+        if let Some(residuals) = residuals {
+            for res in residuals {
+                if res.len() != hidden {
+                    return Err(invalid("mismatched FFN chain residual length"));
+                }
+                finite_slice(res)?;
+            }
+        }
+        if let Some(block_size) = hadamard_block_size {
+            let block_usize = usize::try_from(block_size)?;
+            if block_size < 32
+                || !block_size.is_power_of_two()
+                || !ffn_dim.is_multiple_of(block_usize)
+            {
+                return Err(invalid("invalid FFN chain Hadamard block size"));
+            }
+        }
+        for activation in activations {
+            finite_slice(activation)?;
+        }
+        let cached_down = self.residency.as_ref().and_then(|cache| cache.find(down));
+        let cached_all = [cached_gate_up[0], cached_gate_up[1], cached_down];
+        let mut weights = Vec::new();
+        for (member, &tensor) in tensors.iter().enumerate() {
+            if cached_all[member].is_none() {
+                self.prepare_resident(tensor, &mut weights, false)?
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+            }
+        }
+        let mut indices = [0_usize; 3];
+        if let Some(cache) = &mut self.residency {
+            for (member, &tensor) in tensors.iter().enumerate() {
+                let idx = cache
+                    .find(tensor)
+                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
+                if cache.projections[idx].evaluated {
+                    cache.statistics.cache_hits = cache
+                        .statistics
+                        .cache_hits
+                        .saturating_add(u64::try_from(activations.len())?);
+                } else {
+                    cache.projections[idx].evaluated = true;
+                    cache.statistics.cache_hits = cache
+                        .statistics
+                        .cache_hits
+                        .saturating_add(u64::try_from(activations.len() - 1)?);
+                }
+                indices[member] = idx;
+            }
+        }
+        for output in outputs.iter_mut() {
+            if output.len() != hidden {
+                output.clear();
+                output
+                    .try_reserve(hidden)
+                    .map_err(|_| invalid("native Q2 output allocation failed"))?;
+                output.resize(hidden, f32::NAN);
+            }
+        }
+        let op_count =
+            4_u64 + u64::from(hadamard_block_size.is_some()) + u64::from(residuals.is_some());
+        let cache = self
+            .residency
+            .as_ref()
+            .ok_or_else(|| invalid("native Q2 resident cache is unavailable"))?;
+        let handles = indices.map(|index| &cache.handles[cache.projections[index].first_handle]);
+        let batch_tokens = if self.submitter.supports_ffn_chain_multi2() {
+            2
+        } else {
+            1
+        };
+        for (batch, out_chunk) in outputs.chunks_mut(batch_tokens).enumerate() {
+            let token = batch * batch_tokens;
+            let count = u64::try_from(out_chunk.len())?;
+            self.statistics.operations_attempted = self
+                .statistics
+                .operations_attempted
+                .saturating_add(op_count * count);
+            self.queue_writes_attempted = self.queue_writes_attempted.saturating_add(1);
+            match out_chunk {
+                [out0, out1] => self.submitter.submit_resident_ffn_chain_multi2(
+                    handles,
+                    [
+                        activations[token].as_slice(),
+                        activations[token + 1].as_slice(),
+                    ],
+                    [
+                        residuals.map(|res| res[token].as_slice()),
+                        residuals.map(|res| res[token + 1].as_slice()),
+                    ],
+                    hadamard_block_size,
+                    [out0.as_mut_slice(), out1.as_mut_slice()],
+                )?,
+                [out] => self.submitter.submit_resident_ffn_chain(
+                    handles,
+                    &activations[token],
+                    residuals.map(|res| res[token].as_slice()),
+                    hadamard_block_size,
+                    out,
+                )?,
+                _ => return Err(invalid("unexpected FFN chain token batch")),
+            }
+            for output in out_chunk.iter() {
+                finite_slice(output)?;
+            }
+            self.statistics.operations_completed = self
+                .statistics
+                .operations_completed
+                .saturating_add(op_count * count);
+            self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
+            self.statistics.projections_completed = self
+                .statistics
+                .projections_completed
+                .saturating_add(3 * count);
+        }
+        Ok(())
+    }
 }
 
 fn accumulate_tile_output(dst_rows: &mut [f32], out_slice: &[f32]) -> Result<()> {
@@ -2457,6 +2622,30 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
             hadamard_block_size,
             output,
         )
+    }
+    fn project_f32_ffn_chain_tokens(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activations: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+        hadamard_block_size: Option<u32>,
+        _pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let result = self.project_f32_ffn_chain_tokens_inner(
+            tensors,
+            activations,
+            residuals,
+            hadamard_block_size,
+            outputs,
+        );
+        if result.is_err() {
+            self.failed = true;
+            for output in outputs {
+                output.clear();
+            }
+        }
+        result
     }
 }
 
@@ -2991,6 +3180,8 @@ mod tests {
     }
 
     struct MockNativeSubmitter {
+        batch_ffn: bool,
+        ffn_pair_calls: u64,
         calls: u64,
         resident_calls: u64,
         remaining: u64,
@@ -3208,6 +3399,33 @@ mod tests {
             let res0 = residual.and_then(|r| r.first().copied()).unwrap_or(0.0);
             output.fill(0.0);
             output[0] = sum.mul_add(3.0, res0);
+            Ok(())
+        }
+
+        fn supports_ffn_chain_multi2(&self) -> bool {
+            self.batch_ffn
+        }
+
+        fn submit_resident_ffn_chain_multi2(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activations: [&[f32]; 2],
+            residuals: [Option<&[f32]>; 2],
+            hadamard_block_size: Option<u32>,
+            outputs: [&mut [f32]; 2],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.ffn_pair_calls += 1;
+            for ((activation, residual), output) in
+                activations.into_iter().zip(residuals).zip(outputs)
+            {
+                self.submit_resident_ffn_chain(
+                    handles,
+                    activation,
+                    residual,
+                    hadamard_block_size,
+                    output,
+                )?;
+            }
             Ok(())
         }
 
@@ -4074,6 +4292,8 @@ mod tests {
             let payload_bytes = rows * 4 + packed_bytes + 32 * 4;
             let submitter = TransientCapture {
                 mock: MockNativeSubmitter {
+                    batch_ffn: true,
+                    ffn_pair_calls: 0,
                     calls: 0,
                     resident_calls: 0,
                     remaining: 100,
@@ -4137,6 +4357,8 @@ mod tests {
             .with_resident_weights(2304)
             .map_err(|_| invalid("residency"))?;
         let mut submitter = MockNativeSubmitter {
+            batch_ffn: true,
+            ffn_pair_calls: 0,
             calls: 0,
             resident_calls: 0,
             remaining: 100,
@@ -4311,6 +4533,8 @@ mod tests {
             .with_resident_weights(131_072)
             .map_err(|_| invalid("residency"))?;
         let mut submitter = MockNativeSubmitter {
+            batch_ffn: true,
+            ffn_pair_calls: 0,
             calls: 0,
             resident_calls: 0,
             remaining: 100,
@@ -4564,6 +4788,115 @@ mod tests {
             het.layers[27].adreno_fwht_kernel,
             Some(crate::AdrenoQ2KernelKind::FwhtLocalMem1024)
         );
+        Ok(())
+    }
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Cover capability-disabled and paired tile tails with every optional chain shape and terminal input refusal"
+    )]
+    fn native_q2_full_ffn_tiles_batch_pairs_and_preserve_tail_accounting() -> Result<()> {
+        let tensor = |name: &str| Tensor {
+            name: name.to_owned(),
+            dimensions: vec![128, 128],
+            kind: 142,
+            data: Arc::from(vec![0_u8; 128 * 34]),
+        };
+        let gate = tensor("blk.0.ffn_gate.weight");
+        let up = tensor("blk.0.ffn_up.weight");
+        let down = tensor("blk.0.ffn_down.weight");
+        for batching in [false, true] {
+            for tokens in [0_u8, 1, 2, 3, 8, 16, 32] {
+                for (hadamard, add) in [
+                    (None, false),
+                    (Some(64), false),
+                    (None, true),
+                    (Some(64), true),
+                ] {
+                    let limits =
+                        NativeQ2ProjectionLimits::new(128, 128, 256, Duration::from_secs(4))?
+                            .with_resident_weights(65_536)?;
+                    let mut submitter = MockNativeSubmitter {
+                        batch_ffn: batching,
+                        ffn_pair_calls: 0,
+                        calls: 0,
+                        resident_calls: 0,
+                        remaining: 256,
+                        residency_bytes: 65_536,
+                    };
+                    let mut executor = NativeQ2Executor::new(&mut submitter, limits, 1_048_576)
+                        .with_resident_weights(16_384)?;
+                    let activations: Vec<_> = (0..tokens)
+                        .map(|token| vec![f32::from(token); 128])
+                        .collect();
+                    let residuals = vec![vec![2.0_f32; 128]; usize::from(tokens)];
+                    let mut outputs = vec![vec![99.0_f32]; usize::from(tokens)];
+                    Pq2ProjectionExecutor::project_f32_ffn_chain_tokens(
+                        &mut executor,
+                        [&gate, &up, &down],
+                        &activations,
+                        add.then_some(residuals.as_slice()),
+                        hadamard,
+                        true,
+                        &mut outputs,
+                    )?;
+                    assert_eq!(
+                        executor.queue_writes_completed(),
+                        u64::from(if batching { tokens.div_ceil(2) } else { tokens })
+                    );
+                    assert_eq!(
+                        executor.statistics().operations_completed,
+                        u64::from(tokens) * (4 + u64::from(hadamard.is_some()) + u64::from(add))
+                    );
+                    assert_eq!(
+                        executor.statistics().projections_completed,
+                        u64::from(tokens) * 3
+                    );
+                    for (token, output) in (0..tokens).zip(&outputs) {
+                        assert_eq!(output.len(), 128);
+                        assert_eq!(
+                            output[0],
+                            f32::from(token) * 384.0 + if add { 2.0 } else { 0.0 }
+                        );
+                    }
+                    assert_eq!(
+                        executor.submitter.ffn_pair_calls,
+                        u64::from(if batching { tokens / 2 } else { 0 })
+                    );
+                    if tokens > 0 {
+                        let mut invalid_activations = activations;
+                        invalid_activations[usize::from(tokens) - 1][127] = f32::NAN;
+                        let writes = executor.queue_writes_attempted();
+                        assert!(
+                            Pq2ProjectionExecutor::project_f32_ffn_chain_tokens(
+                                &mut executor,
+                                [&gate, &up, &down],
+                                &invalid_activations,
+                                None,
+                                hadamard,
+                                true,
+                                &mut outputs
+                            )
+                            .is_err()
+                        );
+                        assert!(outputs.iter().all(Vec::is_empty));
+                        assert_eq!(executor.queue_writes_attempted(), writes);
+                        assert!(
+                            Pq2ProjectionExecutor::project_f32_ffn_chain_tokens(
+                                &mut executor,
+                                [&gate, &up, &down],
+                                &[],
+                                None,
+                                None,
+                                true,
+                                &mut []
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -724,6 +724,53 @@ pub trait NativeQ2Submitter {
         Err(Error::Contract)
     }
 
+    /// Whether two full FFN chains execute in exactly one native queue write.
+    ///
+    /// The default sequential fallback returns false so callers retain exact
+    /// queue accounting for arbitrary submitters.
+    fn supports_ffn_chain_multi2(&self) -> bool {
+        false
+    }
+
+    /// Submit two ordered full FFN chains in one bounded native queue packet.
+    ///
+    /// The member chains retain the single-token arithmetic and VTCM flags.
+    /// Custom submitters default to two sequential chains.
+    ///
+    /// # Errors
+    /// Any failure invalidates both outputs; native sessions remain terminal.
+    fn submit_resident_ffn_chain_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 2],
+        residuals: [Option<&[f32]>; 2],
+        hadamard_block_size: Option<u32>,
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        let [out0, out1] = outputs;
+        let result = (|| {
+            self.submit_resident_ffn_chain(
+                handles,
+                activations[0],
+                residuals[0],
+                hadamard_block_size,
+                out0,
+            )?;
+            self.submit_resident_ffn_chain(
+                handles,
+                activations[1],
+                residuals[1],
+                hadamard_block_size,
+                out1,
+            )
+        })();
+        if result.is_err() {
+            out0.fill(f32::NAN);
+            out1.fill(f32::NAN);
+        }
+        result
+    }
+
     /// Submit tiled `HTP_TYPE_Q2_0` weights (`[columns, rows]`) and one `F32`
     /// activation vector (`[columns]`) in a single DSP operation.
     ///
@@ -898,6 +945,27 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         )
     }
 
+    fn supports_ffn_chain_multi2(&self) -> bool {
+        (**self).supports_ffn_chain_multi2()
+    }
+
+    fn submit_resident_ffn_chain_multi2(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activations: [&[f32]; 2],
+        residuals: [Option<&[f32]>; 2],
+        hadamard_block_size: Option<u32>,
+        outputs: [&mut [f32]; 2],
+    ) -> Result<(), Error> {
+        (**self).submit_resident_ffn_chain_multi2(
+            handles,
+            activations,
+            residuals,
+            hadamard_block_size,
+            outputs,
+        )
+    }
+
     fn submit(
         &mut self,
         columns: usize,
@@ -925,10 +993,16 @@ pub(crate) const fn layout(columns: usize, rows: usize) -> projection::Layout {
 
 pub(crate) const fn working_allocation(columns: usize, rows: usize) -> usize {
     let raw = layout(columns, rows).allocation;
-    if raw > NATIVE_Q2_MAX_WORKING_BYTES {
+    // Both token chains remain live through one correlated response. Reserve
+    // command bytes and eight maximum-width F32 regions per token even for
+    // small shapes whose packed-weight workspace would otherwise be smaller.
+    let extent = if columns > rows { columns } else { rows };
+    let chain = (8192 + 2 * extent * 4 * 8).next_multiple_of(4096);
+    let required = if raw > chain { raw } else { chain };
+    if required > NATIVE_Q2_MAX_WORKING_BYTES {
         NATIVE_Q2_MAX_WORKING_BYTES
     } else {
-        raw
+        required
     }
 }
 
@@ -1930,9 +2004,8 @@ fn write_f32_2d_tensor_desc(
 /// optional `HTP_OP_HADAMARD` + `OP_MUL_MAT(down)` + optional `HTP_OP_ADD(residual)`
 /// with VTCM intermediate residency chaining across all stages.
 #[expect(
-    clippy::too_many_lines,
     clippy::too_many_arguments,
-    reason = "Keep full intra-layer FFN 4/5/6-op descriptor assembly and VTCM pass flags together"
+    reason = "Keep full intra-layer FFN 4/5/6-op packet inputs together"
 )]
 pub(crate) fn image_ffn_full_chain_resident(
     bytes: &mut [u8],
@@ -1947,17 +2020,103 @@ pub(crate) fn image_ffn_full_chain_resident(
     residual: Option<&[f32]>,
     hadamard_block_size: Option<u32>,
 ) -> Result<FfnFullChainLayout, Error> {
+    let active = image_ffn_full_chain_resident_batch(
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        gate_handle,
+        up_handle,
+        down_handle,
+        [activation],
+        [residual],
+        hadamard_block_size,
+    )?;
+    Ok(FfnFullChainLayout {
+        output_offset: active.output_offsets[0],
+        output_end: active.output_end,
+        n_bufs: active.n_bufs,
+        n_tensors: active.n_tensors,
+        n_ops: active.n_ops,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FfnFullChainBatchLayout<const B: usize> {
+    pub(crate) output_offsets: [usize; B],
+    pub(crate) output_end: usize,
+    pub(crate) n_bufs: u32,
+    pub(crate) n_tensors: u32,
+    pub(crate) n_ops: u32,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep two-token FFN chain packet inputs together"
+)]
+pub(crate) fn image_ffn_full_chain_resident_multi2(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    handles: [&NativeQ2WeightHandle; 3],
+    activations: [&[f32]; 2],
+    residuals: [Option<&[f32]>; 2],
+    hadamard_block_size: Option<u32>,
+) -> Result<FfnFullChainBatchLayout<2>, Error> {
+    image_ffn_full_chain_resident_batch(
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        handles[0],
+        handles[1],
+        handles[2],
+        activations,
+        residuals,
+        hadamard_block_size,
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "Keep exact per-token FFN descriptors, checked offsets and index rebasing in one bounded packet builder"
+)]
+fn image_ffn_full_chain_resident_batch<const B: usize>(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    down_handle: &NativeQ2WeightHandle,
+    activations: [&[f32]; B],
+    residuals: [Option<&[f32]>; B],
+    hadamard_block_size: Option<u32>,
+) -> Result<FfnFullChainBatchLayout<B>, Error> {
     let hidden = gate_handle.columns;
     let ffn_dim = gate_handle.rows;
     if up_handle.columns != hidden
         || up_handle.rows != ffn_dim
         || down_handle.columns != ffn_dim
         || down_handle.rows != hidden
-        || activation.len() != hidden
         || !hidden.is_multiple_of(128)
         || !ffn_dim.is_multiple_of(128)
-        || residual.is_some_and(|res| res.len() != hidden || !is_finite_f32_slice(res))
-        || !is_finite_f32_slice(activation)
+        || !matches!(B, 1 | 2)
+        || activations
+            .iter()
+            .any(|act| act.len() != hidden || !is_finite_f32_slice(act))
+        || residuals
+            .iter()
+            .any(|res| res.is_some_and(|res| res.len() != hidden || !is_finite_f32_slice(res)))
+        || residuals
+            .iter()
+            .any(|res| res.is_some() != residuals[0].is_some())
     {
         return Err(Error::Contract);
     }
@@ -2024,44 +2183,20 @@ pub(crate) fn image_ffn_full_chain_resident(
         }
     }
 
-    let cmd_pad = 4096_usize;
-    let hidden_bytes = hidden * 4;
-    let ffn_bytes = ffn_dim * 4;
-    let act_offset = cmd_pad;
-    let mut next_offset = (act_offset + hidden_bytes).next_multiple_of(128);
-    let res_offset = if residual.is_some() {
-        let off = next_offset;
-        next_offset = (off + hidden_bytes).next_multiple_of(128);
-        off
-    } else {
-        0
-    };
-    let gate_out_offset = next_offset;
-    let up_out_offset = (gate_out_offset + ffn_bytes).next_multiple_of(128);
-    let swiglu_out_offset = (up_out_offset + ffn_bytes).next_multiple_of(128);
-    let hadamard_out_offset = if hadamard_block_size.is_some() {
-        (swiglu_out_offset + ffn_bytes).next_multiple_of(128)
-    } else {
-        swiglu_out_offset
-    };
-    let down_out_offset = (hadamard_out_offset + ffn_bytes).next_multiple_of(128);
-    let final_out_offset = if residual.is_some() {
-        (down_out_offset + hidden_bytes).next_multiple_of(128)
-    } else {
-        down_out_offset
-    };
-    let output_end = final_out_offset + hidden_bytes;
+    let cmd_pad = if B == 1 { 4096_usize } else { 8192_usize };
     let working = bytes.get_mut(..arena_start).ok_or(Error::Contract)?;
-    if output_end > working.len() {
+    if cmd_pad > working.len() {
         return Err(Error::Contract);
     }
-
     let n_bufs_usize = 1 + extra_buf_count;
     let n_bufs = u32::try_from(n_bufs_usize).map_err(|_| Error::Contract)?;
-    let n_tensors_usize =
-        12 + usize::from(hadamard_block_size.is_some()) * 2 + usize::from(residual.is_some()) * 3;
-    let n_ops_usize =
-        4 + usize::from(hadamard_block_size.is_some()) + usize::from(residual.is_some());
+    let member_tensors = 12
+        + usize::from(hadamard_block_size.is_some()) * 2
+        + usize::from(residuals[0].is_some()) * 3;
+    let n_tensors_usize = member_tensors * B;
+    let member_ops =
+        4 + usize::from(hadamard_block_size.is_some()) + usize::from(residuals[0].is_some());
+    let n_ops_usize = member_ops * B;
     let tensors_base = n_bufs_usize * 24;
     let ops_base = tensors_base + n_tensors_usize * 56;
     if ops_base + n_ops_usize * 232 > cmd_pad {
@@ -2086,248 +2221,321 @@ pub(crate) fn image_ffn_full_chain_resident(
         put32(working, buf_offset + 20, extra.fd);
     }
 
-    let vtcm_chain = ffn_bytes.saturating_mul(3) <= 1_048_576;
-    let keep_vtcm = if vtcm_chain {
-        crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
-    } else {
-        crate::htp_ops::HtpOpPassFlags::NONE
-    };
+    let mut output_offsets = [0_usize; B];
+    let mut next_token_offset = cmd_pad;
+    for token in 0..B {
+        let activation = activations[token];
+        let residual = residuals[token];
+        let tensors_base = tensors_base + token * member_tensors * 56;
+        let ops_base = ops_base + token * member_ops * 232;
+        let hidden_bytes = hidden * 4;
+        let ffn_bytes = ffn_dim * 4;
+        let act_offset = next_token_offset;
+        let mut next_offset = (act_offset + hidden_bytes).next_multiple_of(128);
+        let res_offset = if residual.is_some() {
+            let off = next_offset;
+            next_offset = (off + hidden_bytes).next_multiple_of(128);
+            off
+        } else {
+            0
+        };
+        let gate_out_offset = next_offset;
+        let up_out_offset = (gate_out_offset + ffn_bytes).next_multiple_of(128);
+        let swiglu_out_offset = (up_out_offset + ffn_bytes).next_multiple_of(128);
+        let hadamard_out_offset = if hadamard_block_size.is_some() {
+            (swiglu_out_offset + ffn_bytes).next_multiple_of(128)
+        } else {
+            swiglu_out_offset
+        };
+        let down_out_offset = (hadamard_out_offset + ffn_bytes).next_multiple_of(128);
+        let final_out_offset = if residual.is_some() {
+            (down_out_offset + hidden_bytes).next_multiple_of(128)
+        } else {
+            down_out_offset
+        };
+        let output_end = final_out_offset + hidden_bytes;
+        if output_end > working.len() {
+            return Err(Error::Contract);
+        }
 
-    // Op 0 (gate: ti 0, 1 -> 2) and Op 1 (up: ti 3, 4 -> 5).
-    write_member_descriptors(
-        working,
-        0,
-        weight_bis[0],
-        tensors_base,
-        ops_base,
-        hidden,
-        ffn_dim,
-        weight_offsets[0],
-        layout(hidden, ffn_dim).weights,
-        act_offset,
-        gate_out_offset,
-        gate_handle.hvx_params,
-    )?;
-    put32(working, ops_base + 4, keep_vtcm.bits());
+        let vtcm_chain = ffn_bytes.saturating_mul(3) <= 1_048_576;
+        let keep_vtcm = if vtcm_chain {
+            crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
+        } else {
+            crate::htp_ops::HtpOpPassFlags::NONE
+        };
 
-    write_member_descriptors(
-        working,
-        3,
-        weight_bis[1],
-        tensors_base + 3 * 56,
-        ops_base + 232,
-        hidden,
-        ffn_dim,
-        weight_offsets[1],
-        layout(hidden, ffn_dim).weights,
-        act_offset,
-        up_out_offset,
-        up_handle.hvx_params,
-    )?;
-    put32(working, ops_base + 232 + 4, keep_vtcm.bits());
-
-    // Op 2: GluSwiglu (ti 6, 7 -> 8).
-    let (glu_cols, glu_rows) = if ffn_dim >= 64 {
-        (32_usize, ffn_dim / 32)
-    } else {
-        (ffn_dim / 2, 2_usize)
-    };
-    let glu_kp = crate::htp_ops::solve_glu_kparams(
-        u32::try_from(glu_cols).map_err(|_| Error::Contract)?,
-        u32::try_from(glu_rows).map_err(|_| Error::Contract)?,
-    )?;
-    for (ti, buf_off) in [
-        (6_u16, gate_out_offset),
-        (7_u16, up_out_offset),
-        (8_u16, swiglu_out_offset),
-    ] {
-        write_f32_2d_tensor_desc(
+        // Op 0 (gate: ti 0, 1 -> 2) and Op 1 (up: ti 3, 4 -> 5).
+        write_member_descriptors(
             working,
+            0,
+            weight_bis[0],
             tensors_base,
-            ti,
-            buf_off,
-            ffn_bytes,
-            glu_cols,
-            glu_rows,
+            ops_base,
+            hidden,
+            ffn_dim,
+            weight_offsets[0],
+            layout(hidden, ffn_dim).weights,
+            act_offset,
+            gate_out_offset,
+            gate_handle.hvx_params,
         )?;
-    }
-    let glu_op_desc = ops_base + 2 * 232;
-    let glu_flags = if vtcm_chain {
-        crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
-            .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
-            .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
-    } else {
-        crate::htp_ops::HtpOpPassFlags::NONE
-    };
-    put32(
-        working,
-        glu_op_desc,
-        crate::htp_ops::HtpOpCode::GluSwiglu.id(),
-    );
-    put32(working, glu_op_desc + 4, glu_flags.bits());
-    working[glu_op_desc + 72..glu_op_desc + 84].copy_from_slice(&glu_kp);
-    working[glu_op_desc + 200..glu_op_desc + 228].fill(0xff);
-    put16(working, glu_op_desc + 200, 6);
-    put16(working, glu_op_desc + 202, 7);
-    put16(working, glu_op_desc + 220, 8);
+        put32(working, ops_base + 4, keep_vtcm.bits());
 
-    let mut next_ti = 9_u16;
-    let mut next_op = 3_usize;
+        write_member_descriptors(
+            working,
+            3,
+            weight_bis[1],
+            tensors_base + 3 * 56,
+            ops_base + 232,
+            hidden,
+            ffn_dim,
+            weight_offsets[1],
+            layout(hidden, ffn_dim).weights,
+            act_offset,
+            up_out_offset,
+            up_handle.hvx_params,
+        )?;
+        put32(working, ops_base + 232 + 4, keep_vtcm.bits());
 
-    // Optional Op 3: HTP_OP_HADAMARD (69) over [block_size, ffn_dim / block_size].
-    if let Some(block_size) = hadamard_block_size {
-        let block_cols = usize::try_from(block_size).map_err(|_| Error::Contract)?;
-        let block_rows = ffn_dim / block_cols;
-        let had_kp = crate::htp_ops::solve_unary_kparams(
-            crate::htp_ops::HtpOpCode::Hadamard,
-            block_size,
-            u32::try_from(block_rows).map_err(|_| Error::Contract)?,
-            1,
+        // Op 2: GluSwiglu (ti 6, 7 -> 8).
+        let (glu_cols, glu_rows) = if ffn_dim >= 64 {
+            (32_usize, ffn_dim / 32)
+        } else {
+            (ffn_dim / 2, 2_usize)
+        };
+        let glu_kp = crate::htp_ops::solve_glu_kparams(
+            u32::try_from(glu_cols).map_err(|_| Error::Contract)?,
+            u32::try_from(glu_rows).map_err(|_| Error::Contract)?,
         )?;
-        write_f32_2d_tensor_desc(
-            working,
-            tensors_base,
-            next_ti,
-            swiglu_out_offset,
-            ffn_bytes,
-            block_cols,
-            block_rows,
-        )?;
-        write_f32_2d_tensor_desc(
-            working,
-            tensors_base,
-            next_ti + 1,
-            hadamard_out_offset,
-            ffn_bytes,
-            block_cols,
-            block_rows,
-        )?;
-        let had_op_desc = ops_base + next_op * 232;
-        let had_flags = if vtcm_chain {
+        for (ti, buf_off) in [
+            (6_u16, gate_out_offset),
+            (7_u16, up_out_offset),
+            (8_u16, swiglu_out_offset),
+        ] {
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                ti,
+                buf_off,
+                ffn_bytes,
+                glu_cols,
+                glu_rows,
+            )?;
+        }
+        let glu_op_desc = ops_base + 2 * 232;
+        let glu_flags = if vtcm_chain {
             crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
                 .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
         } else {
             crate::htp_ops::HtpOpPassFlags::NONE
         };
         put32(
             working,
-            had_op_desc,
-            crate::htp_ops::HtpOpCode::Hadamard.id(),
+            glu_op_desc,
+            crate::htp_ops::HtpOpCode::GluSwiglu.id(),
         );
-        put32(working, had_op_desc + 4, had_flags.bits());
-        working[had_op_desc + 72..had_op_desc + 136].copy_from_slice(&had_kp);
-        working[had_op_desc + 200..had_op_desc + 228].fill(0xff);
-        put16(working, had_op_desc + 200, next_ti);
-        put16(working, had_op_desc + 220, next_ti + 1);
-        next_ti += 2;
-        next_op += 1;
-    }
+        put32(working, glu_op_desc + 4, glu_flags.bits());
+        working[glu_op_desc + 72..glu_op_desc + 84].copy_from_slice(&glu_kp);
+        working[glu_op_desc + 200..glu_op_desc + 228].fill(0xff);
+        put16(working, glu_op_desc + 200, 6);
+        put16(working, glu_op_desc + 202, 7);
+        put16(working, glu_op_desc + 220, 8);
 
-    // Next Op: MUL_MAT(down) reading activation from VTCM.
-    let down_op_desc = ops_base + next_op * 232;
-    write_member_descriptors(
-        working,
-        next_ti,
-        weight_bis[2],
-        tensors_base + usize::from(next_ti) * 56,
-        down_op_desc,
-        ffn_dim,
-        hidden,
-        weight_offsets[2],
-        layout(ffn_dim, hidden).weights,
-        hadamard_out_offset,
-        down_out_offset,
-        down_handle.hvx_params,
-    )?;
-    let down_flags = if vtcm_chain {
-        let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM;
-        if residual.is_some() {
-            base_flags.union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
-        } else {
-            base_flags
+        let mut next_ti = 9_u16;
+        let mut next_op = 3_usize;
+
+        // Optional Op 3: HTP_OP_HADAMARD (69) over [block_size, ffn_dim / block_size].
+        if let Some(block_size) = hadamard_block_size {
+            let block_cols = usize::try_from(block_size).map_err(|_| Error::Contract)?;
+            let block_rows = ffn_dim / block_cols;
+            let had_kp = crate::htp_ops::solve_unary_kparams(
+                crate::htp_ops::HtpOpCode::Hadamard,
+                block_size,
+                u32::try_from(block_rows).map_err(|_| Error::Contract)?,
+                1,
+            )?;
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti,
+                swiglu_out_offset,
+                ffn_bytes,
+                block_cols,
+                block_rows,
+            )?;
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti + 1,
+                hadamard_out_offset,
+                ffn_bytes,
+                block_cols,
+                block_rows,
+            )?;
+            let had_op_desc = ops_base + next_op * 232;
+            let had_flags = if vtcm_chain {
+                crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                    .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+            } else {
+                crate::htp_ops::HtpOpPassFlags::NONE
+            };
+            put32(
+                working,
+                had_op_desc,
+                crate::htp_ops::HtpOpCode::Hadamard.id(),
+            );
+            put32(working, had_op_desc + 4, had_flags.bits());
+            working[had_op_desc + 72..had_op_desc + 136].copy_from_slice(&had_kp);
+            working[had_op_desc + 200..had_op_desc + 228].fill(0xff);
+            put16(working, had_op_desc + 200, next_ti);
+            put16(working, had_op_desc + 220, next_ti + 1);
+            next_ti += 2;
+            next_op += 1;
         }
-    } else {
-        crate::htp_ops::HtpOpPassFlags::NONE
-    };
-    put32(working, down_op_desc + 4, down_flags.bits());
-    next_ti += 3;
-    next_op += 1;
 
-    // Optional Final Op: HTP_OP_ADD(down_out, residual) -> final_out.
-    if residual.is_some() {
-        let add_kp = crate::htp_ops::solve_binary_kparams(
-            crate::htp_ops::HtpOpCode::Add,
-            u32::try_from(hidden).map_err(|_| Error::Contract)?,
-            1,
-        )?;
-        write_f32_2d_tensor_desc(
+        // Next Op: MUL_MAT(down) reading activation from VTCM.
+        let down_op_desc = ops_base + next_op * 232;
+        write_member_descriptors(
             working,
-            tensors_base,
             next_ti,
+            weight_bis[2],
+            tensors_base + usize::from(next_ti) * 56,
+            down_op_desc,
+            ffn_dim,
+            hidden,
+            weight_offsets[2],
+            layout(ffn_dim, hidden).weights,
+            hadamard_out_offset,
             down_out_offset,
-            hidden_bytes,
-            hidden,
-            1,
+            down_handle.hvx_params,
         )?;
-        write_f32_2d_tensor_desc(
-            working,
-            tensors_base,
-            next_ti + 1,
-            res_offset,
-            hidden_bytes,
-            hidden,
-            1,
-        )?;
-        write_f32_2d_tensor_desc(
-            working,
-            tensors_base,
-            next_ti + 2,
-            final_out_offset,
-            hidden_bytes,
-            hidden,
-            1,
-        )?;
-        let add_op_desc = ops_base + next_op * 232;
-        let add_flags = if vtcm_chain {
-            crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+        let down_flags = if vtcm_chain {
+            let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM;
+            if residual.is_some() {
+                base_flags.union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+            } else {
+                base_flags
+            }
         } else {
             crate::htp_ops::HtpOpPassFlags::NONE
         };
-        put32(working, add_op_desc, crate::htp_ops::HtpOpCode::Add.id());
-        put32(working, add_op_desc + 4, add_flags.bits());
-        working[add_op_desc + 72..add_op_desc + 168].copy_from_slice(&add_kp);
-        working[add_op_desc + 200..add_op_desc + 228].fill(0xff);
-        put16(working, add_op_desc + 200, next_ti);
-        put16(working, add_op_desc + 202, next_ti + 1);
-        put16(working, add_op_desc + 220, next_ti + 2);
-    }
+        put32(working, down_op_desc + 4, down_flags.bits());
+        next_ti += 3;
+        next_op += 1;
 
-    for (dst, &val) in working[act_offset..act_offset + hidden_bytes]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(activation)
-    {
-        *dst = val.to_bits().to_le_bytes();
-    }
-    if let Some(res_slice) = residual {
-        for (dst, &val) in working[res_offset..res_offset + hidden_bytes]
+        // Optional Final Op: HTP_OP_ADD(down_out, residual) -> final_out.
+        if residual.is_some() {
+            let add_kp = crate::htp_ops::solve_binary_kparams(
+                crate::htp_ops::HtpOpCode::Add,
+                u32::try_from(hidden).map_err(|_| Error::Contract)?,
+                1,
+            )?;
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti,
+                down_out_offset,
+                hidden_bytes,
+                hidden,
+                1,
+            )?;
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti + 1,
+                res_offset,
+                hidden_bytes,
+                hidden,
+                1,
+            )?;
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti + 2,
+                final_out_offset,
+                hidden_bytes,
+                hidden,
+                1,
+            )?;
+            let add_op_desc = ops_base + next_op * 232;
+            let add_flags = if vtcm_chain {
+                crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+            } else {
+                crate::htp_ops::HtpOpPassFlags::NONE
+            };
+            put32(working, add_op_desc, crate::htp_ops::HtpOpCode::Add.id());
+            put32(working, add_op_desc + 4, add_flags.bits());
+            working[add_op_desc + 72..add_op_desc + 168].copy_from_slice(&add_kp);
+            working[add_op_desc + 200..add_op_desc + 228].fill(0xff);
+            put16(working, add_op_desc + 200, next_ti);
+            put16(working, add_op_desc + 202, next_ti + 1);
+            put16(working, add_op_desc + 220, next_ti + 2);
+        }
+
+        for (dst, &val) in working[act_offset..act_offset + hidden_bytes]
             .as_chunks_mut::<4>()
             .0
             .iter_mut()
-            .zip(res_slice)
+            .zip(activation)
         {
             *dst = val.to_bits().to_le_bytes();
         }
-    }
-    working[gate_out_offset..output_end]
-        .as_chunks_mut::<4>()
-        .0
-        .fill(0x7fc0_ae51_u32.to_le_bytes());
+        if let Some(res_slice) = residual {
+            for (dst, &val) in working[res_offset..res_offset + hidden_bytes]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(res_slice)
+            {
+                *dst = val.to_bits().to_le_bytes();
+            }
+        }
+        working[gate_out_offset..output_end]
+            .as_chunks_mut::<4>()
+            .0
+            .fill(0x7fc0_ae51_u32.to_le_bytes());
 
-    Ok(FfnFullChainLayout {
-        output_offset: final_out_offset,
-        output_end,
+        // Each member keeps the single-token packet's exact descriptor bytes,
+        // with only globally unique tensor indices rebased for this packet.
+        let tensor_start = u16::try_from(token * member_tensors).map_err(|_| Error::Contract)?;
+        for index in 0..member_tensors {
+            let offset = tensors_base + index * 56 + 22;
+            let local = u16::from_le_bytes(
+                working[offset..offset + 2]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?,
+            );
+            put16(
+                working,
+                offset,
+                local.checked_add(tensor_start).ok_or(Error::Contract)?,
+            );
+        }
+        for index in 0..member_ops {
+            for field in (200..228).step_by(2) {
+                let offset = ops_base + index * 232 + field;
+                let local = u16::from_le_bytes(
+                    working[offset..offset + 2]
+                        .try_into()
+                        .map_err(|_| Error::Contract)?,
+                );
+                if local != u16::MAX {
+                    put16(
+                        working,
+                        offset,
+                        local.checked_add(tensor_start).ok_or(Error::Contract)?,
+                    );
+                }
+            }
+        }
+        output_offsets[token] = final_out_offset;
+        next_token_offset = output_end.next_multiple_of(128);
+    }
+    Ok(FfnFullChainBatchLayout {
+        output_offsets,
+        output_end: next_token_offset,
         n_bufs,
         n_tensors: u32::try_from(n_tensors_usize).map_err(|_| Error::Contract)?,
         n_ops: u32::try_from(n_ops_usize).map_err(|_| Error::Contract)?,
@@ -2728,6 +2936,166 @@ mod tests {
             first[5] = f32::from_bits(invalid);
             assert!(NativeQ2ValidatedOutputs::validate([first.as_slice()]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Compare every paired chain descriptor with the original single-token builder and reject insufficient scratch"
+    )]
+    fn native_q2_two_chain_packets_preserve_single_token_descriptors_and_capacity()
+    -> Result<(), Error> {
+        let weights = vec![0_u8; 4608];
+        let mut registry = NativeQ2WeightRegistry::new(16_384)?;
+        let handle = registry
+            .prepare(128, 128, &weights)?
+            .ok_or(Error::Contract)?;
+        let arena_start = 32_768;
+        let activation0 = [1.0_f32; 128];
+        let activation1 = [-0.0_f32; 128];
+        let residual0 = [3.0_f32; 128];
+        let residual1 = [4.0_f32; 128];
+        let extras = [HtpBufferDesc {
+            base: 0x2000_0000,
+            size: 16_384,
+            fd: 8,
+        }];
+        for secondary in [false, true] {
+            let mut handle = handle.clone();
+            if secondary {
+                handle.arena_index = 1;
+            }
+            let extra = if secondary { extras.as_slice() } else { &[] };
+            let buffers = 1 + usize::from(secondary);
+            for (hadamard, add, member_ops, member_tensors) in [
+                (None, false, 4_usize, 12_usize),
+                (Some(64), false, 5, 14),
+                (None, true, 5, 15),
+                (Some(64), true, 6, 17),
+            ] {
+                let mut paired = vec![0_u8; arena_start + 16_384];
+                let pair = image_ffn_full_chain_resident_multi2(
+                    &mut paired,
+                    0x1000_0000,
+                    7,
+                    arena_start,
+                    extra,
+                    [&handle; 3],
+                    [&activation0, &activation1],
+                    [
+                        add.then_some(residual0.as_slice()),
+                        add.then_some(residual1.as_slice()),
+                    ],
+                    hadamard,
+                )?;
+                assert_eq!(
+                    pair.n_ops,
+                    u32::try_from(member_ops * 2).map_err(|_| Error::Contract)?
+                );
+                assert_eq!(
+                    pair.n_tensors,
+                    u32::try_from(member_tensors * 2).map_err(|_| Error::Contract)?
+                );
+                assert_eq!(
+                    pair.n_bufs,
+                    u32::try_from(buffers).map_err(|_| Error::Contract)?
+                );
+                assert!(pair.output_offsets[0] + 512 <= pair.output_offsets[1]);
+                assert!(pair.output_end <= arena_start);
+                for token in 0..2 {
+                    let activation = [&activation0, &activation1][token];
+                    let residual =
+                        add.then_some([residual0.as_slice(), residual1.as_slice()][token]);
+                    let mut single = vec![0_u8; paired.len()];
+                    let original = image_ffn_full_chain_resident(
+                        &mut single,
+                        0x1000_0000,
+                        7,
+                        arena_start,
+                        extra,
+                        &handle,
+                        &handle,
+                        &handle,
+                        activation,
+                        residual,
+                        hadamard,
+                    )?;
+                    let tensor_base = buffers * 24 + token * member_tensors * 56;
+                    let ops_base =
+                        buffers * 24 + 2 * member_tensors * 56 + token * member_ops * 232;
+                    let shift = pair.output_offsets[token] - original.output_offset;
+                    for index in 0..member_tensors {
+                        let offset = tensor_base + index * 56;
+                        let mut descriptor: [u8; 56] = paired[offset..offset + 56]
+                            .try_into()
+                            .map_err(|_| Error::Contract)?;
+                        let down_index = 9 + usize::from(hadamard.is_some()) * 2;
+                        if ![0, 3, down_index].contains(&index) {
+                            let data = usize::try_from(u64::from_le_bytes(
+                                descriptor[..8].try_into().map_err(|_| Error::Contract)?,
+                            ))
+                            .map_err(|_| Error::Contract)?;
+                            descriptor[..8].copy_from_slice(
+                                &u64::try_from(data - shift)
+                                    .map_err(|_| Error::Contract)?
+                                    .to_le_bytes(),
+                            );
+                        }
+                        descriptor[22..24].copy_from_slice(
+                            &u16::try_from(index)
+                                .map_err(|_| Error::Contract)?
+                                .to_le_bytes(),
+                        );
+                        assert_eq!(
+                            descriptor,
+                            single[buffers * 24 + index * 56..buffers * 24 + (index + 1) * 56]
+                        );
+                    }
+                    for index in 0..member_ops {
+                        let offset = ops_base + index * 232;
+                        let mut operation: [u8; 232] = paired[offset..offset + 232]
+                            .try_into()
+                            .map_err(|_| Error::Contract)?;
+                        for field in (200..228).step_by(2) {
+                            let global = u16::from_le_bytes(
+                                operation[field..field + 2]
+                                    .try_into()
+                                    .map_err(|_| Error::Contract)?,
+                            );
+                            if global != u16::MAX {
+                                let local = global
+                                    - u16::try_from(token * member_tensors)
+                                        .map_err(|_| Error::Contract)?;
+                                operation[field..field + 2].copy_from_slice(&local.to_le_bytes());
+                            }
+                        }
+                        let original_offset = buffers * 24 + member_tensors * 56 + index * 232;
+                        assert_eq!(operation, single[original_offset..original_offset + 232]);
+                    }
+                    assert!(!output_valid(
+                        &paired[pair.output_offsets[token]..pair.output_offsets[token] + 512]
+                    ));
+                }
+                let mut insufficient = vec![0_u8; 8192 + 16_384];
+                assert!(
+                    image_ffn_full_chain_resident_multi2(
+                        &mut insufficient,
+                        0x1000_0000,
+                        7,
+                        8192,
+                        &[],
+                        [&handle; 3],
+                        [&activation0, &activation1],
+                        [None; 2],
+                        hadamard,
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let small = NativeQ2ProjectionLimits::new(128, 128, 24, Duration::from_secs(4))?;
+        assert!(small.allocation_bytes() >= 8192 + 2 * 128 * 4 * 8);
         Ok(())
     }
 

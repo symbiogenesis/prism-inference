@@ -964,6 +964,30 @@ macro_rules! impl_native_q2_session_forwarding {
                 )
             }
 
+            fn supports_ffn_chain_multi2(&self) -> bool {
+                $dispatch!(self, supports_ffn_chain_multi2())
+            }
+
+            fn submit_resident_ffn_chain_multi2(
+                &mut self,
+                handles: [&NativeQ2WeightHandle; 3],
+                activations: [&[f32]; 2],
+                residuals: [Option<&[f32]>; 2],
+                hadamard_block_size: Option<u32>,
+                outputs: [&mut [f32]; 2],
+            ) -> Result<(), Error> {
+                $dispatch!(
+                    self,
+                    submit_resident_ffn_chain_multi2(
+                        handles,
+                        activations,
+                        residuals,
+                        hadamard_block_size,
+                        outputs
+                    )
+                )
+            }
+
             fn submit(
                 &mut self,
                 columns: usize,

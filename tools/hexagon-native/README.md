@@ -391,6 +391,31 @@ calls reach the native session execution and exact packet-correlation path
 described above. These source fixes do not qualify signed-device
 execution, end-to-end performance, reduced admission or a release/default change.
 
+The resident full-FFN prefill consumer pairs adjacent token chains into one
+`8`, `10` or `12`-operation packet (`24`, `28`/`30` or `34` tensors, at most four
+buffer descriptors). Each token retains the single-token gate/up, SwiGLU,
+optional Hadamard, down and optional residual operations, including their solver
+and VTCM pass flags. Tensor indices and working offsets are rebased within an
+8 KiB command area; immutable weight arenas are shared. These are two ordered
+`N = 1` chains. True `N > 1` matrix prefill remains unimplemented.
+
+`NativeQ2Submitter::supports_ffn_chain_multi2` explicitly reports the one-write
+capability. Custom submitters retain per-token execution and exact queue counts
+unless they implement it. The native path validates both complete final outputs
+before copying either destination. Refusal, wrong response geometry or a late
+nonfinite output invalidates both vectors and closes admission without replay.
+The whole-token-tile wrapper also clears earlier token outputs on any failure.
+The lifetime operation cap and absolute deadlines remain unchanged.
+
+The admitted native working allocation reserves at least `8192 + 2 * 8 * 4 *
+max(K, M)` bytes, page aligned, for both chains' command, activation, residual,
+intermediate and output regions until completion. The existing much larger Swift
+packed-weight workspace still dominates at production shapes. Small shapes now
+charge this larger minimum before native allocation; no admission reserve is
+reduced. Model-free packet equivalence, capacity, native failure/correlation,
+forwarding and tile-tail controls do not qualify signed-device numerics, vendor
+lifetime or measured request performance.
+
 ## Explicit reference process initialization
 
 The separate `--reference-session-mapping-probe ABSOLUTE_PACKAGE_DIRECTORY` and

@@ -12,6 +12,15 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "kernels::pinned_attention::gated_tests::gated_two_token_tiles_never_gate_a_failed_partial_publication",
+        "kernels::pinned_attention::gated_tests::gated_four_head_tiles_match_independent_channel_oracle",
+        "kernels::pinned_attention::gated_tests::gated_two_token_tiles_match_independent_causal_oracle",
+        "kernels::pinned_attention::gated_tests::gated_tiles_preserve_ungated_failure_publication_and_reject_bad_gates",
+        "sampling::selection::tests::lane_masks_preserve_signed_zero_winners_and_invalid_visitation",
+        "sampling::selection::tests::lane_masks_preserve_dense_and_sparse_visits_as_threshold_advances",
+        "sampling::selection::tests::greedy_lane_pruning_preserves_scalar_ties_tails_and_rejections",
+        "sampling::swift::tests::lane_pruned_heap_preserves_native_ties_threshold_advances_and_tails",
+        "sampling::swift::tests::lane_pruned_heap_rejects_every_nonfinite_position_without_consuming_rng",
         "kernels::finite_activation_tests::prepared_quantizers_reuse_finite_proof_with_original_code_bits",
         "kernels::finite_activation_tests::prepared_finite_proof_preserves_preflight_precedence_and_storage",
         "kernels::finite_activation_tests::prepared_finite_proof_retains_q8_overflow_and_external_validation",
@@ -124,6 +133,10 @@ CONTROLS = {
         "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
     ],
     "hexagon_native": [
+        "native_q2_forwarding_tests::owned_session_forwards_direct_resident_initialization_once",
+        "native_q2_forwarding_tests::owned_session_keeps_eight_operations_in_one_native_call",
+        "native_q2_forwarding_tests::owned_session_preserves_fused_swiglu_calls_and_rejection",
+        "native_q2_forwarding_tests::owned_session_preserves_borrowed_output_evidence_and_errors",
         "native_q2::tests::native_q2_finite_output_evidence_binds_regions_and_preserves_bits",
         "native_q2::tests::native_q2_reused_packet_geometry_matches_complete_scalar_frames",
         "native_q2::tests::native_q2_reused_packet_geometry_refuses_invalid_members_before_writing",

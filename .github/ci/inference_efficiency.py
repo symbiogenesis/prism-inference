@@ -12,6 +12,11 @@ import subprocess
 TOOLCHAIN = "+nightly-2026-11-09"
 CONTROLS = {
     "lib": [
+        "kernels::finite_activation_tests::prepared_quantizers_reuse_finite_proof_with_original_code_bits",
+        "kernels::finite_activation_tests::prepared_finite_proof_preserves_preflight_precedence_and_storage",
+        "kernels::finite_activation_tests::prepared_finite_proof_retains_q8_overflow_and_external_validation",
+        "sampling::swift::tests::cached_top_p_exponents_preserve_original_backing_bits_draws_and_reset",
+        "sampling::swift::tests::cached_top_p_guards_preserve_candidates_and_rng_with_unsorted_fallback",
         "sampling::tests::finite_logits_preserves_bits_bounds_and_custom_sampler_dispatch",
         "sampling::swift::tests::finite_selection_matches_checked_heap_bits_rng_reset_and_rejection",
         "runtime::deadline_tests::finite_greedy_matches_checked_selection_across_tiles_and_ties",
@@ -96,6 +101,7 @@ CONTROLS = {
         "prefill::tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance",
     ],
     "swift_sampling": [
+        "swift_declared_stop_is_not_delivered_and_commits_its_draw",
         "swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",
         "swift_rejects_invalid_full_vocabulary_without_consuming_draws_and_resets_seed",
     ],
@@ -103,6 +109,8 @@ CONTROLS = {
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
     ],
     "hexagon_runtime": [
+        "native_q2::tests::native_q2_default_output_evidence_preserves_success_and_terminal_failures",
+        "native_q2::tests::native_q2_unrelated_output_evidence_cannot_publish",
         "native_q2::tests::native_q2_resident_sibling_four_token_batches_preserve_order_and_tails",
         "native_q2::tests::native_q2_resident_sibling_eight_op_failure_clears_entire_tile",
         "native_q2::tests::native_q2_batches_two_and_three_resident_sibling_projections_in_single_queue_writes",
@@ -116,6 +124,7 @@ CONTROLS = {
         "native_q2::tests::native_q2_direct_prewarm_rejects_partially_packed_invalid_scale",
     ],
     "hexagon_native": [
+        "native_q2::tests::native_q2_finite_output_evidence_binds_regions_and_preserves_bits",
         "native_q2::tests::native_q2_reused_packet_geometry_matches_complete_scalar_frames",
         "native_q2::tests::native_q2_reused_packet_geometry_refuses_invalid_members_before_writing",
         "native_q2::tests::multi_arena_resident_descriptors_deduplicate_buffers_and_route_bi",
@@ -157,6 +166,8 @@ WINDOWS_ARM64_NEON_CONTROLS = [
 ]
 
 WINDOWS_ARM64_NATIVE_CONTROLS = [
+    "windows::compute_native::projection_native::tests::resident_native_q2_scopes_queue_buffer_flush_after_initial_dirty_submission",
+    "windows::compute_native::projection_native::tests::resident_native_q2_batch2_and_batch3_share_activation_and_validate_mixed_rows",
     "windows::compute_native::projection_native::tests::native_q2_in_place_preparation_preserves_extents_and_atomic_publication",
     "windows::compute_native::projection_native::tests::resident_native_q2_multi_arena_populates_secondary_buffer_and_batches_across_arenas",
 ]

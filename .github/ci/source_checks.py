@@ -25,7 +25,11 @@ INPUTS = {
               "scripts/Bonsai.Common.psm1", "scripts/Bonsai.Native.psm1",
               ".github/actions/rust-toolchain/**"),
     "parity": ("Cargo.toml", "Cargo.lock", "src/**", "server/**", "tools/gguf/**",
-               "tools/native-hash/**", "tests/swift*", "rust-toolchain.toml",
+               "tools/native-hash/**", "tools/neon-dot/**", "tools/ternary/**",
+               "tools/prism/**", "tools/hexagon-native/**", "tools/hexagon-runtime/**",
+               "tests/**/*.rs", "tests/fixtures/**", "tests/upstream_prism/**",
+               "examples/**", "rust-toolchain.toml", "clippy.toml",
+               "rustfmt.toml", ".cargo/**",
                ".github/actions/rust-toolchain/**"),
 }
 SHA = re.compile(r"[0-9a-f]{40}\Z")

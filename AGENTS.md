@@ -43,3 +43,15 @@ CI; hosted cloud CI retains its own workflow limits.
 
 Runner's explicit 5/10/15-minute native-runtime acceptance option does not extend
 Prism's numerical/accelerator captures or existing external owner helpers.
+
+# Cross-target lint checks
+
+For cfg-sensitive Rust changes or compiler/lint configuration changes, identify
+the affected native and fallback branches before local delivery. Select each
+changed helper package explicitly with pinned Release Clippy, `--all-targets`
+and `-D warnings`; a dependency build does not lint the helper's test targets.
+Include an applicable non-ARM target when changing NEON dispatch or stubs.
+Use the [focused check recipes](docs/build-and-validation.md#focused-checks-before-local-delivery)
+within the existing aggregate owner-device budget. Record unavailable targets
+and pending hosted coverage accurately; never widen local work to a full suite
+or restart a closed validation allowance.

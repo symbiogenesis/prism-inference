@@ -49,10 +49,25 @@ class SelectionTests(unittest.TestCase):
 
     def test_runtime_parity_keeps_pr_and_manual_scope_without_duplicate_push(self):
         for path in ("Cargo.toml", "Cargo.lock", "src/runtime.rs", "server/src/main.rs",
-                     "tools/gguf/src/lib.rs", "tools/native-hash/src/lib.rs", "tests/swift_session.rs"):
+                     "tools/gguf/src/lib.rs", "tools/native-hash/src/lib.rs", "tests/swift_session.rs",
+                     "tools/neon-dot/src/lib.rs", "tools/ternary/src/lib.rs", "tools/prism/src/lib.rs",
+                     "tools/hexagon-native/src/lib.rs", "tools/hexagon-runtime/src/native_q2.rs",
+                     "tests/graph.rs", "tests/upstream_prism/fixtures/model.json",
+                     "examples/swift_model_check.rs"):
             with self.subTest(path=path):
                 self.assertFalse(self.selected(path)["parity"])
                 self.assertTrue(self.selected(path, event="pull_request", git_ref=MERGE)["parity"])
+
+    def test_lint_and_compiler_configuration_select_all_cfg_parity_arms(self):
+        for path in ("rust-toolchain.toml", "clippy.toml", "rustfmt.toml",
+                     ".cargo/config.toml", ".cargo/nested/flags.toml",
+                     ".github/actions/rust-toolchain/action.yml"):
+            with self.subTest(path=path):
+                selected = self.selected(path, event="pull_request", git_ref=MERGE)
+                self.assertTrue(selected["parity"])
+                self.assertFalse(selected["standards"])
+                self.assertFalse(selected["probe"])
+                self.assertFalse(self.selected(path)["parity"])
 
     def test_mixed_changes_select_each_eligible_owner(self):
         selected = self.selected("docs/contract.md", "src/lib.rs", "tests/Test-Check.ps1",
@@ -71,7 +86,11 @@ class SelectionTests(unittest.TestCase):
 
     def test_empty_or_unrelated_changes_skip_all_jobs(self):
         self.assertFalse(any(self.selected().values()))
-        self.assertFalse(any(self.selected("tools/ternary/src/lib.rs").values()))
+        self.assertFalse(any(self.selected("tools/conformance-policy/src/lib.rs").values()))
+        self.assertFalse(any(self.selected("tools/conformance-policy/src/lib.rs",
+                                           event="pull_request", git_ref=MERGE).values()))
+        self.assertFalse(self.selected("tests/Test-Standards.ps1",
+                                       event="pull_request", git_ref=MERGE)["parity"])
 
     def test_manual_main_runs_all_and_other_refs_keep_original_branch_boundary(self):
         self.assertTrue(all(checks.plan(Path('.'), "workflow_dispatch", MAIN, AFTER)["groups"].values()))

@@ -269,8 +269,40 @@ and bounded release preparation. No hosted verdict transfers across those scopes
 Source checks retains parity's Windows ARM64, Windows x64 and Linux ARM64 matrix
 for relevant pull requests and manual dispatch. It exercises model-free serving,
 workers, hashing and documentation; it does not qualify actual-model parity.
+Its strict all-target Clippy invocation explicitly selects the NEON helper and
+Hexagon native/runtime crates on every target. This includes helper test code
+and non-ARM fallback branches that are absent from an ARM64 dependency build.
+Changes to those helpers, their runtime dependencies, examples/tests, Clippy,
+rustfmt and Cargo configuration select this matrix. Main pushes retain
+Foundation's owning coverage without a duplicate parity matrix.
 The separate qualification and preparation workflows remain tied to open gates.
 Foundation bundle remains outside Foundation's successful-ancestor baseline.
+
+### Focused checks before local delivery
+
+A passing ARM64 build does not cover x64 fallback code, and `cargo test` does not
+run Clippy. For cfg-sensitive helper changes, select the package itself with
+`--all-targets`, using the pinned compiler and the workspace lint configuration.
+For the NEON/Hexagon helpers, the focused strict commands are:
+
+```powershell
+cargo +nightly-2026-11-09-aarch64-pc-windows-msvc clippy --locked --offline --release `
+    --manifest-path <repo>/Cargo.toml --target-dir <temp>/build `
+    --target aarch64-pc-windows-msvc -p bonsai-neon-dot -p bonsai-hexagon-native `
+    -p bonsai-hexagon-runtime --all-targets -- -D warnings
+cargo +nightly-2026-11-09-aarch64-pc-windows-msvc clippy --locked --offline --release `
+    --manifest-path <repo>/Cargo.toml --target-dir <temp>/build `
+    --target x86_64-pc-windows-msvc -p bonsai-neon-dot -p bonsai-hexagon-native `
+    -p bonsai-hexagon-runtime --all-targets -- -D warnings
+```
+
+Run from the external working directory convention above. Cross-target Clippy
+type-checks without linking or executing the other architecture; it does not
+replace native hosted tests. On the owner's laptop, predeclare only the fixed
+selection that can fit the aggregate allowance, including setup, power snapshots
+and cleanup. Reuse installed targets and cached dependencies; report unavailable
+or unfinished arms as pending hosted checks. Keep full suites in CI and preserve
+the owner's push and dispatch ownership.
 
 ## Checkpoint restore storage
 

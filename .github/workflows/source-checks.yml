@@ -218,7 +218,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-11-09-${{ matrix.target }}
-      - name: Check native hashing, transactional serving and worker protocol
+      - name: Check native and fallback lints, transactional serving and worker protocol
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -233,7 +233,9 @@ jobs:
           try {
             $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
             cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
-            cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
+            # Explicit packages also lint helper test targets and the non-ARM
+            # NEON stubs that dependency-only ARM64 checks cannot reach.
+            cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p bonsai-neon-dot -p bonsai-hexagon-native -p bonsai-hexagon-runtime -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
             cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf
             cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference --features parallel-rows --test graph --test swift_session --test swift_worker_request --test swift_worker_output --test swift_sampling --test swift_client
             cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows

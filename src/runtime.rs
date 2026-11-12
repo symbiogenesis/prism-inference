@@ -1291,11 +1291,11 @@ fn check_deadline(cancellation: &Cancellation, deadline: Instant, now: Instant) 
 // A snapshot owns only an immutable Arc. Before writing a new distribution,
 // detach shared output without cloning values that will immediately be cleared.
 // The fresh allocation then remains unique and reusable across decoder steps.
-// No Weak references escape, and Arc::make_mut therefore never copies payload.
 fn mutable_logits(logits: &mut Arc<Vec<f32>>) -> &mut Vec<f32> {
-    if Arc::get_mut(logits).is_none() {
-        *logits = Arc::new(Vec::new());
+    if let Some(values) = Arc::get_mut(logits) {
+        return values;
     }
+    *logits = Arc::new(Vec::new());
     Arc::make_mut(logits)
 }
 

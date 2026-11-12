@@ -87,11 +87,23 @@ impl<S: LogitsSource> SupportsLogitsView for (S, for<'a> fn(S::Output<'a>) -> Op
     }
 }
 
-/// Visit a borrowed logits view through a higher-ranked callback bound.
-pub fn with_logits<S: LogitsSource, R>(
-    source: &mut S,
+/// Visit a logits view borrowed for this call, including from a borrowed source.
+///
+/// The consumer may return the view; its borrow then keeps the source from being
+/// evaluated or invalidated until the last use of the returned value.
+///
+/// ```compile_fail,E0499
+/// use bonsai_rust_trial::{LogitsCache, with_logits};
+///
+/// let mut source = LogitsCache::new(4);
+/// let view = with_logits(&mut source, 1, |output| output);
+/// source.invalidate(); // The returned view still borrows the source.
+/// assert_eq!(view.len(), 4);
+/// ```
+pub fn with_logits<'a, S: LogitsSource, R>(
+    source: &'a mut S,
     token: u16,
-    consumer: impl for<'a> FnOnce(S::Output<'a>) -> R,
+    consumer: impl FnOnce(S::Output<'a>) -> R,
 ) -> R {
     consumer(source.evaluate(token))
 }
@@ -149,5 +161,28 @@ mod tests {
         assert_eq!(cache.evaluate(11).as_ptr(), address);
         assert_eq!(cache.capacity(), capacity);
         assert_eq!(cache.refills(), 3);
+    }
+
+    struct BorrowedLogits<'a>(&'a [f32]);
+
+    impl LogitsSource for BorrowedLogits<'_> {
+        type Output<'a>
+            = &'a [f32]
+        where
+            Self: 'a;
+
+        fn evaluate(&mut self, _token: u16) -> Self::Output<'_> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn consumer_can_return_a_view_from_a_nonstatic_source() {
+        let values = [4.0, -1.0, 2.0];
+        let mut source = BorrowedLogits(&values);
+        let view = with_logits(&mut source, 0, |output| output);
+        assert_eq!(view, values);
+        assert_eq!(view.as_ptr(), values.as_ptr());
+        assert_eq!(maximum_logit(&mut source, 0), Some(4.0));
     }
 }

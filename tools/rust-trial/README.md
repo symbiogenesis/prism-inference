@@ -16,9 +16,11 @@ The synthetic regressions compare an owned numerical reference, cache hits,
 invalidation, empty vocabulary and unchanged storage address/capacity. They
 establish storage ownership/reuse, not allocation profiles, model parity or speed.
 The token-only cache key is not a production decoder's sequence state. `LogitsCache::evaluate`
-returns the cached slice on a hit before mutating storage on a miss (Polonius lending),
-and `with_logits` / `SupportsLogitsView` normalize higher-ranked associated views
-through the next-generation trait solver.
+returns the cached slice on a hit before mutating storage on a miss (Polonius lending).
+`with_logits` ties its consumer to the current source borrow, admitting sources
+that borrow local data and consumers that return a view without copying it.
+`SupportsLogitsView` retains the higher-ranked associated-view normalization
+exercised by the next-generation trait solver.
 
 ## Production pattern audit
 
@@ -35,9 +37,14 @@ reuse output and activation storage without new solver behavior. Saved-prefix
 restoration now also retains the runtime's token allocation; that optimization
 is expressible on stable. Checkpoints still own complete independent state.
 
-Both Polonius lending and the next solver's higher-ranked associated-view
-normalization are also exercised in `src/text_output.rs`, `server/src/native_response.rs`
-and Cargo-compiled behavioral gates in `tools/rust-trial/tests/compiler.rs`.
+Production text output uses a generic lending view in `src/text_output.rs`, and
+`server/src/native_response.rs` uses failure-path borrowing. Text output's
+`push_with` visitor, like `with_logits`, needs only the current call's lifetime;
+requiring every lifetime unnecessarily rejects nonstatic sources and consumers
+that retain valid borrowed pieces. This API correction requires no new compiler
+feature and establishes no runtime speedup. Cargo-compiled behavioral gates in
+`tools/rust-trial/tests/compiler.rs` independently verify Polonius lending and the
+next solver's higher-ranked associated-view normalization.
 
 ## Compiler capability fixtures
 
@@ -76,6 +83,7 @@ This trial includes no benchmarks. Exact prototype regression names are:
 
 - `tests::borrowed_outputs_match_reference_and_invalidate`
 - `tests::repeated_outputs_reuse_storage`
+- `tests::consumer_can_return_a_view_from_a_nonstatic_source`
 
 The main-only compiler jobs in
 [Source checks](../../.github/workflows/source-checks.yml) compare isolated pinned

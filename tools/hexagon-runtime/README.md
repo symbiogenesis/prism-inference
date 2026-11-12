@@ -167,7 +167,6 @@ qualification, actual resource admission, cancellation/device loss,
 sustained use and paired end-to-end benefit remain pending. Native invocation,
 successful loading or an exact CPU/mock control does not establish NPU speed.
 
-
 Resident multi-operation token prefill now uses the native session's explicit
 single-packet capability to batch up to eight tokens per weight tile. Packed
 preparation scratch is released before bounded partial outputs reuse its

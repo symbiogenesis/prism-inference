@@ -196,7 +196,7 @@ replace full numerical, long-output or human-quality acceptance.
 ### Owning workflows
 
 This repository also owns the [complete upstream conformance guide](prism-upstream-tests.md).
-Routine pushes use [Runtime regression](../.github/workflows/runtime-regression.yml):
+Routine pushes use the regression jobs in [Foundation](../.github/workflows/foundation.yml):
 23 existing Rust source contracts in one cached native ARM64 job, affected native
 codec parity and a fail-closed aggregate. Its receipts explicitly record
 `FullSourceGate=false`; it does not replay the C++ reference or replace full release
@@ -207,12 +207,11 @@ release. Measurements and gradients remain explicit manual opt-ins.
 The [focused workflow](../.github/workflows/prism-focused.yml)
 diagnoses one named source without replacing the complete gate.
 
-The [standards workflow](../.github/workflows/standards.yml) owns PowerShell and
-embedded-C# analysis; Rust-only pushes do not start it. The
-[Markdown standards workflow](../.github/workflows/markdown.yml) runs `rumdl`
-against [`.rumdl.toml`](../.rumdl.toml) when Markdown files or linter settings
-change. The
-[compiler acceptance workflow](../.github/workflows/rust-nightly.yml) compares
+[Source checks](../.github/workflows/source-checks.yml) selects independent jobs
+for Markdown, PowerShell/embedded-C# analysis, compiler probes and model-free
+Swift parity. Markdown keeps push and pull-request coverage with pinned `rumdl`
+and [`.rumdl.toml`](../.rumdl.toml). Script standards remain main-only; Rust-only
+pushes do not select them. Compiler acceptance compares
 isolated stable/nightly language probes and preserves the fail-closed
 `compatibility` check. It runs when probe inputs change or on manual dispatch;
 [`tools/rust-trial/tests/compiler.rs`](../tools/rust-trial/tests/compiler.rs)
@@ -223,7 +222,8 @@ Runner contains only app/provisioning/released-runtime integration gates; none o
 these runtime suites bootstrap through its maintenance executable or released source.
 All full suites and every benchmark remain hosted-only.
 
-Automatic workflows skip pushes limited to root Markdown files and `docs/`.
+Foundation skips pushes limited to root Markdown files and `docs/`.
+Source checks still selects Markdown validation for those changes.
 For other pushes, the [impact map](../.github/ci/impact.json) combines changed
 paths with Cargo's local dependency graph. A server-only change checks the
 server; a ternary-codec change also checks its GGUF/runtime/server consumers and
@@ -232,18 +232,45 @@ server or policy-tool changes do not start its regression job. Shared
 manifests, lockfiles, toolchains, CI policy and unclassified inputs select full
 validation. Manual dispatch always selects every group in that workflow.
 Known unrelated server, compiler-trial, policy-tool, packaging and C# analyzer
-paths also bypass the regression workflow at its push trigger. The native
-codec lane builds its probe and checks parity; Foundation owns its Rust analyzers.
+paths do not select Foundation's Rust regression job. The native codec lane
+builds its probe and checks parity; Foundation owns its Rust analyzers.
+The independent source-package matrix verifies Windows ARM64, Windows x64 and
+Linux ARM64 archives and external consumers within the same Foundation run.
+The Foundation aggregate requires each selected regression, codec and package job,
+alongside selected workspace and native-overlay jobs.
 
 Each workflow compares with its most recent successful push revision on the
 current ancestry, so changes from failed or cancelled pushes remain covered.
 If that baseline cannot be established, selection falls back to full validation.
-Automatic Foundation, standards and compiler-probe runs supersede older pushes
-on the same branch, releasing runners for the newest revision. Successful-ancestor
+Automatic Foundation and Source checks runs supersede older pushes on the same
+branch, releasing runners for the newest revision. Successful-ancestor
 selection carries changes from cancelled and failed pushes into Foundation's
 next plan. Manual dispatches retain independent complete validation requests.
 Aggregate gates require successful planning
 and successful selected jobs; they permit skips only for unselected groups.
+
+### Workflow inventory
+
+The nine entry points separate routine source validation from explicit qualification
+and bounded release preparation. No hosted verdict transfers across those scopes.
+
+| Workflow | Current responsibility |
+| --- | --- |
+| Foundation | Selected workspace, overlay, regression, codec and source-package checks |
+| Source checks | Selected Markdown, scripts, compiler probes and model-free parity |
+| Foundation bundle | Manual exact-source five-minute ARM64 binary preparation |
+| Runtime conformance | Manual complete source/reference and backend release gate |
+| Prism focused reference | Manual diagnosis of one named source contract |
+| Inference efficiency candidate | Exact named controls and source-bound admission receipts |
+| Experimental native Hexagon boundary | Independent cross-target and native accelerator checks |
+| Released private-service acceptance | Pinned released-service lifecycle and receipt acceptance |
+| Swift request timing tool preparation | Source-bound standalone actual-model diagnostic tool |
+
+Source checks retains parity's Windows ARM64, Windows x64 and Linux ARM64 matrix
+for relevant pull requests and manual dispatch. It exercises model-free serving,
+workers, hashing and documentation; it does not qualify actual-model parity.
+The separate qualification and preparation workflows remain tied to open gates.
+Foundation bundle remains outside Foundation's successful-ancestor baseline.
 
 ## Checkpoint restore storage
 
@@ -523,13 +550,14 @@ executables and package them with the four root
 license/notice files. Each bundle has a receipt identifying its exact source
 revision, target, version, file hashes and archive hash. Isolated crate changes
 check and build their affected packages without rebuilding a complete bundle.
-The aggregate Foundation check requires both Windows targets when selected and
-the Linux native overlay gate when its inputs are selected.
+The aggregate Foundation check requires both Windows targets, the Linux native
+overlay, Rust regression, native codec and source-package matrix whenever their
+respective groups are selected.
 
 The published binary bundle version is `0.1.23`; the source installation and
-library examples above independently select registry `0.1.24`. Packaging rejects a changed or untracked source
-checkout, a revision mismatch, inconsistent runtime/server versions or a
-toolchain string that differs from the pinned channel and target. The receipt
+library examples above independently select registry `0.1.24`. Packaging rejects
+a changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
+versions or a toolchain string that differs from the pinned channel and target. The receipt
 records the resulting bytes; its source-to-binary trust still depends on the
 checked Foundation build. The synthetic release-bundle regressions verify
 identity rejection, PE target checks and every archive entry's recorded hash.
@@ -573,8 +601,9 @@ and independently pending qualification. The server pins registry
 `bonsai-windows-credentials =0.1.4` and retains `publish = false` because its
 Hexagon helpers are unpublished path dependencies. Verified GitHub bundles and
 exact source checkouts remain its supported delivery paths. The hosted
-[Source package workflow](../.github/workflows/source-package.yml) verifies normalized Cargo archives together before registry publication on
-Windows ARM64, Windows x64 and Linux ARM64. A separate application consumes the extracted runtime,
+[Foundation source-package matrix](../.github/workflows/foundation.yml) verifies
+normalized Cargo archives together before registry publication on Windows ARM64,
+Windows x64 and Linux ARM64. A separate application consumes the extracted runtime,
 GGUF and hash archives and runs model-free public API checks with scalar, default and parallel-row
 features. Its receipt retains archive digests, source identity, consumer lockfile and executed
 commands. This checks source delivery independently of building inside the original workspace.
@@ -583,8 +612,8 @@ The five current registry helpers are already published and unchanged:
 `bonsai-native-hash =0.1.2`, `bonsai-neon-dot =0.1.1`, `bonsai-ternary =0.1.2`,
 `bonsai-gguf =0.1.4` and `bonsai-prism =0.1.4`. Only the runtime was newly
 published as `0.1.24`; its normalized package and public checksum were verified
-separately from the still-pending binary delivery. Source preparation and hosted checks alone neither publish
-registry packages nor qualify model serving.
+separately from the still-pending binary delivery. Source preparation and hosted
+checks alone neither publish registry packages nor qualify model serving.
 
 The published development bundle build explicitly enables
 `prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the

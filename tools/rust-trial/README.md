@@ -77,13 +77,13 @@ This trial includes no benchmarks. Exact prototype regression names are:
 - `tests::borrowed_outputs_match_reference_and_invalidate`
 - `tests::repeated_outputs_reuse_storage`
 
-The manual main-only [workflow](../../.github/workflows/rust-nightly.yml) checks
-the pinned nightly across Runtime groups in two parallel lanes. Runtime holds
-ternary, GGUF, Prism, the CPU reference and this trial; Broker holds Windows
-boundaries, broker and maintenance tools. Compiler/group targets remain separate.
-Independent probes and every lane must pass the final `compatibility` check,
-including evidence retention. Receipts bind compiler identity, exact arguments,
-source hashes and verdicts. Native Prism linking remains in Foundation.
+The main-only compiler jobs in
+[Source checks](../../.github/workflows/source-checks.yml) compare isolated pinned
+stable and nightly language probes when their inputs change or on manual dispatch.
+The `compatibility` check requires successful probes, including evidence retention;
+failed, cancelled or skipped selected probes are rejected. Receipts bind compiler
+identity, exact arguments, source hashes and verdicts. Foundation owns complete
+workspace correctness, feature checks and native Prism linking.
 
 `-Mode Compatibility -PackageGroup Runtime` or `Broker` selects formatting,
 Release Clippy/documentation locally; the default checks all packages. Full

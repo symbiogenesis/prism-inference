@@ -31,7 +31,7 @@ read as an assertion-level pass rate or full-model qualification.
 
 ## What runs
 
-Routine pushes run [Runtime regression](../.github/workflows/runtime-regression.yml):
+Routine pushes run regression jobs in [Foundation](../.github/workflows/foundation.yml):
 one native Windows ARM64 Rust job replays 23 existing source contracts with their
 unchanged inputs and assertions, and a separate job retains native codec parity
 when affected. The [selected corpus](../.github/ci/runtime_regression.py) covers
@@ -52,7 +52,7 @@ Dispatch **Runtime conformance** on `main` for exhaustive source/reference and
 backend qualification before release. Its existing workflow ID, name, complete
 gate, four source partitions, 16 planning partitions and 32 execution partitions
 are retained; full conformance no longer starts on every push. Existing benchmark
-and gradient inputs remain explicit opt-ins. A green Runtime regression result
+and gradient inputs remain explicit opt-ins. A green Foundation regression result
 does not satisfy the Runtime conformance release requirement.
 
 The successful baseline [41535008203](https://github.com/symbiogenesis/prism-inference/actions/runs/41535008203)

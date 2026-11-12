@@ -2,7 +2,8 @@
 
 `tests/Test-Standards.ps1` checks every repository PowerShell source with
 PSScriptAnalyzer 1.25.0 and explicit parameter, output, parser and error-handling
-contracts. The main-only `Script standards` workflow runs these checks in Prism;
+contracts. The main-only script standards job in
+[Source checks](../../.github/workflows/source-checks.yml) runs these checks in Prism;
 it does not build Runner tools or run model/test/benchmark workloads.
 
 Every literal `Add-Type -TypeDefinition` helper is extracted into external

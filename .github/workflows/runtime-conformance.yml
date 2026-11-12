@@ -23,7 +23,7 @@ env:
   PRISM_BACKEND_EXECUTION_COUNT: '32'
 concurrency:
   # Full source/reference qualification is an explicit release/diagnostic request.
-  # Routine pushes use runtime-regression.yml and never satisfy this full gate.
+  # Routine pushes use Foundation regression jobs and never satisfy this full gate.
   group: runtime-conformance-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 jobs:

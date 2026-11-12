@@ -7,7 +7,7 @@
 
 /// Widens four IEEE binary16 bit patterns without changing NaN payload bits.
 ///
-/// Native AArch64 NEON uses `FCVTL` for finite inputs; this conversion does not
+/// Native `AArch64` NEON uses `FCVTL` for finite inputs; this conversion does not
 /// require the optional full FP16 arithmetic extension. Exceptional arrays use
 /// integer decoding, preserving signaling NaNs without submitting them to a
 /// floating-point conversion. Other targets use that same portable decoding.
@@ -26,7 +26,7 @@ pub fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
 
 /// Widens eight IEEE binary16 bit patterns in their original lane order.
 ///
-/// Uses baseline `FCVTL`/`FCVTL2` for finite AArch64 NEON inputs, with the same
+/// Uses baseline `FCVTL`/`FCVTL2` for finite `AArch64` NEON inputs, with the same
 /// exact exceptional and portable behavior as [`widen_f16_four`].
 #[inline]
 #[must_use]

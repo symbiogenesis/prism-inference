@@ -11,7 +11,7 @@
 /// planes. `sum` is the sum of all signed bytes used for the unsigned-code
 /// correction. The runtime retains its existing 136-byte block layout.
 pub struct Pq2Activation {
-    /// Original Q8_K scale, shared by both halves of its quantizer block.
+    /// Original `Q8_K` scale, shared by both halves of its quantizer block.
     pub scale: f32,
     /// Original signed codes rearranged into consumption order.
     pub values: [i8; 128],

@@ -25,6 +25,15 @@ static I8MM_STATE: AtomicU8 = AtomicU8::new(UNINIT);
 #[cfg(target_feature = "neon")]
 #[inline]
 pub(super) fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
+    // SAFETY: this wrapper is compiled only for targets with baseline NEON.
+    // The fixed array supplies every input element and no memory is retained.
+    unsafe { widen_f16_four_neon(bits) }
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn widen_f16_four_neon(bits: &[u16; 4]) -> [f32; 4] {
     use core::arch::aarch64::{
         vand_u16, vcvt_f32_f16, vdup_n_u16, vld1_u16, vmaxv_u16, vreinterpret_f16_u16, vst1q_f32,
     };
@@ -45,6 +54,15 @@ pub(super) fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
 #[cfg(target_feature = "neon")]
 #[inline]
 pub(super) fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
+    // SAFETY: this wrapper is compiled only when baseline NEON is available;
+    // fixed-size input and output arrays cover every unaligned access.
+    unsafe { widen_f16_eight_neon(bits) }
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn widen_f16_eight_neon(bits: &[u16; 8]) -> [[f32; 4]; 2] {
     use core::arch::aarch64::{
         vandq_u16, vcvt_f32_f16, vcvt_high_f32_f16, vdupq_n_u16, vget_low_f16, vld1q_u16,
         vmaxvq_u16, vreinterpretq_f16_u16, vst1q_f32,

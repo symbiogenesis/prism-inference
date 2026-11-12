@@ -12,9 +12,13 @@ use serde_json::{Value, json};
 const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
-fn child(spec: &ProcessSpec, parent: &ParentProcess) -> Result<usize, String> {
+fn child(
+    spec: &ProcessSpec,
+    parent: &ParentProcess,
+    launch: fn(&ProcessSpec) -> std::io::Result<OwnedProcess>,
+) -> Result<usize, String> {
     parent.ensure_alive().map_err(|error| error.to_string())?;
-    let process = OwnedProcess::start(spec).map_err(|error| error.to_string())?;
+    let process = launch(spec).map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         parent.ensure_alive().map_err(|error| error.to_string())?;
@@ -28,7 +32,9 @@ fn child(spec: &ProcessSpec, parent: &ParentProcess) -> Result<usize, String> {
             .map_err(|error| error.to_string())?
         {
             if code != 0 {
-                return Err(format!("Native codec child failed with exit code {code}."));
+                return Err(format!(
+                    "Native codec child failed with exit code {code} (0x{code:08X})."
+                ));
             }
             return process
                 .peak_job_memory_bytes()
@@ -104,7 +110,11 @@ pub(super) fn run(arguments: &[OsString]) -> Result<Value, String> {
         memory_limit_bytes: MEMORY_LIMIT,
         active_process_limit: 1,
     };
-    let version_peak = child(&spec, &parent)?;
+    // This fixed model-free --version command imports legacy shell DLLs. Use
+    // the audited inspection policy, which permits their initialization and
+    // rejects other arguments, while retaining the one-process bounded Job.
+    // Its success does not qualify model workers under Win32k syscall denial.
+    let version_peak = child(&spec, &parent, OwnedProcess::start_inspection)?;
     let version = fs::read_to_string(&spec.stdout).map_err(|error| error.to_string())?
         + &fs::read_to_string(&spec.stderr).map_err(|error| error.to_string())?;
     if !matches_commit(&version) {
@@ -120,11 +130,14 @@ pub(super) fn run(arguments: &[OsString]) -> Result<Value, String> {
     ];
     spec.stdout = evidence.join("codec.stdout");
     spec.stderr = evidence.join("codec.stderr");
-    let codec_peak = child(&spec, &parent)?;
+    // The codec child retains ordinary headless mitigations; inspection is
+    // neither a fallback for a failed codec child nor an inference policy.
+    let codec_peak = child(&spec, &parent, OwnedProcess::start)?;
     let receipt = json!({
         "Status":"owned-native-codec-complete", "NativeRuntimeCommit":super::RUNTIME_COMMIT,
         "RuntimeVersion":version.trim(), "MemoryLimitBytes":MEMORY_LIMIT,
         "ActiveProcessLimit":1, "TimeoutSeconds":30, "ModelLoaded":false,
+        "VersionLaunchPolicy":"fixed-command-inspection", "CodecLaunchPolicy":"headless",
         "VersionPeakJobMemoryBytes":version_peak, "CodecPeakJobMemoryBytes":codec_peak,
     });
     let mut output = OpenOptions::new()

@@ -106,6 +106,7 @@ try {
     $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json -DateKind String
     if ($supervision.Status -cne 'owned-native-codec-complete' -or $supervision.MemoryLimitBytes -ne 1GB -or
         $supervision.ActiveProcessLimit -ne 1 -or $supervision.TimeoutSeconds -ne 30 -or $supervision.ModelLoaded -ne $false -or
+        $supervision.VersionLaunchPolicy -cne 'fixed-command-inspection' -or $supervision.CodecLaunchPolicy -cne 'headless' -or
         $supervision.NativeRuntimeCommit -cne $runtime.commit -or $supervision.CodecPeakJobMemoryBytes -gt 1GB -or
         $supervision.VersionPeakJobMemoryBytes -gt 1GB -or
         $result.Status -cne 'native-fp32-bit-parity-passed' -or $result.SyntheticBlocks -ne 6670 -or

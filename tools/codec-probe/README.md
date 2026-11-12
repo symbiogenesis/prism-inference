@@ -22,8 +22,14 @@ Runner installer nor its maintenance CLI. Version and codec children run in
 separate one-process kill-on-close Windows Jobs via the already published
 `bonsai-windows-process =0.1.2`, each capped to 1 GiB commit and 30 seconds, with
 parent-process lifetime checks, inherited environment and an explicit external
-native working directory. Evidence includes exact package file hashes, version,
-ABI, corpus counts, stdout/stderr and peak Job memory.
+native working directory. The fixed `llama-server.exe --version` child uses the
+audited inspection policy, which permits the pinned runtime's shell-DLL
+initialization and accepts only one `--version` or `--help` argument. The codec
+child retains ordinary headless mitigations, including Win32k syscall denial.
+Inspection success does not qualify native model-worker startup, and a failed
+codec child never falls back to inspection. Evidence includes exact package file
+hashes, version, ABI, corpus counts, stdout/stderr, peak Job memory and the
+distinct launch policies, which the wrapper requires in its completion receipt.
 
 Unsafe code stays confined to `src/native.rs`: restricted absolute DLL loading,
 export ABI conversion, static traits and bounded decoders. The reviewed ABI is

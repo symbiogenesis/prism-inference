@@ -91,6 +91,18 @@ establish full-model parity, throughput or complete device qualification.
 | Application ownership | Complete broader process/OS, daily-service and device lifecycle qualification |
 | Device acceptance | Retain correctness, tokens/second, memory, quality and security evidence on the intended hardware |
 
+Local CPU source also reuses detected SDOT/I8MM eligibility across prepared PQ2
+prefill tiles, keeps bounded elementwise worker error slots on the stack, and
+combines adapter-enabled FFN SwiGLU with down-projection basis preparation.
+Original-basis activations remain available for the down adapter. These source
+work reductions require final-source hosted checks, feature-disabled fallback,
+strict Release analysis and production linking, ARM64 codegen/stack review,
+complete-model state/logit/adapter/cancellation parity and independent matched
+X1 request measurements. X2 development checks establish no X1 benefit. The new
+opaque capability APIs require a new `bonsai-neon-dot` helper publication and
+exact runtime dependency update before registry delivery; Runner continues to
+consume its verified 0.1.23 binary bundle until a qualified release and repin.
+
 ## Research and provenance
 
 The original SwiftBonsai records remain useful historical context for the

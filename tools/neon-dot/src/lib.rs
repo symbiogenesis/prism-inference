@@ -14,6 +14,9 @@ pub use scaled::Pq2Activation;
 mod half;
 pub use half::{widen_f16_eight, widen_f16_four};
 
+/// Packed rotated scalar KV consumption with portable and baseline-NEON paths.
+pub mod kv_quant;
+
 #[cfg(target_arch = "aarch64")]
 #[allow(
     unsafe_code,

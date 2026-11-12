@@ -19,7 +19,7 @@ CONTROLS = {
         "special_input::window_tests::windowed_specials_retain_maximum_special_index_and_literal_limits",
         "kernels::pinned_attention::six::tests::six_head_paired_scores_match_independent_native_lanes_and_reject_bad_rows",
         "graph::attention_six::prefill_tests::six_head_paired_prefill_excludes_future_rows_and_rejects_malformed_input",
-        "bpe::piece_cache_tests::piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges",
+        "bpe::piece_cache_tests::x1_piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges",
         "bpe::piece_cache_tests::piece_cache_collisions_owners_unicode_and_long_bypass_preserve_identity",
         "bpe::piece_cache_tests::piece_cache_failures_preserve_output_bounds_and_missing_byte_precedence",
         "bpe::piece_cache_tests::piece_cache_storage_and_public_piece_composition_remain_bounded",

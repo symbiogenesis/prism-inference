@@ -2936,6 +2936,24 @@ pub(crate) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) {
     }
 }
 
+// Scalar attention accumulates f32 products in f64 and rounds only the final sum.
+// Keep this conversion shared by the single-head and batched fallback paths.
+#[cfg(not(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+)))]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "Match the source attention contract's final binary64-to-binary32 rounding."
+)]
+const fn source_value_float(value: f64) -> f32 {
+    value as f32
+}
+
 pub(crate) fn source_value_tile<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
@@ -2974,7 +2992,7 @@ pub(crate) fn source_value_tile<'a>(
         }
         let probability = probabilities[last];
         for ((out, sum), &value) in output.iter_mut().zip(sums).zip(current) {
-            *out = (sum + f64::from(probability * value)) as f32;
+            *out = source_value_float(sum + f64::from(probability * value));
         }
     }
 }
@@ -3023,7 +3041,7 @@ pub(crate) fn source_value_tile_four<'a>(
         {
             let probability = prob_row[last];
             for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(current) {
-                *out = (sum + f64::from(probability * value)) as f32;
+                *out = source_value_float(sum + f64::from(probability * value));
             }
         }
     }
@@ -3096,7 +3114,7 @@ pub(crate) fn source_value_tile_four_two_tokens<'a>(
             let probability = prob_row[last0];
             for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(currents[0])
             {
-                *out = (sum + f64::from(probability * value)) as f32;
+                *out = source_value_float(sum + f64::from(probability * value));
             }
         }
         for (output, (prob_row, sum_row)) in outputs1
@@ -3106,7 +3124,7 @@ pub(crate) fn source_value_tile_four_two_tokens<'a>(
             let probability = prob_row[last1];
             for ((out, &sum), &value) in output.iter_mut().zip(&sum_row[..out_len]).zip(currents[1])
             {
-                *out = (sum + f64::from(probability * value)) as f32;
+                *out = source_value_float(sum + f64::from(probability * value));
             }
         }
     }
@@ -3425,7 +3443,14 @@ pub(crate) fn add_rms_norm_pinned_into(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
 pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) -> Result<()> {
     let scale = rms_norm_scale(values, weight, epsilon)?;
     #[cfg(all(
@@ -3444,7 +3469,14 @@ pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
 pub(crate) fn rms_norm_pinned_in_place(
     values: &mut [f32],
     weight: &[f32],
@@ -3948,7 +3980,14 @@ pub(crate) fn hadamard_grouped_strided_block_into(
     hadamard(output)
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
 #[expect(
     clippy::too_many_arguments,
     reason = "Grouped-value Hadamard block fuses head permutation, optional sign multiply, and stage-64 butterfly."

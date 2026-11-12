@@ -28,6 +28,9 @@ mod projection;
 pub use projection::ProjectedQwen35;
 mod prefill;
 pub use prefill::TiledPrefillStatistics;
+#[cfg(test)]
+#[path = "graph/attention_preparation_tests.rs"]
+mod attention_preparation_tests;
 mod attention_six;
 
 /// Maximum admitted live KV/recurrent element payload, also the default budget.
@@ -3161,58 +3164,96 @@ impl Evaluation<'_, '_> {
         let arithmetic = self.arithmetic;
         let query_norm: &[f32] = &layer.query_norm;
         let frequencies: &[(f32, f32)] = frequencies_scratch;
-        self.projection.matvec.row_parallelism().update_chunks(
-            query_scratch,
-            g.head,
-            |base_head, query_chunk| {
-                let mut query_finite = true;
-                for (head_offset, query_head) in query_chunk.chunks_exact_mut(g.head).enumerate() {
-                    let head_idx = base_head + head_offset;
-                    let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                    // F16 K x Q converts the F32 query to F16 even with F32 precision.
-                    query_finite &= arithmetic.normalize_rope_round_f16_into(
-                        &src[..g.head],
-                        query_norm,
-                        g.epsilon,
-                        g,
-                        frequencies,
-                        query_head,
-                    )?;
-                }
-                if !query_finite {
-                    return Err(invalid("nonfinite values in binary16 attention query"));
-                }
-                Ok(())
-            },
-        )?;
+        let normalize_queries = |base_head: usize, query_chunk: &mut [f32]| {
+            let mut query_finite = true;
+            for (head_offset, query_head) in query_chunk.chunks_exact_mut(g.head).enumerate() {
+                let head_idx = base_head + head_offset;
+                let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
+                // F16 K x Q converts the F32 query to F16 even with F32 precision.
+                query_finite &= arithmetic.normalize_rope_round_f16_into(
+                    &src[..g.head],
+                    query_norm,
+                    g.epsilon,
+                    g,
+                    frequencies,
+                    query_head,
+                )?;
+            }
+            if !query_finite {
+                return Err(invalid("nonfinite values in binary16 attention query"));
+            }
+            Ok(())
+        };
         let key_norm: &[f32] = &layer.key_norm;
-        self.projection
-            .matvec
-            .row_parallelism()
-            .update_paired_chunks(key, g.head, value, g.head, |_, key_chunk, value_chunk| {
-                let mut key_finite = true;
-                let mut value_finite = true;
-                for (key_head, value_head) in key_chunk
-                    .chunks_exact_mut(g.head)
-                    .zip(value_chunk.chunks_exact_mut(g.head))
-                {
-                    key_finite &= arithmetic.normalize_rope_round_f16_in_place(
-                        key_head,
-                        key_norm,
-                        g.epsilon,
-                        g,
-                        frequencies,
-                    )?;
-                    value_finite &= round_f16_slice(value_head);
-                }
-                if !key_finite {
-                    return Err(invalid("nonfinite values in binary16 key cache"));
-                }
-                if !value_finite {
-                    return Err(invalid("nonfinite values in binary16 value cache"));
-                }
-                Ok(())
-            })?;
+        let normalize_key_values = |key_chunk: &mut [f32], value_chunk: &mut [f32]| {
+            let mut key_finite = true;
+            let mut value_finite = true;
+            for (key_head, value_head) in key_chunk
+                .chunks_exact_mut(g.head)
+                .zip(value_chunk.chunks_exact_mut(g.head))
+            {
+                key_finite &= arithmetic.normalize_rope_round_f16_in_place(
+                    key_head,
+                    key_norm,
+                    g.epsilon,
+                    g,
+                    frequencies,
+                )?;
+                value_finite &= round_f16_slice(value_head);
+            }
+            if !key_finite {
+                return Err(invalid("nonfinite values in binary16 key cache"));
+            }
+            if !value_finite {
+                return Err(invalid("nonfinite values in binary16 value cache"));
+            }
+            Ok(())
+        };
+        let parallelism = self.projection.matvec.row_parallelism();
+        let heads_per_kv = g.heads / g.kv_heads;
+        if parallelism.workers() > 1 && g.kv_heads.is_multiple_of(parallelism.workers()) {
+            // With aligned partitions, each task owns the same query/KV heads
+            // as the two original dispatches. Defer KV errors until every query
+            // task succeeds, preserving query-first and earliest-KV-task error
+            // precedence without synchronizing successful tasks with each other.
+            // Only provisional scratch changes before complete graph publication.
+            let key_value_failure = std::sync::Mutex::new(None);
+            parallelism.update_triple_chunks(
+                query_scratch,
+                heads_per_kv * g.head,
+                key,
+                g.head,
+                value,
+                g.head,
+                |base_kv, query_chunk, key_chunk, value_chunk| {
+                    normalize_queries(base_kv * heads_per_kv, query_chunk)?;
+                    if let Err(error) = normalize_key_values(key_chunk, value_chunk) {
+                        let mut failure = key_value_failure
+                            .lock()
+                            .map_err(|_| invalid("attention preparation failure lock poisoned"))?;
+                        if failure.as_ref().is_none_or(|&(base, _)| base_kv < base) {
+                            *failure = Some((base_kv, error));
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some((_, error)) = key_value_failure
+                .into_inner()
+                .map_err(|_| invalid("attention preparation failure lock poisoned"))?
+            {
+                return Err(error);
+            }
+        } else {
+            parallelism.update_chunks(query_scratch, g.head, normalize_queries)?;
+            parallelism.update_paired_chunks(
+                key,
+                g.head,
+                value,
+                g.head,
+                |_, key_chunk, value_chunk| normalize_key_values(key_chunk, value_chunk),
+            )?;
+        }
         resize_into(g.head * g.heads, attended)?;
         let score_len = self.position + 1;
         resize_into(g.heads * score_len, scores_scratch)?;
@@ -3221,7 +3262,6 @@ impl Evaluation<'_, '_> {
         let query_ref: &[f32] = query_scratch;
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
-        let heads_per_kv = g.heads / g.kv_heads;
         // Preserve whole six-head KV groups when partitioning Swift decode.
         // Other geometries and source-order arithmetic keep their old dispatch.
         let head_unit = if matches!(arithmetic, Arithmetic::PinnedSwift)

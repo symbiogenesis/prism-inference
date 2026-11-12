@@ -435,9 +435,10 @@ pub(super) fn dot_consumption_order_prewidened(
     values: &[i8; 128],
     widened: Option<&[i16; 128]>,
     activation_sum: i32,
+    dotprod: Option<bonsai_neon_dot::Pq2Dotprod>,
 ) -> i32 {
-    if bonsai_neon_dot::has_dotprod() {
-        return bonsai_neon_dot::dot_pq2_consumption_block(packed, values, activation_sum);
+    if let Some(dotprod) = dotprod {
+        return dotprod.dot(packed, values, activation_sum);
     }
     let Some(widened) = widened else {
         return dot_consumption_order(packed, values);
@@ -494,7 +495,6 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
     input: &super::packed_pq2::Activations,
 ) -> Option<Result<[f32; 4]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let c0 = rows[0].as_chunks::<34>().0;
     let c1 = rows[1].as_chunks::<34>().0;
     let c2 = rows[2].as_chunks::<34>().0;
@@ -515,18 +515,14 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
         );
         scales_finite &= row_scales.is_finite();
         let ds = row_scales * f32x4::splat(neon, activation.scale);
-        let sums = if use_dotprod {
+        let sums = if let Some(dotprod) = input.dotprod {
             let [_, _, ref p0 @ ..] = *b0;
             let [_, _, ref p1 @ ..] = *b1;
             let [_, _, ref p2 @ ..] = *b2;
             let [_, _, ref p3 @ ..] = *b3;
             i32x4::from_slice(
                 neon,
-                &bonsai_neon_dot::dot_pq2_four_consumption_precomputed(
-                    [p0, p1, p2, p3],
-                    &activation.values,
-                    activation.sum,
-                ),
+                &dotprod.dot_four([p0, p1, p2, p3], &activation.values, activation.sum),
             )
             .to_float::<f32x4<Neon>>()
         } else {
@@ -575,7 +571,6 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
     input: &super::packed_pq2::Activations,
 ) -> Option<Result<[f32; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let chunks: [&[[u8; 34]]; 8] = rows.map(|row| row.as_chunks::<34>().0);
     let mut out_lo = f32x4::splat(neon, 0.0);
     let mut out_hi = f32x4::splat(neon, 0.0);
@@ -599,7 +594,7 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
         let act_scale = f32x4::splat(neon, activation.scale);
         let ds_lo = scales_lo * act_scale;
         let ds_hi = scales_hi * act_scale;
-        let (sums_lo, sums_hi) = if use_dotprod {
+        let (sums_lo, sums_hi) = if let Some(dotprod) = input.dotprod {
             let [_, _, ref p0 @ ..] = *blocks[0];
             let [_, _, ref p1 @ ..] = *blocks[1];
             let [_, _, ref p2 @ ..] = *blocks[2];
@@ -608,7 +603,7 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             let [_, _, ref p5 @ ..] = *blocks[5];
             let [_, _, ref p6 @ ..] = *blocks[6];
             let [_, _, ref p7 @ ..] = *blocks[7];
-            let dots = bonsai_neon_dot::dot_pq2_eight_consumption_precomputed(
+            let dots = dotprod.dot_eight(
                 [p0, p1, p2, p3, p4, p5, p6, p7],
                 &activation.values,
                 activation.sum,

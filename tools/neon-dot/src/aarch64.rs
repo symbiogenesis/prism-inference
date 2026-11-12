@@ -574,6 +574,42 @@ fn dot_pq2_eight_consumption_dotprod(
 }
 
 #[inline]
+pub(super) fn pq2_detected_dot(
+    _detected: super::Pq2Dotprod,
+    packed: &[u8; 32],
+    planes: &[i8; 128],
+    activation_sum: i32,
+) -> i32 {
+    // SAFETY: The unforgeable capability was constructed only after CPU/OS
+    // `dotprod` detection. Array references provide every required input byte.
+    unsafe { dot_pq2_consumption_dotprod(packed, planes, activation_sum) }
+}
+
+#[inline]
+pub(super) fn pq2_detected_dot_four(
+    _detected: super::Pq2Dotprod,
+    packed: [&[u8; 32]; 4],
+    planes: &[i8; 128],
+    activation_sum: i32,
+) -> [i32; 4] {
+    // SAFETY: The unforgeable capability retains verified CPU/OS `dotprod`
+    // eligibility, and all inputs are valid fixed-size array references.
+    unsafe { dot_pq2_four_consumption_dotprod(packed, planes, activation_sum) }
+}
+
+#[inline]
+pub(super) fn pq2_detected_dot_eight(
+    _detected: super::Pq2Dotprod,
+    packed: [&[u8; 32]; 8],
+    planes: &[i8; 128],
+    activation_sum: i32,
+) -> [i32; 8] {
+    // SAFETY: The unforgeable capability retains verified CPU/OS `dotprod`
+    // eligibility, and all inputs are valid fixed-size array references.
+    unsafe { dot_pq2_eight_consumption_dotprod(packed, planes, activation_sum) }
+}
+
+#[inline]
 pub(super) fn dot_pq2_eight_consumption_precomputed(
     packed: [&[u8; 32]; 8],
     planes: &[i8; 128],

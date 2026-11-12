@@ -28,6 +28,77 @@ pub fn has_dotprod() -> bool {
     }
 }
 
+/// Detected `SDOT` support reusable across packed PQ2 rows and blocks.
+///
+/// Construction checks CPU/OS eligibility once. The private field prevents safe
+/// callers from creating a capability without that check; copying it preserves
+/// the same process-wide feature eligibility as the ordinary dispatch APIs.
+#[derive(Clone, Copy, Debug)]
+pub struct Pq2Dotprod {
+    _detected: (),
+}
+
+impl Pq2Dotprod {
+    /// Detects support without enabling an optional ISA for baseline callers.
+    #[inline]
+    #[must_use]
+    pub fn detect() -> Option<Self> {
+        has_dotprod().then_some(Self { _detected: () })
+    }
+
+    /// Computes one exact unsigned-code dot minus the supplied activation sum.
+    #[inline]
+    #[must_use]
+    pub fn dot(self, packed: &[u8; 32], planes: &[i8; 128], activation_sum: i32) -> i32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot(self, packed, planes, activation_sum)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            dot_pq2_consumption_block(packed, planes, activation_sum)
+        }
+    }
+
+    /// Computes four exact dots while loading their activation planes once.
+    #[inline]
+    #[must_use]
+    pub fn dot_four(
+        self,
+        packed: [&[u8; 32]; 4],
+        planes: &[i8; 128],
+        activation_sum: i32,
+    ) -> [i32; 4] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_four(self, packed, planes, activation_sum)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| self.dot(row, planes, activation_sum))
+        }
+    }
+
+    /// Computes eight exact dots while loading their activation planes once.
+    #[inline]
+    #[must_use]
+    pub fn dot_eight(
+        self,
+        packed: [&[u8; 32]; 8],
+        planes: &[i8; 128],
+        activation_sum: i32,
+    ) -> [i32; 8] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_eight(self, packed, planes, activation_sum)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| self.dot(row, planes, activation_sum))
+        }
+    }
+}
+
 /// Returns whether the current CPU supports ARMv8.2-A `i8mm` (`SMMLA`).
 #[inline]
 #[must_use]
@@ -852,6 +923,58 @@ pub fn dot_pq2_eight_rows_eight_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x1_pq2_detected_capability_preserves_four_symbols_and_extremes() {
+        let detected = Pq2Dotprod::detect();
+        assert_eq!(detected.is_some(), has_dotprod());
+        let Some(detected) = detected else {
+            return;
+        };
+        for phase in 0..=u8::MAX {
+            let rows: [[u8; 32]; 8] = std::array::from_fn(|row| {
+                std::array::from_fn(|index| {
+                    phase
+                        .wrapping_add(row.to_le_bytes()[0].wrapping_mul(37))
+                        .wrapping_add(index.to_le_bytes()[0].wrapping_mul(73))
+                })
+            });
+            for values in [
+                [i8::MIN; 128],
+                [i8::MAX; 128],
+                std::array::from_fn(|index: usize| {
+                    i8::from_ne_bytes([phase.wrapping_add(index.to_le_bytes()[0])])
+                }),
+            ] {
+                let sum = values.iter().map(|&value| i32::from(value)).sum();
+                let expected: [i32; 8] = rows.map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(index, byte)| {
+                            (0..4)
+                                .map(|digit| {
+                                    let weight = i32::from((byte >> (digit * 2)) & 3) - 1;
+                                    weight
+                                        * i32::from(
+                                            values[index / 16 * 64 + digit * 16 + index % 16],
+                                        )
+                                })
+                                .sum::<i32>()
+                        })
+                        .sum()
+                });
+                let refs = std::array::from_fn(|row| &rows[row]);
+                assert_eq!(detected.dot_eight(refs, &values, sum), expected);
+                assert_eq!(
+                    detected.dot_four([refs[0], refs[1], refs[2], refs[3]], &values, sum),
+                    [expected[0], expected[1], expected[2], expected[3]]
+                );
+                for (row, expected) in refs.into_iter().zip(expected) {
+                    assert_eq!(detected.dot(row, &values, sum), expected);
+                }
+            }
+        }
+    }
 
     fn reference_ptq1_trits(packed: &[u8; 28]) -> [i8; 128] {
         let mut digits = [[0_u8; 5]; 26];

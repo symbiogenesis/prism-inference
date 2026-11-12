@@ -26,6 +26,14 @@ pub(super) struct Activation {
 pub(super) struct Activations {
     blocks: Vec<Activation>,
     pub(super) widened: Vec<[i16; 128]>,
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pub(super) dotprod: Option<bonsai_neon_dot::Pq2Dotprod>,
 }
 
 impl std::ops::Deref for Activations {
@@ -40,6 +48,16 @@ impl Activations {
     pub(super) fn clear(&mut self) {
         self.blocks.clear();
         self.widened.clear();
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        {
+            self.dotprod = None;
+        }
     }
 
     #[cfg(test)]
@@ -57,7 +75,15 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    let widened = !bonsai_neon_dot::has_dotprod();
+    let dotprod = bonsai_neon_dot::Pq2Dotprod::detect();
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    let widened = dotprod.is_none();
     #[cfg(not(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -66,7 +92,18 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()
         target_feature = "neon"
     )))]
     let widened = false;
-    prepare_with_layout(input, output, widened)
+    prepare_with_layout(input, output, widened)?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        output.dotprod = dotprod;
+    }
+    Ok(())
 }
 
 fn prepare_with_layout(input: &[Q8KBlock], output: &mut Activations, widened: bool) -> Result<()> {
@@ -155,6 +192,7 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &Activations) -> R
             &activation.values,
             input.widened.get(index),
             activation.sum,
+            input.dotprod,
         ));
         output = if FUSED {
             d.mul_add(sum, output)
@@ -560,6 +598,51 @@ mod native_tests {
 
     use super::{dot_eight_rows, dot_four_rows, dot_row, prepare};
     use crate::Result;
+
+    #[test]
+    fn x1_pq2_prepared_dispatch_matches_forced_baseline_and_clears_on_failure() -> Result<()> {
+        let mut input = [Q8KBlock {
+            scale: f32::from_bits(0x3eaa_aaab),
+            values: std::array::from_fn(|index| i8::from_ne_bytes([index.to_le_bytes()[0]])),
+            sums: [0; 16],
+        }];
+        let mut detected = super::Activations::default();
+        let mut baseline = super::Activations::default();
+        prepare(&input, &mut detected)?;
+        super::prepare_with_layout(&input, &mut baseline, true)?;
+        assert_eq!(detected.dotprod.is_some(), bonsai_neon_dot::has_dotprod());
+        assert!(baseline.dotprod.is_none());
+        let rows: [[u8; 68]; 8] = std::array::from_fn(|row| {
+            let mut bytes = std::array::from_fn(|index: usize| {
+                index.to_le_bytes()[0]
+                    .wrapping_mul(73)
+                    .wrapping_add(row.to_le_bytes()[0])
+            });
+            bytes[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+            bytes[34..36].copy_from_slice(&0xb787_u16.to_le_bytes());
+            bytes
+        });
+        let refs: [&[u8]; 8] = std::array::from_fn(|row| rows[row].as_slice());
+        for (pinned, expected) in [
+            (true, dot_eight_rows::<true>(refs, &baseline)?),
+            (false, dot_eight_rows::<false>(refs, &baseline)?),
+        ] {
+            let actual = if pinned {
+                dot_eight_rows::<true>(refs, &detected)?
+            } else {
+                dot_eight_rows::<false>(refs, &detected)?
+            };
+            assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+        }
+        detected.clear();
+        assert!(detected.dotprod.is_none());
+        prepare(&input, &mut detected)?;
+        input[0].scale = f32::NAN;
+        assert!(prepare(&input, &mut detected).is_err());
+        assert!(detected.is_empty());
+        assert!(detected.dotprod.is_none());
+        Ok(())
+    }
 
     #[test]
     fn x1_packed_consumption_preserves_independent_pinned_fma_rounding_control() -> Result<()> {

@@ -1,6 +1,6 @@
 [package]
 name = "prism-inference-server"
-version = "0.1.24"
+version = "0.1.25"
 edition.workspace = true
 rust-version.workspace = true
 # Unpublished Hexagon path dependencies below are retained for GitHub binaries/source checkouts.
@@ -20,7 +20,7 @@ test = true
 
 
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.24" }
+bonsai-prism-runtime = { package = "prism-inference", path = "..", version = "=0.1.25" }
 httparse = "=1.10.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

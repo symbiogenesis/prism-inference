@@ -8,7 +8,10 @@ GitHub bundles and crates.io packages are separate deliveries. The published
 registry runtime is `0.1.24`; the latest verified Windows ARM64 development
 bundle remains `0.1.23`. The [0.1.24 registry delivery](release-0.1.24.md) and
 [0.1.23 binary delivery](release-0.1.23.md) retain their separate checks and
-pending qualification. Install the registry source with the pinned nightly:
+pending qualification. The [0.1.25 registry candidate](release-0.1.25.md)
+advances every public helper and refreshes direct dependency pins; its publication
+and binary delivery remain separate pending operations. Install the published
+registry source with the pinned nightly:
 
 ```powershell
 cargo +nightly-2026-11-09 install prism-inference --version '=0.1.24' --locked

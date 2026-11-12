@@ -25,6 +25,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |
 | Capture explicit rank-one adapter correctness evidence | [Adapter correctness path](rank-one-adapter.md) |
 | Check support and remaining qualification | [Roadmap](roadmap.md) |
+| Review the prepared registry release | [0.1.25 candidate](release-0.1.25.md) |
 | Review the latest registry runtime | [0.1.24 registry delivery](release-0.1.24.md) |
 | Review the current development binary bundle | [0.1.23 delivery scope](release-0.1.23.md) |
 

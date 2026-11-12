@@ -3935,7 +3935,19 @@ mod tests {
         let mut memory = vec![0_u8; limits.allocation_bytes()];
         let pointer = memory.as_mut_ptr().cast::<c_void>();
         let full_size = u32::try_from(memory.len()).map_err(|_| Error::Contract)?;
-        assert_eq!(full_size, 20_480);
+        // Paired-chain scratch precedes the resident arena even for this single
+        // projection. Flush only prepared weights, then only the active output;
+        // neither prefix includes unused resident capacity.
+        let working_bytes = Mode::NativeQ2 { columns: 128 }.allocation_bytes(32);
+        let dirty_flush_size =
+            u32::try_from((working_bytes + weights.len()).next_multiple_of(4096))
+                .map_err(|_| Error::Contract)?;
+        let active = native_q2::layout(128, 32);
+        let warm_flush_size =
+            u32::try_from((active.output + 32 * size_of::<f32>()).next_multiple_of(4096))
+                .map_err(|_| Error::Contract)?;
+        assert!(warm_flush_size < dirty_flush_size);
+        assert!(dirty_flush_size < full_size);
         let expected = QueueBuffer {
             fd: 7,
             size: full_size,
@@ -3982,7 +3994,7 @@ mod tests {
         assert!(!session.dirty_resident_weights);
         assert_eq!(
             STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
-            8192
+            dirty_flush_size
         );
 
         output.fill(99.0);
@@ -3997,7 +4009,7 @@ mod tests {
         assert_eq!(output, [7.0_f32; 32]);
         assert_eq!(
             STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
-            4096
+            warm_flush_size
         );
         STATE.lock().map_err(|_| Error::Contract)?.bad_numeric = true;
         assert!(
@@ -4023,6 +4035,10 @@ mod tests {
             .is_err()
         );
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
+        assert_eq!(
+            &memory[working_bytes..working_bytes + weights.len()],
+            weights
+        );
         Ok(())
     }
 

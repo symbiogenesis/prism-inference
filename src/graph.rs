@@ -1,8 +1,9 @@
 //! Bounded Qwen3.5 text decoder with full attention and Gated Delta Net.
 //!
 //! The operation ordering follows Prism's `src/models/qwen35.cpp`. KV values
-//! are stored as IEEE binary16 bits; convolution and recurrent state
-//! remain binary32. This correctness path does not establish device parity.
+//! default to IEEE binary16 bits; explicit rotated profiles use packed 3/4-bit
+//! records. Convolution and recurrent state remain binary32. This correctness
+//! path does not establish device parity or approximation quality.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -32,6 +33,8 @@ pub use prefill::TiledPrefillStatistics;
 #[path = "graph/attention_preparation_tests.rs"]
 mod attention_preparation_tests;
 mod attention_six;
+mod quantized_kv;
+pub use quantized_kv::KvCachePolicy;
 mod ffn_preparation;
 #[cfg(all(test, feature = "parallel-rows"))]
 #[path = "graph/sibling_projection_tests.rs"]
@@ -1030,6 +1033,7 @@ struct KvCache {
     page_elements: usize,
     maximum: usize,
     len: usize,
+    packed: Option<Box<quantized_kv::PackedCache>>,
 }
 
 impl KvCache {
@@ -1048,6 +1052,7 @@ impl KvCache {
             page_elements: checked_product(&[width, context.min(KV_PAGE_TOKENS)])?,
             maximum,
             len: 0,
+            packed: None,
         })
     }
 
@@ -1087,6 +1092,11 @@ impl KvCache {
 
     fn append(&mut self, values: &[f32]) {
         debug_assert_eq!(values.len(), self.width);
+        if let Some(packed) = &mut self.packed {
+            packed.commit();
+            self.len += self.width;
+            return;
+        }
         append_half_bits(values, &mut self.tail);
         self.len += self.width;
         if self.tail.len() == self.page_elements || self.len == self.maximum {
@@ -1104,10 +1114,18 @@ impl KvCache {
             page_elements: self.page_elements,
             maximum: self.maximum,
             len: self.len,
+            packed: self
+                .packed
+                .as_ref()
+                .map(|cache| cache.copy().map(Box::new))
+                .transpose()?,
         })
     }
 
     fn clear(&mut self) {
+        if let Some(packed) = &mut self.packed {
+            packed.clear();
+        }
         self.pages.clear();
         self.tail.clear();
         self.len = 0;
@@ -1116,6 +1134,7 @@ impl KvCache {
     fn bytes(&self) -> usize {
         self.pages.capacity() * size_of::<Arc<Vec<u16>>>()
             + self.tail.capacity() * size_of::<u16>()
+            + self.packed.as_ref().map_or(0, |cache| cache.bytes())
             + self
                 .pages
                 .iter()
@@ -1228,7 +1247,7 @@ impl LayerState {
 enum LayerDelta {
     Full {
         // Keep the current token in reusable binary32 scratch while the graph
-        // runs; only a successful evaluation appends its rounded binary16 bits.
+        // runs; only a successful evaluation commits the selected cache record.
         key: Vec<f32>,
         value: Vec<f32>,
     },
@@ -1888,9 +1907,9 @@ pub struct Qwen35Checkpoint {
 /// One logical state component observed for full-model numerical qualification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateComponent {
-    /// One cached key token, promoted exactly from stored binary16 bits.
+    /// One cached key token, reconstructed from the selected cache precision.
     Key(usize),
-    /// One cached value token, promoted exactly from stored binary16 bits.
+    /// One cached value token, reconstructed from the selected cache precision.
     Value(usize),
     /// Channel-major convolution history, oldest value first per channel.
     Convolution,
@@ -1919,6 +1938,7 @@ pub struct Qwen35 {
     context_limit: usize,
     position: usize,
     vocabulary: usize,
+    kv_cache_policy: KvCachePolicy,
     narrow_last_layer: bool,
     tiled_prefill: Option<prefill::TiledPrefill>,
     projection_executor: Option<Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>>,
@@ -1929,7 +1949,8 @@ impl Qwen35 {
     ///
     /// The callback receives the block index and component. Recurrent and
     /// convolution slices borrow committed state directly. Each cached token
-    /// uses one reusable, fallibly allocated row to promote FP16 bits to F32.
+    /// uses bounded, fallibly allocated storage to reconstruct its selected
+    /// FP16 or rotated packed representation as F32.
     /// No observation can mutate state, and callback errors leave state intact.
     /// This supplies no state-import or portable checkpoint contract.
     ///
@@ -1944,6 +1965,17 @@ impl Qwen35 {
             match state {
                 LayerState::Full { keys, values } => {
                     for (cache, key) in [(keys, true), (values, false)] {
+                        if cache.packed.is_some() {
+                            cache.observe_packed(|position, values| {
+                                let component = if key {
+                                    StateComponent::Key(position)
+                                } else {
+                                    StateComponent::Value(position)
+                                };
+                                observer(index, component, values)
+                            })?;
+                            continue;
+                        }
                         for (position, values) in cache.tokens().enumerate() {
                             row.clear();
                             row.try_reserve_exact(values.len())?;
@@ -2020,11 +2052,44 @@ impl Qwen35 {
         adapter: RankOneAdapter,
         scale: f32,
     ) -> Result<Self> {
+        Self::with_rank_one_adapter_and_kv(
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            adapter,
+            scale,
+            KvCachePolicy::F16,
+        )
+    }
+
+    /// Constructs an adapter graph with a separately identified KV approximation.
+    ///
+    /// The standard adapter scale is preserved; changing KV precision never
+    /// changes weights, adapter factors, convolution or recurrent precision.
+    ///
+    /// # Errors
+    /// Returns ordinary adapter validation and explicit KV policy/budget errors.
+    pub fn with_rank_one_adapter_and_kv(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        adapter: RankOneAdapter,
+        scale: f32,
+        kv_cache_policy: KvCachePolicy,
+    ) -> Result<Self> {
         RankOneAdapter::validate_scale(scale)?;
         if adapter.base_identity() != model.identity {
             return Err(invalid("rank-one adapter belongs to another base model"));
         }
-        let mut graph = Self::with_state_budget(model, context_limit, state_budget_bytes, backend)?;
+        let mut graph = Self::with_state_budget_and_kv(
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            kv_cache_policy,
+        )?;
         for target in adapter.targets() {
             if target == graph.embedding.name && graph.output.name == graph.embedding.name {
                 return Err(invalid(
@@ -2118,15 +2183,39 @@ impl Qwen35 {
     /// Rejects zero budgets, budgets above [`MAX_STATE_BYTES`], a graph whose
     /// maximum live-state element payload exceeds the budget, and the same
     /// malformed model/allocation errors as [`Self::new`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep validation and graph operation order auditable together."
-    )]
     pub fn with_state_budget(
         model: Model,
         context_limit: usize,
         state_budget_bytes: usize,
         backend: MatvecBackend,
+    ) -> Result<Self> {
+        Self::with_state_budget_and_kv(
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            KvCachePolicy::F16,
+        )
+    }
+
+    /// Constructs a graph with explicit immutable KV precision and storage bounds.
+    ///
+    /// Rotated 256-channel profiles change full-attention numerics, cache bytes
+    /// and graph identity. They do not compress F32 recurrent state or qualify
+    /// quality/performance on Snapdragon X1 or X2. FP16 remains the default.
+    ///
+    /// # Errors
+    /// Rejects unsupported head dimensions and the ordinary graph/budget errors.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Validate all geometry and storage bounds before loading graph state."
+    )]
+    pub fn with_state_budget_and_kv(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        kv_cache_policy: KvCachePolicy,
     ) -> Result<Self> {
         if state_budget_bytes == 0 || state_budget_bytes > MAX_STATE_BYTES {
             return Err(invalid("invalid native live-state payload budget"));
@@ -2145,6 +2234,11 @@ impl Qwen35 {
         }
         let layer_count = block_count - mtp;
         let train_context = integer(metadata, "qwen35.context_length")?;
+        if kv_cache_policy != KvCachePolicy::F16 && context_limit > 262_144 {
+            return Err(invalid(
+                "rotated KV exceeds its declared 262144-token bound",
+            ));
+        }
         if context_limit == 0 || context_limit > train_context || context_limit > 1_048_576 {
             return Err(invalid(
                 "context limit must be positive and within the unscaled training context",
@@ -2243,20 +2337,26 @@ impl Qwen35 {
         };
         let mut state_bytes = 0_usize;
         for &recurrent in recurrent_flags.iter().take(layer_count) {
-            let elements = if recurrent {
-                checked_sum(
-                    checked_product(&[geometry.ssm_head, geometry.ssm_head, geometry.ssm_values])?,
-                    checked_product(&[geometry.convolution - 1, geometry.convolution_width()])?,
+            let bytes = if recurrent {
+                checked_product(&[
+                    checked_sum(
+                        checked_product(&[
+                            geometry.ssm_head,
+                            geometry.ssm_head,
+                            geometry.ssm_values,
+                        ])?,
+                        checked_product(&[geometry.convolution - 1, geometry.convolution_width()])?,
+                    )?,
+                    size_of::<f32>(),
+                ])?
+            } else {
+                kv_cache_policy.layer_payload_bytes(
+                    geometry.head,
+                    geometry.kv_heads,
+                    context_limit,
                 )?
-            } else {
-                checked_product(&[2, geometry.head, geometry.kv_heads, context_limit])?
             };
-            let element_bytes = if recurrent {
-                size_of::<f32>()
-            } else {
-                size_of::<u16>()
-            };
-            state_bytes = checked_sum(state_bytes, checked_product(&[elements, element_bytes])?)?;
+            state_bytes = checked_sum(state_bytes, bytes)?;
         }
         if state_bytes > state_budget_bytes {
             return Err(invalid(
@@ -2403,8 +2503,20 @@ impl Qwen35 {
         for layer in &layers {
             state.push(match &layer.attention {
                 Attention::Full(_) => LayerState::Full {
-                    keys: KvCache::new(geometry.head * geometry.kv_heads, context_limit)?,
-                    values: KvCache::new(geometry.head * geometry.kv_heads, context_limit)?,
+                    keys: KvCache::with_policy(
+                        geometry.head * geometry.kv_heads,
+                        context_limit,
+                        kv_cache_policy,
+                        true,
+                        backend == MatvecBackend::Scalar,
+                    )?,
+                    values: KvCache::with_policy(
+                        geometry.head * geometry.kv_heads,
+                        context_limit,
+                        kv_cache_policy,
+                        false,
+                        backend == MatvecBackend::Scalar,
+                    )?,
                 },
                 Attention::Recurrent(_) => LayerState::Recurrent {
                     convolution: zeros((geometry.convolution - 1) * geometry.convolution_width())?,
@@ -2430,7 +2542,15 @@ impl Qwen35 {
         } else {
             QWEN35_GRAPH_CONTRACT
         };
-        let identity = model.identity + ":" + contract;
+        let contract = if kv_cache_policy == KvCachePolicy::F16 {
+            contract.to_owned()
+        } else {
+            contract.replace(
+                "kv-f16",
+                &format!("kv-{}-d256-rht3-v1", kv_cache_policy.name()),
+            )
+        };
+        let identity = model.identity + ":" + &contract;
         Ok(Self {
             provenance: Arc::new(()),
             identity,
@@ -2459,6 +2579,7 @@ impl Qwen35 {
             context_limit,
             position: 0,
             vocabulary,
+            kv_cache_policy,
             narrow_last_layer: layer_count >= 4,
             tiled_prefill: None,
             projection_executor: None,
@@ -2473,6 +2594,12 @@ impl Qwen35 {
     #[must_use]
     pub const fn requested_backend(&self) -> MatvecBackend {
         self.workspace.projection.matvec.requested_backend()
+    }
+
+    /// Immutable cache precision sealed into this decoder's checkpoint identity.
+    #[must_use]
+    pub const fn kv_cache_policy(&self) -> KvCachePolicy {
+        self.kv_cache_policy
     }
 
     /// Sets explicit packed-base-projection row scheduling for subsequent tokens.
@@ -2780,10 +2907,12 @@ impl Qwen35 {
         }
         // Reserve every append before changing numerical state. Deltas retain
         // their allocations across tokens but never alias checkpoint storage.
-        for state in &mut self.state {
-            if let LayerState::Full { keys, values } = state {
-                keys.reserve_append()?;
-                values.reserve_append()?;
+        for (state, delta) in self.state.iter_mut().zip(deltas.iter()) {
+            if let (LayerState::Full { keys, values }, LayerDelta::Full { key, value }) =
+                (state, delta)
+            {
+                keys.prepare_append(key)?;
+                values.prepare_append(value)?;
             }
         }
         for (state, delta) in self.state.iter_mut().zip(deltas.iter_mut()) {
@@ -3311,6 +3440,21 @@ impl Evaluation<'_, '_> {
         let query_ref: &[f32] = query_scratch;
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
+        if keys.packed.is_some() || values.packed.is_some() {
+            return quantized_kv::attend(
+                keys,
+                values,
+                query_ref,
+                projected,
+                key_ref,
+                value_ref,
+                attended,
+                scores_scratch,
+                g.heads,
+                scale,
+                arithmetic,
+            );
+        }
         // Preserve whole six-head KV groups when partitioning Swift decode.
         // Other geometries and source-order arithmetic keep their old dispatch.
         let head_unit = if matches!(arithmetic, Arithmetic::PinnedSwift)

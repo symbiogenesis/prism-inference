@@ -220,6 +220,9 @@ impl Qwen35 {
     /// Rejects nonempty/already-configured graphs, unsupported sizes, insufficient
     /// reservation and failed allocation before changing selection or identity.
     pub fn with_tiled_prefill(mut self, tokens: usize, scratch_bytes: usize) -> Result<Self> {
+        if self.kv_cache_policy != super::KvCachePolicy::F16 {
+            return Err(invalid("tiled prefill is not qualified for rotated KV"));
+        }
         let required = self.tiled_prefill_scratch_bytes(tokens)?;
         if self.position != 0 || self.tiled_prefill.is_some() || scratch_bytes < required {
             return Err(invalid(

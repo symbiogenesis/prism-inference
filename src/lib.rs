@@ -18,6 +18,7 @@ pub mod graph;
 #[cfg(feature = "cli")]
 pub mod jinja;
 pub mod kernels;
+pub mod kv_quant;
 pub mod logging;
 pub mod media;
 pub mod model;

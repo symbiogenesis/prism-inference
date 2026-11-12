@@ -1,0 +1,384 @@
+//! Explicit lossy, packed 256-channel KV storage for Snapdragon CPU evaluation.
+//!
+//! The codec is independent of model-weight packing. Only full-attention K/V
+//! change; recurrent/convolution state and checkpoint ownership stay exact.
+
+use super::{KvCache, checked_product, checked_sum};
+use crate::kv_quant::{Bits, HEAD_DIM, Quantizer};
+use crate::{Result, invalid};
+use std::sync::Arc;
+
+#[cfg(test)]
+#[path = "quantized_kv_tests.rs"]
+mod tests;
+
+/// Immutable full-attention cache precision selected before graph construction.
+///
+/// Rotated profiles are experimental approximations, not FP16-equivalent paths.
+/// Both Snapdragon X1 Elite and X2 Elite Extreme use the same portable/NEON
+/// contract; selection does not claim measured device benefit or quality.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KvCachePolicy {
+    /// Existing exact binary16 cache and attention contract.
+    #[default]
+    F16,
+    /// Four-bit rotated scalar keys and values, with one F32 scale per head.
+    Rotated4,
+    /// Four-bit keys and three-bit values, with one F32 scale per head.
+    Rotated4Keys3Values,
+}
+
+impl KvCachePolicy {
+    /// Stable configuration name, independent of CPU dispatch and model packing.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Rotated4 => "rsq4",
+            Self::Rotated4Keys3Values => "rsq4k3v",
+        }
+    }
+
+    /// Conservative packed K/V element payload for one layer at full context.
+    ///
+    /// Includes F32 vector scales. Page tables, codec state, scratch and allocator
+    /// overhead remain separate; this is not a process-memory projection.
+    ///
+    /// # Errors
+    /// Rejects unsupported dimensions, zero geometry and arithmetic overflow.
+    pub fn layer_payload_bytes(self, head: usize, heads: usize, context: usize) -> Result<usize> {
+        if head == 0 || heads == 0 || context == 0 {
+            return Err(invalid("invalid KV payload geometry"));
+        }
+        let record = if self == Self::F16 {
+            checked_product(&[2, head, size_of::<u16>()])?
+        } else {
+            if head != HEAD_DIM {
+                return Err(invalid("rotated KV requires 256-channel heads"));
+            }
+            let (key, value) = self.bits().ok_or_else(|| invalid("missing KV precision"))?;
+            checked_sum(
+                Quantizer::new(key, KEY_SEED).encoded_len(),
+                Quantizer::new(value, VALUE_SEED).encoded_len(),
+            )?
+        };
+        checked_product(&[record, heads, context])
+    }
+
+    const fn bits(self) -> Option<(Bits, Bits)> {
+        match self {
+            Self::F16 => None,
+            Self::Rotated4 => Some((Bits::Four, Bits::Four)),
+            Self::Rotated4Keys3Values => Some((Bits::Four, Bits::Three)),
+        }
+    }
+}
+
+// Fixed, distinct transforms prevent accidental key/value basis reuse. They are
+// numerical profile identities, unrelated to the sampler's request seed.
+const KEY_SEED: u64 = 0x5357_4946_544b_5631;
+const VALUE_SEED: u64 = 0x5357_4946_5456_5631;
+
+pub(super) struct PackedCache {
+    pages: Vec<Arc<Vec<u8>>>,
+    tail: Vec<u8>,
+    prepared: Vec<u8>,
+    quantizer: Quantizer,
+    heads: usize,
+    row_bytes: usize,
+    page_bytes: usize,
+    maximum: usize,
+    len: usize,
+}
+
+impl PackedCache {
+    fn new(width: usize, context: usize, bits: Bits, seed: u64, scalar: bool) -> Result<Self> {
+        if !width.is_multiple_of(HEAD_DIM) || width == 0 || context == 0 {
+            return Err(invalid("invalid packed KV geometry"));
+        }
+        let quantizer = if scalar {
+            Quantizer::scalar(bits, seed)
+        } else {
+            Quantizer::new(bits, seed)
+        };
+        let heads = width / HEAD_DIM;
+        let row_bytes = checked_product(&[heads, quantizer.encoded_len()])?;
+        Ok(Self {
+            pages: Vec::new(),
+            tail: Vec::new(),
+            prepared: Vec::new(),
+            quantizer,
+            heads,
+            row_bytes,
+            page_bytes: checked_product(&[row_bytes, context.min(super::KV_PAGE_TOKENS)])?,
+            maximum: checked_product(&[row_bytes, context])?,
+            len: 0,
+        })
+    }
+
+    fn prepare(&mut self, values: &[f32]) -> Result<()> {
+        if values.len() != self.heads * HEAD_DIM {
+            return Err(invalid("packed KV row width mismatch"));
+        }
+        self.reserve()?;
+        resize_bytes(self.row_bytes, &mut self.prepared)?;
+        for (head, output) in values
+            .as_chunks::<HEAD_DIM>()
+            .0
+            .iter()
+            .zip(self.prepared.chunks_exact_mut(self.quantizer.encoded_len()))
+        {
+            self.quantizer.encode(head, output)?;
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self) -> Result<()> {
+        let next = checked_sum(self.len, self.row_bytes)?;
+        if next > self.maximum {
+            return Err(invalid("packed KV append exceeds context bound"));
+        }
+        let required = checked_sum(self.tail.len(), self.row_bytes)?;
+        let remaining = self.maximum - (self.len - self.tail.len());
+        let limit = self.page_bytes.min(remaining);
+        if required > self.tail.capacity() {
+            let target = self
+                .tail
+                .capacity()
+                .saturating_mul(2)
+                .min(limit)
+                .max(required);
+            self.tail.try_reserve_exact(target - self.tail.len())?;
+        }
+        if required == self.page_bytes || next == self.maximum {
+            self.pages.try_reserve_exact(1)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit(&mut self) {
+        debug_assert_eq!(self.prepared.len(), self.row_bytes);
+        self.tail.extend_from_slice(&self.prepared);
+        self.len += self.row_bytes;
+        if self.tail.len() == self.page_bytes || self.len == self.maximum {
+            self.pages.push(Arc::new(std::mem::take(&mut self.tail)));
+        }
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &[u8]> {
+        self.pages
+            .iter()
+            .flat_map(|page| page.chunks_exact(self.row_bytes))
+            .chain(self.tail.chunks_exact(self.row_bytes))
+    }
+
+    fn record<'a>(&self, row: &'a [u8], head: usize) -> &'a [u8] {
+        let width = self.quantizer.encoded_len();
+        &row[head * width..(head + 1) * width]
+    }
+
+    pub(super) fn copy(&self) -> Result<Self> {
+        let mut pages = super::capacity(self.pages.len())?;
+        pages.extend(self.pages.iter().map(Arc::clone));
+        Ok(Self {
+            pages,
+            tail: super::copy_values(&self.tail)?,
+            prepared: Vec::new(),
+            quantizer: self.quantizer.clone(),
+            heads: self.heads,
+            row_bytes: self.row_bytes,
+            page_bytes: self.page_bytes,
+            maximum: self.maximum,
+            len: self.len,
+        })
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.pages.clear();
+        self.tail.clear();
+        self.prepared.clear();
+        self.len = 0;
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.pages.capacity() * size_of::<Arc<Vec<u8>>>()
+            + self.tail.capacity()
+            + self.prepared.capacity()
+            + self
+                .pages
+                .iter()
+                .map(|page| page.capacity() + size_of::<Vec<u8>>() + 2 * size_of::<usize>())
+                .sum::<usize>()
+    }
+}
+
+impl KvCache {
+    pub(super) fn with_policy(
+        width: usize,
+        context: usize,
+        policy: KvCachePolicy,
+        key: bool,
+        scalar: bool,
+    ) -> Result<Self> {
+        let Some((key_bits, value_bits)) = policy.bits() else {
+            return Self::new(width, context);
+        };
+        let mut cache = Self::new(width, context)?;
+        cache.packed = Some(Box::new(PackedCache::new(
+            width,
+            context,
+            if key { key_bits } else { value_bits },
+            if key { KEY_SEED } else { VALUE_SEED },
+            scalar,
+        )?));
+        Ok(cache)
+    }
+
+    pub(super) fn prepare_append(&mut self, values: &[f32]) -> Result<()> {
+        if let Some(packed) = &mut self.packed {
+            packed.prepare(values)
+        } else {
+            self.reserve_append()
+        }
+    }
+
+    pub(super) fn observe_packed(
+        &self,
+        mut observer: impl FnMut(usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let packed = self
+            .packed
+            .as_ref()
+            .ok_or_else(|| invalid("missing packed KV"))?;
+        let mut row = super::zeros(self.width)?;
+        for (position, bytes) in packed.rows().enumerate() {
+            for head in 0..packed.heads {
+                let mut decoded = [0.0; HEAD_DIM];
+                packed
+                    .quantizer
+                    .decode(packed.record(bytes, head), &mut decoded)?;
+                row[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&decoded);
+            }
+            observer(position, &row)?;
+        }
+        Ok(())
+    }
+}
+
+/// Stream packed history directly: query rotation once, cache-sized scores only,
+/// and one bounded rotated value accumulator per query head. Never expands a
+/// context-sized FP16/F32 key or value buffer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrow immutable history and provisional current projections separately."
+)]
+pub(super) fn attend(
+    keys: &KvCache,
+    values: &KvCache,
+    queries: &[f32],
+    projected: &[f32],
+    current_key: &[f32],
+    current_value: &[f32],
+    attended: &mut [f32],
+    scores: &mut [f32],
+    heads: usize,
+    scale: f32,
+    arithmetic: super::Arithmetic,
+) -> Result<()> {
+    let key_cache = keys
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("missing packed keys"))?;
+    let value_cache = values
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("missing packed values"))?;
+    let tokens = keys.len / keys.width;
+    let stride = checked_sum(tokens, 1)?;
+    if heads == 0
+        || !heads.is_multiple_of(key_cache.heads)
+        || key_cache.heads != value_cache.heads
+        || keys.len != values.len
+        || queries.len() != heads * HEAD_DIM
+        || attended.len() != queries.len()
+        || projected.len() != 2 * queries.len()
+        || scores.len() != heads * stride
+        || current_key.len() != keys.width
+        || current_value.len() != values.width
+    {
+        return Err(invalid("invalid packed attention geometry"));
+    }
+    let mut key_records = Vec::new();
+    let mut value_records = Vec::new();
+    resize_bytes(key_cache.row_bytes, &mut key_records)?;
+    resize_bytes(value_cache.row_bytes, &mut value_records)?;
+    for ((key, output), (value, value_output)) in current_key
+        .as_chunks::<HEAD_DIM>()
+        .0
+        .iter()
+        .zip(key_records.chunks_exact_mut(key_cache.quantizer.encoded_len()))
+        .zip(
+            current_value
+                .as_chunks::<HEAD_DIM>()
+                .0
+                .iter()
+                .zip(value_records.chunks_exact_mut(value_cache.quantizer.encoded_len())),
+        )
+    {
+        key_cache.quantizer.encode(key, output)?;
+        value_cache.quantizer.encode(value, value_output)?;
+    }
+    for head in 0..heads {
+        let kv_head = head / (heads / key_cache.heads);
+        let mut query = [0.0; HEAD_DIM];
+        key_cache
+            .quantizer
+            .rotate(&queries[head * HEAD_DIM..(head + 1) * HEAD_DIM], &mut query)?;
+        let probabilities = &mut scores[head * stride..(head + 1) * stride];
+        for (score, row) in probabilities.iter_mut().zip(
+            key_cache
+                .rows()
+                .chain(std::iter::once(key_records.as_slice())),
+        ) {
+            *score = key_cache
+                .quantizer
+                .score(&query, key_cache.record(row, kv_head))?
+                * scale;
+        }
+        match arithmetic {
+            super::Arithmetic::Source => crate::kernels::softmax_round_f16(probabilities)?,
+            super::Arithmetic::PinnedSwift => {
+                crate::kernels::pinned_attention::softmax_rotated_kv(probabilities)?;
+            }
+        }
+        let mut output = [0.0; HEAD_DIM];
+        for (&weight, row) in probabilities.iter().zip(
+            value_cache
+                .rows()
+                .chain(std::iter::once(value_records.as_slice())),
+        ) {
+            value_cache.quantizer.accumulate(
+                value_cache.record(row, kv_head),
+                weight,
+                &mut output,
+            )?;
+        }
+        value_cache.quantizer.inverse(&mut output)?;
+        super::mul_sigmoid_in_place(
+            &mut output,
+            super::attention_gate(projected, head, HEAD_DIM),
+        );
+        super::finite(&output, "packed attention output")?;
+        attended[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&output);
+    }
+    Ok(())
+}
+
+fn resize_bytes(count: usize, output: &mut Vec<u8>) -> Result<()> {
+    if count > output.len() {
+        output.try_reserve_exact(count - output.len())?;
+    }
+    output.resize(count, 0);
+    Ok(())
+}

@@ -259,6 +259,10 @@ fn mode_options(values: &mut BTreeMap<String, String>) -> Result<Mode> {
     Ok(mode)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Validate artifact, resource and immutable numerical policy before accepting input."
+)]
 fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
     let mut values = option_values(arguments)?;
     let mode = mode_options(&mut values)?;

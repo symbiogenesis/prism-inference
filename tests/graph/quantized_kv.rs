@@ -155,13 +155,13 @@ fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Resul
 
         let base = profile_fixture();
         let factors = rank_one_factors(&base, &["blk.0.attn_output.weight"], 0.125);
-        let adapter = RankOneAdapter::from_model(factors, &base)?;
+        let correction = RankOneAdapter::from_model(factors, &base)?;
         let mut adapted = Qwen35::with_rank_one_adapter_and_kv(
             base,
             CONTEXT,
             BUDGET,
             MatvecBackend::Scalar,
-            adapter,
+            correction,
             1.3,
             policy,
         )?;
@@ -298,7 +298,7 @@ fn rotated_kv_late_logit_failure_preserves_committed_full_and_recurrent_state() 
         let checkpoint = actual.checkpoint()?;
         let mut logits = vec![1.0];
         assert!(actual.evaluate_into(1, &mut logits).is_err());
-        assert!(logits.is_empty());
+        assert_eq!(logits, Vec::<f32>::new());
         assert_eq!(graph_bits(&actual)?, before);
         actual.restore(&checkpoint)?;
         actual.evaluate(0)?;
@@ -364,7 +364,7 @@ fn rotated_kv_runtime_delivery_and_cancellation_roll_back_across_page_seal() -> 
         runtime.generate(&changed, &stop, &Cancellation::default(), |_| Ok(()))?;
         assert_eq!(runtime.tokens(), changed);
         runtime.reset()?;
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens(), [0_u32; 0]);
         assert_eq!(
             graph_bits(runtime.decoder())?,
             graph_bits(&graph(policy, MatvecBackend::Scalar)?)?

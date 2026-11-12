@@ -927,8 +927,11 @@ pub(crate) fn dot(mut values: impl Iterator<Item = f32>, weights: &[f32]) -> Res
     clippy::as_conversions,
     reason = "Match the native binary64 reciprocal rounded once to binary32."
 )]
-fn softmax_with_rounding<const ROUND_F16: bool>(scores: &mut [f32]) -> Result<()> {
-    if scores.is_empty() || scores.len() > crate::model::swift::CONTEXT_TOKENS {
+fn softmax_with_rounding<const ROUND_F16: bool>(
+    scores: &mut [f32],
+    maximum_tokens: usize,
+) -> Result<()> {
+    if scores.is_empty() || scores.len() > maximum_tokens {
         return Err(invalid("invalid pinned attention softmax row"));
     }
     #[cfg(all(
@@ -1039,7 +1042,7 @@ fn softmax_with_rounding<const ROUND_F16: bool>(scores: &mut [f32]) -> Result<()
 /// Rejects empty, oversized or nonfinite input before mutation.
 #[cfg(test)]
 pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
-    softmax_with_rounding::<false>(scores)
+    softmax_with_rounding::<false>(scores, crate::model::swift::CONTEXT_TOKENS)
 }
 
 /// Normalizes a causal attention score slice with the pinned Windows ARM64 softmax contract
@@ -1048,7 +1051,12 @@ pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
 /// # Errors
 /// Rejects empty, oversized or nonfinite input before mutation.
 pub(crate) fn softmax_round_f16(scores: &mut [f32]) -> Result<()> {
-    softmax_with_rounding::<true>(scores)
+    softmax_with_rounding::<true>(scores, crate::model::swift::CONTEXT_TOKENS)
+}
+
+/// Same pinned arithmetic with the separate rotated-KV profile's context bound.
+pub(crate) fn softmax_rotated_kv(scores: &mut [f32]) -> Result<()> {
+    softmax_with_rounding::<true>(scores, 262_144)
 }
 
 /// Retains the pinned out-of-place operator oracle for focused comparisons.

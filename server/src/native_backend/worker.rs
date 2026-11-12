@@ -2,6 +2,7 @@
 
 use super::{NativeBackendError, PendingChat, profile::ModelProfile};
 use bonsai_prism_runtime::{
+    graph::KvCachePolicy,
     runtime::{Cancellation, Completion},
     swift_session::{SwiftSession, TextEvent},
 };
@@ -47,6 +48,9 @@ impl Engine for SwiftSession {
             adapter: self.adapter_identity().is_some(),
             prompt_reuse: self.prompt_reuse(),
             row_workers: self.row_workers(),
+            kv_cache: self.kv_cache_policy(),
+            startup_graph_identity: (self.kv_cache_policy() != KvCachePolicy::F16)
+                .then(|| Arc::from(self.decoder_identity())),
         })
     }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
@@ -499,7 +503,13 @@ impl Drop for Settlement<'_> {
 impl Worker {
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
         let profile = engine.profile()?;
-        if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers) {
+        if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
+            || match (profile.kv_cache, profile.startup_graph_identity.as_deref()) {
+                (KvCachePolicy::F16, None) => false,
+                (KvCachePolicy::F16, Some(_)) | (_, None) => true,
+                (_, Some(identity)) => identity.is_empty() || identity.len() > 4096,
+            }
+        {
             return Err(NativeBackendError::Configuration);
         }
         let (commands, receive) = mpsc::sync_channel::<Command>(1);

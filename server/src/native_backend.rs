@@ -147,7 +147,7 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     worker: &mut Worker,
     deadline: Instant,
 ) -> Result<(), NativeBackendError> {
-    let received = match receive(&mut client, policy, worker.profile, deadline).await {
+    let received = match receive(&mut client, policy, &worker.profile, deadline).await {
         Ok(value) => value,
         Err(error) => {
             let status = if error == NativeBackendError::Unauthorized {
@@ -326,7 +326,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
 async fn receive<C: AsyncRead + Unpin>(
     client: &mut C,
     policy: &RequestPolicy,
-    profile: ModelProfile,
+    profile: &ModelProfile,
     deadline: Instant,
 ) -> Result<Received, NativeBackendError> {
     let start = Instant::now();
@@ -484,12 +484,12 @@ struct PrivateBody<'a, 'b> {
 
 #[cfg(test)]
 fn canonical(bytes: &[u8]) -> Result<PendingChat, NativeBackendError> {
-    canonical_for_profile(bytes, ModelProfile::default())
+    canonical_for_profile(bytes, &ModelProfile::default())
 }
 
 fn canonical_for_profile(
     bytes: &[u8],
-    profile: ModelProfile,
+    profile: &ModelProfile,
 ) -> Result<PendingChat, NativeBackendError> {
     if bytes.len() > MAX_BODY_BYTES {
         return Err(NativeBackendError::Schema);

@@ -2,8 +2,8 @@
 //! Explicit token and plain-text driver for the unqualified CPU reference engine.
 
 use bonsai_prism_runtime::{
-    MAX_PREFILL_BLOCK_TOKENS, Result,
-    graph::{MAX_STATE_BYTES, Qwen35},
+    Decoder, MAX_PREFILL_BLOCK_TOKENS, Result,
+    graph::{KvCachePolicy, MAX_STATE_BYTES, Qwen35},
     kernels::{MatvecBackend, MatvecDiagnostics, MatvecFallbackReason, MatvecStatistics},
     model::{Model, ModelMetadata},
     prompt_input::read_prompt,
@@ -42,6 +42,7 @@ Usage: prism-inference --model <absolute-gguf-path> --bytes <u64>\n\
   [--stop-tokens <id,id,...>] [--backend <auto|scalar|neon>]\n\
   [--timeout-seconds <1..3600>] [--output <tokens|text>]\n\
   [--state-bytes <usize>]\n\
+  [--kv-cache <f16|rsq4|rsq4k3v>]\n\
   [--prefill-block-tokens <1..256>]\n\
   [--sampling <greedy|reference>] [--seed <u64>]\n\
   [--temperature <positive-f32>] [--top-k <0..1048576>] [--top-p <0..1>]\n\
@@ -49,11 +50,13 @@ Mode defaults to generate, which requires checkpoint-bytes and positive max-toke
 Tokenize verifies the artifact and bounded metadata without loading weights or\n\
 constructing a graph, then emits one JSON record with exact input IDs and count.\n\
 Its optional max-tokens reserves context for output (default zero); generation-only\n\
-checkpoint, stop, backend, timeout, output, state, prefill and sampling options reject.\n\
+checkpoint, stop, backend, timeout, output, state, KV-cache, prefill and sampling options reject.\n\
 The memory budget covers retained metadata only in tokenize mode; tokenizer\n\
 storage and input/output obey their separate fixed resource bounds.\n\
 State budget defaults to 4 GiB for live KV/recurrent element payload only;\n\
 model storage, graph scratch, checkpoints and allocator overhead are separate.\n\
+KV cache defaults to f16. Rotated rsq4/rsq4k3v profiles are experimental and\n\
+require 256-channel full-attention heads; output records identify the selected graph.\n\
 Timeout covers generation after loading. Checks are cooperative between operations;\n\
 streamed tokens are provisional until the final completion record.\n\
 Backend defaults to auto. NEON requires the experimental-neon feature and\n\
@@ -88,6 +91,7 @@ struct Arguments {
     context: usize,
     checkpoint_bytes: usize,
     state_bytes: usize,
+    kv_cache: KvCachePolicy,
     generation: Generation,
     tokens: Vec<u32>,
     prompt: Option<String>,
@@ -202,6 +206,7 @@ fn option_values(arguments: impl IntoIterator<Item = String>) -> Result<BTreeMap
                 | "--backend"
                 | "--timeout-seconds"
                 | "--state-bytes"
+                | "--kv-cache"
                 | "--prefill-block-tokens"
                 | "--output"
                 | "--sampling"
@@ -236,6 +241,7 @@ fn mode_options(values: &mut BTreeMap<String, String>) -> Result<Mode> {
             "--timeout-seconds",
             "--output",
             "--state-bytes",
+            "--kv-cache",
             "--prefill-block-tokens",
             "--sampling",
             "--seed",
@@ -309,6 +315,12 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
     if state_bytes == 0 || state_bytes > MAX_STATE_BYTES {
         return Err(bad("invalid native live-state payload budget"));
     }
+    let kv_cache = match values.remove("--kv-cache").as_deref().unwrap_or("f16") {
+        "f16" => KvCachePolicy::F16,
+        "rsq4" => KvCachePolicy::Rotated4,
+        "rsq4k3v" => KvCachePolicy::Rotated4Keys3Values,
+        _ => return Err(bad("KV cache must be f16, rsq4 or rsq4k3v")),
+    };
     let backend = match values.remove("--backend").as_deref().unwrap_or("auto") {
         "auto" => MatvecBackend::Auto,
         "scalar" => MatvecBackend::Scalar,
@@ -343,6 +355,7 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
         context,
         checkpoint_bytes,
         state_bytes,
+        kv_cache,
         generation: Generation {
             max_tokens,
             stop_tokens,
@@ -579,11 +592,12 @@ fn load_decoder(arguments: &Arguments) -> Result<Loaded> {
         .text_output
         .then(|| Vocabulary::from_metadata(&model.metadata, vocab_size))
         .transpose()?;
-    let decoder = Qwen35::with_state_budget(
+    let decoder = Qwen35::with_state_budget_and_kv(
         model,
         arguments.context,
         arguments.state_bytes,
         arguments.backend,
+        arguments.kv_cache,
     )?;
     Ok(Loaded {
         decoder,
@@ -668,6 +682,8 @@ fn execute(arguments: &Arguments) -> Result<()> {
         "reused_tokens": result.reused_tokens,
         "backend_requested": backend_requested,
         "state_budget_bytes": arguments.state_bytes,
+        "kv_cache": arguments.kv_cache.name(),
+        "graph_identity": runtime.decoder().identity(),
         "prefill_block_tokens": arguments.prefill.block_tokens,
         "stop_tokens": generation.stop_tokens,
         "sampling": arguments.sampling.record(),
@@ -845,8 +861,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, InsertSpecial, MAX_STATE_BYTES, MatvecBackend, Mode, Result, SamplingMode,
-        SpecialInputPolicy, bad, parse,
+        Duration, InsertSpecial, KvCachePolicy, MAX_STATE_BYTES, MatvecBackend, Mode, Result,
+        SamplingMode, SpecialInputPolicy, bad, parse,
     };
 
     fn arguments() -> Vec<String> {
@@ -898,6 +914,7 @@ mod tests {
     fn cli_prompt_file_options_reject_before_reading_stdin() -> Result<()> {
         for pair in [
             ("--backend", "invalid"),
+            ("--kv-cache", "invalid"),
             ("--insert-special", "invalid"),
             ("--special-input", "invalid"),
             ("--prompt", "private prompt sentinel"),
@@ -920,6 +937,7 @@ mod tests {
     fn cli_token_file_options_reject_before_reading_stdin() -> Result<()> {
         for pair in [
             ("--backend", "invalid"),
+            ("--kv-cache", "invalid"),
             ("--insert-special", "none"),
             ("--insert-special", "model"),
             ("--special-input", "literal"),
@@ -994,6 +1012,9 @@ mod tests {
             ("--timeout-seconds", "1"),
             ("--output", "tokens"),
             ("--state-bytes", "4096"),
+            ("--kv-cache", "f16"),
+            ("--kv-cache", "rsq4"),
+            ("--kv-cache", "rsq4k3v"),
             ("--prefill-block-tokens", "1"),
             ("--sampling", "greedy"),
             ("--seed", "0"),
@@ -1006,6 +1027,28 @@ mod tests {
             input.extend([key, value].map(str::to_owned));
             assert!(parse(input).is_err(), "accepted incompatible {key}");
         }
+    }
+
+    #[test]
+    fn cli_kv_cache_policy_is_explicit_and_rejects_unknown_or_repeated_modes() -> Result<()> {
+        assert_eq!(parse(arguments())?.kv_cache, KvCachePolicy::F16);
+        for (name, expected) in [
+            ("f16", KvCachePolicy::F16),
+            ("rsq4", KvCachePolicy::Rotated4),
+            ("rsq4k3v", KvCachePolicy::Rotated4Keys3Values),
+        ] {
+            let mut input = arguments();
+            input.extend(["--kv-cache", name].map(str::to_owned));
+            assert_eq!(parse(input.clone())?.kv_cache, expected);
+            input.extend(["--kv-cache", name].map(str::to_owned));
+            assert!(parse(input).is_err());
+        }
+        for name in ["", "F16", "q4_0", "turboquant", "rsq3", "rsq4 "] {
+            let mut input = arguments();
+            input.extend(["--kv-cache", name].map(str::to_owned));
+            assert!(parse(input).is_err());
+        }
+        Ok(())
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Exact immutable identities for the explicitly selected private service profile.
 
 use bonsai_prism_runtime::{
+    graph::KvCachePolicy,
     model::{
         lora::SWIFT_ADAPTER_SHA256,
         swift::{self, Representation},
@@ -8,13 +9,16 @@ use bonsai_prism_runtime::{
     runtime::PromptReuse,
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ModelProfile {
     pub representation: Representation,
     pub adapter: bool,
     pub prompt_reuse: PromptReuse,
     pub row_workers: usize,
+    pub kv_cache: KvCachePolicy,
+    pub startup_graph_identity: Option<Arc<str>>,
 }
 
 impl Default for ModelProfile {
@@ -24,12 +28,14 @@ impl Default for ModelProfile {
             adapter: false,
             prompt_reuse: PromptReuse::default(),
             row_workers: 1,
+            kv_cache: KvCachePolicy::F16,
+            startup_graph_identity: None,
         }
     }
 }
 
 impl ModelProfile {
-    pub(super) fn readiness(self, seed: u32) -> Value {
+    pub(super) fn readiness(&self, seed: u32) -> Value {
         let mut model = json!({
             "id": match self.representation {
                 Representation::Pq2 => "Swift-Bonsai-2-PQ2_0",
@@ -50,6 +56,12 @@ impl ModelProfile {
         }
         if self.prompt_reuse == PromptReuse::Latest {
             model["prompt_reuse"] = json!("latest");
+        }
+        if self.kv_cache != KvCachePolicy::F16 {
+            model["kv_cache"] = json!(self.kv_cache.name());
+            // Adapter scales may change between requests. This records the
+            // actual startup graph, never a claim about its current scale.
+            model["startup_graph_identity"] = json!(self.startup_graph_identity.as_deref());
         }
         json!({"data": [model]})
     }

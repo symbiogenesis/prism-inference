@@ -94,6 +94,8 @@ struct Observation {
     terminated: Arc<AtomicBool>,
     row_workers: Option<usize>,
     prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse,
+    kv_cache: Option<bonsai_prism_runtime::graph::KvCachePolicy>,
+    startup_graph_identity: Option<Arc<str>>,
     preparation_rejection: Option<(usize, Rejection)>,
 }
 struct FakeEngine(Observation);
@@ -110,6 +112,11 @@ impl worker::Engine for FakeEngine {
         Ok(ModelProfile {
             row_workers: self.0.row_workers.unwrap_or(1),
             prompt_reuse: self.0.prompt_reuse,
+            kv_cache: self
+                .0
+                .kv_cache
+                .unwrap_or(bonsai_prism_runtime::graph::KvCachePolicy::F16),
+            startup_graph_identity: self.0.startup_graph_identity.clone(),
             ..ModelProfile::default()
         })
     }
@@ -375,7 +382,7 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
         };
         let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
         let mut value: Value = serde_json::from_slice(&original)?;
-        assert!(canonical_for_profile(&original, profile).is_err());
+        assert!(canonical_for_profile(&original, &profile).is_err());
         for invalid in [
             Value::Null,
             json!([]),
@@ -388,13 +395,13 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
             json!([{"id":0,"scale":1.3},{"id":0,"scale":1.3}]),
         ] {
             value["lora"] = invalid;
-            assert!(canonical_for_profile(&serde_json::to_vec(&value)?, profile).is_err());
+            assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &profile).is_err());
         }
         for scale in [0.0_f64, -0.0, 1.3, 2.0] {
             value["lora"] = json!([{"id":0,"scale":scale}]);
             let bytes = serde_json::to_vec(&value)?;
             assert!(canonical(&bytes).is_err());
-            let prepared = canonical_for_profile(&bytes, profile).map_err(|e| format!("{e:?}"))?;
+            let prepared = canonical_for_profile(&bytes, &profile).map_err(|e| format!("{e:?}"))?;
             let canonical: Value = serde_json::from_slice(&prepared.body)?;
             assert_eq!(
                 serde_json::from_value::<f64>(canonical["lora"][0]["scale"].clone())?.to_bits(),
@@ -403,21 +410,21 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
         }
         value["lora"] = json!([{"id":0,"scale":1.3}]);
         value["abliteration_scale"] = json!(1.3);
-        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, profile).is_err());
+        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &profile).is_err());
         value
             .as_object_mut()
             .ok_or("Missing request object.")?
             .remove("abliteration_scale");
-        let body = canonical_for_profile(&serde_json::to_vec(&value)?, profile)
+        let body = canonical_for_profile(&serde_json::to_vec(&value)?, &profile)
             .map_err(|e| format!("{e:?}"))?
             .body;
         let duplicate =
             std::str::from_utf8(&body)?.replacen("\"scale\":", "\"scale\":1.3,\"scale\":", 1);
-        assert!(canonical_for_profile(duplicate.as_bytes(), profile).is_err());
+        assert!(canonical_for_profile(duplicate.as_bytes(), &profile).is_err());
         let observed = Observation::default();
         let mut worker =
             Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
-        worker.profile = profile;
+        worker.profile = profile.clone();
         let (result, _) = perform(
             &mut worker,
             request("/v1/chat/completions/input_tokens", &body, true),
@@ -425,7 +432,7 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
         .await?;
         assert_eq!(result, Ok(()));
         value["lora"] = json!([{"id":0,"scale":0.0}]);
-        let changed = canonical_for_profile(&serde_json::to_vec(&value)?, profile)
+        let changed = canonical_for_profile(&serde_json::to_vec(&value)?, &profile)
             .map_err(|e| format!("{e:?}"))?
             .body;
         let (result, _) =
@@ -503,6 +510,73 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
                 );
             }
         }
+    }
+}
+
+#[test]
+fn private_rotated_cache_readiness_reports_startup_identity_and_rejects_request_overrides()
+-> TestResult {
+    use bonsai_prism_runtime::graph::KvCachePolicy;
+
+    run(async {
+        for kv_cache in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+            let identity: Arc<str> = Arc::from(format!(
+                "verified-model:graph:{}:scale-1.3",
+                kv_cache.name()
+            ));
+            let observed = Observation {
+                kv_cache: Some(kv_cache),
+                startup_graph_identity: Some(identity.clone()),
+                ..Observation::default()
+            };
+            let mut worker =
+                Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
+            for route in ["/v1/models", "/props"] {
+                let (result, reply) = perform(&mut worker, request(route, &[], true)).await?;
+                assert_eq!(result, Ok(()));
+                let end = reply
+                    .array_windows()
+                    .position(|part| part == b"\r\n\r\n")
+                    .ok_or("missing readiness response head")?
+                    + 4;
+                let body: Value = serde_json::from_slice(&reply[end..])?;
+                let selected = &body["data"][0];
+                assert_eq!(selected["context_tokens"], 8192);
+                assert_eq!(selected["kv_cache"], kv_cache.name());
+                assert_eq!(selected["startup_graph_identity"], identity.as_ref());
+                assert!(selected.get("graph_identity").is_none());
+            }
+            let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+            let mut value: Value = serde_json::from_slice(&original)?;
+            value["kv_cache"] = json!("f16");
+            assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile).is_err());
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+            assert_eq!(observed.preparations.load(Ordering::Relaxed), 0);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn private_cache_profile_rejects_missing_unbounded_or_inconsistent_graph_identity() {
+    use bonsai_prism_runtime::graph::KvCachePolicy;
+
+    for (kv_cache, identity) in [
+        (KvCachePolicy::F16, Some(Arc::<str>::from("unexpected"))),
+        (KvCachePolicy::Rotated4, None),
+        (KvCachePolicy::Rotated4Keys3Values, Some(Arc::from(""))),
+        (KvCachePolicy::Rotated4, Some(Arc::from("x".repeat(4097)))),
+    ] {
+        let observed = Observation {
+            kv_cache: Some(kv_cache),
+            startup_graph_identity: identity,
+            ..Observation::default()
+        };
+        assert!(matches!(
+            Worker::new(FakeEngine(observed.clone()), 42),
+            Err(NativeBackendError::Configuration)
+        ));
+        assert!(observed.terminated.load(Ordering::Acquire));
     }
 }
 
@@ -637,7 +711,7 @@ fn private_adapter_signed_zero_changes_require_recounting() -> TestResult {
         for scale in [0.0_f64, -0.0] {
             value["lora"] = json!([{"id":0,"scale":scale}]);
             bodies.push(
-                canonical_for_profile(&serde_json::to_vec(&value)?, worker.profile)
+                canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile)
                     .map_err(|e| format!("{e:?}"))?
                     .body,
             );
@@ -1008,7 +1082,7 @@ async fn fail_acknowledgement(worker: &mut Worker, body: &[u8], terminal: bool) 
     let mut events = worker
         .start(
             Input::Generate(
-                canonical_for_profile(body, worker.profile).map_err(|e| format!("{e:?}"))?,
+                canonical_for_profile(body, &worker.profile).map_err(|e| format!("{e:?}"))?,
             ),
             Cancellation::default(),
             std::time::Instant::now() + allowance,
@@ -1065,7 +1139,7 @@ fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admis
                 };
                 value["lora"] = json!([{"id":0,"scale":1.3}]);
             }
-            let body = canonical_for_profile(&serde_json::to_vec(&value)?, worker.profile)
+            let body = canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile)
                 .map_err(|e| format!("{e:?}"))?
                 .body;
             let (counted, _) = perform(
@@ -1087,7 +1161,7 @@ fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admis
             if adapter {
                 value["lora"] = json!([{"id":0,"scale":0.0}]);
             }
-            let next = canonical_for_profile(&serde_json::to_vec(&value)?, worker.profile)
+            let next = canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile)
                 .map_err(|e| format!("{e:?}"))?
                 .body;
             let (result, _) = perform(

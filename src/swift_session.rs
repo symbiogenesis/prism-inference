@@ -8,8 +8,8 @@ use std::{path::Path, sync::Arc, time::Instant};
 use serde_json::Value;
 
 use crate::{
-    Result,
-    graph::Qwen35,
+    Decoder, Result,
+    graph::{KvCachePolicy, Qwen35},
     invalid,
     kernels::{MatvecBackend, RowParallelism},
     model::{
@@ -87,6 +87,7 @@ pub enum TextEvent<'a> {
 pub struct SwiftSession {
     owner: Arc<()>,
     representation: Representation,
+    kv_cache: KvCachePolicy,
     adapter_identity: Option<String>,
     runtime: Runtime<Qwen35>,
     chat: SwiftChatSession,
@@ -150,6 +151,35 @@ impl SwiftSession {
         seed: u32,
         parallelism: RowParallelism,
     ) -> Result<Self> {
+        Self::load_profile_with_kv_cache(
+            path,
+            representation,
+            adapter_path,
+            backend,
+            seed,
+            parallelism,
+            KvCachePolicy::F16,
+        )
+    }
+
+    /// Load an explicit, immutable KV precision profile with optional approved LoRA.
+    ///
+    /// Rotated profiles change numerical cache semantics and remain experimental.
+    /// Context, output, model, checkpoint and process-admission limits are unchanged.
+    /// Existing loading APIs retain FP16; selection is never a request-body control.
+    ///
+    /// # Errors
+    /// Rejects unsupported cache geometry and the same loading errors as
+    /// [`Self::load_profile_with_row_parallelism`].
+    pub fn load_profile_with_kv_cache(
+        path: &Path,
+        representation: Representation,
+        adapter_path: Option<&Path>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+    ) -> Result<Self> {
         let sampler = SwiftSampler::new(seed)?;
         let (model, receipt) =
             swift::load_representation(path, MODEL_MEMORY_BYTES, representation)?;
@@ -162,16 +192,23 @@ impl SwiftSession {
             .as_ref()
             .map(|_| crate::model::lora::SWIFT_ADAPTER_SHA256.to_owned());
         let mut decoder = if let Some(adapter) = adapter {
-            Qwen35::with_rank_one_adapter(
+            Qwen35::with_rank_one_adapter_and_kv(
                 model,
                 swift::CONTEXT_TOKENS,
                 STATE_MEMORY_BYTES,
                 backend,
                 adapter,
                 1.3,
+                kv_cache,
             )?
         } else {
-            Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, STATE_MEMORY_BYTES, backend)?
+            Qwen35::with_state_budget_and_kv(
+                model,
+                swift::CONTEXT_TOKENS,
+                STATE_MEMORY_BYTES,
+                backend,
+                kv_cache,
+            )?
         };
         decoder.set_row_parallelism(parallelism);
         let runtime = Runtime::new(
@@ -185,6 +222,7 @@ impl SwiftSession {
         Ok(Self {
             owner: Arc::new(()),
             representation,
+            kv_cache,
             adapter_identity,
             runtime,
             chat,
@@ -201,6 +239,18 @@ impl SwiftSession {
     #[must_use]
     pub const fn representation(&self) -> Representation {
         self.representation
+    }
+
+    /// Exact immutable KV-cache precision profile selected at session construction.
+    #[must_use]
+    pub const fn kv_cache_policy(&self) -> KvCachePolicy {
+        self.kv_cache
+    }
+
+    /// Current complete graph identity, including an explicitly changed adapter scale.
+    #[must_use]
+    pub fn decoder_identity(&self) -> &str {
+        self.runtime.decoder().identity()
     }
 
     /// Exact approved adapter artifact SHA-256, when one was explicitly loaded.

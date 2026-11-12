@@ -3,6 +3,7 @@
 use std::{ffi::OsString, io, path::PathBuf};
 
 use bonsai_prism_runtime::{
+    graph::KvCachePolicy,
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
     model::swift::Representation,
     runtime::PromptReuse,
@@ -24,6 +25,7 @@ struct Config {
     representation: Representation,
     adapter: Option<PathBuf>,
     prompt_reuse: PromptReuse,
+    kv_cache: KvCachePolicy,
 }
 
 fn invalid() -> io::Error {
@@ -41,6 +43,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut repacked_ptq1 = false;
     let mut adapter = None;
     let mut prompt_reuse = None;
+    let mut kv_cache = None;
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
             child = true;
@@ -89,6 +92,14 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                     _ => return Err(invalid()),
                 });
             }
+            Some("--kv-cache") if kv_cache.is_none() => {
+                kv_cache = Some(match value.to_str() {
+                    Some("f16") => KvCachePolicy::F16,
+                    Some("rsq4") => KvCachePolicy::Rotated4,
+                    Some("rsq4k3v") => KvCachePolicy::Rotated4Keys3Values,
+                    _ => return Err(invalid()),
+                });
+            }
             _ => return Err(invalid()),
         }
     }
@@ -105,6 +116,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         },
         adapter,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
+        kv_cache: kv_cache.unwrap_or(KvCachePolicy::F16),
     };
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -150,13 +162,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         .map_err(|error| startup::at(Stage::Key, &error))?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_row_parallelism(
+    let mut session = SwiftSession::load_profile_with_kv_cache(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
         MatvecBackend::Auto,
         config.seed,
         parallelism,
+        config.kv_cache,
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     session
@@ -344,6 +357,40 @@ mod tests {
             let mut invalid = base.clone();
             invalid.extend(extra.into_iter().map(OsString::from));
             assert!(parse(invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_kv_cache_requires_an_explicit_supported_unique_mode() -> io::Result<()> {
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        assert_eq!(parse(base.clone())?.kv_cache, KvCachePolicy::F16);
+        for (name, expected) in [
+            ("f16", KvCachePolicy::F16),
+            ("rsq4", KvCachePolicy::Rotated4),
+            ("rsq4k3v", KvCachePolicy::Rotated4Keys3Values),
+        ] {
+            let mut selected = base.clone();
+            selected.extend(["--kv-cache", name].map(OsString::from));
+            assert_eq!(parse(selected.clone())?.kv_cache, expected);
+            selected.extend(["--kv-cache", name].map(OsString::from));
+            assert!(parse(selected).is_err());
+        }
+        for name in ["", "F16", "q4_0", "turboquant", "rsq3", "rsq4 "] {
+            let mut selected = base.clone();
+            selected.extend(["--kv-cache", name].map(OsString::from));
+            assert!(parse(selected).is_err());
         }
         Ok(())
     }

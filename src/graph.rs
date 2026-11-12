@@ -1174,7 +1174,7 @@ struct RecurrentAttention {
     gate: Tensor,
     beta: Tensor,
     alpha: Tensor,
-    convolution: Vec<f32>,
+    convolution: crate::kernels::pinned_convolution::Coefficients,
     time_bias: Vec<f32>,
     decay: Vec<f32>,
     norm: Vec<f32>,
@@ -2235,6 +2235,18 @@ impl Qwen35 {
         for tensor in model.tensors.values() {
             crate::kernels::validate_tensor(tensor)?;
         }
+        // Verified loaders set identity to the complete file SHA256. Select the
+        // compiled native contract only for the exact current-weight PQ2 and
+        // lossless PTQ1 artifacts. Packing does not change the graph's native
+        // arithmetic; generic artifacts retain source-order controls.
+        let arithmetic = if matches!(
+            model.identity.as_str(),
+            crate::model::swift::MODEL_SHA256 | crate::model::swift::REPACKED_PTQ1_SHA256
+        ) {
+            Arithmetic::PinnedSwift
+        } else {
+            Arithmetic::Source
+        };
         let mut layers = capacity(layer_count)?;
         for (index, &recurrent) in recurrent_flags.iter().take(layer_count).enumerate() {
             let prefix = format!("blk.{index}.");
@@ -2266,7 +2278,11 @@ impl Qwen35 {
                         &format!("{prefix}ssm_alpha.weight"),
                         &[geometry.embedding, geometry.ssm_values],
                     )?,
-                    convolution,
+                    convolution: crate::kernels::pinned_convolution::Coefficients::new(
+                        convolution,
+                        geometry.convolution,
+                        matches!(arithmetic, Arithmetic::PinnedSwift),
+                    ),
                     time_bias: vector(
                         &model,
                         &format!("{prefix}ssm_dt.bias"),
@@ -2374,18 +2390,6 @@ impl Qwen35 {
                 },
             });
         }
-        // Verified loaders set identity to the complete file SHA256. Select the
-        // compiled native contract only for the exact current-weight PQ2 and
-        // lossless PTQ1 artifacts. Packing does not change the graph's native
-        // arithmetic; generic artifacts retain source-order controls.
-        let arithmetic = if matches!(
-            model.identity.as_str(),
-            crate::model::swift::MODEL_SHA256 | crate::model::swift::REPACKED_PTQ1_SHA256
-        ) {
-            Arithmetic::PinnedSwift
-        } else {
-            Arithmetic::Source
-        };
         let contract = if matches!(arithmetic, Arithmetic::PinnedSwift) {
             SWIFT_GRAPH_CONTRACT
         } else {
@@ -3573,10 +3577,11 @@ impl Evaluation<'_, '_> {
                     {
                         let head = base_head + offset;
                         let h_slice = &history[head * head_hist..(head + 1) * head_hist];
-                        let c_slice =
-                            &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
+                        let c_slice = layer
+                            .convolution
+                            .range(head * head_coeff..(head + 1) * head_coeff);
                         if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                            crate::kernels::pinned_convolution::step_silu_into(
+                            crate::kernels::pinned_convolution::step_silu_into_coefficients(
                                 h_slice,
                                 head_mixed,
                                 c_slice,
@@ -3587,7 +3592,7 @@ impl Evaluation<'_, '_> {
                             for (channel, mixed_value) in head_mixed.iter_mut().enumerate() {
                                 let projected = *mixed_value;
                                 let start = channel * hist_width;
-                                let coefficients = &c_slice
+                                let coefficients = &c_slice.source()
                                     [channel * g.convolution..(channel + 1) * g.convolution];
                                 *mixed_value = arithmetic.convolution_row(
                                     &h_slice[start..start + hist_width],
@@ -3615,10 +3620,10 @@ impl Evaluation<'_, '_> {
             )?;
         } else {
             if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                crate::kernels::pinned_convolution::step_silu_into(
+                crate::kernels::pinned_convolution::step_silu_into_coefficients(
                     history,
                     mixed,
-                    &layer.convolution,
+                    layer.convolution.view(),
                     g.convolution,
                     convolution,
                 )?;
@@ -3626,8 +3631,8 @@ impl Evaluation<'_, '_> {
                 for (channel, mixed_value) in mixed.iter_mut().enumerate() {
                     let projected = *mixed_value;
                     let start = channel * hist_width;
-                    let coefficients =
-                        &layer.convolution[channel * g.convolution..(channel + 1) * g.convolution];
+                    let coefficients = &layer.convolution.view().source()
+                        [channel * g.convolution..(channel + 1) * g.convolution];
                     *mixed_value = arithmetic.convolution_row(
                         &history[start..start + hist_width],
                         projected,

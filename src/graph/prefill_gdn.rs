@@ -552,9 +552,11 @@ pub(super) fn recurrent_tile<'a>(
                     .enumerate()
                 {
                     let head = base_head + offset;
-                    let c_slice = &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
+                    let c_slice = layer
+                        .convolution
+                        .range(head * head_coeff..(head + 1) * head_coeff);
                     if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                        crate::kernels::pinned_convolution::step_silu_token_rows_into(
+                        crate::kernels::pinned_convolution::step_silu_token_rows_into_coefficients(
                             head_conv,
                             mixed_ref,
                             &(head * width..(head + 1) * width),
@@ -571,7 +573,7 @@ pub(super) fn recurrent_tile<'a>(
                             for (channel, value) in head_mixed.iter_mut().enumerate() {
                                 let projected = *value;
                                 let start = channel * hist_width;
-                                let coefficients = &c_slice[channel * geometry.convolution
+                                let coefficients = &c_slice.source()[channel * geometry.convolution
                                     ..(channel + 1) * geometry.convolution];
                                 *value = arithmetic.convolution_row(
                                     &head_conv[start..start + hist_width],
@@ -613,10 +615,11 @@ pub(super) fn recurrent_tile<'a>(
                             .enumerate()
                         {
                             let head = base_head + offset;
-                            let c_slice =
-                                &layer.convolution[head * head_coeff..(head + 1) * head_coeff];
+                            let c_slice = layer
+                                .convolution
+                                .range(head * head_coeff..(head + 1) * head_coeff);
                             if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                                crate::kernels::pinned_convolution::step_silu_in_place(
+                                crate::kernels::pinned_convolution::step_silu_in_place_coefficients(
                                     head_conv,
                                     head_mixed,
                                     c_slice,
@@ -626,7 +629,8 @@ pub(super) fn recurrent_tile<'a>(
                                 for (channel, value) in head_mixed.iter_mut().enumerate() {
                                     let projected = *value;
                                     let start = channel * hist_width;
-                                    let coefficients = &c_slice[channel * geometry.convolution
+                                    let coefficients = &c_slice.source()[channel
+                                        * geometry.convolution
                                         ..(channel + 1) * geometry.convolution];
                                     *value = arithmetic.convolution_row(
                                         &head_conv[start..start + hist_width],
@@ -646,17 +650,17 @@ pub(super) fn recurrent_tile<'a>(
                     },
                 )?;
             } else if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                crate::kernels::pinned_convolution::step_silu_in_place(
+                crate::kernels::pinned_convolution::step_silu_in_place_coefficients(
                     convolution,
                     mixed,
-                    &layer.convolution,
+                    layer.convolution.view(),
                     geometry.convolution,
                 )?;
             } else {
                 for (channel, value) in mixed.iter_mut().enumerate() {
                     let projected = *value;
                     let start = channel * hist_width;
-                    let coefficients = &layer.convolution
+                    let coefficients = &layer.convolution.view().source()
                         [channel * geometry.convolution..(channel + 1) * geometry.convolution];
                     *value = arithmetic.convolution_row(
                         &convolution[start..start + hist_width],

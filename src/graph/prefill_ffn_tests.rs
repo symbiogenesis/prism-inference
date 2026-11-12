@@ -113,11 +113,21 @@ impl Fixture {
         input: &[f32],
         fused: bool,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let mut projection = ProjectionScratch::default();
+        // Match Qwen35 graph construction: arithmetic controls both the
+        // projection reduction contract and the adapter's original-basis dot.
+        // A default scratch would silently compare source-order F32 decode
+        // against pinned FMA tiled projection for aligned down weights.
+        let mut projection = ProjectionScratch {
+            matvec: arithmetic.scratch(MatvecBackend::Scalar),
+            ..ProjectionScratch::default()
+        };
         projection
             .matvec
             .set_row_parallelism(RowParallelism::new(workers)?);
-        let mut adapter_scratch = AdapterScratch::default();
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
         let mut evaluation = Evaluation {
             geometry: &self.geometry,
             arithmetic,
@@ -140,7 +150,10 @@ impl Fixture {
                 evaluation.projection.pre_transformed_len,
                 self.transforms
                     .can_block_hadamard(up.len())
-                    .then_some(up.len())
+                    .then_some(up.len()),
+                "decode reuse: width={}, block={}, workers={workers}, scale={scale}",
+                self.geometry.feed_forward,
+                self.transforms.block,
             );
         } else {
             evaluation.project_group_into([&self.up, &self.gate], input, [&mut up, &mut gate])?;
@@ -154,14 +167,89 @@ impl Fixture {
         evaluation.project_into(&self.down, &up, &mut output)?;
         Ok((up, output))
     }
+
+    fn tile(
+        &self,
+        arithmetic: Arithmetic,
+        workers: usize,
+        scale: f32,
+        inputs: &[Vec<f32>],
+        scenario: &str,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+        projector.set_row_parallelism(RowParallelism::new(workers)?);
+        let mut projection_scratch = arithmetic.scratch(MatvecBackend::Scalar);
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut gate = vec![Vec::new(); inputs.len()];
+        let mut up = vec![Vec::new(); inputs.len()];
+        let mut transformed = vec![Vec::new(); inputs.len()];
+        let reuse = project_tile_ffn_swiglu(
+            &self.transforms,
+            &self.geometry,
+            arithmetic,
+            Some(&self.adapter),
+            scale,
+            &mut adapter_scratch,
+            &mut projection_scratch,
+            TileReuse::default(),
+            &self.gate,
+            &self.up,
+            &self.down,
+            inputs,
+            &mut gate,
+            &mut up,
+            &mut transformed,
+            &mut projector,
+            None,
+            &|| Ok(()),
+        )?;
+        assert_eq!(
+            reuse.basis.is_some(),
+            self.transforms.block >= 16,
+            "{scenario}: tile reuse"
+        );
+        let mut outputs = vec![Vec::new(); inputs.len()];
+        let _ = project_tile(
+            &self.transforms,
+            &self.geometry,
+            arithmetic,
+            Some(&self.adapter),
+            scale,
+            &mut adapter_scratch,
+            &mut projection_scratch,
+            reuse,
+            &self.down,
+            &up,
+            &mut outputs,
+            &mut transformed,
+            &mut projector,
+            None,
+            &|| Ok(()),
+        )?;
+        Ok((up, outputs))
+    }
 }
 
-fn same_bits(actual: &[f32], expected: &[f32]) {
-    assert!(
+fn same_bits(actual: &[f32], expected: &[f32], context: &str) {
+    assert_eq!(actual.len(), expected.len(), "{context}: result lengths");
+    let mismatch =
         actual
             .iter()
-            .map(|value| value.to_bits())
-            .eq(expected.iter().map(|value| value.to_bits()))
+            .zip(expected)
+            .enumerate()
+            .find_map(|(index, (actual, expected))| {
+                (actual.to_bits() != expected.to_bits()).then_some((
+                    index,
+                    actual.to_bits(),
+                    expected.to_bits(),
+                ))
+            });
+    assert!(
+        mismatch.is_none(),
+        "{context}: first differing (index, actual bits, expected bits) = {mismatch:?}"
     );
 }
 
@@ -172,72 +260,51 @@ fn adapter_ffn_consumers_retain_original_basis_and_exact_down_correction() -> Re
     } else {
         1
     };
-    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+    for (arithmetic, name) in [
+        (Arithmetic::Source, "source"),
+        (Arithmetic::PinnedSwift, "pinned"),
+    ] {
         for (width, block) in [(32, 16), (4096, 256), (32, 8)] {
             let fixture = Fixture::new(width, block)?;
             for scale in [0.0, 1.3] {
+                let scenario = format!(
+                    "{name}, width={width}, block={block}, workers={workers}, scale={scale}"
+                );
                 let inputs = vec![vec![0.75, -0.5], vec![-0.25, 1.0], vec![0.0, -0.0]];
                 let expected = inputs
                     .iter()
                     .map(|input| fixture.decode(arithmetic, workers, scale, input, false))
                     .collect::<Result<Vec<_>>>()?;
-                for (input, (expected_up, expected_output)) in inputs.iter().zip(&expected) {
+                for (token, (input, (expected_up, expected_output))) in
+                    inputs.iter().zip(&expected).enumerate()
+                {
                     let (up, output) = fixture.decode(arithmetic, workers, scale, input, true)?;
-                    same_bits(&up, expected_up);
-                    same_bits(&output, expected_output);
+                    same_bits(
+                        &up,
+                        expected_up,
+                        &format!("{scenario}: decode token {token} up"),
+                    );
+                    same_bits(
+                        &output,
+                        expected_output,
+                        &format!("{scenario}: decode token {token} down output"),
+                    );
                 }
 
-                let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
-                projector.set_row_parallelism(RowParallelism::new(workers)?);
-                let mut projection_scratch = arithmetic.scratch(MatvecBackend::Scalar);
-                let mut adapter_scratch = AdapterScratch::default();
-                let mut gate = vec![Vec::new(); inputs.len()];
-                let mut up = vec![Vec::new(); inputs.len()];
-                let mut transformed = vec![Vec::new(); inputs.len()];
-                let reuse = project_tile_ffn_swiglu(
-                    &fixture.transforms,
-                    &fixture.geometry,
-                    arithmetic,
-                    Some(&fixture.adapter),
-                    scale,
-                    &mut adapter_scratch,
-                    &mut projection_scratch,
-                    TileReuse::default(),
-                    &fixture.gate,
-                    &fixture.up,
-                    &fixture.down,
-                    &inputs,
-                    &mut gate,
-                    &mut up,
-                    &mut transformed,
-                    &mut projector,
-                    None,
-                    &|| Ok(()),
-                )?;
-                assert_eq!(reuse.basis.is_some(), block >= 16);
-                let mut outputs = vec![Vec::new(); inputs.len()];
-                let _ = project_tile(
-                    &fixture.transforms,
-                    &fixture.geometry,
-                    arithmetic,
-                    Some(&fixture.adapter),
-                    scale,
-                    &mut adapter_scratch,
-                    &mut projection_scratch,
-                    reuse,
-                    &fixture.down,
-                    &up,
-                    &mut outputs,
-                    &mut transformed,
-                    &mut projector,
-                    None,
-                    &|| Ok(()),
-                )?;
-                for ((up, output), (expected_up, expected_output)) in
-                    up.iter().zip(&outputs).zip(&expected)
+                let (up, outputs) = fixture.tile(arithmetic, workers, scale, &inputs, &scenario)?;
+                for (token, ((up, output), (expected_up, expected_output))) in
+                    up.iter().zip(&outputs).zip(&expected).enumerate()
                 {
-                    same_bits(up, expected_up);
-                    same_bits(output, expected_output);
+                    same_bits(
+                        up,
+                        expected_up,
+                        &format!("{scenario}: tile token {token} up"),
+                    );
+                    same_bits(
+                        output,
+                        expected_output,
+                        &format!("{scenario}: tile token {token} down output"),
+                    );
                 }
             }
         }
@@ -248,7 +315,10 @@ fn adapter_ffn_consumers_retain_original_basis_and_exact_down_correction() -> Re
 #[test]
 fn adapter_ffn_preparation_rejects_invalid_geometry_and_never_replays_failed_swiglu() -> Result<()>
 {
-    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+    for (arithmetic, name) in [
+        (Arithmetic::Source, "source"),
+        (Arithmetic::PinnedSwift, "pinned"),
+    ] {
         let gate = vec![0.5; 32];
         let original_up = vec![0.25; 32];
         for (gate, block, signs) in [
@@ -270,7 +340,11 @@ fn adapter_ffn_preparation_rejects_invalid_geometry_and_never_replays_failed_swi
                     )
                     .is_err()
             );
-            same_bits(&up, &original_up);
+            same_bits(
+                &up,
+                &original_up,
+                &format!("{name}: invalid block {block} up"),
+            );
             assert!(transformed.is_empty());
         }
         let mut up = original_up.clone();
@@ -293,8 +367,16 @@ fn adapter_ffn_preparation_rejects_invalid_geometry_and_never_replays_failed_swi
                     |error| error.to_string() == "Hadamard requires a finite power-of-two block"
                 )
         );
-        same_bits(&up[..16], &expected);
-        same_bits(&up[16..], &original_up[16..]);
+        same_bits(
+            &up[..16],
+            &expected,
+            &format!("{name}: failed first block up"),
+        );
+        same_bits(
+            &up[16..],
+            &original_up[16..],
+            &format!("{name}: untouched later block up"),
+        );
         assert!(transformed.is_empty());
     }
     Ok(())

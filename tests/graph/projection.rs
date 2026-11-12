@@ -411,3 +411,123 @@ fn tiled_prefill_projection_scope_dispatches_pq2_projections_and_preserves_state
     }
     Ok(())
 }
+
+#[cfg(feature = "parallel-rows")]
+fn sibling_graph_weight(name: &str, rows: usize) -> Tensor {
+    let mut data = Vec::new();
+    for row in 0..rows {
+        let mut block = [if row % 2 == 0 { 0x66 } else { 0x99 }; 34];
+        block[..2].copy_from_slice(&0x2000_u16.to_le_bytes());
+        data.extend(block.repeat(2));
+    }
+    Tensor {
+        name: name.to_owned(),
+        dimensions: vec![256, rows],
+        kind: 142,
+        data: Arc::from(data),
+    }
+}
+
+#[cfg(feature = "parallel-rows")]
+fn sibling_graph_fixture(recurrent: bool) -> Result<Model> {
+    let mut base = backend_fixture(recurrent, 142, 256)?;
+    base.metadata.insert(
+        "qwen35.embedding_length".to_owned(),
+        MetadataValue::from(256_u64),
+    );
+    // Keep the fixture's two-element KV/GDN heads, but widen the residual
+    // stream so real sibling projections consume complete Q8_K blocks.
+    for tensor in base.tensors.values_mut() {
+        match tensor.name.as_str() {
+            "token_embd.weight" | "output.weight" => {
+                tensor.dimensions[0] = 256;
+                let data: Vec<_> = tensor
+                    .data
+                    .chunks_exact(8)
+                    .flat_map(|row| row.repeat(128))
+                    .collect();
+                tensor.data = Arc::from(data);
+            }
+            "output_norm.weight"
+            | "blk.0.attn_norm.weight"
+            | "blk.0.post_attention_norm.weight" => {
+                tensor.dimensions[0] = 256;
+                tensor.data = Arc::from(tensor.data.repeat(128));
+            }
+            "blk.0.ffn_up.weight"
+            | "blk.0.ffn_gate.weight"
+            | "blk.0.attn_q.weight"
+            | "blk.0.attn_k.weight"
+            | "blk.0.attn_v.weight"
+            | "blk.0.attn_qkv.weight"
+            | "blk.0.attn_gate.weight" => {
+                *tensor = sibling_graph_weight(&tensor.name, tensor.dimensions[1]);
+            }
+            "blk.0.ffn_down.weight" | "blk.0.attn_output.weight" | "blk.0.ssm_out.weight" => {
+                tensor.dimensions[1] = 256;
+                tensor.data = Arc::from(tensor.data.repeat(128));
+            }
+            "blk.0.ssm_beta.weight" | "blk.0.ssm_alpha.weight" => {
+                tensor.dimensions[0] = 256;
+                tensor.data = Arc::from(vec![0; 256 * 4]);
+            }
+            _ => {}
+        }
+    }
+    writer_transform(&mut base, "blk.0.ffn_down.weight", false);
+    base.metadata.insert(
+        "prism.hadamard.sign_widths".to_owned(),
+        MetadataValue::from(vec![256_u64]),
+    );
+    base.metadata.insert(
+        "prism.hadamard.sign_values".to_owned(),
+        MetadataValue::from([-1_i64, 1].repeat(128)),
+    );
+    Ok(base)
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn cpu_sibling_projection_preserves_full_and_recurrent_state_with_adapter() -> Result<()> {
+    use bonsai_prism_runtime::kernels::RowParallelism;
+
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for recurrent in [false, true] {
+        for adapter_scale in [0.0, 1.3] {
+            let build = || -> Result<Qwen35> {
+                let base = sibling_graph_fixture(recurrent)?;
+                let output = if recurrent {
+                    "blk.0.ssm_out.weight"
+                } else {
+                    "blk.0.attn_output.weight"
+                };
+                let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight", output], 0.125);
+                rank_one_graph(base, factors, adapter_scale)
+            };
+            let mut control = build()?;
+            let mut graph = build()?;
+            graph.set_row_parallelism(RowParallelism::new(4)?);
+            for token in [0, 1, 0] {
+                assert_eq!(bits(graph.evaluate(token)?), bits(control.evaluate(token)?));
+                assert_eq!(graph_bits(&graph)?, graph_bits(&control)?);
+            }
+            assert!(graph.backend_statistics().grouped_row_dispatches > 0);
+            let checkpoint = graph.checkpoint()?;
+            let control_checkpoint = control.checkpoint()?;
+            graph.ingest(1)?;
+            control.ingest(1)?;
+            assert_eq!(graph_bits(&graph)?, graph_bits(&control)?);
+            graph.restore(&checkpoint)?;
+            control.restore(&control_checkpoint)?;
+            assert_eq!(bits(graph.evaluate(1)?), bits(control.evaluate(1)?));
+            let before_failure = graph_bits(&graph)?;
+            assert!(graph.evaluate(2).is_err());
+            assert_eq!(graph_bits(&graph)?, before_failure);
+            graph.reset()?;
+            control.reset()?;
+            assert_eq!(bits(graph.evaluate(0)?), bits(control.evaluate(0)?));
+            assert_eq!(graph_bits(&graph)?, graph_bits(&control)?);
+        }
+    }
+    Ok(())
+}

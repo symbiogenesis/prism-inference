@@ -248,11 +248,13 @@ mod tests {
         let _ = decoder.push_borrowed(b"\xe9\x9b")?;
         let oversized = vec![b'a'; MAX_TEXT_OUTPUT_BYTES + 1];
         let mut visited = false;
-        assert!(push_with(&mut decoder, &oversized, |_| {
-            visited = true;
-            Ok(())
-        })
-        .is_err());
+        assert!(
+            push_with(&mut decoder, &oversized, |_| {
+                visited = true;
+                Ok(())
+            })
+            .is_err()
+        );
         assert!(!visited);
         assert_eq!(decoder.pending_bytes(), b"\xe9\x9b");
         let error = push_with(&mut decoder, b"\xa8", |_| Err(invalid("visitor rejected")));

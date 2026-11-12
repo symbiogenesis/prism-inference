@@ -18,6 +18,11 @@ on:
       - .github/workflows/hexagon-native.yml
       - Cargo.toml
       - Cargo.lock
+      - rust-toolchain.toml
+      - clippy.toml
+      - rustfmt.toml
+      - .cargo/**
+      - .github/actions/rust-toolchain/**
   workflow_dispatch:
 permissions:
   contents: read

@@ -4,6 +4,7 @@ import copy
 import io
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -255,6 +256,77 @@ class AggregateGateTests(unittest.TestCase):
         for index, needs in enumerate(cases):
             with self.subTest(case=index):
                 self.assertTrue(gate.failures(needs, {"build": "rust"}))
+
+
+class FoundationCoverageTests(unittest.TestCase):
+    """Consolidation preserves distinct consumers and selected-job acceptance."""
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[2]
+        self.config = json.loads((self.root / ".github/ci/impact.json").read_text(encoding="utf-8"))
+        self.jobs = self.config["workflows"]["foundation"]
+
+    def test_runtime_and_codec_inputs_reach_their_independent_consumers(self):
+        cases = (
+            ("src/lib.rs", {"windows", "conformance", "package"}),
+            ("tools/ternary/src/lib.rs", {"windows", "conformance", "codec", "mutations", "package"}),
+            ("server/src/main.rs", {"windows"}),
+            ("tests/Test-ReleaseBundle.ps1", {"windows", "release", "standards", "package"}),
+        )
+        for path, expected in cases:
+            with self.subTest(path=path):
+                plan = impact.select(self.root, [path], config=self.config)
+                self.assertFalse(plan["full"])
+                self.assertEqual({group for group, selected in plan["groups"].items() if selected}, expected)
+
+    def test_package_checks_retain_the_original_source_delivery_inputs(self):
+        for path in (
+            "examples/library_chat.rs", "tests/Test-RustNightly.ps1",
+            "tools/gguf/README.md", "tools/native-hash/src/lib.rs",
+            "tools/neon-dot/src/lib.rs", "tools/prism/upstream/CMakeLists.txt",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(impact.select(self.root, [path], config=self.config)["groups"]["package"])
+        for path in ("docs/roadmap.md", "README.md", "server/src/main.rs"):
+            with self.subTest(path=path):
+                self.assertFalse(impact.select(self.root, [path], config=self.config)["groups"]["package"])
+
+    def test_shared_ci_edits_and_manual_dispatch_cover_every_moved_job(self):
+        for path in (".github/workflows/foundation.yml", ".github/workflows/source-checks.yml"):
+            with self.subTest(path=path):
+                plan = impact.select(self.root, [path], config=self.config)
+                self.assertTrue(plan["full"])
+                self.assertTrue(all(plan["groups"].values()))
+        self.assertTrue(all(impact.select(self.root, [], full=True, config=self.config)["groups"].values()))
+        self.assertFalse(any(impact.select(self.root, ["docs/roadmap.md"], config=self.config)["groups"].values()))
+
+    def needs(self, selected):
+        groups = {group: group == selected for group in self.config["groups"]}
+        return {
+            "changes": {"result": "success", "outputs": {"plan": json.dumps({"groups": groups})}},
+            **{job: {"result": "success" if groups[group] else "skipped"}
+               for job, group in self.jobs.items()},
+        }
+
+    def test_moved_job_failure_skip_or_cancellation_fails_foundation(self):
+        for job in ("rust-regression", "codec-native", "source-package"):
+            needs = self.needs(self.jobs[job])
+            self.assertFalse(gate.failures(needs, self.jobs))
+            for result in ("failure", "skipped", "cancelled"):
+                with self.subTest(job=job, result=result):
+                    rejected = copy.deepcopy(needs)
+                    rejected[job]["result"] = result
+                    self.assertTrue(gate.failures(rejected, self.jobs))
+            incomplete = copy.deepcopy(needs)
+            del incomplete[job]
+            self.assertTrue(gate.failures(incomplete, self.jobs))
+
+    def test_foundation_aggregate_and_routing_map_have_the_same_dependencies(self):
+        workflow = (self.root / ".github/workflows/foundation.yml").read_text(encoding="utf-8")
+        aggregate = workflow.split("\n  foundation:\n", 1)[1]
+        dependencies = re.search(r"(?m)^    needs: \[([^]]+)\]$", aggregate)
+        self.assertIsNotNone(dependencies)
+        self.assertEqual({name.strip() for name in dependencies[1].split(",")}, {"changes", *self.jobs})
 
 
 class SuccessfulBaselineTests(unittest.TestCase):

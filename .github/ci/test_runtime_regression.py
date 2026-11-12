@@ -103,13 +103,13 @@ class ReportTests(unittest.TestCase):
 
     def test_regression_gate_rejects_failed_selected_jobs_and_full_gate_inputs(self):
         config = json.loads((Path(__file__).resolve().parent / "impact.json").read_text())
-        jobs = config["workflows"]["runtime-regression"]
+        jobs = config["workflows"]["foundation"]
         needs = {
             "changes": {"result": "success", "outputs": {"plan": json.dumps({
-                "groups": {"conformance": True, "codec": False},
+                "groups": {group: group == "conformance" for group in config["groups"]},
             })}},
-            "rust-regression": {"result": "success"},
-            "codec-native": {"result": "skipped"},
+            **{job: {"result": "success" if group == "conformance" else "skipped"}
+               for job, group in jobs.items()},
         }
         self.assertFalse(gate.failures(needs, jobs))
         self.assertTrue(gate.failures(needs, config["workflows"]["runtime-conformance"]))

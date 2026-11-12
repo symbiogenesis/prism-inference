@@ -216,3 +216,58 @@ fn six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation(
     actual.assert_same(&expected);
     Ok(())
 }
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn x1_tiled_qkv_query_failure_precedes_all_key_value_chunks() -> Result<()> {
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        for workers in [2, 3, 4, 18] {
+            // Thirteen tokens exercise unequal and one-token worker tails.
+            let mut actual = Harness::new(13, workers)?;
+            for projected in &mut actual.tile.mixed {
+                projected.fill(0.0);
+            }
+            actual.tile.mixed[12][23 * 2 * actual.geometry.head] = 1.0;
+            actual.weights.query_norm.fill(100_000.0);
+            actual.tile.recurrent_gate[0][0] = f32::NAN;
+            actual.tile.beta[0][0] = 70_000.0;
+            assert!(actual.run(arithmetic, &|| Ok(())).is_err_and(|error| {
+                error.to_string() == "nonfinite values in binary16 attention query"
+            }));
+            assert_eq!(actual.keys.tokens().count(), actual.base);
+            assert_eq!(actual.values.tokens().count(), actual.base);
+            assert!(actual.attention_scratch.scores.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn x1_tiled_qkv_keeps_earliest_key_value_chunk_and_recovers() -> Result<()> {
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        for workers in [2, 3, 4, 18] {
+            let mut actual = Harness::new(13, workers)?;
+            let original_keys = actual.tile.recurrent_gate.clone();
+            let original_values = actual.tile.beta.clone();
+            // The first task's value overflow outranks a later task's bad key,
+            // preserving the original paired worker submission's error order.
+            actual.tile.beta[0][0] = 70_000.0;
+            actual.tile.recurrent_gate[12][0] = f32::NAN;
+            assert!(actual.run(arithmetic, &|| Ok(())).is_err_and(|error| {
+                error.to_string() == "nonfinite values in binary16 value cache"
+            }));
+            assert_eq!(actual.keys.tokens().count(), actual.base);
+            assert_eq!(actual.values.tokens().count(), actual.base);
+            assert!(actual.attention_scratch.scores.is_empty());
+            // An owner restores provisional inputs before reusing the stage.
+            actual.tile.recurrent_gate = original_keys;
+            actual.tile.beta = original_values;
+            actual.run(arithmetic, &|| Ok(()))?;
+            let mut expected = Harness::new(13, 1)?;
+            expected.run(arithmetic, &|| Ok(()))?;
+            actual.assert_same(&expected);
+        }
+    }
+    Ok(())
+}

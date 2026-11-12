@@ -845,40 +845,32 @@ fn full_attention_tile(
     let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
     let frequencies_ref: &[Vec<(f32, f32)>] = &tile.frequencies[..count];
     let query_norm: &[f32] = &weights.query_norm;
-    tile.projector.row_parallelism().update_chunks(
-        &mut tile.up[..count],
-        1,
-        |base_tok, query_chunk| {
-            for (offset, query_tok) in query_chunk.iter_mut().enumerate() {
-                let tok = base_tok + offset;
-                let projected = &mixed_ref[tok];
-                let frequencies = &frequencies_ref[tok];
-                let mut query_finite = true;
-                for (head_idx, query_head) in query_tok.chunks_exact_mut(g.head).enumerate() {
-                    let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
-                    query_finite &= arithmetic.normalize_rope_round_f16_into(
-                        &src[..g.head],
-                        query_norm,
-                        g.epsilon,
-                        g,
-                        frequencies,
-                        query_head,
-                    )?;
-                }
-                if !query_finite {
-                    return Err(invalid("nonfinite values in binary16 attention query"));
-                }
+    let normalize_queries = |base_tok: usize, query_chunk: &mut [Vec<f32>]| {
+        for (offset, query_tok) in query_chunk.iter_mut().enumerate() {
+            let tok = base_tok + offset;
+            let projected = &mixed_ref[tok];
+            let frequencies = &frequencies_ref[tok];
+            let mut query_finite = true;
+            for (head_idx, query_head) in query_tok.chunks_exact_mut(g.head).enumerate() {
+                let src = &projected[head_idx * 2 * g.head..(head_idx + 1) * 2 * g.head];
+                query_finite &= arithmetic.normalize_rope_round_f16_into(
+                    &src[..g.head],
+                    query_norm,
+                    g.epsilon,
+                    g,
+                    frequencies,
+                    query_head,
+                )?;
             }
-            Ok(())
-        },
-    )?;
+            if !query_finite {
+                return Err(invalid("nonfinite values in binary16 attention query"));
+            }
+        }
+        Ok(())
+    };
     let key_norm: &[f32] = &weights.key_norm;
-    tile.projector.row_parallelism().update_paired_chunks(
-        &mut tile.recurrent_gate[..count],
-        1,
-        &mut tile.beta[..count],
-        1,
-        |base_tok, key_chunk, value_chunk| {
+    let normalize_key_values =
+        |base_tok: usize, key_chunk: &mut [Vec<f32>], value_chunk: &mut [Vec<f32>]| {
             for (offset, (key_tok, value_tok)) in
                 key_chunk.iter_mut().zip(value_chunk.iter_mut()).enumerate()
             {
@@ -907,8 +899,38 @@ fn full_attention_tile(
                 }
             }
             Ok(())
+        };
+    // All three buffers partition by token, so every worker retains the exact
+    // chunks of the two original submissions, including partial final chunks.
+    // Query failures must outrank every KV failure. Keep KV failures on the cold
+    // path until all queries succeed; only provisional scratch changes here.
+    let key_value_failure = std::sync::Mutex::new(None);
+    tile.projector.row_parallelism().update_triple_chunks(
+        &mut tile.up[..count],
+        1,
+        &mut tile.recurrent_gate[..count],
+        1,
+        &mut tile.beta[..count],
+        1,
+        |base_tok, query_chunk, key_chunk, value_chunk| {
+            normalize_queries(base_tok, query_chunk)?;
+            if let Err(error) = normalize_key_values(base_tok, key_chunk, value_chunk) {
+                let mut failure = key_value_failure
+                    .lock()
+                    .map_err(|_| invalid("prefill attention preparation failure lock poisoned"))?;
+                if failure.as_ref().is_none_or(|&(base, _)| base_tok < base) {
+                    *failure = Some((base_tok, error));
+                }
+            }
+            Ok(())
         },
     )?;
+    if let Some((_, error)) = key_value_failure
+        .into_inner()
+        .map_err(|_| invalid("prefill attention preparation failure lock poisoned"))?
+    {
+        return Err(error);
+    }
     for index in 0..count {
         if index > 0 {
             check()?;

@@ -338,10 +338,10 @@ mod tests {
         input[0].scale = f32::NAN;
         assert!(super::prepare_with_layout(&input, &mut baseline, true).is_err());
         assert!(baseline.is_empty());
-        assert!(baseline.widened.is_empty());
+        assert_eq!(baseline.widened.len(), 0);
         assert!(super::prepare_with_layout(&input, &mut compact, false).is_err());
         assert!(compact.is_empty());
-        assert!(compact.widened.is_empty());
+        assert_eq!(compact.widened.len(), 0);
         Ok(())
     }
 

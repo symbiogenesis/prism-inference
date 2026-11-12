@@ -36,6 +36,11 @@ struct Fixture {
     adapter: RankOneAdapter,
 }
 
+struct TileResult {
+    up: Vec<Vec<f32>>,
+    outputs: Vec<Vec<f32>>,
+}
+
 impl Fixture {
     fn new(width: usize, block: usize) -> Result<Self> {
         let pattern = [-0.75, -0.0, 0.25, 0.5, -0.125, 1.0, -0.5];
@@ -175,7 +180,7 @@ impl Fixture {
         scale: f32,
         inputs: &[Vec<f32>],
         scenario: &str,
-    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    ) -> Result<TileResult> {
         let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
         projector.set_row_parallelism(RowParallelism::new(workers)?);
         let mut projection_scratch = arithmetic.scratch(MatvecBackend::Scalar);
@@ -229,7 +234,7 @@ impl Fixture {
             None,
             &|| Ok(()),
         )?;
-        Ok((up, outputs))
+        Ok(TileResult { up, outputs })
     }
 }
 
@@ -291,7 +296,8 @@ fn adapter_ffn_consumers_retain_original_basis_and_exact_down_correction() -> Re
                     );
                 }
 
-                let (up, outputs) = fixture.tile(arithmetic, workers, scale, &inputs, &scenario)?;
+                let TileResult { up, outputs } =
+                    fixture.tile(arithmetic, workers, scale, &inputs, &scenario)?;
                 for (token, ((up, output), (expected_up, expected_output))) in
                     up.iter().zip(&outputs).zip(&expected).enumerate()
                 {
@@ -345,7 +351,7 @@ fn adapter_ffn_preparation_rejects_invalid_geometry_and_never_replays_failed_swi
                 &original_up,
                 &format!("{name}: invalid block {block} up"),
             );
-            assert!(transformed.is_empty());
+            assert_eq!(transformed.len(), 0);
         }
         let mut up = original_up.clone();
         let mut signs = vec![1.0; 32];
@@ -377,7 +383,7 @@ fn adapter_ffn_preparation_rejects_invalid_geometry_and_never_replays_failed_swi
             &original_up[16..],
             &format!("{name}: untouched later block up"),
         );
-        assert!(transformed.is_empty());
+        assert_eq!(transformed.len(), 0);
     }
     Ok(())
 }

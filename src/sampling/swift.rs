@@ -615,7 +615,7 @@ mod tests {
             for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
                 small[index] = invalid;
                 assert!(top_k_logits(&small, SwiftSampler::TOP_K, &mut sampler.backing).is_err());
-                assert!(sampler.backing.is_empty());
+                assert_eq!(sampler.backing.len(), 0);
                 assert_eq!(sampler.backing.as_ptr(), allocation);
             }
             small[index] = 0.0;

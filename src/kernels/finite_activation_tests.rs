@@ -134,7 +134,7 @@ fn prepared_finite_proof_preserves_preflight_precedence_and_storage() -> Result<
         error(&mut scratch, &weights, &mixed_failure),
         "Q8_K activation scale overflow"
     );
-    assert!(scratch.q8k.is_empty());
+    assert_eq!(scratch.q8k.len(), 0);
     assert_eq!(scratch.q8k.as_ptr(), pointer);
     scratch.prepare(&weights, &[-127.0; 512])?;
     same_q8k::<true>(&scratch, &[-127.0; 512])?;
@@ -154,7 +154,7 @@ fn prepared_finite_proof_retains_q8_overflow_and_external_validation() -> Result
             };
             scratch.prepare(&weights, &[127.0; 256])?;
             let pointer = scratch.q8.as_ptr();
-            assert!(!error(&mut scratch, &weights, &[f32::MAX; 256]).is_empty());
+            assert_ne!(error(&mut scratch, &weights, &[f32::MAX; 256]), "");
             assert!(scratch.q8.is_empty());
             assert_eq!(scratch.q8.as_ptr(), pointer);
             assert!(

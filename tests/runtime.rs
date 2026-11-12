@@ -1036,7 +1036,9 @@ fn reusable_logits_preserve_storage_prefixes_and_transaction_recovery() -> Resul
     // Retained immutable snapshots keep their own distribution. Each request
     // detaches once, then all of its decoder steps reuse the unique allocation.
     assert_eq!(captured.len(), 8);
-    for pair in captured.chunks_exact(2) {
+    let (pairs, remainder) = captured.as_chunks::<2>();
+    assert_eq!(remainder.len(), 0);
+    for pair in pairs {
         assert_eq!(pair[0], pair[1]);
         assert_eq!(pair[0].1, 8);
     }

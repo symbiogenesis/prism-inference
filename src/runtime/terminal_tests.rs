@@ -338,7 +338,7 @@ fn terminal_state_only_rejects_retained_snapshots_and_expired_requests_before_wo
             |_| Ok(()),
         );
         assert!(result.is_err());
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens().len(), 0);
         assert_eq!(runtime.decoder().evaluations, 0);
         assert_eq!(runtime.decoder().ingestions, 0);
         assert_eq!(sampler, original);

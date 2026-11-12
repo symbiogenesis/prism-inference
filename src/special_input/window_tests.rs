@@ -146,7 +146,7 @@ fn windowed_specials_retain_maximum_special_index_and_literal_limits() -> Result
     );
     for policy in [SpecialInputPolicy::Parse, SpecialInputPolicy::Literal] {
         assert!(input.split(&text, policy, 0).is_err());
-        assert!(input.split("", policy, 0)?.is_empty());
+        assert_eq!(input.split("", policy, 0)?.len(), 0);
     }
     Ok(())
 }

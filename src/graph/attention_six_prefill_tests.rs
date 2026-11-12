@@ -236,17 +236,29 @@ fn six_head_prefill_excludes_future_nan_and_rejects_bad_prefix_before_output() -
         actual.fill(19.0);
         scores.resize(score_len, 19.0);
         assert!(prefix(&fixture, position, &mut actual, &mut scores).is_err());
-        assert!(actual.iter().all(|&value| value == 19.0));
+        assert!(
+            actual
+                .iter()
+                .all(|value| value.to_bits() == 19.0_f32.to_bits())
+        );
     }
     // The sixth head fails during score evaluation before any value output.
     scores.resize(6, 19.0);
     fixture.queries[0][5 * width] = f32::NAN;
     assert!(prefix(&fixture, 0, &mut actual, &mut scores).is_err());
-    assert!(actual.iter().all(|&value| value == 19.0));
+    assert!(
+        actual
+            .iter()
+            .all(|value| value.to_bits() == 19.0_f32.to_bits())
+    );
     fixture.queries[0][5 * width] = 0.0;
     fixture.current_values[0][0] = f32::NAN;
     assert!(prefix(&fixture, 0, &mut actual, &mut scores).is_err());
-    assert!(actual.iter().all(|&value| value == 19.0));
+    assert!(
+        actual
+            .iter()
+            .all(|value| value.to_bits() == 19.0_f32.to_bits())
+    );
     assert!(fixture.keys.tokens().flatten().copied().eq(key_bits));
     assert!(fixture.values.tokens().flatten().copied().eq(value_bits));
     Ok(())
@@ -300,6 +312,11 @@ fn six_head_paired_prefill_excludes_future_rows_and_rejects_malformed_input() ->
     fixture.queries[1] = original_query;
     fixture.queries[1][5 * fixture.geometry.head] = f32::NAN;
     assert!(run(&fixture, &mut actual, &mut scores).is_err());
-    assert!(actual.iter().flatten().all(|&value| value == 19.0));
+    assert!(
+        actual
+            .iter()
+            .flatten()
+            .all(|value| value.to_bits() == 19.0_f32.to_bits())
+    );
     Ok(())
 }

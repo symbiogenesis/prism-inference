@@ -115,8 +115,8 @@ impl Fixture {
     }
 
     fn assert_unpublished(&self) {
-        assert!(self.scratch.attended.is_empty());
-        assert!(self.scratch.scores.is_empty());
+        assert_eq!(self.scratch.attended.len(), 0);
+        assert_eq!(self.scratch.scores.len(), 0);
         assert_eq!(self.keys.tokens().count(), 2);
         assert_eq!(self.values.tokens().count(), 2);
     }

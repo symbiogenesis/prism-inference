@@ -2670,7 +2670,10 @@ impl Qwen35 {
                         )?,
                     )?;
                 }
-                LayerState::Recurrent { convolution, matrix } => {
+                LayerState::Recurrent {
+                    convolution,
+                    matrix,
+                } => {
                     memory.recurrent_payload_bytes = checked_sum(
                         memory.recurrent_payload_bytes,
                         checked_product(&[

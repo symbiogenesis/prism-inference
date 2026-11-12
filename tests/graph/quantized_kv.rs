@@ -159,13 +159,19 @@ fn kv_memory_observations_separate_payload_capacity_and_context_bound() -> Resul
         let snapshot = decoder.checkpoint()?;
         decoder.ingest(1)?;
         decoder.restore(&snapshot)?;
-        assert_eq!(decoder.state_memory()?.kv_payload_bytes, populated.kv_payload_bytes);
+        assert_eq!(
+            decoder.state_memory()?.kv_payload_bytes,
+            populated.kv_payload_bytes
+        );
         decoder.reset()?;
         let reset = decoder.state_memory()?;
         assert_eq!(reset.position, 0);
         assert_eq!(reset.kv_payload_bytes, 0);
         assert_eq!(reset.recurrent_payload_bytes, GDN_BYTES);
-        assert_eq!(reset.full_context_kv_payload_bytes, empty.full_context_kv_payload_bytes);
+        assert_eq!(
+            reset.full_context_kv_payload_bytes,
+            empty.full_context_kv_payload_bytes
+        );
         // Cleared tails and page tables retain capacity even though no token
         // payload remains. A snapshot elsewhere also retains its own pages.
         assert!(reset.live_state_storage_bytes > empty.live_state_storage_bytes);

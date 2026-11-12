@@ -611,6 +611,18 @@ fn load_decoder(arguments: &Arguments) -> Result<Loaded> {
     })
 }
 
+fn state_memory_record(memory: bonsai_prism_runtime::graph::StateMemory) -> serde_json::Value {
+    json!({
+        "position": memory.position,
+        "context_tokens": memory.context_tokens,
+        "kv_payload_bytes": memory.kv_payload_bytes,
+        "full_context_kv_payload_bytes": memory.full_context_kv_payload_bytes,
+        "recurrent_payload_bytes": memory.recurrent_payload_bytes,
+        "live_state_storage_bytes": memory.live_state_storage_bytes,
+        "scope": "live state capacities and metadata; excludes model, workspace, external checkpoints, allocator overhead and process/device memory",
+    })
+}
+
 fn execute(arguments: &Arguments) -> Result<()> {
     if arguments.mode == Mode::Tokenize {
         let record = tokenize_record(arguments)?;
@@ -679,7 +691,6 @@ fn execute(arguments: &Arguments) -> Result<()> {
             emit,
         )?
     };
-    let state_memory = runtime.decoder().state_memory()?;
     let mut completion = json!({
         "finish_reason": match result.finish { Finish::Stop => "stop", Finish::Length => "length" },
         "prompt_tokens": result.prompt_tokens,
@@ -687,15 +698,7 @@ fn execute(arguments: &Arguments) -> Result<()> {
         "reused_tokens": result.reused_tokens,
         "backend_requested": backend_requested,
         "state_budget_bytes": arguments.state_bytes,
-        "state_memory": {
-            "position": state_memory.position,
-            "context_tokens": state_memory.context_tokens,
-            "kv_payload_bytes": state_memory.kv_payload_bytes,
-            "full_context_kv_payload_bytes": state_memory.full_context_kv_payload_bytes,
-            "recurrent_payload_bytes": state_memory.recurrent_payload_bytes,
-            "live_state_storage_bytes": state_memory.live_state_storage_bytes,
-            "scope": "live state capacities and metadata; excludes model, workspace, external checkpoints, allocator overhead and process/device memory",
-        },
+        "state_memory": state_memory_record(runtime.decoder().state_memory()?),
         "kv_cache": arguments.kv_cache.name(),
         "graph_identity": runtime.decoder().identity(),
         "prefill_block_tokens": arguments.prefill.block_tokens,

@@ -22,12 +22,19 @@ pub const MAX_ROW_WORKERS: usize = 18;
 /// require `parallel-rows`; clones share the same persistent pool. Each thread
 /// has a requested 512 KiB stack, additionally charged by the process owner.
 /// This does not select an ISA or establish target-device benefit.
+/// In-place updates keep at most [`MAX_ROW_WORKERS`] optional boxed failures
+/// inline on the calling thread's stack; successful dispatch needs no heap
+/// allocation for those failure slots.
 #[derive(Clone)]
 pub struct RowParallelism {
     workers: usize,
     #[cfg(feature = "parallel-rows")]
     pool: Option<Arc<rayon::ThreadPool>>,
 }
+
+#[cfg(all(test, feature = "parallel-rows"))]
+#[path = "parallel_rows_scratch_tests.rs"]
+mod scratch_tests;
 
 #[cfg(all(test, feature = "parallel-rows"))]
 mod tests {
@@ -211,8 +218,8 @@ impl RowParallelism {
     /// all workers join.
     ///
     /// # Errors
-    /// Rejects unavailable `parallel-rows` support, error-slot allocation
-    /// failure, or the first chunk failure returned by `update`.
+    /// Rejects unavailable `parallel-rows` support or the first chunk failure
+    /// returned by `update`.
     pub fn update_rows(
         &self,
         target: &mut [f32],
@@ -229,8 +236,7 @@ impl RowParallelism {
     ///
     /// # Errors
     /// Rejects a zero or non-dividing `unit_size`, unavailable `parallel-rows`
-    /// support, error-slot allocation failure, or the first chunk failure
-    /// returned by `update`.
+    /// support, or the first chunk failure returned by `update`.
     pub fn update_chunks<T: Send>(
         &self,
         target: &mut [T],
@@ -256,13 +262,14 @@ impl RowParallelism {
             let task_units = units.div_ceil(self.workers);
             let task_elems = task_units * unit_size;
             let tasks = units.div_ceil(task_units);
-            let mut errors = Vec::new();
-            errors.try_reserve_exact(tasks)?;
-            errors.resize_with(tasks, || None);
+            // There is at most one task per configured worker. Keep the cold
+            // failure slots on the caller's stack instead of allocating a
+            // transient vector for every normalization/transform dispatch.
+            let mut errors: [Option<crate::Error>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
             pool.install(|| {
                 target
                     .par_chunks_mut(task_elems)
-                    .zip(errors.par_iter_mut())
+                    .zip(errors[..tasks].par_iter_mut())
                     .enumerate()
                     .for_each(|(task, (chunk, error))| {
                         if let Err(failure) = update(task * task_units, chunk) {
@@ -282,8 +289,7 @@ impl RowParallelism {
     ///
     /// # Errors
     /// Rejects zero or non-dividing unit sizes, unequal unit counts, unavailable
-    /// `parallel-rows` support, error-slot allocation failure, or the first chunk
-    /// failure returned by `update`.
+    /// `parallel-rows` support, or the first chunk failure returned by `update`.
     pub fn update_paired_chunks<A: Send, B: Send>(
         &self,
         first: &mut [A],
@@ -319,14 +325,12 @@ impl RowParallelism {
             let first_task_elems = task_units * first_unit_size;
             let second_task_elems = task_units * second_unit_size;
             let tasks = units.div_ceil(task_units);
-            let mut errors = Vec::new();
-            errors.try_reserve_exact(tasks)?;
-            errors.resize_with(tasks, || None);
+            let mut errors: [Option<crate::Error>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
             pool.install(|| {
                 first
                     .par_chunks_mut(first_task_elems)
                     .zip(second.par_chunks_mut(second_task_elems))
-                    .zip(errors.par_iter_mut())
+                    .zip(errors[..tasks].par_iter_mut())
                     .enumerate()
                     .for_each(|(task, ((first_chunk, second_chunk), error))| {
                         if let Err(failure) = update(task * task_units, first_chunk, second_chunk) {
@@ -386,15 +390,13 @@ impl RowParallelism {
             let second_task_elems = task_units * second_unit_size;
             let third_task_elems = task_units * third_unit_size;
             let tasks = units.div_ceil(task_units);
-            let mut errors = Vec::new();
-            errors.try_reserve_exact(tasks)?;
-            errors.resize_with(tasks, || None);
+            let mut errors: [Option<crate::Error>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
             pool.install(|| {
                 first
                     .par_chunks_mut(first_task_elems)
                     .zip(second.par_chunks_mut(second_task_elems))
                     .zip(third.par_chunks_mut(third_task_elems))
-                    .zip(errors.par_iter_mut())
+                    .zip(errors[..tasks].par_iter_mut())
                     .enumerate()
                     .for_each(
                         |(task, (((first_chunk, second_chunk), third_chunk), error))| {

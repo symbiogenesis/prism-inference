@@ -1373,10 +1373,6 @@ pub(super) fn step_eight_rows_tokens_from(
 }
 
 #[inline]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep 8-row multi-token register-resident NEON GDN recurrence together."
-)]
 fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
     previous: [&[f32]; 8],
     states: [&mut [f32]; 8],

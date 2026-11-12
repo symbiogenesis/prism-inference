@@ -162,7 +162,7 @@ impl SwiftSession {
         )
     }
 
-    /// Load an explicit, immutable KV precision profile with optional approved LoRA.
+    /// Load an explicit, immutable KV precision profile with optional approved `LoRA`.
     ///
     /// Rotated profiles change numerical cache semantics and remain experimental.
     /// Context, output, model, checkpoint and process-admission limits are unchanged.

@@ -13,20 +13,34 @@ pub(super) fn dot_neon<const HEADS: usize>(
 ) -> Result<[f32; HEADS]> {
     let zero = f32x4::splat(neon, 0.0);
     let mut sums = [[zero; 4]; HEADS];
-    let (chunks, remainder) = key.as_chunks::<8>();
+    // A complete native sixteen-lane step addresses the four accumulators at
+    // fixed indices. The former eight-column step selected two accumulator
+    // registers with `index * 2 % 4` on every iteration. Keep each lane's exact
+    // FMA sequence while halving full-width loop trips and query-row slicing.
+    let (chunks, remainder) = key.as_chunks::<16>();
     for (index, chunk) in chunks.iter().enumerate() {
-        let (first, second) = crate::kernels::neon::f16_bits_to_f32_x8(neon, chunk);
-        let first_lane = index * 2 % 4;
-        let second_lane = first_lane + 1;
+        let (halves, _) = chunk.as_chunks::<8>();
+        let (first, second) = crate::kernels::neon::f16_bits_to_f32_x8(neon, &halves[0]);
+        let (third, fourth) = crate::kernels::neon::f16_bits_to_f32_x8(neon, &halves[1]);
         for (head, sum) in sums.iter_mut().enumerate() {
-            let query = &queries[head][index * 8..index * 8 + 8];
-            sum[first_lane] =
-                first.mul_add_precise(f32x4::from_slice(neon, &query[..4]), sum[first_lane]);
-            sum[second_lane] =
-                second.mul_add_precise(f32x4::from_slice(neon, &query[4..]), sum[second_lane]);
+            let query = &queries[head][index * 16..index * 16 + 16];
+            sum[0] = first.mul_add_precise(f32x4::from_slice(neon, &query[..4]), sum[0]);
+            sum[1] = second.mul_add_precise(f32x4::from_slice(neon, &query[4..8]), sum[1]);
+            sum[2] = third.mul_add_precise(f32x4::from_slice(neon, &query[8..12]), sum[2]);
+            sum[3] = fourth.mul_add_precise(f32x4::from_slice(neon, &query[12..]), sum[3]);
         }
     }
-    let vector_steps = key.len() - remainder.len();
+    let vector_steps = chunks.len() * 16;
+    let (tail_chunks, _) = remainder.as_chunks::<8>();
+    if let Some(chunk) = tail_chunks.first() {
+        let (first, second) = crate::kernels::neon::f16_bits_to_f32_x8(neon, chunk);
+        for (head, sum) in sums.iter_mut().enumerate() {
+            let query = &queries[head][vector_steps..vector_steps + 8];
+            sum[0] = first.mul_add_precise(f32x4::from_slice(neon, &query[..4]), sum[0]);
+            sum[1] = second.mul_add_precise(f32x4::from_slice(neon, &query[4..]), sum[1]);
+        }
+    }
+    let vector_steps = vector_steps + tail_chunks.len() * 8;
     let mut output = [0.0; HEADS];
     // Swift's complete 16-element key blocks need no scalar tail. Keep the
     // four native registers through padding and the original reduction tree,

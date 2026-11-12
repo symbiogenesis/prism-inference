@@ -14,13 +14,12 @@ worker, private HTTP server, GGUF tooling, ternary codecs and native storage
 overlay. SwiftBonsai consumes a prebuilt server inside its guarded Windows Job;
 ordinary SwiftBonsai builds do not compile this runtime.
 
-The [0.1.25 registry candidate](release-0.1.25.md) advances all five public
-helpers and the runtime, including refreshed direct dependencies. Registry
-publication, source-bound binaries and qualification remain separate gates.
-
-The [0.1.24 registry delivery](release-0.1.24.md) records the newer published
-runtime package and its verified checksum. Its binary bundle and Runner repin
-remain pending owner source publication and source-bound hosted production.
+The [0.1.25 registry delivery](release-0.1.25.md) advances all five public
+helpers and the runtime, including refreshed direct dependencies. Normal Cargo
+verification and all six public checksums passed. Its binary bundle and Runner
+repin remain pending owner source publication and source-bound hosted production.
+The [0.1.24 registry delivery](release-0.1.24.md) retains its historical scope.
+Registry publication, verified binaries and qualification remain separate gates.
 
 The [0.1.23 delivery scope](release-0.1.23.md) records the earlier CPU crate and
 Windows ARM64 development prerelease at `055c743`. Its bounded hosted operation

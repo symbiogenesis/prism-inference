@@ -5,16 +5,15 @@
 ## Install from source
 
 GitHub bundles and crates.io packages are separate deliveries. The published
-registry runtime is `0.1.24`; the latest verified Windows ARM64 development
-bundle remains `0.1.23`. The [0.1.24 registry delivery](release-0.1.24.md) and
+registry runtime is `0.1.25`; the latest verified Windows ARM64 development
+bundle remains `0.1.23`. The [0.1.25 registry delivery](release-0.1.25.md) and
 [0.1.23 binary delivery](release-0.1.23.md) retain their separate checks and
-pending qualification. The [0.1.25 registry candidate](release-0.1.25.md)
-advances every public helper and refreshes direct dependency pins; its publication
-and binary delivery remain separate pending operations. Install the published
-registry source with the pinned nightly:
+pending qualification. The new registry delivery advances every public helper
+and refreshes direct dependency pins; a matching binary bundle remains pending.
+Install the published registry source with the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-11-09 install prism-inference --version '=0.1.24' --locked
+cargo +nightly-2026-11-09 install prism-inference --version '=0.1.25' --locked
 prism-inference --help
 ```
 
@@ -31,7 +30,7 @@ The package name is `prism-inference`; the existing Rust import path remains
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.24", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.25", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
@@ -102,8 +101,8 @@ targets retain the portable Rust baseline. Every model byte is still checked
 through the retained handle before metadata parsing. The GGUF crate remains
 unsafe-free, and full-file reads, load progress and cancellation contracts are
 unchanged. This implementation alone establishes no startup timing improvement.
-The current delivery uses published `bonsai-native-hash 0.1.2` and
-`bonsai-gguf 0.1.4`; future helper changes still require their registry
+The current registry delivery uses published `bonsai-native-hash 0.1.3` and
+`bonsai-gguf 0.1.5`; future helper changes still require their registry
 prerequisites before dependent package publication.
 
 ## Build a checkout
@@ -590,7 +589,7 @@ overlay, Rust regression, native codec and source-package matrix whenever their
 respective groups are selected.
 
 The published binary bundle version is `0.1.23`; the source installation and
-library examples above independently select registry `0.1.24`. Packaging rejects
+library examples above independently select registry `0.1.25`. Packaging rejects
 a changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
 versions or a toolchain string that differs from the pinned channel and target. The receipt
 records the resulting bytes; its source-to-binary trust still depends on the
@@ -643,12 +642,13 @@ GGUF and hash archives and runs model-free public API checks with scalar, defaul
 features. Its receipt retains archive digests, source identity, consumer lockfile and executed
 commands. This checks source delivery independently of building inside the original workspace.
 
-The five current registry helpers are already published and unchanged:
-`bonsai-native-hash =0.1.2`, `bonsai-neon-dot =0.1.1`, `bonsai-ternary =0.1.2`,
-`bonsai-gguf =0.1.4` and `bonsai-prism =0.1.4`. Only the runtime was newly
-published as `0.1.24`; its normalized package and public checksum were verified
-separately from the still-pending binary delivery. Source preparation and hosted
-checks alone neither publish registry packages nor qualify model serving.
+The five current registry helpers are published as `bonsai-native-hash =0.1.3`,
+`bonsai-neon-dot =0.1.2`, `bonsai-ternary =0.1.3`, `bonsai-gguf =0.1.5` and
+`bonsai-prism =0.1.5`, alongside runtime `0.1.25`. All six normalized packages
+and public checksums were verified separately from the still-pending binary
+delivery. The [0.1.25 delivery record](release-0.1.25.md) retains checks and
+limits; the [0.1.24 delivery](release-0.1.24.md) remains historical. Source
+preparation and hosted checks alone do not qualify model serving.
 
 The published development bundle build explicitly enables
 `prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the

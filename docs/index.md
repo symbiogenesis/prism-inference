@@ -17,6 +17,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Understand budgets and failure recovery | [Runtime contracts](runtime-contracts.md) |
 | Configure opt-in packed projection workers | [Explicit row workers](parallel-rows.md) |
 | Review CPU work/storage reductions and qualification limits | [Inference efficiency candidate](inference-efficiency.md) |
+| Prepare a source-bound ordinary CPU bundle comparison | [CPU bundle comparison](cpu-bundle-comparison.md) |
 | Review scoped packed activation preparation | [PQ2 consumption layout](packed-pq2-consumption.md) |
 | Select separately qualified CPU prompt tiles or GDN chunks | [CPU tiled prefill](cpu-tiled-prefill.md) |
 | Evaluate explicit Snapdragon compressed KV profiles | [Rotated KV candidate](quantized-kv.md) |

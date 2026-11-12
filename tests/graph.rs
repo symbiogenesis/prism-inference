@@ -7,6 +7,8 @@ mod admission;
 mod prefill;
 #[path = "graph/projection.rs"]
 mod projection;
+#[path = "graph/quantized_kv.rs"]
+mod quantized_kv;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

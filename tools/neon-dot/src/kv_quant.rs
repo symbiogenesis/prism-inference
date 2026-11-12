@@ -188,10 +188,6 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
     unsafe_code,
     reason = "Private baseline-NEON intrinsics use checked fixed-size tiles behind runtime detection and failure-atomic safe public APIs."
 )]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Parent-only dispatch wrappers keep intrinsics inside the private audited boundary."
-)]
 mod native {
     use core::arch::aarch64::{
         vaddq_f32, vaddq_f64, vcvt_f64_f32, vcvt_high_f64_f32, vdupq_n_f32, vdupq_n_f64,

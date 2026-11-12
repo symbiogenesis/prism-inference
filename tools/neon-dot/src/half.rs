@@ -16,7 +16,7 @@
 pub fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        super::aarch64::widen_f16_four(bits)
+        super::aarch64::widen_f16_four(*bits)
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {

@@ -30,14 +30,17 @@ pub trait LendingText {
     fn next_text<'a>(&'a mut self, bytes: &'a [u8]) -> Result<Self::Piece<'a>>;
 }
 
-/// Decode one bounded byte chunk and pass its borrowed or owned piece to a higher-ranked visitor.
+/// Decode one bounded byte chunk and pass its borrowed or owned piece to a visitor.
+///
+/// The source, input and visitor need only support this call's borrow. A visitor
+/// may retain a borrowed piece while that borrow remains valid.
 ///
 /// # Errors
 /// Propagates decoder or visitor errors.
-pub fn push_with<T: LendingText>(
-    decoder: &mut T,
-    bytes: &[u8],
-    visit: impl for<'a> FnOnce(T::Piece<'a>) -> Result<()>,
+pub fn push_with<'a, T: LendingText>(
+    decoder: &'a mut T,
+    bytes: &'a [u8],
+    visit: impl FnOnce(T::Piece<'a>) -> Result<()>,
 ) -> Result<()> {
     let piece = decoder.next_text(bytes)?;
     visit(piece)
@@ -207,8 +210,59 @@ fn append_complete<'a>(mut bytes: &'a [u8], output: &mut String) -> Result<&'a [
 
 #[cfg(test)]
 mod tests {
-    use super::{Cow, Utf8Output, push_with};
-    use crate::Result;
+    use super::{Cow, LendingText, MAX_TEXT_OUTPUT_BYTES, Utf8Output, push_with};
+    use crate::{Result, invalid};
+
+    #[test]
+    fn visitor_can_retain_a_piece_from_a_nonstatic_source() -> Result<()> {
+        struct BorrowedText<'a>(&'a str);
+
+        impl LendingText for BorrowedText<'_> {
+            type Piece<'a>
+                = &'a str
+            where
+                Self: 'a;
+
+            fn next_text<'a>(&'a mut self, _bytes: &'a [u8]) -> Result<Self::Piece<'a>> {
+                Ok(self.0)
+            }
+        }
+
+        let text = String::from("borrowed source");
+        let mut decoder = BorrowedText(&text);
+        let mut retained = None;
+        push_with(&mut decoder, b"", |piece| {
+            retained = Some(piece);
+            Ok(())
+        })?;
+        assert_eq!(retained, Some(text.as_str()));
+        push_with(&mut decoder, b"", |piece| {
+            assert_eq!(piece, text);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn visitor_errors_propagate_and_decoder_errors_skip_the_visitor() -> Result<()> {
+        let mut decoder = Utf8Output::new();
+        let _ = decoder.push_borrowed(b"\xe9\x9b")?;
+        let oversized = vec![b'a'; MAX_TEXT_OUTPUT_BYTES + 1];
+        let mut visited = false;
+        assert!(push_with(&mut decoder, &oversized, |_| {
+            visited = true;
+            Ok(())
+        })
+        .is_err());
+        assert!(!visited);
+        assert_eq!(decoder.pending_bytes(), b"\xe9\x9b");
+        let error = push_with(&mut decoder, b"\xa8", |_| Err(invalid("visitor rejected")));
+        assert_eq!(
+            error.map_err(|error| error.to_string()),
+            Err("visitor rejected".to_owned())
+        );
+        assert_eq!(decoder.pending_bytes(), b"");
+        Ok(())
+    }
 
     #[test]
     fn push_borrowed_lends_valid_prefixes_and_owns_bridged_or_lossy_chunks() -> Result<()> {

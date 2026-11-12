@@ -15,17 +15,19 @@
 mod aarch64;
 
 /// Returns whether the current CPU supports ARMv8.2-A `dotprod` (`SDOT`).
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[must_use]
 pub fn has_dotprod() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        aarch64::has_dotprod()
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    aarch64::has_dotprod()
+}
+
+/// Returns false because `dotprod` is unavailable on non-ARM64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+#[must_use]
+pub const fn has_dotprod() -> bool {
+    false
 }
 
 /// Detected `SDOT` support and optional `I8MM` selection reusable across PQ2 blocks.
@@ -178,17 +180,19 @@ impl Pq2Dotprod {
 }
 
 /// Returns whether the current CPU supports ARMv8.2-A `i8mm` (`SMMLA`).
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[must_use]
 pub fn has_i8mm() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        aarch64::has_i8mm()
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+    aarch64::has_i8mm()
+}
+
+/// Returns false because `i8mm` is unavailable on non-ARM64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+#[must_use]
+pub const fn has_i8mm() -> bool {
+    false
 }
 
 #[cfg(not(target_arch = "aarch64"))]

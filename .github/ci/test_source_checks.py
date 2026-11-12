@@ -4,6 +4,8 @@ import copy
 import io
 import json
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -19,6 +21,51 @@ MERGE = "refs/pull/7/merge"
 BEFORE = "a" * 40
 AFTER = "b" * 40
 HEAD = "c" * 40
+
+
+class WorkflowCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (Path(__file__).resolve().parents[2] /
+                         ".github/workflows/source-checks.yml").read_text(encoding="utf-8")
+
+    def assert_cfg_lint_coverage(self, workflow):
+        job = re.search(r"(?ms)^  model-free:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)
+        self.assertIsNotNone(job, "Keep the independently selected model-free job")
+        for runner, target in (("windows-11-arm", "aarch64-pc-windows-msvc"),
+                               ("windows-2025", "x86_64-pc-windows-msvc"),
+                               ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu")):
+            self.assertRegex(job[1], rf"- runner: {runner}\n\s+target: {target}\n")
+        commands = [shlex.split(line.strip()) for line in job[1].splitlines()
+                    if line.strip().startswith("cargo ")]
+        lint = [command for command in commands if "clippy" in command]
+        self.assertTrue(lint, "Keep an actual Clippy command in model-free")
+        required = {"bonsai-neon-dot", "bonsai-hexagon-native", "bonsai-hexagon-runtime"}
+        self.assertTrue(any(
+            required.issubset({command[index + 1] for index, argument in enumerate(command[:-1])
+                               if argument in ("-p", "--package")})
+            and {"--all-targets", "--release", "--locked"}.issubset(command)
+            and command[-3:] == ["--", "-D", "warnings"] for command in lint
+        ), "Every native/fallback helper must be a direct strict all-target lint selection")
+
+    def test_model_free_lints_direct_helpers_on_native_and_fallback_targets(self):
+        self.assert_cfg_lint_coverage(self.workflow)
+
+    def test_missing_helper_strict_flag_or_target_is_rejected(self):
+        removals = ["-p " + package + " " for package in
+                    ("bonsai-neon-dot", "bonsai-hexagon-native", "bonsai-hexagon-runtime")]
+        removals += ["--all-targets ", "--release ", "--locked ", "-- -D warnings"]
+        removals += ["          - runner: " + runner + "\n            target: " + target + "\n"
+                     for runner, target in (("windows-11-arm", "aarch64-pc-windows-msvc"),
+                                            ("windows-2025", "x86_64-pc-windows-msvc"),
+                                            ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"))]
+        job = re.search(r"(?ms)^  model-free:\n(.*?)(?=^  [\w-]+:\n|\Z)", self.workflow)
+        self.assertIsNotNone(job)
+        for removal in removals:
+            with self.subTest(removal=removal):
+                self.assertIn(removal, job[1])
+                mutated = self.workflow[:job.start(1)] + job[1].replace(removal, "") + self.workflow[job.end(1):]
+                with self.assertRaises(AssertionError):
+                    self.assert_cfg_lint_coverage(mutated)
 
 
 class SelectionTests(unittest.TestCase):

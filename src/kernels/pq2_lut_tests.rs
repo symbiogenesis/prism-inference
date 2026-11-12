@@ -85,14 +85,14 @@ fn lut_projection_checks_extents_scales_limits_and_late_row_failure() -> Result<
     let valid = tensor(256, 3)?;
     let mut output = vec![42.0];
     assert!(executor.project(&valid, &[], false, &mut output).is_err());
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     activation.scale = f32::NAN;
     assert!(
         executor
             .project(&valid, std::slice::from_ref(&activation), true, &mut output)
             .is_err()
     );
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     assert!(executor.tables.is_empty());
     activation.scale = -0.125;
     let mut invalid = valid.clone();
@@ -109,7 +109,7 @@ fn lut_projection_checks_extents_scales_limits_and_late_row_failure() -> Result<
             )
             .is_err()
     );
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     assert!(executor.tables.is_empty());
     executor.project(
         &valid,
@@ -139,7 +139,7 @@ fn lut_projection_checks_extents_scales_limits_and_late_row_failure() -> Result<
     );
     q8[3].scale = f32::INFINITY;
     assert!(executor.project_q8(&odd, &q8, false, &mut output).is_err());
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     assert!(executor.tables.is_empty());
     Ok(())
 }

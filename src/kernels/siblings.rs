@@ -38,19 +38,6 @@ impl PreparedMatvec<'_> {
         result
     }
 
-    #[cfg_attr(
-        all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc",
-            target_feature = "neon"
-        ),
-        expect(
-            clippy::too_many_lines,
-            reason = "Keep atomic geometry checks, original row kernels and scalar fallback together."
-        )
-    )]
     fn multiply_pq2_siblings(
         &mut self,
         tensors: &[&Tensor],

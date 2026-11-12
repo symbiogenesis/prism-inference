@@ -443,7 +443,9 @@ fn sibling_graph_fixture(recurrent: bool) -> Result<Model> {
                 tensor.dimensions[0] = 256;
                 let data: Vec<_> = tensor
                     .data
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .flat_map(|row| row.repeat(128))
                     .collect();
                 tensor.data = Arc::from(data);

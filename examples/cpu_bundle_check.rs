@@ -134,6 +134,9 @@ fn selection(arguments: &[String], started: Instant, now: SystemTime) -> Result<
         ));
     }
     let (deadline_unix_milliseconds, deadline) = bounded_deadline(&arguments[5], started, now)?;
+    let generation_deadline = deadline
+        .checked_sub(RECEIPT_RESERVE)
+        .ok_or_else(|| reject("deadline cannot reserve receipt time"))?;
     Ok(Selection {
         model: absolute_path(&arguments[0])?,
         adapter: absolute_path(&arguments[1])?,
@@ -143,7 +146,7 @@ fn selection(arguments: &[String], started: Instant, now: SystemTime) -> Result<
         source_commit: source_commit.clone(),
         deadline_unix_milliseconds,
         deadline,
-        generation_deadline: deadline - RECEIPT_RESERVE,
+        generation_deadline,
     })
 }
 
@@ -222,8 +225,8 @@ fn load_session(selection: &Selection) -> Result<SwiftSession> {
 }
 
 impl CapturedOutput {
-    fn push_observed(&mut self, event: TextEvent<'_>, elapsed: Duration) -> Result<()> {
-        let nonempty = matches!(&event, TextEvent::Delta(text) if !text.is_empty());
+    fn push_observed(&mut self, event: &TextEvent<'_>, elapsed: Duration) -> Result<()> {
+        let nonempty = matches!(event, TextEvent::Delta(text) if !text.is_empty());
         self.push(event)?;
         if nonempty && self.first_text_delta_milliseconds.is_none() {
             self.first_text_delta_milliseconds = Some(elapsed.as_secs_f64() * 1000.0);
@@ -231,7 +234,7 @@ impl CapturedOutput {
         Ok(())
     }
 
-    fn push(&mut self, event: TextEvent<'_>) -> Result<()> {
+    fn push(&mut self, event: &TextEvent<'_>) -> Result<()> {
         if self.terminal.is_some() {
             return Err(reject("output arrived after terminal accounting"));
         }
@@ -248,7 +251,7 @@ impl CapturedOutput {
                 self.text.try_reserve(text.len())?;
                 self.text.push_str(text);
             }
-            TextEvent::Complete(completion) => self.terminal = Some(completion),
+            TextEvent::Complete(completion) => self.terminal = Some(*completion),
         }
         Ok(())
     }
@@ -279,7 +282,7 @@ fn complete_request(
         &Cancellation::default(),
         selection.generation_deadline,
         &mut observation.timings,
-        |event| output.push_observed(event, started.elapsed()),
+        |event| output.push_observed(&event, started.elapsed()),
     );
     observation.request_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     observation.output = output;

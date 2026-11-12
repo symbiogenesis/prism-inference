@@ -1,7 +1,8 @@
 use super::*;
 
 fn bounded_selection() -> Selection {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let generation_deadline = Instant::now() + Duration::from_secs(28);
+    let deadline = generation_deadline + RECEIPT_RESERVE;
     Selection {
         model: PathBuf::from("model"),
         adapter: PathBuf::from("adapter"),
@@ -11,7 +12,7 @@ fn bounded_selection() -> Selection {
         source_commit: "0".repeat(40),
         deadline_unix_milliseconds: 1,
         deadline,
-        generation_deadline: deadline - RECEIPT_RESERVE,
+        generation_deadline,
     }
 }
 
@@ -88,10 +89,10 @@ fn selection_rejects_relative_paths_bad_commit_and_output_overflow() {
 #[test]
 fn output_rejects_overflow_and_any_delivery_after_terminal() -> Result<()> {
     let mut output = CapturedOutput::default();
-    output.push(TextEvent::Delta("oak"))?;
+    output.push(&TextEvent::Delta("oak"))?;
     assert!(
         output
-            .push(TextEvent::Delta(&"x".repeat(MAX_OUTPUT_BYTES)))
+            .push(&TextEvent::Delta(&"x".repeat(MAX_OUTPUT_BYTES)))
             .is_err()
     );
     assert_eq!(output.text, "oak");
@@ -101,9 +102,9 @@ fn output_rejects_overflow_and_any_delivery_after_terminal() -> Result<()> {
         generated_tokens: 2,
         finish: Finish::Length,
     };
-    output.push(TextEvent::Complete(completion))?;
-    assert!(output.push(TextEvent::Complete(completion)).is_err());
-    assert!(output.push(TextEvent::Delta("late")).is_err());
+    output.push(&TextEvent::Complete(completion))?;
+    assert!(output.push(&TextEvent::Complete(completion)).is_err());
+    assert!(output.push(&TextEvent::Delta("late")).is_err());
     assert_eq!(output.text, "oak");
     Ok(())
 }
@@ -111,20 +112,20 @@ fn output_rejects_overflow_and_any_delivery_after_terminal() -> Result<()> {
 #[test]
 fn first_text_event_timing_ignores_empty_failed_and_subsequent_deliveries() -> Result<()> {
     let mut output = CapturedOutput::default();
-    output.push_observed(TextEvent::Delta(""), Duration::from_millis(1))?;
+    output.push_observed(&TextEvent::Delta(""), Duration::from_millis(1))?;
     assert!(output.first_text_delta_milliseconds.is_none());
     assert!(
         output
             .push_observed(
-                TextEvent::Delta(&"x".repeat(MAX_OUTPUT_BYTES + 1)),
+                &TextEvent::Delta(&"x".repeat(MAX_OUTPUT_BYTES + 1)),
                 Duration::from_millis(2),
             )
             .is_err()
     );
     assert!(output.first_text_delta_milliseconds.is_none());
-    output.push_observed(TextEvent::Delta("oak"), Duration::from_millis(3))?;
+    output.push_observed(&TextEvent::Delta("oak"), Duration::from_millis(3))?;
     let first = output.first_text_delta_milliseconds;
-    output.push_observed(TextEvent::Delta(" tree"), Duration::from_millis(4))?;
+    output.push_observed(&TextEvent::Delta(" tree"), Duration::from_millis(4))?;
     assert_eq!(
         output.first_text_delta_milliseconds.map(f64::to_bits),
         first.map(f64::to_bits),

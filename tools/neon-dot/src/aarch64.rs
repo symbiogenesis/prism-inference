@@ -1710,6 +1710,66 @@ pub(super) fn dot_pq2_four_rows_four_tokens(
 }
 
 #[inline]
+pub(super) fn pq2_detected_dot_four_tokens(
+    detected: super::Pq2Dotprod,
+    packed: [&[u8; 32]; 4],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 4] {
+    if detected.i8mm {
+        // SAFETY: This private capability flag was set only after CPU/OS I8MM
+        // detection. Fixed array references provide every required input byte.
+        unsafe { dot_pq2_four_rows_four_tokens_precomputed_i8mm(packed, planes, activation_sums) }
+    } else {
+        // SAFETY: Constructing the unforgeable capability verified CPU/OS
+        // dotprod eligibility. All inputs have the kernel's fixed array sizes.
+        unsafe {
+            dot_pq2_four_rows_four_tokens_precomputed_dotprod(packed, planes, activation_sums)
+        }
+    }
+}
+
+#[inline]
+pub(super) fn pq2_detected_dot_eight_rows_four_tokens(
+    detected: super::Pq2Dotprod,
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 4],
+    activation_sums: [i32; 4],
+) -> [[i32; 4]; 8] {
+    if detected.i8mm {
+        // SAFETY: This private capability flag was set only after CPU/OS I8MM
+        // detection. Fixed array references provide every required input byte.
+        unsafe { dot_pq2_eight_rows_four_tokens_precomputed_i8mm(packed, planes, activation_sums) }
+    } else {
+        // SAFETY: Constructing the unforgeable capability verified CPU/OS
+        // dotprod eligibility. All inputs have the kernel's fixed array sizes.
+        unsafe {
+            dot_pq2_eight_rows_four_tokens_precomputed_dotprod(packed, planes, activation_sums)
+        }
+    }
+}
+
+#[inline]
+pub(super) fn pq2_detected_dot_eight_tokens(
+    detected: super::Pq2Dotprod,
+    packed: [&[u8; 32]; 8],
+    planes: [&[i8; 128]; 8],
+    activation_sums: [i32; 8],
+) -> [[i32; 8]; 8] {
+    if detected.i8mm {
+        // SAFETY: This private capability flag was set only after CPU/OS I8MM
+        // detection. Fixed array references provide every required input byte.
+        unsafe { dot_pq2_eight_rows_eight_tokens_precomputed_i8mm(packed, planes, activation_sums) }
+    } else {
+        // SAFETY: Constructing the unforgeable capability verified CPU/OS
+        // dotprod eligibility. All inputs have the kernel's fixed array sizes.
+        unsafe {
+            dot_pq2_eight_rows_eight_tokens_precomputed_dotprod(packed, planes, activation_sums)
+        }
+    }
+}
+
+#[inline]
 pub(super) fn dot_pq2_four_rows_four_tokens_precomputed(
     packed: [&[u8; 32]; 4],
     planes: [&[i8; 128]; 4],

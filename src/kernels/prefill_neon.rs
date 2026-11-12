@@ -492,7 +492,6 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
     decoded_blocks: &mut u64,
 ) -> Option<crate::Result<[[f32; TOKENS]; 4]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut sums = [[0.0_f32; TOKENS]; 4];
     let r0 = rows[0].as_chunks::<34>().0;
     let r1 = rows[1].as_chunks::<34>().0;
@@ -501,6 +500,11 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
     let has_precomputed = preparations
         .iter()
         .all(|scratch| scratch.pq2_consumption.len() >= r0.len());
+    let dotprod = if has_precomputed {
+        preparations.first()?.pq2_consumption.dotprod
+    } else {
+        bonsai_neon_dot::Pq2Dotprod::detect()
+    };
     for (index, (((b0, b1), b2), b3)) in r0.iter().zip(r1).zip(r2).zip(r3).enumerate() {
         let scales_vec = crate::kernels::neon::f16_bits_to_f32_x4(
             neon,
@@ -526,7 +530,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
         let start = half * 128;
         let q8k_idx = index / 2;
         let (chunks4, rem4) = preparations.as_chunks::<4>();
-        if use_dotprod {
+        if let Some(dotprod) = dotprod {
             for (chunk_idx, chunk) in chunks4.iter().enumerate() {
                 let base = chunk_idx * 4;
                 let (dots, act_scales) = if has_precomputed {
@@ -535,7 +539,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
                     let a2 = &chunk[2].pq2_consumption[index];
                     let a3 = &chunk[3].pq2_consumption[index];
                     (
-                        bonsai_neon_dot::dot_pq2_four_rows_four_tokens_precomputed(
+                        dotprod.dot_four_tokens(
                             packed_rows,
                             [&a0.values, &a1.values, &a2.values, &a3.values],
                             [a0.sum, a1.sum, a2.sum, a3.sum],
@@ -584,11 +588,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
                 let (dots, act_scale) = if has_precomputed {
                     let act_block = &scratch.pq2_consumption[index];
                     (
-                        bonsai_neon_dot::dot_pq2_four_consumption_precomputed(
-                            packed_rows,
-                            &act_block.values,
-                            act_block.sum,
-                        ),
+                        dotprod.dot_four(packed_rows, &act_block.values, act_block.sum),
                         act_block.scale,
                     )
                 } else {
@@ -745,12 +745,16 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
     decoded_blocks: &mut u64,
 ) -> Option<crate::Result<[[f32; TOKENS]; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut sums = [[0.0_f32; TOKENS]; 8];
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
     let has_precomputed = preparations
         .iter()
         .all(|scratch| scratch.pq2_consumption.len() >= chunks[0].len());
+    let dotprod = if has_precomputed {
+        preparations.first()?.pq2_consumption.dotprod
+    } else {
+        bonsai_neon_dot::Pq2Dotprod::detect()
+    };
     for index in 0..chunks[0].len() {
         let b0 = &chunks[0][index];
         let b1 = &chunks[1][index];
@@ -805,7 +809,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
         let start = half * 128;
         let q8k_idx = index / 2;
         let (chunks8, rem8) = preparations.as_chunks::<8>();
-        if use_dotprod {
+        if let Some(dotprod) = dotprod {
             let packed_all: [&[u8; 32]; 8] = [
                 packed_lo[0],
                 packed_lo[1],
@@ -828,7 +832,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     let a6 = &chunk[6].pq2_consumption[index];
                     let a7 = &chunk[7].pq2_consumption[index];
                     (
-                        bonsai_neon_dot::dot_pq2_eight_rows_eight_tokens_precomputed(
+                        dotprod.dot_eight_tokens(
                             packed_all,
                             [
                                 &a0.values, &a1.values, &a2.values, &a3.values, &a4.values,
@@ -911,7 +915,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     let a3 = &chunk[3].pq2_consumption[index];
                     let act_scales =
                         f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]);
-                    let dots8 = bonsai_neon_dot::dot_pq2_eight_rows_four_tokens_precomputed(
+                    let dots8 = dotprod.dot_eight_rows_four_tokens(
                         packed_all,
                         [&a0.values, &a1.values, &a2.values, &a3.values],
                         [a0.sum, a1.sum, a2.sum, a3.sum],
@@ -970,11 +974,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                 let token = rem_base + offset;
                 if has_precomputed {
                     let act_block = &scratch.pq2_consumption[index];
-                    let dots8 = bonsai_neon_dot::dot_pq2_eight_consumption_precomputed(
-                        packed_all,
-                        &act_block.values,
-                        act_block.sum,
-                    );
+                    let dots8 = dotprod.dot_eight(packed_all, &act_block.values, act_block.sum);
                     for row in 0..8 {
                         let d = row_scales[row] * act_block.scale;
                         let dot_f32 = crate::kernels::integer_float(dots8[row]);

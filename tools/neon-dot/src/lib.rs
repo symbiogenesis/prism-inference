@@ -28,14 +28,16 @@ pub fn has_dotprod() -> bool {
     }
 }
 
-/// Detected `SDOT` support reusable across packed PQ2 rows and blocks.
+/// Detected `SDOT` support and optional `I8MM` selection reusable across PQ2 blocks.
 ///
-/// Construction checks CPU/OS eligibility once. The private field prevents safe
+/// Construction checks CPU/OS eligibility once. Private fields prevent safe
 /// callers from creating a capability without that check; copying it preserves
 /// the same process-wide feature eligibility as the ordinary dispatch APIs.
 #[derive(Clone, Copy, Debug)]
 pub struct Pq2Dotprod {
     _detected: (),
+    #[cfg(target_arch = "aarch64")]
+    i8mm: bool,
 }
 
 impl Pq2Dotprod {
@@ -43,7 +45,14 @@ impl Pq2Dotprod {
     #[inline]
     #[must_use]
     pub fn detect() -> Option<Self> {
-        has_dotprod().then_some(Self { _detected: () })
+        let detected = has_dotprod();
+        #[cfg(target_arch = "aarch64")]
+        let i8mm = detected && has_i8mm();
+        detected.then_some(Self {
+            _detected: (),
+            #[cfg(target_arch = "aarch64")]
+            i8mm,
+        })
     }
 
     /// Computes one exact unsigned-code dot minus the supplied activation sum.
@@ -95,6 +104,75 @@ impl Pq2Dotprod {
         #[cfg(not(target_arch = "aarch64"))]
         {
             packed.map(|row| self.dot(row, planes, activation_sum))
+        }
+    }
+
+    /// Computes an exact 4-row by 4-token tile using detected `I8MM` or `SDOT`.
+    ///
+    /// Activations use the same pre-deinterleaved digit planes as [`Self::dot`].
+    #[inline]
+    #[must_use]
+    pub fn dot_four_tokens(
+        self,
+        packed: [&[u8; 32]; 4],
+        planes: [&[i8; 128]; 4],
+        activation_sums: [i32; 4],
+    ) -> [[i32; 4]; 4] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_four_tokens(self, packed, planes, activation_sums)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| {
+                std::array::from_fn(|token| self.dot(row, planes[token], activation_sums[token]))
+            })
+        }
+    }
+
+    /// Computes an exact 8-row by 4-token tile using detected `I8MM` or `SDOT`.
+    ///
+    /// Activations use the same pre-deinterleaved digit planes as [`Self::dot`].
+    #[inline]
+    #[must_use]
+    pub fn dot_eight_rows_four_tokens(
+        self,
+        packed: [&[u8; 32]; 8],
+        planes: [&[i8; 128]; 4],
+        activation_sums: [i32; 4],
+    ) -> [[i32; 4]; 8] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_eight_rows_four_tokens(self, packed, planes, activation_sums)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| {
+                std::array::from_fn(|token| self.dot(row, planes[token], activation_sums[token]))
+            })
+        }
+    }
+
+    /// Computes an exact 8-row by 8-token tile using detected `I8MM` or `SDOT`.
+    ///
+    /// Activations use the same pre-deinterleaved digit planes as [`Self::dot`].
+    #[inline]
+    #[must_use]
+    pub fn dot_eight_tokens(
+        self,
+        packed: [&[u8; 32]; 8],
+        planes: [&[i8; 128]; 8],
+        activation_sums: [i32; 8],
+    ) -> [[i32; 8]; 8] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_eight_tokens(self, packed, planes, activation_sums)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| {
+                std::array::from_fn(|token| self.dot(row, planes[token], activation_sums[token]))
+            })
         }
     }
 }
@@ -1109,6 +1187,34 @@ mod tests {
                 tile8x4[r],
                 [tile8[r][0], tile8[r][1], tile8[r][2], tile8[r][3]]
             );
+        }
+
+        let detected = Pq2Dotprod::detect();
+        assert_eq!(detected.is_some(), has_dotprod());
+        if let Some(detected) = detected {
+            // Disabling I8MM on an eligible capability also exercises the SDOT
+            // tile kernels on machines where ordinary dispatch chooses I8MM.
+            #[cfg(target_arch = "aarch64")]
+            let sdot_only = Pq2Dotprod {
+                i8mm: false,
+                ..detected
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let sdot_only = detected;
+            for capability in [detected, sdot_only] {
+                assert_eq!(
+                    capability.dot_eight_tokens(row_refs8, plane_refs8, sums),
+                    tile8
+                );
+                assert_eq!(
+                    capability.dot_four_tokens(row_refs4, plane_refs4, sums4),
+                    tile4
+                );
+                assert_eq!(
+                    capability.dot_eight_rows_four_tokens(row_refs8, plane_refs4, sums4),
+                    tile8x4
+                );
+            }
         }
     }
 

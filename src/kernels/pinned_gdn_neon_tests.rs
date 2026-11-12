@@ -870,3 +870,155 @@ fn x1_gdn_second_four_row_phase_keeps_atomic_refusal_and_scalar_failure_bits() -
     }
     Ok(())
 }
+
+#[test]
+fn x1_gdn_prefill_four_row_phases_match_scalar_and_repeated_decode_bits() -> Result<()> {
+    for width in [16, 112, 128, 144, 256] {
+        for count in [1, 2, 7, 32, 64] {
+            let keys: Vec<_> = (0..count)
+                .map(|token| {
+                    let mut key = values(width);
+                    key.rotate_left(token % width);
+                    key
+                })
+                .collect();
+            let queries: Vec<_> = (0..count)
+                .map(|token| {
+                    let mut query = values(width);
+                    query.rotate_right((token + 1) % width);
+                    query
+                })
+                .collect();
+            let token_values: Vec<_> = (0..count)
+                .map(|token| {
+                    let mut value = values(8);
+                    value[token % 8] = -0.0;
+                    value
+                })
+                .collect();
+            let inputs: Vec<_> = (0..count)
+                .map(|token| ChunkInput {
+                    key: &keys[token],
+                    query: &queries[token],
+                    value: &token_values[token],
+                    decay: [0.875, -0.0, -0.25, 1.0][token % 4],
+                    beta: [0.625, 0.0, -0.0, 0.375][token % 4],
+                })
+                .collect();
+            let mut previous = values(width * 8);
+            previous[0] = -0.0;
+            previous[4 * width] = f32::from_bits(1);
+            previous[8 * width - 1] = -f32::MIN_POSITIVE;
+            let mut expected = previous.clone();
+            let mut expected_output = vec![-3.0; count * width];
+            for (row, state) in expected.chunks_exact_mut(width).enumerate() {
+                oracle_row(state, &inputs, row, width, &mut expected_output)?;
+            }
+            let mut repeated = previous.clone();
+            for (token, input) in inputs.iter().enumerate() {
+                let before = repeated;
+                repeated = vec![-5.0; width * 8];
+                let output = super::step_eight_rows_from(
+                    std::array::from_fn(|row| &before[row * width..(row + 1) * width]),
+                    mutable_rows(&mut repeated, width)?,
+                    input.key,
+                    input.query,
+                    input.decay,
+                    std::array::from_fn(|row| input.value[row]),
+                    input.beta,
+                )
+                .ok_or_else(|| invalid("eight-row decode control refused"))?;
+                let expected = &expected_output[token * width..token * width + 8];
+                assert_eq!(bits(&output.map(|value| value * 0.125)), bits(expected));
+            }
+            assert_eq!(bits(&repeated), bits(&expected));
+            let mut actual = vec![-5.0; width * 8];
+            let mut output = vec![-3.0; count * width];
+            assert!(grouped_from(
+                &previous,
+                &mut actual,
+                8,
+                width,
+                &inputs,
+                &mut output
+            )?);
+            assert_eq!(bits(&actual), bits(&expected));
+            assert_eq!(bits(&output), bits(&expected_output));
+            let mut in_place = previous;
+            assert!(grouped_in_place(&mut in_place, 8, width, &inputs)?);
+            assert_eq!(bits(&in_place), bits(&expected));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn x1_gdn_prefill_second_phase_late_failure_keeps_all_destinations_untouched() -> Result<()> {
+    for width in [16, 128, 144, 256] {
+        for failing_row in [4, 7] {
+            for failing_token in [0, 2, 6] {
+                for failure in 0..3 {
+                    let count = 7;
+                    let mut previous = vec![0.0; width * 8];
+                    let mut keys = vec![vec![0.0; width]; count];
+                    let mut queries = vec![vec![0.0; width]; count];
+                    let mut token_values = vec![[0.0; 8]; count];
+                    match failure {
+                        0 => {
+                            previous[(failing_row + 1) * width - 1] = f32::MAX;
+                            keys[failing_token][width - 1] = 4.0;
+                        }
+                        1 => {
+                            token_values[failing_token][failing_row] = f32::MAX;
+                            keys[failing_token][width - 1] = 4.0;
+                        }
+                        _ => {
+                            token_values[failing_token][failing_row] = 1.0;
+                            keys[failing_token].fill(1.0);
+                            queries[failing_token].fill(f32::MAX);
+                        }
+                    }
+                    let inputs: Vec<_> = (0..count)
+                        .map(|token| ChunkInput {
+                            key: &keys[token],
+                            query: &queries[token],
+                            value: &token_values[token],
+                            decay: 1.0,
+                            beta: if token == failing_token { 1.0 } else { 0.0 },
+                        })
+                        .collect();
+                    let mut oracle =
+                        previous[failing_row * width..(failing_row + 1) * width].to_vec();
+                    assert!(
+                        oracle_row(
+                            &mut oracle,
+                            &inputs,
+                            failing_row,
+                            width,
+                            &mut vec![-3.0; count * width]
+                        )
+                        .is_err()
+                    );
+                    let mut actual = vec![-5.0; width * 8];
+                    let untouched = bits(&actual);
+                    let mut output = vec![-3.0; count * width];
+                    let untouched_output = bits(&output);
+                    assert!(!grouped_from(
+                        &previous,
+                        &mut actual,
+                        8,
+                        width,
+                        &inputs,
+                        &mut output
+                    )?);
+                    assert_eq!(bits(&actual), untouched);
+                    assert_eq!(bits(&output), untouched_output);
+                    let mut in_place = previous.clone();
+                    assert!(!grouped_in_place(&mut in_place, 8, width, &inputs)?);
+                    assert_eq!(bits(&in_place), bits(&previous));
+                }
+            }
+        }
+    }
+    Ok(())
+}

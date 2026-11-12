@@ -1005,6 +1005,52 @@ fn decay_four_rows_from_blocks<const BLOCKS: usize>(
 }
 
 #[inline]
+fn decay_four_rows_blocks<const BLOCKS: usize>(
+    neon: Neon,
+    work: &mut [[[f32x4<Neon>; 4]; BLOCKS]; 4],
+    key: &[f32],
+    decay: f32,
+    values: [f32; 4],
+    beta: f32,
+) -> Option<[f32; 4]> {
+    let decays = f32x4::splat(neon, decay);
+    let mut s0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s1 = [f32x4::splat(neon, 0.0); 4];
+    let mut s2 = [f32x4::splat(neon, 0.0); 4];
+    let mut s3 = [f32x4::splat(neon, 0.0); 4];
+
+    for (b, key_block) in key.as_chunks::<16>().0.iter().enumerate() {
+        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+        for r in 0..4 {
+            let [c0, c1, c2, c3] = work[r][b];
+            let d0 = c0 * decays;
+            let d1 = c1 * decays;
+            let d2 = c2 * decays;
+            let d3 = c3 * decays;
+            work[r][b] = [d0, d1, d2, d3];
+            s0[r] = d0.mul_add_precise(k0, s0[r]);
+            s1[r] = d1.mul_add_precise(k1, s1[r]);
+            s2[r] = d2.mul_add_precise(k2, s2[r]);
+            s3[r] = d3.mul_add_precise(k3, s3[r]);
+        }
+    }
+
+    let mut scales = [0.0; 4];
+    for r in 0..4 {
+        let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
+        if !dot_k.is_finite() {
+            return None;
+        }
+        scales[r] = (values[r] - dot_k) * beta;
+    }
+
+    Some(scales)
+}
+
+#[inline]
 fn update_four_rows_blocks<const BLOCKS: usize>(
     neon: Neon,
     work: &mut [[[f32x4<Neon>; 4]; BLOCKS]; 4],
@@ -1013,6 +1059,19 @@ fn update_four_rows_blocks<const BLOCKS: usize>(
     scales: [f32; 4],
 ) -> Option<[f32; 4]> {
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let output = update_four_rows_blocks_masked(neon, work, key, query, scales, &mut finite_mask)?;
+    finite_mask.all_true().then_some(output)
+}
+
+#[inline]
+fn update_four_rows_blocks_masked<const BLOCKS: usize>(
+    neon: Neon,
+    work: &mut [[[f32x4<Neon>; 4]; BLOCKS]; 4],
+    key: &[f32],
+    query: &[f32],
+    scales: [f32; 4],
+    finite_mask: &mut fearless_simd::mask32x4<Neon>,
+) -> Option<[f32; 4]> {
     let scales = scales.map(|scale| f32x4::splat(neon, scale));
     let mut q0 = [f32x4::splat(neon, 0.0); 4];
     let mut q1 = [f32x4::splat(neon, 0.0); 4];
@@ -1041,7 +1100,7 @@ fn update_four_rows_blocks<const BLOCKS: usize>(
             let u1 = scale.mul_add_precise(k1, d1);
             let u2 = scale.mul_add_precise(k2, d2);
             let u3 = scale.mul_add_precise(k3, d3);
-            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
+            *finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
             work[r][b] = [u0, u1, u2, u3];
             q0[r] = u0.mul_add_precise(qv0, q0[r]);
             q1[r] = u1.mul_add_precise(qv1, q1[r]);
@@ -1057,10 +1116,6 @@ fn update_four_rows_blocks<const BLOCKS: usize>(
             return None;
         }
         outputs[r] = out;
-    }
-
-    if !finite_mask.all_true() {
-        return None;
     }
 
     Some(outputs)
@@ -1356,78 +1411,45 @@ fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
     let mut staged_out = [[0.0_f32; 64]; 8];
 
     for (token, input) in inputs.iter().enumerate() {
-        let decays = f32x4::splat(neon, input.decay);
-        let mut s0 = [f32x4::splat(neon, 0.0); 8];
-        let mut s1 = [f32x4::splat(neon, 0.0); 8];
-        let mut s2 = [f32x4::splat(neon, 0.0); 8];
-        let mut s3 = [f32x4::splat(neon, 0.0); 8];
-        for (b, key_block) in input.key.as_chunks::<16>().0.iter().enumerate() {
-            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-            for r in 0..8 {
-                let [c0, c1, c2, c3] = current[r][b];
-                let d0 = c0 * decays;
-                let d1 = c1 * decays;
-                let d2 = c2 * decays;
-                let d3 = c3 * decays;
-                current[r][b] = [d0, d1, d2, d3];
-                s0[r] = d0.mul_add_precise(k0, s0[r]);
-                s1[r] = d1.mul_add_precise(k1, s1[r]);
-                s2[r] = d2.mul_add_precise(k2, s2[r]);
-                s3[r] = d3.mul_add_precise(k3, s3[r]);
-            }
-        }
-        let mut scales = [f32x4::splat(neon, 0.0); 8];
-        for r in 0..8 {
-            let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
-            if !dot_k.is_finite() {
-                return false;
-            }
-            scales[r] = f32x4::splat(neon, (input.value[row + r] - dot_k) * input.beta);
-        }
-        let mut q0 = [f32x4::splat(neon, 0.0); 8];
-        let mut q1 = [f32x4::splat(neon, 0.0); 8];
-        let mut q2 = [f32x4::splat(neon, 0.0); 8];
-        let mut q3 = [f32x4::splat(neon, 0.0); 8];
-        for (b, (key_block, query_block)) in input
-            .key
-            .as_chunks::<16>()
+        // Keep all eight key dots ahead of every update. Each arithmetic
+        // phase owns only sixteen FMA accumulators, leaving registers for the
+        // shared inputs while the eight-row transaction remains private.
+        let mut scales = [[0.0; 4]; 2];
+        for (group, (work, scales)) in current
+            .as_chunks_mut::<4>()
             .0
-            .iter()
-            .zip(input.query.as_chunks::<16>().0)
+            .iter_mut()
+            .zip(&mut scales)
             .enumerate()
         {
-            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-            let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
-            let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
-            let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
-            let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
-            for r in 0..8 {
-                let [d0, d1, d2, d3] = current[r][b];
-                let delta = scales[r];
-                let u0 = delta.mul_add_precise(k0, d0);
-                let u1 = delta.mul_add_precise(k1, d1);
-                let u2 = delta.mul_add_precise(k2, d2);
-                let u3 = delta.mul_add_precise(k3, d3);
-                finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
-                current[r][b] = [u0, u1, u2, u3];
-                q0[r] = u0.mul_add_precise(qv0, q0[r]);
-                q1[r] = u1.mul_add_precise(qv1, q1[r]);
-                q2[r] = u2.mul_add_precise(qv2, q2[r]);
-                q3[r] = u3.mul_add_precise(qv3, q3[r]);
-            }
-        }
-        for r in 0..8 {
-            let out = ((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum();
-            if !out.is_finite() {
+            let values = std::array::from_fn(|r| input.value[row + group * 4 + r]);
+            let Some(values) =
+                decay_four_rows_blocks(neon, work, input.key, input.decay, values, input.beta)
+            else {
                 return false;
+            };
+            *scales = values;
+        }
+        for (group, (work, scales)) in current
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(scales)
+            .enumerate()
+        {
+            let Some(values) = update_four_rows_blocks_masked(
+                neon,
+                work,
+                input.key,
+                input.query,
+                scales,
+                &mut finite_mask,
+            ) else {
+                return false;
+            };
+            for (r, value) in values.into_iter().enumerate() {
+                staged_out[group * 4 + r][token] = value * scale;
             }
-            staged_out[r][token] = out * scale;
         }
     }
 
@@ -1623,74 +1645,36 @@ fn step_eight_rows_tokens_in_place_blocks<const BLOCKS: usize>(
     }
 
     for input in inputs {
-        let decays = f32x4::splat(neon, input.decay);
-        let mut s0 = [f32x4::splat(neon, 0.0); 8];
-        let mut s1 = [f32x4::splat(neon, 0.0); 8];
-        let mut s2 = [f32x4::splat(neon, 0.0); 8];
-        let mut s3 = [f32x4::splat(neon, 0.0); 8];
-        for (b, key_block) in input.key.as_chunks::<16>().0.iter().enumerate() {
-            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-            for r in 0..8 {
-                let [c0, c1, c2, c3] = current[r][b];
-                let d0 = c0 * decays;
-                let d1 = c1 * decays;
-                let d2 = c2 * decays;
-                let d3 = c3 * decays;
-                current[r][b] = [d0, d1, d2, d3];
-                s0[r] = d0.mul_add_precise(k0, s0[r]);
-                s1[r] = d1.mul_add_precise(k1, s1[r]);
-                s2[r] = d2.mul_add_precise(k2, s2[r]);
-                s3[r] = d3.mul_add_precise(k3, s3[r]);
-            }
-        }
-        let mut scales = [f32x4::splat(neon, 0.0); 8];
-        for r in 0..8 {
-            let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
-            if !dot_k.is_finite() {
-                return false;
-            }
-            scales[r] = f32x4::splat(neon, (input.value[row + r] - dot_k) * input.beta);
-        }
-        let mut q0 = [f32x4::splat(neon, 0.0); 8];
-        let mut q1 = [f32x4::splat(neon, 0.0); 8];
-        let mut q2 = [f32x4::splat(neon, 0.0); 8];
-        let mut q3 = [f32x4::splat(neon, 0.0); 8];
-        for (b, (key_block, query_block)) in input
-            .key
-            .as_chunks::<16>()
+        // Keep all eight key dots ahead of every update. Each arithmetic
+        // phase owns only sixteen FMA accumulators, leaving registers for the
+        // shared inputs while the eight-row transaction remains private.
+        let mut scales = [[0.0; 4]; 2];
+        for (group, (work, scales)) in current
+            .as_chunks_mut::<4>()
             .0
-            .iter()
-            .zip(input.query.as_chunks::<16>().0)
+            .iter_mut()
+            .zip(&mut scales)
             .enumerate()
         {
-            let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-            let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-            let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-            let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-            let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
-            let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
-            let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
-            let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
-            for r in 0..8 {
-                let [d0, d1, d2, d3] = current[r][b];
-                let delta = scales[r];
-                let u0 = delta.mul_add_precise(k0, d0);
-                let u1 = delta.mul_add_precise(k1, d1);
-                let u2 = delta.mul_add_precise(k2, d2);
-                let u3 = delta.mul_add_precise(k3, d3);
-                finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
-                current[r][b] = [u0, u1, u2, u3];
-                q0[r] = u0.mul_add_precise(qv0, q0[r]);
-                q1[r] = u1.mul_add_precise(qv1, q1[r]);
-                q2[r] = u2.mul_add_precise(qv2, q2[r]);
-                q3[r] = u3.mul_add_precise(qv3, q3[r]);
-            }
+            let values = std::array::from_fn(|r| input.value[row + group * 4 + r]);
+            let Some(values) =
+                decay_four_rows_blocks(neon, work, input.key, input.decay, values, input.beta)
+            else {
+                return false;
+            };
+            *scales = values;
         }
-        for r in 0..8 {
-            if !((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum().is_finite() {
+        for (work, scales) in current.as_chunks_mut::<4>().0.iter_mut().zip(scales) {
+            if update_four_rows_blocks_masked(
+                neon,
+                work,
+                input.key,
+                input.query,
+                scales,
+                &mut finite_mask,
+            )
+            .is_none()
+            {
                 return false;
             }
         }

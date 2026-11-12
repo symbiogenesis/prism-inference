@@ -153,11 +153,11 @@ fn add_descriptions(
         })
         .collect::<Result<Vec<_>>>();
     if let Ok(tokens) = tokens {
-        // Each add_tokens call clones the existing descriptors and rebuilds two
-        // Aho-Corasick tries, even when a publisher descriptor is unchanged.
+        // Each add_tokens call updates the existing descriptors and rebuilds
+        // token matchers, even when a publisher descriptor is unchanged.
         // Unique contents have independent ID/flag overlays, so construct the
         // identical ordered token tables and matching tries only once.
-        tokenizer.add_tokens(&tokens);
+        tokenizer.add_tokens(tokens.iter().cloned())?;
         for ((id, _), token) in descriptions.iter().zip(tokens) {
             if tokenizer.token_to_id(&token.content) != Some(*id) {
                 return Err(invalid(
@@ -171,10 +171,10 @@ fn add_descriptions(
         for (id, value) in descriptions {
             let content =
                 token_content(value).ok_or_else(|| invalid("HF added-token content missing"))?;
-            tokenizer.add_tokens(&[added_token(
+            tokenizer.add_tokens([added_token(
                 value,
                 specials.iter().any(|token| token == content),
-            )?]);
+            )?])?;
             if tokenizer.token_to_id(content) != Some(*id) {
                 return Err(invalid(
                     "HF added-token ID differs from publisher descriptor",
@@ -316,7 +316,7 @@ impl Reference {
                 .map(|token| AddedToken::from(token.as_str(), true))
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
-                tokenizer.add_special_tokens(&missing);
+                tokenizer.add_special_tokens(missing)?;
             }
             let mut ids = tokenizer
                 .get_added_tokens_decoder()
@@ -697,10 +697,10 @@ mod tests {
                 for (id, value) in &descriptions {
                     let content = token_content(value)
                         .ok_or_else(|| invalid("HF added-token content missing"))?;
-                    scalar.add_tokens(&[added_token(
+                    scalar.add_tokens([added_token(
                         value,
                         specials.iter().any(|token| token == content),
-                    )?]);
+                    )?])?;
                     if scalar.token_to_id(content) != Some(*id) {
                         return Err(invalid(
                             "HF added-token ID differs from publisher descriptor",

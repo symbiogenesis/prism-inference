@@ -28,6 +28,24 @@ pub(super) fn dot_neon<const HEADS: usize>(
     }
     let vector_steps = key.len() - remainder.len();
     let mut output = [0.0; HEADS];
+    // Swift's complete 16-element key blocks need no scalar tail. Keep the
+    // four native registers through padding and the original reduction tree,
+    // rather than extracting sixteen lanes per head before adding them.
+    if key.len().is_multiple_of(16) {
+        let padded = padded_dot_steps(key.len()) != key.len();
+        for (mut sum, output) in sums.into_iter().zip(&mut output) {
+            if padded {
+                // An aligned row's retained masked cycle visits every lane
+                // once. Preserve the +0 FMA that normalizes a possible -0.
+                for register in &mut sum {
+                    *register = zero.mul_add_precise(zero, *register);
+                }
+            }
+            let lanes = ((sum[0] + sum[2]) + (sum[1] + sum[3])).to_array();
+            *output = crate::kernels::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+        return Ok(output);
+    }
     for (head, (sum, output)) in sums.into_iter().zip(&mut output).enumerate() {
         let mut scalar = sum.map(f32x4::to_array);
         for index in vector_steps..padded_dot_steps(key.len()) {

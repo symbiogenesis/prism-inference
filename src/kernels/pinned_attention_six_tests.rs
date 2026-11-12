@@ -31,6 +31,63 @@ fn six_head_scores_match_independent_native_lanes_and_tails() -> crate::Result<(
 }
 
 #[test]
+fn six_head_aligned_scores_keep_native_vector_reduction_bits() -> crate::Result<()> {
+    // The scalar iterator helper retains the old independent four-register
+    // finish. Include aligned masked cycles, no padding, and scalar tails.
+    let key_pattern = [
+        0x0000, 0x8000, 0x0001, 0x8001, 0x3c00, 0xbc00, 0x7bff, 0xfbff,
+    ];
+    let query_pattern = [
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::from_bits(0x3f80_0001),
+        -f32::from_bits(0x3f80_0001),
+        0.25,
+        -0.25,
+    ];
+    for width in [
+        1, 7, 15, 16, 17, 31, 32, 64, 128, 240, 255, 256, 257, 272, 512,
+    ] {
+        for shift in 0..key_pattern.len() {
+            let key: Vec<_> = (0..width)
+                .map(|index| key_pattern[(index + shift) % key_pattern.len()])
+                .collect();
+            let queries: [Vec<f32>; 12] = std::array::from_fn(|head| {
+                (0..width)
+                    .map(|index| query_pattern[(index * 3 + head + shift) % query_pattern.len()])
+                    .collect()
+            });
+            let first = std::array::from_fn(|head| queries[head].as_slice());
+            let second = std::array::from_fn(|head| queries[head + 6].as_slice());
+            let paired = dot_pair(&key, [first, second])?;
+            assert_eq!(
+                dot(&key, first)?.map(f32::to_bits),
+                paired[0].map(f32::to_bits)
+            );
+            for (head, query) in queries.iter().enumerate() {
+                let expected = super::super::dot(key.iter().copied().map(half_to_float), query)?;
+                assert_eq!(
+                    paired[head / 6][head % 6].to_bits(),
+                    expected.to_bits(),
+                    "width {width}, shift {shift}, head {head}"
+                );
+            }
+        }
+    }
+    for width in [16, 32, 128, 256] {
+        let key = vec![0x3c00; width];
+        let mut queries: [Vec<f32>; 6] = std::array::from_fn(|_| vec![1.0; width]);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+            queries[5].fill(value);
+            assert!(dot(&key, queries.each_ref().map(Vec::as_slice)).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn six_head_values_match_independent_channels_and_visit_each_row_once() -> crate::Result<()> {
     let pattern = [0, 0x8000, 1, 0x8001, 0x3555, 0xb555, 0x3c00, 0xbc00];
     for count in [1, 2, 15, 16, 17, 64, 65, 255, 256, 257] {

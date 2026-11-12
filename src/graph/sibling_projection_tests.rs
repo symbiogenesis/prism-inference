@@ -26,7 +26,7 @@ fn weight(name: &str, rows: usize) -> Tensor {
 #[test]
 fn cpu_sibling_projection_matches_independent_rows_and_retains_preparation() -> Result<()> {
     let geometry = Geometry {
-        width: 512,
+        embedding: 512,
         feed_forward: 512,
         heads: 1,
         kv_heads: 1,

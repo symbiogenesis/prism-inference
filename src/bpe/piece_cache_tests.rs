@@ -46,7 +46,7 @@ fn oracle(bpe: &Bpe, bytes: &[u8]) -> Result<Vec<u32>> {
 }
 
 #[test]
-fn piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges() -> Result<()> {
+fn x1_piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges() -> Result<()> {
     let bpe = fixture()?;
     let mut scratch = BpeScratch::default();
     for length in 1..=7 {
@@ -199,5 +199,89 @@ fn piece_cache_storage_and_public_piece_composition_remain_bounded() -> Result<(
             .is_err_and(|error| error.is::<crate::TokenLimitExceeded>())
     );
     assert_eq!(bpe.encode_pieces(&pieces, expected.len())?, expected);
+    Ok(())
+}
+
+#[test]
+fn x1_short_piece_stack_merges_match_ranked_oracle_across_cutoffs() -> Result<()> {
+    let bpe = fixture()?;
+    for length in [
+        1,
+        2,
+        7,
+        SHORT_PIECE_BYTES - 1,
+        SHORT_PIECE_BYTES,
+        SHORT_PIECE_BYTES + 1,
+        32,
+        33,
+    ] {
+        for round in 0..32 {
+            let piece = (0..length)
+                .map(|index| match round % 4 {
+                    0 => b'a',
+                    1 => b"abc"[(index + round) % 3],
+                    2 => [0, 255, 128, b'a', b'b', b'c'][(index * 17 + round) % 6],
+                    _ => b"aabcaabc"[(index * 7 + round) % 8],
+                })
+                .collect::<Vec<_>>();
+            let expected = oracle(&bpe, &piece)?;
+            let mut scratch = BpeScratch::default();
+            let mut output = vec![42];
+            assert!(
+                bpe.encode_piece_into(&piece, expected.len() - 1, &mut output, &mut scratch)
+                    .is_err_and(|error| error.is::<crate::TokenLimitExceeded>())
+            );
+            assert_eq!(output, [42]);
+            bpe.encode_piece_into(&piece, expected.len(), &mut output, &mut scratch)?;
+            assert_eq!(&output[1..], expected);
+            let uncached = scratch.uncached_pieces;
+            bpe.encode_piece_into(&piece, expected.len(), &mut output, &mut scratch)?;
+            assert_eq!(&output[expected.len() + 1..], expected);
+            assert_eq!(
+                scratch.uncached_pieces,
+                uncached + usize::from(length > PIECE_CACHE_BYTES)
+            );
+            if length <= SHORT_PIECE_BYTES {
+                assert_eq!(scratch.nodes.capacity(), 0);
+                assert_eq!(scratch.candidates.capacity(), 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn x1_short_piece_missing_byte_precedence_and_scratch_bound_remain_exact() -> Result<()> {
+    let mut bpe = fixture()?;
+    bpe.bytes[usize::from(b'x')] = None;
+    for length in [
+        1,
+        SHORT_PIECE_BYTES - 1,
+        SHORT_PIECE_BYTES,
+        SHORT_PIECE_BYTES + 1,
+    ] {
+        let mut piece = vec![b'a'; length];
+        piece[length - 1] = b'x';
+        for limit in [0, 1, length] {
+            let mut scratch = BpeScratch::default();
+            let mut output = vec![42];
+            let error = bpe
+                .encode_piece_into(&piece, limit, &mut output, &mut scratch)
+                .err()
+                .ok_or_else(|| invalid("missing byte unexpectedly admitted"))?;
+            assert!(!error.is::<crate::TokenLimitExceeded>());
+            assert_eq!(
+                error.to_string(),
+                "BPE input byte has no normal single-byte token"
+            );
+            assert_eq!(output, [42]);
+        }
+    }
+    // Bounded stack payload excludes codegen spills, which remain a separate
+    // ARM64 Release review; it adds no persistent cache or resource discount.
+    assert!(
+        size_of::<[u32; SHORT_PIECE_BYTES]>() + size_of::<[Option<Merge>; SHORT_PIECE_BYTES - 1]>()
+            <= 512
+    );
     Ok(())
 }

@@ -44,6 +44,9 @@ type Candidate = (usize, usize, usize, u32, u32, u32);
 
 const PIECE_CACHE_SLOTS: usize = 16;
 const PIECE_CACHE_BYTES: usize = 32;
+// Keep common uncached words off the linked-node/heap path. The bounded scan
+// performs at most 120 pair comparisons and uses no retained scratch storage.
+const SHORT_PIECE_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CachedPiece {
@@ -223,6 +226,8 @@ impl Bpe {
     /// No special tokens are recognized or inserted. Arbitrary UTF-8 and binary
     /// bytes are preserved; callers can recover the bytes with
     /// [`Vocabulary`](crate::vocabulary::Vocabulary).
+    /// Pieces of at most sixteen bytes merge in bounded stack storage without
+    /// node or candidate allocations. Larger pieces retain the heap path.
     /// The 64 KiB piece bound limits work to fewer than `3 * bytes.len()` heap
     /// insertions and `O(n log n)` comparisons, including stale candidates.
     /// Scratch allocations reserve for at most `n` nodes, `3 * n` candidates and
@@ -288,6 +293,9 @@ impl Bpe {
         {
             scratch.uncached_pieces += 1;
         }
+        if bytes.len() <= SHORT_PIECE_BYTES {
+            return self.encode_short(bytes, max_tokens, output);
+        }
         let BpeScratch {
             nodes, candidates, ..
         } = scratch;
@@ -347,6 +355,51 @@ impl Bpe {
             output.push(nodes[index].token);
             current = nodes[index].next;
         }
+        Ok(())
+    }
+
+    // Cache each live adjacency once, then refresh only the two pairs changed
+    // by a merge. Compact order is original left-position order, so selecting
+    // the first minimum rank preserves heap rank/leftmost ties exactly. Unlike
+    // a complete rescan oracle, unchanged pairs need no repeated hash lookup.
+    fn encode_short(&self, bytes: &[u8], max_tokens: usize, output: &mut Vec<u32>) -> Result<()> {
+        let mut tokens = [0; SHORT_PIECE_BYTES];
+        for (token, &byte) in tokens.iter_mut().zip(bytes) {
+            *token = self.bytes[usize::from(byte)]
+                .ok_or_else(|| invalid("BPE input byte has no normal single-byte token"))?;
+        }
+        let mut pairs = [None; SHORT_PIECE_BYTES - 1];
+        for (pair, adjacent) in pairs.iter_mut().zip(tokens[..bytes.len()].windows(2)) {
+            *pair = self.merges.get(&(adjacent[0], adjacent[1])).copied();
+        }
+        let mut remaining = bytes.len();
+        loop {
+            let next = pairs[..remaining - 1]
+                .iter()
+                .enumerate()
+                .filter_map(|(left, pair)| pair.map(|merge| (merge.rank, left, merge.token)))
+                .min_by_key(|&(rank, left, _)| (rank, left));
+            let Some((_, left, token)) = next else {
+                break;
+            };
+            tokens[left] = token;
+            tokens.copy_within(left + 2..remaining, left + 1);
+            if left + 2 < remaining {
+                pairs.copy_within(left + 2..remaining - 1, left + 1);
+            }
+            remaining -= 1;
+            if left != 0 {
+                pairs[left - 1] = self.merges.get(&(tokens[left - 1], tokens[left])).copied();
+            }
+            if left + 1 < remaining {
+                pairs[left] = self.merges.get(&(tokens[left], tokens[left + 1])).copied();
+            }
+        }
+        if remaining > max_tokens {
+            return Err(crate::TokenLimitExceeded.into());
+        }
+        output.try_reserve_exact(remaining)?;
+        output.extend_from_slice(&tokens[..remaining]);
         Ok(())
     }
 

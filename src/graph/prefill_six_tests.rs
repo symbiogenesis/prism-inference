@@ -236,7 +236,7 @@ fn x1_tiled_qkv_query_failure_precedes_all_key_value_chunks() -> Result<()> {
             }));
             assert_eq!(actual.keys.tokens().count(), actual.base);
             assert_eq!(actual.values.tokens().count(), actual.base);
-            assert!(actual.attention_scratch.scores.is_empty());
+            assert_eq!(actual.attention_scratch.scores, [0.0_f32; 0]);
         }
     }
     Ok(())
@@ -259,7 +259,7 @@ fn x1_tiled_qkv_keeps_earliest_key_value_chunk_and_recovers() -> Result<()> {
             }));
             assert_eq!(actual.keys.tokens().count(), actual.base);
             assert_eq!(actual.values.tokens().count(), actual.base);
-            assert!(actual.attention_scratch.scores.is_empty());
+            assert_eq!(actual.attention_scratch.scores, [0.0_f32; 0]);
             // An owner restores provisional inputs before reusing the stage.
             actual.tile.recurrent_gate = original_keys;
             actual.tile.beta = original_values;

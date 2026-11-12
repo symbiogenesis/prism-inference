@@ -9,7 +9,7 @@ use bonsai_prism_runtime::{
     Result,
     kernels::{MatvecBackend, RowParallelism},
     model::{lora::SWIFT_ADAPTER_SHA256, swift::Representation},
-    runtime::{Cancellation, Completion, Finish, GenerationTimings, PromptReuse},
+    runtime::{Cancellation, Completion, Finish, GenerationPhase, GenerationTimings, PromptReuse},
     swift_session::{SwiftSession, TextEvent},
 };
 use serde_json::{Value, json};
@@ -45,6 +45,7 @@ struct Selection {
 struct CapturedOutput {
     text: String,
     terminal: Option<Completion>,
+    first_text_delta_milliseconds: Option<f64>,
 }
 
 #[derive(Default)]
@@ -221,6 +222,15 @@ fn load_session(selection: &Selection) -> Result<SwiftSession> {
 }
 
 impl CapturedOutput {
+    fn push_observed(&mut self, event: TextEvent<'_>, elapsed: Duration) -> Result<()> {
+        let nonempty = matches!(&event, TextEvent::Delta(text) if !text.is_empty());
+        self.push(event)?;
+        if nonempty && self.first_text_delta_milliseconds.is_none() {
+            self.first_text_delta_milliseconds = Some(elapsed.as_secs_f64() * 1000.0);
+        }
+        Ok(())
+    }
+
     fn push(&mut self, event: TextEvent<'_>) -> Result<()> {
         if self.terminal.is_some() {
             return Err(reject("output arrived after terminal accounting"));
@@ -269,7 +279,7 @@ fn complete_request(
         &Cancellation::default(),
         selection.generation_deadline,
         &mut observation.timings,
-        |event| output.push(event),
+        |event| output.push_observed(event, started.elapsed()),
     );
     observation.request_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     observation.output = output;
@@ -350,6 +360,22 @@ const fn finish_name(finish: Finish) -> &'static str {
     }
 }
 
+fn phase_records(timings: &GenerationTimings) -> Vec<Value> {
+    GenerationPhase::ALL
+        .into_iter()
+        .map(|phase| {
+            let timing = timings.phase(phase);
+            json!({
+                "phase":phase.name(), "milliseconds":timing.elapsed.as_secs_f64() * 1000.0,
+                "attempted_calls":timing.attempted_calls, "completed_calls":timing.completed_calls,
+                "attempted_tokens":timing.attempted_tokens,
+                "completed_tokens_lower_bound":timing.completed_tokens_lower_bound,
+                "partial_progress_unknown":timing.partial_progress_unknown,
+            })
+        })
+        .collect()
+}
+
 fn identity_record(selection: &Selection, observation: &Observation) -> Value {
     json!({
         "schema_version":1, "kind":"swift-cpu-bundle-arm",
@@ -417,6 +443,15 @@ fn record(
     record["load_milliseconds"] = json!(observation.load_milliseconds);
     record["preparation_milliseconds"] = json!(observation.preparation_milliseconds);
     record["request_milliseconds"] = json!(observation.request_milliseconds);
+    record["first_text_delta_milliseconds"] =
+        json!(observation.output.first_text_delta_milliseconds);
+    record["first_text_delta_scope"] = json!(
+        "first accepted nonempty UTF-8 text callback measured from SwiftSession completion entry; includes prefill and sampling; not a model token timestamp"
+    );
+    record["generation_phases"] = json!(phase_records(&observation.timings));
+    record["generation_phases_scope"] = json!(
+        "runtime brackets include validation/allocation; sampling counts draws and callback counts provisional delivery units; completed_tokens_lower_bound is phase-specific, not generated output; phase sums exclude other request overhead"
+    );
     record["runtime_milliseconds"] = json!(
         observation
             .timings

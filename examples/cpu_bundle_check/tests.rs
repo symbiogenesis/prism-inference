@@ -30,6 +30,7 @@ fn complete_observation() -> Observation {
         output: CapturedOutput {
             text: "oak 🌳".to_owned(),
             terminal: Some(completion),
+            first_text_delta_milliseconds: Some(1.0),
         },
         ..Observation::default()
     };
@@ -108,6 +109,48 @@ fn output_rejects_overflow_and_any_delivery_after_terminal() -> Result<()> {
 }
 
 #[test]
+fn first_text_event_timing_ignores_empty_failed_and_subsequent_deliveries() -> Result<()> {
+    let mut output = CapturedOutput::default();
+    output.push_observed(TextEvent::Delta(""), Duration::from_millis(1))?;
+    assert!(output.first_text_delta_milliseconds.is_none());
+    assert!(
+        output
+            .push_observed(
+                TextEvent::Delta(&"x".repeat(MAX_OUTPUT_BYTES + 1)),
+                Duration::from_millis(2),
+            )
+            .is_err()
+    );
+    assert!(output.first_text_delta_milliseconds.is_none());
+    output.push_observed(TextEvent::Delta("oak"), Duration::from_millis(3))?;
+    let first = output.first_text_delta_milliseconds;
+    output.push_observed(TextEvent::Delta(" tree"), Duration::from_millis(4))?;
+    assert_eq!(
+        output.first_text_delta_milliseconds.map(f64::to_bits),
+        first.map(f64::to_bits),
+    );
+    assert_eq!(output.text, "oak tree");
+    let receipt = record(
+        &bounded_selection(),
+        &Observation {
+            output,
+            request_milliseconds: Some(5.0),
+            ..Observation::default()
+        },
+        false,
+        Duration::from_millis(6),
+    )?;
+    assert!(
+        receipt["first_text_delta_milliseconds"]
+            .as_f64()
+            .is_some_and(|value| (value - 3.0).abs() < f64::EPSILON)
+    );
+    assert_eq!(receipt["generated_tokens"], Value::Null);
+    assert_eq!(receipt["output_committed"], false);
+    Ok(())
+}
+
+#[test]
 fn completion_requires_matching_terminal_runtime_counts_and_nonempty_output() -> Result<()> {
     let mut observation = complete_observation();
     validate_completion(&observation, 16)?;
@@ -136,6 +179,11 @@ fn records_hash_exact_utf8_and_keep_unentered_counts_unknown() -> Result<()> {
         hex(hash_bytes("oak 🌳".as_bytes())?)
     );
     assert_eq!(completed["terminal_accounting_matches"], true);
+    assert!(
+        completed["first_text_delta_milliseconds"]
+            .as_f64()
+            .is_some_and(|value| (value - 1.0).abs() < f64::EPSILON)
+    );
     let unentered = record(&selection, &Observation::default(), false, Duration::ZERO)?;
     for field in [
         "prompt_tokens",
@@ -144,6 +192,7 @@ fn records_hash_exact_utf8_and_keep_unentered_counts_unknown() -> Result<()> {
         "output_text",
         "output_sha256",
         "runtime_milliseconds",
+        "first_text_delta_milliseconds",
     ] {
         assert!(unentered[field].is_null());
     }

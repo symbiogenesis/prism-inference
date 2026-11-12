@@ -1281,7 +1281,8 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         // Keep that full conservative reservation; do not lower admission.
         let batch_limit = if resident.is_some() {
             self.scratch_weights = Vec::new();
-            weights = Vec::new();
+            // Release packing storage before charging the batched output buffer.
+            drop(std::mem::take(&mut weights));
             let limit = self.submitter.maximum_resident_token_batch();
             if matches!(limit, 2..=4 | 8) { limit } else { 1 }
         } else {
@@ -5084,7 +5085,7 @@ mod tests {
                         assert_eq!(output.len(), 128);
                         assert_eq!(
                             output[0],
-                            f32::from(token) * 384.0 + if add { 2.0 } else { 0.0 }
+                            f32::from(token).mul_add(384.0, if add { 2.0 } else { 0.0 })
                         );
                     }
                     assert_eq!(

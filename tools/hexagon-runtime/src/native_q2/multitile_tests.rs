@@ -437,7 +437,8 @@ fn native_q2_multitile_tokens_reject_invalid_input_before_submission() -> Result
             assert!(executor.is_faulted());
             assert_eq!(executor.statistics().operations_attempted, 0);
             assert_eq!(executor.residency_statistics().tensors_prepared, 0);
-            assert_eq!(executor.submitter.activations, [] as [Vec<f32>; 0]);
+            let no_activations: [Vec<f32>; 0] = [];
+            assert_eq!(executor.submitter.activations, no_activations);
         }
     }
     Ok(())

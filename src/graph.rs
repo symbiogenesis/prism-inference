@@ -32,6 +32,7 @@ pub use prefill::TiledPrefillStatistics;
 #[path = "graph/attention_preparation_tests.rs"]
 mod attention_preparation_tests;
 mod attention_six;
+mod ffn_preparation;
 
 /// Maximum admitted live KV/recurrent element payload, also the default budget.
 ///
@@ -3020,6 +3021,23 @@ impl Evaluation<'_, '_> {
             }
         }
         self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
+        if self.adapter.is_some()
+            && self.transforms.basis(down_weight) == (true, false)
+            && self.transforms.can_block_hadamard(up.len())
+            && down_weight.dimensions.first().copied() == Some(up.len())
+        {
+            let signs = self.transforms.signs.get(&up.len()).map(Vec::as_slice);
+            self.arithmetic.swiglu_hadamard_preserving_up_into(
+                gate,
+                up,
+                self.transforms.block,
+                signs,
+                self.projection.matvec.row_parallelism(),
+                &mut self.projection.transformed,
+            )?;
+            self.projection.pre_transformed_len = Some(up.len());
+            return Ok(());
+        }
         if self.adapter.is_none()
             && self.transforms.basis(down_weight) == (true, false)
             && self.transforms.can_block_hadamard(up.len())

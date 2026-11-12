@@ -23,6 +23,10 @@ mod gdn;
 #[path = "prefill_six_tests.rs"]
 mod six_tests;
 
+#[cfg(test)]
+#[path = "prefill_ffn_tests.rs"]
+mod ffn_tests;
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct TileReuse<'a> {
     basis: Option<&'a Tensor>,
@@ -2026,6 +2030,57 @@ fn project_tile_ffn_swiglu<'a>(
     )?;
     let count = inputs.len();
     let up_len = up_outputs.first().map_or(0, Vec::len);
+    if adapter.is_some()
+        && up_len > 0
+        && transforms.basis(down) == (true, false)
+        && transforms.can_block_hadamard(up_len)
+        && down.dimensions.first().copied() == Some(up_len)
+    {
+        let signs = transforms.signs.get(&up_len).map(Vec::as_slice);
+        let block = transforms.block;
+        if count > 1 && projector.row_parallelism().workers() > 1 {
+            let single_worker = RowParallelism::default();
+            projector.row_parallelism().update_paired_chunks(
+                &mut up_outputs[..count],
+                1,
+                &mut transformed[..count],
+                1,
+                |base_tok, up_chunk, out_chunk| {
+                    for (offset, (up_out, target)) in up_chunk.iter_mut().zip(out_chunk).enumerate()
+                    {
+                        arithmetic.swiglu_hadamard_preserving_up_into(
+                            &gate_outputs[base_tok + offset],
+                            up_out,
+                            block,
+                            signs,
+                            &single_worker,
+                            target,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for ((up_out, gate_out), target) in up_outputs[..count]
+                .iter_mut()
+                .zip(&gate_outputs[..count])
+                .zip(&mut transformed[..count])
+            {
+                arithmetic.swiglu_hadamard_preserving_up_into(
+                    gate_out,
+                    up_out,
+                    block,
+                    signs,
+                    projector.row_parallelism(),
+                    target,
+                )?;
+            }
+        }
+        return Ok(TileReuse {
+            basis: Some(down),
+            prepared: None,
+        });
+    }
     if adapter.is_none()
         && up_len > 0
         && transforms.basis(down) == (true, false)

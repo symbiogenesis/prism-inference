@@ -52,7 +52,66 @@ pub struct Pq2Dotprod {
     i8mm: bool,
 }
 
+/// A borrowed, finite-scale PQ2 activation scope for complete-row execution.
+///
+/// Construction checks every activation scale once. The immutable borrow
+/// prevents changes or replacement while row workers share this scope; no
+/// pointer identity, allocation or retained activation copy is involved.
+#[derive(Clone, Copy)]
+pub struct Pq2Prepared<'a> {
+    detected: Pq2Dotprod,
+    activation: &'a [Pq2Activation],
+}
+
+impl Pq2Prepared<'_> {
+    /// Consumes one, four or eight complete rows using the validated scope.
+    ///
+    /// Row extents, packed weight scales and final results remain checked on
+    /// every call. Original integer correction and floating accumulation order
+    /// are identical to [`Pq2Dotprod::dot_scaled_rows`].
+    /// Returns `None` for unsupported geometry or nonfinite weights/results.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize, const FUSED: bool>(
+        self,
+        rows: [&[u8]; ROWS],
+    ) -> Option<[f32; ROWS]> {
+        if !scaled::valid_rows(rows, self.activation.len()) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_scaled_rows::<ROWS, FUSED>(self.detected, rows, self.activation)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_validated::<ROWS, FUSED>(rows, self.activation)
+        }
+    }
+}
+
 impl Pq2Dotprod {
+    /// Validates current activation scales once for any number of row groups.
+    ///
+    /// The returned scope borrows the activation slice immutably. Replacing or
+    /// clearing prepared activation storage requires dropping every scope first.
+    /// Returns `None` for empty input, overflowing extents or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled(self, activation: &[Pq2Activation]) -> Option<Pq2Prepared<'_>> {
+        if activation.is_empty()
+            || activation.len().checked_mul(34).is_none()
+            || !activation.iter().all(|block| block.scale.is_finite())
+        {
+            return None;
+        }
+        Some(Pq2Prepared {
+            detected: self,
+            activation,
+        })
+    }
+
     /// Consumes complete packed rows inside one detected `SDOT` invocation.
     ///
     /// Supports one, four or eight rows of original 34-byte PQ2 blocks. Every

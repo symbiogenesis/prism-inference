@@ -14,6 +14,25 @@ use crate::{Result, invalid};
     target_env = "msvc",
     target_feature = "neon"
 ))]
+#[path = "packed_pq2_scoped.rs"]
+mod scoped;
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+pub(super) use scoped::Consumer;
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
 pub(super) use bonsai_neon_dot::Pq2Activation as Activation;
 
 #[cfg(not(all(
@@ -622,6 +641,51 @@ mod native_tests {
 
     use super::{dot_eight_rows, dot_four_rows, dot_row, prepare};
     use crate::Result;
+
+    #[test]
+    fn x1_scoped_pq2_consumer_retains_baseline_rounding_and_failure() -> Result<()> {
+        let mut values = [3; 256];
+        values[128..].fill(-13);
+        let input = [Q8KBlock {
+            scale: f32::from_bits(0x3da0_0001),
+            values,
+            sums: [0; 16],
+        }];
+        let mut detected = super::Activations::default();
+        let mut baseline = super::Activations::default();
+        prepare(&input, &mut detected)?;
+        super::prepare_with_layout(&input, &mut baseline, true)?;
+        let mut weights = [0xaa; 68];
+        weights[..2].copy_from_slice(&0x3c01_u16.to_le_bytes());
+        weights[34..36].copy_from_slice(&0x3787_u16.to_le_bytes());
+        for activations in [&detected, &baseline] {
+            let consumer = super::Consumer::new(activations)?;
+            assert_eq!(consumer.dot_row::<true>(&weights)?.to_bits(), 0xc1f9_0b01);
+            assert_eq!(
+                consumer
+                    .dot_four_rows::<false>([&weights; 4])?
+                    .map(f32::to_bits),
+                [0xc1f9_0b02; 4]
+            );
+            assert_eq!(
+                consumer
+                    .dot_eight_rows::<true>([&weights; 8])?
+                    .map(f32::to_bits),
+                [0xc1f9_0b01; 8]
+            );
+            assert!(
+                consumer
+                    .dot_eight_rows::<true>([&weights[..67]; 8])
+                    .is_err()
+            );
+        }
+        weights[34..36].copy_from_slice(&0x7c01_u16.to_le_bytes());
+        let consumer = super::Consumer::new(&detected)?;
+        assert!(consumer.dot_row::<true>(&weights).is_err());
+        assert!(consumer.dot_four_rows::<false>([&weights; 4]).is_err());
+        assert!(consumer.dot_eight_rows::<true>([&weights; 8]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn x1_pq2_prepared_dispatch_matches_forced_baseline_and_clears_on_failure() -> Result<()> {

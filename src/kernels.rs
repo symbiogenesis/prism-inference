@@ -2219,7 +2219,7 @@ impl MatvecScratch {
             packed_pq2::prepare(&self.q8k, &mut self.pq2_consumption)?;
         }
         let pinned = self.pinned_accumulation;
-        let activations = &self.pq2_consumption;
+        let activations = packed_pq2::Consumer::new(&self.pq2_consumption)?;
         self.row_parallelism.fill_four_rows(
             data,
             row_bytes,
@@ -2227,23 +2227,23 @@ impl MatvecScratch {
             &mut self.row_errors,
             |rows| {
                 if pinned {
-                    packed_pq2::dot_eight_rows::<true>(rows, activations)
+                    activations.dot_eight_rows::<true>(rows)
                 } else {
-                    packed_pq2::dot_eight_rows::<false>(rows, activations)
+                    activations.dot_eight_rows::<false>(rows)
                 }
             },
             |rows| {
                 if pinned {
-                    packed_pq2::dot_four_rows::<true>(rows, activations)
+                    activations.dot_four_rows::<true>(rows)
                 } else {
-                    packed_pq2::dot_four_rows::<false>(rows, activations)
+                    activations.dot_four_rows::<false>(rows)
                 }
             },
             |bytes| {
                 if pinned {
-                    packed_pq2::dot_row::<true>(bytes, activations)
+                    activations.dot_row::<true>(bytes)
                 } else {
-                    packed_pq2::dot_row::<false>(bytes, activations)
+                    activations.dot_row::<false>(bytes)
                 }
             },
         )

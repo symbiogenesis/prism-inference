@@ -20,20 +20,18 @@ pub struct Pq2Activation {
 }
 
 pub(super) fn valid<const ROWS: usize>(rows: [&[u8]; ROWS], activation: &[Pq2Activation]) -> bool {
+    valid_rows(rows, activation.len()) && activation.iter().all(|block| block.scale.is_finite())
+}
+
+pub(super) fn valid_rows<const ROWS: usize>(rows: [&[u8]; ROWS], count: usize) -> bool {
     matches!(ROWS, 1 | 4 | 8)
-        && !activation.is_empty()
-        && activation
-            .len()
+        && count != 0
+        && count
             .checked_mul(34)
             .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
-        && activation.iter().all(|block| block.scale.is_finite())
 }
 
 #[cfg(any(test, not(target_arch = "aarch64")))]
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "The nonfused contract requires separate product and addition rounding."
-)]
 pub(super) fn portable<const ROWS: usize, const FUSED: bool>(
     rows: [&[u8]; ROWS],
     activation: &[Pq2Activation],
@@ -41,6 +39,18 @@ pub(super) fn portable<const ROWS: usize, const FUSED: bool>(
     if !valid(rows, activation) {
         return None;
     }
+    portable_validated::<ROWS, FUSED>(rows, activation)
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "The nonfused contract requires separate product and addition rounding."
+)]
+pub(super) fn portable_validated<const ROWS: usize, const FUSED: bool>(
+    rows: [&[u8]; ROWS],
+    activation: &[Pq2Activation],
+) -> Option<[f32; ROWS]> {
     let mut output = [0.0_f32; ROWS];
     for (row, output) in rows.into_iter().zip(&mut output) {
         for (bytes, activation) in row.as_chunks::<34>().0.iter().zip(activation) {
@@ -83,6 +93,80 @@ pub(super) fn portable<const ROWS: usize, const FUSED: bool>(
 #[cfg(test)]
 mod tests {
     use super::{Pq2Activation, portable};
+
+    #[test]
+    fn x1_scoped_pq2_matches_reference_and_revalidates_replaced_activations() {
+        #[cfg(target_arch = "aarch64")]
+        let Some(detected) = crate::Pq2Dotprod::detect() else {
+            return;
+        };
+        // This test-only capability selects exclusively portable arithmetic on
+        // non-ARM targets. It never reaches a target-feature instruction.
+        #[cfg(not(target_arch = "aarch64"))]
+        let detected = crate::Pq2Dotprod { _detected: () };
+        let mut activation = [
+            Pq2Activation {
+                scale: f32::from_bits(0x3da0_0001),
+                values: [3; 128],
+                sum: 384,
+            },
+            Pq2Activation {
+                scale: f32::from_bits(0x3da0_0001),
+                values: [-13; 128],
+                sum: -1664,
+            },
+        ];
+        let mut row = [0xaa; 68];
+        row[..2].copy_from_slice(&0x3c01_u16.to_le_bytes());
+        row[34..36].copy_from_slice(&0x3787_u16.to_le_bytes());
+        {
+            let prepared = detected.prepare_scaled(&activation);
+            assert!(prepared.is_some());
+            if let Some(prepared) = prepared {
+                for _ in 0..3 {
+                    assert_eq!(
+                        prepared
+                            .dot_scaled_rows::<1, true>([&row])
+                            .map(|v| v.map(f32::to_bits)),
+                        Some([0xc1f9_0b01])
+                    );
+                    assert_eq!(
+                        prepared
+                            .dot_scaled_rows::<4, false>([&row; 4])
+                            .map(|v| v.map(f32::to_bits)),
+                        Some([0xc1f9_0b02; 4])
+                    );
+                    assert_eq!(
+                        prepared
+                            .dot_scaled_rows::<8, true>([&row; 8])
+                            .map(|v| v.map(f32::to_bits)),
+                        portable::<8, true>([&row; 8], &activation).map(|v| v.map(f32::to_bits))
+                    );
+                }
+                assert!(prepared.dot_scaled_rows::<2, true>([&row; 2]).is_none());
+                assert!(
+                    prepared
+                        .dot_scaled_rows::<8, true>([&row[..67]; 8])
+                        .is_none()
+                );
+                row[34..36].copy_from_slice(&0x7c01_u16.to_le_bytes());
+                assert!(prepared.dot_scaled_rows::<8, true>([&row; 8]).is_none());
+            }
+        }
+        activation[1].scale = f32::NAN;
+        assert!(detected.prepare_scaled(&activation).is_none());
+        assert!(detected.prepare_scaled(&[]).is_none());
+        activation[1].scale = -0.125;
+        row[34..36].copy_from_slice(&0x3787_u16.to_le_bytes());
+        let expected = portable::<8, true>([&row; 8], &activation).map(|v| v.map(f32::to_bits));
+        assert_eq!(
+            detected
+                .prepare_scaled(&activation)
+                .and_then(|scope| scope.dot_scaled_rows::<8, true>([&row; 8]))
+                .map(|v| v.map(f32::to_bits)),
+            expected
+        );
+    }
 
     #[test]
     fn x1_scaled_pq2_rows_preserve_independent_fma_control_and_reject_bad_inputs() {

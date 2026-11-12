@@ -100,7 +100,7 @@ impl PreparedMatvec<'_> {
             target_feature = "neon"
         ))]
         if matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon) {
-            let activations = &scratch.pq2_consumption;
+            let activations = super::packed_pq2::Consumer::new(&scratch.pq2_consumption)?;
             let pinned = scratch.pinned_accumulation;
             return scratch.row_parallelism.fill_siblings(
                 data,
@@ -113,23 +113,23 @@ impl PreparedMatvec<'_> {
                         output,
                         &|rows| {
                             if pinned {
-                                super::packed_pq2::dot_eight_rows::<true>(rows, activations)
+                                activations.dot_eight_rows::<true>(rows)
                             } else {
-                                super::packed_pq2::dot_eight_rows::<false>(rows, activations)
+                                activations.dot_eight_rows::<false>(rows)
                             }
                         },
                         &|rows| {
                             if pinned {
-                                super::packed_pq2::dot_four_rows::<true>(rows, activations)
+                                activations.dot_four_rows::<true>(rows)
                             } else {
-                                super::packed_pq2::dot_four_rows::<false>(rows, activations)
+                                activations.dot_four_rows::<false>(rows)
                             }
                         },
                         &|bytes| {
                             if pinned {
-                                super::packed_pq2::dot_row::<true>(bytes, activations)
+                                activations.dot_row::<true>(bytes)
                             } else {
-                                super::packed_pq2::dot_row::<false>(bytes, activations)
+                                activations.dot_row::<false>(bytes)
                             }
                         },
                     )

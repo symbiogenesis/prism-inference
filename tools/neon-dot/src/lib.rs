@@ -8,6 +8,9 @@
 
 #![deny(unsafe_code)]
 
+mod scaled;
+pub use scaled::Pq2Activation;
+
 mod half;
 pub use half::{widen_f16_eight, widen_f16_four};
 
@@ -47,6 +50,32 @@ pub struct Pq2Dotprod {
 }
 
 impl Pq2Dotprod {
+    /// Consumes complete packed rows inside one detected `SDOT` invocation.
+    ///
+    /// Supports one, four or eight rows of original 34-byte PQ2 blocks. Every
+    /// block retains its original scale product and ordered fused or separate
+    /// accumulation; no weights or activations are copied or retained.
+    /// Returns `None` for unsupported geometry or a nonfinite scale/result.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize, const FUSED: bool>(
+        self,
+        rows: [&[u8]; ROWS],
+        activation: &[Pq2Activation],
+    ) -> Option<[f32; ROWS]> {
+        if !scaled::valid(rows, activation) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_scaled_rows::<ROWS, FUSED>(self, rows, activation)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            scaled::portable::<ROWS, FUSED>(rows, activation)
+        }
+    }
+
     /// Detects support without enabling an optional ISA for baseline callers.
     #[inline]
     #[must_use]

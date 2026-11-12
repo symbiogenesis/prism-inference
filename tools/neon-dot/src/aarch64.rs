@@ -622,6 +622,100 @@ fn dot_pq2_eight_consumption_dotprod(
     ]
 }
 
+/// All extents and activation scales were checked by the safe parent boundary.
+#[target_feature(enable = "neon,dotprod")]
+fn pq2_scaled_rows<const ROWS: usize, const FUSED: bool>(
+    rows: [&[u8]; ROWS],
+    activation: &[super::Pq2Activation],
+) -> Option<[f32; ROWS]> {
+    use core::arch::aarch64::{
+        vaddq_f32, vandq_u16, vcvt_f32_f16, vcvt_high_f32_f16, vcvtq_f32_s32, vdupq_n_f32,
+        vdupq_n_u16, vfmaq_f32, vget_low_f16, vld1q_u16, vmaxvq_u16, vmulq_f32,
+        vreinterpretq_f16_u16, vst1q_f32,
+    };
+    let zero = vdupq_n_s32(0);
+    let mut low = vdupq_n_f32(0.0);
+    let mut high = low;
+    for (index, activation) in activation.iter().enumerate() {
+        let blocks: [&[u8; 34]; ROWS] =
+            std::array::from_fn(|row| &rows[row].as_chunks::<34>().0[index]);
+        let scales: [u16; 8] = std::array::from_fn(|row| {
+            blocks
+                .get(row)
+                .map_or(0, |block| u16::from_le_bytes([block[0], block[1]]))
+        });
+        // SAFETY: `scales` is an initialized eight-element array; NEON permits
+        // unaligned loads and the detected capability includes baseline NEON.
+        let raw = unsafe { vld1q_u16(scales.as_ptr()) };
+        if vmaxvq_u16(vandq_u16(raw, vdupq_n_u16(0x7fff))) >= 0x7c00 {
+            return None;
+        }
+        let half = vreinterpretq_f16_u16(raw);
+        let act_scale = vdupq_n_f32(activation.scale);
+        let scale_low = vmulq_f32(vcvt_f32_f16(vget_low_f16(half)), act_scale);
+        let scale_high = vmulq_f32(vcvt_high_f32_f16(half), act_scale);
+        let mut acc = [zero; ROWS];
+        for (half, values) in activation.values.as_chunks::<64>().0.iter().enumerate() {
+            let planes = values.as_chunks::<16>().0;
+            let p0 = load_s8x16(&planes[0]);
+            let p1 = load_s8x16(&planes[1]);
+            let p2 = load_s8x16(&planes[2]);
+            let p3 = load_s8x16(&planes[3]);
+            for (row, acc) in acc.iter_mut().enumerate() {
+                let [_, _, ref packed @ ..] = *blocks[row];
+                let bytes = &packed.as_chunks::<16>().0[half];
+                *acc = pq2_half_unsigned_sdot(*acc, load_u8x16(bytes), p0, p1, p2, p3);
+            }
+        }
+        let correction = vdupq_n_s32(activation.sum);
+        let lane = |index| acc.get(index).copied().unwrap_or(zero);
+        let dot_low = vcvtq_f32_s32(vsubq_s32(
+            reduce4_s32x4(lane(0), lane(1), lane(2), lane(3)),
+            correction,
+        ));
+        let dot_high = vcvtq_f32_s32(vsubq_s32(
+            reduce4_s32x4(lane(4), lane(5), lane(6), lane(7)),
+            correction,
+        ));
+        if FUSED {
+            low = vfmaq_f32(low, scale_low, dot_low);
+            high = vfmaq_f32(high, scale_high, dot_high);
+        } else {
+            low = vaddq_f32(low, vmulq_f32(scale_low, dot_low));
+            high = vaddq_f32(high, vmulq_f32(scale_high, dot_high));
+        }
+    }
+    let mut low_output = [0.0_f32; 4];
+    let mut high_output = [0.0_f32; 4];
+    // SAFETY: both destinations are valid unique four-element arrays. Stores
+    // are unaligned-safe and occur only after complete row accumulation.
+    unsafe { vst1q_f32(low_output.as_mut_ptr(), low) };
+    // SAFETY: this second destination is disjoint from the first output array.
+    unsafe { vst1q_f32(high_output.as_mut_ptr(), high) };
+    let output: [f32; ROWS] = std::array::from_fn(|row| {
+        if row < 4 {
+            low_output[row]
+        } else {
+            high_output[row - 4]
+        }
+    });
+    output
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(output)
+}
+
+#[inline]
+pub(super) fn pq2_detected_scaled_rows<const ROWS: usize, const FUSED: bool>(
+    _detected: super::Pq2Dotprod,
+    rows: [&[u8]; ROWS],
+    activation: &[super::Pq2Activation],
+) -> Option<[f32; ROWS]> {
+    // SAFETY: the unforgeable capability establishes CPU/OS `SDOT` eligibility;
+    // the safe parent checked complete row extents and finite activation scales.
+    unsafe { pq2_scaled_rows::<ROWS, FUSED>(rows, activation) }
+}
+
 #[inline]
 pub(super) fn pq2_detected_dot(
     _detected: super::Pq2Dotprod,

@@ -7,18 +7,26 @@ use bonsai_ternary::Q8KBlock;
 
 use crate::{Result, invalid};
 
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+pub(super) use bonsai_neon_dot::Pq2Activation as Activation;
+
+#[cfg(not(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+)))]
 /// One original 128-weight block's exact scale and reordered activation bytes.
 pub(super) struct Activation {
     pub(super) scale: f32,
     pub(super) values: [i8; 128],
-    #[cfg(all(
-        feature = "experimental-neon",
-        target_arch = "aarch64",
-        target_os = "windows",
-        target_env = "msvc",
-        target_feature = "neon"
-    ))]
-    pub(super) sum: i32,
 }
 
 /// Byte planes shared by every backend, with wide planes only for baseline NEON.
@@ -178,6 +186,12 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &Activations) -> R
     if input.is_empty() || bytes.len() / 34 != input.len() || !bytes.len().is_multiple_of(34) {
         return Err(invalid("incompatible packed consumption activation extent"));
     }
+    if let Some(dotprod) = input.dotprod {
+        return dotprod
+            .dot_scaled_rows::<1, FUSED>([bytes], input)
+            .ok_or_else(|| invalid("nonfinite tensor or activation value"))
+            .map(|output| output[0]);
+    }
     let mut output = 0.0;
     for (index, (block, activation)) in bytes
         .as_chunks::<34>()
@@ -224,6 +238,11 @@ pub(super) fn dot_four_rows<const FUSED: bool>(
             .any(|bytes| bytes.len() / 34 != input.len() || !bytes.len().is_multiple_of(34))
     {
         return Err(invalid("incompatible packed consumption activation extent"));
+    }
+    if let Some(dotprod) = input.dotprod {
+        return dotprod
+            .dot_scaled_rows::<4, FUSED>(rows, input)
+            .ok_or_else(|| invalid("nonfinite tensor or activation value"));
     }
     if let Some(result) = super::neon::dot_four_rows_consumption::<FUSED>(rows, input) {
         return result;
@@ -284,6 +303,11 @@ pub(super) fn dot_eight_rows<const FUSED: bool>(
             .any(|bytes| bytes.len() / 34 != input.len() || !bytes.len().is_multiple_of(34))
     {
         return Err(invalid("incompatible packed consumption activation extent"));
+    }
+    if let Some(dotprod) = input.dotprod {
+        return dotprod
+            .dot_scaled_rows::<8, FUSED>(rows, input)
+            .ok_or_else(|| invalid("nonfinite tensor or activation value"));
     }
     if let Some(result) = super::neon::dot_eight_rows_consumption::<FUSED>(rows, input) {
         return result;
@@ -633,7 +657,30 @@ mod native_tests {
                 dot_eight_rows::<false>(refs, &detected)?
             };
             assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+            let (single, four) = if pinned {
+                (
+                    dot_row::<true>(refs[0], &detected)?,
+                    dot_four_rows::<true>([refs[0], refs[1], refs[2], refs[3]], &detected)?,
+                )
+            } else {
+                (
+                    dot_row::<false>(refs[0], &detected)?,
+                    dot_four_rows::<false>([refs[0], refs[1], refs[2], refs[3]], &detected)?,
+                )
+            };
+            assert_eq!(single.to_bits(), expected[0].to_bits());
+            assert_eq!(
+                four.map(f32::to_bits),
+                [expected[0], expected[1], expected[2], expected[3]].map(f32::to_bits)
+            );
         }
+        let mut malformed = rows;
+        malformed[7][34..36].copy_from_slice(&0x7c01_u16.to_le_bytes());
+        let refs: [&[u8]; 8] = std::array::from_fn(|row| malformed[row].as_slice());
+        assert!(dot_eight_rows::<true>(refs, &detected).is_err());
+        assert!(dot_eight_rows::<false>(refs, &detected).is_err());
+        assert!(dot_row::<true>(refs[7], &detected).is_err());
+        assert!(dot_four_rows::<true>([refs[4], refs[5], refs[6], refs[7]], &detected).is_err());
         detected.clear();
         assert!(detected.dotprod.is_none());
         prepare(&input, &mut detected)?;

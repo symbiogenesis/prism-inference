@@ -411,3 +411,164 @@ fn rotated_kv_runtime_delivery_and_cancellation_roll_back_across_page_seal() -> 
     }
     Ok(())
 }
+
+fn profile_runtime(policy: KvCachePolicy, scale: f32) -> Result<Runtime<Qwen35>> {
+    let base = profile_fixture();
+    let factors = rank_one_factors(
+        &base,
+        &[
+            "blk.0.attn_output.weight",
+            "blk.1.ssm_out.weight",
+            "blk.1.ffn_down.weight",
+        ],
+        0.125,
+    );
+    let adapter = RankOneAdapter::from_model(factors, &base)?;
+    Runtime::new(
+        Qwen35::with_rank_one_adapter_and_kv(
+            base,
+            CONTEXT,
+            BUDGET,
+            MatvecBackend::Auto,
+            adapter,
+            scale,
+            policy,
+        )?,
+        Limits {
+            context_tokens: CONTEXT,
+            checkpoints: 0,
+            checkpoint_bytes: BUDGET,
+        },
+    )
+}
+
+fn compare_profile_request(
+    runtime: &mut Runtime<Qwen35>,
+    sampler: &mut ProfileSampler,
+    prompt: &[u32],
+    scale: f32,
+) -> Result<()> {
+    let options = Generation {
+        max_tokens: 2,
+        stop_tokens: vec![],
+    };
+    let policy = runtime.decoder().kv_cache_policy();
+    let previous = runtime.tokens().to_vec();
+    let previous_scale = runtime.decoder().adapter_scale().map(f32::to_bits);
+    let before = graph_bits(runtime.decoder())?;
+    runtime.prepare_profile_request(Some(scale), PromptReuse::Latest)?;
+    let unchanged = previous_scale == Some(scale.to_bits());
+    if unchanged {
+        assert_eq!(runtime.tokens(), previous);
+        assert_eq!(graph_bits(runtime.decoder())?, before);
+    } else {
+        assert!(runtime.tokens().is_empty());
+        assert!(graph_bits(runtime.decoder())?.iter().all(|&bits| bits == 0));
+    }
+    assert_eq!(runtime.decoder().kv_cache_policy(), policy);
+    assert_eq!(
+        runtime.decoder().adapter_scale().map(f32::to_bits),
+        Some(scale.to_bits())
+    );
+    let mut reference_sampler = sampler.clone();
+    profile_request_failures(runtime, prompt, &options, sampler)?;
+    let mut reference = profile_runtime(policy, scale)?;
+    let mut expected = Vec::new();
+    reference.generate_sampled(
+        prompt,
+        &options,
+        Prefill { block_tokens: 4 },
+        &Cancellation::default(),
+        &mut reference_sampler,
+        |token| {
+            expected.push(token);
+            Ok(())
+        },
+    )?;
+    let mut actual = Vec::new();
+    let completion = runtime.generate_sampled(
+        prompt,
+        &options,
+        Prefill { block_tokens: 4 },
+        &Cancellation::default(),
+        sampler,
+        |token| {
+            actual.push(token);
+            Ok(())
+        },
+    )?;
+    assert_eq!(actual, expected);
+    assert_eq!(sampler.logits, reference_sampler.logits);
+    assert_eq!(runtime.tokens(), reference.tokens());
+    assert_eq!(
+        graph_bits(runtime.decoder())?,
+        graph_bits(reference.decoder())?
+    );
+    assert_eq!(
+        completion.reused_tokens,
+        if unchanged && prompt.starts_with(&previous) {
+            previous.len()
+        } else {
+            0
+        }
+    );
+    assert_eq!(runtime.checkpoint_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn rotated_kv_latest_prefix_and_adapter_changes_preserve_selected_profile() -> Result<()> {
+    use bonsai_prism_runtime::sampling::{ReferenceSampler, Sampling};
+
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        let mut runtime = profile_runtime(policy, 1.3)?;
+        let mut sampler = ProfileSampler {
+            inner: ReferenceSampler::new(Sampling::default(), 42)?,
+            logits: Vec::new(),
+        };
+        // Include a page-sealing extension, an edited history, a shortened
+        // history and signed-zero/change-back adapter transitions. Every
+        // reference uses the same selected lossy profile, never FP16 parity.
+        for (length, scale, edit) in [
+            (61, 1.3_f32, false),
+            (64, 1.3, false),
+            (64, 1.3, true),
+            (3, 1.3, false),
+            (3, 0.0, false),
+            (3, -0.0, false),
+            (3, 1.3, false),
+        ] {
+            let mut prompt = if length == 64 && !edit {
+                let mut extended = runtime.tokens().to_vec();
+                extended.resize(length, 1);
+                extended
+            } else {
+                tokens(length)
+            };
+            if edit {
+                prompt[0] = 1 - prompt[0];
+            }
+            compare_profile_request(&mut runtime, &mut sampler, &prompt, scale)?;
+        }
+        let committed = runtime.tokens().to_vec();
+        let before = graph_bits(runtime.decoder())?;
+        for invalid in [None, Some(f32::NAN), Some(-1.0)] {
+            assert!(
+                runtime
+                    .prepare_profile_request(invalid, PromptReuse::Latest)
+                    .is_err()
+            );
+            assert_eq!(runtime.tokens(), committed);
+            assert_eq!(graph_bits(runtime.decoder())?, before);
+            assert_eq!(runtime.decoder().kv_cache_policy(), policy);
+            assert!(!runtime.is_faulted());
+        }
+        runtime.prepare_profile_request(Some(1.3), PromptReuse::Disabled)?;
+        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.decoder().kv_cache_policy(), policy);
+        runtime.reset()?;
+        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.decoder().kv_cache_policy(), policy);
+    }
+    Ok(())
+}

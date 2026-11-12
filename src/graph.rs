@@ -33,6 +33,9 @@ pub use prefill::TiledPrefillStatistics;
 mod attention_preparation_tests;
 mod attention_six;
 mod ffn_preparation;
+#[cfg(all(test, feature = "parallel-rows"))]
+#[path = "graph/sibling_projection_tests.rs"]
+mod sibling_projection_tests;
 
 /// Maximum admitted live KV/recurrent element payload, also the default budget.
 ///
@@ -1526,6 +1529,7 @@ impl Transforms {
         executor: &mut Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
         let mut pre_transformed = scratch.pre_transformed_len.take();
+        let cpu_siblings = executor.is_none() && scratch.matvec.row_workers() > 1;
         let result = (|| {
             if N > 4 {
                 return Err(invalid("projection group exceeds four siblings"));
@@ -1604,6 +1608,33 @@ impl Transforms {
                         executor,
                     )?;
                     completed[index..index + group_len].fill(true);
+                    continue;
+                }
+                // Compatible CPU PQ2 siblings already share their exact basis
+                // and Q8_K preparation. Submit their original row partitions
+                // together, replacing one pool join per matrix with one join
+                // per group. Other formats and external executors stay on
+                // their existing independently checked execution paths.
+                let cpu_group_len = weights[index..index + group_len]
+                    .iter()
+                    .take_while(|weight| weight.kind == crate::kernels::PQ2)
+                    .count();
+                if cpu_siblings
+                    && cpu_group_len >= 2
+                    && weights[index].dimensions[0].is_multiple_of(256)
+                    && weights.iter().enumerate().skip(index + cpu_group_len).all(
+                        |(candidate, weight)| {
+                            completed[candidate]
+                                || self.basis(weight) != basis
+                                || !prepared.is_compatible(weight).unwrap_or(false)
+                        },
+                    )
+                {
+                    prepared.matvec_pq2_siblings_into(
+                        &weights[index..index + cpu_group_len],
+                        &mut outputs[index..index + cpu_group_len],
+                    )?;
+                    completed[index..index + cpu_group_len].fill(true);
                     continue;
                 }
                 for (candidate, (weight, output)) in

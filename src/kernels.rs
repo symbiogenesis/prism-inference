@@ -46,6 +46,7 @@ pub(crate) mod pinned_attention;
 pub(crate) mod pinned_convolution;
 pub(crate) mod pinned_gdn;
 pub(crate) mod prefill;
+mod siblings;
 mod signquants;
 mod tquants;
 pub use tquants::Tl1BlockLut;
@@ -1783,7 +1784,13 @@ impl MatvecDiagnostics {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MatvecStatistics {
     /// Packed matrix attempts using the explicit persistent row-worker pool.
+    /// Grouped matrices count individually, including single-row siblings.
     pub parallel_row_operations: u64,
+    /// Single worker-pool submissions combining two through four PQ2 matrices.
+    ///
+    /// Each participating matrix still counts in `parallel_row_operations`.
+    /// This counter describes submitted source work, not a timing measurement.
+    pub grouped_row_dispatches: u64,
     /// Activation preparations attempted, including unused prepared guards.
     pub preparations: u64,
     /// Preparations rejected before a matrix could be attempted.

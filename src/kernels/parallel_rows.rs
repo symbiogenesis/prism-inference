@@ -13,6 +13,9 @@ use crate::{Result, invalid};
 #[path = "parallel_tile.rs"]
 mod tile;
 
+#[path = "parallel_siblings.rs"]
+mod siblings;
+
 /// Largest explicit number of persistent projection workers.
 pub const MAX_ROW_WORKERS: usize = 18;
 
@@ -552,7 +555,7 @@ impl RowParallelism {
     target_env = "msvc",
     target_feature = "neon"
 ))]
-fn fill_batched_chunk(
+pub(super) fn fill_batched_chunk(
     bytes: &[u8],
     row_bytes: usize,
     chunk: &mut [f32],

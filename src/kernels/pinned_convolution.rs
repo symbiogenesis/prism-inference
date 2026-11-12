@@ -43,6 +43,9 @@ impl Coefficients {
     }
 
     /// Borrows an aligned head partition without allocating or changing layout.
+    ///
+    /// # Panics
+    /// Panics if a private graph partition is out of bounds or splits a prepared block.
     pub(crate) fn range(&self, range: std::ops::Range<usize>) -> CoefficientSlice<'_> {
         // Graph head partitions are multiples of four channels. A prepared
         // view must begin/end at a complete 4-channel, 4-tap block.
@@ -71,6 +74,9 @@ impl<'a> CoefficientSlice<'a> {
     }
 
     /// Generic arithmetic only receives unprepared channel-major coefficients.
+    ///
+    /// # Panics
+    /// Panics if a private graph caller requests source rows from a prepared view.
     pub(crate) const fn source(self) -> &'a [f32] {
         assert!(!self.prepared);
         self.values

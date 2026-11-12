@@ -132,6 +132,17 @@ impl Tl1BlockLut {
         }
         sum
     }
+
+    /// Retain four independent 32-element integer sums for original `Q8_0`
+    /// activation scales. No integer group crosses a quantizer boundary.
+    pub(super) fn dot_groups(&self, packed: &[u8; 32]) -> [i32; 4] {
+        let mut sums = [0_i32; 4];
+        for (byte_idx, &byte) in packed.iter().enumerate() {
+            sums[byte_idx / 8] += i32::from(self.low_nibbles[byte_idx][usize::from(byte & 15)])
+                + i32::from(self.high_nibbles[byte_idx][usize::from(byte >> 4)]);
+        }
+        sums
+    }
 }
 
 fn codes(kind: u32, block: &[u8]) -> [i16; 256] {

@@ -283,6 +283,42 @@ fn projection_scope_preserves_logits_state_adapter_basis_checkpoint_and_reset() 
 }
 
 #[test]
+fn lut_projection_scope_preserves_full_and_recurrent_state_with_adapter() -> Result<()> {
+    use bonsai_prism_runtime::kernels::{Pq2LutExecutor, RowParallelism};
+
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for width in [128, 256] {
+        for recurrent in [false, true] {
+            let build = || -> Result<Qwen35> {
+                let base = backend_fixture(recurrent, 142, width)?;
+                let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.125);
+                rank_one_graph(base, factors, 1.3)
+            };
+            let mut control = build()?;
+            let mut executor = Pq2LutExecutor::new(256, RowParallelism::new(1)?)?;
+            let mut graph = build()?.with_projection_executor(&mut executor)?;
+            for token in [0, 1, 0] {
+                assert_eq!(bits(graph.evaluate(token)?), bits(control.evaluate(token)?));
+                assert_eq!(graph_bits(graph.decoder())?, graph_bits(&control)?);
+            }
+            let checkpoint = graph.checkpoint()?;
+            let control_checkpoint = control.checkpoint()?;
+            graph.ingest(1)?;
+            control.ingest(1)?;
+            assert_eq!(graph_bits(graph.decoder())?, graph_bits(&control)?);
+            graph.restore(&checkpoint)?;
+            control.restore(&control_checkpoint)?;
+            assert_eq!(bits(graph.evaluate(1)?), bits(control.evaluate(1)?));
+            graph.reset()?;
+            control.reset()?;
+            assert_eq!(bits(graph.evaluate(0)?), bits(control.evaluate(0)?));
+            assert_eq!(graph_bits(graph.decoder())?, graph_bits(&control)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn projection_scope_device_loss_after_prepared_state_delta_never_replays_or_reopens() -> Result<()>
 {
     for recurrent in [false, true] {

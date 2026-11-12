@@ -39,6 +39,8 @@ pub use parallel_rows::{MAX_ROW_WORKERS, RowParallelism};
 mod packed_pq2;
 mod projection;
 pub use projection::Pq2ProjectionExecutor;
+mod pq2_lut;
+pub use pq2_lut::Pq2LutExecutor;
 pub(crate) mod pinned_activations;
 pub(crate) mod pinned_attention;
 pub(crate) mod pinned_convolution;

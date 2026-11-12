@@ -1,5 +1,10 @@
 //! Exact binary16 widening with a baseline-NEON finite fast path.
 
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "Parent-only fallback helpers remain inside the safe binary16 boundary."
+)]
+
 /// Widens four IEEE binary16 bit patterns without changing NaN payload bits.
 ///
 /// Native AArch64 NEON uses `FCVTL` for finite inputs; this conversion does not

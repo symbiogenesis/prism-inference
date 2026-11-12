@@ -4,6 +4,7 @@
 
 use bonsai_prism_runtime::{
     Result,
+    graph::{KvCachePolicy, SWIFT_GRAPH_CONTRACT},
     model::swift,
     runtime::{Cancellation, Finish},
     swift_client::{
@@ -33,7 +34,9 @@ fn ready() -> Value {
         "max_output_bytes":MAX_OUTPUT_BYTES,"context_tokens":8192,"max_output_tokens":4096,
         "temperature":1,"top_p":0.95,"top_k":20,"min_p":0,"repeat_penalty":1,"presence_penalty":0,
         "frequency_penalty":0,"thinking":true,"reasoning_effort":"xhigh","preserve_thinking":true,
-        "cache_reuse":false,"speculation":false,"adapters":false,"qualification":"pending-full-model-parity-and-device-evidence"
+        "cache_reuse":false,"speculation":false,"adapters":false,"qualification":"pending-full-model-parity-and-device-evidence",
+        "kv_cache":"rsq4","startup_graph_identity":format!("{}:{}",swift::MODEL_SHA256,
+            SWIFT_GRAPH_CONTRACT.replace("kv-f16","kv-rsq4-d256-rht3-v1"))
     })
 }
 fn messages() -> Value {
@@ -129,7 +132,7 @@ fn checks_count_complete_identical_messages_accounting_streaming_and_reset() -> 
 }
 
 #[test]
-fn readiness_rejects_foreign_identity_effective_settings_and_duplicate_fields() -> Result<()> {
+fn kv_cache_readiness_rejects_foreign_identity_settings_and_duplicate_fields() -> Result<()> {
     for (key, value) in [
         ("model_sha256", json!("0".repeat(64))),
         ("template_sha256", json!("0".repeat(64))),
@@ -142,6 +145,11 @@ fn readiness_rejects_foreign_identity_effective_settings_and_duplicate_fields() 
         ("cache_reuse", json!(true)),
         ("vocab_size", json!(131_072)),
         ("max_frame_bytes", json!(42)),
+        ("kv_cache", json!("f16")),
+        ("kv_cache", json!("rsq4k3v")),
+        ("kv_cache", json!(null)),
+        ("startup_graph_identity", json!("foreign-codec")),
+        ("startup_graph_identity", json!(null)),
         ("unexpected", json!(true)),
     ] {
         let mut frame = ready();
@@ -160,6 +168,58 @@ fn readiness_rejects_foreign_identity_effective_settings_and_duplicate_fields() 
         SwiftClient::connect(Cursor::new(Vec::new()), Vec::new(), invalid),
         Err(ClientError::InvalidConfiguration)
     ));
+    Ok(())
+}
+
+#[test]
+fn kv_cache_fp16_recovery_requires_explicit_owner_selection_and_unchanged_readiness() -> Result<()>
+{
+    let mut frame = ready();
+    frame
+        .as_object_mut()
+        .ok_or("readiness is not an object")?
+        .remove("kv_cache");
+    frame
+        .as_object_mut()
+        .ok_or("readiness is not an object")?
+        .remove("startup_graph_identity");
+    let bytes = format!("{}\n", serde_json::to_string(&frame)?);
+    assert!(SwiftClient::connect(Cursor::new(bytes.clone()), Vec::new(), expected()).is_err());
+    assert!(
+        SwiftClient::connect_with_kv_cache(
+            Cursor::new(bytes),
+            Vec::new(),
+            expected(),
+            KvCachePolicy::F16
+        )
+        .is_ok()
+    );
+    let bytes = format!("{}\n", serde_json::to_string(&ready())?);
+    assert!(
+        SwiftClient::connect_with_kv_cache(
+            Cursor::new(bytes),
+            Vec::new(),
+            expected(),
+            KvCachePolicy::F16
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn kv_cache_default_requires_both_exact_readiness_fields() -> Result<()> {
+    for key in ["kv_cache", "startup_graph_identity"] {
+        let mut frame = ready();
+        frame
+            .as_object_mut()
+            .ok_or("readiness is not an object")?
+            .remove(key);
+        let bytes = format!("{}\n", serde_json::to_string(&frame)?);
+        assert!(SwiftClient::connect(Cursor::new(bytes), Vec::new(), expected()).is_err());
+    }
+    let bytes = format!("{}\n", serde_json::to_string(&ready())?);
+    assert!(SwiftClient::connect(Cursor::new(bytes), Vec::new(), expected()).is_ok());
     Ok(())
 }
 

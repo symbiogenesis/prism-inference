@@ -4,6 +4,7 @@ use super::{AdapterSelection, Representation, evidence_backend, reject};
 use bonsai_native_hash::{Hasher, hash_bytes};
 use bonsai_prism_runtime::{
     Result,
+    graph::KvCachePolicy,
     kernels::{MatvecBackend, RowParallelism},
     model::lora::SWIFT_ADAPTER_SHA256,
     runtime::{Cancellation, Completion, GenerationPhase, GenerationTimings},
@@ -140,13 +141,16 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
     check(selection.deadline)?;
     let parallelism = RowParallelism::new(selection.row_workers)?;
     let started = Instant::now();
-    let loaded = SwiftSession::load_profile_with_row_parallelism(
+    // Keep the established attribution control on its explicit FP16 baseline;
+    // changing the serving default must not silently redefine this comparison.
+    let loaded = SwiftSession::load_profile_with_kv_cache(
         selection.model,
         selection.representation,
         selection.adapter.map(|value| value.path.as_path()),
         selection.backend,
         42,
         parallelism,
+        KvCachePolicy::F16,
     );
     observation.load_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     let mut session = loaded?;

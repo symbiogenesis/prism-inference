@@ -1,9 +1,16 @@
-# Experimental Snapdragon rotated KV
+# Development-default Snapdragon rotated KV
 
 This source candidate adds a clean-room Rust cache codec for the 256-channel
 full-attention heads used by Swift. The public graph policy is
-`graph::KvCachePolicy::{F16, Rotated4, Rotated4Keys3Values}`. Existing callers and
-serving defaults retain FP16. No released Runner bundle selects this candidate.
+`graph::KvCachePolicy::{F16, Rotated4, Rotated4Keys3Values}`. K4/V4 (`rsq4`) is
+the owner-selected development default for Swift generation, sessions and workers.
+It is required within that selected service profile; request bodies cannot change
+precision and failures never switch to FP16. Generic graph constructors retain
+FP16 for reference controls. No released Runner bundle selects this source yet.
+
+This development choice does not require identical tokens, FP16 logits or perfect
+reconstruction. Actual-model quality, memory benefit, responsiveness and separate
+X1/X2 device qualification remain pending; they are not claimed by the default.
 
 ## Algorithm and CPU implementation
 
@@ -40,18 +47,26 @@ FP16 preparation are retained; the pinned Swift softmax arithmetic has a separat
 
 ## Selection, identity and recovery
 
-The raw generation CLI accepts `--kv-cache f16|rsq4|rsq4k3v`. It rejects that option
-in tokenize mode. Completion metadata reports `kv_cache` and `graph_identity`.
+The raw generation CLI accepts `--kv-cache f16|rsq4|rsq4k3v`, defaulting to `rsq4`
+only after loading verifies the exact Swift PQ2/PTQ1 identity. Other models retain
+FP16. Tokenize mode rejects this option. Explicit `f16` supplies comparison/recovery;
+unsupported rotated geometry rejects instead of falling back. Completion metadata reports `kv_cache`
+and `graph_identity`. K4/V3 remains a separate opt-in capacity experiment.
 `Qwen35::with_state_budget_and_kv` admits full-context payload including scales;
 `with_rank_one_adapter_and_kv` preserves explicit adapter selection and scale.
 
-`SwiftSession::load_profile_with_kv_cache` and the private server's trusted
-`--kv-cache` option expose the candidate at the existing fixed 8K service bound.
+Ordinary `SwiftSession` loading uses `DEFAULT_KV_CACHE` (`Rotated4`).
+`SwiftSession::load_profile_with_kv_cache` and both workers' trusted `--kv-cache`
+options supply explicit FP16 comparison/recovery at the existing fixed 8K bound.
 Client requests cannot change precision. Non-FP16 readiness adds `kv_cache` and
 `startup_graph_identity`; the latter explicitly identifies construction before
 any request changes the adapter scale. Old strict Runner clients reject that
 different profile. Application integration requires an owner-published verified
 runtime bundle and a matching broker capability contract; no active pin is changed.
+The JSONL `SwiftClient::connect` verifies the default cache and exact startup graph
+identity. Use `connect_with_kv_cache` when explicitly launching a different cache;
+FP16 retains its original readiness shape. Restart at a fresh-session boundary
+to change the immutable precision policy.
 
 Packed caches seal immutable 64-token pages and copy only their bounded tails
 when checkpointing. Every row is encoded and all storage growth is reserved before
@@ -99,9 +114,10 @@ checkpoint page boundaries, cancellation and failed-delivery recovery. These
 model-free checks do not establish long-context retrieval, complete-answer quality,
 actual-model trajectories, adapter quality or device speed.
 
-Default or mandatory adoption is conditional on predeclared, owner-accepted
-negligible-quality-loss thresholds and a useful measured capacity or latency benefit.
-Retain losing modes and counterexamples. Qualify X1 and X2 independently with exact
+The owner has selected K4/V4 as the development default before full qualification.
+Keep the predeclared practical quality/memory packet for a measured benefit and
+device verdict; source selection cannot pass it. Retain losing modes and
+counterexamples. Qualify X1 and X2 independently with exact
 source/model/adapter/profile identities and matched power observations. Complete
 suites and benchmarks remain owner-operated CI. Bounded laptop work retains the
 aggregate budget and power rules in `AGENTS.md`; no historical allowance reopens.

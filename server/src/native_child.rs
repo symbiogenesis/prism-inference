@@ -116,7 +116,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         },
         adapter,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
-        kv_cache: kv_cache.unwrap_or(KvCachePolicy::F16),
+        kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
     };
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn native_child_kv_cache_requires_an_explicit_supported_unique_mode() -> io::Result<()> {
+    fn native_child_kv_cache_defaults_to_k4v4_with_explicit_unique_recovery() -> io::Result<()> {
         let (_directory, [model, key, _adapter]) = files()?;
         let base = vec![
             OsString::from("--native-engine-child"),
@@ -375,7 +375,7 @@ mod tests {
             "--seed".into(),
             "42".into(),
         ];
-        assert_eq!(parse(base.clone())?.kv_cache, KvCachePolicy::F16);
+        assert_eq!(parse(base.clone())?.kv_cache, KvCachePolicy::Rotated4);
         for (name, expected) in [
             ("f16", KvCachePolicy::F16),
             ("rsq4", KvCachePolicy::Rotated4),

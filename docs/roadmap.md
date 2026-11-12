@@ -29,12 +29,13 @@ worker and fresh per-request state remain the service defaults. PTQ1, approved
 rank-one adapters, parallel row workers and latest-prefix reuse require explicit
 selection; availability does not establish their model or device qualification.
 
-The [rotated KV source candidate](quantized-kv.md) adds explicit Rust 4-bit and
+The [rotated KV source candidate](quantized-kv.md) adds Rust 4-bit and
 asymmetric 4/3-bit profiles, common X1/X2 NEON kernels and exact packed-state
-rollback. Full-model quality, long-context benefit and separate X1/X2 device
-qualification remain open. Any default or mandatory promotion requires the
-declared negligible-quality-loss and useful-benefit gates; active bundle/profile
-integration remains pending owner publication.
+rollback. K4/V4 (`rsq4`) is the owner-selected source development default for
+generation, Swift sessions and workers, with explicit FP16 comparison/recovery.
+Full-model quality, long-context benefit and separate X1/X2 device qualification
+remain open. The default does not claim those passes; active bundle/profile
+integration remains pending owner publication. K4/V3 remains opt-in.
 
 ## What the evidence establishes
 

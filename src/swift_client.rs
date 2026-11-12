@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
+    graph::{KvCachePolicy, SWIFT_GRAPH_CONTRACT},
     model::swift,
     runtime::{Cancellation, Completion, Finish},
-    swift_session::MAX_OUTPUT_BYTES,
+    swift_session::{DEFAULT_KV_CACHE, MAX_OUTPUT_BYTES},
 };
 
 /// Maximum complete JSONL frame, including its LF, accepted by the Swift worker.
@@ -140,6 +141,23 @@ impl<R: BufRead, W: Write> SwiftClient<R, W> {
         output: W,
         expected: ExpectedSwiftWorker,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_kv_cache(input, output, expected, DEFAULT_KV_CACHE)
+    }
+
+    /// Verify an explicitly selected immutable cache, including FP16 recovery.
+    ///
+    /// The owner must select the same cache in the worker's trusted startup
+    /// arguments. A missing or different cache never triggers automatic fallback.
+    ///
+    /// # Errors
+    /// Returns the same configuration, transport and identity errors as
+    /// [`Self::connect`], including missing or mismatched cache/graph identity.
+    pub fn connect_with_kv_cache(
+        input: R,
+        output: W,
+        expected: ExpectedSwiftWorker,
+        kv_cache: KvCachePolicy,
+    ) -> Result<Self, ClientError> {
         if expected.seed == u32::MAX
             || !(1..=MAX_FRAME_BYTES).contains(&expected.max_response_frame_bytes)
         {
@@ -164,7 +182,7 @@ impl<R: BufRead, W: Write> SwiftClient<R, W> {
             .try_reserve_exact(client.response_limit)
             .map_err(|_| ClientError::Allocation)?;
         match client.read_response()? {
-            Response::Ready(ready) if ready.matches(expected) => {
+            Response::Ready(ready) if ready.matches(expected, kv_cache) => {
                 client.healthy = true;
                 Ok(client)
             }
@@ -442,6 +460,12 @@ enum Request<'a> {
     },
 }
 
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    input: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(input).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[expect(
@@ -483,9 +507,13 @@ struct Ready<'a> {
     adapters: bool,
     #[serde(borrow)]
     qualification: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    kv_cache: Option<Cow<'a, str>>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    startup_graph_identity: Option<Cow<'a, str>>,
 }
 impl Ready<'_> {
-    fn matches(&self, expected: ExpectedSwiftWorker) -> bool {
+    fn matches(&self, expected: ExpectedSwiftWorker, kv_cache: KvCachePolicy) -> bool {
         self.protocol == "bonsai-swift-worker-v1"
             && self.model_sha256 == swift::MODEL_SHA256
             && self.template_sha256 == swift::TEMPLATE_SHA256
@@ -512,6 +540,18 @@ impl Ready<'_> {
             && !self.speculation
             && !self.adapters
             && self.qualification == "pending-full-model-parity-and-device-evidence"
+            && self.matches_kv_cache(kv_cache)
+    }
+
+    fn matches_kv_cache(&self, policy: KvCachePolicy) -> bool {
+        if policy == KvCachePolicy::F16 {
+            return self.kv_cache.is_none() && self.startup_graph_identity.is_none();
+        }
+        let contract =
+            SWIFT_GRAPH_CONTRACT.replace("kv-f16", &format!("kv-{}-d256-rht3-v1", policy.name()));
+        let identity = format!("{}:{contract}", swift::MODEL_SHA256);
+        self.kv_cache.as_deref() == Some(policy.name())
+            && self.startup_graph_identity.as_deref() == Some(identity.as_str())
     }
 }
 

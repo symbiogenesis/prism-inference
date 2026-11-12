@@ -55,8 +55,9 @@ The memory budget covers retained metadata only in tokenize mode; tokenizer\n\
 storage and input/output obey their separate fixed resource bounds.\n\
 State budget defaults to 4 GiB for live KV/recurrent element payload only;\n\
 model storage, graph scratch, checkpoints and allocator overhead are separate.\n\
-KV cache defaults to f16. Rotated rsq4/rsq4k3v profiles are experimental and\n\
-require 256-channel full-attention heads; output records identify the selected graph.\n\
+KV cache defaults to rsq4 (K4/V4) for verified Swift PQ2/PTQ1, f16 for other models.\n\
+Use --kv-cache f16 for explicit comparison/recovery. Rotated profiles require\n\
+256-channel heads; rsq4k3v remains experimental. Output records identify the graph.\n\
 Timeout covers generation after loading. Checks are cooperative between operations;\n\
 streamed tokens are provisional until the final completion record.\n\
 Backend defaults to auto. NEON requires the experimental-neon feature and\n\
@@ -91,7 +92,7 @@ struct Arguments {
     context: usize,
     checkpoint_bytes: usize,
     state_bytes: usize,
-    kv_cache: KvCachePolicy,
+    kv_cache: Option<KvCachePolicy>,
     generation: Generation,
     tokens: Vec<u32>,
     prompt: Option<String>,
@@ -319,10 +320,11 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
     if state_bytes == 0 || state_bytes > MAX_STATE_BYTES {
         return Err(bad("invalid native live-state payload budget"));
     }
-    let kv_cache = match values.remove("--kv-cache").as_deref().unwrap_or("f16") {
-        "f16" => KvCachePolicy::F16,
-        "rsq4" => KvCachePolicy::Rotated4,
-        "rsq4k3v" => KvCachePolicy::Rotated4Keys3Values,
+    let kv_cache = match values.remove("--kv-cache").as_deref() {
+        None => None,
+        Some("f16") => Some(KvCachePolicy::F16),
+        Some("rsq4") => Some(KvCachePolicy::Rotated4),
+        Some("rsq4k3v") => Some(KvCachePolicy::Rotated4Keys3Values),
         _ => return Err(bad("KV cache must be f16, rsq4 or rsq4k3v")),
     };
     let backend = match values.remove("--backend").as_deref().unwrap_or("auto") {
@@ -596,18 +598,31 @@ fn load_decoder(arguments: &Arguments) -> Result<Loaded> {
         .text_output
         .then(|| Vocabulary::from_metadata(&model.metadata, vocab_size))
         .transpose()?;
+    let kv_cache = generation_kv_cache(arguments.kv_cache, &model.identity);
     let decoder = Qwen35::with_state_budget_and_kv(
         model,
         arguments.context,
         arguments.state_bytes,
         arguments.backend,
-        arguments.kv_cache,
+        kv_cache,
     )?;
     Ok(Loaded {
         decoder,
         generation,
         vocabulary,
         tokens,
+    })
+}
+
+fn generation_kv_cache(explicit: Option<KvCachePolicy>, verified_identity: &str) -> KvCachePolicy {
+    use bonsai_prism_runtime::model::swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256};
+
+    explicit.unwrap_or({
+        if matches!(verified_identity, MODEL_SHA256 | REPACKED_PTQ1_SHA256) {
+            bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE
+        } else {
+            KvCachePolicy::F16
+        }
     })
 }
 
@@ -699,7 +714,7 @@ fn execute(arguments: &Arguments) -> Result<()> {
         "backend_requested": backend_requested,
         "state_budget_bytes": arguments.state_bytes,
         "state_memory": state_memory_record(runtime.decoder().state_memory()?),
-        "kv_cache": arguments.kv_cache.name(),
+        "kv_cache": runtime.decoder().kv_cache_policy().name(),
         "graph_identity": runtime.decoder().identity(),
         "prefill_block_tokens": arguments.prefill.block_tokens,
         "stop_tokens": generation.stop_tokens,
@@ -1047,8 +1062,25 @@ mod tests {
     }
 
     #[test]
-    fn cli_kv_cache_policy_is_explicit_and_rejects_unknown_or_repeated_modes() -> Result<()> {
-        assert_eq!(parse(arguments())?.kv_cache, KvCachePolicy::F16);
+    fn cli_kv_cache_policy_defaults_to_verified_swift_k4v4_and_preserves_other_models() -> Result<()>
+    {
+        use bonsai_prism_runtime::model::swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256};
+
+        assert_eq!(parse(arguments())?.kv_cache, None);
+        for identity in [MODEL_SHA256, REPACKED_PTQ1_SHA256] {
+            assert_eq!(
+                super::generation_kv_cache(None, identity),
+                KvCachePolicy::Rotated4
+            );
+            assert_eq!(
+                super::generation_kv_cache(Some(KvCachePolicy::F16), identity),
+                KvCachePolicy::F16
+            );
+        }
+        assert_eq!(
+            super::generation_kv_cache(None, "generic-model"),
+            KvCachePolicy::F16
+        );
         for (name, expected) in [
             ("f16", KvCachePolicy::F16),
             ("rsq4", KvCachePolicy::Rotated4),
@@ -1056,7 +1088,11 @@ mod tests {
         ] {
             let mut input = arguments();
             input.extend(["--kv-cache", name].map(str::to_owned));
-            assert_eq!(parse(input.clone())?.kv_cache, expected);
+            assert_eq!(parse(input.clone())?.kv_cache, Some(expected));
+            assert_eq!(
+                super::generation_kv_cache(Some(expected), "generic-model"),
+                expected
+            );
             input.extend(["--kv-cache", name].map(str::to_owned));
             assert!(parse(input).is_err());
         }

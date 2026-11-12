@@ -8,6 +8,13 @@ PTQ1 export, with an optional approved rank-one adapter. It uses each selected
 representation's full artifact and metadata verification. There is no arbitrary
 checkpoint or model-path fallback.
 
+These ordinary loading APIs select the owner-directed K4/V4 (`rsq4`) development
+cache. Use `load_profile_with_kv_cache(..., KvCachePolicy::F16)` explicitly for
+FP16 comparison/recovery. A session never changes precision after a failure or
+through a request body. This default does not establish actual-model quality,
+memory benefit or device qualification; [rotated KV](quantized-kv.md) records the
+remaining evidence and the generic graph constructors' FP16 reference behavior.
+
 Representation and adapter identity are immutable for the session. The accessors
 `representation()` and `adapter_identity()` expose the selected format and exact
 approved adapter artifact SHA-256. Model receipt accounting retains its original
@@ -37,8 +44,8 @@ By default every completion starts from empty model state. Adapter requests use
 `Runtime<Qwen35>::reset_with_adapter_scale`, which clears committed tokens,
 logits and saved prefixes only after renewing the decoder's empty-state identity.
 `Qwen35::reset_with_adapter_scale` reuses immutable weights and factors, clears
-FP16 KV and F32 convolution/recurrent state, and creates fresh checkpoint
-provenance. No prior checkpoint can restore afterward, including after the same
+the selected KV representation and F32 convolution/recurrent state, and creates
+fresh checkpoint provenance. No prior checkpoint can restore afterward, including after the same
 scale or a change back to an earlier scale. Neither API exposes general mutable
 decoder access or duplicates the model.
 

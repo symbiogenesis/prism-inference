@@ -26,7 +26,12 @@ use crate::{
 
 /// Maximum retained model storage admitted by this Swift session.
 pub const MODEL_MEMORY_BYTES: usize = 8 * 1024 * 1024 * 1024;
-/// Maximum live FP16 KV and F32 recurrent/convolution payload.
+/// Development-default Swift attention cache; explicit FP16 remains available.
+///
+/// This approximate K4/V4 policy does not establish full-model quality or device
+/// qualification. Generic graph constructors retain the FP16 reference policy.
+pub const DEFAULT_KV_CACHE: KvCachePolicy = KvCachePolicy::Rotated4;
+/// Maximum live selected-profile KV and F32 recurrent/convolution payload.
 pub const STATE_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Maximum complete transactional rollback snapshot storage.
 pub const CHECKPOINT_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
@@ -102,6 +107,9 @@ pub struct SwiftSession {
 impl SwiftSession {
     /// Load the pinned immutable artifact and establish bounded executable state.
     ///
+    /// Attention uses the development-default K4/V4 cache. Use
+    /// [`Self::load_profile_with_kv_cache`] for explicit FP16 comparison/recovery.
+    ///
     /// The separate storage/state/checkpoint caps exclude allocator overhead,
     /// bounded graph scratch and temporary loader copies. They do not replace
     /// the existing process-memory admission and watchdog policies.
@@ -139,7 +147,8 @@ impl SwiftSession {
     ///
     /// Selection is explicit and immutable for this session. Only the approved
     /// adapter artifact is admitted. This executable path does not qualify model
-    /// arithmetic, authoring basis, device resources, quality or a serving default.
+    /// arithmetic, authoring basis, device resources, quality or release readiness.
+    /// The attention cache uses [`DEFAULT_KV_CACHE`].
     ///
     /// # Errors
     /// Rejects artifact, representation, adapter, graph and storage-budget drift.
@@ -158,7 +167,7 @@ impl SwiftSession {
             backend,
             seed,
             parallelism,
-            KvCachePolicy::F16,
+            DEFAULT_KV_CACHE,
         )
     }
 
@@ -166,7 +175,8 @@ impl SwiftSession {
     ///
     /// Rotated profiles change numerical cache semantics and remain experimental.
     /// Context, output, model, checkpoint and process-admission limits are unchanged.
-    /// Existing loading APIs retain FP16; selection is never a request-body control.
+    /// Ordinary loading APIs use K4/V4. Pass [`KvCachePolicy::F16`] explicitly for
+    /// comparison/recovery; selection is never a request-body control or fallback.
     ///
     /// # Errors
     /// Rejects unsupported cache geometry and the same loading errors as

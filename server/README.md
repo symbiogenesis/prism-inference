@@ -11,6 +11,15 @@ current-weight export; `--abliterate-lora <absolute-path>` loads only the approv
 These options preserve the existing process admission and do not qualify full-model parity, creative
 quality, device performance or lower memory limits.
 
+The owner-selected source development default uses K4/V4 `rsq4` attention KV.
+Trusted startup `--kv-cache f16` selects the explicit comparison/recovery profile;
+`rsq4k3v` remains opt-in. Requests cannot choose precision and failures never
+change it. Non-FP16 readiness reports `kv_cache` and the actual
+`startup_graph_identity`; strict owning brokers must validate both. Full-model
+quality, measured memory benefit and X1/X2 qualification remain pending. A
+verified published bundle and matching broker contract are required for Runner;
+changing this source default does not replace its active release pin.
+
 Read-only model, adapter and key validation uses the credential helper pinned to
 Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`. Inside an actual Windows
 AppContainer, that helper preserves local-drive, non-root ancestry, reparse and

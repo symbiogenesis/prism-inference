@@ -11,6 +11,7 @@ use std::{
 
 use bonsai_prism_runtime::{
     Result,
+    graph::KvCachePolicy,
     kernels::{MatvecBackend, RowParallelism},
     model::swift,
     runtime::Cancellation,
@@ -24,7 +25,7 @@ use request::{MAX_FRAME_BYTES, Request};
 #[path = "../swift_worker_output.rs"]
 mod delivery;
 use delivery::{Delivery, write_record};
-const USAGE: &[u8] = b"Usage: bonsai-swift-worker --model <absolute-pinned-swift-gguf> --seed <u32> [--backend <auto|scalar>] [--row-workers <1..16>]\nJSONL: {\"op\":\"count\",\"id\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16}\nUse op=complete with timeout_seconds (1..600), or {\"op\":\"reset\",\"id\":2}.\nInput frames require LF and are bounded to 1 MiB. Output is flushed JSONL.\nDeltas are provisional until complete. Close the worker for transport cancellation;\nlibrary owners can also cancel cooperatively through the session Cancellation.\nExisting process admission and ownership policies must wrap this worker.\nFull-model correctness and device qualification require retained comparison evidence.\n";
+const USAGE: &[u8] = b"Usage: bonsai-swift-worker --model <absolute-pinned-swift-gguf> --seed <u32> [--backend <auto|scalar>] [--row-workers <1..16>] [--kv-cache <f16|rsq4|rsq4k3v>]\nDevelopment default: rsq4 K4/V4 KV. Use --kv-cache f16 for explicit comparison/recovery.\nJSONL: {\"op\":\"count\",\"id\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16}\nUse op=complete with timeout_seconds (1..600), or {\"op\":\"reset\",\"id\":2}.\nInput frames require LF and are bounded to 1 MiB. Output is flushed JSONL.\nDeltas are provisional until complete. Close the worker for transport cancellation;\nlibrary owners can also cancel cooperatively through the session Cancellation.\nExisting process admission and ownership policies must wrap this worker.\nFull-model correctness and device qualification require retained comparison evidence.\n";
 
 fn bad() -> bonsai_prism_runtime::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid Swift worker options").into()
@@ -36,6 +37,7 @@ fn load() -> Result<SwiftSession> {
     let mut seed = None;
     let mut backend = None;
     let mut row_workers = None;
+    let mut kv_cache = None;
     while let Some(key) = args.next() {
         let value = args.next().ok_or_else(bad)?;
         match key.to_str() {
@@ -53,16 +55,27 @@ fn load() -> Result<SwiftSession> {
             Some("--row-workers") if row_workers.is_none() => {
                 row_workers = Some(value.to_str().ok_or_else(bad)?.parse::<usize>()?);
             }
+            Some("--kv-cache") if kv_cache.is_none() => {
+                kv_cache = Some(match value.to_str() {
+                    Some("f16") => KvCachePolicy::F16,
+                    Some("rsq4") => KvCachePolicy::Rotated4,
+                    Some("rsq4k3v") => KvCachePolicy::Rotated4Keys3Values,
+                    _ => return Err(bad()),
+                });
+            }
             _ => return Err(bad()),
         }
     }
     let model = model.filter(|path| path.is_absolute()).ok_or_else(bad)?;
     let parallelism = RowParallelism::new(row_workers.unwrap_or(1))?;
-    SwiftSession::load_with_row_parallelism(
+    SwiftSession::load_profile_with_kv_cache(
         &model,
+        swift::Representation::Pq2,
+        None,
         backend.unwrap_or(MatvecBackend::Auto),
         seed.ok_or_else(bad)?,
         parallelism,
+        kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
     )
 }
 
@@ -103,25 +116,27 @@ fn write_readiness(session: &SwiftSession, output: &mut impl Write) -> Result<()
         MatvecBackend::Scalar => "scalar",
         MatvecBackend::ExperimentalNeon => "neon",
     };
-    write_record(
-        output,
-        &json!({
-            "type":"ready", "model_sha256":swift::MODEL_SHA256,
-            "protocol":"bonsai-swift-worker-v1", "template_sha256":swift::TEMPLATE_SHA256,
-            "vocab_size":swift::VOCAB_SIZE,
-            "prism_commit":"73bfe6cc485554822f80c473a3c0c4f25e80f41b",
-            "seed":session.seed(), "backend":backend,
-            "max_frame_bytes":MAX_FRAME_BYTES,
-            "max_output_bytes":bonsai_prism_runtime::swift_session::MAX_OUTPUT_BYTES,
-            "runtime":"bonsai-prism-runtime", "context_tokens":swift::CONTEXT_TOKENS,
-            "max_output_tokens":swift::MAX_OUTPUT_TOKENS,
-            "temperature":1, "top_p":0.95, "top_k":20, "min_p":0,
-            "repeat_penalty":1, "presence_penalty":0, "frequency_penalty":0,
-            "thinking":true, "reasoning_effort":"xhigh", "preserve_thinking":true,
-            "cache_reuse":false, "speculation":false, "adapters":false,
-            "qualification":"pending-full-model-parity-and-device-evidence",
-        }),
-    )?;
+    let mut readiness = json!({
+        "type":"ready", "model_sha256":swift::MODEL_SHA256,
+        "protocol":"bonsai-swift-worker-v1", "template_sha256":swift::TEMPLATE_SHA256,
+        "vocab_size":swift::VOCAB_SIZE,
+        "prism_commit":"73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+        "seed":session.seed(), "backend":backend,
+        "max_frame_bytes":MAX_FRAME_BYTES,
+        "max_output_bytes":bonsai_prism_runtime::swift_session::MAX_OUTPUT_BYTES,
+        "runtime":"bonsai-prism-runtime", "context_tokens":swift::CONTEXT_TOKENS,
+        "max_output_tokens":swift::MAX_OUTPUT_TOKENS,
+        "temperature":1, "top_p":0.95, "top_k":20, "min_p":0,
+        "repeat_penalty":1, "presence_penalty":0, "frequency_penalty":0,
+        "thinking":true, "reasoning_effort":"xhigh", "preserve_thinking":true,
+        "cache_reuse":false, "speculation":false, "adapters":false,
+        "qualification":"pending-full-model-parity-and-device-evidence",
+    });
+    if session.kv_cache_policy() != KvCachePolicy::F16 {
+        readiness["kv_cache"] = json!(session.kv_cache_policy().name());
+        readiness["startup_graph_identity"] = json!(session.decoder_identity());
+    }
+    write_record(output, &readiness)?;
     Ok(())
 }
 

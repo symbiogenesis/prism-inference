@@ -62,6 +62,13 @@ insertion flags are validated; supplied token-ID prompts remain unchanged.
 
 ## Streaming output and generation controls
 
+The source development default for the exact verified Swift PQ2/PTQ1 identities
+is K4/V4 `--kv-cache rsq4`; other models retain FP16. Rotated profiles require
+256-channel full-attention heads. Use `--kv-cache f16` for explicit reference or
+comparison/recovery; unsupported rotated geometry rejects without fallback.
+`rsq4k3v` remains opt-in. Completion records identify the selected
+cache and numerical graph; this choice does not establish quality or device benefit.
+
 Output defaults to one JSON token object per line followed by accounting, which
 includes the effective `stop_tokens`. Optional `--output text` adds `bytes`,
 `text` and `special` to each token record. It requires matching `gpt2`/`qwen35`
@@ -252,9 +259,16 @@ caller owns process lifetime, transport deadlines, cancellation and shutdown.
 `SwiftChatSession` applies the verified template and tokenizer, while
 `SwiftSession` supplies the production MT19937 sampler and transactional
 decoding. See [runtime contracts](runtime-contracts.md#status-and-integration).
+The worker uses the K4/V4 development default and accepts trusted startup
+`--kv-cache f16|rsq4|rsq4k3v`; client requests cannot change it. Non-FP16 readiness
+adds `kv_cache` and `startup_graph_identity`. `SwiftClient::connect` verifies the
+default; `connect_with_kv_cache` verifies an explicit comparison/recovery profile.
 
 `prism-inference-server` supplies the private authenticated HTTP contract used
 by SwiftBonsai's guarded Windows launcher. The owner verifies executable and
 model identity and retains process/Job ownership. See the
 [server guide](../server/README.md) for its ownership and streaming contract.
 Use each executable's `--help` for its startup arguments.
+The private server also defaults to K4/V4 and preserves explicit `--kv-cache f16`
+recovery. Application use requires the matching verified bundle and strict broker
+readiness contract; source defaults do not change a released application's pin.

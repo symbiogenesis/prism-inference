@@ -78,7 +78,9 @@ for qualification that remains open.
 - Embeddings, Hadamard/sign transforms, RMS normalization, causal nonflash
   attention, text-interleaved MRoPE, GDN/convolution state, gated feed-forward
   layers and output projection. Attention retains FP16 query/probability
-  conversion and exact FP16 KV bits; convolution/GDN state stays F32.
+  conversion. Generic graph constructors retain exact FP16 KV bits; ordinary
+  Swift sessions/workers use the [K4/V4 development default](quantized-kv.md).
+  Convolution/GDN state stays F32.
 - Single-owner bounded conversations with greedy token streaming, backpressure,
   exact prefix checkpoints, edited prompts, reset, cancellation between decoder
   operations and rollback after evaluation or delivery failure. Streamed tokens
@@ -125,8 +127,9 @@ for qualification that remains open.
   The default block decoder preserves exact sequential arithmetic and checks
   cancellation/deadlines between tokens. Errors roll back the whole request.
   Optimized tiled graph execution and prefill performance remain unqualified.
-- Full-attention checkpoints share sealed 64-token FP16 KV pages. Each snapshot
-  copies the private mutable tail and complete F32 convolution/recurrent state;
+- Full-attention checkpoints share sealed 64-token pages in the selected KV
+  representation. Each snapshot copies the private mutable tail and complete F32
+  convolution/recurrent state;
   later append, reset or restoration cannot modify saved pages.
 - At position zero, graph checkpoints store provenance and metadata without
   copying canonical empty KV or positive-zero convolution/recurrent payloads.
@@ -240,7 +243,7 @@ before constructing the graph. These bounds do not qualify process-memory use.
 Optional `--state-bytes` sets the admitted maximum
 live KV/convolution/recurrent element payload, from 1 byte through the default
 4 GiB. `Qwen35::with_state_budget` exposes the same bound to library callers.
-Admission charges the complete configured context using FP16 K/V and F32
+Admission charges the complete configured context using the selected K/V and F32
 convolution/recurrent state before state allocation; KV storage remains lazy.
 The completion record includes `state_budget_bytes`. This is a payload bound,
 not a bound on vector headers, allocator overhead, graph scratch or process RAM;

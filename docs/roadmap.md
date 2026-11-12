@@ -29,6 +29,13 @@ worker and fresh per-request state remain the service defaults. PTQ1, approved
 rank-one adapters, parallel row workers and latest-prefix reuse require explicit
 selection; availability does not establish their model or device qualification.
 
+The [rotated KV source candidate](quantized-kv.md) adds explicit Rust 4-bit and
+asymmetric 4/3-bit profiles, common X1/X2 NEON kernels and exact packed-state
+rollback. Full-model quality, long-context benefit and separate X1/X2 device
+qualification remain open. Any default or mandatory promotion requires the
+declared negligible-quality-loss and useful-benefit gates; active bundle/profile
+integration remains pending owner publication.
+
 ## What the evidence establishes
 
 The retained model-loading evidence covers the pinned 851-tensor artifact and

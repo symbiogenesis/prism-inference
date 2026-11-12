@@ -43,7 +43,7 @@ impl Pq2LutExecutor {
         if max_columns == 0
             || !max_columns.is_multiple_of(128)
             || (max_columns / 128)
-                .checked_mul(std::mem::size_of::<Tl1BlockLut>())
+                .checked_mul(size_of::<Tl1BlockLut>())
                 .is_none()
         {
             return Err(invalid("PQ2 LUT requires a bounded complete input width"));
@@ -94,7 +94,7 @@ impl Pq2LutExecutor {
 }
 
 impl Pq2ProjectionExecutor for Pq2LutExecutor {
-    fn identity(&self) -> &str {
+    fn identity(&self) -> &'static str {
         "cpu-pq2-tl1-exact-experimental"
     }
 

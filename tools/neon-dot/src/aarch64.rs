@@ -19,6 +19,55 @@ const PRESENT: u8 = 2;
 static DOTPROD_STATE: AtomicU8 = AtomicU8::new(UNINIT);
 static I8MM_STATE: AtomicU8 = AtomicU8::new(UNINIT);
 
+// FCVTL is part of baseline AArch64 NEON, independently of the optional FP16
+// arithmetic extension. Its exact finite widening ignores FZ16. Sanitizing via
+// the integer exceptional check also avoids AHP/DN and signaling-NaN changes.
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
+    use core::arch::aarch64::{
+        vand_u16, vcvt_f32_f16, vdup_n_u16, vld1_u16, vmaxv_u16, vreinterpret_f16_u16, vst1q_f32,
+    };
+    // SAFETY: fixed-array extent covers the unaligned load. This function is
+    // compiled only when baseline NEON is enabled for its AArch64 target.
+    let raw = unsafe { vld1_u16(bits.as_ptr()) };
+    if vmaxv_u16(vand_u16(raw, vdup_n_u16(0x7fff))) >= 0x7c00 {
+        return bits.map(super::half::scalar);
+    }
+    let value = vcvt_f32_f16(vreinterpret_f16_u16(raw));
+    let mut output = [0.0; 4];
+    // SAFETY: output is a unique valid four-element array; unaligned stores
+    // are supported, and the vector contains four initialized values.
+    unsafe { vst1q_f32(output.as_mut_ptr(), value) };
+    output
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
+    use core::arch::aarch64::{
+        vandq_u16, vcvt_f32_f16, vcvt_high_f32_f16, vdupq_n_u16, vget_low_f16, vld1q_u16,
+        vmaxvq_u16, vreinterpretq_f16_u16, vst1q_f32,
+    };
+    // SAFETY: fixed-array extent covers the unaligned load. The enclosing
+    // cfg ensures baseline AArch64 NEON; no optional FP16 arithmetic is used.
+    let raw = unsafe { vld1q_u16(bits.as_ptr()) };
+    if vmaxvq_u16(vandq_u16(raw, vdupq_n_u16(0x7fff))) >= 0x7c00 {
+        return super::half::portable_eight(bits);
+    }
+    let half = vreinterpretq_f16_u16(raw);
+    let first = vcvt_f32_f16(vget_low_f16(half));
+    let second = vcvt_high_f32_f16(half);
+    let mut output = [[0.0; 4]; 2];
+    // SAFETY: the first output is a valid unique four-element array, and
+    // `first` contains four initialized values; unaligned stores are valid.
+    unsafe { vst1q_f32(output[0].as_mut_ptr(), first) };
+    // SAFETY: the second output is a disjoint valid four-element array, and
+    // `second` contains four initialized values; unaligned stores are valid.
+    unsafe { vst1q_f32(output[1].as_mut_ptr(), second) };
+    output
+}
+
 #[inline]
 pub(super) fn has_dotprod() -> bool {
     if cfg!(target_feature = "dotprod") {

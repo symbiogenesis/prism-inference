@@ -376,19 +376,13 @@ pub(super) fn f16_u32x4_to_f32_x4(neon: Neon, raw: u32x4<Neon>) -> f32x4<Neon> {
 
 #[inline]
 pub(super) fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
-    f16_u32x4_to_f32_x4(neon, u32x4::from_slice(neon, &bits.map(u32::from)))
+    f32x4::load_array(neon, bonsai_neon_dot::widen_f16_four(&bits))
 }
 
 #[inline]
 pub(super) fn f16_bits_to_f32_x8(neon: Neon, bits: &[u16; 8]) -> (f32x4<Neon>, f32x4<Neon>) {
-    let raw = u16x8::from_slice(neon, bits);
-    let zero = u16x8::splat(neon, 0);
-    let low = raw.zip_low(zero).bitcast::<u32x4<Neon>>();
-    let high = raw.zip_high(zero).bitcast::<u32x4<Neon>>();
-    (
-        f16_u32x4_to_f32_x4(neon, low),
-        f16_u32x4_to_f32_x4(neon, high),
-    )
+    let [low, high] = bonsai_neon_dot::widen_f16_eight(bits);
+    (f32x4::load_array(neon, low), f32x4::load_array(neon, high))
 }
 
 #[inline]
@@ -6259,6 +6253,8 @@ pub(super) fn swiglu_hadamard_block_read_into(
 
 #[cfg(test)]
 mod tests {
+    use fearless_simd::SimdBase as _;
+
     use super::{
         block16_all_finite_le, block16_all_le, dot, dot_consumption_order, dot_groups,
         dot_i16_block, dot_ptq1_groups, dot_q4_0_block, dot_q4_0_eight_rows, dot_q4_0_four_rows,
@@ -6267,6 +6263,30 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[test]
+    fn simd_neon_half_widening_preserves_all_encoding_bits_in_consumers() {
+        let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+            return;
+        };
+        for bits in 0..=u16::MAX {
+            let input = std::array::from_fn(|lane: usize| {
+                bits.wrapping_add(u16::from(lane.to_le_bytes()[0]) * 8191)
+            });
+            let expected = input.map(|value| bonsai_ternary::half_to_float(value).to_bits());
+            let (first, second) = super::f16_bits_to_f32_x8(neon, &input);
+            let actual = [first.to_array(), second.to_array()].map(|row| row.map(f32::to_bits));
+            assert_eq!(actual[0], expected[..4]);
+            assert_eq!(actual[1], expected[4..]);
+            let four = [input[0], input[2], input[4], input[6]];
+            assert_eq!(
+                super::f16_bits_to_f32_x4(neon, four)
+                    .to_array()
+                    .map(f32::to_bits),
+                four.map(|value| bonsai_ternary::half_to_float(value).to_bits())
+            );
+        }
+    }
 
     fn reference(packed: &[u8; 32], activations: &[i8; 128]) -> i32 {
         let mut sum = 0;

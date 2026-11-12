@@ -1,11 +1,15 @@
 //! Audited ARMv8.2-A `dotprod` (`vdotq_s32`) and `i8mm` (`vmmlaq_s32`) SIMD
-//! dot-product and non-widening `PTQ1_0` base-3 unpacking primitives.
+//! dot-product, exact binary16 widening and non-widening `PTQ1_0` unpacking.
 //!
 //! All public entry points accept fixed-size array references and fall back
-//! cleanly to exact portable integer arithmetic when `aarch64`, `dotprod`, or
-//! `i8mm` is unavailable.
+//! cleanly to exact portable arithmetic when their target features are absent.
+//! Binary16 widening preserves every bit pattern through a baseline-NEON
+//! finite fast path and exact exceptional decoding.
 
 #![deny(unsafe_code)]
+
+mod half;
+pub use half::{widen_f16_eight, widen_f16_four};
 
 #[cfg(target_arch = "aarch64")]
 #[allow(

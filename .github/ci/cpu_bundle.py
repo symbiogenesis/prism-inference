@@ -26,6 +26,17 @@ TARGET = "aarch64-pc-windows-msvc"
 FEATURES = ["cli", "experimental-neon", "parallel-rows"]
 CHECK_PHASES = ["source_analysis", "portable_library", "state_fixture", "collector_analysis",
                 "collector_controls", "collector_link"]
+STATE_CONTROL = "graph_parallel_rows_preserve_logits_checkpoints_and_recovery"
+COLLECTOR_CONTROLS = [
+    "tests::completion_requires_matching_terminal_runtime_counts_and_nonempty_output",
+    "tests::deadlines_require_original_bounded_absolute_time",
+    "tests::failure_receipt_retains_provisional_output_without_committing_or_overwriting",
+    "tests::first_text_event_timing_ignores_empty_failed_and_subsequent_deliveries",
+    "tests::output_rejects_overflow_and_any_delivery_after_terminal",
+    "tests::records_hash_exact_utf8_and_keep_unentered_counts_unknown",
+    "tests::selection_rejects_relative_paths_bad_commit_and_output_overflow",
+]
+TEST_INVENTORIES = {"state_fixture": [STATE_CONTROL], "collector_controls": COLLECTOR_CONTROLS}
 SCHEDULE = ["baseline", "candidate", "candidate", "baseline"]
 MESSAGES = [{"role": "user", "content": "Count from 1 to 10. Answer with only the numbers."}]
 PROFILE = {
@@ -42,6 +53,9 @@ REGISTRY_PACKAGES = {
     "prism-inference": ("0.1.25", "0a117db7589a821b27c224e41aaababa5ddd2ac9852344c0a8121a0849046363"),
     "bonsai-neon-dot": ("0.1.2", "f932c3309ef3645b055b91bdd9ee6986b7ef98c24bc1831701138e3ab9d3a31b"),
     "bonsai-native-hash": ("0.1.3", "315284b1f3fc7e98f2cb0f749e63690853f1c441d2b3a3eec2ad68abe45180a2"),
+    "bonsai-ternary": ("0.1.3", "f6ea8b95000a131bb48e27453b776e9e42096194648a3a8ebde782d5cfe9f604"),
+    "bonsai-gguf": ("0.1.5", "fdd15a1ed0911fca0d987c349c3ffa02078b729b05148f46e78a285f89189b4b"),
+    "bonsai-prism": ("0.1.5", "9ecabe1b5c626d4ceaef666b27f11c5a906dea56234252d3cbb8f46125d976ea"),
 }
 MAX_JSON_BYTES = 4 * 1024 * 1024
 
@@ -130,8 +144,22 @@ def command(args: list[str], cwd: Path, env: dict | None = None) -> str:
                                capture_output=True, text=True, encoding="utf-8")
     if completed.returncode:
         raise AdmissionError(f"Command failed ({completed.returncode}): {args!r}\n"
-                             f"{completed.stderr[-12000:]}")
+                             f"stdout:\n{completed.stdout[-12000:]}\nstderr:\n{completed.stderr[-12000:]}")
     return completed.stdout.strip()
+
+
+def test_summary(output: str, expected_names: list[str]) -> dict:
+    summaries = re.findall(r"^test result:.*$", output, re.MULTILINE)
+    require(len(summaries) == 1, "Require exactly one complete libtest result summary.")
+    match = re.fullmatch(r"test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; 0 measured; "
+                         r"[0-9]+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s", summaries[0])
+    require(match is not None and int(match.group(1)) == len(expected_names) and expected_names,
+            "Libtest summary did not execute the exact positive control inventory.")
+    executed = re.findall(r"^test ([^\s]+) \.\.\. ok$", output, re.MULTILINE)
+    require(len(executed) == len(expected_names) and sorted(executed) == sorted(expected_names),
+            "Libtest named controls differ from the required inventory.")
+    return {"passed": len(expected_names), "failed": 0, "ignored": 0, "measured": 0,
+            "names": sorted(executed), "summary": summaries[0]}
 
 
 def git(root: Path, *args: str) -> str:
@@ -197,8 +225,7 @@ def registry_source(output: Path) -> tuple[Path, dict, dict]:
             verify_registry_tree(root, checksum)
             vcs = read_json(root / ".cargo_vcs_info.json")["git"]["sha1"]
             hex_value(vcs, 40, "registry package VCS identity")
-            if name in ("prism-inference", "bonsai-neon-dot"):
-                require(vcs == REGISTRY_REVISION, "Registry package VCS source differs.")
+            require(vcs == REGISTRY_REVISION, "Registry package VCS source differs.")
             packages[name] = {"name": name, "version": version, "sha256": checksum,
                               "revision": vcs, "source": matches[0]["source"],
                               "manifest_sha256": file_digest(root / "Cargo.toml"),
@@ -243,6 +270,13 @@ def verify_registry_tree(root: Path, archive_sha256: str) -> None:
             require(path.stat().st_size == entry.size and file_digest(path) == expected,
                     "Cargo-extracted registry source bytes differ from the approved archive.")
     require(seen, "Empty registry source archive.")
+    actual = set()
+    for path in root.rglob("*"):
+        require(not path.is_symlink(), "Unexpected link in Cargo-extracted registry source.")
+        if path.is_file():
+            actual.add(path.relative_to(root).as_posix())
+    require(actual - {".cargo-ok"} == seen,
+            "Cargo-extracted registry tree contains missing or unexpected source files.")
 
 
 def hosted_preparation(runner_revision: str | None = None) -> dict:
@@ -333,27 +367,49 @@ def prepare(baseline: Path, candidate: Path, revision: str, output: Path,
                 encoding="utf-8")
             cargo = ["cargo", f"+{CHANNEL}"]
             command(cargo + ["fetch", "--locked", "--manifest-path", str(root / "Cargo.toml")], lane, env)
-            command(cargo + ["generate-lockfile", "--offline", "--manifest-path", str(driver_manifest)], lane, env)
+            # Preserve settled transitive selections while adding the external driver.
+            # A fresh generate-lockfile would select newer cached transitive versions.
+            shutil.copyfile(root / "Cargo.lock", lane / "Cargo.lock")
+            command(cargo + ["metadata", "--offline", "--format-version", "1",
+                             "--manifest-path", str(driver_manifest)], lane, env)
             lock_subset(lane / "Cargo.lock", root / "Cargo.lock", registry)
             commands = [
                 cargo + ["clippy", "--manifest-path", str(root / "Cargo.toml"), "--locked", "--offline",
-                         "--release", "-p", "prism-inference", "-p", "bonsai-neon-dot", "-p", "bonsai-native-hash",
+                         "--release", "-p", "prism-inference",
                          "--all-targets", "--features", "prism-inference/parallel-rows", "--", "-D", "warnings"],
                 cargo + ["check", "--manifest-path", str(root / "Cargo.toml"), "--locked", "--offline",
                          "--release", "-p", "prism-inference", "--lib", "--no-default-features"],
                 cargo + ["test", "--manifest-path", str(root / "Cargo.toml"), "--locked", "--offline", "--release",
                          "-p", "prism-inference", "--features", "parallel-rows", "--test", "graph",
-                         "graph_parallel_rows_preserve_logits_checkpoints_and_recovery", "--", "--exact"],
+                         STATE_CONTROL, "--", "--exact", "--color", "never"],
                 cargo + ["clippy", "--manifest-path", str(driver_manifest), "--locked", "--offline",
                          "--release", "--all-targets", "--", "-D", "warnings"],
                 cargo + ["test", "--manifest-path", str(driver_manifest), "--locked", "--offline", "--release",
-                         "--bin", "cpu-bundle-check"],
+                         "--bin", "cpu-bundle-check", "--", "--color", "never"],
                 cargo + ["build", "--manifest-path", str(driver_manifest), "--locked", "--offline", "--release",
                          "--bin", "cpu-bundle-check"],
             ]
             for phase, args in zip(CHECK_PHASES, commands, strict=True):
-                command(args, lane, env)
-                checks.append({"phase": phase, "command": args, "exit_code": 0})
+                output_text = command(args, lane, env)
+                check = {"phase": phase, "command": args, "exit_code": 0}
+                if phase in TEST_INVENTORIES:
+                    check["test_summary"] = test_summary(output_text, TEST_INVENTORIES[phase])
+                if phase == "source_analysis":
+                    check["helper_checks"] = []
+                    for package, helper_root in (
+                        ("bonsai-neon-dot", packages["bonsai-neon-dot"]["root"] if registry else root / "tools/neon-dot"),
+                        ("bonsai-native-hash", hash_root),
+                    ):
+                        helper_manifest = helper_root / "Cargo.toml"
+                        helper_lock = helper_root / "Cargo.lock" if registry else root / "Cargo.lock"
+                        command(cargo + ["fetch", "--locked", "--manifest-path", str(helper_manifest)], lane, env)
+                        helper_args = cargo + ["clippy", "--manifest-path", str(helper_manifest), "--locked", "--offline",
+                                               "--release", "--all-targets", "--", "-D", "warnings"]
+                        command(helper_args, lane, env)
+                        check["helper_checks"].append({"package": package, "command": helper_args, "exit_code": 0,
+                                                       "manifest_sha256": file_digest(helper_manifest),
+                                                       "lock_sha256": file_digest(helper_lock)})
+                checks.append(check)
             executable = output / f"{role}.exe"
             shutil.copyfile(lane / "build/release/cpu-bundle-check.exe", executable)
             arms[role] = {"source": identities[role], "legacy_f16_build": legacy,
@@ -386,7 +442,7 @@ def prepare(baseline: Path, candidate: Path, revision: str, output: Path,
                "messages": {"path": "messages.json", "sha256": digest(messages)}, "output_tokens": 32,
                "model_sha256": MODEL_SHA256, "model_bytes": 7_206_168_928,
                "adapter_sha256": ADAPTER_SHA256, "adapter_bytes": 9_682_464,
-               "per_arm_timeout_seconds": 90,
+               "per_arm_timeout_seconds": 60,
                "schedule": SCHEDULE, "profile": PROFILE, "arms": arms,
                "minimum_relative_request_improvement": 0.10, "maximum_owned_arm_regression": 0.10,
                "model_executed": False, "promotion_qualified": False}
@@ -482,7 +538,7 @@ def evaluate(preparation_path: Path, owner_path: Path) -> dict:
     require(preparation.get("schema_version") == 1 and preparation.get("kind") == "prism-cpu-bundle-preparation"
             and preparation.get("target") == TARGET and preparation.get("features") == FEATURES
             and preparation.get("schedule") == SCHEDULE and preparation.get("profile") == PROFILE
-            and preparation.get("per_arm_timeout_seconds") == 90
+            and preparation.get("per_arm_timeout_seconds") == 60
             and preparation.get("model_sha256") == MODEL_SHA256
             and preparation.get("adapter_sha256") == ADAPTER_SHA256
             and preparation.get("model_executed") is False and preparation.get("promotion_qualified") is False,
@@ -516,6 +572,25 @@ def evaluate(preparation_path: Path, owner_path: Path) -> dict:
                         and isinstance(check.get("command"), list) and check["command"]
                         for check in prepared["checks"]),
                 "Missing successful source-bound preparation checks.")
+        for check in prepared["checks"]:
+            if check["phase"] in TEST_INVENTORIES:
+                expected_names = TEST_INVENTORIES[check["phase"]]
+                summary = check.get("test_summary", {})
+                require(summary.get("passed") == len(expected_names)
+                        and all(type(summary.get(field)) is int for field in ("passed", "failed", "ignored", "measured"))
+                        and summary.get("failed") == 0 and summary.get("ignored") == 0
+                        and summary.get("measured") == 0 and summary.get("names") == sorted(expected_names),
+                        "Missing exact executed control inventory.")
+            if check["phase"] == "source_analysis":
+                helpers = check.get("helper_checks")
+                require(isinstance(helpers, list)
+                        and [helper.get("package") for helper in helpers] == ["bonsai-neon-dot", "bonsai-native-hash"]
+                        and all(type(helper.get("exit_code")) is int and helper["exit_code"] == 0
+                                and helper.get("command") for helper in helpers),
+                        "Missing explicit helper-manifest strict analysis.")
+                for helper in helpers:
+                    hex_value(helper.get("manifest_sha256"), 64, "helper manifest digest")
+                    hex_value(helper.get("lock_sha256"), 64, "helper lock digest")
     require(preparation["arms"]["candidate"]["source"]["revision"] != BASELINE,
             "Candidate is the baseline source.")
     if preparation["arms"]["candidate"]["source"].get("kind") == "registry":
@@ -531,8 +606,7 @@ def evaluate(preparation_path: Path, owner_path: Path) -> dict:
             require(package.get("name") == name and package.get("version") == version
                     and package.get("sha256") == checksum, "Changed registry dependency bytes.")
             hex_value(package.get("revision"), 40, "registry package VCS identity")
-            if name in ("prism-inference", "bonsai-neon-dot"):
-                require(package["revision"] == REGISTRY_REVISION, "Changed registry package source identity.")
+            require(package["revision"] == REGISTRY_REVISION, "Changed registry package source identity.")
     integer(preparation.get("output_tokens"), 1, 32, "prepared output cap")
     hex_value(preparation.get("messages", {}).get("sha256"), 64, "messages digest")
     require(owner.get("schema_version") == 1 and owner.get("kind") == "prism-cpu-bundle-owner"
@@ -568,7 +642,7 @@ def evaluate(preparation_path: Path, owner_path: Path) -> dict:
                                     "collector arm deadline")
         derived_unix_deadline = source_deadline - ((deadline - execution_deadline) * 1000 // frequency)
         require(begin < execution_deadline <= deadline
-                and execution_deadline - begin <= 90 * frequency
+                and execution_deadline - begin <= 60 * frequency
                 and abs(derived_unix_deadline - arm_unix_deadline) <= 2,
                 "Arm deadline is not derived from the original aggregate clock.")
         require(arm.get("host_identity") == owner["host_identity"], "Native host identity changed.")
@@ -594,6 +668,8 @@ def evaluate(preparation_path: Path, owner_path: Path) -> dict:
         native_snapshots += [native_conditions(cpu.get("Before"), owner["host_identity"]),
                              native_conditions(cpu.get("After"), owner["host_identity"])]
         wall = positive(supervision.get("WallMilliseconds"), "supervised wall time")
+        require(wall <= (execution_deadline - begin) * 1000.0 / frequency + 1.0,
+                "Observed process wall time exceeded its declared arm execution deadline.")
         minimum = integer(supervision.get("MinimumAvailablePhysicalBytes"), 4_294_967_296, 2**63 - 1,
                           "physical reserve")
         peak = integer(supervision.get("PeakJobMemoryBytes"), 1, 12_348_030_976, "Job memory peak")

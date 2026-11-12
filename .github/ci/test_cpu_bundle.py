@@ -53,7 +53,7 @@ class CaptureFixture:
                                                   "examples/cpu_bundle_check/tests.rs": "2" * 64},
                             "messages": {"path": "messages.json", "sha256": cpu.file_digest(self.packet / "messages.json")},
                             "model_sha256": cpu.MODEL_SHA256, "adapter_sha256": cpu.ADAPTER_SHA256,
-                            "per_arm_timeout_seconds": 90, "output_tokens": 32,
+                            "per_arm_timeout_seconds": 60, "output_tokens": 32,
                             "minimum_relative_request_improvement": 0.10, "maximum_owned_arm_regression": 0.10,
                             "arms": {}}
         for role in ("baseline", "candidate"):
@@ -62,6 +62,16 @@ class CaptureFixture:
                 "legacy_f16_build": role == "baseline", "executable": {"sha256": "b" * 64 if role == "baseline" else "c" * 64},
                 "checks": [{"phase": phase, "exit_code": 0, "command": ["synthetic-fixture"]}
                            for phase in cpu.CHECK_PHASES]}
+            for check in self.preparation["arms"][role]["checks"]:
+                if check["phase"] in cpu.TEST_INVENTORIES:
+                    names = sorted(cpu.TEST_INVENTORIES[check["phase"]])
+                    check["test_summary"] = {"passed": len(names), "failed": 0, "ignored": 0,
+                                             "measured": 0, "names": names}
+                if check["phase"] == "source_analysis":
+                    check["helper_checks"] = [{"package": package, "exit_code": 0,
+                                                "command": ["synthetic-helper-fixture"],
+                                                "manifest_sha256": "1" * 64, "lock_sha256": "2" * 64}
+                                               for package in ("bonsai-neon-dot", "bonsai-native-hash")]
         self.owner = {"schema_version": 1, "kind": "prism-cpu-bundle-owner", "workload_predeclared": True,
                       "completed": True, "budget_seconds": 600, "clock_frequency": 1000,
                       "started_tick": 100000, "deadline_tick": 700000, "retention_completed_tick": 300000,
@@ -74,7 +84,7 @@ class CaptureFixture:
             begin = 110000 + index * 20000
             candidate = role == "candidate"
             finish = begin + (1000 if candidate else 1500)
-            execution_deadline = begin + 90000
+            execution_deadline = begin + 60000
             unix_deadline = self.owner["original_deadline_unix_milliseconds"] - (700000 - execution_deadline)
             output = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
             receipt = dict(cpu.PROFILE)
@@ -186,6 +196,19 @@ class CpuBundleAdmissionTests(unittest.TestCase):
                 self.assert_rejected()
                 self.capture.preparation = saved
 
+    def test_libtest_stdout_requires_exact_positive_named_controls(self):
+        name = cpu.STATE_CONTROL
+        good = f"running 1 test\ntest {name} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.01s"
+        self.assertEqual(cpu.test_summary(good, [name])["passed"], 1)
+        for output in ("", good.replace("1 passed", "0 passed"), good.replace("0 ignored", "1 ignored"),
+                       good + "\n" + good, good.replace(f"test {name} ... ok", "test different_control ... ok")):
+            with self.subTest(output=output), self.assertRaises(cpu.AdmissionError):
+                cpu.test_summary(output, [name])
+
+    def test_preparation_cannot_replace_positive_controls_with_zero_test_receipts(self):
+        self.capture.preparation["arms"]["candidate"]["checks"][2]["test_summary"]["passed"] = 0
+        self.assert_rejected()
+
     def test_changed_artifact_backend_precision_or_worker_identity_rejects(self):
         for field, value in (("executable_sha256", "d" * 64), ("execution_device", "npu"),
                              ("kv_cache", "rsq4"), ("effective_row_workers", 6),
@@ -237,6 +260,11 @@ class CpuBundleAdmissionTests(unittest.TestCase):
                 change(self.capture.owner)
                 self.assert_rejected()
                 self.capture.owner = saved
+
+    def test_observed_wall_time_cannot_exceed_its_declared_execution_window(self):
+        self.capture.supervisions[0]["WallMilliseconds"] = 60002
+        self.capture.owner["arms"][0]["cleanup_completed_tick"] = self.capture.owner["arms"][0]["started_tick"] + 61000
+        self.assert_rejected()
 
     def test_incomplete_or_overlapping_cleanup_and_reordered_arms_reject(self):
         for field, value in (("cleanup_succeeded", False), ("owned_job_empty", False),
@@ -321,6 +349,12 @@ class CpuBundleAdmissionTests(unittest.TestCase):
         root, checksum = self.registry_tree_fixture("package-1.0.0/Cargo.toml")
         cpu.verify_registry_tree(root, checksum)
         (root / "Cargo.toml").write_bytes(b"changed source")
+        with self.assertRaises(cpu.AdmissionError):
+            cpu.verify_registry_tree(root, checksum)
+
+    def test_registry_source_rejects_added_discoverable_files(self):
+        root, checksum = self.registry_tree_fixture("package-1.0.0/Cargo.toml")
+        (root / "extra.rs").write_text("// unexpected test source\n", encoding="utf-8")
         with self.assertRaises(cpu.AdmissionError):
             cpu.verify_registry_tree(root, checksum)
 

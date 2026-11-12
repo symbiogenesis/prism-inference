@@ -38,12 +38,20 @@ runtime 0.1.25 checksum `0a117db7589a821b27c224e41aaababa5ddd2ac9852344c0a8121a0
 VCS identities before building. Before and after building, stream each verified
 Cargo cache archive read-only and compare its regular-file bytes with the source
 files Cargo extracted; never extract paths supplied by the archive.
+The same freeze includes `bonsai-ternary` 0.1.3
+(`f6ea8b95000a131bb48e27453b776e9e42096194648a3a8ebde782d5cfe9f604`),
+`bonsai-gguf` 0.1.5
+(`fdd15a1ed0911fca0d987c349c3ffa02078b729b05148f46e78a285f89189b4b`) and
+`bonsai-prism` 0.1.5
+(`9ecabe1b5c626d4ceaef666b27f11c5a906dea56234252d3cbb8f46125d976ea`).
 They never transplant files into or edit the baseline. The same collector bytes
 use the baseline's intrinsic FP16 loader under `cpu_bundle_legacy_f16`; the
 candidate explicitly selects FP16. The fixed features are `cli`,
 `experimental-neon` and `parallel-rows`; both compile with nightly-2026-11-09.
 The generated consumer lock may select only versions/checksums already in the
-corresponding source lock. No registry helper publication is needed for these
+corresponding source lock. Seed that lock before resolving the external driver,
+then check the resulting subset; do not select fresh transitive versions merely
+because they are cached. No registry helper publication is needed for these
 source-path baseline build. The newly published helper prerequisites are already
 available for the selected registry candidate. An alternative source comparison
 uses `--candidate-root` and `--candidate-revision` instead of the two registry-mode
@@ -52,7 +60,11 @@ options; it requires that exact candidate checkout to be clean.
 Each arm requires strict Release analysis of the runtime and changed native
 helpers, portable-library checking, the named graph state/row-worker control,
 strict collector analysis, its focused model-free controls and production
-linking. Failure stops preparation. These source controls do not establish
+linking. Analyze NEON and native-hash helper test targets through their explicit
+package manifests. Test stdout must contain one exact positive libtest summary
+and the named inventory: one graph state fixture and all seven collector controls.
+An exit-zero run with zero, ignored, missing or different tests rejects preparation.
+Failure stops preparation. These source controls do not establish
 actual-model state/logit/adapter/cancellation parity. Owning hosted x64 fallback
 and other affected source checks remain required independently.
 
@@ -83,12 +95,18 @@ labels nor this packet claim that every operation uses NEON.
 The collector's seven arguments are absolute model path, approved adapter path,
 new existing empty arm directory, absolute messages path, output cap, the arm's
 absolute Unix-millisecond deadline, and its exact source revision. Bound that
-deadline once from the original aggregate clock and the at-most-90-second arm
+deadline once from the original aggregate clock and the at-most-60-second arm
 limit. The collector accepts at most 240 seconds remaining and reserves two
 seconds for its final receipt; a 600-second aggregate deadline must not be
 passed directly to the first arm. Native supervision must separately bound
 blocking load, retain 15.5 GiB admission, 11.5 GiB Job ceiling and 4 GiB reserve,
 and confirm owned teardown under the same aggregate deadline.
+The declared aggregate remains 600 seconds: four arms reserve 110 seconds each
+(at most 95 seconds for the generic supervisor wrapper, ten seconds for condition
+helpers and five for metadata), with sixty seconds for bootstrap/intake and one
+hundred for final cleanup/evaluation/upload. Generic completion has a 90-second
+total cap; its model/collector deadline stays sixty seconds. A timed-out arm stops
+the operation without retrying, reducing the fixture or restarting the clock.
 
 Capture `GetSystemPowerStatus` before and after the aggregate and each arm,
 including AC, battery saver and available charge observations. Enable native
@@ -132,6 +150,9 @@ and UTF-8 digest, positive matching prompt/output counts, approved profile and
 source/binary/input identities, positive enclosed timings and successful native
 resource/cleanup observations. Empty output, zero generated tokens, failed or
 missing receipts and incomplete four-arm captures supply no benefit pass.
+Observed supervised wall time must fit the arm's declared execution window;
+one millisecond of rounding slack covers the supervisor's integer-millisecond
+receipt and grants no additional workload time.
 
 The primary observation is load-inclusive supervised process wall time. Report
 each reversed-pair candidate/baseline ratio, preparation-plus-request ratios and

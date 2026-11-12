@@ -60,39 +60,36 @@ impl<'a, const N: usize> Grid<'a, N> {
     }
 
     fn candidates(&mut self, key: usize, levels: &[u8]) -> Result<&[usize]> {
-        if !self.neighbours.contains_key(&key) {
-            let mut distances = Vec::new();
-            distances.try_reserve_exact(self.points.len())?;
-            for (index, point) in self.points.iter().enumerate() {
-                let distance = point.iter().zip(levels).fold(0_i32, |sum, (&q, &l)| {
-                    let difference = i32::from(q) - (2 * i32::from(l) + 1);
-                    sum + difference * difference
-                });
-                distances.push((distance, index));
-            }
-            // Native qsort compares squared distance and then original index.
-            distances.sort_unstable();
-            let mut previous = distances[0].0;
-            let mut shells = 1;
-            let mut neighbours = Vec::new();
-            neighbours.try_reserve_exact(distances.len())?;
-            for (distance, index) in distances {
-                if distance > previous {
-                    if shells == self.shells {
-                        break;
-                    }
-                    previous = distance;
-                    shells += 1;
-                }
-                neighbours.push(index);
-            }
-            self.neighbours.try_reserve(1)?;
-            self.neighbours.insert(key, neighbours);
+        if let Some(neighbours) = self.neighbours.get(&key) {
+            return Ok(neighbours);
         }
-        self.neighbours
-            .get(&key)
-            .map(Vec::as_slice)
-            .ok_or_else(|| invalid("IQ neighbour cache entry missing"))
+        let mut distances = Vec::new();
+        distances.try_reserve_exact(self.points.len())?;
+        for (index, point) in self.points.iter().enumerate() {
+            let distance = point.iter().zip(levels).fold(0_i32, |sum, (&q, &l)| {
+                let difference = i32::from(q) - (2 * i32::from(l) + 1);
+                sum + difference * difference
+            });
+            distances.push((distance, index));
+        }
+        // Native qsort compares squared distance and then original index.
+        distances.sort_unstable();
+        let mut previous = distances[0].0;
+        let mut shells = 1;
+        let mut neighbours = Vec::new();
+        neighbours.try_reserve_exact(distances.len())?;
+        for (distance, index) in distances {
+            if distance > previous {
+                if shells == self.shells {
+                    break;
+                }
+                previous = distance;
+                shells += 1;
+            }
+            neighbours.push(index);
+        }
+        self.neighbours.try_reserve(1)?;
+        Ok(self.neighbours.entry(key).or_insert(neighbours))
     }
 
     fn fit(

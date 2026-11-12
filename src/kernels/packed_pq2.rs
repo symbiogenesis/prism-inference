@@ -18,7 +18,38 @@ pub(super) struct Activation {
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    pub(super) widened: [i16; 128],
+    pub(super) sum: i32,
+}
+
+/// Byte planes shared by every backend, with wide planes only for baseline NEON.
+#[derive(Default)]
+pub(super) struct Activations {
+    blocks: Vec<Activation>,
+    pub(super) widened: Vec<[i16; 128]>,
+}
+
+impl std::ops::Deref for Activations {
+    type Target = [Activation];
+
+    fn deref(&self) -> &Self::Target {
+        &self.blocks
+    }
+}
+
+impl Activations {
+    pub(super) fn clear(&mut self) {
+        self.blocks.clear();
+        self.widened.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) const fn capacity(&self) -> usize {
+        self.blocks.capacity()
+    }
+}
+
+/// Prepare four digit planes for each consecutive 16-byte weight load.
+pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()> {
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -26,18 +57,29 @@ pub(super) struct Activation {
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    pub(super) sum: i32,
+    let widened = !bonsai_neon_dot::has_dotprod();
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    let widened = false;
+    prepare_with_layout(input, output, widened)
 }
 
-/// Prepare four digit planes for each consecutive 16-byte weight load.
-pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Result<()> {
-    super::fill_into(output, |output| {
-        output.try_reserve_exact(
-            input
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| invalid("packed activation extent overflow"))?,
-        )?;
+fn prepare_with_layout(input: &[Q8KBlock], output: &mut Activations, widened: bool) -> Result<()> {
+    output.clear();
+    let result = (|| {
+        let count = input
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| invalid("packed activation extent overflow"))?;
+        output.blocks.try_reserve_exact(count)?;
+        if widened {
+            output.widened.try_reserve_exact(count)?;
+        }
         for block in input {
             let scale = super::finite(block.scale)?;
             for source in block.values.as_chunks::<128>().0 {
@@ -49,13 +91,14 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Resul
                     target_feature = "neon"
                 ))]
                 {
-                    let (values, widened, sum) = super::neon::prepare_pq2_activations(source);
-                    output.push(Activation {
-                        scale,
-                        values,
-                        widened,
-                        sum,
-                    });
+                    let wide = if widened {
+                        output.widened.push([0; 128]);
+                        output.widened.last_mut()
+                    } else {
+                        None
+                    };
+                    let (values, sum) = super::neon::prepare_pq2_activations(source, wide);
+                    output.blocks.push(Activation { scale, values, sum });
                 }
                 #[cfg(not(all(
                     feature = "experimental-neon",
@@ -68,12 +111,19 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Resul
                     let values = std::array::from_fn(|index| {
                         source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
                     });
-                    output.push(Activation { scale, values });
+                    if widened {
+                        output.widened.push(values.map(i16::from));
+                    }
+                    output.blocks.push(Activation { scale, values });
                 }
             }
         }
         Ok(())
-    })
+    })();
+    if result.is_err() {
+        output.clear();
+    }
+    result
 }
 
 #[cfg(all(
@@ -87,17 +137,23 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Vec<Activation>) -> Resul
     clippy::suboptimal_flops,
     reason = "Preserve original per-128 scalar multiply/add or pinned FMA rounding."
 )]
-pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &[Activation]) -> Result<f32> {
+pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &Activations) -> Result<f32> {
     if input.is_empty() || bytes.len() / 34 != input.len() || !bytes.len().is_multiple_of(34) {
         return Err(invalid("incompatible packed consumption activation extent"));
     }
     let mut output = 0.0;
-    for (block, activation) in bytes.as_chunks::<34>().0.iter().zip(input) {
+    for (index, (block, activation)) in bytes
+        .as_chunks::<34>()
+        .0
+        .iter()
+        .zip(input.iter())
+        .enumerate()
+    {
         let d = super::scale(block)? * activation.scale;
         let sum = super::integer_float(super::neon::dot_consumption_order_prewidened(
             block[2..].try_into()?,
             &activation.values,
-            &activation.widened,
+            input.widened.get(index),
             activation.sum,
         ));
         output = if FUSED {
@@ -122,7 +178,7 @@ pub(super) fn dot_row<const FUSED: bool>(bytes: &[u8], input: &[Activation]) -> 
 )]
 pub(super) fn dot_four_rows<const FUSED: bool>(
     rows: [&[u8]; 4],
-    input: &[Activation],
+    input: &Activations,
 ) -> Result<[f32; 4]> {
     if input.is_empty()
         || rows
@@ -139,7 +195,7 @@ pub(super) fn dot_four_rows<const FUSED: bool>(
     let c1 = rows[1].as_chunks::<34>().0;
     let c2 = rows[2].as_chunks::<34>().0;
     let c3 = rows[3].as_chunks::<34>().0;
-    for ((((b0, b1), b2), b3), activation) in c0.iter().zip(c1).zip(c2).zip(c3).zip(input) {
+    for ((((b0, b1), b2), b3), activation) in c0.iter().zip(c1).zip(c2).zip(c3).zip(input.iter()) {
         let act_scale = activation.scale;
         let ds = [
             super::scale(b0)? * act_scale,
@@ -182,7 +238,7 @@ pub(super) fn dot_four_rows<const FUSED: bool>(
 ))]
 pub(super) fn dot_eight_rows<const FUSED: bool>(
     rows: [&[u8]; 8],
-    input: &[Activation],
+    input: &Activations,
 ) -> Result<[f32; 8]> {
     if input.is_empty()
         || rows
@@ -215,6 +271,43 @@ mod tests {
     };
 
     #[test]
+    fn x1_pq2_compact_preparation_preserves_baseline_planes_and_clears_both_layouts() -> Result<()>
+    {
+        let mut input = [Q8KBlock {
+            scale: f32::from_bits(0x3eaa_aaab),
+            sums: [123; 16],
+            values: std::array::from_fn(|index| i8::from_ne_bytes([index.to_le_bytes()[0]])),
+        }];
+        let mut compact = super::Activations::default();
+        let mut baseline = super::Activations::default();
+        super::prepare_with_layout(&input, &mut compact, false)?;
+        super::prepare_with_layout(&input, &mut baseline, true)?;
+        assert_eq!(compact.len(), 2);
+        assert_eq!(compact.widened.capacity(), 0);
+        assert_eq!(baseline.widened.len(), 2);
+        for (index, (actual, wide)) in compact.iter().zip(&baseline.widened).enumerate() {
+            assert_eq!(actual.scale.to_bits(), baseline[index].scale.to_bits());
+            assert_eq!(actual.values, baseline[index].values);
+            for lane in 0..128 {
+                let source = index * 128 + (lane / 64) * 64 + (lane % 16) * 4 + (lane / 16) % 4;
+                assert_eq!(actual.values[lane], input[0].values[source]);
+                assert_eq!(wide[lane], i16::from(input[0].values[source]));
+            }
+        }
+        // Native compact blocks have scale + bytes + exact integer correction,
+        // independent of whether this host can execute the optional ISA.
+        assert!(size_of::<super::Activation>() <= 136);
+        input[0].scale = f32::NAN;
+        assert!(super::prepare_with_layout(&input, &mut baseline, true).is_err());
+        assert!(baseline.is_empty());
+        assert!(baseline.widened.is_empty());
+        assert!(super::prepare_with_layout(&input, &mut compact, false).is_err());
+        assert!(compact.is_empty());
+        assert!(compact.widened.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn packed_consumption_preparation_preserves_each_lane_scale_and_source() -> Result<()> {
         let input = [Q8KBlock {
             scale: f32::from_bits(0x3eaa_aaab),
@@ -222,7 +315,7 @@ mod tests {
             values: std::array::from_fn(|index| i8::from_ne_bytes([index.to_le_bytes()[0]])),
         }];
         let original = input[0].values;
-        let mut output = Vec::new();
+        let mut output = super::Activations::default();
         prepare(&input, &mut output)?;
         assert_eq!(output.len(), 2);
         for (half, activation) in output.iter().enumerate() {
@@ -250,7 +343,7 @@ mod tests {
             sums: [0; 16],
             values: [-128; 256],
         }];
-        let mut output = Vec::new();
+        let mut output = super::Activations::default();
         prepare(&input, &mut output)?;
         assert_eq!(output[0].scale.to_bits(), (-0.0_f32).to_bits());
         let capacity = output.capacity();
@@ -287,6 +380,43 @@ mod tests {
             kind: super::super::PQ2,
             data: Arc::from(data),
         }
+    }
+
+    #[test]
+    fn x1_pq2_compact_prefill_matches_independent_scalar_rows() -> Result<()> {
+        let tensor = weights(512, 9);
+        for count in [1, 8, 9, 16, 32] {
+            let inputs: Vec<Vec<f32>> = (0..count)
+                .map(|token| {
+                    (0..512)
+                        .map(|lane| [0.0, -0.0, 127.0, -128.0, 63.5, -3.25][(lane + token) % 6])
+                        .collect()
+                })
+                .collect();
+            for pinned in [false, true] {
+                let mut tile = crate::kernels::prefill::ProjectionTile::with_backend(
+                    MatvecBackend::ExperimentalNeon,
+                );
+                #[cfg(feature = "parallel-rows")]
+                tile.set_row_parallelism(RowParallelism::new(4)?);
+                let mut outputs = vec![Vec::new(); count];
+                tile.project(&tensor, &inputs, &mut outputs, pinned, &|| Ok(()))?;
+                let mut reference = if pinned {
+                    MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                } else {
+                    MatvecScratch::with_backend(MatvecBackend::Scalar)
+                };
+                for (input, output) in inputs.iter().zip(outputs) {
+                    let mut expected = Vec::new();
+                    matvec_into(&tensor, input, &mut expected, &mut reference)?;
+                    assert_eq!(
+                        output.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -432,7 +562,7 @@ mod native_tests {
     use crate::Result;
 
     #[test]
-    fn packed_consumption_preserves_independent_pinned_fma_rounding_control() -> Result<()> {
+    fn x1_packed_consumption_preserves_independent_pinned_fma_rounding_control() -> Result<()> {
         // Frozen native arithmetic control from kernels' original PQ2 test.
         // Its pinned FMA differs by one bit from multiply-then-add.
         let mut weights = [0xaa; 68];
@@ -447,8 +577,12 @@ mod native_tests {
             values,
             sums,
         }];
-        let mut prepared = Vec::new();
+        let mut prepared = super::Activations::default();
         prepare(&input, &mut prepared)?;
+        assert_eq!(prepared.widened.is_empty(), bonsai_neon_dot::has_dotprod());
+        if bonsai_neon_dot::has_dotprod() {
+            assert_eq!(prepared.widened.capacity(), 0);
+        }
         assert_eq!(dot_row::<true>(&weights, &prepared)?.to_bits(), 0xc1f9_0b01);
         assert_eq!(
             dot_row::<false>(&weights, &prepared)?.to_bits(),
@@ -472,7 +606,7 @@ mod native_tests {
         );
         assert!(dot_row::<true>(&weights[..34], &prepared).is_err());
         assert!(dot_row::<true>(&weights[..67], &prepared).is_err());
-        assert!(dot_row::<true>(&[], &[]).is_err());
+        assert!(dot_row::<true>(&[], &super::Activations::default()).is_err());
         assert!(dot_four_rows::<true>([&weights[..34]; 4], &prepared).is_err());
         assert!(dot_eight_rows::<true>([&weights[..34]; 8], &prepared).is_err());
         weights[..2].copy_from_slice(&0x7c00_u16.to_le_bytes());

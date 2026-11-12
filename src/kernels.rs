@@ -1605,8 +1605,9 @@ pub fn packed_dot(kind: u32, count: usize, weights: &[u8], activations: &[u8]) -
 /// Construct with [`Default::default`]. Storage grows fallibly to accommodate
 /// each call and retains its capacity across tensors, activation formats and
 /// errors. Scratch contains no tensor-sized decoded matrix or model state.
-/// Eligible PQ2 NEON dispatch additionally retains one input-width byte layout
-/// and one f32 scale per 128 columns, shared by rows and prepared siblings.
+/// Eligible PQ2 NEON dispatch additionally retains one input-width byte layout,
+/// scale and integer correction per 128 columns, shared by rows and prepared
+/// siblings. Only the baseline fallback retains additional widened planes.
 pub struct MatvecScratch {
     q8k: Vec<Q8KBlock>,
     #[cfg(any(
@@ -1619,7 +1620,7 @@ pub struct MatvecScratch {
             target_feature = "neon"
         )
     ))]
-    pq2_consumption: Vec<packed_pq2::Activation>,
+    pq2_consumption: packed_pq2::Activations,
     q8: Vec<Q8Block>,
     activations: Vec<f32>,
     row: Vec<f32>,
@@ -1858,7 +1859,7 @@ impl Default for MatvecScratch {
                     target_feature = "neon"
                 )
             ))]
-            pq2_consumption: Vec::new(),
+            pq2_consumption: packed_pq2::Activations::default(),
             q8: Vec::new(),
             activations: Vec::new(),
             row: Vec::new(),

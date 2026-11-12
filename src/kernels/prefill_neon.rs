@@ -338,13 +338,15 @@ fn q8k_half_sum(neon: Neon, sums: &[i16; 16], half: usize) -> i32 {
 #[inline]
 fn load_pq2_activation_precomputed(
     neon: Neon,
-    act: &crate::kernels::packed_pq2::Activation,
-) -> Pq2Activation {
-    let chunks = act.widened.as_chunks::<8>().0;
-    Pq2Activation {
+    prepared: &crate::kernels::packed_pq2::Activations,
+    index: usize,
+) -> Option<Pq2Activation> {
+    let act = prepared.get(index)?;
+    let chunks = prepared.widened.get(index)?.as_chunks::<8>().0;
+    Some(Pq2Activation {
         planes: std::array::from_fn(|k| i16x8::from_slice(neon, &chunks[k])),
         sum128: act.sum,
-    }
+    })
 }
 
 #[inline]
@@ -621,10 +623,26 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
                     let a3 = &chunk[3].pq2_consumption[index];
                     (
                         [
-                            load_pq2_activation_precomputed(neon, a0),
-                            load_pq2_activation_precomputed(neon, a1),
-                            load_pq2_activation_precomputed(neon, a2),
-                            load_pq2_activation_precomputed(neon, a3),
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[0].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[1].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[2].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[3].pq2_consumption,
+                                index,
+                            )?,
                         ],
                         f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
                     )
@@ -678,7 +696,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
                 let (act, act_scale) = if has_precomputed {
                     let act_block = &scratch.pq2_consumption[index];
                     (
-                        load_pq2_activation_precomputed(neon, act_block),
+                        load_pq2_activation_precomputed(neon, &scratch.pq2_consumption, index)?,
                         act_block.scale,
                     )
                 } else {
@@ -1009,16 +1027,48 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     let a7 = &chunk[7].pq2_consumption[index];
                     (
                         [
-                            load_pq2_activation_precomputed(neon, a0),
-                            load_pq2_activation_precomputed(neon, a1),
-                            load_pq2_activation_precomputed(neon, a2),
-                            load_pq2_activation_precomputed(neon, a3),
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[0].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[1].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[2].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[3].pq2_consumption,
+                                index,
+                            )?,
                         ],
                         [
-                            load_pq2_activation_precomputed(neon, a4),
-                            load_pq2_activation_precomputed(neon, a5),
-                            load_pq2_activation_precomputed(neon, a6),
-                            load_pq2_activation_precomputed(neon, a7),
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[4].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[5].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[6].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[7].pq2_consumption,
+                                index,
+                            )?,
                         ],
                         f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
                         f32x4::from_slice(neon, &[a4.scale, a5.scale, a6.scale, a7.scale]),
@@ -1117,10 +1167,26 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     let a3 = &chunk[3].pq2_consumption[index];
                     (
                         [
-                            load_pq2_activation_precomputed(neon, a0),
-                            load_pq2_activation_precomputed(neon, a1),
-                            load_pq2_activation_precomputed(neon, a2),
-                            load_pq2_activation_precomputed(neon, a3),
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[0].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[1].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[2].pq2_consumption,
+                                index,
+                            )?,
+                            load_pq2_activation_precomputed(
+                                neon,
+                                &chunk[3].pq2_consumption,
+                                index,
+                            )?,
                         ],
                         f32x4::from_slice(neon, &[a0.scale, a1.scale, a2.scale, a3.scale]),
                     )
@@ -1177,7 +1243,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                 let (act, act_scale) = if has_precomputed {
                     let act_block = &scratch.pq2_consumption[index];
                     (
-                        load_pq2_activation_precomputed(neon, act_block),
+                        load_pq2_activation_precomputed(neon, &scratch.pq2_consumption, index)?,
                         act_block.scale,
                     )
                 } else {

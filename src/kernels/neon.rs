@@ -304,24 +304,28 @@ fn reduce4_i16x8_to_i32x4(
 }
 
 #[inline]
-pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 128], i32) {
+pub(super) fn prepare_pq2_activations(
+    source: &[i8; 128],
+    mut widened: Option<&mut [i16; 128]>,
+) -> ([i8; 128], i32) {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let values = std::array::from_fn(|index| {
             source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
         });
         let sum = source.iter().map(|&v| i32::from(v)).sum();
-        return (values, values.map(i16::from), sum);
+        if let Some(widened) = widened {
+            *widened = values.map(i16::from);
+        }
+        return (values, sum);
     };
-    let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut output = [0_i8; 128];
-    let mut widened = [0_i16; 128];
     let mut sum_acc = i16x8::splat(neon, 0);
-    for ((src_half, dst_half), wide_half) in source
+    for (half, (src_half, dst_half)) in source
         .as_chunks::<64>()
         .0
         .iter()
         .zip(output.as_chunks_mut::<64>().0)
-        .zip(widened.as_chunks_mut::<64>().0)
+        .enumerate()
     {
         let chunks = src_half.as_chunks::<16>().0;
         let v0 = i8x16::from_slice(neon, &chunks[0]);
@@ -341,20 +345,17 @@ pub(super) fn prepare_pq2_activations(source: &[i8; 128]) -> ([i8; 128], [i16; 1
         p1.store_slice(&mut dst[1]);
         p2.store_slice(&mut dst[2]);
         p3.store_slice(&mut dst[3]);
-        let wide = wide_half.as_chunks_mut::<8>().0;
-        for (plane, pair) in [p0, p1, p2, p3]
-            .into_iter()
-            .zip(wide.as_chunks_mut::<2>().0)
-        {
+        for (digit, plane) in [p0, p1, p2, p3].into_iter().enumerate() {
             let (low, high) = plane.widen();
             sum_acc += low + high;
-            if !use_dotprod {
-                low.store_slice(&mut pair[0]);
-                high.store_slice(&mut pair[1]);
+            if let Some(wide) = widened.as_mut() {
+                let offset = half * 64 + digit * 16;
+                low.store_slice(&mut wide[offset..offset + 8]);
+                high.store_slice(&mut wide[offset + 8..offset + 16]);
             }
         }
     }
-    (output, widened, pq2_reduce(sum_acc))
+    (output, pq2_reduce(sum_acc))
 }
 
 #[inline]
@@ -432,12 +433,15 @@ const fn scale_u16(block: &[u8; 34]) -> u16 {
 pub(super) fn dot_consumption_order_prewidened(
     packed: &[u8; 32],
     values: &[i8; 128],
-    widened: &[i16; 128],
+    widened: Option<&[i16; 128]>,
     activation_sum: i32,
 ) -> i32 {
     if bonsai_neon_dot::has_dotprod() {
         return bonsai_neon_dot::dot_pq2_consumption_block(packed, values, activation_sum);
     }
+    let Some(widened) = widened else {
+        return dot_consumption_order(packed, values);
+    };
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return packed
             .as_chunks::<16>()
@@ -487,7 +491,7 @@ pub(super) fn dot_consumption_order_prewidened(
 #[inline]
 pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
     rows: [&[u8]; 4],
-    input: &[super::packed_pq2::Activation],
+    input: &super::packed_pq2::Activations,
 ) -> Option<Result<[f32; 4]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let use_dotprod = bonsai_neon_dot::has_dotprod();
@@ -497,7 +501,14 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
     let c3 = rows[3].as_chunks::<34>().0;
     let mut outputs = f32x4::splat(neon, 0.0);
     let mut scales_finite = outputs.is_finite();
-    for ((((b0, b1), b2), b3), activation) in c0.iter().zip(c1).zip(c2).zip(c3).zip(input) {
+    for (index, ((((b0, b1), b2), b3), activation)) in c0
+        .iter()
+        .zip(c1)
+        .zip(c2)
+        .zip(c3)
+        .zip(input.iter())
+        .enumerate()
+    {
         let row_scales = f16_bits_to_f32_x4(
             neon,
             [scale_u16(b0), scale_u16(b1), scale_u16(b2), scale_u16(b3)],
@@ -521,7 +532,8 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
         } else {
             let blocks = [b0, b1, b2, b3];
             let mut acc = [i16x8::splat(neon, 0); 4];
-            for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
+            let widened = input.widened.get(index)?;
+            for (half, values) in widened.as_chunks::<64>().0.iter().enumerate() {
                 let planes = values.as_chunks::<8>().0;
                 let p0_low = i16x8::from_slice(neon, &planes[0]);
                 let p0_high = i16x8::from_slice(neon, &planes[1]);
@@ -560,7 +572,7 @@ pub(super) fn dot_four_rows_consumption<const FUSED: bool>(
 #[inline]
 pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
     rows: [&[u8]; 8],
-    input: &[super::packed_pq2::Activation],
+    input: &super::packed_pq2::Activations,
 ) -> Option<Result<[f32; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let use_dotprod = bonsai_neon_dot::has_dotprod();
@@ -607,7 +619,8 @@ pub(super) fn dot_eight_rows_consumption<const FUSED: bool>(
             )
         } else {
             let mut acc = [i16x8::splat(neon, 0); 8];
-            for (half, values) in activation.widened.as_chunks::<64>().0.iter().enumerate() {
+            let widened = input.widened.get(block_idx)?;
+            for (half, values) in widened.as_chunks::<64>().0.iter().enumerate() {
                 let planes = values.as_chunks::<8>().0;
                 let p0_low = i16x8::from_slice(neon, &planes[0]);
                 let p0_high = i16x8::from_slice(neon, &planes[1]);

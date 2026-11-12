@@ -76,6 +76,11 @@ test = true
 required-features = ["cli"]
 
 [[example]]
+name = "cpu_bundle_check"
+test = true
+required-features = ["cli", "parallel-rows"]
+
+[[example]]
 name = "upstream_prism"
 # Conformance code lives with tests; the explicit example target preserves
 # its command-line runner and embedded unit tests.
@@ -116,6 +121,7 @@ windows-sys = "=0.61.2"
 
 [workspace.lints.rust]
 warnings = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(cpu_bundle_legacy_f16)'] }
 unsafe_code = "deny"
 non_ascii_idents = "forbid"
 # Native-boundary unsafe allowances must never waive these safety checks.

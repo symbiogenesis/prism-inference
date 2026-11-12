@@ -468,7 +468,7 @@ fn compare_profile_request(
         assert_eq!(runtime.tokens(), previous);
         assert_eq!(graph_bits(runtime.decoder())?, before);
     } else {
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens().len(), 0);
         assert!(graph_bits(runtime.decoder())?.iter().all(|&bits| bits == 0));
     }
     assert_eq!(runtime.decoder().kv_cache_policy(), policy);
@@ -570,10 +570,10 @@ fn rotated_kv_latest_prefix_and_adapter_changes_preserve_selected_profile() -> R
             assert!(!runtime.is_faulted());
         }
         runtime.prepare_profile_request(Some(1.3), PromptReuse::Disabled)?;
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens().len(), 0);
         assert_eq!(runtime.decoder().kv_cache_policy(), policy);
         runtime.reset()?;
-        assert!(runtime.tokens().is_empty());
+        assert_eq!(runtime.tokens().len(), 0);
         assert_eq!(runtime.decoder().kv_cache_policy(), policy);
     }
     Ok(())

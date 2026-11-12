@@ -1,0 +1,261 @@
+name: Source checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  # Source-check selection carries failed/cancelled pushes forward from the
+  # newest successful main ancestor. Manual checks retain independent requests.
+  group: source-checks-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+jobs:
+  changes:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      plan: ${{ steps.select.outputs.plan }}
+      markdown: ${{ steps.select.outputs.markdown }}
+      standards: ${{ steps.select.outputs.standards }}
+      probe: ${{ steps.select.outputs.probe }}
+      parity: ${{ steps.select.outputs.parity }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify source-check selection and fail-closed aggregation
+        shell: bash
+        run: python3 -B -m unittest discover -s .github/ci -p test_source_checks.py
+      - name: Select checks within their supported event scope
+        id: select
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/ci/source_checks.py
+  markdown:
+    needs: changes
+    if: needs.changes.outputs.markdown == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reuse the pinned rumdl linter
+        id: rumdl-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/rumdl-bin
+          key: rumdl-v1-${{ runner.os }}-${{ runner.arch }}-0.3.2-afc6dd91f1c4
+      - name: Install and verify the pinned rumdl linter on a cache miss
+        if: steps.rumdl-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          asset="rumdl-v0.3.2-aarch64-unknown-linux-musl.tar.gz"
+          expected="afc6dd91f1c4f2a8cf4a40ab99f8e52e06e6dddfc5334f1c1db8b158d353d143"
+          curl -fsSL --retry 3 -o "$asset" "https://github.com/rvben/rumdl/releases/download/v0.3.2/$asset"
+          printf '%s  %s\n' "$expected" "$asset" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/rumdl-bin"
+          tar -xzf "$asset" -C "$RUNNER_TEMP/rumdl-bin" rumdl
+          chmod 0755 "$RUNNER_TEMP/rumdl-bin/rumdl"
+          rm -f "$asset"
+      - name: Check Markdown lint and formatting contracts
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/rumdl-bin/rumdl" --version
+          "$RUNNER_TEMP/rumdl-bin/rumdl" check --no-cache .
+          "$RUNNER_TEMP/rumdl-bin/rumdl" fmt --check --no-cache .
+  standards:
+    needs: changes
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.standards == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare the pinned C# analyzer SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.4xx'
+      - name: Reuse the pinned PowerShell analyzer
+        id: analyzer-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/Prism-Standards-Tools
+          key: psscriptanalyzer-v1-${{ runner.os }}-${{ runner.arch }}-1.25.0
+      - name: Save the pinned PowerShell analyzer on a cache miss
+        if: steps.analyzer-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Save-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Path (Join-Path $env:RUNNER_TEMP 'Prism-Standards-Tools') -Force
+      - name: Enforce PowerShell contracts and embedded C# analyzers
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($PSVersionTable.PSVersion -lt [version]'7.6' -or $PSVersionTable.PSVersion.PreReleaseLabel) {
+            throw 'Script standards require stable PowerShell 7.6 or later.'
+          }
+          $tooling = Join-Path $env:RUNNER_TEMP 'Prism-Standards-Tools'
+          $analyzer = Join-Path $tooling 'PSScriptAnalyzer/1.25.0/PSScriptAnalyzer.psd1'
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Standards.ps1') -AnalyzerModulePath $analyzer
+  probe:
+    name: Compiler acceptance probes
+    needs: changes
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.probe == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select pinned native compilers and external evidence for metadata probes
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Expected a native ARM64 runner process.' }
+          $evidence = Join-Path $env:RUNNER_TEMP ('Prism-RustProbe-' + [guid]::NewGuid().ToString('N'))
+          if (-not [IO.Path]::IsPathFullyQualified($evidence) -or $evidence -match '%[^%]+%') { throw 'Expected an expanded absolute evidence path.' }
+          [void][IO.Directory]::CreateDirectory($evidence)
+          "RUST_TRIAL_EVIDENCE=$evidence" >> $env:GITHUB_ENV
+          $configuration = Get-Content -Raw -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'config/rust-nightly-trial.json') | ConvertFrom-Json -DateKind String -NoEnumerate
+          if ($configuration.SchemaVersion -ne 1) { throw 'Unsupported Rust trial configuration schema.' }
+          "RUST_PROBE_STABLE_TOOLCHAIN=$($configuration.StableToolchain)" >> $env:GITHUB_ENV
+          "RUST_PROBE_NIGHTLY_TOOLCHAIN=$($configuration.NightlyToolchain)" >> $env:GITHUB_ENV
+      - name: Reuse the exact stable control compiler
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: ${{ env.RUST_PROBE_STABLE_TOOLCHAIN }}
+          components: ''
+      - name: Reuse the exact production nightly compiler
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: ${{ env.RUST_PROBE_NIGHTLY_TOOLCHAIN }}
+          components: ''
+      - name: Compare borrowing and trait-solver acceptance
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-RustNightly.ps1') -Mode Probe -FullTests -EvidenceDirectory (Join-Path $env:RUST_TRIAL_EVIDENCE 'probe')
+      - name: Retain compiler identities, acceptance results and command logs
+        if: always() && env.RUST_TRIAL_EVIDENCE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-nightly-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RUST_TRIAL_EVIDENCE }}
+          if-no-files-found: error
+  compatibility:
+    name: compatibility
+    if: always() && github.ref == 'refs/heads/main' && needs.changes.outputs.probe == 'true'
+    needs: [changes, probe]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Require compiler acceptance probes
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          PROBE_RESULT: ${{ needs.probe.result }}
+        run: |
+          {
+            printf '%s\n' \
+              "Revision: $GITHUB_SHA" \
+              "Compiler acceptance probes: $PROBE_RESULT" \
+              '' \
+              'The pinned nightly is the production toolchain; stable is an isolated compiler-probe control. Compiler acceptance and correctness do not establish inference performance gains.' \
+              'Foundation owns workspace correctness and loader feature checks; this check only compares compiler acceptance.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$PROBE_RESULT" != 'success' ]]; then
+            echo 'Compiler acceptance probes must succeed; failed, cancelled or skipped jobs are not accepted.' >&2
+            exit 1
+          fi
+  model-free:
+    needs: changes
+    if: needs.changes.outputs.parity == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+      CARGO_BUILD_FINGERPRINT: content
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly-2026-11-09-${{ matrix.target }}
+      - name: Check native hashing, transactional serving and worker protocol
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Swift-Parity-Target'
+          $evidence = Join-Path $env:RUNNER_TEMP 'Swift-Parity-Evidence'
+          [void][IO.Directory]::CreateDirectory($evidence)
+          "SWIFT_PARITY_EVIDENCE=$evidence" >> $env:GITHUB_ENV
+          Start-Transcript -LiteralPath (Join-Path $evidence 'checks.log') | Out-Null
+          try {
+            $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+            cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
+            cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference --features parallel-rows --test graph --test swift_session --test swift_worker_request --test swift_worker_output --test swift_sampling --test swift_client
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows
+            cargo +nightly-2026-11-09 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --no-deps
+          } finally { Stop-Transcript | Out-Null }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && env.SWIFT_PARITY_EVIDENCE != ''
+        with:
+          name: swift-parity-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.SWIFT_PARITY_EVIDENCE }}
+          if-no-files-found: error
+  source-checks:
+    if: always()
+    needs: [changes, markdown, standards, probe, compatibility, model-free]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require all selected source checks
+        shell: bash
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -B .github/ci/source_checks.py --gate

@@ -3,7 +3,7 @@
 use super::{HEAD_DIM, finite_values};
 use crate::{Result, invalid};
 
-pub(super) fn splitmix64(state: &mut u64) -> u64 {
+pub(super) const fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut word = *state;
     word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -81,6 +81,10 @@ pub(super) fn read_code(bytes: &[u8], bits: u8, index: usize) -> usize {
     usize::from(code & ((1_u8 << bits) - 1))
 }
 
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "The canonical scalar/native contract requires separate binary64 products and additions with a fixed four-lane reduction."
+)]
 pub(super) fn dot(
     codes: &[u8],
     bits: u8,

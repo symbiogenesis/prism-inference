@@ -1,8 +1,8 @@
 //! Independent wire, transform and approximation controls for the scalar codec.
 
 #![expect(
-    clippy::float_cmp,
-    reason = "These controls deliberately check exact codec identities, canonical zeros and failure atomicity."
+    clippy::suboptimal_flops,
+    reason = "Independent numerical oracles deliberately use separate products and additions instead of changing the specified codec arithmetic to fused operations."
 )]
 
 use super::{Bits, HEAD_DIM, Quantizer, scalar, tables};

@@ -1,6 +1,6 @@
 //! Experimental, clean-room rotated scalar quantization for 256-channel KV rows.
 //!
-//! This is an approximate codec, not Google's TurboQuant implementation or its
+//! This is an approximate codec, not Google's `TurboQuant` implementation or its
 //! QJL estimator. Three seeded signed, normalized Walsh-Hadamard passes spread
 //! a row before a symmetric Gaussian Lloyd-Max scalar codebook quantizes it.
 //! Each record contains a positive binary32 scale followed by 256 tightly packed
@@ -62,7 +62,7 @@ pub struct Identity {
     pub version: u32,
     /// Scalar code precision.
     pub bits: Bits,
-    /// SplitMix64 seed defining all three independent diagonal sign masks.
+    /// `SplitMix64` seed defining all three independent diagonal sign masks.
     pub seed: u64,
 }
 
@@ -266,7 +266,7 @@ impl Quantizer {
         Ok(())
     }
 
-    fn centroids(&self) -> &'static [f32; 16] {
+    const fn centroids(&self) -> &'static [f32; 16] {
         match self.identity.bits {
             Bits::Three => &tables::THREE,
             Bits::Four => &tables::FOUR,
@@ -301,6 +301,18 @@ impl Quantizer {
         Ok((scale, codes))
     }
 
+    #[cfg_attr(
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )),
+        expect(
+            clippy::unused_self,
+            reason = "The native target reads the instance backend policy; portable targets share this method with the scalar path."
+        )
+    )]
     fn hadamard(&self, row: &mut [f32; HEAD_DIM]) -> Result<()> {
         #[cfg(all(
             feature = "experimental-neon",

@@ -943,12 +943,30 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
     if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) {
         return None;
     }
-    let blocks = width / 16;
-    // Every update remains private until the group commits. Preserve all lane
-    // predicates while reducing their combined mask once before publication.
-    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    let decays = f32x4::splat(neon, decay);
     let mut work = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 4];
+    let scales = decay_four_rows_from_blocks(neon, previous, &mut work, key, decay, values, beta)?;
+    let outputs = update_four_rows_blocks(neon, &mut work, key, query, scales)?;
+    for (state, row_blocks) in states.into_iter().zip(work.iter()) {
+        flush_blocks(state, row_blocks, width / 16);
+    }
+    Some(outputs)
+}
+
+// Four rows retain sixteen FMA accumulators. An eight-row phase would need all
+// thirty-two AArch64 vector registers before its input, decay or mask vectors.
+// Keep the complete native four-register tree for each row, but bound its live
+// arithmetic phase independently of the eight-row transactional staging owner.
+#[inline]
+fn decay_four_rows_from_blocks<const BLOCKS: usize>(
+    neon: Neon,
+    previous: [&[f32]; 4],
+    work: &mut [[[f32x4<Neon>; 4]; BLOCKS]; 4],
+    key: &[f32],
+    decay: f32,
+    values: [f32; 4],
+    beta: f32,
+) -> Option<[f32; 4]> {
+    let decays = f32x4::splat(neon, decay);
     let mut s0 = [f32x4::splat(neon, 0.0); 4];
     let mut s1 = [f32x4::splat(neon, 0.0); 4];
     let mut s2 = [f32x4::splat(neon, 0.0); 4];
@@ -974,15 +992,28 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
         }
     }
 
-    let mut scales = [f32x4::splat(neon, 0.0); 4];
+    let mut scales = [0.0; 4];
     for r in 0..4 {
         let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
         if !dot_k.is_finite() {
             return None;
         }
-        scales[r] = f32x4::splat(neon, (values[r] - dot_k) * beta);
+        scales[r] = (values[r] - dot_k) * beta;
     }
 
+    Some(scales)
+}
+
+#[inline]
+fn update_four_rows_blocks<const BLOCKS: usize>(
+    neon: Neon,
+    work: &mut [[[f32x4<Neon>; 4]; BLOCKS]; 4],
+    key: &[f32],
+    query: &[f32],
+    scales: [f32; 4],
+) -> Option<[f32; 4]> {
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let scales = scales.map(|scale| f32x4::splat(neon, scale));
     let mut q0 = [f32x4::splat(neon, 0.0); 4];
     let mut q1 = [f32x4::splat(neon, 0.0); 4];
     let mut q2 = [f32x4::splat(neon, 0.0); 4];
@@ -1032,9 +1063,6 @@ fn step_four_rows_from_blocks<const BLOCKS: usize>(
         return None;
     }
 
-    for (state, row_blocks) in states.into_iter().zip(work.iter()) {
-        flush_blocks(state, row_blocks, blocks);
-    }
     Some(outputs)
 }
 
@@ -1191,9 +1219,10 @@ fn step_four_rows_tokens_from_blocks<const BLOCKS: usize>(
     true
 }
 
-/// Steps 8 GDN state rows simultaneously from `previous` into `states`, sharing
-/// `key` and `query` vector loads across all 8 rows. Returns `None` if dimensions
-/// are unsupported or if any non-finite intermediate occurs before `states` is mutated,
+/// Steps 8 GDN state rows transactionally from `previous` into `states`, sharing
+/// `key` and `query` vector loads within bounded four-row arithmetic phases.
+/// Returns `None` if dimensions are unsupported or if any non-finite intermediate
+/// occurs before `states` is mutated,
 /// allowing the caller to fall back to the sequential per-row path for exact error state.
 #[inline]
 pub(super) fn step_eight_rows_from(
@@ -1227,97 +1256,37 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
     if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) {
         return None;
     }
-    let blocks = width / 16;
-    // Every update remains private until the group commits. Preserve all lane
-    // predicates while reducing their combined mask once before publication.
-    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    let decays = f32x4::splat(neon, decay);
     let mut work = [[[f32x4::splat(neon, 0.0); 4]; BLOCKS]; 8];
-    let mut s0 = [f32x4::splat(neon, 0.0); 8];
-    let mut s1 = [f32x4::splat(neon, 0.0); 8];
-    let mut s2 = [f32x4::splat(neon, 0.0); 8];
-    let mut s3 = [f32x4::splat(neon, 0.0); 8];
-
-    for (b, key_block) in key.as_chunks::<16>().0.iter().enumerate() {
-        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-        let offset = b * 16;
-        for r in 0..8 {
-            let prev_block = &previous[r][offset..offset + 16];
-            let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
-            let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
-            let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
-            let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
-            work[r][b] = [d0, d1, d2, d3];
-            s0[r] = d0.mul_add_precise(k0, s0[r]);
-            s1[r] = d1.mul_add_precise(k1, s1[r]);
-            s2[r] = d2.mul_add_precise(k2, s2[r]);
-            s3[r] = d3.mul_add_precise(k3, s3[r]);
-        }
-    }
-
-    let mut scales = [f32x4::splat(neon, 0.0); 8];
-    for r in 0..8 {
-        let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
-        if !dot_k.is_finite() {
-            return None;
-        }
-        scales[r] = f32x4::splat(neon, (values[r] - dot_k) * beta);
-    }
-
-    let mut q0 = [f32x4::splat(neon, 0.0); 8];
-    let mut q1 = [f32x4::splat(neon, 0.0); 8];
-    let mut q2 = [f32x4::splat(neon, 0.0); 8];
-    let mut q3 = [f32x4::splat(neon, 0.0); 8];
-
-    for (b, (key_block, query_block)) in key
-        .as_chunks::<16>()
+    let mut scales = [0.0; 8];
+    // Validate every key dot before beginning updates, retaining the original
+    // phase order. Four-row phases reread the small key/query rows while
+    // halving the maximum number of live dot accumulators from 32 to 16.
+    for (group, ((previous, work), values)) in previous
+        .as_chunks::<4>()
         .0
         .iter()
-        .zip(query.as_chunks::<16>().0)
+        .zip(work.as_chunks_mut::<4>().0)
+        .zip(values.as_chunks::<4>().0)
         .enumerate()
     {
-        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-        let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
-        let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
-        let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
-        let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
-        for r in 0..8 {
-            let [d0, d1, d2, d3] = work[r][b];
-            let scale = scales[r];
-            let u0 = scale.mul_add_precise(k0, d0);
-            let u1 = scale.mul_add_precise(k1, d1);
-            let u2 = scale.mul_add_precise(k2, d2);
-            let u3 = scale.mul_add_precise(k3, d3);
-            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
-            work[r][b] = [u0, u1, u2, u3];
-            q0[r] = u0.mul_add_precise(qv0, q0[r]);
-            q1[r] = u1.mul_add_precise(qv1, q1[r]);
-            q2[r] = u2.mul_add_precise(qv2, q2[r]);
-            q3[r] = u3.mul_add_precise(qv3, q3[r]);
-        }
+        let deltas = decay_four_rows_from_blocks(neon, *previous, work, key, decay, *values, beta)?;
+        scales[group * 4..group * 4 + 4].copy_from_slice(&deltas);
     }
-
-    let mut outputs = [0.0_f32; 8];
-    for r in 0..8 {
-        let out = ((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum();
-        if !out.is_finite() {
-            return None;
-        }
-        outputs[r] = out;
+    let mut outputs = [0.0; 8];
+    for (group, (work, scales)) in work
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(scales.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let values = update_four_rows_blocks(neon, work, key, query, *scales)?;
+        outputs[group * 4..group * 4 + 4].copy_from_slice(&values);
     }
-
-    if !finite_mask.all_true() {
-        return None;
-    }
-
+    // A failed second phase still leaves all eight destinations untouched.
+    // The caller can replay rows in order to recover exact failure mutation.
     for (state, row_blocks) in states.into_iter().zip(work.iter()) {
-        flush_blocks(state, row_blocks, blocks);
+        flush_blocks(state, row_blocks, width / 16);
     }
     Some(outputs)
 }

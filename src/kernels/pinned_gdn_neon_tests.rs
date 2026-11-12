@@ -754,3 +754,119 @@ fn pinned_gdn_multitoken_capacities_preserve_refusal() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn x1_gdn_four_row_phases_keep_eight_row_temporal_bits() -> Result<()> {
+    for width in [16, 112, 128, 144, 256] {
+        let mut actual = values(width * 8);
+        actual[0] = -0.0;
+        actual[4 * width] = f32::from_bits(1);
+        actual[7 * width] = -f32::MIN_POSITIVE;
+        let mut expected = actual.clone();
+        let mut key = values(width);
+        let mut query = values(width);
+        query.reverse();
+        for token in 0..8 {
+            key.rotate_left(1);
+            query.rotate_right(1);
+            let decay = [0.875, -0.0, -0.25, 1.0][token % 4];
+            let beta = [0.625, 0.0, -0.0, 0.375][token % 4];
+            let token_values: [f32; 8] =
+                std::array::from_fn(|row| if row == token { -0.0 } else { key[row % width] });
+            let expected_output = expected
+                .chunks_exact_mut(width)
+                .zip(token_values)
+                .map(|(state, value)| decode_oracle(state, &key, &query, decay, value, beta))
+                .collect::<Result<Vec<_>>>()?;
+            let previous = actual;
+            actual = vec![-5.0; width * 8];
+            let output = super::step_eight_rows_from(
+                std::array::from_fn(|row| &previous[row * width..(row + 1) * width]),
+                mutable_rows(&mut actual, width)?,
+                &key,
+                &query,
+                decay,
+                token_values,
+                beta,
+            )
+            .ok_or_else(|| invalid("four-row GDN arithmetic phases were not selected"))?;
+            assert_eq!(bits(&actual), bits(&expected));
+            assert_eq!(bits(&output), bits(&expected_output));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn x1_gdn_second_four_row_phase_keeps_atomic_refusal_and_scalar_failure_bits() -> Result<()> {
+    for width in [16, 128, 144, 256] {
+        for failing_row in [4, 7] {
+            for failure in 0..3 {
+                let mut previous = vec![0.0; width * 8];
+                let mut key = vec![0.0; width];
+                let mut query = vec![0.0; width];
+                let mut token_values = [0.0; 8];
+                match failure {
+                    0 => {
+                        previous[(failing_row + 1) * width - 1] = f32::MAX;
+                        key[width - 1] = 4.0;
+                    }
+                    1 => {
+                        token_values[failing_row] = f32::MAX;
+                        key[width - 1] = 4.0;
+                    }
+                    _ => {
+                        token_values[failing_row] = 1.0;
+                        key.fill(1.0);
+                        query.fill(f32::MAX);
+                    }
+                }
+                let previous_rows =
+                    std::array::from_fn(|row| &previous[row * width..(row + 1) * width]);
+                let mut state = vec![-5.0; width * 8];
+                let untouched = bits(&state);
+                assert!(
+                    super::step_eight_rows_from(
+                        previous_rows,
+                        mutable_rows(&mut state, width)?,
+                        &key,
+                        &query,
+                        1.0,
+                        token_values,
+                        1.0,
+                    )
+                    .is_none()
+                );
+                assert_eq!(bits(&state), untouched);
+
+                // The public parent replays every row from immutable previous
+                // state after refusal. Compare the exact finite prefix, failing
+                // row and untouched later rows with independent scalar steps.
+                let mut expected = state.clone();
+                let mut failed = false;
+                for (row, target) in expected.chunks_exact_mut(width).enumerate() {
+                    target.copy_from_slice(previous_rows[row]);
+                    if decode_oracle(target, &key, &query, 1.0, token_values[row], 1.0).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed);
+                assert!(
+                    super::super::step_eight_rows_from(
+                        previous_rows,
+                        mutable_rows(&mut state, width)?,
+                        &key,
+                        &query,
+                        1.0,
+                        token_values,
+                        1.0,
+                    )
+                    .is_err()
+                );
+                assert_eq!(bits(&state), bits(&expected));
+            }
+        }
+    }
+    Ok(())
+}

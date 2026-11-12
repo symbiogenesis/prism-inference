@@ -543,8 +543,9 @@ pub(crate) fn step_four_rows_tokens_from(
     step_row_tokens_from(previous[3], s3, inputs, row + 3, stride, scale, output)
 }
 
-/// Steps 8 GDN state rows simultaneously from `previous` into `states`, sharing
-/// `key` and `query` vector loads across all 8 rows.
+/// Steps 8 GDN state rows transactionally from `previous` into `states`.
+/// Eligible NEON execution shares `key` and `query` loads within four-row
+/// arithmetic phases while retaining atomic eight-row publication.
 ///
 /// # Errors
 /// Rejects unequal vector lengths before mutation, or a nonfinite updated element or dot result.

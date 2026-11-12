@@ -679,6 +679,7 @@ fn execute(arguments: &Arguments) -> Result<()> {
             emit,
         )?
     };
+    let state_memory = runtime.decoder().state_memory()?;
     let mut completion = json!({
         "finish_reason": match result.finish { Finish::Stop => "stop", Finish::Length => "length" },
         "prompt_tokens": result.prompt_tokens,
@@ -686,6 +687,15 @@ fn execute(arguments: &Arguments) -> Result<()> {
         "reused_tokens": result.reused_tokens,
         "backend_requested": backend_requested,
         "state_budget_bytes": arguments.state_bytes,
+        "state_memory": {
+            "position": state_memory.position,
+            "context_tokens": state_memory.context_tokens,
+            "kv_payload_bytes": state_memory.kv_payload_bytes,
+            "full_context_kv_payload_bytes": state_memory.full_context_kv_payload_bytes,
+            "recurrent_payload_bytes": state_memory.recurrent_payload_bytes,
+            "live_state_storage_bytes": state_memory.live_state_storage_bytes,
+            "scope": "live state capacities and metadata; excludes model, workspace, external checkpoints, allocator overhead and process/device memory",
+        },
         "kv_cache": arguments.kv_cache.name(),
         "graph_identity": runtime.decoder().identity(),
         "prefill_block_tokens": arguments.prefill.block_tokens,

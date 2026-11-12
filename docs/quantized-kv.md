@@ -61,6 +61,23 @@ F32 GDN/convolution state stays unchanged. Codec/profile identities prevent
 cross-profile checkpoint reuse. Tiled prefill is explicitly rejected for these
 profiles; ordinary cancellation-aware sequential block ingestion remains supported.
 
+## Memory observations
+
+`Qwen35::state_memory` and `SwiftSession::state_memory` observe committed KV
+payload (including packed scales), the configured full-context payload bound,
+unchanged FP32 recurrent/convolution payload and live state storage capacities.
+The generation CLI emits these fields as `state_memory` in its completion record,
+separately from the configured `state_budget_bytes`. Observation allocates no
+expanded cache and does not change state or checkpoint ownership.
+
+Live storage charges layer tables, cache metadata and retained buffer capacities,
+including buffers left after reset; referenced shared pages are charged in full.
+It excludes model weights, workspace scratch, external retained checkpoints,
+allocator overhead and process/device allocations. The full-context field is a
+calculation rather than an allocation observation. Use independent complete-task
+process/Job/residency measurements to establish an application memory benefit.
+A zero committed payload after reset does not establish that all memory was freed.
+
 ## Memory and promotion
 
 For 16 full-attention layers and four KV heads, maximum packed K/V payload is:

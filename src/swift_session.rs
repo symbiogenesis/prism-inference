@@ -247,6 +247,17 @@ impl SwiftSession {
         self.kv_cache
     }
 
+    /// Observe live state capacities and payload without copying cache contents.
+    ///
+    /// This is not complete process memory or a peak observation. See
+    /// [`crate::graph::StateMemory`] for the storage scope and exclusions.
+    ///
+    /// # Errors
+    /// Returns an error if checked accounting arithmetic exceeds address space.
+    pub fn state_memory(&self) -> Result<crate::graph::StateMemory> {
+        self.runtime.decoder().state_memory()
+    }
+
     /// Current complete graph identity, including an explicitly changed adapter scale.
     #[must_use]
     pub fn decoder_identity(&self) -> &str {

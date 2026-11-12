@@ -1917,6 +1917,30 @@ pub enum StateComponent {
     Recurrent,
 }
 
+/// Live decoder-state accounting at one observation, independent of process peaks.
+///
+/// Payload fields count committed elements, including packed per-head scales.
+/// Storage includes live layer tables, buffer capacities and cache metadata;
+/// referenced pages are charged in full even when a checkpoint shares them.
+/// Model weights, graph/workspace scratch, external checkpoints, allocator
+/// overhead and accelerator/process allocations are excluded. Full-context KV
+/// is a calculated payload bound, not allocated storage or a measured saving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateMemory {
+    /// Committed token position shared by the live layers.
+    pub position: usize,
+    /// Configured total context bound.
+    pub context_tokens: usize,
+    /// Committed key/value payload, including quantized record scales.
+    pub kv_payload_bytes: usize,
+    /// Maximum key/value payload at the configured context, excluding metadata.
+    pub full_context_kv_payload_bytes: usize,
+    /// Live FP32 recurrent and convolution element payload.
+    pub recurrent_payload_bytes: usize,
+    /// Live layer tables, state buffer capacities and cache metadata.
+    pub live_state_storage_bytes: usize,
+}
+
 /// Native decoder for the supported Qwen3.5 dense text graph.
 ///
 /// The exact pinned Swift artifact uses its compiled Windows ARM64 arithmetic
@@ -2600,6 +2624,64 @@ impl Qwen35 {
     #[must_use]
     pub const fn kv_cache_policy(&self) -> KvCachePolicy {
         self.kv_cache_policy
+    }
+
+    /// Observe live state without copying, expanding or changing cache ownership.
+    ///
+    /// Unlike checkpoint admission, this includes retained buffer capacities at
+    /// position zero after reset. See [`StateMemory`] for excluded storage.
+    ///
+    /// # Errors
+    /// Returns an error if checked accounting arithmetic exceeds address space.
+    pub fn state_memory(&self) -> Result<StateMemory> {
+        let mut memory = StateMemory {
+            position: self.position,
+            context_tokens: self.context_limit,
+            kv_payload_bytes: 0,
+            full_context_kv_payload_bytes: 0,
+            recurrent_payload_bytes: 0,
+            live_state_storage_bytes: checked_product(&[
+                self.state.capacity(),
+                size_of::<LayerState>(),
+            ])?,
+        };
+        for state in &self.state {
+            memory.live_state_storage_bytes =
+                checked_sum(memory.live_state_storage_bytes, state.bytes())?;
+            match state {
+                LayerState::Full { keys, .. } => {
+                    let tokens = keys.len / keys.width;
+                    let current = if tokens == 0 {
+                        0
+                    } else {
+                        self.kv_cache_policy.layer_payload_bytes(
+                            self.geometry.head,
+                            self.geometry.kv_heads,
+                            tokens,
+                        )?
+                    };
+                    memory.kv_payload_bytes = checked_sum(memory.kv_payload_bytes, current)?;
+                    memory.full_context_kv_payload_bytes = checked_sum(
+                        memory.full_context_kv_payload_bytes,
+                        self.kv_cache_policy.layer_payload_bytes(
+                            self.geometry.head,
+                            self.geometry.kv_heads,
+                            self.context_limit,
+                        )?,
+                    )?;
+                }
+                LayerState::Recurrent { convolution, matrix } => {
+                    memory.recurrent_payload_bytes = checked_sum(
+                        memory.recurrent_payload_bytes,
+                        checked_product(&[
+                            checked_sum(convolution.len(), matrix.len())?,
+                            size_of::<f32>(),
+                        ])?,
+                    )?;
+                }
+            }
+        }
+        Ok(memory)
     }
 
     /// Sets explicit packed-base-projection row scheduling for subsequent tokens.

@@ -135,6 +135,45 @@ fn rotated_kv_admission_charges_record_headers_and_unchanged_gdn_payload() -> Re
 }
 
 #[test]
+fn kv_memory_observations_separate_payload_capacity_and_context_bound() -> Result<()> {
+    for (policy, record_bytes) in [
+        (KvCachePolicy::F16, 1024),
+        (KvCachePolicy::Rotated4, 264),
+        (KvCachePolicy::Rotated4Keys3Values, 232),
+    ] {
+        let mut decoder = graph(policy, MatvecBackend::Scalar)?;
+        let empty = decoder.state_memory()?;
+        assert_eq!(empty.position, 0);
+        assert_eq!(empty.context_tokens, CONTEXT);
+        assert_eq!(empty.kv_payload_bytes, 0);
+        assert_eq!(empty.full_context_kv_payload_bytes, record_bytes * CONTEXT);
+        assert_eq!(empty.recurrent_payload_bytes, GDN_BYTES);
+        for token in tokens(65) {
+            decoder.ingest(token)?;
+        }
+        let populated = decoder.state_memory()?;
+        assert_eq!(populated.position, 65);
+        assert_eq!(populated.kv_payload_bytes, record_bytes * 65);
+        assert_eq!(populated.recurrent_payload_bytes, GDN_BYTES);
+        assert!(populated.live_state_storage_bytes >= populated.kv_payload_bytes + GDN_BYTES);
+        let snapshot = decoder.checkpoint()?;
+        decoder.ingest(1)?;
+        decoder.restore(&snapshot)?;
+        assert_eq!(decoder.state_memory()?.kv_payload_bytes, populated.kv_payload_bytes);
+        decoder.reset()?;
+        let reset = decoder.state_memory()?;
+        assert_eq!(reset.position, 0);
+        assert_eq!(reset.kv_payload_bytes, 0);
+        assert_eq!(reset.recurrent_payload_bytes, GDN_BYTES);
+        assert_eq!(reset.full_context_kv_payload_bytes, empty.full_context_kv_payload_bytes);
+        // Cleared tails and page tables retain capacity even though no token
+        // payload remains. A snapshot elsewhere also retains its own pages.
+        assert!(reset.live_state_storage_bytes > empty.live_state_storage_bytes);
+    }
+    Ok(())
+}
+
+#[test]
 fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Result<()> {
     let mut exact = graph(KvCachePolicy::F16, MatvecBackend::Scalar)?;
     exact.evaluate(0)?;

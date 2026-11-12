@@ -242,6 +242,10 @@ fn owned_session_forwards_direct_resident_initialization_once() -> Result<(), Er
 
 #[test]
 fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error> {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Passing &mut RecordingSession by value tests its NativeQ2Submitter implementation."
+    )]
     fn borrowed_limit(submitter: impl NativeQ2Submitter) -> usize {
         submitter.maximum_resident_token_batch()
     }
@@ -252,8 +256,8 @@ fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error
     let mut outputs = [[f32::NAN; 32]; 8];
     session.submit_resident_multi8(
         [&handle; 8],
-        activations.each_ref().map(|row| row.as_slice()),
-        outputs.each_mut().map(|row| row.as_mut_slice()),
+        activations.each_ref().map(<[f32; 128]>::as_slice),
+        outputs.each_mut().map(<[f32; 32]>::as_mut_slice),
     )?;
     assert_eq!(session.0.calls, ["multi8"]);
     for (output, activation) in outputs.iter().zip(&activations) {
@@ -265,8 +269,8 @@ fn owned_session_keeps_eight_operations_in_one_native_call() -> Result<(), Error
         session
             .submit_resident_multi8(
                 [&handle; 8],
-                activations.each_ref().map(|row| row.as_slice()),
-                outputs.each_mut().map(|row| row.as_mut_slice())
+                activations.each_ref().map(<[f32; 128]>::as_slice),
+                outputs.each_mut().map(<[f32; 32]>::as_mut_slice)
             )
             .is_err()
     );
@@ -291,7 +295,7 @@ fn owned_session_preserves_fused_swiglu_calls_and_rejection() -> Result<(), Erro
         &handle,
         &handle,
         [&activation; 2],
-        pair.each_mut().map(|row| row.as_mut_slice()),
+        pair.each_mut().map(<[f32; 32]>::as_mut_slice),
     )?;
     assert_eq!(pair, [[3.0; 32]; 2]);
     assert_eq!(session.0.calls, ["swiglu", "swiglu-multi2"]);
@@ -309,7 +313,7 @@ fn owned_session_preserves_fused_swiglu_calls_and_rejection() -> Result<(), Erro
                 &handle,
                 &handle,
                 [&activation; 2],
-                pair.each_mut().map(|row| row.as_mut_slice())
+                pair.each_mut().map(<[f32; 32]>::as_mut_slice)
             )
             .is_err()
     );
@@ -341,7 +345,7 @@ fn owned_session_preserves_borrowed_output_evidence_and_errors() -> Result<(), E
         .submit_resident_batch2_validated(
             [&handle; 2],
             &activation,
-            pair.each_mut().map(|row| row.as_mut_slice()),
+            pair.each_mut().map(<[f32; 32]>::as_mut_slice),
         )?
         .validate_destinations(destinations)?;
     let mut triple = [[f32::NAN; 32]; 3];
@@ -350,7 +354,7 @@ fn owned_session_preserves_borrowed_output_evidence_and_errors() -> Result<(), E
         .submit_resident_batch3_validated(
             [&handle; 3],
             &activation,
-            triple.each_mut().map(|row| row.as_mut_slice()),
+            triple.each_mut().map(<[f32; 32]>::as_mut_slice),
         )?
         .validate_destinations(destinations)?;
     assert_eq!(
@@ -410,10 +414,10 @@ fn owned_session_forwards_paired_chain_capability_and_one_call() -> Result<(), E
     let mut outputs = [[f32::NAN; 32]; 2];
     session.submit_resident_ffn_chain_multi2(
         [&handle; 3],
-        activations.each_ref().map(|row| row.as_slice()),
+        activations.each_ref().map(<[f32; 128]>::as_slice),
         [None; 2],
         None,
-        outputs.each_mut().map(|row| row.as_mut_slice()),
+        outputs.each_mut().map(<[f32; 32]>::as_mut_slice),
     )?;
     assert_eq!(session.0.calls, ["chain-multi2"]);
     assert_eq!(outputs, [[1.0; 32], [2.0; 32]]);
@@ -423,10 +427,10 @@ fn owned_session_forwards_paired_chain_capability_and_one_call() -> Result<(), E
         session
             .submit_resident_ffn_chain_multi2(
                 [&handle; 3],
-                activations.each_ref().map(|row| row.as_slice()),
+                activations.each_ref().map(<[f32; 128]>::as_slice),
                 [None; 2],
                 None,
-                outputs.each_mut().map(|row| row.as_mut_slice())
+                outputs.each_mut().map(<[f32; 32]>::as_mut_slice)
             )
             .is_err()
     );

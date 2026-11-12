@@ -4255,7 +4255,7 @@ mod tests {
                     [&activation, &second_activation],
                     [add.then_some(residual.as_slice()); 2],
                     hadamard,
-                    outputs.each_mut().map(|out| out.as_mut_slice()),
+                    outputs.each_mut().map(<[f32; 128]>::as_mut_slice),
                 );
                 let writes = STATE.lock().map_err(|_| Error::Contract)?.writes;
                 if case == 0 {
@@ -4296,7 +4296,7 @@ mod tests {
                                 [&activation; 2],
                                 [None; 2],
                                 None,
-                                outputs.each_mut().map(|out| out.as_mut_slice()),
+                                outputs.each_mut().map(<[f32; 128]>::as_mut_slice),
                             )
                             .is_err()
                     );
@@ -4770,8 +4770,8 @@ mod tests {
         NativeQ2Submitter::submit_resident_multi8(
             &mut session,
             [&h_a; 8],
-            activations.map(|row| row.as_slice()),
-            outputs.each_mut().map(|row| row.as_mut_slice()),
+            activations.map(<[f32; 128]>::as_slice),
+            outputs.each_mut().map(<[f32; 32]>::as_mut_slice),
         )?;
         for (member, output) in outputs.iter().enumerate() {
             let step = u8::try_from(member).map_err(|_| Error::Contract)?;
@@ -4784,8 +4784,8 @@ mod tests {
             NativeQ2Submitter::submit_resident_multi8(
                 &mut session,
                 [&h_a; 8],
-                activations.map(|row| row.as_slice()),
-                outputs.each_mut().map(|row| row.as_mut_slice()),
+                activations.map(<[f32; 128]>::as_slice),
+                outputs.each_mut().map(<[f32; 32]>::as_mut_slice),
             )
             .is_err()
         );

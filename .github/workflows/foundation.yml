@@ -109,6 +109,7 @@ jobs:
       - name: Reuse locked Cargo downloads
         id: downloads
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -116,6 +117,7 @@ jobs:
           key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
       - name: Reuse this lane's compiler artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           # Never seed every shard with the old full-workspace target: retaining
           # only its own outputs keeps restore time and cache quota bounded.
@@ -138,6 +140,7 @@ jobs:
       - name: Save locked downloads once per architecture
         if: matrix.lane == 'correctness-0' && steps.downloads.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -322,6 +325,7 @@ jobs:
           "PRISM_PACKAGE_HOST=$env:ImageOS-$env:ImageVersion" >> $env:GITHUB_ENV
       - name: Reuse ccache installation packages for this runner image
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/SwiftBonsai-CcachePackages/*.deb
           # Dependencies already installed by the image must match on a hit.
@@ -355,6 +359,7 @@ jobs:
       # invalidate every C++ object through the Actions cache path version.
       - name: Reuse pinned source downloads and compiler objects
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ${{ runner.temp }}/SwiftBonsai-PrismDownloads
@@ -364,6 +369,7 @@ jobs:
             prism-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-
       - name: Reuse locked Prism Rust downloads and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -453,6 +459,7 @@ jobs:
           "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'Prism-RuntimeRegressionTarget')" >> $env:GITHUB_ENV
       - name: Reuse the bounded regression compiler cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -496,11 +503,13 @@ jobs:
           toolchain: nightly-2026-11-09-aarch64-pc-windows-msvc
       - name: Reuse the immutable released runtime archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/Prism-CodecDownloads
           key: prism-codec-download-v1-${{ runner.os }}-${{ hashFiles('tools/codec-probe/native.lock.json') }}
       - name: Reuse native codec probe compiler artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -580,6 +589,7 @@ jobs:
           components: ''
       - name: Reuse locked Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -587,6 +597,7 @@ jobs:
           key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
       - name: Reuse only source-package compiler outputs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           # Normalized archives, temporary registries, extracted sources and
           # consumer receipts must be constructed anew on every run.
@@ -634,6 +645,7 @@ jobs:
           components: clippy
       - name: Reuse locked Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -641,6 +653,7 @@ jobs:
           key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
       - name: Reuse only this cross-target compiler's build outputs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/Prism-Hexagon-Cross-Target
           key: prism-hexagon-v1-cross-${{ runner.os }}-${{ runner.arch }}-aarch64-pc-windows-msvc-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', 'clippy.toml', 'rustfmt.toml', '.cargo/**', 'src/**', 'tools/**', 'tests/**', 'server/**', '.github/workflows/foundation.yml') }}-content-v1

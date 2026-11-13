@@ -118,7 +118,16 @@ class HexagonWorkflowTests(unittest.TestCase):
                 self.assertIn("needs.changes.outputs.hexagon == 'true'", job)
                 paths = re.findall(r"(?m)^          path: (.+)$", job)
                 self.assertEqual(paths, ["|", "${{ runner.temp }}/" + directory])
-                self.assertNotIn("continue-on-error", job)
+                steps = re.split(r"(?m)^      - ", job)[1:]
+                cache_steps = [step for step in steps if "uses: actions/cache" in step]
+                self.assertEqual(len(cache_steps), 2)
+                for step in steps:
+                    if step in cache_steps:
+                        self.assertRegex(step, r"(?m)^        continue-on-error: true$")
+                    else:
+                        # Cache outages may lose reuse, but actual target setup,
+                        # Cargo checks and strict lints must remain blocking.
+                        self.assertNotIn("continue-on-error", step)
                 commands = self.cargo_commands(job)
                 self.assertEqual(len(commands), 2)
                 for command in commands:

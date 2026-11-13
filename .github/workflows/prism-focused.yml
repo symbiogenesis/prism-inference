@@ -79,11 +79,13 @@ jobs:
       # outputs can survive checkout timestamps in a stable external directory.
       - name: Reuse the pinned upstream archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/SwiftBonsai-PrismUpstreamDownloads
           key: prism-upstream-download-v1-${{ runner.os }}-${{ hashFiles('tools/prism/source.lock.json') }}
       - name: Reuse shared-assertion Rust dependencies and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -94,6 +96,7 @@ jobs:
             prism-upstream-rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_CACHE_HOST }}-nightly-2026-11-09-
       - name: Reuse exact pinned upstream native builds
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/SwiftBonsai-PrismUpstreamNative
           # Orchestration changes can reuse the same native source/compiler tree.
@@ -102,6 +105,7 @@ jobs:
           key: prism-upstream-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_UPSTREAM_NATIVE_HOST }}-vs18-clangcl-arm64-${{ hashFiles('tools/prism/source.lock.json') }}-${{ hashFiles('tools/prism/upstream/**/CMakeLists.txt', 'tools/prism/upstream/**/*.cmake', 'tools/prism/upstream/**/*.c', 'tools/prism/upstream/**/*.cpp', 'tools/prism/upstream/**/*.h', 'tools/prism/upstream/**/*.hpp', 'tools/prism/upstream/**/*.inc', 'tools/prism/upstream/**/*.rs', 'tools/prism/upstream/patches/**', 'tools/prism/upstream/reference-patches.lock.json', 'tools/prism/upstream/llguidance.lock.json', 'tests/Test-PrismUpstream.ps1', 'scripts/Bonsai.PrismNativeCache.psm1', 'scripts/Bonsai.PrismGrammar.psm1', 'scripts/Bonsai.PrismReferencePatch.psm1') }}
       - name: Reuse hash-locked tokenizer and LoRA download inputs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/SwiftBonsai-PrismFixtureDownloads
           key: prism-fixtures-v1-case-${{ inputs.case }}-${{ hashFiles('tests/upstream_prism/tokenizer-reference-assets.json', 'tests/upstream_prism/tokenizer-repository-assets.json', 'tests/upstream_prism/lora-assets.json') }}

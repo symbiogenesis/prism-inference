@@ -64,6 +64,7 @@ jobs:
           toolchain: nightly-2026-11-09-aarch64-pc-windows-msvc
       - name: Reuse locked Cargo downloads
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry/index
@@ -71,6 +72,7 @@ jobs:
           key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
       - name: Reuse only the matching ARM64 release-build shard artifacts
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
           key: prism-runtime-v2-aarch64-pc-windows-msvc-correctness-2-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tools/**', 'tests/**', 'scripts/**', '.github/ci/foundation_shards.py', 'rustfmt.toml', 'rust-toolchain.toml') }}-content-v1

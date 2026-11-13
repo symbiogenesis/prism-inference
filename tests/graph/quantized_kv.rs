@@ -1,8 +1,9 @@
 //! Synthetic graph/state controls for separately selected lossy KV profiles.
 //!
 //! Two hidden coordinates project to one 256-coordinate attention head, then a
-//! second block retains the original tiny FP32 GDN geometry. These fixtures do
-//! not qualify actual Swift quality, performance or target-device memory use.
+//! second block retains the original tiny FP32 GDN geometry. The shared RoPE
+//! geometry supports both source and pinned arithmetic. These fixtures do not
+//! qualify actual Swift quality, performance or target-device memory use.
 
 use super::*;
 use bonsai_prism_runtime::graph::KvCachePolicy;
@@ -22,11 +23,20 @@ pub(super) fn profile_fixture() -> Model {
         ("qwen35.context_length", 70_u64),
         ("qwen35.attention.key_length", 256_u64),
         ("qwen35.attention.value_length", 256_u64),
+        ("qwen35.rope.dimension_count", 64_u64),
     ] {
         model
             .metadata
             .insert(key.to_owned(), MetadataValue::from(value));
     }
+    model.metadata.insert(
+        "qwen35.rope.dimension_sections".to_owned(),
+        MetadataValue::from(vec![16_i64, 8, 8, 0]),
+    );
+    model.metadata.insert(
+        "qwen35.rope.freq_base".to_owned(),
+        MetadataValue::from(10_000_000.0_f32),
+    );
     for (name, rows, salt) in [
         ("blk.0.attn_q.weight", 512, 3_u8),
         ("blk.0.attn_k.weight", 256, 5_u8),

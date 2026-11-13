@@ -519,11 +519,13 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
     // Match one complete typed cache identity component, never an arbitrary
     // substring: rsq4 and rsq4k3v must not validate one another or FP16.
     let mut cache_components = identity.split(':').filter(|part| part.starts_with("kv-"));
-    let expected_cache = format!("kv-{}-d256-rht3-v1", profile.kv_cache.name());
-    let cache_matches = match profile.kv_cache {
-        KvCachePolicy::F16 => cache_components.next().is_none(),
-        _ => cache_components.next() == Some(expected_cache.as_str()) && cache_components.next().is_none(),
+    let expected_cache = if profile.kv_cache == KvCachePolicy::F16 {
+        "kv-f16".to_owned()
+    } else {
+        format!("kv-{}-d256-rht3-v1", profile.kv_cache.name())
     };
+    let cache_matches = cache_components.next() == Some(expected_cache.as_str())
+        && cache_components.next().is_none();
     if !cache_matches { return false; }
     if let Some(prefill) = profile.cpu_prefill {
         let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());

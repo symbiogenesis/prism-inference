@@ -11,8 +11,7 @@ Scales include negatives, FP16 subnormals and extrema. Another table contains
 
 The fixture is 62,964 bytes with SHA-256
 `de86d0ff0e31037635ae5f607bcb68d4e62ee7cb5d1b5db5e739ef900114fd79`.
-It retains codec fields from the original fixture in Git history; experimental
-storage/arithmetic fields are omitted. The capture used strict floating-point
+The capture used strict floating-point
 ARM64 MSVC Release mode and required native PTQ decoding to reproduce PQ2 bytes.
 
 All multibyte values are little endian:

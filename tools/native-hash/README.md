@@ -15,9 +15,8 @@ The GGUF loader uses this stream for exact artifact/range verification while
 retaining its original file handle, Windows sharing protection, 64 KiB scratch
 and cursor restoration. Header parsing and payload ownership remain in the
 unsafe-free GGUF crate. Mandatory full-file verification still reads all model
-bytes; this change establishes no measured startup or model-performance gain.
+bytes; hashing strategy alone establishes no model-performance gain.
 
 Independent vectors, binary block boundaries, interruption, read errors,
 cancellation, short/long input and bounded-range tests run in hosted CI alongside
-the GGUF final-byte-corruption regression. Publish this dependency before any
-registry release of a GGUF package that requires it.
+the GGUF final-byte-corruption regression.

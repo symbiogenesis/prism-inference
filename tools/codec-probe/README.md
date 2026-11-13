@@ -1,10 +1,9 @@
 # Pinned native codec probe
 
 `bonsai-codec-probe` checks production `bonsai-ternary` PQ2/PTQ1 conversion
-against both native dequantizers from the released Windows ARM64 Prism runtime
+against both native dequantizers from the pinned Windows ARM64 Prism runtime
 `73bfe6cc485554822f80c473a3c0c4f25e80f41b`, without model weights. The preserved
 6,670 blocks cover 853,760 FP32 values and the original fixed random corpus.
-The independent bit oracle and native ABI boundary moved unchanged from Runner.
 
 Runtime conformance CI owns the complete probe. Its wrapper accepts an already
 downloaded archive; `native.lock.json` pins all 12,412,126 bytes and SHA-256:
@@ -19,7 +18,7 @@ The wrapper verifies the entire archive, bounds expansion, compares every
 extracted file with its ZIP entry, verifies all native PE headers and retains
 read handles denying mutation through child completion. It uses neither the
 Runner installer nor its maintenance CLI. Version and codec children run in
-separate one-process kill-on-close Windows Jobs via the already published
+separate one-process kill-on-close Windows Jobs via
 `bonsai-windows-process =0.1.2`, each capped to 1 GiB commit and 30 seconds, with
 parent-process lifetime checks, inherited environment and an explicit external
 native working directory. The fixed `llama-server.exe --version` child uses the

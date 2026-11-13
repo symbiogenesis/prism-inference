@@ -2,8 +2,7 @@
 
 This safe offline JSON tool owns the runtime catalog, baseline floor, deterministic
 ordinary-source partitioning and bounded revision-bound artifact fan-in. It
-preserves the policy and frozen fixtures moved from SwiftBonsai2Runner; no Runner
-binary, released runtime source archive, installer or model is needed.
+needs no Runner binary, native runtime archive, installer or model.
 
 Build with `cargo +nightly-2026-11-09 build -p prism-conformance-policy --locked --release`.
 Invoke `prism-conformance-policy --version`, or pass `prism-baseline`/`prism-source`
@@ -16,11 +15,10 @@ partitions and the complete baseline gate. Benchmarks and gradients are explicit
 manual opt-ins. Routine pushes use the regression jobs in
 `.github/workflows/foundation.yml`: its compact Rust corpus plus affected native
 codec parity. Regression receipts
-record `FullSourceGate=false` and cannot replace complete release qualification.
+record `FullSourceGate=false` and cannot replace the complete conformance gate.
 `.github/workflows/prism-focused.yml` diagnoses one named source
 without claiming complete coverage. `scripts/Bonsai.PrismSource.psm1` always
 selects this checkout; only the separately hash-pinned C++ reference is downloaded.
 
-The existing Foundation workflow continues to own workspace Release analyzers,
-complete Rust tests, immutable codec fixtures, mutation checks, both Windows
-architectures and the Linux ARM64 native storage overlay regression.
+See [conformance](../../docs/prism-upstream-tests.md) for coverage and
+[validation](../../docs/build-and-validation.md) for workflow ownership.

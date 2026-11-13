@@ -1,98 +1,52 @@
-# Rust compiler trial
+# Rust compiler capability checks
 
-This dependency-free crate compares standalone compiler capabilities using stable
-1.99.1 and the nightly pinned in [configuration](../../config/rust-nightly-trial.json).
-The workspace uses nightly-2026-11-09, whose defaults enable the next trait solver
-and Polonius Alpha. Stable is retained only as a compiler-probe control.
+This dependency-free crate compares stable 1.99.1 with the nightly pinned in
+[configuration](../../config/rust-nightly-trial.json). The workspace nightly enables
+Polonius Alpha and the next trait solver; stable is the probe control.
 
-## Stable storage reuse
+## Borrowing fixtures
 
-`LogitsSource` ties its generic associated output to an exclusive source borrow.
-`LogitsCache` returns `&[f32]` from storage allocated by its constructor. Cache
-hits reuse values; changed tokens or `invalidate()` refill that same buffer.
-`maximum_logit` demonstrates a consumer that releases its view before reevaluation.
+`LogitsSource` ties its associated output to an exclusive source borrow.
+`LogitsCache` reuses constructor-owned storage, returning cached slices or refilling
+on changed tokens/invalidation. Its token-only key is a fixture, not a production
+decoder-state key. `maximum_logit` releases the view before reevaluation;
+`with_logits` permits borrowed inputs and consumers returning a valid view.
+`SupportsLogitsView` exercises higher-ranked associated-view normalization.
 
-The synthetic regressions compare an owned numerical reference, cache hits,
-invalidation, empty vocabulary and unchanged storage address/capacity. They
-establish storage ownership/reuse, not allocation profiles, model parity or speed.
-The token-only cache key is not a production decoder's sequence state. `LogitsCache::evaluate`
-returns the cached slice on a hit before mutating storage on a miss (Polonius lending).
-`with_logits` ties its consumer to the current source borrow, admitting sources
-that borrow local data and consumers that return a view without copying it.
-`SupportsLogitsView` retains the higher-ranked associated-view normalization
-exercised by the next-generation trait solver.
+The regressions compare independent numerical output, cache hits, invalidation,
+empty vocabulary and stable storage address/capacity. They establish ownership and
+reuse, without model-parity or speed claims.
 
-## Production pattern audit
+`fixtures/` compile directly with `rustc --edition=2024 --crate-type=lib
+--emit=metadata`, outside Cargo discovery. They forbid unsafe code and deny warnings
+and missing documentation.
 
-The audit found one useful Polonius refactor in the broker's
-[`BackendBody`](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/src/broker/src/backend.rs). Its shared `poll_available`
-helper lends buffered bytes on success and closes the reader on I/O failure,
-EOF or deadline expiry. Polonius tracks the successful borrow separately from
-the failure branches that mutate the owner. This centralizes checks previously
-duplicated in payload and chunk-framing paths. The stable alternative is the
-previous inline implementation; no throughput improvement is claimed.
-
-The native runtime's `Decoder::evaluate_into` and scoped `PreparedMatvec` already
-reuse output and activation storage without new solver behavior. Saved-prefix
-restoration now also retains the runtime's token allocation; that optimization
-is expressible on stable. Checkpoints still own complete independent state.
-
-Production text output uses a generic lending view in `src/text_output.rs`, and
-`server/src/native_response.rs` uses failure-path borrowing. Text output's
-`push_with` visitor, like `with_logits`, needs only the current call's lifetime;
-requiring every lifetime unnecessarily rejects nonstatic sources and consumers
-that retain valid borrowed pieces. This API correction requires no new compiler
-feature and establishes no runtime speedup. Cargo-compiled behavioral gates in
-`tools/rust-trial/tests/compiler.rs` independently verify Polonius lending and the
-next solver's higher-ranked associated-view normalization.
-
-## Compiler capability fixtures
-
-`fixtures/` files compile directly with `rustc --edition=2024 --crate-type=lib
---emit=metadata`, outside Cargo's module/test discovery. They forbid unsafe code
-and deny warnings/missing documentation.
-
-| Fixture | Assertion | Baseline | Candidate component |
+| Fixture | Assertion | Stable | Nightly component |
 | --- | --- | --- | --- |
 | `stable_control.rs` | Refill before lending; generic consumer | Accept | Accept |
-| `invalid_alias.rs` | Two overlapping exclusive references | Reject `E0499` | Reject `E0499` |
-| `polonius.rs` | Cached-borrow return or owner refill on alternate branch | Reject `E0499` | Accept with Polonius Alpha |
-| `next_solver.rs` | Lifetime-generic view in higher-ranked callback bound | Reject `E0277` | Accept with next trait solver |
+| `invalid_alias.rs` | Overlapping exclusive references | Reject `E0499` | Reject `E0499` |
+| `polonius.rs` | Cached borrow or alternate-branch refill | Reject `E0499` | Accept with Polonius Alpha |
+| `next_solver.rs` | Lifetime-generic view in higher-ranked callback | Reject `E0277` | Accept with next solver |
 
-The examples follow Rust's [Polonius Alpha](https://blog.rust-lang.org/2026/08/04/enabling-polonius-alpha-on-nightly/)
+Controls distinguish capability from broken invocation or invalid aliasing. The
+hosted matrix isolates all four nightly component combinations and stable. See
+Rust's [Polonius Alpha](https://blog.rust-lang.org/2026/08/04/enabling-polonius-alpha-on-nightly/)
 and [next solver](https://blog.rust-lang.org/2026/08/21/enabling-next-solver-on-nightly/)
-announcements. Controls distinguish compiler acceptance from broken invocation or
-invalid aliasing. The hosted matrix isolates all four component combinations on
-one nightly binary, with stable as another baseline. These fixtures establish
-compiler capabilities; the broker helper is the current production Polonius use.
-Neither establishes an accelerator interface or inference performance.
+descriptions for the language features.
 
-## Validation
+## Run a focused check
 
-For one focused local comparison, give the orchestrator a new absolute evidence
-path outside Git:
+Supply a fresh absolute evidence directory outside Git:
 
 ```powershell
 ./tests/Test-RustNightly.ps1 -Mode Probe -ProbeCase Polonius -EvidenceDirectory C:/absolute/temp/rust-trial-evidence
 ```
 
-Local formatting, Release builds/analyzers, standalone metadata checks and focused
-regressions are allowed. Full suites and the complete compiler matrix require
-hosted CI with `-FullTests`; never approximate them by batching local selections.
-This trial includes no benchmarks. Exact prototype regression names are:
-
-- `tests::borrowed_outputs_match_reference_and_invalidate`
-- `tests::repeated_outputs_reuse_storage`
-- `tests::consumer_can_return_a_view_from_a_nonstatic_source`
-
-The main-only compiler jobs in
-[Source checks](../../.github/workflows/source-checks.yml) compare isolated pinned
-stable and nightly language probes when their inputs change or on manual dispatch.
-The `compatibility` check requires successful probes, including evidence retention;
-failed, cancelled or skipped selected probes are rejected. Receipts bind compiler
-identity, exact arguments, source hashes and verdicts. Foundation owns complete
-workspace correctness, feature checks and native Prism linking.
-
-`-Mode Compatibility -PackageGroup Runtime` or `Broker` selects formatting,
-Release Clippy/documentation locally; the default checks all packages. Full
-correctness still requires hosted `-FullTests`. See [validation](../../docs/build-and-validation.md).
+`-Mode Compatibility -PackageGroup Runtime` or `Broker` selects formatting and
+Release Clippy/documentation; the default selects all packages. Full correctness
+and the complete compiler matrix require hosted `-FullTests`.
+[Source checks](../../.github/workflows/source-checks.yml) requires successful
+selected probes and retained compiler identity, arguments, source hashes and
+verdicts; failed, cancelled or skipped probes reject. Foundation owns workspace
+correctness and native Prism linking. Follow the
+[validation policy](../../docs/build-and-validation.md) for local budgets.

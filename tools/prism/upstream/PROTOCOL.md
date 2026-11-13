@@ -1,12 +1,10 @@
 # Upstream process adapter
 
 `prism-upstream-bridge --input ABSOLUTE_PATH --output ABSOLUTE_PATH` calls the
-production ggml library from the verified pinned Prism source. The process
-adapter is written in Rust; production ggml remains the native reference. It does not compile
-or include upstream test sources. The safe Rust caller supplies all inputs,
-independent references, tolerances and pass/fail decisions. Exit zero means the
-operations completed and the response was written; errors use a nonzero exit and
-stderr. A response produced by a failing process must be discarded.
+production ggml library from the pinned Prism source. The Rust adapter serializes
+production calls; the [safe Rust harness](README.md) owns inputs and assertions.
+Exit zero means completion and a written response; errors use nonzero exit and
+stderr. Discard any response from a failing process.
 
 All integers and IEEE-754 binary32 floats are little-endian. Packed tensor bytes
 use the pinned upstream ggml layout on a little-endian host. No implicit padding
@@ -61,6 +59,5 @@ failure digest/retention policy. A hard process kill or abort can lose the
 unflushed in-memory prefix. Default transport diagnostics retain transcripts.
 Partition stderr and process-exit receipts remain separate diagnostics. Framing,
 count, I/O, deadline or process failures poison the session and abort further
-geometries. The original file/checkpoint transport remains available to focused
-equivalence checks. Foundation requires native old/new observation, output-byte,
-input-receipt, seed and state-isolation checks before publishing shard tools.
+geometries. The file/checkpoint transport remains available for equivalence checks
+of raw observations, output bytes, input receipts, seeds and state isolation.

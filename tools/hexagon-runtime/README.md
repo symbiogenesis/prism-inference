@@ -1,176 +1,109 @@
 # Experimental native Hexagon graph integration
 
-This unpublished Rust crate joins Prism's ordinary Qwen3.5 graph to a single
-caller-owned signed X2 projection session. The published CPU runtime depends on
-neither this crate nor the unpublished native driver boundary.
+This unpublished crate joins the Qwen3.5 graph to a caller-owned X2 projection
+session. The main CPU runtime depends on neither it nor the
+[native driver boundary](../hexagon-native/README.md).
 
-`NativeQ2Executor` prewarming can initialize a fresh resident `Q2_0` extent directly
-through the native submitter's synchronous, exact-length callback. Packing then
-writes into its admitted `rpcmem` arena, retaining the same byte transcode and
-row-worker pool. The prospective registry and handle stay private until packing,
-all packed scales and the existing deadline pass. Callback errors close admission;
-unwinding publishes no handle or registry growth. Existing handles and neighboring
-extents remain untouched. Submitters without this optional capability retain the
-scratch-and-copy API and its original input validation.
+## Executors
 
-For the current 168-projection selection, this removes a nominal
-`2,888,663,040` bytes of startup host copying and the temporary packed-weight
-scratch from the direct prewarm path. This is a source work reduction, with no
-measured startup, RAM, request-throughput or DSP-transfer verdict. The existing
-host/resource admission, six mapped arenas, signed kernels, queue/cache protocol,
-operation limits and CPU placement remain unchanged. Hosted model-free controls
-compare direct and copied preparation across partial-row/column tiles and retain
-failure, unwinding, extent-bound and secondary-arena controls. Signed-device,
-actual-model state/adapter parity and matched whole-request benefit remain pending.
+All executors implement `Pq2ProjectionExecutor`. The graph applies its original
+Hadamard/sign/grouped transforms before projection and approved rank-one adapter
+corrections afterward. Embedding, attention, GDN, convolution, sampling and
+committed state remain in the Rust graph.
 
-For native submitters with direct eight-operation support, resident multi-token
-sibling dispatch fills the existing eight-operation packet
-for every complete four-token pair, including a four-token tail. Eight, sixteen
-and thirty-two pair tokens therefore use two, four and eight queue writes rather
-than three, five and nine. A four-token triple tail uses eight plus four
-operations in two queue writes rather than three four-operation writes. Member
-and token order, total operations, arithmetic, immutable handles and admission
-stay unchanged. These are source submission counts, with no measured latency
-claim. The same native multi-eight packet path already used for longer tiles
-carries these tails; no wider packet, activation/output reserve or session cap is
-introduced. A failed submission or nonfinite returned value clears every output
-in the tile and permanently closes the executor. Hosted controls retain all
-partial-token tails, distinguish member/token identities and inject failures
-and nonfinite results at every packet boundary. Signed-device lifecycle,
-full-model state/adapter parity and matched request benefit remain pending.
+| Executor | Arithmetic |
+| --- | --- |
+| `GuardedQ2Executor` | Guarded HVX K=256/N=2 with prepared Q8_K codes |
+| `HmxQ2Executor` | HMX K=128/N=8 bitplanes of one token's Q8_K codes; signed high bit has coefficient -128 |
+| `HmxQ8Executor` | Explicit PTQ1/odd-block PQ2 with Q8_0 codes and per-32 scales; four sparse rows preserve DOTPROD lanes |
+| `NativeQ2Executor` | Native resident Q2_0 preparation and projection |
 
-`GuardedQ2Executor` uses the existing guarded HVX K=256/N=2 primitive.
-`HmxQ2Executor` uses the separate K=128/N=8 binary-plane HMX primitive. Both
-implement the public CPU runtime's `Pq2ProjectionExecutor` extension and consume
-the graph's existing prepared Q8_K codes, without another activation quantizer.
-Original PQ2 scale bits and per-128-block fused/nonfused reduction order remain on
-CPU. The HMX rows are the eight bits of one token's codes, with signed high-bit
-coefficient -128; they are not eight prefill tokens.
+Original scale bits and per-128 fused/nonfused reductions remain on CPU.
+Pinned PTQ1 retains four FMA accumulators and adjacent-pair reduction; generic
+PTQ1/odd-block PQ2 retain their per-32/per-128 nonfused order. PTQ1 byte aliases
+keep decoder semantics. Its fourfold row duplication is an explicit compatibility
+path, without an efficiency claim. Unsupported arithmetic stays on CPU before
+submission. Any submitted error clears provisional output and permanently closes
+the executor and scoped decoder; failed work is never replayed on CPU.
 
-Original-PQ2 `HmxQ2Executor` additionally supports explicit immutable weight
-residency. The caller first reserves a bounded native arena with
-`HmxQ2ProjectionLimits::with_resident_weights`, then enables the executor's
-`with_resident_weights(maximum_cache_metadata_bytes)`. The host metadata
-reservation is charged inside `maximum_owned_payload_bytes` for every supported
-projection, so eligibility and request operation counts stay stable as the cache
-fills. Equal numbers of projection records and tile handles are allocated up
-front; each tensor consumes one record and one handle per block/row-tile operation.
-Original immutable source bytes are retained through strong `Arc` ownership,
-without another model copy. Original model retention, allocator overhead and the
-separately bounded native mapping remain additional resource charges.
+Use `Qwen35::with_projection_executor` inside the native driver's projection work
+callback, then place the borrowed `ProjectedQwen35` in an ordinary `Runtime`.
+Its borrow covers all tokens and projections in that one session. Request
+checkpoints, cancellation and prefix policies remain active. Keep outputs
+provisional until the native report's `completed_cycle()` succeeds.
 
-An entire projection's padded packed bytes and metadata must fit before its first
-preparation. All its tiles are then prepared before any kernel submission. A
-capacity miss uses the ordinary streaming HMX path for the entire projection;
-unexpected preparation refusal or error closes the executor with no partial
-fallback. Cache identity checks shared immutable source ownership plus tensor
-kind/dimensions, avoiding raw pointer keys, address reuse and per-token hashing.
-Repeated projections reuse the native handles and skip weight packing/copying.
-There is no eviction and no renewal of operation/deadline limits. The native
-arena still participates in the existing mapping/descriptor/cache protocol: this
-does not establish reduced DSP DMA traffic, signed-device parity or speed.
-`residency_statistics` reports complete preparations, cache hits, copied packed
-bytes and reserved host metadata payload independently of kernel work counts.
+## Placement and work admission
 
-`HmxQ8Executor` opts into PTQ1 and odd-block PQ2 using the graph's original
-prepared Q8_0 codes and per-32 scales. Four sparse output rows preserve the four
-integer DOTPROD lanes of one original row, with four K128/N8 submissions per
-128-weight block. Pinned PTQ1 keeps four independent FMA accumulators across the
-complete row and the final adjacent-pair reduction. Generic PTQ1 and odd-block
-PQ2 retain their original per-32 and per-128 nonfused reduction order. Native
-PTQ1 fractional-byte aliases retain decoder semantics; no canonical conversion
-or expanded model copy is required. The fourfold row duplication reduces the
-original-row tile capacity to the native limit divided by four. This exact
-composition is an experimental compatibility path, not an efficiency claim.
+`PlacedProjectionExecutor` freezes a model-tensor subset before graph construction,
+for example `blk.0.ffn_up.weight`. Unknown names, duplicates, unsupported arithmetic
+and changed immutable storage/geometry reject. Identity binds the model, executor,
+selected names and operation counts. Qualification must observe nonzero submissions
+for the intended placement; selecting a model tensor does not prove graph use.
 
-The graph applies the existing Hadamard/sign/grouped transformations before projection and the
-existing approved rank-one adapter corrections afterward. Embedding, attention, GDN, convolution,
-sampling and complete committed state remain in their original Rust graph. PTQ1 and odd-block
-PQ2/Q8_0 use the configured CPU implementation unless the executor explicitly opts in. Any submitted
-error clears provisional output and permanently closes the executor and scoped decoder; no failed
-work is replayed on CPU.
+Executors report stable, nonzero operation counts for each selected projection.
+`ProjectedQwen35` derives ingestion/evaluation costs from graph projections,
+excluding embedding gathers and CPU placement. `Runtime::admit_work` reserves all
+unreused prompt work and the maximum output before inference or sampling; early
+stop is not assumed. Direct graph calls admit one complete token. Capacity
+refusal leaves a healthy scope; errors after admitted evaluation starts are
+terminal. Checkpoints/reset never replenish capacity.
 
-Use `Qwen35::with_projection_executor` inside
-`Driver::reference_q2_projection` or `Driver::reference_hmx_q2_projection`'s work
-callback. Place the resulting borrowed `ProjectedQwen35` in an ordinary `Runtime`
-to retain request checkpoints, cancellation checks and prefix policies. The
-borrow spans every projection and token in that callback, so module/session
-open and close occur once for the whole explicitly bounded workload. Keep all
-outputs provisional until the native report's `completed_cycle()` succeeds.
-Only then may a trusted supervisor publish a terminal qualification result.
+At the retained Swift geometry and 17,408-row tile limit, all eligible projections
+cost 22,656 submissions per ingestion token and another 600 for its vocabulary
+head. One evaluation therefore fits the 24,000-write cap; ingestion plus evaluation
+does not. Useful larger requests need explicit partial placement or a separately
+qualified session contract. These are source-derived counts, not device timings.
 
-`maximum_owned_payload_bytes` separately bounds original-F32 provisional output,
-one padded packed-weight tile, returned limb/plane results and activation payload.
-The original model/prepared activations/caller output, allocator and stack overhead,
-native shared allocation, VTCM and resources outside the process are additional.
-Insufficient host payload or unsupported geometry selects CPU before submission;
-native operation/deadline exhaustion fails the scope. Native bounds remain
-4..=120 seconds with a three-second cleanup reserve and at most 24,000 write
-attempts.
-They are terminal experiment limits, not a daily service session contract; a
-complete model/token may exceed them. An outer process deadline, exact signed
-package/driver verification, child-only environment and verified teardown remain
-the trusted caller's responsibility.
+## Resources and residency
 
-Every executor reports its exact source-derived projection operation count and
-remaining caller-bound work allowance. The native submitter additionally reports
-the actual session's remaining writes, including any work preceding the executor
-borrow; the effective allowance is the minimum of both bounds. Custom submitters
-with opaque capacity still require independently matched caller limits.
+`maximum_owned_payload_bytes` bounds provisional F32 output, one padded weight
+tile, returned limb/plane results and activation payload. Model/prepared activation
+storage, caller output, allocator/stack overhead, native mappings and VTCM are
+additional charges. Insufficient host payload or unsupported geometry selects
+CPU before submission. Native operation/deadline exhaustion fails the scope.
+The [native session limits and ownership rules](../hexagon-native/README.md#projection-sessions)
+and [owner-device policy](../../AGENTS.md#owner-device-execution-budgets) both apply.
 
-`ProjectedQwen35` derives per-ingestion and per-evaluation costs from the actual
-graph projections, excluding embedding row gathers and CPU placements. Bounded
-executors must provide stable, nonzero counts for every selected projection.
-The ordinary `Runtime` checks all unreused prompt forwards and the complete
-reserved output length through `Decoder::admit_work` before starting new
-inference or sampling. Early stop is not assumed. Direct graph calls also check
-one complete token before executing its first projection. Capacity refusal
-leaves the scope healthy; errors after admitted evaluation starts remain terminal.
-Reset and checkpoints never replenish the native operation allowance. Operation
-admission establishes no duration, memory, device placement or performance gate;
-outputs still stay provisional until terminal native cleanup succeeds.
+For original-PQ2 HMX residency, first reserve a native arena with
+`HmxQ2ProjectionLimits::with_resident_weights`, then enable executor
+`with_resident_weights(maximum_cache_metadata_bytes)`. Metadata is reserved inside
+the owned-payload cap for all supported projections. Strong `Arc` ownership retains
+the original immutable bytes without a model copy. Cache identity uses shared
+ownership, tensor kind and dimensions rather than raw addresses or per-token hashes.
 
-For the retained Swift geometry, source arithmetic at the maximum 17,408-row
-tile requires 22,656 submissions for all eligible projections of one ingestion
-token and another 600 for its vocabulary head (23,256 for evaluation). This
-fits the owner-authorized 24,000-write cap for one evaluation token, with 744
-writes left. One ingestion token plus one evaluation needs 45,912 writes and
-still exceeds the cap. Complete-request admission continues to reserve all
-unreused prompt work and the maximum output before the first submission;
-the higher cap is not a complete-chat or persistent-serving qualification.
-Those derived counts are not a device observation: useful full-model requests
-need an admitted explicit partial placement or a separately reviewed
-persistent-session/operation contract.
+All padded bytes and metadata for a projection must fit before preparation.
+Capacity miss selects streaming for that entire projection; unexpected preparation
+failure closes the executor. Entries are append-only, without eviction or renewed
+limits. Statistics report preparations, cache hits, copied bytes and metadata
+separately from kernel operations. Host caching proves neither DSP residency nor
+reduced DMA/cache work.
 
-Model-free controls compare complete fused and nonfused matvec bits, multiple and
-partial row tiles, all i8 bitplane codes, native PTQ1 DOTPROD captures and refusal/poisoned output behavior.
-The CPU runtime's `projection_scope` graph regressions cover attention/recurrent
-state, transforms, loaded-zero/nonzero adapter corrections, checkpoints, reset,
-unsupported CPU paths and terminal failure after provisional attention state.
-Hosted Hexagon and Foundation CI own these tests and Clippy/documentation checks.
+`NativeQ2Executor` can pack a fresh resident extent directly through the submitter's
+exact-length callback into its admitted mapped arena. Registry growth and handles
+remain private until packing, scale checks and deadline checks pass. Error or
+unwinding publishes nothing; existing extents stay untouched. Submitters without
+this capability use scratch-and-copy preparation.
 
-This source integration enables no Runner profile or automatic backend selection.
-`PlacedProjectionExecutor` freezes an explicit model-tensor subset before graph
-construction. For example, select `blk.0.ffn_up.weight` while leaving the other
-projections on CPU. Unknown model names, duplicates and unsupported arithmetic
-reject at construction, and immutable storage/geometry checks prevent another
-tensor from borrowing the selection. Its deterministic identity binds model,
-executor, selected names and operation counts. The existing graph counts this
-placement for complete-request admission before new inference; reset never
-restores native capacity. Selection does not establish that an otherwise unused
-model tensor is an executed graph projection: qualification must observe the
-expected nonzero submissions and exact placement. Hosted controls exercise real
-graph admission, unchanged logits/state and refusal before state mutation.
+## Prefill packets
 
-Signed HMX execution and actual shapes, PQ2/PTQ1 full logits/state and adapter
-qualification, actual resource admission, cancellation/device loss,
-sustained use and paired end-to-end benefit remain pending. Native invocation,
-successful loading or an exact CPU/mock control does not establish NPU speed.
+Native resident dispatch batches up to eight ordered operations per packet and
+uses paired-token FFN chains when the submitter explicitly supports them.
+Member/token order, arithmetic and lifetime operation charges remain unchanged.
+Failure or nonfinite output clears the complete tile and closes admission.
+Transient/custom submitters retain their declared scalar capabilities.
 
-Resident multi-operation token prefill now uses the native session's explicit
-single-packet capability to batch up to eight tokens per weight tile. Packed
-preparation scratch is released before bounded partial outputs reuse its
-existing conservative charge; transient and arbitrary submitters retain scalar
-submission. [The implementation contract](../../docs/native-q2-prefill-batching.md)
-records queue counts, failure/publication semantics, exact controls and the
-separate unimplemented true `N > 1` solver boundary.
+These are ordered `N=1` projections, not true multi-token matrix multiplication.
+See the [native packet contract](../hexagon-native/README.md#resident-weights-and-fused-packets)
+for supported chains, command/resource bounds and publication rules.
+
+## Validation
+
+Model-free controls compare fused/nonfused matvec bits, row tails, all i8 bitplanes,
+PTQ1 captures and failure poisoning. Runtime `projection_scope` tests cover
+attention/recurrent state, transforms, adapters, checkpoints, reset, CPU fallback
+and terminal failure. Hosted Hexagon/Foundation CI owns complete tests and analyzers.
+The [model probe](MODEL-PROBE.md) provides the bounded actual-model procedure.
+
+Signed-device shapes, full logits/state/adapters, actual resource admission,
+cancellation/device loss, persistent use and matched request benefit remain
+unqualified. No automatic backend or application profile is enabled.

@@ -28,7 +28,7 @@ be on an expanded local drive outside Git and without reparse ancestors.
 
 Optional `executionBackend` is `guarded-hvx` (the default) or `hmx-bitplane`.
 Optional `tokenIds` contains one or two valid token IDs and must start with the
-required legacy `tokenId`. Without it the worker evaluates only `tokenId`.
+required `tokenId`. Without it the worker evaluates only `tokenId`.
 `contextLimit` must fit the entire sequence and `maximumOperations` must reserve
 forty submissions per token before execution. For example, `tokenId:42`,
 `tokenIds:[42,43]`, `executionBackend:"hmx-bitplane"`, `contextLimit:2` and

@@ -12,10 +12,7 @@ Rust independently decodes the packed weights and computes every reference dot.
 
 The input-only file has 167,652 bytes and SHA256
 `a37e4e61333647ff528ac597e8bba75b945ac0255430a87332719f34c56b5ef1`.
-It was obtained by stripping decoded weights and target outputs from the
-261,492-byte original `BSPQ2V1\n` fixture whose SHA256 is
-`279cac324e1382b93650dcfe3b4e2a1a80c346e7c481ba8ef966f47f6f7b1621`.
-The retained bytes are unchanged. The input-only format is `BSPQ2I1\n`, a
+The input-only format is `BSPQ2I1\n`, a
 little-endian u32 shape count, then for every shape u32 K/M/N/packed-byte-count,
 the packed bytes, and K*N little-endian binary32 activations. Parsing rejects
 wrong counts, extents, order, nonfinite activations, truncation and trailing data.

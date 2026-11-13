@@ -1,4 +1,4 @@
-# Rust LoRA storage sharing for pinned Prism
+# Rust LoRA storage sharing
 
 `bonsai-prism` implements bounded LoRA B-vector sharing and the pinned engine's
 file-loading/tensor-view boundary. The policy in `src/pool.rs` forbids unsafe code;
@@ -16,19 +16,16 @@ signed zero and NaN payload bits remain distinct. Each candidate is at most
 usable at either cap. Failed cache allocations retain independent storage.
 Views keep their own tensor names; only canonical owners are loaded.
 
-The approved adapter's 129 identical 20,480-byte B vectors avoid **2.5 MiB** of
-native payload allocation. The native regression checks that exact difference
-and byte-identical ggml MUL_MAT output. Whole-model throughput/quality remain
-unqualified.
+For 129 identical 20,480-byte B vectors, sharing avoids 2,621,440 native payload
+bytes (2.5 MiB). The native regression checks allocation and exact ggml MUL_MAT
+output, without establishing whole-model throughput or quality.
 
 ## Native boundary
 
 The external Prism/llama.cpp engine remains C/C++. The source applicator inserts
 ownership, Rust calls and exception translation into its loader. Generated C
-declarations preserve the interop contract; inference replacement is separate
-[native Rust engine work](../../docs/roadmap.md). The experimental
-[CPU reference](../../docs/runtime-contracts.md) reuses the safe sharing policy
-but does not replace this overlay or the publisher profile.
+declarations preserve the interop contract. The [Rust CPU runtime](../../docs/runtime-contracts.md)
+reuses the safe sharing policy and is separate from this C/C++ engine overlay.
 
 `src/loader.rs` is the audited FFI boundary. It reads the pinned tensor's initial
 C layout fields and calls public ggml/gguf APIs. It retains one file handle and
@@ -44,7 +41,7 @@ denies unsafe code and the policy forbids it.
 
 ## Build and checks
 
-Use PowerShell 7.6, pinned nightly Rust and a Clang-compatible CMake environment
+Use PowerShell 7.6 or later, pinned Rust and a Clang-compatible CMake environment
 for the external engine. Download and verify the ZIP in `source.lock.json` into
 external storage. From the checkout, capture the repository path and use an
 external native working directory for dependency fetches:

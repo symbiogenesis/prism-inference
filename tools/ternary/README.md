@@ -23,32 +23,15 @@ edges and activation ABI. The [native C++ fixture](tests/fixtures/README.md) add
 
 Independent base-3 expectations check all 5,994 lane words against exact symbol
 positions, so a matching encoder/decoder permutation cannot pass by round trip
-alone. The separate [released native probe](https://github.com/symbiogenesis/SwiftBonsai2/blob/main/tools/codec-probe/README.md) compares
+alone. The [native probe](../codec-probe/README.md) compares
 production Rust packing against the pinned native PQ2/PTQ1 decoders without
 adding unsafe code to this crate.
 
-From the repository root, run a build and one focused parity check in external
-working/target directories:
+Use the [pinned compiler and build setup](../../docs/build-and-validation.md).
+One focused parity check, from an external working directory with absolute paths:
 
-```powershell
-$repo = (Get-Location).Path
-$scratch = Join-Path ([IO.Path]::GetTempPath()) ('SwiftBonsai-Ternary-' + [guid]::NewGuid().ToString('N'))
-[void][IO.Directory]::CreateDirectory($scratch)
-$manifest = Join-Path $repo 'tools/ternary/Cargo.toml'
-$target = Join-Path $scratch 'build'
-$previous = [Environment]::CurrentDirectory
-Push-Location $scratch
-try {
-    [Environment]::CurrentDirectory = $scratch
-    cargo +nightly-2026-11-09-aarch64-pc-windows-msvc build --locked --offline --release --manifest-path $manifest --target-dir $target
-    if ($LASTEXITCODE) { throw 'Ternary build failed.' }
-    cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline --release --manifest-path $manifest --target-dir $target --test cpp_reference cpp_reference_ptq_parity -- --exact
-    if ($LASTEXITCODE) { throw 'C++ codec parity failed.' }
-} finally {
-    [Environment]::CurrentDirectory = $previous
-    Pop-Location
-}
+```text
+cargo +nightly-2026-11-09 test --locked --offline --release --manifest-path <repo>/tools/ternary/Cargo.toml --target-dir <temp>/build --test cpp_reference cpp_reference_ptq_parity -- --exact
 ```
 
-Full suites and all benchmarks remain CI-only. Foundation runs formatting,
-strict Clippy, documentation and correctness checks; see [building and validation](../../docs/build-and-validation.md).
+Full suites and benchmarks follow the [validation policy](../../docs/build-and-validation.md).

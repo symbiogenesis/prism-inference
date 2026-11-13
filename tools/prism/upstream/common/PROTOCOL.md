@@ -4,7 +4,9 @@ Build this separate CMake tree with `PRISM_SOURCE_DIR` naming the verified pinne
 upstream root, and target `prism-upstream-common-bridge`. It statically links the
 production `llama`, `llama-common` and `mtmd` libraries. Tests, tools, examples, server,
 apps, TLS, optional external libraries and dependency downloads are disabled.
-No upstream test source is compiled or included.
+The [safe Rust harness](../README.md) owns every generated input, reference,
+schedule, tolerance and verdict. This adapter validates and serializes production
+calls and raw observations; it contains no upstream test sources or assertions.
 
 Run `prism-upstream-common-bridge --input ABSOLUTE_PATH --output ABSOLUTE_PATH`.
 Input and output are bounded UTF-8 JSON files with this schema:
@@ -32,9 +34,8 @@ The adapter forwards inputs directly to `unicode_regex_split` and
 
 `Pieces` contains the production split result without further encoding changes;
 the production function receives `ByteEncoding` exactly as supplied. `Fits` is
-the production boolean result. The Rust suite owns all expected results and
-assertions. A zero process exit means the operations completed and the response
-was written. Errors return a nonzero exit and a message on stderr. Discard any
+the production boolean result. A zero process exit means completion and a written
+response. Errors return a nonzero exit and a message on stderr. Discard any
 response from a failing process. The caller owns the timeout and file lifecycle.
 
 ## Generic Jinja operations
@@ -102,8 +103,7 @@ from 1 through 64 and parts contains at most 64 descriptors:
 The adapter constructs production bitmap handles with null payload pointers,
 sets the supplied mergeability flags, and calls `mtmd_group_mergeable_bitmaps`.
 It returns `{"GroupSizes":[...],"RemainingBitmapParts":number}` from the actual
-groups and mutated part list. Descriptor generation and interpretation of any
-compact test specifications belong to the Rust suite.
+groups and mutated part list.
 
 ## Generic grammar-parser operation
 
@@ -114,7 +114,6 @@ each request. The result is `{"Parsed":boolean,"SymbolIds":[{"Name":"...",
 "Id":number}],"Rules":[[{"Type":number,"Value":number}]]}`. Symbol IDs retain
 the production map's name order, and rules retain the production vector order.
 The result is limited to 4,096 symbols, 4,096 rules and 65,536 total rule elements.
-The Rust caller owns every grammar input, expected symbol and expected rule.
 
 ## Generic reasoning-budget and UTF-8 operations
 
@@ -146,9 +145,7 @@ forced sequence at most 1,024 tokens. Token IDs and budgets are signed 32-bit
 integers. Each apply has at most 4,096 candidates, with at most 65,536 candidates
 combined across the trace. Floats use their raw IEEE binary32 bits, preserving
 infinities and NaNs without JSON number conversions. The complete backing
-candidate vector is returned. Every state transition, clone, reset, forcing
-operation and end match comes from the production sampler API; the adapter has
-no test sequence generation, finite-count calculation or forcing assertions.
+candidate vector is returned from the production sampler API.
 
 ## Generic tensor graphs
 
@@ -171,9 +168,7 @@ The adapter allocates a 128 MiB ggml context, with a conservative cumulative
 storage estimate capped at 96 MiB, then executes the graph using the supplied
 thread count. The response is `{"Outputs":[{"Type":"...","Dimensions":[four
 padded dimensions],"DataHex":"..."}]}` in requested output order. Outputs must
-be contiguous, and their combined hex data is limited to 15 MiB. Inputs, graph
-specifications, random streams, reference calculations, tolerances and all
-pass/fail decisions remain in the Rust suite.
+be contiguous, and their combined hex data is limited to 15 MiB.
 
 ## Generic stateful grammar operations
 
@@ -207,8 +202,7 @@ contain at most 65,536 pointers combined, with at most 8,192 stacks.
 Candidate arrays contain at most 4,096 entries, each with 1 through 1,024 u32
 code points ending in zero, a u32 index, an i32 token ID, and partial UTF-8 state
 with u32 `Value` and `NRemain` from -1 through 3. Rejected code-point pointers are
-serialized as suffix arrays bounded by the original buffers. The Rust suite owns
-input text decoding, encoded token IDs, expected rejections and match decisions.
+serialized as suffix arrays bounded by the original buffers.
 Saved stacks copy only the production stack collection and are invalidated when
 their owning grammar is freed. Grammar handles are freed on every exit path.
 
@@ -238,8 +232,7 @@ table initialization use production APIs.
 These operations do not execute CUDA or another GPU backend. A Rust port of a
 CUDA-named source may compare its original host-side transcription against raw
 production CPU observations; that establishes host coverage and must not be
-reported as GPU execution. All input generation, independent transcription,
-reference algorithms, tolerances and pass/fail decisions remain in Rust.
+reported as GPU execution.
 
 ## Generic PEG builder and parse transport
 
@@ -264,7 +257,7 @@ production trigger-only/lazy modes. `RoundTrip` is boolean.
 The result has exact fields `Results` (raw `{Type,Start,End}` parse results),
 `GrammarTexts`, `SerializedJson` (string or null), `RoundTripResults`. A requested
 round trip serializes the actual arena once, deserializes it with the production
-API and parses the same supplied inputs. Native code does not compare outcomes.
+API and parses the same supplied inputs.
 `peg-serialize` takes `Kind`, `Graph` and returns `SerializedJson`.
 `peg-deserialize` takes `Kind`, `SerializedJson` (at most 8 MiB) and returns the
 production `Root` parser ID. Benchmark repetitions and timing belong to an
@@ -281,7 +274,7 @@ all workers at most 65,536 combined. Actions are `emit` with exact `Level`
 `Finalize` contains at most eight `flush`/`free` strings and must end with `free`.
 Workers join before finalization; captured worker exceptions fail the operation.
 The result is `Completed`, containing action completion counts per worker.
-Schedules and verdicts belong to Rust. This must be the final operation in a
+This must be the final operation in a
 request because the production logger singleton cache is not reset after free.
 
 ## CPU arena placement transport
@@ -293,9 +286,8 @@ views. Forward supplies explicit graph expansion indices. Allocation is null for
 the production context allocator, or `{BufferBytes,Offsets}` for manual placement;
 view offsets are null, deriving storage from their source. Offsets and extents
 must fit the supplied buffer and meet the actual backend alignment.
-The result is raw production `Status` and output `DataHex` values. Input creation,
-overlap layouts, operation ordering and result comparisons remain in Rust. CPU
-thread count comes from Graph; the pinned CPU backend defaults to four threads.
+The result is raw production `Status` and output `DataHex` values. CPU thread
+count comes from Graph; the pinned CPU backend defaults to four threads.
 
 ## Generic batch allocator trace
 
@@ -313,8 +305,7 @@ The response is `Actions`, containing raw initialization status, allocator state
 and ubatch observations in action order. Snapshots include every supplied/derived
 batch field, output IDs, used/output counts, sequence position ranges, ubatch
 counts, pointer presence and pointed-to content. The optional range-only memory
-adapter returns caller-supplied position ranges; unused methods throw. Native
-code has no original case selector, expected split table or allocator assertions.
+adapter returns caller-supplied position ranges; unused methods throw.
 
 ## Generic graph allocator observations
 
@@ -334,14 +325,12 @@ and context fields are declared in `allocation.hpp`.
 Results contain raw reserve/allocation status, live buffer sizes, tensor buffer
 and relative address offsets, byte extents, source/view references, actual op and
 flags, production in-place capability, output flags, graph nodes and leaves.
-The Rust suite owns graph scenarios, memory overlap/liveness analysis and every
-allocation assertion. The adapter does not execute tensor computation here.
+This operation does not execute tensor computation.
 
 The generic `mtmd-chunks-trace` transport exposes production public chunk collection, serialization,
 reload and decoder-position APIs with bounded handles and buffers. Its explicit `create-test-inputs`
 action calls the pinned production public `mtmd_test_create_input_chunks` factory, as the original
-source does: Rust owns the invocation and predicates, while the opaque populated chunks originate in
-that existing SUT factory. The adapter does not duplicate its contents or compile a C++ test source.
+source does. Opaque populated chunks originate in that production factory.
 
 The `sampler-trace` transport owns scoped production sampler and candidate handles. Rust supplies
 constructors, raw IEEE binary32 candidate fields and ordered apply, accept, reset, clone, copy and
@@ -378,31 +367,27 @@ context with its defaults. Rust supplies byte inputs, special-token flags, and u
 worker action schedules operating on that same shared context. Tokenize actions choose capture and
 diagnostic detokenization; clock actions return production microseconds. The exact response fields
 are `ModelLoaded`, `ContextLoaded`, `Workers` and `Error`; Error is null or a production load/worker
-failure message. The adapter returns raw per-action token observations, never expected tokens or
-comparisons. The default Rust source port reads all15 pinned `.inp`/`.out` corpora, verifies asset
-digests, reproduces Windows text I/O and map behavior, and captures source worker0. Text-file export
+failure message. The Rust source port verifies all fifteen pinned `.inp`/`.out` corpora,
+reproduces Windows text I/O and map behavior, and captures source worker zero. Text-file export
 is a separate bounded CI-only diagnostic; its timer includes action dispatch and token
 serialization. External vocabularies remain under the runner's verified source directory. The Rust
 target uses existing production `Tokenizer`, `Vocabulary` and optional `SpecialTokens` construction
 as its vocabulary context, and preserves unsupported metadata errors without relabeling formats.
 
-`chat_auto.hpp` adds preliminary generic production chat helper, template-variant comparison and analyzer/parser
-traces. Its Rust source port must be complete before source registration; native compilation alone
-establishes no source coverage.
+`chat_auto.hpp` exposes production chat helpers, template-variant comparison and
+analyzer/parser traces.
 
 The separate `--model-session` mode provides bounded JSON-lines production model/context operations
-on persistent native worker lanes. Rust owns operation schedules, callbacks, token selection,
-stopping and all verdicts. Ordinary file-mode protocol is unchanged. `vocab_session.hpp` adds batch
+on persistent native worker lanes. `vocab_session.hpp` provides batch
 primitives `vocab-tokenize`, `vocab-detokenize`, `unicode-encode` and `unicode-decode`, each at
 most512 supplied items and1MiB supplied bytes. Values and per-item exception metadata return in
-parallel arrays; no native roundtrip comparison or codepoint/token enumeration occurs.
+parallel arrays.
 Vocabulary-only model loading and shared read-only context access preserve the original concurrent
 tokenizer domain. Complete roundtrip coverage requires the safe Rust source ports, not merely these
 native calls.
 
-The generic `json-schema-convert` and `json-schema-info` operations return production
-grammar/exception metadata and ordered schema-information traces. Rust owns positive/negative
-schemas, expected grammar text, validation and optional independent process comparison.
+`json-schema-convert` and `json-schema-info` return production grammar/exception
+metadata and ordered schema-information traces.
 
 `public-c-abi` returns raw size/alignment observations from a separate C17 translation unit
 including production `llama.h`: model/context parameters, batch, token/position/sequence scalar
@@ -421,20 +406,18 @@ enumeration or acceptance comparisons.
 
 `argument-enums`, `argument-parser-trace` and `remote-get-content` expose bounded production
 argument parsing and remote-file observations. The session-only resolution operations expose
-caller-supplied model-resolution plans and handler actions; Rust owns fixtures, loopback HTTP
-responses, reordering and comparisons.
+caller-supplied model-resolution plans and handler actions.
 
 `chat-trace`, `chat-value`, `chat-server-params`, `chat-generic-parse` and `chat-regex` expose
 production chat/response conversions, parsers and raw regex observations. The build links the
 upstream production server-context source list as a static library without enabling the HTTP server
-executable or UI. Inputs, templates, trigger selection, streaming schedules and all assertions
-remain in Rust.
+executable or UI.
 
 The session `model-user` operation calls production `llama_model_init_from_user` using
 caller-supplied metadata. Each production tensor-initialization callback sends its actual TensorSpec
 to Rust and reads the caller's bounded data file; native code performs only the requested F32-to-F16
-conversion when supplied as float32 bytes. Tensor contents, RNG and model schedules remain
-Rust-owned. Callback failures are latched and reported after the C API returns, without unwinding
+conversion when supplied as float32 bytes. Callback failures are latched and reported
+after the C API returns, without unwinding
 across the C callback. Context options and raw KV-center/logit observations expose production
 behavior without a native training or generation policy.
 
@@ -442,8 +425,8 @@ behavior without a native training or generation policy.
 context-overhead metadata. `optimizer-trace` accepts caller-supplied devices/scheduler order,
 bounded F32 graph and dataset descriptors, and explicit production allocator, optimizer, result,
 epoch and fit actions. Tensor values and result doubles use raw little-endian bytes/bits, retaining
-NaNs. Fit callbacks only select the supplied per-epoch parameter struct; RNG, rates, epochs, reset
-choices and assertions are Rust-owned. Raw saved tensor bytes support caller-requested save/restore
+NaNs. Fit callbacks select the supplied per-epoch parameter struct. Raw saved tensor
+bytes support caller-requested save/restore
 without introducing expected values. At most8192 actions, sixteen live
 contexts/buffers/datasets/optimizers/results,256 tensor descriptors,1MiB per data payload and4096
 fit epochs are accepted. Context and buffer lifetimes are validated separately from numerical test
@@ -454,13 +437,9 @@ predicates.
 descriptors from supplied dimensions/names. Explicit `allows` actions return actual quantizability
 flags and production tensor names; `types` actions classify the caller's ordered tensor indices. At
 most32768 tensor descriptors and128 actions are accepted, with two million returned classifications.
-No expected schema, model catalog, sorting rule, filtering workload or ftype-name table exists in
-C++. The original test-only GGUF parser/cache/split library is rewritten entirely in safe Rust and
-never included or compiled here.
 
 `backend-graph` accepts `Directory`, `MaxFileBytes` and either an `Actions` array or an absolute
-`ActionsFile` beneath that directory. All graph descriptors, input bytes, execution schedules,
-references, sentinels, comparisons and stopping decisions are Rust-owned. Native `call` actions
+`ActionsFile` beneath that directory. Native `call` actions
 dispatch an explicit allowlist of production GGML functions using typed
 context/tensor/graph/backend/buffer/scalar handles, signed/unsigned integers, raw float bits and
 bounded arrays. Integer argument marshalling can read supplied tensor metadata and checked binary
@@ -496,15 +475,12 @@ generates actions nor decides numerical results. Full source matrices and benchm
 CI-only.
 
 `model-load-observe` and the persistent DSpark operations expose production model loading/logging, context
-staging/capture, tensor observations, samplers and speculation primitives. Their inputs, source
-schedules, environment choices and all predicates remain Rust-owned. The persistent provider retains
-production owners and callback data for their required lifetimes; compilation or malformed-request
-probes do not establish model or source coverage.
+staging/capture, tensor observations, samplers and speculation primitives. The provider
+retains production owners and callback data for their required lifetimes.
 
-The persistent session accepts at most65,536 requests so the complete24-prompt
-real-evaluation source can retain its model and speculative state across prompts.
-The16MiB frame,64MiB stream,90-second operation and240-second session limits remain
-unchanged. `context-logits` accepts row indices from-1 through2047, including the
+Persistent sessions accept at most 65,536 requests, with a 16 MiB frame, 64 MiB
+stream, 90-second operation and 240-second session limit.
+`context-logits` accepts row indices from -1 through 2047, including the
 production API's last-row selector. `model-chat-render` applies the loaded model's
 own production template to supplied messages and explicit thinking/generation flags.
 
@@ -512,9 +488,7 @@ The persistent `llg-*` operations construct production LLGuidance, distribution 
 retain caller-owned candidate vectors. Candidate files supply exact little-endian
 IDs/logits/probabilities; updates may replace only logits or IDs/logits while retaining the original
 probability fields. Explicit patches, active-view metadata, apply probes, reset, accept and free
-operations return raw observations. Rust owns tokenization order, full-vector initialization,
-one-hot inputs, negative-logit decisions and EOS fallback. No native matching helper or
-grammar/schema test vectors are compiled. Candidates are capped at1,048,576 entries, files at12MiB
+operations return raw observations. Candidates are capped at 1,048,576 entries, files at 12 MiB
 and live sampler/candidate tables at64 entries each, within the existing model-session request and
 lifetime bounds.
 

@@ -1,222 +1,122 @@
-# Prism inference private server
+# Prism private inference server
 
-The independently built prism-inference-server executable supplies the same strict private HTTP
-contract used by SwiftBonsai's guarded development launcher. The owner verifies executable and model
-bytes before launch and retains process/Job ownership, the selected memory limit, authenticated
-readiness and listener-PID checks.
+`prism-inference-server` serves authenticated HTTP on numeric IPv4 loopback after
+loading the exact Swift model. The owning launcher verifies executable/model
+bytes and retains credential guards, process/Job ownership, memory/watchdog policy,
+authenticated readiness and exclusive listener-PID checks. The crate is
+`publish=false`; build it from the exact checkout.
 
-The server loads the selected exact Swift artifact before binding numeric IPv4 loopback. PQ2 without
-an adapter remains the default. Explicit `--use-repacked-ptq1` selects only the verified
-current-weight export; `--abliterate-lora <absolute-path>` loads only the approved rank-one adapter.
-These options preserve the existing process admission and do not qualify full-model parity, creative
-quality, device performance or lower memory limits.
+## Startup profiles
 
-The owner-selected source development default uses K4/V4 `rsq4` attention KV.
-Trusted startup `--kv-cache f16` selects the explicit comparison/recovery profile;
-`rsq4k3v` remains opt-in. Requests cannot choose precision and failures never
-change it. Non-FP16 readiness reports `kv_cache` and the actual
-`startup_graph_identity`; strict owning brokers must validate both. Full-model
-quality, measured memory benefit and X1/X2 qualification remain pending. A
-verified published bundle and matching broker contract are required for Runner;
-changing this source default does not replace its active release pin.
+Original PQ2 without an adapter is the default. `--use-repacked-ptq1` selects the
+verified current-weight export; `--abliterate-lora <absolute-path>` loads the
+approved rank-one adapter. See [adapter semantics](../docs/rank-one-adapter.md).
 
-Trusted owners may now supply the paired startup options
-`--context-tokens <4352..62720> --memory-limit-bytes <u64>`. Context is a multiple
-of 256, chosen once before loading from current available memory. The server
-checks at least 11 GiB of fixed runtime allowance plus 137,344 bytes per context
-token, then independently requires that allowance plus a 4 GiB physical host
-reserve. This conservative source charge covers live and rollback FP16 KV,
-64-token/24-head publisher-style attention scores and context bookkeeping even
-when native quantized KV is selected. Native ordinary prefill is sequential.
-New local source offers CPU tiles through paired trusted
-`--cpu-prefill-tokens <8|16|32>` and `--cpu-prefill-scratch-bytes <usize>` options.
-Both require explicit `--kv-cache` and paired context/process-memory limits;
-the selected FP16, K4/V4 or K4/V3 cache is retained and the entire extra reserve
-is charged before model I/O.
-Readiness binds the tile, reserve and startup graph identity. This CPU profile
-skips implicit Hexagon installation; explicit latest-prefix reuse stays compatible.
+K4/V4 `rsq4` is the source development KV default; `--kv-cache f16` selects the
+comparison/recovery profile and `rsq4k3v` is opt-in. Requests cannot select
+precision, and failures never change it. Non-FP16 readiness reports `kv_cache`
+and `startup_graph_identity`, both of which strict owners must validate.
+See [KV profiles and accounting](../docs/quantized-kv.md).
 
-An additional explicit triple selects sampled suffix generation:
-`--cpu-speculative-tokens <1..8>`, `--cpu-verification-scratch-bytes <usize>` and
-`--cpu-speculative-checkpoint-bytes <usize>`. It requires admitted CPU tiles and
-charges the full additional logits and complete-prefix recovery reserves beside
-ordinary request rollback. Swift's actual fixed sampler draws once per output
-position; deterministic matching proposals reuse target tiles and rejection
-restores/replays complete state. Readiness binds the proposal count, both reserves and
-`:cpu-tiled-verify-v1` identity. Existing phase-timing capture rejects this selection
-before changing state. See [CPU tiled prefill](../docs/cpu-tiled-prefill.md#explicit-private-service-consumer)
-and [sampled suffixes](../docs/cpu-tiled-prefill.md#explicit-sampled-suffix-consumer).
-Current published bundles and application defaults are unchanged; no measured
-speedup or actual-model qualification is claimed.
+Paired `--context-tokens`/`--memory-limit-bytes` options select immutable capacity
+before model I/O. Context, exact tokenization, request admission and authenticated
+`context_tokens` readiness must agree. Partial, duplicate, unaligned, overflowing
+or underfunded options reject. Owners enforce the selected Job allowance and
+monitor pressure; observed free memory is not a reservation. The
+[memory contract](../docs/runtime-contracts.md#memory-and-ownership) defines current
+context ranges and per-profile charges. Without those options,
+the server uses 8,192 tokens and 16 GiB startup admission.
 
-The selected context is immutable and identical in exact chat tokenization,
-server admission, decoder/runtime bounds and authenticated `context_tokens`
-readiness. The unreleased full-context K4/V4 source candidate admits up to
-262,144 tokens with a geometry-derived 4,644,798,464-byte state/checkpoint bound.
-Only the exact Swift identities and pinned 16-attention/48-recurrent-layer
-geometry can use this larger aggregate scope; generic constructors, FP16 and
-K4/V3 keep the existing 4 GiB limit. Individual allocations and scratch retain
-their old bounds. Complete rollback accounting increases with a selected context
-beyond the legacy default. Missing, partial, duplicate, unaligned, overflowing or
-underfunded capacity options reject rather than resize after loading. Owners
-must enforce the selected Job memory allowance and monitor pressure. Available
-memory is an observation, not a reservation or full-context qualification.
+Explicit CPU prefill requires `--cpu-prefill-tokens <8|16|32>` and
+`--cpu-prefill-scratch-bytes`, paired capacity options and explicit `--kv-cache`.
+The selected cache and full scratch charge are retained, and readiness binds tile,
+reserve and graph identity. Sampled suffix generation additionally requires
+`--cpu-speculative-tokens <1..8>`, `--cpu-verification-scratch-bytes` and
+`--cpu-speculative-checkpoint-bytes`. Readiness binds every reserve and
+`:cpu-tiled-verify-v1`; phase-timing capture rejects that selection.
+See [CPU prefill and suffix options](../docs/cpu-tiled-prefill.md).
 
-Without either capacity option, legacy 8,192-token loading APIs and the private
-server's existing 16 GiB startup admission remain unchanged. Source support does
-not update an installed runtime: Runner needs a genuine source-bound published
-bundle and reviewed release pin before enabling these options for native chat.
+Read-only model/adapter/key validation uses the exact Runner credential-helper
+dependency. AppContainer checks preserve local-drive, non-root ancestry, reparse
+and regular-file restrictions; the owner validates full ancestry before granting
+only selected files. The key remains held against writes/deletion.
 
-Read-only model, adapter and key validation uses the credential helper pinned to
-Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`. Inside an actual Windows
-AppContainer, that helper preserves local-drive, non-root ancestry, reparse and
-regular-file checks while avoiding denied volume-root metadata queries. The
-trusted owner still validates and retains complete ancestry before granting only
-the selected files. The key remains held by a write/delete-denying reader. No
-filesystem grant is expanded.
+## Requests and readiness
 
-The server temporarily has `publish = false`: its reviewed Git-only helper
-dependency must remain exact. Delivery uses checked GitHub binary prereleases or
-the exact source checkout, not crates.io server installation. Publishing a shared
-helper release and qualifying a registry-backed server remain pending; the root
-runtime library's separate publication contract is unchanged.
+`/v1/models` and `/props` identify model ID/hash, weight representation, approved
+adapter hash or null, scale support, configured `row_workers` (1..16), and selected
+startup policies. Worker count is a budget, not measured parallel utilization.
+Requests cannot override it. Strict owning brokers must validate the complete
+selected profile before forwarding work.
 
-Failed startup emits one value-free stderr line, for example
+Adapter requests require exactly `lora: [{"id": 0, "scale": 1.3}]`, with a finite
+JSON scale in 0..2 before binary32 conversion. Missing/null/extra slots, other IDs
+and overrides reject. No-adapter requests reject `lora`. Public
+`abliteration_scale` belongs to the outer broker and is rejected here.
+
+Exact count/completion canonical bytes bind scale bits, including signed zero.
+Prepared input cannot survive reset or a replacement count. Requests recompute
+from fresh model state unless latest-prefix reuse is explicitly enabled.
+See [session profiles](../docs/swift-session-profiles.md) for scale changes,
+prefix eligibility, sampler progression, cancellation and reset semantics.
+One acknowledged event bounds provisional streaming; failed delivery or
+cancellation closes admission until explicit reset.
+
+`chat_template_kwargs.enable_thinking` accepts either boolean value in exact
+counting and generation. Disabled thinking closes the reasoning block before
+generation; generated text is visible answer content. Supplied assistant reasoning
+history is preserved. Enabled thinking uses `xhigh`; other template/sampler
+overrides reject. Rust `prepare_with_thinking` selects this mode explicitly;
+ordinary `prepare` and the JSONL worker enable thinking.
+
+Startup failure emits one value-free diagnostic:
 `private-inference-startup-failed stage=arguments errorKind=PermissionDenied osCode=5`.
-The fixed stages are `arguments`, `environment`, `memory`, `key`, `model`,
-`runtime`, `listener` and `backend`; an unclassified error uses `unknown`.
-`osCode=none` means no numeric OS code was available. No original error message,
-source chain, path, argument, credential or model value enters this diagnostic.
-The owning launcher must retain it before deleting temporary CI storage.
+Stages are `arguments`, `environment`, `memory`, `key`, `model`, `runtime`,
+`listener`, `backend` or `unknown`; absent numeric OS codes use `none`.
+Diagnostics omit paths, arguments, credentials, model values and original error
+chains. The launcher retains the line before temporary storage cleanup.
 
-Extended `/v1/models` and `/props` readiness names the exact model ID/hash and
-`weight_representation`, the approved `adapter_sha256` or null, and
-`supports_abliteration_scale`. Adapter profiles also report
-`abliteration_scale_range: [0, 2]`. Every private profile additionally reports
-`row_workers`, read from the instantiated session's graph. It identifies the
-configured persistent projection-worker budget (1 through 16), not executed
-parallel operations, an ISA, active thread utilization or measured speedup.
-Small and floating projections can remain serial. Artifact and adapter identities
-remain unchanged. Strict readiness consumers must admit and validate this added
-field when integrating a release built from this source; prior release receipts
-cannot supply the observation. The public API does not accept a worker override.
-Adapter-loaded private requests require exactly `lora: [{"id": 0, "scale": 1.3}]`;
-the scale must be a finite JSON number in 0..2 before conversion to binary32.
-The outer broker owns the public `abliteration_scale` setting; that field is
-rejected directly on this private endpoint. Missing/null/extra adapter slots,
-other IDs and overrides reject; no-adapter requests reject `lora` entirely.
+## Service correctness capture
 
-Exact count/completion canonical bytes bind the selected scale, including signed
-zero. Every generation starts fresh model state at that scale; prior prepared
-input cannot be reused after reset or a different count. One acknowledged output
-event bounds provisional streaming, and cancellation/deadline or delivery failure
-closes admission until explicit reset. Reset preserves loaded artifact identities
-and restores the seeded sampler. Successful requests keep the existing sampler
-draw sequence, including across scale changes.
+The owner-operated [acceptance workflow](../.github/workflows/private-service-acceptance.yml)
+packages source/run-bound `private-service-check.exe` and `private-service-owner.exe`
+after hosted model-free controls. Default preparation runs no model. Explicit
+device acceptance requires the external owner's ephemeral run-specific runner
+label and complete `BONSAI_NATIVE_OWNER_*` source/run/deadline binding.
 
-The private canonical request accepts either boolean value for
-`chat_template_kwargs.enable_thinking`. Both exact counting and generation use
-that selected template mode. With thinking disabled, the template closes the
-reasoning block before generation and all generated text is visible answer
-content. Supplied assistant reasoning history remains preserved. Effort stays
-`xhigh` when thinking is enabled, and other template and sampler overrides remain
-rejected. Existing public Rust `prepare` methods and the JSONL worker retain their
-thinking-enabled behavior; `prepare_with_thinking` selects the mode explicitly.
+This workflow has a fixed 210-second work cutoff, 240-second owner process lifetime
+and at most 60 further seconds for intake: five minutes total, including setup,
+package verification, model loading and cleanup. No retry extends it. Follow
+[owner-device budgets](../AGENTS.md#owner-device-execution-budgets), including power
+observations. Narrower checker/session limits still apply.
 
-## Released-service correctness capture
-
-The main-only [acceptance workflow](../.github/workflows/private-service-acceptance.yml)
-builds `private-service-check.exe` and runs its model-free framing and cancellation
-observation controls on hosted Windows ARM64. Its artifact is named
-`private-service-check-<main-revision>-<run-id>-<attempt>`. The packaged receipt binds
-the checker bytes to its exact owning main source, workflow and run. Its version-2
-package also contains `private-service-owner.exe`, built from Prism's Rust owner
-example against exact Runner revision `1914330f8a31769bfe8368ca9728fe7a418ed84e`,
-and the owner source digest. Hosted preparation checks the owner, package intake
-and mandatory deadline controls without models. Preparation remains the default;
-it does not qualify a released service.
-
-Explicit `run_device: true` adds one Prism-owned `acceptance` job. An external
-trusted owner must register an ephemeral runner with only the run-specific
-`private-service-acceptance-<run-id>` label and supply the complete
-`BONSAI_NATIVE_OWNER_*` run/revision/start-tick/start-UTC/fixed-210-second deadline
-binding. Missing, partial, stale or exhausted bindings fail closed. The external
-owner has a 240-second process lifetime, including thirty seconds after the work
-cutoff, and at most sixty further seconds for evidence intake: five minutes total.
-No retry or matrix extends that allowance.
-
-The job starts its own monotonic clock before checkout and same-run package
-intake. It verifies the exact member inventory, source/run receipt, native ARM64
-PE identities and held-file digests. The Rust owner additionally retains every
-installed release member and the released archive, then uses the exact reviewed
-Runner launcher for model/adapter verification, native sandbox, Job, memory,
-authenticated readiness and exclusive listener monitoring. All setup reduces the
-remaining model/checker allowance, with independent checker, cleanup and outer
-process limits. Only `host.json`, `hosted-build.json`, `owner.json` and
-`service.json` may be uploaded; protected child directories contain credentials.
-Successful owner receipts require an empty owned Job and released listeners.
-
-The capture's `finally` path first stages available public receipts under
-`%LOCALAPPDATA%\SwiftBonsai2\qualification\prism-private-service-<harness-sha>-<run-id>-<attempt>-<unique-id>`.
-The durable owner-managed directory is outside the checkout and `RUNNER_TEMP`;
-runner temp cleanup and a later Actions upload failure cannot remove its copies.
-An always-run staging step also preserves partial evidence when capture exits
-before its own staging. Only the four fixed JSON filenames are considered, with
-a 64 KiB per-file bound, public schema/source/run checks, read-only held source
-files, non-reparse external ancestry and create-new destinations. Extra/private
-files and child directories are never copied. Missing files stay missing;
-malformed, redirected or unexpected-field receipts are excluded and fail staging.
-Validated failed/pending receipts remain archived without converting their status.
-Each staging call creates a separate immutable selection; it never overwrites
-prior evidence. The workflow uploads only explicit public paths in this durable
-selection. This is bounded local retention, not independent promotion review or
-the complete qualification archive/retrieval policy.
-
-An existing trusted launcher must start the independently verified released
-`prism-inference-server.exe` with the original PQ2 model, approved adapter, seed,
-explicit row-worker count and omitted prompt reuse. It retains the executable,
-model, adapter and private credential guards, AppContainer/Job, exclusive listener
-PID, memory/watchdog policy and teardown. The checker starts no process and accepts
-only a numeric loopback port. It uses the same protected private backend key as the
-owner; do not pass key bytes on the command line or save them in evidence.
+The trusted owner retains the exact server archive/members, original model,
+approved adapter, seeded sampler, explicit row-worker count and disabled prompt
+reuse, using the reviewed Runner launcher and its sandbox/Job/listener controls.
+The checker starts no process; invoke it outside Git against that owned test
+service with a fresh absolute output path and the remaining allowance:
 
 ```powershell
-# Run outside every checkout while the existing trusted owner retains the server.
-# The new evidence file must be absolute and must not already exist.
 & $checker $privatePort $privateKeyPath $newEvidencePath $remainingCheckSeconds
 ```
 
-The owner supplies a positive allowance of at most 240 seconds, shortened to the
-actual time remaining after setup, artifact verification and model loading, with
-time reserved for owned cleanup. All owner-device diagnostics and captures share
-one five-minute aggregate budget; this command does not grant another allowance.
-Socket operations check one absolute checker deadline. No automatic retry or model
-download occurs. Never use the checker against an independently running daily
-service: it explicitly resets state and abandons a generated response.
+The port must be numeric loopback; the key stays in its protected file. Never
+target an independently running daily service: the checker resets state and
+abandons output. Its fixed workload checks readiness, canonical counts and usage
+at scales 1.3/zero, invalid scale, stale count/reset, provisional-stream disconnect,
+closed admission and seeded reset/replay. Completed observations flush before the
+next step; failures retain partial results. Responses/credentials are excluded.
 
-The fixed workload checks exact PQ2/template/adapter readiness, canonical counts
-and terminal generation usage at scales 1.3 and zero, invalid-scale rejection,
-stale canonical generation after a replacement count and reset, then disconnects
-after receiving a nonempty provisional streamed delta. A subsequent count must
-be rejected until explicit reset; reset must reproduce the initial seeded short
-response. Every completed observation is flushed to the held evidence file before
-the next step. Natural completion, missing provisional output, a deadline or any
-failed required observation leaves a failed receipt with the completed steps.
-Responses and credentials are never written to that receipt.
+Only `host.json`, `hosted-build.json`, `owner.json` and `service.json` are public
+retention/upload candidates. Staging verifies schema/source/run, non-reparse
+external ancestry and held-file identities, with 64 KiB per file and create-new
+destinations under `%LOCALAPPDATA%\SwiftBonsai2\qualification`. It never copies
+extra files or protected child directories. Missing/malformed receipts cannot
+become success; failed/pending receipts retain their status. Success additionally
+requires an empty owned Job and released listeners. Retain the checker package,
+tested server identities and owner artifact/cleanup reports for independent review.
 
-Receiving provisional output and observing closed admission establishes externally
-visible interruption and recovery. It does not establish graph execution at the
-instant of disconnect, a cancellation acknowledgement, logits or complete-state
-rollback. Those fields remain explicitly unqualified in the receipt. The checker
-also establishes no sandbox/process ownership, performance, long-context/output,
-creative quality or default-promotion evidence. Runner lifecycle receipts remain
-separate from this Prism-owned capture.
-
-Archive the checker package and receipt alongside the actual-model result and
-the trusted owner's process/cleanup and artifact-verification reports. Bind the
-tested released source, version, archive/server/worker SHA-256 identities separately
-from the later owning main checker source/workflow/run and retained package artifact.
-An internal model thread is exercised through the released HTTP service; the
-separate JSONL `bonsai-swift-worker` binary is not executed by this checker. Exact
-source Foundation/conformance and independent review remain required, and a passed
-checker receipt alone cannot close the released-service promotion gate.
+The checker establishes visible interruption/recovery, not graph execution at the
+disconnect instant, cancellation acknowledgement, complete-state rollback or
+performance. It does not exercise the JSONL worker. Model/state, lifecycle,
+long-context, quality and device qualification remain separate gates.

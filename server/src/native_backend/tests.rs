@@ -467,6 +467,41 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
 }
 
 #[test]
+fn private_context_capacity_controls_admission_and_readiness() -> TestResult {
+    let profile = ModelProfile {
+        context_tokens: 32_768,
+        ..ModelProfile::default()
+    };
+    assert_eq!(profile.readiness(42)["data"][0]["context_tokens"], 32_768);
+    let prompt = 32_768 - 128 - crate::TEMPLATE_MARGIN_TOKENS;
+    assert!(
+        pending(true, 128)?
+            .admit_with_context(profile.context_tokens, |_| Ok(prompt))
+            .is_ok()
+    );
+    assert!(matches!(
+        pending(true, 128)?.admit_with_context(profile.context_tokens, |_| Ok(prompt + 1)),
+        Err(crate::Rejection::ContextLimit),
+    ));
+    assert!(matches!(
+        pending(true, 128)?.admit(|_| Ok(prompt)),
+        Err(crate::Rejection::ContextLimit),
+    ));
+    assert!(matches!(
+        pending(true, 128)?
+            .admit_with_context(4_352, |_| Ok(
+                4_352 - 128 - crate::TEMPLATE_MARGIN_TOKENS + 1
+            )),
+        Err(crate::Rejection::ContextLimit),
+    ));
+    assert!(matches!(
+        pending(true, 128)?.admit_with_context(profile.context_tokens, |_| Ok(usize::MAX)),
+        Err(crate::Rejection::ContextLimit),
+    ));
+    Ok(())
+}
+
+#[test]
 fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scale() {
     use bonsai_prism_runtime::model::{
         lora::SWIFT_ADAPTER_SHA256,

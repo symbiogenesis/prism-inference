@@ -30,8 +30,10 @@ pub const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 /// Number of declared input and output vocabulary entries.
 pub const VOCAB_SIZE: usize = 248_320;
-/// Total conversation context admitted by the Swift MVP.
+/// Legacy default context for fixed Swift qualification callers.
 pub const CONTEXT_TOKENS: usize = 8_192;
+/// Unscaled training context declared by the pinned Swift artifact.
+pub const TRAINING_CONTEXT_TOKENS: usize = 262_144;
 /// Maximum complete output allowance, including reasoning.
 pub const MAX_OUTPUT_TOKENS: usize = 4_096;
 /// Exact serialized tensor payload bytes, excluding header and alignment gaps.

@@ -35,6 +35,48 @@ pub const DEFAULT_KV_CACHE: KvCachePolicy = KvCachePolicy::Rotated4;
 pub const STATE_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Maximum complete transactional rollback snapshot storage.
 pub const CHECKPOINT_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+/// Conservative fixed model/runtime allowance, excluding context growth.
+pub const NON_CONTEXT_MEMORY_BYTES: u64 = 11 * 1024 * 1024 * 1024;
+/// Live and rollback FP16 KV, bounded attention scores and context bookkeeping
+/// charged for each selected context token.
+///
+/// Quantized caches retain this conservative FP16 capacity charge. Bookkeeping
+/// includes token histories and checkpoint/page metadata. Fixed workspace and
+/// recurrent state use the non-context allowance. The shared launcher charge
+/// reserves 64-token, 24-head F32 scores for publisher microbatch attention.
+/// Native ordinary block prefill is sequential and retains 24 score rows;
+/// optional tiled-prefill APIs still need their separate reservation review.
+/// This source estimate is not a measured peak or a memory qualification.
+pub const CONTEXT_TOKEN_MEMORY_BYTES: u64 = 2 * 65_536 + 64 * 24 * 4 + 128;
+/// Maximum context fitting the existing graph state bound at FP16 precision.
+///
+/// Preserve the graph's 4 GiB cap and the pinned 156,893,184-byte recurrent
+/// payload. The extra scratch charge and 256-token rounding leave metadata room.
+pub const MAX_CONTEXT_TOKENS: usize =
+    (crate::graph::MAX_STATE_BYTES - 156_893_184) / (65_536 + 96 + 128) / 256 * 256;
+
+/// Validate a launcher's selected context and conservative process allowance.
+///
+/// This never queries memory or creates a Job. The owner enforces that process
+/// allowance and independently retains a 4 GiB physical host reserve.
+///
+/// # Errors
+/// Rejects a context outside the model/state bounds or an insufficient allowance.
+pub fn validate_context_capacity(context_tokens: usize, memory_limit_bytes: u64) -> Result<()> {
+    let required = u64::try_from(context_tokens)?
+        .checked_mul(CONTEXT_TOKEN_MEMORY_BYTES)
+        .and_then(|bytes| bytes.checked_add(NON_CONTEXT_MEMORY_BYTES))
+        .ok_or_else(|| invalid("Swift context memory allowance overflow"))?;
+    if context_tokens == 0
+        || context_tokens > MAX_CONTEXT_TOKENS
+        || context_tokens > swift::TRAINING_CONTEXT_TOKENS
+        || memory_limit_bytes < required
+    {
+        return Err(invalid("Swift context memory allowance rejected"));
+    }
+    Ok(())
+}
+
 /// Largest complete displayed output retained or delivered by one request.
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -190,10 +232,54 @@ impl SwiftSession {
         parallelism: RowParallelism,
         kv_cache: KvCachePolicy,
     ) -> Result<Self> {
+        Self::load_profile_with_context(
+            path,
+            representation,
+            adapter_path,
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            swift::CONTEXT_TOKENS,
+        )
+    }
+
+    /// Load one immutable context shared by tokenizer, decoder and runtime.
+    ///
+    /// Fixed callers retain the 8,192-token default through existing loading
+    /// methods. A launcher may select a larger or smaller context from current
+    /// memory and must enforce its separate process and host-reserve allowance.
+    /// The graph's existing 4 GiB live-state ceiling is never increased.
+    ///
+    /// # Errors
+    /// Rejects a context beyond the conservative FP16 state capacity and the
+    /// artifact, adapter, cache and allocation errors of other loading methods.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The explicit context extends the established seven-argument immutable profile loader."
+    )]
+    pub fn load_profile_with_context(
+        path: &Path,
+        representation: Representation,
+        adapter_path: Option<&Path>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+        context_tokens: usize,
+    ) -> Result<Self> {
+        validate_context_capacity(context_tokens, u64::MAX)?;
+        let state_budget = if context_tokens == swift::CONTEXT_TOKENS {
+            STATE_MEMORY_BYTES
+        } else {
+            crate::graph::MAX_STATE_BYTES
+        };
+        let checkpoint_budget = CHECKPOINT_MEMORY_BYTES.max(state_budget);
         let sampler = SwiftSampler::new(seed)?;
         let (model, receipt) =
             swift::load_representation(path, MODEL_MEMORY_BYTES, representation)?;
-        let chat = SwiftChatSession::from_model_representation(&model, representation)?;
+        let chat = SwiftChatSession::from_model_representation(&model, representation)?
+            .with_context_tokens(context_tokens)?;
         let vocabulary = Vocabulary::from_metadata(&model.metadata, swift::VOCAB_SIZE)?;
         let adapter = adapter_path
             .map(|path| RankOneAdapter::load_swift_representation(path, &model, representation))
@@ -204,8 +290,8 @@ impl SwiftSession {
         let mut decoder = if let Some(adapter) = adapter {
             Qwen35::with_rank_one_adapter_and_kv(
                 model,
-                swift::CONTEXT_TOKENS,
-                STATE_MEMORY_BYTES,
+                context_tokens,
+                state_budget,
                 backend,
                 adapter,
                 1.3,
@@ -214,8 +300,8 @@ impl SwiftSession {
         } else {
             Qwen35::with_state_budget_and_kv(
                 model,
-                swift::CONTEXT_TOKENS,
-                STATE_MEMORY_BYTES,
+                context_tokens,
+                state_budget,
                 backend,
                 kv_cache,
             )?
@@ -224,9 +310,9 @@ impl SwiftSession {
         let runtime = Runtime::new(
             decoder,
             Limits {
-                context_tokens: swift::CONTEXT_TOKENS,
+                context_tokens,
                 checkpoints: 0,
-                checkpoint_bytes: CHECKPOINT_MEMORY_BYTES,
+                checkpoint_bytes: checkpoint_budget,
             },
         )?;
         Ok(Self {
@@ -243,6 +329,12 @@ impl SwiftSession {
             prompt_reuse: PromptReuse::Disabled,
             receipt,
         })
+    }
+
+    /// Immutable capacity shared by exact input admission and executable state.
+    #[must_use]
+    pub const fn context_tokens(&self) -> usize {
+        self.chat.context_tokens()
     }
 
     /// Exact immutable model representation selected for this session.
@@ -651,9 +743,27 @@ fn check_request(cancellation: &Cancellation, deadline: Instant) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedChat, validate_adapter_scale, validate_prompt_owner};
+    use super::{
+        CONTEXT_TOKEN_MEMORY_BYTES, MAX_CONTEXT_TOKENS, NON_CONTEXT_MEMORY_BYTES, PreparedChat,
+        validate_adapter_scale, validate_context_capacity, validate_prompt_owner,
+    };
     use crate::Result;
     use std::sync::Arc;
+
+    #[test]
+    fn context_capacity_checks_memory_and_preserves_graph_state_ceiling() -> Result<()> {
+        for tokens in [1, 4_352, 8_192, 32_768, MAX_CONTEXT_TOKENS] {
+            let memory =
+                NON_CONTEXT_MEMORY_BYTES + u64::try_from(tokens)? * CONTEXT_TOKEN_MEMORY_BYTES;
+            validate_context_capacity(tokens, memory)?;
+            assert!(validate_context_capacity(tokens, memory - 1).is_err());
+        }
+        assert!(validate_context_capacity(0, u64::MAX).is_err());
+        assert!(validate_context_capacity(MAX_CONTEXT_TOKENS + 1, u64::MAX).is_err());
+        assert!(validate_context_capacity(usize::MAX, u64::MAX).is_err());
+        assert_eq!(MAX_CONTEXT_TOKENS, 62_720);
+        Ok(())
+    }
 
     #[test]
     fn prepared_chat_seals_session_and_exact_adapter_settings() -> Result<()> {

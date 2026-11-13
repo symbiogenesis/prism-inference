@@ -49,7 +49,7 @@ impl NativeChat {
 /// Returns value-free schema/count/context rejection; no prompt escapes in errors.
 pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeChat, Rejection> {
     let mut prepared = None;
-    let admitted = pending.admit(|body| {
+    let admitted = pending.admit_with_context(session.context_tokens(), |body| {
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
         let messages = value.get("messages").ok_or(Rejection::ChatSchema)?;

@@ -17,6 +17,7 @@ pub(super) struct ModelProfile {
     pub adapter: bool,
     pub prompt_reuse: PromptReuse,
     pub row_workers: usize,
+    pub context_tokens: usize,
     pub kv_cache: KvCachePolicy,
     pub startup_graph_identity: Option<Arc<str>>,
 }
@@ -28,6 +29,7 @@ impl Default for ModelProfile {
             adapter: false,
             prompt_reuse: PromptReuse::default(),
             row_workers: 1,
+            context_tokens: swift::CONTEXT_TOKENS,
             kv_cache: KvCachePolicy::F16,
             startup_graph_identity: None,
         }
@@ -43,7 +45,7 @@ impl ModelProfile {
             },
             "object": "model", "model_sha256": self.representation.model_sha256(),
             "template_sha256": swift::TEMPLATE_SHA256, "runtime": "prism-inference",
-            "context_tokens": swift::CONTEXT_TOKENS, "seed": seed,
+            "context_tokens": self.context_tokens, "seed": seed,
             "row_workers": self.row_workers,
         });
         if self.representation != Representation::Pq2 || self.adapter {

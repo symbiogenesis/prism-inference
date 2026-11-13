@@ -453,6 +453,21 @@ impl PendingChat {
         self,
         count_rendered_prompt: impl FnOnce(&[u8]) -> Result<usize, Rejection>,
     ) -> Result<AdmittedChat, Rejection> {
+        self.admit_with_context(CONTEXT_TOKENS, count_rendered_prompt)
+    }
+
+    /// Admit against the immutable context selected by the owning native session.
+    ///
+    /// The legacy [`Self::admit`] entry point retains its fixed qualification
+    /// default. Only the verified session owner may supply this capacity.
+    ///
+    /// # Errors
+    /// Returns the same counting/admission errors as [`Self::admit`].
+    pub fn admit_with_context(
+        self,
+        context_tokens: usize,
+        count_rendered_prompt: impl FnOnce(&[u8]) -> Result<usize, Rejection>,
+    ) -> Result<AdmittedChat, Rejection> {
         let prompt = count_rendered_prompt(&self.body)?;
         if prompt == 0 {
             return Err(Rejection::TokenCountUnavailable);
@@ -462,7 +477,7 @@ impl PendingChat {
         let total = prompt
             .checked_add(completion)
             .and_then(|n| n.checked_add(TEMPLATE_MARGIN_TOKENS));
-        if total.is_none_or(|n| n > CONTEXT_TOKENS) {
+        if total.is_none_or(|n| n > context_tokens) {
             return Err(Rejection::ContextLimit);
         }
         Ok(AdmittedChat {

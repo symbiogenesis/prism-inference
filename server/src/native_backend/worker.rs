@@ -48,6 +48,7 @@ impl Engine for SwiftSession {
             adapter: self.adapter_identity().is_some(),
             prompt_reuse: self.prompt_reuse(),
             row_workers: self.row_workers(),
+            context_tokens: self.context_tokens(),
             kv_cache: self.kv_cache_policy(),
             startup_graph_identity: (self.kv_cache_policy() != KvCachePolicy::F16)
                 .then(|| Arc::from(self.decoder_identity())),

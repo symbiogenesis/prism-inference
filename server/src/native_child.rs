@@ -7,7 +7,7 @@ use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
     model::swift::Representation,
     runtime::PromptReuse,
-    swift_session::SwiftSession,
+    swift_session::{SwiftSession, validate_context_capacity},
 };
 use bonsai_windows_credentials::validate_read_path;
 
@@ -26,6 +26,7 @@ struct Config {
     adapter: Option<PathBuf>,
     prompt_reuse: PromptReuse,
     kv_cache: KvCachePolicy,
+    capacity: Option<(usize, u64)>,
 }
 
 fn invalid() -> io::Error {
@@ -44,6 +45,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut adapter = None;
     let mut prompt_reuse = None;
     let mut kv_cache = None;
+    let (mut context_tokens, mut memory_limit_bytes) = (None, None);
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
             child = true;
@@ -58,6 +60,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Some("--model") if model.is_none() => model = Some(PathBuf::from(value)),
             Some("--key-file") if key.is_none() => key = Some(PathBuf::from(value)),
             Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
+            Some("--context-tokens") if context_tokens.is_none() => context_tokens = Some(value),
+            Some("--memory-limit-bytes") if memory_limit_bytes.is_none() => {
+                memory_limit_bytes = Some(value)
+            }
             Some("--port") if port.is_none() => {
                 port = Some(
                     value
@@ -117,6 +123,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         adapter,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
+        capacity: parse_capacity(context_tokens, memory_limit_bytes)?,
     };
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -135,6 +142,36 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     Ok(config)
 }
 
+fn parse_capacity(
+    context_tokens: Option<OsString>,
+    memory_limit_bytes: Option<OsString>,
+) -> io::Result<Option<(usize, u64)>> {
+    match (context_tokens, memory_limit_bytes) {
+        (None, None) => Ok(None),
+        (Some(context), Some(memory)) => {
+            let context = context
+                .to_str()
+                .ok_or_else(invalid)?
+                .parse::<usize>()
+                .map_err(|_| invalid())?;
+            let memory = memory
+                .to_str()
+                .ok_or_else(invalid)?
+                .parse::<u64>()
+                .map_err(|_| invalid())?;
+            if context < 4_352
+                || !context.is_multiple_of(256)
+                || memory.checked_add(4 * 1024 * 1024 * 1024).is_none()
+            {
+                return Err(invalid());
+            }
+            validate_context_capacity(context, memory).map_err(|_| invalid())?;
+            Ok(Some((context, memory)))
+        }
+        _ => Err(invalid()),
+    }
+}
+
 /// Start only the private backend selected by `--native-engine-child`.
 ///
 /// The Windows development launcher supplies its protected key, external model,
@@ -149,9 +186,13 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     crate::native_backend::register_hexagon_model_path(&config.model);
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
         .map_err(|error| startup::at(Stage::Environment, &error))?;
+    let required_available_bytes = config.capacity.map_or(
+        crate::configuration::REQUIRED_AVAILABLE_BYTES,
+        |(_, memory)| memory + 4 * 1024 * 1024 * 1024,
+    );
     if bonsai_windows_process::available_memory_bytes()
         .map_err(|error| startup::at(Stage::Memory, &error))?
-        < crate::configuration::REQUIRED_AVAILABLE_BYTES
+        < required_available_bytes
     {
         return Err(startup::at(
             Stage::Memory,
@@ -162,7 +203,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         .map_err(|error| startup::at(Stage::Key, &error))?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_kv_cache(
+    let mut session = SwiftSession::load_profile_with_context(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
@@ -170,6 +211,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         config.seed,
         parallelism,
         config.kv_cache,
+        config.capacity.map_or(
+            bonsai_prism_runtime::model::swift::CONTEXT_TOKENS,
+            |(tokens, _)| tokens,
+        ),
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     session
@@ -207,6 +252,46 @@ mod tests {
             std::fs::write(path, [])?;
         }
         Ok((directory, paths.map(PathBuf::into_os_string)))
+    }
+
+    #[test]
+    fn native_child_context_capacity_is_paired_and_checked() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, MAX_CONTEXT_TOKENS, NON_CONTEXT_MEMORY_BYTES,
+        };
+        assert_eq!(parse_capacity(None, None)?, None);
+        for tokens in [4_352, 8_192, 32_768, MAX_CONTEXT_TOKENS] {
+            let memory = NON_CONTEXT_MEMORY_BYTES
+                + u64::try_from(tokens).map_err(io::Error::other)? * CONTEXT_TOKEN_MEMORY_BYTES;
+            assert_eq!(
+                parse_capacity(
+                    Some(tokens.to_string().into()),
+                    Some(memory.to_string().into())
+                )?,
+                Some((tokens, memory)),
+            );
+            assert!(
+                parse_capacity(
+                    Some(tokens.to_string().into()),
+                    Some((memory - 1).to_string().into())
+                )
+                .is_err()
+            );
+        }
+        for (tokens, memory) in [
+            (Some("8192"), None),
+            (None, Some("20000000000")),
+            (Some("0"), Some("20000000000")),
+            (Some("4351"), Some("20000000000")),
+            (Some("8193"), Some("20000000000")),
+            (Some("63232"), Some("20000000000")),
+            (Some("8192"), Some("18446744073709551615")),
+        ] {
+            assert!(
+                parse_capacity(tokens.map(OsString::from), memory.map(OsString::from)).is_err()
+            );
+        }
+        Ok(())
     }
 
     #[test]

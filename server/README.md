@@ -2,7 +2,7 @@
 
 The independently built prism-inference-server executable supplies the same strict private HTTP
 contract used by SwiftBonsai's guarded development launcher. The owner verifies executable and model
-bytes before launch and retains process/Job ownership, the fixed memory limit, authenticated
+bytes before launch and retains process/Job ownership, the selected memory limit, authenticated
 readiness and listener-PID checks.
 
 The server loads the selected exact Swift artifact before binding numeric IPv4 loopback. PQ2 without
@@ -19,6 +19,30 @@ change it. Non-FP16 readiness reports `kv_cache` and the actual
 quality, measured memory benefit and X1/X2 qualification remain pending. A
 verified published bundle and matching broker contract are required for Runner;
 changing this source default does not replace its active release pin.
+
+Trusted owners may now supply the paired startup options
+`--context-tokens <4352..62720> --memory-limit-bytes <u64>`. Context is a multiple
+of 256, chosen once before loading from current available memory. The server
+checks at least 11 GiB of fixed runtime allowance plus 137,344 bytes per context
+token, then independently requires that allowance plus a 4 GiB physical host
+reserve. This conservative source charge covers live and rollback FP16 KV,
+64-token/24-head publisher-style attention scores and context bookkeeping even
+when native quantized KV is selected. Native ordinary prefill is sequential;
+optional tiled-prefill APIs retain their separate resource review.
+
+The selected context is immutable and identical in exact chat tokenization,
+server admission, decoder/runtime bounds and authenticated `context_tokens`
+readiness. Live-state payload remains capped at the graph's existing 4 GiB;
+complete rollback accounting increases with a selected context beyond the
+legacy default. Missing, partial, duplicate, unaligned, overflowing or
+underfunded capacity options reject rather than resize after loading. Owners
+must enforce the selected Job memory allowance and monitor pressure. Available
+memory is an observation, not a reservation or full-context qualification.
+
+Without either capacity option, legacy 8,192-token loading APIs and the private
+server's existing 16 GiB startup admission remain unchanged. Source support does
+not update an installed runtime: Runner needs a genuine source-bound published
+bundle and reviewed release pin before enabling these options for native chat.
 
 Read-only model, adapter and key validation uses the credential helper pinned to
 Runner revision `abe04b4a8eff18388af96f0e75c8a8d180b81989`. Inside an actual Windows

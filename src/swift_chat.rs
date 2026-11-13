@@ -32,7 +32,7 @@ const NATIVE_STOPS: [(u32, &str); 5] = [
     (248_065, "<|file_sep|>"),
 ];
 const NATIVE_STOP_IDS: [u32; 5] = [248_044, 248_046, 248_063, 248_064, 248_065];
-/// Fixed prompt-plus-output context capacity for the Swift CPU MVP.
+/// Legacy default prompt-plus-output capacity for fixed Swift qualification callers.
 pub const CONTEXT_TOKENS: usize = 8192;
 /// Largest complete output allowance, including every reasoning token.
 pub const MAX_OUTPUT_TOKENS: usize = 4096;
@@ -54,6 +54,7 @@ pub struct SwiftPrompt {
 pub struct SwiftChatSession {
     template: ChatTemplate,
     tokenization: TokenizationSession,
+    context_tokens: usize,
 }
 
 impl SwiftChatSession {
@@ -225,7 +226,29 @@ impl SwiftChatSession {
         Ok(Self {
             template,
             tokenization,
+            context_tokens: CONTEXT_TOKENS,
         })
+    }
+
+    /// Select a context within the pinned model's unscaled training limit.
+    ///
+    /// This consumes the tokenizer before requests can be prepared. Executable
+    /// callers must select the same context for their decoder and runtime.
+    ///
+    /// # Errors
+    /// Rejects a zero context or one exceeding the pinned training context.
+    pub fn with_context_tokens(mut self, context_tokens: usize) -> Result<Self> {
+        if context_tokens == 0 || context_tokens > crate::model::swift::TRAINING_CONTEXT_TOKENS {
+            return Err(invalid("Swift context exceeds the pinned training limit"));
+        }
+        self.context_tokens = context_tokens;
+        Ok(self)
+    }
+
+    /// Immutable prompt-plus-output capacity selected before preparation.
+    #[must_use]
+    pub const fn context_tokens(&self) -> usize {
+        self.context_tokens
     }
 
     /// Verified lowercase SHA-256 identity of the pinned model artifact.
@@ -271,7 +294,7 @@ impl SwiftChatSession {
     /// # Errors
     /// Rejects output allowances outside 1 through 4096 and allocation failure.
     pub fn generation(&self, max_tokens: usize) -> Result<crate::runtime::Generation> {
-        output_budget(max_tokens)?;
+        output_budget(max_tokens, self.context_tokens)?;
         self.special_tokens()
             .generation(max_tokens, self.stop_tokens())
     }
@@ -288,7 +311,7 @@ impl SwiftChatSession {
     ///
     /// # Errors
     /// Rejects unsupported/bounded message shapes, zero or more than 4096 output
-    /// tokens, template failure and prompt plus output beyond 8192 tokens.
+    /// tokens, template failure and prompt plus output beyond the selected context.
     /// Only encoded prompt-capacity overflow preserves the concrete
     /// [`crate::TokenLimitExceeded`] marker; other failures retain their type.
     pub fn prepare(&self, messages: &Value, reserved_output_tokens: usize) -> Result<SwiftPrompt> {
@@ -308,7 +331,7 @@ impl SwiftChatSession {
         reserved_output_tokens: usize,
         enable_thinking: bool,
     ) -> Result<SwiftPrompt> {
-        let budget = output_budget(reserved_output_tokens)?;
+        let budget = output_budget(reserved_output_tokens, self.context_tokens)?;
         validate_messages(messages)?;
         let rendered = self.template.render_json(
             messages.clone(),
@@ -330,14 +353,14 @@ impl SwiftChatSession {
     }
 }
 
-fn output_budget(reserved_output_tokens: usize) -> Result<TokenBudget> {
+fn output_budget(reserved_output_tokens: usize, context_tokens: usize) -> Result<TokenBudget> {
     if !(1..=MAX_OUTPUT_TOKENS).contains(&reserved_output_tokens) {
         return Err(invalid(
             "Swift output allowance must be from 1 through 4096 tokens",
         ));
     }
     Ok(TokenBudget {
-        context: CONTEXT_TOKENS,
+        context: context_tokens,
         reserved_output_tokens,
     })
 }
@@ -415,9 +438,11 @@ mod tests {
             {"role":"assistant", "content":"answer", "reasoning_content":"private\nthought"},
             {"role":"user", "content":" after "}
         ]))?;
-        assert_eq!(output_budget(4096)?.prompt_token_limit()?, 4096);
-        assert!(output_budget(0).is_err());
-        assert!(output_budget(4097).is_err());
+        assert_eq!(output_budget(4096, 8192)?.prompt_token_limit()?, 4096);
+        assert!(output_budget(0, 8192).is_err());
+        assert!(output_budget(4097, 8192).is_err());
+        assert_eq!(output_budget(4096, 32768)?.prompt_token_limit()?, 28672);
+        assert_eq!(output_budget(4096, 4352)?.prompt_token_limit()?, 256);
         Ok(())
     }
 

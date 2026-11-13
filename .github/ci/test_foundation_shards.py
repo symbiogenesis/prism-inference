@@ -31,6 +31,20 @@ def metadata():
     }
 
 
+def unit_graph(data, enabled=None):
+    """Cargo root fixture: no unselected or host-only dependency units are roots."""
+    enabled = enabled or {package["name"]: shards.default_features(package) for package in data["packages"]}
+    units = []
+    for package in data["packages"]:
+        for item in package["targets"]:
+            if (item["test"] and item["kind"][0] not in {"bench", "custom-build"}
+                    and set(item["required-features"]) <= enabled[package["name"]]):
+                units.append({"pkg_id": package["id"], "platform": "native-target", "mode": "test",
+                              "target": {"name": item["name"], "kind": item["kind"]},
+                              "features": sorted(enabled[package["name"]])})
+    return {"version": 1, "units": units, "roots": list(range(len(units)))}
+
+
 class FoundationShardTests(unittest.TestCase):
     def test_every_enabled_target_is_assigned_once_with_same_name_together(self):
         data = metadata()
@@ -87,19 +101,78 @@ class FoundationShardTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 shards.partition(data, ["runtime"], 4)
 
-    def test_dependency_activated_gated_targets_fail_closed_including_aliases(self):
-        for style in ("direct", "alias", "feature-alias"):
+    def test_inactive_optional_dependency_forwarding_does_not_enable_gated_target(self):
+        data = metadata()
+        data["packages"][1]["dependencies"] = [{"name": "runtime", "rename": "engine", "features": []}]
+        data["packages"][1]["features"] = {"optional": ["engine/native"], "weak": ["engine?/native"]}
+        enabled = shards.resolved_features(data, ["runtime", "tool"], unit_graph(data), "native-target")
+        plan = shards.partition(data, ["runtime", "tool"], 4, enabled)
+        self.assertNotIn(("runtime", "test", "native"), [item for part in plan["shards"] for item in part])
+        self.assertIn(["runtime", "test", "native", "disabled required features"], plan["disabled"])
+
+    def test_dependency_activated_gated_target_is_inventoried_exactly_once(self):
+        data = metadata()
+        enabled = {"runtime": {"default", "cli", "native"}, "tool": set()}
+        resolved = shards.resolved_features(data, ["runtime", "tool"], unit_graph(data, enabled), "native-target")
+        plan = shards.partition(data, ["runtime", "tool"], 4, resolved)
+        self.assertEqual([item for part in plan["shards"] for item in part].count(("runtime", "test", "native")), 1)
+
+    def test_host_dependency_features_are_not_merged_with_selected_target_roots(self):
+        data = metadata()
+        graph = unit_graph(data)
+        host = copy.deepcopy(graph["units"][0])
+        host["platform"] = None
+        host["features"].append("native")
+        graph["units"].append(host)
+        resolved = shards.resolved_features(data, ["runtime", "tool"], graph, "native-target")
+        self.assertNotIn("native", resolved["runtime"])
+        graph["roots"].append(len(graph["units"]) - 1)
+        with self.assertRaisesRegex(ValueError, "target mismatch"):
+            shards.resolved_features(data, ["runtime", "tool"], graph, "native-target")
+
+    def test_inconsistent_missing_and_unselected_unit_roots_fail_with_context(self):
+        for change, message in (("features", "feature sets disagree"), ("missing", "omits enabled test"),
+                                ("package", "outside selected packages"), ("target", "absent from metadata"),
+                                ("index", "invalid root index"), ("version", "unit graph v1")):
             data = metadata()
-            data["packages"][1]["dependencies"] = [{"name": "runtime", "rename": "engine", "features": []}]
-            if style == "direct":
-                data["packages"][1]["dependencies"][0]["features"] = ["native"]
-            elif style == "alias":
-                data["packages"][1]["features"] = {"enable": ["engine/native"]}
+            graph = unit_graph(data)
+            if change == "features":
+                graph["units"][1]["features"].append("native")
+            elif change == "missing":
+                graph["roots"].pop(0)
+            elif change == "package":
+                graph["units"][0]["pkg_id"] = "external-id"
+            elif change == "target":
+                graph["units"][0]["target"]["name"] = "unknown-target"
+            elif change == "index":
+                graph["roots"].append(True)
             else:
-                data["packages"][0]["features"]["forwarded"] = ["native"]
-                data["packages"][1]["dependencies"][0]["features"] = ["forwarded"]
-            with self.subTest(style=style), self.assertRaisesRegex(ValueError, "Dependency-activated"):
-                shards.partition(data, ["runtime", "tool"], 4)
+                graph["version"] = 2
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, message):
+                shards.resolved_features(data, ["runtime", "tool"], graph, "native-target")
+
+    def test_doctests_remain_selected_without_a_separate_compilation_root(self):
+        data = metadata()
+        resolved = shards.resolved_features(data, ["runtime", "tool"], unit_graph(data), "native-target")
+        plan = shards.partition(data, ["runtime", "tool"], 4, resolved)
+        self.assertIn(("runtime", "doc", "runtime"), plan["shards"][0])
+        self.assertIn(("tool", "doc", "tool"), plan["shards"][0])
+
+    def test_gated_package_without_roots_and_partial_feature_map_fail_closed(self):
+        data = metadata()
+        graph = unit_graph(data)
+        graph["roots"] = [index for index in graph["roots"] if graph["units"][index]["pkg_id"] != "runtime-id"]
+        with self.assertRaisesRegex(ValueError, "No resolved Cargo root features for gated package runtime"):
+            shards.resolved_features(data, ["runtime", "tool"], graph, "native-target")
+        with self.assertRaisesRegex(ValueError, "exactly the selected packages"):
+            shards.partition(data, ["runtime", "tool"], 4, {"runtime": {"cli"}})
+
+    def test_feature_independent_empty_package_may_have_no_cargo_roots(self):
+        data = metadata()
+        data["packages"][1]["targets"] = [target("empty", "lib", test=False, doctest=False)]
+        graph = unit_graph(data)
+        resolved = shards.resolved_features(data, ["runtime", "tool"], graph, "native-target")
+        self.assertEqual(resolved["tool"], set())
 
     def test_default_feature_alias_cycles_and_invalid_shard_bounds(self):
         data = metadata()

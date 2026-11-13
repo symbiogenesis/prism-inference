@@ -8,6 +8,58 @@
 
 const DIMENSION: usize = 256;
 
+/// An immutable finite query and codebook checked once for a packed-key scan.
+///
+/// The borrows prevent mutation of either input while the proof is in use.
+/// Packed-row extents and finite dot results remain checked on every call.
+pub struct PreparedQuery<'a> {
+    bits: u8,
+    centroids: &'a [f32; 16],
+    query: &'a [f32; DIMENSION],
+    #[cfg(target_arch = "aarch64")]
+    neon: bool,
+}
+
+impl<'a> PreparedQuery<'a> {
+    /// Checks a query and codebook without allocating or copying either row.
+    ///
+    /// Returns `None` for unsupported precision or nonfinite input. Optional
+    /// native dispatch is selected once and retained only for this borrow.
+    #[must_use]
+    pub fn new(bits: u8, centroids: &'a [f32; 16], query: &'a [f32; DIMENSION]) -> Option<Self> {
+        if !matches!(bits, 3 | 4)
+            || !centroids.iter().all(|value| value.is_finite())
+            || !query.iter().all(|value| value.is_finite())
+        {
+            return None;
+        }
+        Some(Self {
+            bits,
+            centroids,
+            query,
+            #[cfg(target_arch = "aarch64")]
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+        })
+    }
+
+    /// Computes one code-only dot with the ordinary four-lane arithmetic.
+    ///
+    /// Returns `None` for an incorrect code extent or nonfinite binary32 result.
+    /// The current packed bytes are consumed on every call; pointer identity
+    /// never permits stale row reuse.
+    #[must_use]
+    pub fn dot(&self, packed: &[u8]) -> Option<f32> {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            return finite_binary32(native::dot(packed, self.bits, self.centroids, self.query));
+        }
+        finite_binary32(portable_dot(packed, self.bits, self.centroids, self.query))
+    }
+}
+
 /// Computes a dot against one code-only rotated KV row, excluding its scale.
 ///
 /// Rejects unsupported widths, incorrect byte lengths, nonfinite centroids or
@@ -21,14 +73,7 @@ pub fn dot(
     centroids: &[f32; 16],
     query: &[f32; DIMENSION],
 ) -> Option<f32> {
-    if !valid(packed, bits, centroids) || !query.iter().all(|value| value.is_finite()) {
-        return None;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("neon") {
-        return finite_binary32(native::dot(packed, bits, centroids, query));
-    }
-    finite_binary32(portable_dot(packed, bits, centroids, query))
+    PreparedQuery::new(bits, centroids, query)?.dot(packed)
 }
 
 /// Adds a scaled code-only rotated value row into the supplied accumulator.
@@ -343,6 +388,56 @@ mod tests {
         std::array::from_fn(|index: usize| {
             index.to_le_bytes()[0].wrapping_add(offset) & ((1 << bits) - 1)
         })
+    }
+
+    #[test]
+    fn x1_prepared_kv_dot_matches_independent_lanes_and_checks_every_row()
+    -> Result<(), &'static str> {
+        let centroids = codebook();
+        let query = std::array::from_fn(|index: usize| {
+            let value = f32::from(index.to_le_bytes()[0]) - 127.5;
+            value * 0.03125 + (value * 0.17).sin()
+        });
+        for bits in [3, 4] {
+            let prepared = super::PreparedQuery::new(bits, &centroids, &query)
+                .ok_or("finite prepared query must be accepted")?;
+            // Reuse exactly the same packed allocation with different bytes.
+            let mut bytes = packed(&codes(bits, 0), bits);
+            for offset in 0..(1 << bits) {
+                let codes = codes(bits, offset);
+                bytes.copy_from_slice(&packed(&codes, bits));
+                let mut lanes = [0.0_f64; 4];
+                for (index, (&code, &query)) in codes.iter().zip(&query).enumerate() {
+                    lanes[index % 4] += f64::from(centroids[usize::from(code)]) * f64::from(query);
+                }
+                let expected =
+                    super::finite_binary32(((lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
+                assert_eq!(
+                    prepared.dot(&bytes).map(f32::to_bits),
+                    expected.map(f32::to_bits)
+                );
+            }
+            assert!(prepared.dot(&bytes[..bytes.len() - 1]).is_none());
+            bytes.push(0);
+            assert!(prepared.dot(&bytes).is_none());
+        }
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid_query = query;
+            invalid_query[255] = invalid;
+            assert!(super::PreparedQuery::new(4, &centroids, &invalid_query).is_none());
+            let mut invalid_book = centroids;
+            invalid_book[15] = invalid;
+            assert!(super::PreparedQuery::new(4, &invalid_book, &query).is_none());
+        }
+        assert!(super::PreparedQuery::new(2, &centroids, &query).is_none());
+        let huge = [f32::MAX; DIMENSION];
+        let book = [f32::MAX; 16];
+        assert!(
+            super::PreparedQuery::new(4, &book, &huge)
+                .and_then(|query| query.dot(&[0; 128]))
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

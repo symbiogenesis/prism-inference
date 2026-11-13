@@ -34,6 +34,53 @@ fn record(bits: Bits, scale: f32) -> Vec<u8> {
     packed
 }
 
+#[test]
+fn x1_prepared_kv_scores_preserve_order_records_and_failure_precedence() -> Result<()> {
+    let query = input_row();
+    for bits in [Bits::Three, Bits::Four] {
+        for scalar_only in [false, true] {
+            let quantizer = if scalar_only {
+                Quantizer::scalar(bits, 91)
+            } else {
+                Quantizer::new(bits, 91)
+            };
+            let prepared = quantizer.prepare_query(&query)?;
+            for scale in [f32::from_bits(1), 0.25, 1.0, 7.0] {
+                let packed = record(bits, scale);
+                let mut lanes = [0.0_f64; 4];
+                for (index, &coordinate) in query.iter().enumerate() {
+                    let code = index % usize::from(bits.levels());
+                    lanes[index % 4] +=
+                        f64::from(coordinate) * f64::from(quantizer.centroids()[code]);
+                }
+                let expected =
+                    scalar::checked_f32(((lanes[0] + lanes[1]) + lanes[2]) + lanes[3])? * scale;
+                assert_eq!(prepared.score(&packed)?.to_bits(), expected.to_bits());
+            }
+            let mut zero = vec![0; quantizer.encoded_len()];
+            assert_eq!(prepared.score(&zero)?.to_bits(), 0.0_f32.to_bits());
+            zero[4] = 1;
+            assert!(prepared.score(&zero).is_err());
+            for scale in [-0.0, -1.0, f32::INFINITY, f32::NAN] {
+                assert!(prepared.score(&record(bits, scale)).is_err());
+            }
+            assert!(prepared.score(&[]).is_err());
+            let mut invalid_query = query;
+            invalid_query[255] = f32::NAN;
+            let error = quantizer
+                .score(&invalid_query, &[])
+                .err()
+                .ok_or_else(|| crate::invalid("invalid query must fail before invalid record"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("row must contain only finite values")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn near(actual: f32, expected: f32, tolerance: f32) {
     assert!(
         (actual - expected).abs() <= tolerance,

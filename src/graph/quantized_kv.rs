@@ -392,15 +392,12 @@ impl PackedAttention<'_> {
             &self.queries[head * HEAD_DIM..(head + 1) * HEAD_DIM],
             &mut query,
         )?;
+        let prepared_query = self.keys.quantizer.prepare_query(&query)?;
         for (score, row) in probabilities
             .iter_mut()
             .zip(self.keys.rows().chain(std::iter::once(self.current_keys)))
         {
-            *score = self
-                .keys
-                .quantizer
-                .score(&query, self.keys.record(row, kv_head))?
-                * self.scale;
+            *score = prepared_query.score(self.keys.record(row, kv_head))? * self.scale;
         }
         match self.arithmetic {
             super::Arithmetic::Source => crate::kernels::softmax_round_f16(probabilities)?,

@@ -9,6 +9,92 @@ fn input(width: usize, salt: u16) -> Result<Vec<f32>> {
         .collect()
 }
 
+#[test]
+fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()> {
+    let heads = 12;
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for scalar_only in [false, true] {
+            let (keys, values) = populated_caches(policy, 2, 65, scalar_only)?;
+            let before_keys = packed_bytes(&keys);
+            let before_values = packed_bytes(&values);
+            let queries = input(heads * HEAD_DIM, 9)?;
+            let projected = input(2 * heads * HEAD_DIM, 11)?;
+            let current_key = input(keys.width, 31)?;
+            let current_value = input(values.width, 41)?;
+            let key_cache = keys
+                .packed
+                .as_ref()
+                .ok_or_else(|| invalid("missing keys"))?;
+            let mut current = vec![0; key_cache.row_bytes];
+            for (key, output) in current_key
+                .as_chunks::<HEAD_DIM>()
+                .0
+                .iter()
+                .zip(current.chunks_exact_mut(key_cache.quantizer.encoded_len()))
+            {
+                key_cache.quantizer.encode(key, output)?;
+            }
+            for arithmetic in [
+                super::super::Arithmetic::Source,
+                super::super::Arithmetic::PinnedSwift,
+            ] {
+                let mut attended = vec![0.0; queries.len()];
+                let mut scores = vec![0.0; heads * 66];
+                attend(
+                    &keys,
+                    &values,
+                    &queries,
+                    &projected,
+                    &current_key,
+                    &current_value,
+                    &mut attended,
+                    &mut scores,
+                    heads,
+                    1.0 / 16.0,
+                    arithmetic,
+                    &RowParallelism::default(),
+                )?;
+                for (head, actual) in scores.chunks_exact(66).enumerate() {
+                    let mut query = [0.0; HEAD_DIM];
+                    key_cache
+                        .quantizer
+                        .rotate(&queries[head * HEAD_DIM..(head + 1) * HEAD_DIM], &mut query)?;
+                    let mut expected = Vec::new();
+                    for row in key_cache.rows().chain(std::iter::once(current.as_slice())) {
+                        expected.push(
+                            key_cache
+                                .quantizer
+                                .score(&query, key_cache.record(row, head / 6))?
+                                * (1.0 / 16.0),
+                        );
+                    }
+                    match arithmetic {
+                        super::super::Arithmetic::Source => {
+                            crate::kernels::softmax_round_f16(&mut expected)?
+                        }
+                        super::super::Arithmetic::PinnedSwift => {
+                            crate::kernels::pinned_attention::softmax_rotated_kv(&mut expected)?
+                        }
+                    }
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                assert_eq!(packed_bytes(&keys), before_keys);
+                assert_eq!(packed_bytes(&values), before_values);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn packed_bytes(cache: &KvCache) -> Vec<u8> {
     cache
         .packed
@@ -218,7 +304,6 @@ fn payload_accounts_for_scales_and_extended_softmax_preserves_old_boundary() -> 
     Ok(())
 }
 
-#[cfg(feature = "parallel-rows")]
 fn populated_caches(
     policy: KvCachePolicy,
     kv_heads: usize,

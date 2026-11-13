@@ -74,6 +74,63 @@ pub struct Quantizer {
     scalar_only: bool,
 }
 
+/// A finite rotated query whose immutable borrow spans one attention scan.
+pub(crate) struct PreparedQuery<'a> {
+    quantizer: &'a Quantizer,
+    query: &'a [f32; HEAD_DIM],
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    native: Option<bonsai_neon_dot::kv_quant::PreparedQuery<'a>>,
+}
+
+impl PreparedQuery<'_> {
+    /// Retains per-record validation and result rounding without rescanning the query.
+    pub(crate) fn score(&self, packed: &[u8]) -> Result<f32> {
+        let (scale, codes) = self.quantizer.record(packed)?;
+        if scale == 0.0 {
+            return Ok(0.0);
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let unscaled = if let Some(native) = &self.native {
+            native
+                .dot(codes)
+                .ok_or_else(|| invalid("KV codec native dot rejected arithmetic"))?
+        } else {
+            self.scalar_dot(codes)?
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        let unscaled = self.scalar_dot(codes)?;
+        let score = unscaled * scale;
+        if !score.is_finite() {
+            return Err(invalid("KV codec score overflow"));
+        }
+        Ok(score)
+    }
+
+    fn scalar_dot(&self, codes: &[u8]) -> Result<f32> {
+        scalar::dot(
+            codes,
+            self.quantizer.identity.bits.bit_width(),
+            self.quantizer.centroids(),
+            self.query,
+        )
+    }
+}
+
 impl Quantizer {
     /// Construct a codec, using native helpers when compiled for Windows ARM64.
     #[must_use]
@@ -216,17 +273,51 @@ impl Quantizer {
     /// # Errors
     /// Rejects malformed records, nonfinite queries and nonfinite arithmetic.
     pub fn score(&self, rotated_query: &[f32; HEAD_DIM], packed: &[u8]) -> Result<f32> {
-        finite_values(rotated_query)?;
-        let (scale, codes) = self.record(packed)?;
-        if scale == 0.0 {
-            return Ok(0.0);
-        }
-        let unscaled = self.dot(codes, rotated_query)?;
-        let score = unscaled * scale;
-        if !score.is_finite() {
-            return Err(invalid("KV codec score overflow"));
-        }
-        Ok(score)
+        self.prepare_query(rotated_query)?.score(packed)
+    }
+
+    /// Checks an immutable rotated query once before scanning packed history.
+    pub(crate) fn prepare_query<'a>(
+        &'a self,
+        query: &'a [f32; HEAD_DIM],
+    ) -> Result<PreparedQuery<'a>> {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let native = if self.scalar_only {
+            finite_values(query)?;
+            None
+        } else {
+            Some(
+                bonsai_neon_dot::kv_quant::PreparedQuery::new(
+                    self.identity.bits.bit_width(),
+                    self.centroids(),
+                    query,
+                )
+                .ok_or_else(|| invalid("KV codec row must contain only finite values"))?,
+            )
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        finite_values(query)?;
+        Ok(PreparedQuery {
+            quantizer: self,
+            query,
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            native,
+        })
     }
 
     /// Add one weighted packed value row into a rotated-space accumulator.
@@ -328,30 +419,6 @@ impl Quantizer {
             };
         }
         scalar::hadamard(row)
-    }
-
-    fn dot(&self, codes: &[u8], query: &[f32; HEAD_DIM]) -> Result<f32> {
-        #[cfg(all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc"
-        ))]
-        if !self.scalar_only {
-            return bonsai_neon_dot::kv_quant::dot(
-                codes,
-                self.identity.bits.bit_width(),
-                self.centroids(),
-                query,
-            )
-            .ok_or_else(|| invalid("KV codec native dot rejected arithmetic"));
-        }
-        scalar::dot(
-            codes,
-            self.identity.bits.bit_width(),
-            self.centroids(),
-            query,
-        )
     }
 
     fn add_codes(&self, codes: &[u8], scale: f32, out: &mut [f32; HEAD_DIM]) -> Result<()> {

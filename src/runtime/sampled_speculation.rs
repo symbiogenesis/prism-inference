@@ -370,6 +370,9 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
+    const PROMPT: [u32; 12] = [0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0];
+    const MATCHED: [u32; 6] = [0, 1, 2, 0, 0, 1];
+
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
     struct HybridState {
         tokens: Vec<u32>,
@@ -394,7 +397,7 @@ mod tests {
         type Checkpoint = HybridState;
 
         fn identity(&self) -> &'static str { "sampled-suffix-hybrid-control" }
-        fn vocab_size(&self) -> usize { 3 }
+        fn vocab_size(&self) -> usize { 4 }
         fn checkpoint_bytes(&self) -> usize { 256 }
         fn admit_work(&self, ingest: usize, evaluate: usize) -> Result<()> {
             self.admitted.set(Some((ingest, evaluate)));
@@ -414,7 +417,7 @@ mod tests {
             self.state.convolution.rotate_left(1);
             self.state.convolution[2] = token;
             let value = f32::from(u8::try_from(self.state.recurrent & 255)?);
-            Ok(vec![value, value * 0.5, -value])
+            Ok(vec![value, value * 0.5, -value, value * -0.5])
         }
         fn batched_evaluation_capacity(&self) -> usize { self.capacity }
         fn evaluate_batch_into(
@@ -473,7 +476,13 @@ mod tests {
         })
     }
 
-    fn suffix() -> Result<SuffixDraftConfig> { SuffixDraftConfig::new(1, 8, 4) }
+    fn suffix() -> Result<SuffixDraftConfig> {
+        let config = SuffixDraftConfig::new(1, 8, 4)?;
+        // Repeated single tokens select a more recent one-token overlapping
+        // continuation. This period-four history really proposes four tokens.
+        assert_eq!(SuffixDrafter::propose(&PROMPT, config, 4)?, MATCHED[..4]);
+        Ok(config)
+    }
 
     #[test]
     fn sampled_suffix_matches_target_draws_logits_and_full_state_at_every_rejection() -> Result<()> {
@@ -481,20 +490,20 @@ mod tests {
             for rejected in 0..=4 {
                 let mut ordinary = runtime(capacity)?;
                 let mut speculative = runtime(capacity)?;
-                let mut script = vec![0; 6];
-                if rejected < 4 { script[rejected] = 1; }
+                let mut script = (0..16).map(|index| MATCHED[index % 4]).collect::<Vec<_>>();
+                if rejected < 4 { script[rejected] = 3; }
                 let mut expected_sampler = ScriptSampler { script, ..ScriptSampler::default() };
                 let mut actual_sampler = expected_sampler.clone();
                 let mut expected = Vec::new();
                 let mut actual = Vec::new();
-                let options = Generation { max_tokens: 6, stop_tokens: Vec::new() };
+                let options = Generation { max_tokens: 16, stop_tokens: Vec::new() };
                 let deadline = Instant::now() + Duration::from_secs(60);
                 let expected_completion = ordinary.generate_sampled_until(
-                    &[0; 12], &options, Prefill::default(), &Cancellation::default(), deadline,
+                    &PROMPT, &options, Prefill::default(), &Cancellation::default(), deadline,
                     &mut expected_sampler, |token| { expected.push(token); Ok(()) },
                 )?;
                 let (actual_completion, stats) = speculative.generate_sampled_speculative_until(
-                    &[0; 12], &options, Prefill::default(), suffix()?, &Cancellation::default(), deadline,
+                    &PROMPT, &options, Prefill::default(), suffix()?, &Cancellation::default(), deadline,
                     &mut actual_sampler, |token| { actual.push(token); Ok(()) },
                 )?;
                 assert_eq!(actual_completion, expected_completion);
@@ -507,8 +516,8 @@ mod tests {
                 assert!(stats.target_evaluations >= actual.len());
                 assert_eq!(speculative.decoder.batches > 0, capacity > 0);
                 if capacity > 0 && rejected == 4 {
-                    assert_eq!(speculative.decoder.batches, 2);
-                    assert_eq!(stats.target_evaluations, 6);
+                    assert_eq!(speculative.decoder.batches, 4);
+                    assert_eq!(stats.target_evaluations, 16);
                     assert_eq!(stats.rollback_restores, 0);
                 }
                 if capacity > 0 && rejected < 4 {
@@ -524,20 +533,20 @@ mod tests {
         for stop_at in 0..=4 {
             let mut ordinary = runtime(8)?;
             let mut speculative = runtime(8)?;
-            let mut script = vec![0; 6];
-            script[stop_at] = 2;
+            let mut script = MATCHED.to_vec();
+            script[stop_at] = 3;
             let mut expected_sampler = ScriptSampler { script, ..ScriptSampler::default() };
             let mut actual_sampler = expected_sampler.clone();
             let mut expected = Vec::new();
             let mut actual = Vec::new();
-            let options = Generation { max_tokens: 6, stop_tokens: vec![2] };
+            let options = Generation { max_tokens: 6, stop_tokens: vec![3] };
             let deadline = Instant::now() + Duration::from_secs(60);
             let expected_completion = ordinary.generate_sampled_until(
-                &[0; 12], &options, Prefill::default(), &Cancellation::default(), deadline,
+                &PROMPT, &options, Prefill::default(), &Cancellation::default(), deadline,
                 &mut expected_sampler, |token| { expected.push(token); Ok(()) },
             )?;
             let (actual_completion, _) = speculative.generate_sampled_speculative_until(
-                &[0; 12], &options, Prefill::default(), suffix()?, &Cancellation::default(), deadline,
+                &PROMPT, &options, Prefill::default(), suffix()?, &Cancellation::default(), deadline,
                 &mut actual_sampler, |token| { actual.push(token); Ok(()) },
             )?;
             assert_eq!(actual_completion, expected_completion);
@@ -560,14 +569,14 @@ mod tests {
         let mut speculative = runtime(8)?;
         let mut sampler = ScriptSampler { script: vec![0], ..ScriptSampler::default() };
         let (completion, stats) = speculative.generate_sampled_speculative_until(
-            &[0; 12], &Generation { max_tokens: 4, stop_tokens: vec![0] }, Prefill::default(),
+            &PROMPT, &Generation { max_tokens: 4, stop_tokens: vec![0] }, Prefill::default(),
             suffix()?, &Cancellation::default(), Instant::now() + Duration::from_secs(60),
             &mut sampler, |_| Err(invalid("a sampled stop must never be delivered")),
         )?;
         assert_eq!(completion.generated_tokens, 0);
         assert_eq!(completion.finish, Finish::Stop);
-        assert_eq!(speculative.tokens, [0; 12]);
-        assert_eq!(speculative.decoder.state.tokens, [0; 12]);
+        assert_eq!(speculative.tokens, PROMPT);
+        assert_eq!(speculative.decoder.state.tokens, PROMPT);
         assert_eq!(stats.draft_tokens_accepted, 0);
         assert_eq!(stats.rollback_restores, 1);
         assert_eq!(sampler.draws, 1);
@@ -582,7 +591,7 @@ mod tests {
             let mut ordinary = runtime(8)?;
             let mut speculative = runtime(8)?;
             let mut expected_sampler = ReferenceSampler::new(Sampling {
-                temperature: 80.0, top_k: 3, top_p: 1.0,
+                temperature: 80.0, top_k: 4, top_p: 1.0,
             }, seed)?;
             let mut actual_sampler = expected_sampler.clone();
             let mut expected = Vec::new();
@@ -590,11 +599,11 @@ mod tests {
             let options = Generation { max_tokens: 6, stop_tokens: Vec::new() };
             let deadline = Instant::now() + Duration::from_secs(60);
             let expected_completion = ordinary.generate_sampled_until(
-                &[0; 12], &options, Prefill::default(), &Cancellation::default(), deadline,
+                &PROMPT, &options, Prefill::default(), &Cancellation::default(), deadline,
                 &mut expected_sampler, |token| { expected.push(token); Ok(()) },
             )?;
             let (actual_completion, _) = speculative.generate_sampled_speculative_until(
-                &[0; 12], &options, Prefill::default(), suffix()?, &Cancellation::default(), deadline,
+                &PROMPT, &options, Prefill::default(), suffix()?, &Cancellation::default(), deadline,
                 &mut actual_sampler, |token| { actual.push(token); Ok(()) },
             )?;
             assert_eq!(actual, expected);
@@ -602,7 +611,7 @@ mod tests {
             assert_eq!(speculative.decoder.state, ordinary.decoder.state);
             assert_eq!(speculative.logits, ordinary.logits);
             for _ in 0..10 {
-                assert_eq!(actual_sampler.sample(&[0.0; 3])?, expected_sampler.sample(&[0.0; 3])?);
+                assert_eq!(actual_sampler.sample(&[0.0; 4])?, expected_sampler.sample(&[0.0; 4])?);
             }
         }
         Ok(())
@@ -614,7 +623,7 @@ mod tests {
             let mut speculative = runtime(8)?;
             let cancellation = Cancellation::default();
             let mut sampler = ScriptSampler {
-                script: vec![0, 1, 0, 0],
+                script: vec![0, 3, 2, 0],
                 cancel: (failure == 2).then(|| cancellation.clone()),
                 ..ScriptSampler::default()
             };
@@ -625,7 +634,7 @@ mod tests {
             let options = Generation { max_tokens: 4, stop_tokens: Vec::new() };
             let mut delivered = 0;
             let result = speculative.generate_sampled_speculative_until(
-                &[0; 12], &options, Prefill::default(), suffix()?, &cancellation,
+                &PROMPT, &options, Prefill::default(), suffix()?, &cancellation,
                 Instant::now() + Duration::from_secs(60), &mut sampler,
                 |_| {
                     delivered += 1;
@@ -653,7 +662,7 @@ mod tests {
                 speculative.decoder.cancel_replay = None;
                 sampler.cancel = None;
                 let _ = speculative.generate_sampled_speculative_until(
-                    &[0; 12], &options, Prefill::default(), suffix()?, &Cancellation::default(),
+                    &PROMPT, &options, Prefill::default(), suffix()?, &Cancellation::default(),
                     Instant::now() + Duration::from_secs(60), &mut sampler, |_| Ok(()),
                 )?;
                 assert_eq!(sampler.draws, 4);
@@ -672,7 +681,7 @@ mod tests {
         let mut sampler = ScriptSampler { script: vec![0; 4], ..ScriptSampler::default() };
         let mut delivered = 0;
         let result = speculative.generate_sampled_speculative_until(
-            &[0; 12], &Generation { max_tokens: 4, stop_tokens: Vec::new() }, Prefill::default(),
+            &PROMPT, &Generation { max_tokens: 4, stop_tokens: Vec::new() }, Prefill::default(),
             suffix()?, &Cancellation::default(), Instant::now() + Duration::from_secs(60),
             &mut sampler, |_| { delivered += 1; Ok(()) },
         );
@@ -695,7 +704,7 @@ mod tests {
         };
         let mut delivered = 0;
         let result = speculative.generate_sampled_speculative_checked(
-            &[0; 12], &Generation { max_tokens: 4, stop_tokens: Vec::new() }, Prefill::default(), suffix()?,
+            &PROMPT, &Generation { max_tokens: 4, stop_tokens: Vec::new() }, Prefill::default(), suffix()?,
             &|| if draws.get() == 0 { Ok(()) } else {
                 Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "injected post-draw deadline").into())
             },

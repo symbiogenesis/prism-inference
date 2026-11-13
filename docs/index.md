@@ -26,7 +26,7 @@ generation path targets Swift/Bonsai; broader Prism models are planned.
 | Run upstream source/backend and codec checks | [Runtime conformance](prism-upstream-tests.md) |
 | Capture explicit rank-one adapter correctness evidence | [Adapter correctness path](rank-one-adapter.md) |
 | Check support and remaining qualification | [Roadmap](roadmap.md) |
-| Review the unreleased static-runtime replacement | [0.1.27 preparation](release-0.1.27.md) |
+| Review the unreleased static-runtime and full K4/V4 candidate | [0.1.27 preparation](release-0.1.27.md) |
 | Review the latest registry runtime and development ARM64 bundle | [0.1.26 delivery and runtime prerequisite](release-0.1.26.md) |
 
 ## Technical reference

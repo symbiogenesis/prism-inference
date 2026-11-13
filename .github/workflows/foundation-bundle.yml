@@ -100,7 +100,7 @@ jobs:
           cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
           cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --offline --release -p prism-inference -p prism-inference-server -p bonsai-hexagon-native -p bonsai-hexagon-runtime --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
           cargo +nightly-2026-11-09 check --manifest-path $manifest --locked --offline --release -p prism-inference --lib --no-default-features
-      - name: Verify only the named static-runtime unwind and drain controls
+      - name: Verify only named unwind, drain and scoped context controls
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -110,9 +110,21 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           $panicOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib kernels::parallel_rows::tile::tests::tiled_parallel_rows_worker_panic_cannot_strand_caller -- --exact 2>&1 | Out-String)
           $drainOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --test backend_threadpool failed_worker_group_drains_before_the_plan_is_reused -- --exact 2>&1 | Out-String)
+          $geometryOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib graph::swift_state::tests::full_context_state_scope_is_geometry_derived_and_preserves_generic_cap -- --exact 2>&1 | Out-String)
+          $identityOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib graph::swift_state::tests::state_scope_rejects_changed_counts_recurrence_and_mtp -- --exact 2>&1 | Out-String)
+          $boundsOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib graph::swift_state::tests::generic_constructors_and_excess_selected_budgets_reject_before_tensor_loading -- --exact 2>&1 | Out-String)
+          $capacityOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib swift_session::tests::selected_cache_capacity_covers_packed_geometry_and_staged_windows -- --exact 2>&1 | Out-String)
+          $checkpointOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib swift_session::tests::selected_cache_speculation_reserves_full_scaled_checkpoint -- --exact 2>&1 | Out-String)
+          $orderingOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference-server --features parallel-rows --lib native_child::tests::native_child_capacity_uses_final_cache_selection_in_either_argument_order -- --exact 2>&1 | Out-String)
           foreach ($control in @(
             @{ Name = 'kernels::parallel_rows::tile::tests::tiled_parallel_rows_worker_panic_cannot_strand_caller'; Output = $panicOutput },
-            @{ Name = 'failed_worker_group_drains_before_the_plan_is_reused'; Output = $drainOutput }
+            @{ Name = 'failed_worker_group_drains_before_the_plan_is_reused'; Output = $drainOutput },
+            @{ Name = 'graph::swift_state::tests::full_context_state_scope_is_geometry_derived_and_preserves_generic_cap'; Output = $geometryOutput },
+            @{ Name = 'graph::swift_state::tests::state_scope_rejects_changed_counts_recurrence_and_mtp'; Output = $identityOutput },
+            @{ Name = 'graph::swift_state::tests::generic_constructors_and_excess_selected_budgets_reject_before_tensor_loading'; Output = $boundsOutput },
+            @{ Name = 'swift_session::tests::selected_cache_capacity_covers_packed_geometry_and_staged_windows'; Output = $capacityOutput },
+            @{ Name = 'swift_session::tests::selected_cache_speculation_reserves_full_scaled_checkpoint'; Output = $checkpointOutput },
+            @{ Name = 'native_child::tests::native_child_capacity_uses_final_cache_selection_in_either_argument_order'; Output = $orderingOutput }
           )) {
             $control.Output | Write-Output
             $expected = '(?m)^test ' + [regex]::Escape($control.Name) + ' \.\.\. ok\r?$'
@@ -150,6 +162,7 @@ jobs:
             ReceiptControlsPassed = 9
             PeImportControlsPassed = 5
             StaticRuntimeUnwindControlsPassed = 2
+            ScopedContextControlsPassed = 6
             FinalSourceChecksPassed = $true
             ProductionLinkingPassed = $true
             ExternalVcRuntimeImportsAbsent = $true

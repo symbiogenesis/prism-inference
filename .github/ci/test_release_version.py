@@ -80,8 +80,18 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertEqual(test_commands, [
             prefix + "--lib kernels::parallel_rows::tile::tests::tiled_parallel_rows_worker_panic_cannot_strand_caller -- --exact 2>&1 | Out-String)",
             prefix + "--test backend_threadpool failed_worker_group_drains_before_the_plan_is_reused -- --exact 2>&1 | Out-String)",
+            *[prefix + "--lib " + name + " -- --exact 2>&1 | Out-String)" for name in (
+                "graph::swift_state::tests::full_context_state_scope_is_geometry_derived_and_preserves_generic_cap",
+                "graph::swift_state::tests::state_scope_rejects_changed_counts_recurrence_and_mtp",
+                "graph::swift_state::tests::generic_constructors_and_excess_selected_budgets_reject_before_tensor_loading",
+                "swift_session::tests::selected_cache_capacity_covers_packed_geometry_and_staged_windows",
+                "swift_session::tests::selected_cache_speculation_reserves_full_scaled_checkpoint",
+            )],
+            prefix.replace("-p prism-inference ", "-p prism-inference-server ")
+            + "--lib native_child::tests::native_child_capacity_uses_final_cache_selection_in_either_argument_order -- --exact 2>&1 | Out-String)",
         ])
         self.assertIn("StaticRuntimeUnwindControlsPassed = 2", workflow)
+        self.assertIn("ScopedContextControlsPassed = 6", workflow)
         self.assertIn("^running 1 test", workflow)
         self.assertIn("1 passed; 0 failed; 0 ignored", workflow)
         self.assertNotRegex((root / "Cargo.toml").read_text(encoding="utf-8"),

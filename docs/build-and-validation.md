@@ -13,8 +13,9 @@ Its registry source `53f2fcbc89bbdd43ca4b83aea234096626f26040` and binary source
 `ac941f2668ae93dba9824002b4597081457aa09f` retain distinct identities and checks.
 The published five-executable bundle imports `vcruntime140.dll` and requires
 the external ARM64 Visual C++ runtime. The local [0.1.27 preparation](release-0.1.27.md)
-adds target-specific static CRT linkage and a separate normal/delay-import gate;
-its registry and binary deliveries remain pending.
+adds target-specific static CRT linkage, a separate normal/delay-import gate,
+and exact-geometry full K4/V4 context accounting. Its registry and binary
+deliveries remain pending; larger-window qualification is separate.
 Earlier [0.1.25 registry](release-0.1.25.md) and
 [0.1.23 binary](release-0.1.23.md) delivery records retain their original
 identities and qualification limits. Install the published registry source with

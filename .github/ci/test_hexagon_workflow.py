@@ -89,6 +89,59 @@ class HexagonWorkflowTests(unittest.TestCase):
                             for command in commands))
         self.assert_native_lint(native)
 
+    def test_cache_keys_isolate_compiler_image_target_and_lane(self):
+        self.assertRegex(self.workflow, r"(?m)^  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'$")
+        self.assertRegex(self.workflow, r"(?m)^  CARGO_BUILD_FINGERPRINT: content$")
+        for name, lane, target in (
+            ("cross-native-arm64", "cross", "aarch64-pc-windows-msvc"),
+            ("native-contracts", "native", "${{ matrix.target }}"),
+        ):
+            with self.subTest(job=name):
+                job = self.job(name)
+                self.assertIn("id: rust\n", job)
+                prefix = (f"prism-hexagon-v1-{lane}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-"
+                          f"{target}-${{{{ steps.rust.outputs.image-identity }}}}-"
+                          "${{ steps.rust.outputs.compiler-identity }}-")
+                self.assertIn("key: " + prefix + "${{ hashFiles(", job)
+                self.assertIn("restore-keys: |\n            " + prefix + "\n", job)
+                self.assertIn("key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}", job)
+                for source in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**",
+                               "src/**", "tools/**", "tests/**", "server/**"):
+                    self.assertIn("'" + source + "'", job)
+
+    def test_cached_builds_never_skip_commands_or_restore_results(self):
+        for name, directory in (("cross-native-arm64", "Prism-Hexagon-Cross-Target"),
+                                ("native-contracts", "Prism-Hexagon-Native-Target")):
+            with self.subTest(job=name):
+                job = self.job(name)
+                # A cache hit reuses compiler inputs, never a prior check verdict.
+                self.assertNotIn("cache-hit", job)
+                self.assertNotRegex(job, r"(?m)^\s+if:")
+                paths = re.findall(r"(?m)^          path: (.+)$", job)
+                self.assertEqual(paths, ["|", "${{ runner.temp }}/" + directory])
+                self.assertNotIn("continue-on-error", job)
+                commands = self.cargo_commands(job)
+                expected = 2 if name == "cross-native-arm64" else 10
+                self.assertEqual(len(commands), expected)
+                for command in commands:
+                    if "fmt" not in command:
+                        self.assertTrue({"--locked", "--release", "--target-dir"}.issubset(command))
+
+    def test_runtime_contracts_keep_all_checks_and_share_only_build_directory(self):
+        job = self.job("native-contracts")
+        directories = re.findall(r"\$target = Join-Path \$env:RUNNER_TEMP '([^']+)'", job)
+        self.assertEqual(directories, ["Prism-Hexagon-Native-Target"] * 2)
+        commands = self.cargo_commands(job)
+        for required in (
+            {"fmt", "prism-inference", "bonsai-hexagon-runtime"},
+            {"test", "bonsai-hexagon-runtime", "--all-targets"},
+            {"test", "prism-inference", "--test", "graph", "projection_scope"},
+            {"clippy", "bonsai-hexagon-runtime", "--all-targets", "-D", "warnings"},
+            {"doc", "bonsai-hexagon-runtime", "--no-deps"},
+        ):
+            with self.subTest(required=required):
+                self.assertTrue(any(required.issubset(command) for command in commands))
+
 
 if __name__ == "__main__":
     unittest.main()

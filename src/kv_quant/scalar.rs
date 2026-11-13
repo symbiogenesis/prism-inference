@@ -60,6 +60,53 @@ pub(super) fn nearest(value: f32, centroids: &[f32; 16], levels: u8) -> u8 {
     code
 }
 
+/// The codec's active centroids are strictly increasing. Bracket the nearest
+/// pair without calculating every distance, retaining the original rounded
+/// absolute-distance comparison and first-code tie rule.
+#[expect(
+    clippy::float_cmp,
+    reason = "Exact rounded-distance equality identifies the codec's first-code tie plateau."
+)]
+pub(super) fn nearest_ordered(value: f32, centroids: &[f32; 16], levels: u8) -> u8 {
+    let mut low = 0;
+    let mut high = levels;
+    while low < high {
+        let middle = u8::midpoint(low, high);
+        if centroids[usize::from(middle)] < value {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let upper = low;
+    let mut code = upper.saturating_sub(1);
+    let mut distance = (value - centroids[usize::from(code)]).abs();
+    if upper < levels {
+        let upper_distance = (value - centroids[usize::from(upper)]).abs();
+        if upper_distance < distance {
+            code = upper;
+            distance = upper_distance;
+        }
+    }
+    // Large coordinates can round several distinct distances to the same
+    // binary32 value. The adjacent mathematical neighbor is then insufficient:
+    // recover the earliest code in that rounded minimum-distance plateau.
+    if code > 0 && (value - centroids[usize::from(code - 1)]).abs() == distance {
+        low = 0;
+        high = code;
+        while low < high {
+            let middle = u8::midpoint(low, high);
+            if (value - centroids[usize::from(middle)]).abs() > distance {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        code = low;
+    }
+    code
+}
+
 pub(super) fn write_code(bytes: &mut [u8], bits: u8, index: usize, code: u8) {
     let offset = index * usize::from(bits);
     let byte = offset / 8;

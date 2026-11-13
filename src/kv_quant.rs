@@ -354,8 +354,15 @@ impl Quantizer {
         self.forward(&mut row)?;
         let codes = &mut record[SCALE_BYTES..self.encoded_len()];
         let centroids = self.centroids();
+        // Preserve the explicit scalar codec's exhaustive nearest-code control;
+        // ordinary encoding uses the same rounded-distance rule over the
+        // immutable, strictly ordered active codebook.
         for (index, &value) in row.iter().enumerate() {
-            let code = scalar::nearest(value, centroids, self.identity.bits.levels());
+            let code = if self.scalar_only {
+                scalar::nearest(value, centroids, self.identity.bits.levels())
+            } else {
+                scalar::nearest_ordered(value, centroids, self.identity.bits.levels())
+            };
             if !(scale * centroids[usize::from(code)]).is_finite() {
                 return Err(invalid("KV codec reconstructed coordinate overflow"));
             }

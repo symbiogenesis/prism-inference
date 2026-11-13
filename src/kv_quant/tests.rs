@@ -17,6 +17,101 @@ fn input_row() -> [f32; HEAD_DIM] {
     row
 }
 
+#[test]
+fn ordered_centroid_search_preserves_exhaustive_rounding_and_first_ties() {
+    for bits in [Bits::Three, Bits::Four] {
+        let codec = Quantizer::scalar(bits, 91);
+        let centroids = codec.centroids();
+        let levels = bits.levels();
+        assert!(
+            centroids[..usize::from(levels)]
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        let check = |value: f32| {
+            assert_eq!(
+                scalar::nearest_ordered(value, centroids, levels),
+                scalar::nearest(value, centroids, levels),
+                "value bits {:08x}, precision {}",
+                value.to_bits(),
+                bits.bit_width(),
+            );
+        };
+        for value in [
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::MAX,
+            -f32::MAX,
+        ] {
+            check(value);
+        }
+        for &centroid in &centroids[..usize::from(levels)] {
+            for offset in 0..=4 {
+                check(f32::from_bits(centroid.to_bits() + offset));
+                check(f32::from_bits(centroid.to_bits() - offset));
+            }
+        }
+        for pair in centroids[..usize::from(levels)].windows(2) {
+            let midpoint = f32::midpoint(pair[0], pair[1]);
+            for offset in 0..=4 {
+                check(f32::from_bits(midpoint.to_bits().wrapping_add(offset)));
+                check(f32::from_bits(midpoint.to_bits().wrapping_sub(offset)));
+            }
+        }
+        // Sweep finite binary32 encodings across signs and exponents, including
+        // large values whose rounded minimum spans several codebook entries.
+        let mut state = 0x7f4a_7c15_u32;
+        for _ in 0..65_536 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let value = f32::from_bits(state);
+            if value.is_finite() {
+                check(value);
+            }
+        }
+        for exponent in 1..=254 {
+            for fraction in [0, 1, 0x003f_ffff, 0x007f_fffe, 0x007f_ffff] {
+                let word = exponent << 23 | fraction;
+                check(f32::from_bits(word));
+                check(f32::from_bits(word | 0x8000_0000));
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_encoding_preserves_exhaustive_records_across_scale_extremes() -> Result<()> {
+    let mut sparse = [0.0; HEAD_DIM];
+    sparse[19] = -3.0;
+    for bits in [Bits::Three, Bits::Four] {
+        for fitted in [false, true] {
+            let mut automatic = Quantizer::new(bits, 42);
+            let mut exhaustive = Quantizer::scalar(bits, 42);
+            if fitted {
+                automatic = automatic.with_fitted_scale();
+                exhaustive = exhaustive.with_fitted_scale();
+            }
+            for input in [
+                input_row(),
+                sparse,
+                [-0.0; HEAD_DIM],
+                [f32::MIN_POSITIVE; HEAD_DIM],
+                [f32::MAX / 64.0; HEAD_DIM],
+            ] {
+                let mut actual = vec![0xff; automatic.encoded_len()];
+                let mut expected = actual.clone();
+                automatic.encode(&input, &mut actual)?;
+                exhaustive.encode(&input, &mut expected)?;
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn record(bits: Bits, scale: f32) -> Vec<u8> {
     let quantizer = Quantizer::scalar(bits, 91);
     let mut packed = vec![0_u8; quantizer.encoded_len()];

@@ -13,7 +13,7 @@ function Assert-Condition {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
 }
-function New-RustupFixture {
+function Get-RustupFixture {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param()
@@ -64,7 +64,7 @@ function New-RustupFixture {
 
 $cases = [ordered]@{
     cold_install_is_verified = {
-        $fixture = New-RustupFixture
+        $fixture = Get-RustupFixture
         $fixture.Options.CacheRestored = $false
         $options = $fixture.Options
         $digest = Install-VerifiedRustToolchain @options
@@ -72,7 +72,7 @@ $cases = [ordered]@{
         Assert-Condition ($fixture.State.Installs -eq 1 -and $fixture.State.Uninstalls -eq 0) 'Cold install must not uninstall anything.'
     }
     exact_hit_skips_install = {
-        $fixture = New-RustupFixture
+        $fixture = Get-RustupFixture
         $options = $fixture.Options
         $digest = Install-VerifiedRustToolchain @options
         Assert-Condition ($digest -cmatch '^[a-f0-9]{64}$') 'Expected the verified compiler digest.'
@@ -80,7 +80,7 @@ $cases = [ordered]@{
     }
     invalid_hosted_cache_repairs_once = {
         foreach ($broken in @('component', 'host', 'sysroot', 'unreadable')) {
-            $fixture = New-RustupFixture
+            $fixture = Get-RustupFixture
             $fixture.State.Broken = $broken
             $options = $fixture.Options
             $digest = Install-VerifiedRustToolchain @options
@@ -89,7 +89,7 @@ $cases = [ordered]@{
         }
     }
     replacement_failure_stays_fatal = {
-        $fixture = New-RustupFixture
+        $fixture = Get-RustupFixture
         $fixture.State.Broken = 'component'
         $fixture.State.ReplacementBroken = $true
         $options = $fixture.Options
@@ -99,7 +99,7 @@ $cases = [ordered]@{
         Assert-Condition ($fixture.State.Installs -eq 1 -and $fixture.State.Uninstalls -eq 1) 'Invalid replacement must not retry.'
     }
     owner_install_is_never_removed = {
-        $fixture = New-RustupFixture
+        $fixture = Get-RustupFixture
         $fixture.State.Broken = 'component'
         $fixture.Options.HostedRunner = $false
         $options = $fixture.Options
@@ -109,7 +109,7 @@ $cases = [ordered]@{
         Assert-Condition ($fixture.State.Installs -eq 0 -and $fixture.State.Uninstalls -eq 0) 'Never remove an owner installation.'
     }
     fresh_failure_is_not_retried = {
-        $fixture = New-RustupFixture
+        $fixture = Get-RustupFixture
         $fixture.State.Broken = 'host'
         $fixture.State.ReplacementBroken = $true
         $fixture.Options.CacheRestored = $false
@@ -120,7 +120,7 @@ $cases = [ordered]@{
         Assert-Condition ($fixture.State.Installs -eq 1 -and $fixture.State.Uninstalls -eq 0) 'Fresh installation failure must not retry or uninstall.'
     }
     unsafe_identity_is_rejected_before_rustup = {
-        $fixture = New-RustupFixture
+        $fixture = Get-RustupFixture
         $fixture.Options.Toolchain = '../nightly'
         $options = $fixture.Options
         $failed = $false

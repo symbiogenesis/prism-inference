@@ -11,7 +11,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
-function Test-CiActionReferences {
+function Test-CiActionReference {
     [CmdletBinding()]
     [OutputType([string[]])]
     param([Parameter(Mandatory)][string]$RepositoryRoot)
@@ -71,7 +71,7 @@ function Invoke-CiWorkflowLint {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$Linter
     )
-    $errors = Test-CiActionReferences $RepositoryRoot
+    $errors = Test-CiActionReference $RepositoryRoot
     if ($errors.Count) { throw ($errors -join "`n") }
     $workflows = @(Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot '.github/workflows') -File |
         Where-Object Extension -cin @('.yml', '.yaml') | Sort-Object Name | ForEach-Object FullName)

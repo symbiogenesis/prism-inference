@@ -2658,6 +2658,10 @@ impl Drop for DriverArtifact {
 
 #[cfg(feature = "cli")]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the independent executable, complete wire record and state-budget rejection scenario together."
+)]
 fn native_driver_executes_verified_synthetic_gguf_and_enforces_state_budget() -> Result<()> {
     let mut model = fixture(false);
     model.metadata.insert(

@@ -2,6 +2,9 @@
 
 [Documentation index](index.md) · [CLI and workers](cli-and-workers.md)
 
+The [CI failure review](ci-failure-review.md) records the latest audited failure snapshot,
+its source-bound diagnoses and the selected CI safeguards.
+
 ## Install from source
 
 GitHub bundles and crates.io packages are separate deliveries. The published

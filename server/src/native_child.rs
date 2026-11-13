@@ -7,7 +7,7 @@ use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
     model::swift::Representation,
     runtime::PromptReuse,
-    swift_session::{SwiftSession, validate_context_capacity},
+    swift_session::{CpuPrefill, SwiftSession, validate_context_capacity, validate_prefill_capacity},
 };
 use bonsai_windows_credentials::validate_read_path;
 
@@ -26,6 +26,7 @@ struct Config {
     adapter: Option<PathBuf>,
     prompt_reuse: PromptReuse,
     kv_cache: KvCachePolicy,
+    cpu_prefill: Option<CpuPrefill>,
     capacity: Option<(usize, u64)>,
 }
 
@@ -36,6 +37,10 @@ fn invalid() -> io::Error {
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep trusted profile parsing and pre-I/O memory admission visibly ordered."
+)]
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut arguments = arguments.into_iter();
     let mut child = false;
@@ -45,6 +50,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut adapter = None;
     let mut prompt_reuse = None;
     let mut kv_cache = None;
+    let (mut prefill_tokens, mut prefill_scratch) = (None, None);
     let (mut context_tokens, mut memory_limit_bytes) = (None, None);
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
@@ -63,6 +69,12 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Some("--context-tokens") if context_tokens.is_none() => context_tokens = Some(value),
             Some("--memory-limit-bytes") if memory_limit_bytes.is_none() => {
                 memory_limit_bytes = Some(value)
+            }
+            Some("--cpu-prefill-tokens") if prefill_tokens.is_none() => {
+                prefill_tokens = Some(value)
+            }
+            Some("--cpu-prefill-scratch-bytes") if prefill_scratch.is_none() => {
+                prefill_scratch = Some(value)
             }
             Some("--port") if port.is_none() => {
                 port = Some(
@@ -123,8 +135,16 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         adapter,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
+        cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch)?,
         capacity: parse_capacity(context_tokens, memory_limit_bytes)?,
     };
+    if let Some(prefill) = config.cpu_prefill {
+        let (context, memory) = config.capacity.ok_or_else(invalid)?;
+        if config.kv_cache != KvCachePolicy::F16 {
+            return Err(invalid());
+        }
+        validate_prefill_capacity(context, memory, Some(prefill)).map_err(|_| invalid())?;
+    }
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
     {
@@ -140,6 +160,29 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         validate_read_path(path)?;
     }
     Ok(config)
+}
+
+fn parse_prefill(
+    tokens: Option<OsString>,
+    scratch: Option<OsString>,
+) -> io::Result<Option<CpuPrefill>> {
+    match (tokens, scratch) {
+        (None, None) => Ok(None),
+        (Some(tokens), Some(scratch)) => {
+            let tokens = tokens
+                .to_str()
+                .ok_or_else(invalid)?
+                .parse::<usize>()
+                .map_err(|_| invalid())?;
+            let scratch = scratch
+                .to_str()
+                .ok_or_else(invalid)?
+                .parse::<usize>()
+                .map_err(|_| invalid())?;
+            CpuPrefill::new(tokens, scratch).map(Some).map_err(|_| invalid())
+        }
+        _ => Err(invalid()),
+    }
 }
 
 fn parse_capacity(
@@ -203,7 +246,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         .map_err(|error| startup::at(Stage::Key, &error))?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_context(
+    let mut session = SwiftSession::load_profile_with_prefill(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
@@ -215,6 +258,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
             bonsai_prism_runtime::model::swift::CONTEXT_TOKENS,
             |(tokens, _)| tokens,
         ),
+        config.cpu_prefill,
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     session
@@ -290,6 +334,61 @@ mod tests {
             assert!(
                 parse_capacity(tokens.map(OsString::from), memory.map(OsString::from)).is_err()
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "One admission control retains valid tile/reuse profiles beside all paired-option rejections."
+    )]
+    fn native_child_cpu_prefill_is_paired_fp16_and_memory_admitted() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES,
+        };
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(), model,
+            "--key-file".into(), key,
+            "--port".into(), "8081".into(),
+            "--seed".into(), "42".into(),
+        ];
+        assert!(parse(base.clone())?.cpu_prefill.is_none());
+        let reserve = 64 * 1024 * 1024;
+        let memory = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES + reserve;
+        for tokens in ["8", "16", "32"] {
+            let mut selected = base.clone();
+            selected.extend([
+                "--kv-cache", "f16", "--prompt-reuse", "latest",
+                "--context-tokens", "8192", "--memory-limit-bytes", &memory.to_string(),
+                "--cpu-prefill-tokens", tokens,
+                "--cpu-prefill-scratch-bytes", &reserve.to_string(),
+            ].map(OsString::from));
+            let config = parse(selected.clone())?;
+            assert_eq!(config.cpu_prefill.map(CpuPrefill::tokens), Some(tokens.parse().map_err(io::Error::other)?));
+            assert_eq!(config.cpu_prefill.map(CpuPrefill::scratch_bytes), Some(usize::try_from(reserve).map_err(io::Error::other)?));
+            assert_eq!(config.prompt_reuse, PromptReuse::Latest);
+            assert_eq!(config.kv_cache, KvCachePolicy::F16);
+            let mut insufficient = selected.clone();
+            insufficient[16] = OsString::from((memory - 1).to_string());
+            assert!(parse(insufficient).is_err());
+            selected.extend(["--cpu-prefill-tokens", tokens].map(OsString::from));
+            assert!(parse(selected).is_err());
+        }
+        for options in [
+            vec!["--cpu-prefill-tokens", "8"],
+            vec!["--cpu-prefill-scratch-bytes", "67108864"],
+            vec!["--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "67108864"],
+            vec!["--kv-cache", "f16", "--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "67108864"],
+            vec!["--kv-cache", "rsq4", "--context-tokens", "8192", "--memory-limit-bytes", "20000000000", "--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "67108864"],
+            vec!["--kv-cache", "f16", "--context-tokens", "8192", "--memory-limit-bytes", "20000000000", "--cpu-prefill-tokens", "7", "--cpu-prefill-scratch-bytes", "67108864"],
+            vec!["--kv-cache", "f16", "--context-tokens", "8192", "--memory-limit-bytes", "20000000000", "--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "0"],
+        ] {
+            let mut arguments = base.clone();
+            arguments.extend(options.into_iter().map(OsString::from));
+            assert!(parse(arguments).is_err());
         }
         Ok(())
     }

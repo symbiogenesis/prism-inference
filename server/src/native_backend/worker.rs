@@ -50,7 +50,9 @@ impl Engine for SwiftSession {
             row_workers: self.row_workers(),
             context_tokens: self.context_tokens(),
             kv_cache: self.kv_cache_policy(),
-            startup_graph_identity: (self.kv_cache_policy() != KvCachePolicy::F16)
+            cpu_prefill: self.cpu_prefill(),
+            startup_graph_identity: (self.kv_cache_policy() != KvCachePolicy::F16
+                || self.cpu_prefill().is_some())
                 .then(|| Arc::from(self.decoder_identity())),
         })
     }
@@ -392,7 +394,9 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 fn install_default_hexagon_executor(session: &mut SwiftSession) {
-    if session.representation() != bonsai_prism_runtime::model::swift::Representation::Pq2 {
+    if session.representation() != bonsai_prism_runtime::model::swift::Representation::Pq2
+        || session.cpu_prefill().is_some()
+    {
         return;
     }
     let Some(package_dir) = discover_hexagon_package_directory() else {
@@ -501,15 +505,26 @@ impl Drop for Settlement<'_> {
     }
 }
 
+fn valid_graph_profile(profile: &ModelProfile) -> bool {
+    let Some(identity) = profile.startup_graph_identity.as_deref() else {
+        return profile.kv_cache == KvCachePolicy::F16 && profile.cpu_prefill.is_none();
+    };
+    if identity.is_empty() || identity.len() > 4096 {
+        return false;
+    }
+    if let Some(prefill) = profile.cpu_prefill {
+        profile.kv_cache == KvCachePolicy::F16
+            && identity.ends_with(&format!(":cpu-tiled-ffn-v1:{}", prefill.tokens()))
+    } else {
+        profile.kv_cache != KvCachePolicy::F16
+    }
+}
+
 impl Worker {
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
         let profile = engine.profile()?;
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
-            || match (profile.kv_cache, profile.startup_graph_identity.as_deref()) {
-                (KvCachePolicy::F16, None) => false,
-                (KvCachePolicy::F16, Some(_)) | (_, None) => true,
-                (_, Some(identity)) => identity.is_empty() || identity.len() > 4096,
-            }
+            || !valid_graph_profile(&profile)
         {
             return Err(NativeBackendError::Configuration);
         }

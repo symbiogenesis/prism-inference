@@ -7,6 +7,7 @@ use bonsai_prism_runtime::{
         swift::{self, Representation},
     },
     runtime::PromptReuse,
+    swift_session::CpuPrefill,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub(super) struct ModelProfile {
     pub row_workers: usize,
     pub context_tokens: usize,
     pub kv_cache: KvCachePolicy,
+    pub cpu_prefill: Option<CpuPrefill>,
     pub startup_graph_identity: Option<Arc<str>>,
 }
 
@@ -31,6 +33,7 @@ impl Default for ModelProfile {
             row_workers: 1,
             context_tokens: swift::CONTEXT_TOKENS,
             kv_cache: KvCachePolicy::F16,
+            cpu_prefill: None,
             startup_graph_identity: None,
         }
     }
@@ -61,6 +64,12 @@ impl ModelProfile {
         }
         if self.kv_cache != KvCachePolicy::F16 {
             model["kv_cache"] = json!(self.kv_cache.name());
+        }
+        if let Some(prefill) = self.cpu_prefill {
+            model["cpu_prefill_tokens"] = json!(prefill.tokens());
+            model["cpu_prefill_scratch_bytes"] = json!(prefill.scratch_bytes());
+        }
+        if self.kv_cache != KvCachePolicy::F16 || self.cpu_prefill.is_some() {
             // Adapter scales may change between requests. This records the
             // actual startup graph, never a claim about its current scale.
             model["startup_graph_identity"] = json!(self.startup_graph_identity.as_deref());

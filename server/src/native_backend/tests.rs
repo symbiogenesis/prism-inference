@@ -95,6 +95,7 @@ struct Observation {
     row_workers: Option<usize>,
     prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse,
     kv_cache: Option<bonsai_prism_runtime::graph::KvCachePolicy>,
+    cpu_prefill: Option<bonsai_prism_runtime::swift_session::CpuPrefill>,
     startup_graph_identity: Option<Arc<str>>,
     preparation_rejection: Option<(usize, Rejection)>,
 }
@@ -117,6 +118,7 @@ impl worker::Engine for FakeEngine {
                 .kv_cache
                 .unwrap_or(bonsai_prism_runtime::graph::KvCachePolicy::F16),
             startup_graph_identity: self.0.startup_graph_identity.clone(),
+            cpu_prefill: self.0.cpu_prefill,
             ..ModelProfile::default()
         })
     }
@@ -613,6 +615,68 @@ fn private_cache_profile_rejects_missing_unbounded_or_inconsistent_graph_identit
         ));
         assert!(observed.terminated.load(Ordering::Acquire));
     }
+}
+
+#[test]
+fn private_cpu_prefill_readiness_binds_tiles_scratch_and_latest_reuse() -> TestResult {
+    use bonsai_prism_runtime::{runtime::PromptReuse, swift_session::CpuPrefill};
+
+    run(async {
+        for tokens in [8, 16, 32] {
+            let prefill = CpuPrefill::new(tokens, 64 * 1024 * 1024)?;
+            let identity: Arc<str> = Arc::from(format!("verified-model:cpu-tiled-ffn-v1:{tokens}"));
+            let observed = Observation {
+                cpu_prefill: Some(prefill),
+                prompt_reuse: PromptReuse::Latest,
+                startup_graph_identity: Some(identity.clone()),
+                ..Observation::default()
+            };
+            let mut worker = Worker::new(FakeEngine(observed.clone()), 42)
+                .map_err(|error| format!("{error:?}"))?;
+            for route in ["/v1/models", "/props"] {
+                let (result, reply) = perform(&mut worker, request(route, &[], true)).await?;
+                assert_eq!(result, Ok(()));
+                let end = reply.array_windows().position(|part| part == b"\r\n\r\n")
+                    .ok_or("missing readiness response head")? + 4;
+                let body: Value = serde_json::from_slice(&reply[end..])?;
+                let profile = &body["data"][0];
+                assert_eq!(profile["cpu_prefill_tokens"], tokens);
+                assert_eq!(profile["cpu_prefill_scratch_bytes"], prefill.scratch_bytes());
+                assert_eq!(profile["prompt_reuse"], "latest");
+                assert_eq!(profile["startup_graph_identity"], identity.as_ref());
+                assert!(profile.get("kv_cache").is_none());
+            }
+            let original = pending(true, 128).map_err(|error| format!("{error:?}"))?.body;
+            for field in ["cpu_prefill_tokens", "cpu_prefill_scratch_bytes"] {
+                let mut value: Value = serde_json::from_slice(&original)?;
+                value[field] = json!(8);
+                assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile).is_err());
+            }
+            assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn private_cpu_prefill_rejects_mismatched_precision_or_graph_selection() -> TestResult {
+    use bonsai_prism_runtime::{graph::KvCachePolicy, swift_session::CpuPrefill};
+
+    let prefill = CpuPrefill::new(8, 64 * 1024 * 1024)?;
+    for (cache, identity) in [
+        (KvCachePolicy::F16, None),
+        (KvCachePolicy::F16, Some(Arc::from("verified-model:cpu-tiled-ffn-v1:16"))),
+        (KvCachePolicy::F16, Some(Arc::from("verified-model:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1"))),
+        (KvCachePolicy::Rotated4, Some(Arc::from("verified-model:cpu-tiled-ffn-v1:8"))),
+    ] {
+        let observed = Observation {
+            kv_cache: Some(cache), cpu_prefill: Some(prefill),
+            startup_graph_identity: identity,
+            ..Observation::default()
+        };
+        assert!(matches!(Worker::new(FakeEngine(observed), 42), Err(NativeBackendError::Configuration)));
+    }
+    Ok(())
 }
 
 #[test]

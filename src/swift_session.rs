@@ -77,6 +77,65 @@ pub fn validate_context_capacity(context_tokens: usize, memory_limit_bytes: u64)
     Ok(())
 }
 
+/// Explicit exact CPU prompt tiles and their separately charged scratch reserve.
+///
+/// Only FP16 KV is supported. This selects the existing sequential-GDN tile
+/// arithmetic, not the separately identified triangular GDN approximation.
+/// Owners must add the full reserve to their process allowance before loading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuPrefill {
+    tokens: usize,
+    scratch_bytes: usize,
+}
+
+impl CpuPrefill {
+    /// Construct an explicit tile selection without loading any model bytes.
+    ///
+    /// The graph independently checks its geometry-derived minimum reservation
+    /// during loading. A larger caller reserve retains its full admission charge.
+    ///
+    /// # Errors
+    /// Rejects tile sizes other than 8, 16 or 32 and an empty scratch reserve.
+    pub fn new(tokens: usize, scratch_bytes: usize) -> Result<Self> {
+        if !matches!(tokens, 8 | 16 | 32) || scratch_bytes == 0 {
+            return Err(invalid("invalid CPU tiled prefill selection or scratch reserve"));
+        }
+        Ok(Self { tokens, scratch_bytes })
+    }
+
+    /// Maximum prompt tokens sharing one layer-major projection tile.
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+
+    /// Additional process-memory allowance reserved by the owning launcher.
+    #[must_use]
+    pub const fn scratch_bytes(self) -> usize {
+        self.scratch_bytes
+    }
+
+}
+
+/// Validate context plus the entire explicitly selected CPU tile reservation.
+///
+/// This performs no artifact I/O or allocation. The process owner separately
+/// enforces the supplied allowance and retains the existing physical host reserve.
+///
+/// # Errors
+/// Rejects invalid context capacity, insufficient memory and reservation overflow.
+pub fn validate_prefill_capacity(
+    context_tokens: usize,
+    memory_limit_bytes: u64,
+    prefill: Option<CpuPrefill>,
+) -> Result<()> {
+    let reserve = prefill.map_or(0, CpuPrefill::scratch_bytes);
+    let available = memory_limit_bytes
+        .checked_sub(u64::try_from(reserve)?)
+        .ok_or_else(|| invalid("Swift CPU prefill memory allowance rejected"))?;
+    validate_context_capacity(context_tokens, available)
+}
+
 /// Largest complete displayed output retained or delivered by one request.
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -135,6 +194,7 @@ pub struct SwiftSession {
     owner: Arc<()>,
     representation: Representation,
     kv_cache: KvCachePolicy,
+    cpu_prefill: Option<CpuPrefill>,
     adapter_identity: Option<String>,
     runtime: Runtime<Qwen35>,
     chat: SwiftChatSession,
@@ -268,7 +328,51 @@ impl SwiftSession {
         kv_cache: KvCachePolicy,
         context_tokens: usize,
     ) -> Result<Self> {
+        Self::load_profile_with_prefill(
+            path,
+            representation,
+            adapter_path,
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            context_tokens,
+            None,
+        )
+    }
+
+    /// Load an explicitly selected exact CPU tiled-prefill profile.
+    ///
+    /// Existing loaders keep ordinary prompt ingestion. An explicit tile requires
+    /// FP16 KV; incompatible precision is rejected before artifact I/O. The model
+    /// owner must charge [`CpuPrefill::scratch_bytes`] in addition to ordinary
+    /// context/process admission, using [`validate_prefill_capacity`]. Graph
+    /// construction independently rejects an insufficient geometry-specific reserve.
+    /// Reset, adapter changes and exact latest-prefix reuse retain this selection.
+    /// No sampling, decode, triangular-GDN or automatic accelerator policy changes.
+    ///
+    /// # Errors
+    /// Rejects incompatible precision or scratch and the errors of
+    /// [`Self::load_profile_with_context`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The explicit tile policy extends the compatible immutable profile loader."
+    )]
+    pub fn load_profile_with_prefill(
+        path: &Path,
+        representation: Representation,
+        adapter_path: Option<&Path>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+        context_tokens: usize,
+        cpu_prefill: Option<CpuPrefill>,
+    ) -> Result<Self> {
         validate_context_capacity(context_tokens, u64::MAX)?;
+        if cpu_prefill.is_some() && kv_cache != KvCachePolicy::F16 {
+            return Err(invalid("CPU tiled prefill requires explicit FP16 KV"));
+        }
         let state_budget = if context_tokens == swift::CONTEXT_TOKENS {
             STATE_MEMORY_BYTES
         } else {
@@ -307,6 +411,9 @@ impl SwiftSession {
             )?
         };
         decoder.set_row_parallelism(parallelism);
+        if let Some(prefill) = cpu_prefill {
+            decoder = decoder.with_tiled_prefill(prefill.tokens, prefill.scratch_bytes)?;
+        }
         let runtime = Runtime::new(
             decoder,
             Limits {
@@ -319,6 +426,7 @@ impl SwiftSession {
             owner: Arc::new(()),
             representation,
             kv_cache,
+            cpu_prefill,
             adapter_identity,
             runtime,
             chat,
@@ -347,6 +455,12 @@ impl SwiftSession {
     #[must_use]
     pub const fn kv_cache_policy(&self) -> KvCachePolicy {
         self.kv_cache
+    }
+
+    /// Immutable exact CPU prompt-tile policy, absent for ordinary ingestion.
+    #[must_use]
+    pub const fn cpu_prefill(&self) -> Option<CpuPrefill> {
+        self.cpu_prefill
     }
 
     /// Observe live state capacities and payload without copying cache contents.
@@ -744,11 +858,51 @@ fn check_request(cancellation: &Cancellation, deadline: Instant) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_TOKEN_MEMORY_BYTES, MAX_CONTEXT_TOKENS, NON_CONTEXT_MEMORY_BYTES, PreparedChat,
-        validate_adapter_scale, validate_context_capacity, validate_prompt_owner,
+        CONTEXT_TOKEN_MEMORY_BYTES, CpuPrefill, MAX_CONTEXT_TOKENS, NON_CONTEXT_MEMORY_BYTES,
+        PreparedChat, SwiftSession, validate_adapter_scale, validate_context_capacity,
+        validate_prefill_capacity, validate_prompt_owner,
     };
-    use crate::Result;
-    use std::sync::Arc;
+    use crate::{Result, graph::KvCachePolicy, kernels::{MatvecBackend, RowParallelism}, model::swift::Representation};
+    use std::{path::Path, sync::Arc};
+
+    #[test]
+    fn cpu_prefill_requires_fp16_before_artifact_io_and_charges_full_reserve() -> Result<()> {
+        let reserve = 64 * 1024 * 1024;
+        let context = 8_192;
+        let base = NON_CONTEXT_MEMORY_BYTES
+            + u64::try_from(context)? * CONTEXT_TOKEN_MEMORY_BYTES;
+        validate_prefill_capacity(context, base, None)?;
+        for tokens in [8, 16, 32] {
+            let selected = CpuPrefill::new(tokens, reserve)?;
+            assert_eq!(selected.tokens(), tokens);
+            assert_eq!(selected.scratch_bytes(), reserve);
+            validate_prefill_capacity(context, base + u64::try_from(reserve)?, Some(selected))?;
+            assert!(validate_prefill_capacity(context, base + u64::try_from(reserve)? - 1, Some(selected)).is_err());
+            for cache in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+                let error = SwiftSession::load_profile_with_prefill(
+                    Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
+                    Representation::Pq2,
+                    None,
+                    MatvecBackend::Scalar,
+                    42,
+                    RowParallelism::default(),
+                    cache,
+                    context,
+                    Some(selected),
+                )
+                .err()
+                .ok_or("incompatible cache was accepted")?;
+                assert_eq!(error.to_string(), "CPU tiled prefill requires explicit FP16 KV");
+            }
+        }
+        for tokens in [0, 1, 4, 7, 9, 64, usize::MAX] {
+            assert!(CpuPrefill::new(tokens, reserve).is_err());
+        }
+        assert!(CpuPrefill::new(8, 0).is_err());
+        let selected = CpuPrefill::new(8, reserve)?;
+        assert!(validate_prefill_capacity(context, 1, Some(selected)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn context_capacity_checks_memory_and_preserves_graph_state_ceiling() -> Result<()> {

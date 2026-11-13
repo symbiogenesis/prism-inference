@@ -40,6 +40,19 @@ use tokio::{
 pub(super) use worker::register_hexagon_model_path;
 use worker::{Event, Input, Output, Worker};
 
+/// Immutable projection placement requested by the trusted private child owner.
+///
+/// This selects execution only; it does not reduce memory admission or qualify
+/// a larger context. Requests cannot change placement after model startup.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Placement {
+    /// Preserve the existing optional resident Hexagon installation and CPU fallback.
+    #[default]
+    Auto,
+    /// Execute projections on the CPU without discovering or opening accelerators.
+    Cpu,
+}
+
 /// Value-free private child errors; keys, prompts and model diagnostics are absent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeBackendError {
@@ -84,6 +97,25 @@ pub async fn serve(
     session: SwiftSession,
     key: String,
 ) -> Result<(), NativeBackendError> {
+    serve_with_placement(listener, session, key, Placement::Auto).await
+}
+
+/// Serve a verified session with one immutable trusted projection placement.
+///
+/// CPU placement clears any supplied projection executor before worker creation
+/// and bypasses accelerator initialization on the model thread. Its readiness
+/// declares both the requested placement and CPU projection backend. Automatic
+/// placement preserves the existing readiness schema and initialization policy.
+/// Process, context and state memory allowances remain unchanged.
+///
+/// # Errors
+/// Rejects invalid listener/key configuration, worker startup or accept failure.
+pub async fn serve_with_placement(
+    listener: TcpListener,
+    mut session: SwiftSession,
+    key: String,
+    placement: Placement,
+) -> Result<(), NativeBackendError> {
     let address = listener
         .local_addr()
         .map_err(|_| NativeBackendError::Configuration)?;
@@ -93,8 +125,11 @@ pub async fn serve(
     }
     let policy =
         RequestPolicy::new(address.port(), &key).map_err(|_| NativeBackendError::Configuration)?;
+    if placement == Placement::Cpu {
+        session.set_projection_executor(None);
+    }
     let seed = session.seed();
-    let mut worker = Worker::new(session, seed)?;
+    let mut worker = Worker::with_placement(session, seed, placement)?;
     loop {
         let (client, peer) = listener
             .accept()

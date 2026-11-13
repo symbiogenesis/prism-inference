@@ -15,11 +15,13 @@ use bonsai_prism_runtime::{
 use bonsai_windows_credentials::validate_read_path;
 
 use crate::{
+    native_backend::Placement,
     service::bound_loopback_socket,
     startup::{self, Stage},
 };
 
 struct Config {
+    placement: Placement,
     model: PathBuf,
     key: PathBuf,
     port: u16,
@@ -54,6 +56,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut adapter = None;
     let mut prompt_reuse = None;
     let mut kv_cache = None;
+    let mut placement = None;
     let (mut prefill_tokens, mut prefill_scratch) = (None, None);
     let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) =
         (None, None, None);
@@ -133,10 +136,18 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                     _ => return Err(invalid()),
                 });
             }
+            Some("--placement") if placement.is_none() => {
+                placement = Some(match value.to_str() {
+                    Some("auto") => Placement::Auto,
+                    Some("cpu") => Placement::Cpu,
+                    _ => return Err(invalid()),
+                });
+            }
             _ => return Err(invalid()),
         }
     }
     let config = Config {
+        placement: placement.unwrap_or_default(),
         model: model.ok_or_else(invalid)?,
         key: key.ok_or_else(invalid)?,
         port: port.filter(|&n| n >= 1024).ok_or_else(invalid)?,
@@ -287,7 +298,9 @@ fn parse_capacity(
 /// verified model loading, listener setup and backend lifecycle failures.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     let config = parse(arguments).map_err(|error| startup::at(Stage::Arguments, &error))?;
-    crate::native_backend::register_hexagon_model_path(&config.model);
+    if config.placement == Placement::Auto {
+        crate::native_backend::register_hexagon_model_path(&config.model);
+    }
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
         .map_err(|error| startup::at(Stage::Environment, &error))?;
     let required_available_bytes = config.capacity.map_or(
@@ -334,7 +347,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         let listener = bound_loopback_socket(config.port)
             .and_then(|socket| socket.listen(1))
             .map_err(|error| startup::at(Stage::Listener, &error))?;
-        crate::native_backend::serve(listener, session, key)
+        crate::native_backend::serve_with_placement(listener, session, key, config.placement)
             .await
             .map_err(|_| {
                 startup::at(
@@ -358,6 +371,42 @@ mod tests {
             std::fs::write(path, [])?;
         }
         Ok((directory, paths.map(PathBuf::into_os_string)))
+    }
+
+    #[test]
+    fn native_child_placement_is_explicit_unique_and_does_not_change_capacity() -> io::Result<()> {
+        let (_directory, [model, key, _]) = files()?;
+        let base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        assert_eq!(parse(base.clone())?.placement, Placement::Auto);
+        for (name, expected) in [("auto", Placement::Auto), ("cpu", Placement::Cpu)] {
+            let mut selected = base.clone();
+            selected.extend(["--placement".into(), name.into()]);
+            let config = parse(selected.clone())?;
+            assert_eq!(config.placement, expected);
+            assert_eq!(config.capacity, None);
+            assert_eq!(config.kv_cache, KvCachePolicy::Rotated4);
+            selected.extend(["--placement".into(), name.into()]);
+            assert!(parse(selected).is_err());
+        }
+        for rejected in ["", "CPU", "npu", "gpu", "cpu ", "automatic"] {
+            let mut selected = base.clone();
+            selected.extend(["--placement".into(), rejected.into()]);
+            assert!(parse(selected).is_err());
+        }
+        let mut missing = base;
+        missing.push("--placement".into());
+        assert!(parse(missing).is_err());
+        Ok(())
     }
 
     #[test]

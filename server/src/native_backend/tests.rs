@@ -87,6 +87,7 @@ struct FakePrepared {
 }
 #[derive(Default, Clone)]
 struct Observation {
+    worker_initializations: Arc<AtomicUsize>,
     preparations: Arc<AtomicUsize>,
     executions: Arc<AtomicUsize>,
     state: Arc<AtomicUsize>,
@@ -110,6 +111,9 @@ impl Drop for FakeEngine {
 
 impl worker::Engine for FakeEngine {
     type Prepared = FakePrepared;
+    fn initialize_worker_thread(&mut self) {
+        self.0.worker_initializations.fetch_add(1, Ordering::Relaxed);
+    }
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
         Ok(ModelProfile {
             row_workers: self.0.row_workers.unwrap_or(1),
@@ -182,6 +186,31 @@ impl worker::Engine for FakeEngine {
         self.0.resets.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+#[test]
+fn cpu_placement_skips_accelerator_initializer_and_binds_readiness() -> TestResult {
+    for placement in [Placement::Auto, Placement::Cpu] {
+        let observed = Observation::default();
+        let worker = Worker::with_placement(FakeEngine(observed.clone()), 42, placement)
+            .map_err(|error| format!("{error:?}"))?;
+        let readiness = worker.profile.readiness(worker.seed);
+        let model = &readiness["data"][0];
+        if placement == Placement::Cpu {
+            assert_eq!(model["placement"], "cpu");
+            assert_eq!(model["projection_backend"], "cpu");
+        } else {
+            assert!(model.get("placement").is_none());
+            assert!(model.get("projection_backend").is_none());
+        }
+        drop(worker);
+        assert!(observed.terminated.load(Ordering::Acquire));
+        assert_eq!(
+            observed.worker_initializations.load(Ordering::Relaxed),
+            usize::from(placement == Placement::Auto)
+        );
+    }
+    Ok(())
 }
 
 async fn perform(

@@ -12,8 +12,11 @@ use bonsai_prism_runtime::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use super::Placement;
+
 #[derive(Clone)]
 pub(super) struct ModelProfile {
+    pub placement: Placement,
     pub representation: Representation,
     pub adapter: bool,
     pub prompt_reuse: PromptReuse,
@@ -28,6 +31,7 @@ pub(super) struct ModelProfile {
 impl Default for ModelProfile {
     fn default() -> Self {
         Self {
+            placement: Placement::Auto,
             representation: Representation::default(),
             adapter: false,
             prompt_reuse: PromptReuse::default(),
@@ -53,6 +57,10 @@ impl ModelProfile {
             "context_tokens": self.context_tokens, "seed": seed,
             "row_workers": self.row_workers,
         });
+        if self.placement == Placement::Cpu {
+            model["placement"] = json!("cpu");
+            model["projection_backend"] = json!("cpu");
+        }
         if self.representation != Representation::Pq2 || self.adapter {
             model["weight_representation"] = json!(self.representation.name());
             model["adapter_sha256"] = json!(self.adapter.then_some(SWIFT_ADAPTER_SHA256));

@@ -1,6 +1,6 @@
 //! A single joined model owner and acknowledged one-event output lane.
 
-use super::{NativeBackendError, PendingChat, profile::ModelProfile};
+use super::{NativeBackendError, PendingChat, Placement, profile::ModelProfile};
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
     runtime::{Cancellation, Completion},
@@ -35,6 +35,12 @@ pub(super) trait Engine: Send + 'static {
     fn initialize_worker_thread(&mut self) {}
 }
 
+fn initialize_for_placement(engine: &mut impl Engine, placement: Placement) {
+    if placement == Placement::Auto {
+        engine.initialize_worker_thread();
+    }
+}
+
 impl Engine for SwiftSession {
     type Prepared = crate::native_swift::NativeChat;
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
@@ -44,6 +50,7 @@ impl Engine for SwiftSession {
             return Err(NativeBackendError::Configuration);
         }
         Ok(ModelProfile {
+            placement: Placement::Auto,
             representation: self.representation(),
             adapter: self.adapter_identity().is_some(),
             prompt_reuse: self.prompt_reuse(),
@@ -545,8 +552,18 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
 }
 
 impl Worker {
+    #[cfg(test)]
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
-        let profile = engine.profile()?;
+        Self::with_placement(engine, seed, Placement::Auto)
+    }
+
+    pub(super) fn with_placement(
+        engine: impl Engine,
+        seed: u32,
+        placement: Placement,
+    ) -> Result<Self, NativeBackendError> {
+        let mut profile = engine.profile()?;
+        profile.placement = placement;
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
             || bonsai_prism_runtime::swift_session::validate_execution_capacity_with_kv(
                 profile.context_tokens,
@@ -573,7 +590,7 @@ impl Worker {
                     counted: None,
                     faulted: false,
                 };
-                state.engine.initialize_worker_thread();
+                initialize_for_placement(&mut state.engine, placement);
                 while let Ok(command) = receive.recv() {
                     let _settlement = Settlement {
                         busy: &active,

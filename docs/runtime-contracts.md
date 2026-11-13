@@ -229,6 +229,21 @@ order. Runner's published 0.1.25 remains fixed at 8K until a genuine source-boun
 compatible release is reviewed and repinned. Its 4 GiB host and 256 MiB startup
 reserves remain separate. Larger token bounds retain all wire-byte limits.
 
+The unreleased private child also accepts trusted `--placement auto|cpu`.
+Omission preserves automatic optional Hexagon placement. CPU placement skips
+model-package discovery and model-thread accelerator initialization, including
+driver/session opening and resident-weight provisioning. The public
+`native_backend::serve_with_placement` entry point additionally clears a supplied
+projection executor before constructing the CPU worker. HTTP requests cannot
+change this immutable selection. CPU readiness adds `placement: "cpu"` and
+`projection_backend: "cpu"`; automatic readiness retains its existing fields.
+This prepares a capacity-first CPU alternative without reducing the 11 GiB
+fixed allowance, per-token charges, Job admission or state/checkpoint limits.
+Usable RAM savings and complete-request latency require separate measured
+qualification before any larger capacity can be credited to this selection.
+Runner activation requires a genuine reviewed compatible release and its own
+trusted launch/readiness integration; published 0.1.25 does not accept this flag.
+
 `--memory-bytes` bounds retained model storage, not process memory. Allow additional
 headroom for parser/conversion scratch, graph workspace, active state, checkpoints,
 optional decoded-vocabulary/output storage and allocator overhead. Text mode admits

@@ -62,6 +62,92 @@ fn decode_oracle(
 }
 
 #[test]
+fn x1_provisional_gdn_native_path_matches_independent_rows_without_fallback() -> Result<()> {
+    let neon = fearless_simd::Level::baseline()
+        .as_neon()
+        .ok_or_else(|| invalid("baseline NEON was unavailable"))?;
+    for width in [16, 112, 128, 144, 240, 256] {
+        let previous = values(8 * width);
+        let key = values(width);
+        let mut query = values(width);
+        query.reverse();
+        let mut expected = previous.clone();
+        let mut expected_output = [0.0; 8];
+        for (state, output) in expected.chunks_exact_mut(width).zip(&mut expected_output) {
+            *output = decode_oracle(state, &key, &query, 0.875, 0.125, 0.625)?;
+        }
+        let mut actual = vec![f32::NAN; previous.len()];
+        let output = super::step_eight_rows_into(
+            neon,
+            std::array::from_fn(|row| &previous[row * width..(row + 1) * width]),
+            &mut mutable_rows(&mut actual, width)?,
+            &key,
+            &query,
+            0.875,
+            [0.125; 8],
+            0.625,
+        )
+        .ok_or_else(|| invalid("provisional native path declined finite supported rows"))?;
+        assert_eq!(bits(&actual), bits(&expected));
+        assert_eq!(output.map(f32::to_bits), expected_output.map(f32::to_bits));
+    }
+    Ok(())
+}
+
+#[test]
+fn x1_provisional_gdn_native_late_failure_rejects_dirty_rows() -> Result<()> {
+    let neon = fearless_simd::Level::baseline()
+        .as_neon()
+        .ok_or_else(|| invalid("baseline NEON was unavailable"))?;
+    let width = 128;
+    let previous = values(8 * width);
+    let frozen = bits(&previous);
+    let key = values(width);
+    let query = values(width);
+    let source = std::array::from_fn(|row| &previous[row * width..(row + 1) * width]);
+    let mut actual = vec![f32::NAN; previous.len()];
+    let mut inputs = [0.125; 8];
+    inputs[7] = f32::NAN;
+    assert!(
+        super::step_eight_rows_into(
+            neon,
+            source,
+            &mut mutable_rows(&mut actual, width)?,
+            &key,
+            &query,
+            0.875,
+            inputs,
+            0.625,
+        )
+        .is_none()
+    );
+    // A completed first update phase is still only disposable scratch.
+    assert!(actual[..4 * width].iter().all(|value| value.is_finite()));
+    assert_eq!(bits(&previous), frozen);
+    let mut expected = previous.clone();
+    let mut expected_output = [0.0; 8];
+    for (state, output) in expected.chunks_exact_mut(width).zip(&mut expected_output) {
+        *output = decode_oracle(state, &key, &query, 0.875, 0.125, 0.625)?;
+    }
+    assert_eq!(bits(&actual[..4 * width]), bits(&expected[..4 * width]));
+    let output = super::step_eight_rows_into(
+        neon,
+        source,
+        &mut mutable_rows(&mut actual, width)?,
+        &key,
+        &query,
+        0.875,
+        [0.125; 8],
+        0.625,
+    )
+    .ok_or_else(|| invalid("native retry declined valid source rows"))?;
+    assert_eq!(bits(&actual), bits(&expected));
+    assert_eq!(output.map(f32::to_bits), expected_output.map(f32::to_bits));
+    assert_eq!(bits(&previous), frozen);
+    Ok(())
+}
+
+#[test]
 fn pinned_gdn_decode_capacities_match_independent_scalar_bits() -> Result<()> {
     for width in [16, 112, 128, 144, 240, 256] {
         let mut previous = values(width);

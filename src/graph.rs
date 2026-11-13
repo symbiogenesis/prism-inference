@@ -984,9 +984,14 @@ impl Arithmetic {
                     self.gdn_step_row_from(previous[7], s7, key, query, decay, values[7], beta)?,
                 ])
             }
-            Self::PinnedSwift => crate::kernels::pinned_gdn::step_eight_rows_from(
-                previous, states, key, query, decay, values, beta,
-            ),
+            Self::PinnedSwift => {
+                // These rows belong exclusively to LayerDelta::Recurrent.
+                // Any graph error rejects all deltas before the infallible
+                // state swaps; live/checkpoint state stays immutable.
+                crate::kernels::pinned_gdn::step_eight_rows_provisional(
+                    previous, states, key, query, decay, values, beta,
+                )
+            }
         }
     }
 

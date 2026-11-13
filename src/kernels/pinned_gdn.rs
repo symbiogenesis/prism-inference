@@ -31,6 +31,10 @@ pub(crate) struct ChunkInput<'a> {
 #[path = "pinned_gdn_neon.rs"]
 mod neon;
 
+#[cfg(test)]
+#[path = "pinned_gdn_provisional_tests.rs"]
+mod provisional_tests;
+
 /// Matches the pinned NEON F32 dot, including its scalar remainder.
 ///
 /// # Errors
@@ -594,6 +598,53 @@ pub(crate) fn step_eight_rows_from(
         step_row_from(previous[6], s6, key, query, decay, values[6], beta)?,
         step_row_from(previous[7], s7, key, query, decay, values[7], beta)?,
     ])
+}
+
+/// Steps eight rows into the graph's unpublished recurrent-state delta.
+///
+/// The destination is disposable scratch: an error may leave any destination
+/// row changed. The caller must reject the complete delta on failure and must
+/// not use this operation for live state or an externally visible checkpoint.
+/// The immutable source remains available for defensive replay and retry.
+///
+/// # Errors
+/// Rejects unequal vector lengths before mutation, or a nonfinite intermediate.
+pub(crate) fn step_eight_rows_provisional(
+    previous: [&[f32]; 8],
+    states: [&mut [f32]; 8],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 8],
+    beta: f32,
+) -> Result<[f32; 8]> {
+    let width = key.len();
+    if query.len() != width
+        || previous.iter().any(|row| row.len() != width)
+        || states.iter().any(|row| row.len() != width)
+    {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::step_eight_rows_provisional(previous, states, key, query, decay, values, beta)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        step_eight_rows_from(previous, states, key, query, decay, values, beta)
+    }
 }
 
 /// Steps 8 GDN state rows across `inputs.len()` tokens from `previous` into `states`,

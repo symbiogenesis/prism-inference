@@ -5,6 +5,9 @@
 //! consumes that decayed block before replacing it with its checked update.
 //! Caller-owned rows remain untouched until the helper's existing publication
 //! point, so grouped fallback and single-row partial-error semantics are retained.
+//! The graph-only provisional decode helper instead uses unpublished delta rows
+//! directly; it never receives live state and rejects the entire graph delta on
+//! failure. Its defensive replay always reads the immutable committed source.
 //! Grouped rows combine every updated-lane finite predicate in a vector mask;
 //! its only horizontal reduction occurs before publication. Dot-result checks
 //! retain their original order. Single-row publication remains unchanged.
@@ -1344,6 +1347,180 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
         flush_blocks(state, row_blocks, width / 16);
     }
     Some(outputs)
+}
+
+/// Uses disposable graph delta rows for decayed and updated state. The source
+/// remains immutable, allowing the ordinary helper to recover original errors
+/// after any native failure without reading a partly updated destination.
+pub(super) fn step_eight_rows_provisional(
+    previous: [&[f32]; 8],
+    mut states: [&mut [f32]; 8],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 8],
+    beta: f32,
+) -> Result<[f32; 8]> {
+    let width = key.len();
+    if width > 0
+        && width <= 256
+        && width.is_multiple_of(16)
+        && let Some(outputs) = fearless_simd::Level::baseline().as_neon().and_then(|neon| {
+            step_eight_rows_into(neon, previous, &mut states, key, query, decay, values, beta)
+        })
+    {
+        return Ok(outputs);
+    }
+    // The native attempt may have dirtied disposable rows. Defensive replay
+    // reads only `previous`, preserving the original row/error precedence.
+    super::step_eight_rows_from(previous, states, key, query, decay, values, beta)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep immutable source and disposable eight-row work ownership explicit."
+)]
+fn step_eight_rows_into(
+    neon: Neon,
+    previous: [&[f32]; 8],
+    states: &mut [&mut [f32]; 8],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 8],
+    beta: f32,
+) -> Option<[f32; 8]> {
+    let mut scales = [0.0; 8];
+    for (group, ((previous, states), values)) in previous
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(states.as_chunks_mut::<4>().0)
+        .zip(values.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let deltas = decay_four_rows_into(neon, *previous, states, key, decay, *values, beta)?;
+        scales[group * 4..group * 4 + 4].copy_from_slice(&deltas);
+    }
+    // Every key dot precedes updates, as in the existing eight-row helper.
+    let mut outputs = [0.0; 8];
+    for (group, (states, scales)) in states
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(scales.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let values = update_four_rows_in_place(neon, states, key, query, *scales)?;
+        outputs[group * 4..group * 4 + 4].copy_from_slice(&values);
+    }
+    Some(outputs)
+}
+
+fn decay_four_rows_into(
+    neon: Neon,
+    previous: [&[f32]; 4],
+    states: &mut [&mut [f32]; 4],
+    key: &[f32],
+    decay: f32,
+    values: [f32; 4],
+    beta: f32,
+) -> Option<[f32; 4]> {
+    let decays = f32x4::splat(neon, decay);
+    let mut s0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s1 = [f32x4::splat(neon, 0.0); 4];
+    let mut s2 = [f32x4::splat(neon, 0.0); 4];
+    let mut s3 = [f32x4::splat(neon, 0.0); 4];
+    for (b, key_block) in key.as_chunks::<16>().0.iter().enumerate() {
+        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+        let offset = b * 16;
+        for r in 0..4 {
+            let prev_block = &previous[r][offset..offset + 16];
+            let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
+            let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
+            let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
+            let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
+            let state = &mut states[r][offset..offset + 16];
+            d0.store_slice(&mut state[0..4]);
+            d1.store_slice(&mut state[4..8]);
+            d2.store_slice(&mut state[8..12]);
+            d3.store_slice(&mut state[12..16]);
+            s0[r] = d0.mul_add_precise(k0, s0[r]);
+            s1[r] = d1.mul_add_precise(k1, s1[r]);
+            s2[r] = d2.mul_add_precise(k2, s2[r]);
+            s3[r] = d3.mul_add_precise(k3, s3[r]);
+        }
+    }
+    let mut scales = [0.0; 4];
+    for r in 0..4 {
+        let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
+        if !dot_k.is_finite() {
+            return None;
+        }
+        scales[r] = (values[r] - dot_k) * beta;
+    }
+    Some(scales)
+}
+
+fn update_four_rows_in_place(
+    neon: Neon,
+    states: &mut [&mut [f32]; 4],
+    key: &[f32],
+    query: &[f32],
+    scales: [f32; 4],
+) -> Option<[f32; 4]> {
+    let scales = scales.map(|scale| f32x4::splat(neon, scale));
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let mut q0 = [f32x4::splat(neon, 0.0); 4];
+    let mut q1 = [f32x4::splat(neon, 0.0); 4];
+    let mut q2 = [f32x4::splat(neon, 0.0); 4];
+    let mut q3 = [f32x4::splat(neon, 0.0); 4];
+    for (b, (key_block, query_block)) in key
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(query.as_chunks::<16>().0)
+        .enumerate()
+    {
+        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+        let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
+        let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
+        let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
+        let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
+        let offset = b * 16;
+        for r in 0..4 {
+            let state = &mut states[r][offset..offset + 16];
+            let scale = scales[r];
+            let u0 = scale.mul_add_precise(k0, f32x4::from_slice(neon, &state[0..4]));
+            let u1 = scale.mul_add_precise(k1, f32x4::from_slice(neon, &state[4..8]));
+            let u2 = scale.mul_add_precise(k2, f32x4::from_slice(neon, &state[8..12]));
+            let u3 = scale.mul_add_precise(k3, f32x4::from_slice(neon, &state[12..16]));
+            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
+            u0.store_slice(&mut state[0..4]);
+            u1.store_slice(&mut state[4..8]);
+            u2.store_slice(&mut state[8..12]);
+            u3.store_slice(&mut state[12..16]);
+            q0[r] = u0.mul_add_precise(qv0, q0[r]);
+            q1[r] = u1.mul_add_precise(qv1, q1[r]);
+            q2[r] = u2.mul_add_precise(qv2, q2[r]);
+            q3[r] = u3.mul_add_precise(qv3, q3[r]);
+        }
+    }
+    let mut outputs = [0.0; 4];
+    for r in 0..4 {
+        let out = ((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum();
+        if !out.is_finite() {
+            return None;
+        }
+        outputs[r] = out;
+    }
+    finite_mask.all_true().then_some(outputs)
 }
 
 /// Steps 8 GDN state rows across `inputs.len()` tokens simultaneously, keeping all 8

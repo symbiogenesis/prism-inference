@@ -2,7 +2,7 @@
 
 This source candidate adds a clean-room Rust cache codec for the 256-channel
 full-attention heads used by Swift. The public graph policy is
-`graph::KvCachePolicy::{F16, Rotated4, Rotated4Keys3Values}`. K4/V4 (`rsq4`) is
+`graph::KvCachePolicy::{F16, Rotated4, Rotated4FittedValues, Rotated4Keys3Values}`. K4/V4 (`rsq4`) is
 the owner-selected development default for Swift generation, sessions and workers.
 It is required within that selected service profile; request bodies cannot change
 precision and failures never switch to FP16. Generic graph constructors retain
@@ -53,7 +53,7 @@ FP16 preparation are retained; the pinned Swift softmax arithmetic has a separat
 
 ## Selection, identity and recovery
 
-The raw generation CLI accepts `--kv-cache f16|rsq4|rsq4k3v`, defaulting to `rsq4`
+The raw generation CLI accepts `--kv-cache f16|rsq4|rsq4vf|rsq4k3v`, defaulting to `rsq4`
 only after loading verifies the exact Swift PQ2/PTQ1 identity. Other models retain
 FP16. Tokenize mode rejects this option. Explicit `f16` supplies comparison/recovery;
 unsupported rotated geometry rejects instead of falling back. Completion metadata reports `kv_cache`
@@ -73,6 +73,46 @@ The JSONL `SwiftClient::connect` verifies the default cache and exact startup gr
 identity. Use `connect_with_kv_cache` when explicitly launching a different cache;
 FP16 retains its original readiness shape. Restart at a fresh-session boundary
 to change the immutable precision policy.
+
+### Guarded fitted-value scale candidate
+
+Explicit `rsq4vf` (`Rotated4FittedValues`) keeps version-1 four-bit keys and
+fits only the scales of four-bit values. It is available through the generation
+CLI, JSONL worker, private server and library selection above. It does not change
+`DEFAULT_KV_CACHE`, Runner's published runtime or request-time precision policy.
+The candidate retains the ordinary 4 GiB graph state ceiling; its session capacity
+calculation admits at most 241,664 tokens, without qualifying that context.
+
+`Quantizer::with_fitted_scale` selects codec version 2. After version-1 normalization,
+rotation and code selection, it fits `s = s_norm * dot(y,c) / dot(c,c)`, where `y`
+is the normalized rotated row and `c` contains the selected centroids. Both sums
+use ordered binary64 fused multiply-add operations; the proposed scale rounds
+to binary32. Nonpositive, nonfinite or reconstruction-overflowing candidates
+retain the original scale. Codes are never reassigned.
+
+Acceptance requires strictly lower measured squared error against
+`binary64(s_norm) * binary64(y[i])`, with actual binary32 `s*c[i]` reconstruction
+products and ordered binary64 squared-error accumulation. Equal error retains
+the baseline, including changes lost to rounding. This guard precedes the rounded
+inverse transform: it does not guarantee lower original-space error, attention
+output error, logits error or better answers. Canonical zero and atomic failures
+retain their existing contracts.
+
+K and V records still occupy 132 bytes per head, including the same four-byte
+scale. Readers, packed attention arithmetic, codebooks, rotations and retained
+scratch are unchanged. Encoding adds two bounded 256-coordinate scans and a
+division per nonzero value head; complete-request cost remains unmeasured.
+Current-token values use the same fitter as retained history. For identical input
+projections, key records and attention probabilities remain unchanged; future
+model states may diverge through changed values.
+
+The graph identity component `kv-rsq4vf-d256-rht3-v1` binds this policy's version-1
+keys and version-2 value scales; `rht3-v1` retains the rotation/layout family name.
+Checkpoint copies preserve the quantizer, and graph/prefix/readiness identities
+reject reuse across `rsq4` and `rsq4vf`. No record bytes are used for identity.
+Focused numerical fixtures cannot qualify native encoding cost or held-out model
+quality. Compare those before selecting this candidate as a default, retaining
+losing results and the existing power, budget and promotion requirements.
 
 Packed caches seal immutable 64-token pages and copy only their bounded tails
 when checkpointing. Every row is encoded and all storage growth is reserved before

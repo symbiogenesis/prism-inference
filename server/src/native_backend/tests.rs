@@ -589,7 +589,11 @@ fn private_rotated_cache_readiness_reports_startup_identity_and_rejects_request_
     use bonsai_prism_runtime::graph::KvCachePolicy;
 
     run(async {
-        for kv_cache in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for kv_cache in [
+            KvCachePolicy::Rotated4,
+            KvCachePolicy::Rotated4FittedValues,
+            KvCachePolicy::Rotated4Keys3Values,
+        ] {
             let identity: Arc<str> = Arc::from(format!(
                 "verified-model:graph:kv-{}-d256-rht3-v1:scale-1.3",
                 kv_cache.name()

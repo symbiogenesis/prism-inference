@@ -25,6 +25,8 @@ pub enum KvCachePolicy {
     F16,
     /// Four-bit rotated scalar keys and values, with one F32 scale per head.
     Rotated4,
+    /// Four-bit keys with version-2 guarded fitted scales on four-bit values.
+    Rotated4FittedValues,
     /// Four-bit keys and three-bit values, with one F32 scale per head.
     Rotated4Keys3Values,
 }
@@ -36,6 +38,7 @@ impl KvCachePolicy {
         match self {
             Self::F16 => "f16",
             Self::Rotated4 => "rsq4",
+            Self::Rotated4FittedValues => "rsq4vf",
             Self::Rotated4Keys3Values => "rsq4k3v",
         }
     }
@@ -69,7 +72,7 @@ impl KvCachePolicy {
     const fn bits(self) -> Option<(Bits, Bits)> {
         match self {
             Self::F16 => None,
-            Self::Rotated4 => Some((Bits::Four, Bits::Four)),
+            Self::Rotated4 | Self::Rotated4FittedValues => Some((Bits::Four, Bits::Four)),
             Self::Rotated4Keys3Values => Some((Bits::Four, Bits::Three)),
         }
     }
@@ -226,13 +229,17 @@ impl KvCache {
             return Self::new(width, context);
         };
         let mut cache = Self::new(width, context)?;
-        cache.packed = Some(Box::new(PackedCache::new(
+        let mut packed = PackedCache::new(
             width,
             context,
             if key { key_bits } else { value_bits },
             if key { KEY_SEED } else { VALUE_SEED },
             scalar,
-        )?));
+        )?;
+        if !key && policy == KvCachePolicy::Rotated4FittedValues {
+            packed.quantizer = packed.quantizer.with_fitted_scale();
+        }
+        cache.packed = Some(Box::new(packed));
         Ok(cache)
     }
 

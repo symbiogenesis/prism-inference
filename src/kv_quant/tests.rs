@@ -326,6 +326,111 @@ fn encode_preserves_norm_scale_and_has_bounded_fixture_error() -> Result<()> {
     Ok(())
 }
 
+fn rotated_reconstruction_error(
+    quantizer: &Quantizer,
+    input: &[f32; HEAD_DIM],
+    baseline: &[u8],
+    packed: &[u8],
+) -> Result<f64> {
+    let norm_scale = f32::from_le_bytes(baseline[..4].try_into()?);
+    let normalized =
+        input.map(|value| scalar::checked_f32(f64::from(value) / f64::from(norm_scale)));
+    let mut normalized_row = [0.0; HEAD_DIM];
+    for (value, result) in normalized_row.iter_mut().zip(normalized) {
+        *value = result?;
+    }
+    let mut target = [0.0; HEAD_DIM];
+    quantizer.rotate(&normalized_row, &mut target)?;
+    let mut reconstructed = [0.0; HEAD_DIM];
+    // Exercise the unchanged packed reader, independently of the fitter.
+    quantizer.accumulate(packed, 1.0, &mut reconstructed)?;
+    Ok(target
+        .iter()
+        .zip(reconstructed)
+        .map(|(&value, decoded)| {
+            (f64::from(value) * f64::from(norm_scale) - f64::from(decoded)).powi(2)
+        })
+        .sum())
+}
+
+#[test]
+fn fitted_scale_preserves_codes_identity_and_improves_rotated_fixture_error() -> Result<()> {
+    let mut sparse = [0.0; HEAD_DIM];
+    sparse[19] = 3.0;
+    let fixtures = [
+        input_row(),
+        sparse,
+        [1.0; HEAD_DIM],
+        input_row().map(|value| value * 1.0e-39),
+        input_row().map(|value| value * 1.0e30),
+    ];
+    let mut improvements = 0;
+    for bits in [Bits::Three, Bits::Four] {
+        let baseline_codec = Quantizer::scalar(bits, 42);
+        let fitted = baseline_codec.clone().with_fitted_scale();
+        let automatic = Quantizer::new(bits, 42).with_fitted_scale();
+        assert_eq!(baseline_codec.identity().version, 1);
+        assert_eq!(fitted.identity().version, 2);
+        assert_ne!(baseline_codec.identity(), fitted.identity());
+        assert_eq!(fitted.identity(), automatic.identity());
+        for input in &fixtures {
+            let mut baseline = vec![0; baseline_codec.encoded_len()];
+            let mut actual = vec![0; fitted.encoded_len()];
+            let mut native = vec![0; automatic.encoded_len()];
+            baseline_codec.encode(input, &mut baseline)?;
+            fitted.encode(input, &mut actual)?;
+            automatic.encode(input, &mut native)?;
+            assert_eq!(actual, native);
+            assert_eq!(&actual[4..], &baseline[4..]);
+            let before =
+                rotated_reconstruction_error(&baseline_codec, input, &baseline, &baseline)?;
+            let after = rotated_reconstruction_error(&baseline_codec, input, &baseline, &actual)?;
+            assert!(after <= before * (1.0 + 1.0e-12), "{after} > {before}");
+            improvements += usize::from(after < before);
+        }
+    }
+    assert!(
+        improvements > 0,
+        "fitted scaling must improve a nontrivial fixture"
+    );
+    Ok(())
+}
+
+#[test]
+fn fitted_scale_zero_and_invalid_encodes_preserve_atomicity() -> Result<()> {
+    for bits in [Bits::Three, Bits::Four] {
+        let codec = Quantizer::scalar(bits, 42).with_fitted_scale();
+        let mut packed = vec![0xff; codec.encoded_len()];
+        codec.encode(&[-0.0; HEAD_DIM], &mut packed)?;
+        assert!(packed.iter().all(|&byte| byte == 0));
+        let mut invalid = [1.0; HEAD_DIM];
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            invalid[19] = value;
+            assert!(codec.encode(&invalid, &mut packed).is_err());
+            assert!(packed.iter().all(|&byte| byte == 0));
+        }
+        let mut underflow = [0.0; HEAD_DIM];
+        underflow[0] = f32::from_bits(1);
+        assert!(codec.encode(&underflow, &mut packed).is_err());
+        assert!(codec.encode(&[0.0; HEAD_DIM - 1], &mut packed).is_err());
+        assert!(packed.iter().all(|&byte| byte == 0));
+    }
+    Ok(())
+}
+
+#[test]
+fn fitted_scale_keeps_baseline_for_unusable_or_unchanged_candidates() {
+    let codes = [0xff; HEAD_DIM / 2];
+    for (row, scale) in [
+        ([tables::FOUR[15]; HEAD_DIM], 1.0),
+        ([16.0; HEAD_DIM], f32::MAX),
+        ([0.01; HEAD_DIM], f32::from_bits(1)),
+    ] {
+        let selected = super::fitted_scale::select(&row, &codes, Bits::Four, &tables::FOUR, scale);
+        assert_eq!(selected.to_bits(), scale.to_bits());
+    }
+}
+
 #[test]
 fn canonical_zero_is_exact_and_rejects_alternate_zero_records() -> Result<()> {
     for bits in [Bits::Three, Bits::Four] {

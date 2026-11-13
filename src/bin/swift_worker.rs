@@ -25,7 +25,7 @@ use request::{MAX_FRAME_BYTES, Request};
 #[path = "../swift_worker_output.rs"]
 mod delivery;
 use delivery::{Delivery, write_record};
-const USAGE: &[u8] = b"Usage: bonsai-swift-worker --model <absolute-pinned-swift-gguf> --seed <u32> [--backend <auto|scalar>] [--row-workers <1..16>] [--kv-cache <f16|rsq4|rsq4k3v>]\nDevelopment default: rsq4 K4/V4 KV. Use --kv-cache f16 for explicit comparison/recovery.\nJSONL: {\"op\":\"count\",\"id\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16}\nUse op=complete with timeout_seconds (1..600), or {\"op\":\"reset\",\"id\":2}.\nInput frames require LF and are bounded to 1 MiB. Output is flushed JSONL.\nDeltas are provisional until complete. Close the worker for transport cancellation;\nlibrary owners can also cancel cooperatively through the session Cancellation.\nExisting process admission and ownership policies must wrap this worker.\nFull-model correctness and device qualification require retained comparison evidence.\n";
+const USAGE: &[u8] = b"Usage: bonsai-swift-worker --model <absolute-pinned-swift-gguf> --seed <u32> [--backend <auto|scalar>] [--row-workers <1..16>] [--kv-cache <f16|rsq4|rsq4vf|rsq4k3v>]\nDevelopment default: rsq4 K4/V4 KV. Use --kv-cache f16 for explicit comparison/recovery.\nJSONL: {\"op\":\"count\",\"id\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16}\nUse op=complete with timeout_seconds (1..600), or {\"op\":\"reset\",\"id\":2}.\nInput frames require LF and are bounded to 1 MiB. Output is flushed JSONL.\nDeltas are provisional until complete. Close the worker for transport cancellation;\nlibrary owners can also cancel cooperatively through the session Cancellation.\nExisting process admission and ownership policies must wrap this worker.\nFull-model correctness and device qualification require retained comparison evidence.\n";
 
 fn bad() -> bonsai_prism_runtime::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid Swift worker options").into()
@@ -59,6 +59,7 @@ fn load() -> Result<SwiftSession> {
                 kv_cache = Some(match value.to_str() {
                     Some("f16") => KvCachePolicy::F16,
                     Some("rsq4") => KvCachePolicy::Rotated4,
+                    Some("rsq4vf") => KvCachePolicy::Rotated4FittedValues,
                     Some("rsq4k3v") => KvCachePolicy::Rotated4Keys3Values,
                     _ => return Err(bad()),
                 });

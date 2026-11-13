@@ -54,7 +54,7 @@ pub const MAX_CONTEXT_TOKENS: usize = max_context_tokens(KvCachePolicy::F16);
 pub const fn kv_token_memory_bytes(kv_cache: KvCachePolicy) -> usize {
     match kv_cache {
         KvCachePolicy::F16 => 65_536,
-        KvCachePolicy::Rotated4 => 16_896,
+        KvCachePolicy::Rotated4 | KvCachePolicy::Rotated4FittedValues => 16_896,
         KvCachePolicy::Rotated4Keys3Values => 14_848,
     }
 }
@@ -70,7 +70,7 @@ pub const fn kv_token_memory_bytes(kv_cache: KvCachePolicy) -> usize {
 pub const fn context_token_memory_bytes(kv_cache: KvCachePolicy) -> u64 {
     let kv_bytes = match kv_cache {
         KvCachePolicy::F16 => 65_536,
-        KvCachePolicy::Rotated4 => 16_896,
+        KvCachePolicy::Rotated4 | KvCachePolicy::Rotated4FittedValues => 16_896,
         KvCachePolicy::Rotated4Keys3Values => 14_848,
     };
     2 * kv_bytes + 96 + 128
@@ -79,13 +79,16 @@ pub const fn context_token_memory_bytes(kv_cache: KvCachePolicy) -> u64 {
 /// Geometry-derived state/checkpoint ceiling for one explicitly selected Swift cache.
 ///
 /// K4/V4 admits the full model context with its narrow verified-geometry graph
-/// constructor. Generic graphs, FP16 and K4/V3 retain their 4 GiB ceiling.
+/// constructor. Generic graphs, FP16, fitted-value K4/V4 and K4/V3 retain their
+/// 4 GiB ceiling.
 /// This is source accounting, not measured memory or quality qualification.
 #[must_use]
 pub const fn state_limit_bytes(kv_cache: KvCachePolicy) -> usize {
     match kv_cache {
         KvCachePolicy::Rotated4 => crate::graph::SWIFT_RSQ4_FULL_STATE_BYTES,
-        KvCachePolicy::F16 | KvCachePolicy::Rotated4Keys3Values => crate::graph::MAX_STATE_BYTES,
+        KvCachePolicy::F16
+        | KvCachePolicy::Rotated4FittedValues
+        | KvCachePolicy::Rotated4Keys3Values => crate::graph::MAX_STATE_BYTES,
     }
 }
 
@@ -1261,6 +1264,7 @@ mod tests {
         for (cache, ceiling) in [
             (KvCachePolicy::F16, 62_720),
             (KvCachePolicy::Rotated4, 262_144),
+            (KvCachePolicy::Rotated4FittedValues, 241_664),
             (KvCachePolicy::Rotated4Keys3Values, 262_144),
         ] {
             // The graph codec independently computes packed records and scales.

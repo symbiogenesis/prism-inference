@@ -147,6 +147,7 @@ fn kv_cache_readiness_rejects_foreign_identity_settings_and_duplicate_fields() -
         ("max_frame_bytes", json!(42)),
         ("kv_cache", json!("f16")),
         ("kv_cache", json!("rsq4k3v")),
+        ("kv_cache", json!("rsq4vf")),
         ("kv_cache", json!(null)),
         ("startup_graph_identity", json!("foreign-codec")),
         ("startup_graph_identity", json!(null)),
@@ -168,6 +169,40 @@ fn kv_cache_readiness_rejects_foreign_identity_settings_and_duplicate_fields() -
         SwiftClient::connect(Cursor::new(Vec::new()), Vec::new(), invalid),
         Err(ClientError::InvalidConfiguration)
     ));
+    Ok(())
+}
+
+#[test]
+fn fitted_scale_readiness_requires_exact_owner_profile_and_graph() -> Result<()> {
+    let mut frame = ready();
+    frame["kv_cache"] = json!("rsq4vf");
+    frame["startup_graph_identity"] = json!(format!(
+        "{}:{}",
+        swift::MODEL_SHA256,
+        SWIFT_GRAPH_CONTRACT.replace("kv-f16", "kv-rsq4vf-d256-rht3-v1")
+    ));
+    let bytes = serde_json::to_string(&frame)? + "\n";
+    assert!(SwiftClient::connect(Cursor::new(bytes.clone()), Vec::new(), expected()).is_err());
+    assert!(
+        SwiftClient::connect_with_kv_cache(
+            Cursor::new(bytes),
+            Vec::new(),
+            expected(),
+            KvCachePolicy::Rotated4FittedValues
+        )
+        .is_ok()
+    );
+    frame["startup_graph_identity"] = ready()["startup_graph_identity"].clone();
+    let bytes = serde_json::to_string(&frame)? + "\n";
+    assert!(
+        SwiftClient::connect_with_kv_cache(
+            Cursor::new(bytes),
+            Vec::new(),
+            expected(),
+            KvCachePolicy::Rotated4FittedValues
+        )
+        .is_err()
+    );
     Ok(())
 }
 

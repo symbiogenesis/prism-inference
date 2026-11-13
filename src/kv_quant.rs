@@ -4,8 +4,9 @@
 //! QJL estimator. Three seeded signed, normalized Walsh-Hadamard passes spread
 //! a row before a symmetric Gaussian Lloyd-Max scalar codebook quantizes it.
 //! Each record contains a positive binary32 scale followed by 256 tightly packed
-//! codes. The scale is the original row's Euclidean norm divided by 16; no
-//! reconstructed-norm correction is applied. Zero has one canonical encoding.
+//! codes. Version 1 uses the original row's Euclidean norm divided by 16.
+//! Explicit version 2 fits that scale to the selected codes, with a rounded
+//! rotated-reconstruction error guard. Zero has one canonical encoding.
 //!
 //! [`Quantizer::score`] and [`Quantizer::accumulate`] consume packed codes directly
 //! in the rotated basis. Only one 256-channel scratch row is needed; a complete
@@ -15,6 +16,7 @@
 
 use crate::{Result, invalid};
 
+mod fitted_scale;
 mod scalar;
 mod tables;
 
@@ -27,6 +29,7 @@ const SCALE_BYTES: usize = size_of::<f32>();
 const MAX_RECORD_BYTES: usize = SCALE_BYTES + HEAD_DIM / 2;
 const ROTATION_PASSES: usize = 3;
 const FORMAT_VERSION: u32 = 1;
+const FITTED_SCALE_VERSION: u32 = 2;
 
 /// Packed scalar precision; both key and value precision are explicit policies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +254,17 @@ impl Quantizer {
         }
     }
 
+    /// Select version 2's guarded least-squares scale for fixed scalar codes.
+    ///
+    /// Packing, rotation and decoding are unchanged. Only encoding fits the
+    /// scale; owners must bind this different numerical identity to their cache.
+    /// The guard measures rotated reconstruction, not attention or answer quality.
+    #[must_use]
+    pub const fn with_fitted_scale(mut self) -> Self {
+        self.identity.version = FITTED_SCALE_VERSION;
+        self
+    }
+
     /// Mathematical and wire identity; scalar and native paths share it.
     #[must_use]
     pub const fn identity(&self) -> Identity {
@@ -308,8 +322,11 @@ impl Quantizer {
     /// Encode a complete row into an exactly sized, caller-owned packed record.
     ///
     /// A finite all-zero row produces scale `+0` and all-zero codes. For nonzero
-    /// rows the stored scale is the binary32-rounded Euclidean norm divided by
-    /// 16. Normalization uses that same stored scale, including for subnormals.
+    /// rows normalization uses the binary32-rounded Euclidean norm divided by
+    /// 16, including for subnormals. Version 1 stores that norm scale unchanged.
+    /// Version 2 keeps the same codes and fits the stored scale, accepting only
+    /// a finite positive candidate with strictly lower rotated squared error
+    /// after binary32 reconstruction products. Otherwise it keeps the norm scale.
     ///
     /// # Errors
     /// Rejects incorrect lengths, nonfinite input, a nonzero row whose scale
@@ -335,7 +352,6 @@ impl Quantizer {
             *value = scalar::checked_f32(f64::from(*value) / f64::from(scale))?;
         }
         self.forward(&mut row)?;
-        record[..SCALE_BYTES].copy_from_slice(&scale.to_le_bytes());
         let codes = &mut record[SCALE_BYTES..self.encoded_len()];
         let centroids = self.centroids();
         for (index, &value) in row.iter().enumerate() {
@@ -345,6 +361,12 @@ impl Quantizer {
             }
             scalar::write_code(codes, self.identity.bits.bit_width(), index, code);
         }
+        let scale = if self.identity.version == FITTED_SCALE_VERSION {
+            fitted_scale::select(&row, codes, self.identity.bits, centroids, scale)
+        } else {
+            scale
+        };
+        record[..SCALE_BYTES].copy_from_slice(&scale.to_le_bytes());
         out.copy_from_slice(&record[..self.encoded_len()]);
         Ok(())
     }

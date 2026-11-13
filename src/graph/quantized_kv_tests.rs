@@ -76,6 +76,66 @@ fn defensive_probabilities(
 }
 
 #[test]
+fn fitted_scale_values_preserve_key_bytes_and_attention_probabilities() -> Result<()> {
+    let (baseline_keys, baseline_values) = populated_caches(KvCachePolicy::Rotated4, 2, 65, true)?;
+    let (keys, values) = populated_caches(KvCachePolicy::Rotated4FittedValues, 2, 65, true)?;
+    assert_eq!(packed_bytes(&keys), packed_bytes(&baseline_keys));
+    assert_ne!(packed_bytes(&values), packed_bytes(&baseline_values));
+    let packed_keys = keys.packed.as_ref().ok_or_else(|| invalid("keys"))?;
+    let packed_values = values.packed.as_ref().ok_or_else(|| invalid("values"))?;
+    let old_keys = baseline_keys
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("keys"))?;
+    assert_eq!(packed_keys.quantizer.identity().version, 1);
+    assert_eq!(packed_values.quantizer.identity().version, 2);
+    let current = input(2 * HEAD_DIM, 77)?;
+    let queries = input(4 * HEAD_DIM, 19)?;
+    let mut encoded = vec![0; packed_keys.row_bytes];
+    for (row, output) in current
+        .as_chunks::<HEAD_DIM>()
+        .0
+        .iter()
+        .zip(encoded.as_chunks_mut::<132>().0)
+    {
+        packed_keys.quantizer.encode(row, output)?;
+    }
+    for head in 0..4 {
+        let expected = defensive_probabilities(
+            old_keys,
+            &encoded,
+            &queries,
+            head,
+            2,
+            super::super::Arithmetic::PinnedSwift,
+        )?;
+        let actual = defensive_probabilities(
+            packed_keys,
+            &encoded,
+            &queries,
+            head,
+            2,
+            super::super::Arithmetic::PinnedSwift,
+        )?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        KvCachePolicy::Rotated4FittedValues.layer_payload_bytes(256, 4, 8192)? * 16,
+        132 * 1024 * 1024
+    );
+    Ok(())
+}
+
+#[test]
 fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()> {
     let heads = 12;
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
@@ -238,7 +298,11 @@ fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<(
 
 #[test]
 fn packed_pages_and_partial_tail_snapshots_are_independent() -> Result<()> {
-    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
         let mut cache = KvCache::with_policy(2 * HEAD_DIM, 66, policy, false, true)?;
         for token in 0..63 {
             let row = input(2 * HEAD_DIM, token)?;
@@ -308,7 +372,11 @@ fn failed_second_head_preparation_preserves_committed_packed_bytes() -> Result<(
 
 #[test]
 fn packed_gqa_attention_matches_independently_decoded_dense_reference() -> Result<()> {
-    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
         let mut keys = KvCache::with_policy(2 * HEAD_DIM, 8, policy, true, true)?;
         let mut values = KvCache::with_policy(2 * HEAD_DIM, 8, policy, false, true)?;
         for position in 0..3 {

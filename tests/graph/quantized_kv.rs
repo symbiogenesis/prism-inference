@@ -599,7 +599,11 @@ fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Resul
     let mut exact = graph(KvCachePolicy::F16, MatvecBackend::Scalar)?;
     exact.evaluate(0)?;
     let exact_checkpoint = exact.checkpoint()?;
-    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
         let mut actual = graph(policy, MatvecBackend::Scalar)?;
         assert_ne!(actual.identity(), exact.identity());
         assert!(
@@ -659,8 +663,47 @@ fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Resul
 }
 
 #[test]
+fn fitted_scale_graph_replays_page_boundary_and_rejects_norm_profile() -> Result<()> {
+    let mut actual = graph(KvCachePolicy::Rotated4FittedValues, MatvecBackend::Scalar)?;
+    let mut automatic = graph(KvCachePolicy::Rotated4FittedValues, MatvecBackend::Auto)?;
+    let mut norm = graph(KvCachePolicy::Rotated4, MatvecBackend::Scalar)?;
+    assert_ne!(actual.identity(), norm.identity());
+    assert!(actual.identity().contains("kv-rsq4vf-d256-rht3-v1"));
+    for token in tokens(63) {
+        assert_eq!(
+            bits(actual.evaluate(token)?),
+            bits(automatic.evaluate(token)?)
+        );
+    }
+    let checkpoint = actual.checkpoint()?;
+    let frozen = graph_bits(&actual)?;
+    let expected = [1, 0, 1]
+        .into_iter()
+        .map(|token| actual.evaluate(token).map(bits))
+        .collect::<Result<Vec<_>>>()?;
+    let completed = graph_bits(&actual)?;
+    actual.restore(&checkpoint)?;
+    assert_eq!(graph_bits(&actual)?, frozen);
+    for (token, logits) in [1, 0, 1].into_iter().zip(expected) {
+        assert_eq!(bits(actual.evaluate(token)?), logits);
+    }
+    assert_eq!(graph_bits(&actual)?, completed);
+    let foreign = norm.checkpoint()?;
+    assert!(actual.restore(&foreign).is_err());
+    assert_eq!(graph_bits(&actual)?, completed);
+    let norm_before = graph_bits(&norm)?;
+    assert!(norm.restore(&checkpoint).is_err());
+    assert_eq!(graph_bits(&norm)?, norm_before);
+    Ok(())
+}
+
+#[test]
 fn rotated_kv_pages_restore_all_state_at_63_64_65_and_final_partial_page() -> Result<()> {
-    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
         let mut actual = graph(policy, MatvecBackend::Scalar)?;
         let empty = actual.checkpoint()?;
         let empty_bits = graph_bits(&actual)?;
@@ -773,7 +816,11 @@ fn rotated_kv_late_logit_failure_preserves_committed_full_and_recurrent_state() 
 
 #[test]
 fn rotated_kv_runtime_delivery_and_cancellation_roll_back_across_page_seal() -> Result<()> {
-    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
         let mut runtime = Runtime::new(
             graph(policy, MatvecBackend::Scalar)?,
             Limits {

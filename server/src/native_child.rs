@@ -132,6 +132,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                 kv_cache = Some(match value.to_str() {
                     Some("f16") => KvCachePolicy::F16,
                     Some("rsq4") => KvCachePolicy::Rotated4,
+                    Some("rsq4vf") => KvCachePolicy::Rotated4FittedValues,
                     Some("rsq4k3v") => KvCachePolicy::Rotated4Keys3Values,
                     _ => return Err(invalid()),
                 });
@@ -974,6 +975,7 @@ mod tests {
         for (name, expected) in [
             ("f16", KvCachePolicy::F16),
             ("rsq4", KvCachePolicy::Rotated4),
+            ("rsq4vf", KvCachePolicy::Rotated4FittedValues),
             ("rsq4k3v", KvCachePolicy::Rotated4Keys3Values),
         ] {
             let mut selected = base.clone();

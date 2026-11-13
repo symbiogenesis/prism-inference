@@ -79,8 +79,12 @@ when checkpointing. Every row is encoded and all storage growth is reserved befo
 the graph commits any KV, GDN, convolution or position delta. Snapshots restore
 the exact selected packed representation, not the original FP16 approximation.
 F32 GDN/convolution state stays unchanged. Codec/profile identities prevent
-cross-profile checkpoint reuse. Tiled prefill is explicitly rejected for these
-profiles; ordinary cancellation-aware sequential block ingestion remains supported.
+cross-profile checkpoint reuse. New local CPU tiles share packed layer/output
+projections while retaining causal per-token quantized attention and encoded
+append. Their target verifier supplies per-position logits at the selected cache
+precision. No FP16 history expansion or additional worker pool is allocated.
+Ordinary sequential ingestion remains supported; triangular GDN stays a separate
+FP16 profile. These consumers require their own source-bound release and gates.
 
 ## Memory observations
 

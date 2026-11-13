@@ -2,8 +2,8 @@
 
 The experimental graph API now consumes bounded packed multi-token projections
 inside real state-only Qwen3.5 prompt ingestion. Ordinary graphs retain their
-current policy. New local source also exposes an explicitly admitted FP16
-private-service profile and an independently selected batched target verifier.
+current policy. New local source also exposes an explicitly admitted private
+service profile and a sampled suffix consumer of the batched target verifier.
 These consumers are not in Runner's published 0.1.25 bundle; they change no
 runtime release, Runner pin or application default.
 
@@ -32,21 +32,22 @@ the full supplied reserve to the existing context/process allowance using
 `validate_prefill_capacity`, while retaining worker, allocator and host reserves.
 
 The private server accepts paired trusted `--cpu-prefill-tokens` and
-`--cpu-prefill-scratch-bytes` arguments only with explicit `--kv-cache f16` and
-paired `--context-tokens` / `--memory-limit-bytes`. Invalid pairing, precision,
-bounds or insufficient total allowance rejects before artifact I/O. Requests
-cannot change this selection. Startup readiness reports `cpu_prefill_tokens`,
+`--cpu-prefill-scratch-bytes` arguments with explicit `--kv-cache` and paired
+`--context-tokens` / `--memory-limit-bytes`. The selected FP16, K4/V4 or K4/V3
+policy is retained; packed-cache attention runs causally through its ordinary
+codec without FP16 history expansion. Invalid pairing, bounds or insufficient
+total allowance rejects before artifact I/O. Requests cannot change this selection. Startup readiness reports `cpu_prefill_tokens`,
 `cpu_prefill_scratch_bytes` and the exact `startup_graph_identity`.
 
 This profile retains sequential GDN arithmetic and skips implicit Hexagon
 discovery/installation. Explicit `--prompt-reuse latest` remains compatible;
-reset and adapter scale changes retain the immutable tile policy. Rotated KV
-and triangular GDN are separate profiles, not fallbacks. Full-model, long-prefix,
-adapter, cancellation/recovery and matched whole-request benefit remain pending.
+reset and adapter scale changes retain the immutable tile policy. Triangular
+GDN remains a separate FP16 profile. Full-model, long-prefix, adapter,
+cancellation/recovery and matched whole-request benefit remain pending.
 
 ## Explicit target-verification consumer
 
-After selecting exact FP16 tiles on an empty CPU graph, call
+After selecting tiles on an empty CPU graph at the chosen KV precision, call
 `Qwen35::tiled_verification_scratch_bytes` and charge that additional reservation
 before `with_tiled_verification`. The separate `cpu-tiled-verify-v1` identity
 admits at most eight candidate positions. It charges each full vocabulary row
@@ -56,8 +57,9 @@ and row metadata in addition to ordinary tile, state and checkpoint budgets.
 logits while layer-major packed projections, including a packed output head,
 share decoded weight blocks across candidates. Final-layer state-only narrowing
 is disabled for verification. Causal attention, convolution and sequential GDN
-remain complete. Triangular GDN, rotated KV and installed external projection
-executors reject the exact CPU verifier.
+remain complete. Rotated policies retain their selected approximate values and
+ordinary attention arithmetic; this does not establish FP16 equivalence.
+Triangular GDN and installed external projection executors reject the verifier.
 
 `Runtime::verify_draft_block` uses this capability for eligible multi-token
 drafts; ordinary graphs keep sequential verification. Candidate zero uses the
@@ -67,10 +69,45 @@ rejection restores the complete checkpoint, replays the accepted prefix and
 evaluates the correction. Work admission conservatively charges the proposed
 block plus possible replay; failed restore closes admission without retry.
 
-This is greedy block verification, not sampled serving. The suffix-generation
-loop and SwiftSession speculative completion remain sequential; stochastic
-acceptance/residual sampling and a useful drafter still require integration.
-Focused synthetic controls do not establish actual-model parity or speed.
+## Explicit sampled suffix consumer
+
+`Runtime::generate_sampled_speculative_until` consumes deterministic prompt/history
+suffix proposals with the actual caller sampler. Each position draws once from
+the target distribution. A matching draw accepts the point-mass proposal; a
+different draw already samples its conditional residual. No extra acceptance draw
+or separate draft sampler is used. Under identical per-position logits this keeps
+ordinary target filters, sampler history and RNG order. It does not implement
+correction for a probabilistic learned drafter.
+
+Eligible multi-token proposals use the real tiled target graph. Consecutive
+all-accepted blocks retain computed state and share weights again. Rejection or a
+stop restores the complete round checkpoint, replays the accepted prefix, and
+evaluates a non-stop correction. Stop tokens never enter state. Callback failure,
+cancellation or deadline expiry restores the whole request and caller sampler;
+a failed restore closes admission without retry. Rejected blocks and replay
+remain charged in work statistics and conservative admission.
+
+`CpuSpeculation::new(tokens, verification_scratch_bytes, checkpoint_bytes)` binds
+1 through 8 suffix positions to two additional memory reserves. The logits
+reserve must cover the graph's complete verification rows; the extra checkpoint
+reserve covers a round prefix beside the existing request rollback. Its minimum
+is the ordinary selected state budget (1 GiB at 8K, 4 GiB at other capacities).
+The complete caller reserves are charged before artifact I/O by
+`validate_execution_capacity`; they do not reduce existing context, worker or
+host reserves. `load_profile_with_execution` supplies this explicit selection;
+older loaders keep speculation absent.
+
+Trusted service startup supplies all three `--cpu-speculative-tokens`,
+`--cpu-verification-scratch-bytes` and `--cpu-speculative-checkpoint-bytes` options,
+plus admitted CPU tiles and paired context/process limits. Ordinary completion
+then uses the actual Swift temperature 1, top-20, top-p 0.95 sampler. Readiness
+binds the immutable suffix bound, both reserves, tile and selected graph identity.
+Existing phase-timing requests reject speculative selection before state changes
+because those counters cannot represent rejected and replayed work.
+
+Legacy greedy APIs and standalone `verify_stochastic_step` remain separate.
+Focused synthetic controls do not establish actual-model parity, stochastic
+quality or speed. Published bundles and Runner defaults are unchanged.
 
 ## Exact packed tiles
 

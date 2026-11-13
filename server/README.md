@@ -28,14 +28,26 @@ token, then independently requires that allowance plus a 4 GiB physical host
 reserve. This conservative source charge covers live and rollback FP16 KV,
 64-token/24-head publisher-style attention scores and context bookkeeping even
 when native quantized KV is selected. Native ordinary prefill is sequential.
-New local source offers explicit exact FP16 CPU tiles through paired trusted
+New local source offers CPU tiles through paired trusted
 `--cpu-prefill-tokens <8|16|32>` and `--cpu-prefill-scratch-bytes <usize>` options.
-Both require explicit `--kv-cache f16` and paired context/process-memory limits;
-the entire extra reserve is charged before model I/O. Readiness binds the tile,
-reserve and startup graph identity, and this CPU profile skips implicit Hexagon
-installation. Explicit latest-prefix reuse remains compatible. See
-[CPU tiled prefill](../docs/cpu-tiled-prefill.md#explicit-private-service-consumer);
-current published bundles and application defaults are unchanged.
+Both require explicit `--kv-cache` and paired context/process-memory limits;
+the selected FP16, K4/V4 or K4/V3 cache is retained and the entire extra reserve
+is charged before model I/O.
+Readiness binds the tile, reserve and startup graph identity. This CPU profile
+skips implicit Hexagon installation; explicit latest-prefix reuse stays compatible.
+
+An additional explicit triple selects sampled suffix generation:
+`--cpu-speculative-tokens <1..8>`, `--cpu-verification-scratch-bytes <usize>` and
+`--cpu-speculative-checkpoint-bytes <usize>`. It requires admitted CPU tiles and
+charges the full additional logits and complete-prefix recovery reserves beside
+ordinary request rollback. Swift's actual fixed sampler draws once per output
+position; deterministic matching proposals reuse target tiles and rejection
+restores/replays complete state. Readiness binds the proposal count, both reserves and
+`:cpu-tiled-verify-v1` identity. Existing phase-timing capture rejects this selection
+before changing state. See [CPU tiled prefill](../docs/cpu-tiled-prefill.md#explicit-private-service-consumer)
+and [sampled suffixes](../docs/cpu-tiled-prefill.md#explicit-sampled-suffix-consumer).
+Current published bundles and application defaults are unchanged; no measured
+speedup or actual-model qualification is claimed.
 
 The selected context is immutable and identical in exact chat tokenization,
 server admission, decoder/runtime bounds and authenticated `context_tokens`

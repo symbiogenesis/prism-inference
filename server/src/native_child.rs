@@ -455,6 +455,85 @@ mod tests {
     }
 
     #[test]
+    fn native_child_k4v3_capacity_covers_projected_and_full_model_windows() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::NON_CONTEXT_MEMORY_BYTES;
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        let cache = KvCachePolicy::Rotated4Keys3Values;
+        // Derive the process charge from the codec's records (including scales),
+        // two independently live caches, 24 score rows and token/page metadata.
+        let kv = cache
+            .layer_payload_bytes(256, 4, 1)
+            .map_err(io::Error::other)?
+            * 16;
+        let per_token = u64::try_from(2 * kv + 24 * 4 + 128).map_err(io::Error::other)?;
+        let gib = 1024 * 1024 * 1024;
+        let usable_at_20_gib = 20 * gib - 4 * gib - gib / 4 - NON_CONTEXT_MEMORY_BYTES;
+        assert!(170_240 * per_token <= usable_at_20_gib);
+        assert!(170_496 * per_token > usable_at_20_gib);
+        for context in [170_240, 262_144] {
+            let memory = NON_CONTEXT_MEMORY_BYTES + context * per_token;
+            for cache_first in [false, true] {
+                let capacity: [OsString; 4] = [
+                    "--context-tokens".into(),
+                    context.to_string().into(),
+                    "--memory-limit-bytes".into(),
+                    memory.to_string().into(),
+                ];
+                let cache_args = [OsString::from("--kv-cache"), "rsq4k3v".into()];
+                let mut args = base.clone();
+                if cache_first {
+                    args.extend(cache_args);
+                    args.extend(capacity);
+                } else {
+                    args.extend(capacity);
+                    args.extend(cache_args);
+                }
+                let selected = parse(args.clone())?;
+                assert_eq!(selected.kv_cache, cache);
+                assert_eq!(
+                    selected.capacity,
+                    Some((usize::try_from(context).map_err(io::Error::other)?, memory)),
+                );
+                let memory_index = if cache_first { 14 } else { 12 };
+                args[memory_index] = (memory - 1).to_string().into();
+                assert!(parse(args.clone()).is_err());
+                args[memory_index] = memory.to_string().into();
+                let cache_index = if cache_first { 10 } else { 14 };
+                for wrong_cache in ["f16", "rsq4"] {
+                    args[cache_index] = wrong_cache.into();
+                    assert!(parse(args.clone()).is_err());
+                }
+            }
+        }
+        let maximum_memory = NON_CONTEXT_MEMORY_BYTES + 262_144 * per_token;
+        for (tokens, memory) in [
+            (262_400, maximum_memory + 256 * per_token),
+            (262_144, u64::MAX),
+        ] {
+            assert!(
+                parse_capacity(
+                    Some(tokens.to_string().into()),
+                    Some(memory.to_string().into()),
+                    cache,
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "One admission control retains valid tile/reuse profiles beside all paired-option rejections."

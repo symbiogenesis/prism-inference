@@ -9,6 +9,8 @@ mod prefill;
 mod projection;
 #[path = "graph/quantized_kv.rs"]
 mod quantized_kv;
+#[path = "graph/sampled_suffix.rs"]
+mod sampled_suffix;
 #[path = "graph/verification.rs"]
 mod verification;
 

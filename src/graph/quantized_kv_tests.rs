@@ -52,6 +52,7 @@ fn defensive_probabilities(
     current: &[u8],
     queries: &[f32],
     head: usize,
+    heads_per_kv: usize,
     arithmetic: super::super::Arithmetic,
 ) -> Result<Vec<f32>> {
     let mut query = [0.0; HEAD_DIM];
@@ -59,7 +60,11 @@ fn defensive_probabilities(
         .rotate(&queries[head * HEAD_DIM..(head + 1) * HEAD_DIM], &mut query)?;
     let mut expected = Vec::new();
     for row in keys.rows().chain(std::iter::once(current)) {
-        expected.push(keys.quantizer.score(&query, keys.record(row, head / 6))? * (1.0 / 16.0));
+        expected.push(
+            keys.quantizer
+                .score(&query, keys.record(row, head / heads_per_kv))?
+                * (1.0 / 16.0),
+        );
     }
     match arithmetic {
         super::super::Arithmetic::Source => crate::kernels::softmax_round_f16(&mut expected)?,
@@ -100,7 +105,7 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                 super::super::Arithmetic::PinnedSwift,
             ] {
                 let mut attended = vec![0.0; queries.len()];
-                let mut scores = vec![0.0; heads * 66];
+                let mut scores = vec![0.0; 66];
                 attend(
                     &keys,
                     &values,
@@ -115,19 +120,24 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                     arithmetic,
                     &RowParallelism::default(),
                 )?;
-                for (head, actual) in scores.as_chunks::<66>().0.iter().enumerate() {
-                    let expected =
-                        defensive_probabilities(key_cache, &current, &queries, head, arithmetic)?;
-                    assert_eq!(
-                        actual
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>(),
-                        expected
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>()
-                    );
+                for head in 0..heads {
+                    let expected = defensive_probabilities(
+                        key_cache, &current, &queries, head, 6, arithmetic,
+                    )?;
+                    // A serial task overwrites its one row after each complete
+                    // head. Its final probabilities still expose exact bits.
+                    if head + 1 == heads {
+                        assert_eq!(
+                            scores
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            expected
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     let output = defensive_value_result(
                         &values,
                         &current_value,
@@ -314,7 +324,7 @@ fn packed_gqa_attention_matches_independently_decoded_dense_reference() -> Resul
         let queries = input(4 * HEAD_DIM, 9)?;
         let projected = input(8 * HEAD_DIM, 11)?;
         let mut actual = vec![0.0; 4 * HEAD_DIM];
-        let mut scores = vec![0.0; 4 * 4];
+        let mut scores = vec![0.0; 4];
         attend(
             &keys,
             &values,
@@ -457,7 +467,7 @@ fn attention_bits(
     let current_key = input(keys.width, 31)?;
     let current_value = input(values.width, 41)?;
     let mut attended = vec![0.0; queries.len()];
-    let mut scores = vec![0.0; heads * (keys.len / keys.width + 1)];
+    let mut scores = vec![0.0; score_rows(heads, parallelism) * (keys.len / keys.width + 1)];
     attend(
         keys,
         values,
@@ -472,11 +482,42 @@ fn attention_bits(
         arithmetic,
         parallelism,
     )?;
-    Ok(attended
+    let key_cache = keys
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("missing keys"))?;
+    let mut current = vec![0; key_cache.row_bytes];
+    for (key, output) in current_key
+        .as_chunks::<HEAD_DIM>()
+        .0
         .iter()
-        .chain(&scores)
-        .map(|value| value.to_bits())
-        .collect())
+        .zip(current.chunks_exact_mut(key_cache.quantizer.encoded_len()))
+    {
+        key_cache.quantizer.encode(key, output)?;
+    }
+    let chunk_heads = heads.div_ceil(parallelism.workers());
+    for (chunk, actual) in scores.chunks_exact(keys.len / keys.width + 1).enumerate() {
+        let last_head = ((chunk + 1) * chunk_heads).min(heads) - 1;
+        let expected = defensive_probabilities(
+            key_cache,
+            &current,
+            &queries,
+            last_head,
+            heads / key_cache.heads,
+            arithmetic,
+        )?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(attended.iter().map(|value| value.to_bits()).collect())
 }
 
 #[cfg(feature = "parallel-rows")]
@@ -484,7 +525,7 @@ fn attention_bits(
 fn parallel_packed_attention_preserves_serial_bits_across_pages_and_head_tails() -> Result<()> {
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
         for scalar in [true, false] {
-            for (kv_heads, heads, history) in [(2, 4, 0), (2, 12, 65), (3, 9, 2)] {
+            for (kv_heads, heads, history) in [(1, 1, 2), (2, 4, 0), (2, 12, 65), (3, 9, 2)] {
                 let (keys, values) = populated_caches(policy, kv_heads, history, scalar)?;
                 for arithmetic in [
                     super::super::Arithmetic::Source,
@@ -539,7 +580,8 @@ fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> R
             let mut expected_error = None;
             for workers in [1, 4, 18] {
                 let mut attended = vec![13.0; queries.len()];
-                let mut scores = vec![17.0; heads * 66];
+                let parallelism = RowParallelism::new(workers)?;
+                let mut scores = vec![17.0; score_rows(heads, &parallelism) * 66];
                 let error = attend(
                     &keys,
                     &values,
@@ -552,7 +594,7 @@ fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> R
                     heads,
                     1.0 / 16.0,
                     super::super::Arithmetic::PinnedSwift,
-                    &RowParallelism::new(workers)?,
+                    &parallelism,
                 )
                 .err()
                 .ok_or_else(|| invalid("the invalid query or final gate must fail"))?

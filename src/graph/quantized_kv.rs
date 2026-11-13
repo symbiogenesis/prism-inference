@@ -4,7 +4,7 @@
 //! change; recurrent/convolution state and checkpoint ownership stay exact.
 
 use super::{KvCache, checked_product, checked_sum};
-use crate::kernels::RowParallelism;
+use crate::kernels::{MAX_ROW_WORKERS, RowParallelism};
 use crate::kv_quant::{Bits, HEAD_DIM, Quantizer};
 use crate::{Result, invalid};
 use std::sync::Arc;
@@ -267,7 +267,19 @@ impl KvCache {
     }
 }
 
-/// Stream packed history directly: query rotation once, cache-sized scores only,
+// Match the existing contiguous head partitions exactly. Each worker consumes
+// its heads sequentially, so their probability rows have disjoint lifetimes.
+pub(super) fn score_rows(heads: usize, parallelism: &RowParallelism) -> usize {
+    heads.div_ceil(heads.div_ceil(parallelism.workers()).max(1))
+}
+
+struct AttentionTask<'a> {
+    base_head: usize,
+    attended: &'a mut [f32],
+    scores: &'a mut [f32],
+}
+
+/// Stream packed history directly: query rotation once, one score row per task,
 /// and one bounded rotated value accumulator per active worker. Independent
 /// query heads use the existing private row pool, with each head retaining its
 /// original score, softmax, value and inverse-transform order. Dispatch joins
@@ -310,7 +322,7 @@ pub(super) fn attend(
         || queries.len() != heads * HEAD_DIM
         || attended.len() != queries.len()
         || projected.len() != 2 * queries.len()
-        || scores.len() != heads * stride
+        || scores.len() != score_rows(heads, parallelism) * stride
         || current_key.len() != keys.width
         || current_value.len() != values.width
     {
@@ -347,24 +359,49 @@ pub(super) fn attend(
         scale,
         arithmetic,
     };
-    parallelism.update_paired_chunks(
-        attended,
-        HEAD_DIM,
-        scores,
-        stride,
-        |base_head, attended_chunk, score_chunk| {
-            for (offset, (result, probabilities)) in attended_chunk
+    let chunk_heads = heads.div_ceil(parallelism.workers());
+    let task_count = score_rows(heads, parallelism);
+    if task_count == 1 {
+        for (head, result) in attended
+            .as_chunks_mut::<HEAD_DIM>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            input.attend_head(head, result, scores)?;
+        }
+        return Ok(());
+    }
+    // Keep the bounded borrowed task descriptors on the stack. This preserves
+    // the original worker partitions and earliest-chunk failure order without
+    // allocating a task vector or a probability row for each serial head.
+    let mut tasks: [Option<AttentionTask<'_>>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
+    for (index, ((attended, scores), task)) in attended
+        .chunks_mut(chunk_heads * HEAD_DIM)
+        .zip(scores.chunks_exact_mut(stride))
+        .zip(&mut tasks)
+        .enumerate()
+    {
+        *task = Some(AttentionTask {
+            base_head: index * chunk_heads,
+            attended,
+            scores,
+        });
+    }
+    parallelism.update_chunks(&mut tasks[..task_count], 1, |_, tasks| {
+        for task in tasks.iter_mut().flatten() {
+            for (offset, result) in task
+                .attended
                 .as_chunks_mut::<HEAD_DIM>()
                 .0
                 .iter_mut()
-                .zip(score_chunk.chunks_exact_mut(stride))
                 .enumerate()
             {
-                input.attend_head(base_head + offset, result, probabilities)?;
+                input.attend_head(task.base_head + offset, result, task.scores)?;
             }
-            Ok(())
-        },
-    )
+        }
+        Ok(())
+    })
 }
 
 struct PackedAttention<'a> {

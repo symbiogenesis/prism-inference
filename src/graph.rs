@@ -3612,7 +3612,12 @@ impl Evaluation<'_, '_> {
         }
         resize_into(g.head * g.heads, attended)?;
         let score_len = self.position + 1;
-        resize_into(g.heads * score_len, scores_scratch)?;
+        let score_rows = if keys.packed.is_some() || values.packed.is_some() {
+            quantized_kv::score_rows(g.heads, parallelism)
+        } else {
+            g.heads
+        };
+        resize_into(score_rows * score_len, scores_scratch)?;
         let scale = 1.0 / small_float(g.head)?.sqrt();
         let arithmetic = self.arithmetic;
         let query_ref: &[f32] = query_scratch;

@@ -56,9 +56,11 @@ setup and a guarded launcher that consumes the prebuilt private server.
 
 For source installation or Rust library integration, follow the
 [build and library guide](docs/build-and-validation.md#install-from-source).
-It pins the registry package version and compiler. GitHub binary releases and
-crates.io versions are separate deliveries; an unpinned `cargo install` can
-select an older runtime.
+It pins registry runtime **0.1.26** and the compiler. The
+[registry delivery record](docs/release-0.1.26.md) identifies its source and
+the updated `bonsai-neon-dot 0.1.3` helper. GitHub binary releases and crates.io
+versions are separate deliveries: the current Windows ARM64 bundle is 0.1.25,
+and its 0.1.26 replacement remains pending.
 
 ## Included tools
 

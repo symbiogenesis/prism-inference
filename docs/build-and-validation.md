@@ -4,20 +4,19 @@
 
 ## Install from source
 
-The local runtime/server workspace is the unreleased [0.1.26
-candidate](release-0.1.26.md). The registry commands below intentionally retain
-the published 0.1.25 package; a local version bump supplies no release bytes.
-
 GitHub bundles and crates.io packages are separate deliveries. The published
-registry runtime is `0.1.25`; the latest verified Windows ARM64 development
-bundle remains `0.1.23`. The [0.1.25 registry delivery](release-0.1.25.md) and
-[0.1.23 binary delivery](release-0.1.23.md) retain their separate checks and
-pending qualification. The new registry delivery advances every public helper
-and refreshes direct dependency pins; a matching binary bundle remains pending.
-Install the published registry source with the pinned nightly:
+registry runtime is [0.1.26](release-0.1.26.md), with exact NEON helper pin
+`bonsai-neon-dot =0.1.3`. The other four public helpers retain their published
+versions because their source has not changed. The current Windows ARM64 binary
+bundle is [0.1.25](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.25).
+The 0.1.26 registry source and selected binary source have distinct revisions;
+its Windows bundle remains pending. Earlier [0.1.25 registry](release-0.1.25.md) and
+[0.1.23 binary](release-0.1.23.md) delivery records retain their original
+identities and qualification limits. Install the published registry source with
+the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-11-09 install prism-inference --version '=0.1.25' --locked
+cargo +nightly-2026-11-09 install prism-inference --version '=0.1.26' --locked
 prism-inference --help
 ```
 
@@ -34,7 +33,7 @@ The package name is `prism-inference`; the existing Rust import path remains
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.25", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.26", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
@@ -105,9 +104,9 @@ targets retain the portable Rust baseline. Every model byte is still checked
 through the retained handle before metadata parsing. The GGUF crate remains
 unsafe-free, and full-file reads, load progress and cancellation contracts are
 unchanged. This implementation alone establishes no startup timing improvement.
-The current registry delivery uses published `bonsai-native-hash 0.1.3` and
-`bonsai-gguf 0.1.5`; future helper changes still require their registry
-prerequisites before dependent package publication.
+The current registry delivery uses published `bonsai-native-hash 0.1.3`,
+`bonsai-gguf 0.1.5` and `bonsai-neon-dot 0.1.3`; future helper changes still
+require their registry prerequisites before dependent package publication.
 
 ## Build a checkout
 
@@ -592,9 +591,12 @@ The aggregate Foundation check requires both Windows targets, the Linux native
 overlay, Rust regression, native codec and source-package matrix whenever their
 respective groups are selected.
 
-The published binary bundle version is `0.1.23`; the source installation and
-library examples above independently select registry `0.1.25`. Packaging rejects
-a changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
+The source installation and library examples above select registry `0.1.26`;
+the corresponding Windows binary bundle remains pending. The current Windows
+ARM64 bundle remains `0.1.25`, with source and archive identities recorded in
+the [0.1.26 delivery notes](release-0.1.26.md#separate-binary-source-and-pending-gates).
+Earlier published bundles keep their original identities. Packaging rejects a
+changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
 versions or a toolchain string that differs from the pinned channel and target. The receipt
 records the resulting bytes; its source-to-binary trust still depends on the
 checked Foundation build. The synthetic release-bundle regressions verify
@@ -631,7 +633,7 @@ model acceptance and performance unqualified. This separate workflow cannot serv
 as Foundation's successful-ancestor validation baseline. A missing cache or a
 timeout leaves packaging incomplete; it does not authorize another attempt.
 
-The published `0.1.23` runtime and Windows ARM64 development prerelease preserve
+The historical `0.1.23` runtime and Windows ARM64 development prerelease preserve
 all older full and prerelease artifacts. Its
 [delivery scope](release-0.1.23.md) records exact source
 `055c7430cb4771dfddb24ddaa30494af6ad182da`, the successful bounded bundle checks
@@ -647,12 +649,13 @@ features. Its receipt retains archive digests, source identity, consumer lockfil
 commands. This checks source delivery independently of building inside the original workspace.
 
 The five current registry helpers are published as `bonsai-native-hash =0.1.3`,
-`bonsai-neon-dot =0.1.2`, `bonsai-ternary =0.1.3`, `bonsai-gguf =0.1.5` and
-`bonsai-prism =0.1.5`, alongside runtime `0.1.25`. All six normalized packages
-and public checksums were verified separately from the still-pending binary
-delivery. The [0.1.25 delivery record](release-0.1.25.md) retains checks and
-limits; the [0.1.24 delivery](release-0.1.24.md) remains historical. Source
-preparation and hosted checks alone do not qualify model serving.
+`bonsai-neon-dot =0.1.3`, `bonsai-ternary =0.1.3`, `bonsai-gguf =0.1.5` and
+`bonsai-prism =0.1.5`, alongside runtime `0.1.26`. The
+[0.1.26 registry record](release-0.1.26.md) binds the two new packages to their
+source, archive digests and separate pending binary delivery. The
+[0.1.25 delivery record](release-0.1.25.md) retains checks and limits for the
+unchanged helpers; the [0.1.24 delivery](release-0.1.24.md) remains historical.
+Registry publication and hosted checks alone do not qualify model serving.
 
 The published development bundle build explicitly enables
 `prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the

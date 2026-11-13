@@ -307,12 +307,13 @@ fn reduce4_i16x8_to_i32x4(
 pub(super) fn prepare_pq2_activations(
     source: &[i8; 128],
     mut widened: Option<&mut [i16; 128]>,
+    known_sum: Option<i32>,
 ) -> ([i8; 128], i32) {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let values = std::array::from_fn(|index| {
             source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
         });
-        let sum = source.iter().map(|&v| i32::from(v)).sum();
+        let sum = known_sum.unwrap_or_else(|| source.iter().map(|&v| i32::from(v)).sum());
         if let Some(widened) = widened {
             *widened = values.map(i16::from);
         }
@@ -346,16 +347,20 @@ pub(super) fn prepare_pq2_activations(
         p2.store_slice(&mut dst[2]);
         p3.store_slice(&mut dst[3]);
         for (digit, plane) in [p0, p1, p2, p3].into_iter().enumerate() {
-            let (low, high) = plane.widen();
-            sum_acc += low + high;
-            if let Some(wide) = widened.as_mut() {
-                let offset = half * 64 + digit * 16;
-                low.store_slice(&mut wide[offset..offset + 8]);
-                high.store_slice(&mut wide[offset + 8..offset + 16]);
+            if known_sum.is_none() || widened.is_some() {
+                let (low, high) = plane.widen();
+                if known_sum.is_none() {
+                    sum_acc += low + high;
+                }
+                if let Some(wide) = widened.as_mut() {
+                    let offset = half * 64 + digit * 16;
+                    low.store_slice(&mut wide[offset..offset + 8]);
+                    high.store_slice(&mut wide[offset + 8..offset + 16]);
+                }
             }
         }
     }
-    (output, pq2_reduce(sum_acc))
+    (output, known_sum.unwrap_or_else(|| pq2_reduce(sum_acc)))
 }
 
 #[inline]

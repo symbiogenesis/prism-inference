@@ -2216,7 +2216,7 @@ impl MatvecScratch {
         // compatible sibling projections in this scope. Original Q8_K blocks
         // stay untouched for other consumers.
         if self.pq2_consumption.is_empty() {
-            packed_pq2::prepare(&self.q8k, &mut self.pq2_consumption)?;
+            self.prepare_pq2_consumption()?;
         }
         let pinned = self.pinned_accumulation;
         let activations = packed_pq2::Consumer::new(&self.pq2_consumption)?;

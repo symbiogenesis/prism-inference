@@ -77,7 +77,7 @@ impl PreparedMatvec<'_> {
         if matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon)
             && scratch.pq2_consumption.is_empty()
         {
-            super::packed_pq2::prepare(&scratch.q8k, &mut scratch.pq2_consumption)?;
+            scratch.prepare_pq2_consumption()?;
         }
         if scratch.row_parallelism.workers() > 1 {
             scratch.statistics.grouped_row_dispatches =

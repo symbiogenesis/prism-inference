@@ -189,7 +189,7 @@ impl ProjectionTile {
                         && columns.is_multiple_of(256)
                         && !matches!(self.backend, MatvecBackend::Scalar)
                     {
-                        super::packed_pq2::prepare(&scratch.q8k, &mut scratch.pq2_consumption)?;
+                        scratch.prepare_pq2_consumption()?;
                     }
                 }
                 output.try_reserve_exact(rows)?;
@@ -220,10 +220,7 @@ impl ProjectionTile {
                                 target_feature = "neon"
                             ))]
                             if prepare_pq2 {
-                                super::packed_pq2::prepare(
-                                    &scratch.q8k,
-                                    &mut scratch.pq2_consumption,
-                                )?;
+                                scratch.prepare_pq2_consumption()?;
                             }
                         }
                         Ok(())
@@ -245,7 +242,7 @@ impl ProjectionTile {
             {
                 for scratch in &mut self.preparations[..inputs.len()] {
                     if scratch.pq2_consumption.is_empty() {
-                        super::packed_pq2::prepare(&scratch.q8k, &mut scratch.pq2_consumption)?;
+                        scratch.prepare_pq2_consumption()?;
                     }
                 }
             }

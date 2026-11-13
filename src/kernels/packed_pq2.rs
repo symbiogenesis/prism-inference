@@ -94,7 +94,24 @@ impl Activations {
 }
 
 /// Prepare four digit planes for each consecutive 16-byte weight load.
+#[cfg(test)]
 pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()> {
+    prepare_detected::<false>(input, output)
+}
+
+impl super::MatvecScratch {
+    /// Only the internal quantizers populate this private Q8_K owner. Their
+    /// exact per-sixteen sums can replace a second reduction during rearranging.
+    /// Public arbitrary Q8_K inputs never enter this method.
+    pub(super) fn prepare_pq2_consumption(&mut self) -> Result<()> {
+        prepare_detected::<true>(&self.q8k, &mut self.pq2_consumption)
+    }
+}
+
+fn prepare_detected<const QUANTIZED: bool>(
+    input: &[Q8KBlock],
+    output: &mut Activations,
+) -> Result<()> {
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -119,7 +136,7 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()
         target_feature = "neon"
     )))]
     let widened = false;
-    prepare_with_layout(input, output, widened)?;
+    prepare_with_source_sums::<QUANTIZED>(input, output, widened)?;
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -133,7 +150,16 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare_with_layout(input: &[Q8KBlock], output: &mut Activations, widened: bool) -> Result<()> {
+    prepare_with_source_sums::<false>(input, output, widened)
+}
+
+fn prepare_with_source_sums<const QUANTIZED: bool>(
+    input: &[Q8KBlock],
+    output: &mut Activations,
+    widened: bool,
+) -> Result<()> {
     output.clear();
     let result = (|| {
         let count = input
@@ -146,7 +172,7 @@ fn prepare_with_layout(input: &[Q8KBlock], output: &mut Activations, widened: bo
         }
         for block in input {
             let scale = super::finite(block.scale)?;
-            for source in block.values.as_chunks::<128>().0 {
+            for (half, source) in block.values.as_chunks::<128>().0.iter().enumerate() {
                 #[cfg(all(
                     feature = "experimental-neon",
                     target_arch = "aarch64",
@@ -161,7 +187,14 @@ fn prepare_with_layout(input: &[Q8KBlock], output: &mut Activations, widened: bo
                     } else {
                         None
                     };
-                    let (values, sum) = super::neon::prepare_pq2_activations(source, wide);
+                    let known_sum = QUANTIZED.then(|| {
+                        block.sums[half * 8..half * 8 + 8]
+                            .iter()
+                            .map(|&sum| i32::from(sum))
+                            .sum()
+                    });
+                    let (values, sum) =
+                        super::neon::prepare_pq2_activations(source, wide, known_sum);
                     output.blocks.push(Activation { scale, values, sum });
                 }
                 #[cfg(not(all(
@@ -172,6 +205,7 @@ fn prepare_with_layout(input: &[Q8KBlock], output: &mut Activations, widened: bo
                     target_feature = "neon"
                 )))]
                 {
+                    let _ = (QUANTIZED, half);
                     let values = std::array::from_fn(|index| {
                         source[(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
                     });
@@ -461,6 +495,108 @@ mod tests {
             kind: super::super::PQ2,
             data: Arc::from(data),
         }
+    }
+
+    #[test]
+    fn x1_pq2_sums_quantizer_reuse_matches_byte_reduction_for_both_layouts() -> Result<()> {
+        for columns in [256, 512, 5120] {
+            let tensor = weights(columns, 8);
+            for pinned in [false, true] {
+                let mut scratch = if pinned {
+                    MatvecScratch::with_pinned_backend(MatvecBackend::ExperimentalNeon)
+                } else {
+                    MatvecScratch::with_backend(MatvecBackend::ExperimentalNeon)
+                };
+                for offset in [0, 1, 7] {
+                    let input: Vec<_> = (0..columns)
+                        .map(|lane| {
+                            if offset == 7 {
+                                -0.0
+                            } else {
+                                [0.0, -0.0, 127.0, -128.0, 63.5, -3.25, 0.125][(lane + offset) % 7]
+                            }
+                        })
+                        .collect();
+                    scratch.prepare_input(&tensor, &input)?;
+                    let original = scratch.q8k.clone();
+                    scratch.prepare_pq2_consumption()?;
+                    for widened in [false, true] {
+                        let mut actual = super::Activations::default();
+                        let mut expected = super::Activations::default();
+                        super::prepare_with_source_sums::<true>(
+                            &scratch.q8k,
+                            &mut actual,
+                            widened,
+                        )?;
+                        super::prepare_with_layout(&scratch.q8k, &mut expected, widened)?;
+                        assert_eq!(actual.widened, expected.widened);
+                        assert_eq!(actual.len(), expected.len());
+                        for (index, (actual, expected)) in
+                            actual.iter().zip(expected.iter()).enumerate()
+                        {
+                            assert_eq!(actual.scale.to_bits(), expected.scale.to_bits());
+                            assert_eq!(actual.values, expected.values);
+                            assert_eq!(actual.values, scratch.pq2_consumption[index].values);
+                            #[cfg(all(
+                                feature = "experimental-neon",
+                                target_arch = "aarch64",
+                                target_os = "windows",
+                                target_env = "msvc",
+                                target_feature = "neon"
+                            ))]
+                            {
+                                assert_eq!(actual.sum, expected.sum);
+                                assert_eq!(actual.sum, scratch.pq2_consumption[index].sum);
+                            }
+                        }
+                    }
+                    assert_eq!(scratch.q8k, original);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn x1_pq2_sums_arbitrary_input_metadata_remains_ignored() -> Result<()> {
+        let mut input = [Q8KBlock {
+            scale: 0.125,
+            values: std::array::from_fn(|index| i8::from_ne_bytes([index.to_le_bytes()[0]])),
+            sums: [i16::MIN; 16],
+        }];
+        let mut output = super::Activations::default();
+        prepare(&input, &mut output)?;
+        let expected_values: Vec<_> = output.iter().map(|block| block.values).collect();
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        for (half, activation) in output.iter().enumerate() {
+            let expected: i32 = input[0].values[half * 128..half * 128 + 128]
+                .iter()
+                .map(|&value| i32::from(value))
+                .sum();
+            assert_eq!(activation.sum, expected);
+        }
+        let mut weights = weights(256, 1);
+        for block in Arc::make_mut(&mut weights.data).as_chunks_mut::<34>().0 {
+            block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+        }
+        let expected = super::super::dot_pq2::<false>(&weights.data, &input)?;
+        input[0].sums.fill(i16::MAX);
+        prepare(&input, &mut output)?;
+        assert_eq!(
+            output.iter().map(|block| block.values).collect::<Vec<_>>(),
+            expected_values
+        );
+        assert_eq!(
+            super::super::dot_pq2::<false>(&weights.data, &input)?.to_bits(),
+            expected.to_bits()
+        );
+        Ok(())
     }
 
     #[test]

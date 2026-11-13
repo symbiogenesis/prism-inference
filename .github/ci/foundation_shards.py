@@ -138,15 +138,32 @@ def inventory(metadata, packages, enabled_features=None):
 
 
 def partition(metadata, packages, count, enabled_features=None):
-    """Assign every integration-target name once; unit and doc tests use shard 0."""
+    """Assign each Cargo selector once, balancing selector groups across shards."""
     if type(count) is not int or count < 1:
         raise ValueError("Expected a positive shard count")
     tests, skipped = inventory(metadata, packages, enabled_features)
-    names = sorted({name for _, kind, name in tests if kind == "test"})
-    owners = {name: index % count for index, name in enumerate(names)}
-    shards = [[] for _ in range(count)]
+    groups = {}
     for test in tests:
-        shards[owners[test[2]] if test[1] == "test" else 0].append(test)
+        # --lib and --doc select every eligible library in the package set.
+        # Other selectors identify one kind/name, including same-named targets
+        # from several packages. Keeping each selector whole prevents overlap.
+        key = (test[1], "" if test[1] in {"lib", "doc"} else test[2])
+        groups.setdefault(key, []).append(test)
+    owners = {}
+    loads = [0] * count
+    for key, owner in (("lib", 0), ("doc", 1 % count)):
+        if (key, "") in groups:
+            owners[(key, "")] = owner
+            loads[owner] += 1
+    for key in sorted(groups.keys() - owners.keys()):
+        owner = min(range(count), key=lambda index: (loads[index], index))
+        owners[key] = owner
+        loads[owner] += 1
+    shards = [[] for _ in range(count)]
+    for key, group in groups.items():
+        shards[owners[key]].extend(group)
+    for shard in shards:
+        shard.sort()
     flattened = [test for shard in shards for test in shard]
     if len(flattened) != len(set(flattened)) or set(flattened) != set(tests):
         raise ValueError("Cargo test inventory was lost or duplicated during sharding")
@@ -157,7 +174,7 @@ def partition(metadata, packages, count, enabled_features=None):
                 for target in package["targets"]:
                     if set(target["kind"]) <= LIB_KINDS and not target["test"]:
                         additional.append((package["name"], "lib", target["name"]))
-    return {"shards": shards, "disabled": skipped, "additional_unit_roots": additional}
+    return {"shards": shards, "disabled": skipped, "additional_unit_roots": sorted(additional)}
 
 
 def commands(plan, packages, index):
@@ -171,14 +188,14 @@ def commands(plan, packages, index):
     # workspace's three empty test=false library roots; this small superset
     # avoids changing features by invoking their consumers package-by-package.
     selection = [argument for package in packages for argument in ("--package", package)]
-    integration = sorted({name for _, kind, name in tests if kind == "test"})
-    if integration:
-        result.append(selection + [argument for name in integration for argument in ("--test", name)])
-    ordinary = sorted({(kind, name) for _, kind, name in tests if kind not in {"test", "doc", "lib"}})
+    ordinary = sorted({(kind, name) for _, kind, name in tests if kind not in {"doc", "lib"}})
     arguments = ["--lib"] if any(kind == "lib" for _, kind, _ in tests) else []
     for kind, name in ordinary:
         arguments.extend(["--" + kind, name])
     if arguments:
+        # One invocation lets Cargo compile and link every selected target as
+        # resources permit, rather than serializing integrations before units
+        # and examples. --doc is incompatible with other target selectors.
         result.append(selection + arguments)
     if any(kind == "doc" for _, kind, _ in tests):
         result.append(selection + ["--doc"])

@@ -55,9 +55,10 @@ class FoundationShardTests(unittest.TestCase):
         self.assertEqual(len(actual), len(set(actual)))
         owners = [index for index, shard in enumerate(plan["shards"]) if any(test[2] == "protocol" for test in shard)]
         self.assertEqual(len(owners), 1)
-        self.assertIn(("runtime", "example", "capture"), plan["shards"][0])
-        self.assertIn(("runtime", "doc", "runtime"), plan["shards"][0])
-        self.assertIn(("tool", "doc", "tool"), plan["shards"][0])
+        self.assertIn(("runtime", "lib", "runtime"), plan["shards"][0])
+        self.assertIn(("runtime", "doc", "runtime"), plan["shards"][1])
+        self.assertIn(("tool", "doc", "tool"), plan["shards"][1])
+        self.assertNotIn(("runtime", "example", "capture"), plan["shards"][0])
         self.assertEqual(len(skipped), 1)
 
     def test_commands_preserve_selected_package_feature_unification(self):
@@ -66,11 +67,92 @@ class FoundationShardTests(unittest.TestCase):
             commands = shards.commands(plan, ["runtime", "tool"], index)
             for command in commands:
                 self.assertEqual(command[:4], ["--package", "runtime", "--package", "tool"])
-            if index:
-                self.assertFalse(any("--doc" in command or "--lib" in command for command in commands))
-        commands = shards.commands(plan, ["runtime", "tool"], 0)
+            self.assertEqual(sum("--doc" not in command for command in commands), 1)
+            if index != 0:
+                self.assertFalse(any("--lib" in command for command in commands))
+            if index != 1:
+                self.assertFalse(any("--doc" in command for command in commands))
+        commands = shards.commands(plan, ["runtime", "tool"], 1)
         self.assertIn(["--package", "runtime", "--package", "tool", "--doc"], commands)
         self.assertFalse(any("ignored-worker" in command for command in commands))
+
+    def test_commands_cover_every_target_once_for_counts_and_package_subsets(self):
+        data = metadata()
+        # Kind/name is the selector identity: --bin protocol is independent of
+        # --test protocol, while two packages' --test protocol must stay together.
+        data["packages"][0]["targets"].append(target("protocol", "bin"))
+        data["packages"][1]["targets"].append(target("protocol", "example"))
+        for packages in (["runtime"], ["tool"], ["runtime", "tool"], ["tool", "runtime"]):
+            expected, _ = shards.inventory(data, packages)
+            for count in (1, 2, 3, 4, 11):
+                with self.subTest(packages=packages, count=count):
+                    plan = shards.partition(data, packages, count)
+                    actual, selectors = [], []
+                    prefix = [argument for package in packages for argument in ("--package", package)]
+                    for index in range(count):
+                        commands = shards.commands(plan, packages, index)
+                        self.assertLessEqual(len(commands), 2)
+                        for command in commands:
+                            self.assertEqual(command[:len(prefix)], prefix)
+                            arguments = iter(command[len(prefix):])
+                            selected = []
+                            for flag in arguments:
+                                self.assertIn(flag, {"--lib", "--doc", "--bin", "--example", "--test"})
+                                selected.append((flag[2:], "" if flag in {"--lib", "--doc"} else next(arguments)))
+                            if ("doc", "") in selected:
+                                self.assertEqual(selected, [("doc", "")])
+                            selectors.extend(selected)
+                            for package, kind, name in expected:
+                                if (kind, "" if kind in {"lib", "doc"} else name) in selected:
+                                    actual.append((package, kind, name))
+                    self.assertCountEqual(actual, expected)
+                    self.assertEqual(len(actual), len(set(actual)))
+                    self.assertEqual(len(selectors), len(set(selectors)))
+                    self.assertEqual(plan["additional_unit_roots"],
+                                     [("tool", "lib", "tool")] if "runtime" in packages and "tool" in packages else [])
+
+    def test_non_doc_targets_share_one_cargo_invocation_and_selector_loads_balance(self):
+        plan = shards.partition(metadata(), ["runtime", "tool"], 4)
+        loads = []
+        for index in range(4):
+            tests = plan["shards"][index]
+            selectors = {(kind, "" if kind in {"lib", "doc"} else name) for _, kind, name in tests}
+            loads.append(len(selectors))
+            commands = shards.commands(plan, ["runtime", "tool"], index)
+            ordinary = [command for command in commands if "--doc" not in command]
+            self.assertEqual(len(ordinary), 1)
+            self.assertGreater(len(ordinary[0]), 4)
+        self.assertLessEqual(max(loads) - min(loads), 1)
+        single = shards.commands(shards.partition(metadata(), ["runtime", "tool"], 1), ["runtime", "tool"], 0)
+        self.assertEqual(len(single), 2)
+        self.assertTrue(all(flag in single[0] for flag in ("--lib", "--bin", "--example", "--test")))
+        self.assertEqual(single[1][-1], "--doc")
+
+    def test_partition_is_independent_of_metadata_and_package_iteration_order(self):
+        data = metadata()
+        expected = shards.partition(data, ["runtime", "tool"], 4)
+        data["packages"].reverse()
+        for package in data["packages"]:
+            package["targets"].reverse()
+        self.assertEqual(shards.partition(data, ["tool", "runtime"], 4), expected)
+
+    def test_library_and_doc_selectors_stay_whole_across_packages(self):
+        data = metadata()
+        data["packages"][1]["targets"][0]["test"] = True
+        plan = shards.partition(data, ["runtime", "tool"], 4)
+        self.assertEqual([test for test in plan["shards"][0] if test[1] == "lib"],
+                         [("runtime", "lib", "runtime"), ("tool", "lib", "tool")])
+        self.assertEqual([test for test in plan["shards"][1] if test[1] == "doc"],
+                         [("runtime", "doc", "runtime"), ("tool", "doc", "tool")])
+        self.assertEqual(plan["additional_unit_roots"], [])
+
+    def test_package_without_enabled_tests_has_empty_assignments_and_no_commands(self):
+        data = metadata()
+        data["packages"][1]["targets"] = [target("empty", "lib", test=False, doctest=False)]
+        plan = shards.partition(data, ["tool"], 4)
+        self.assertEqual(plan["shards"], [[], [], [], []])
+        self.assertEqual(plan["additional_unit_roots"], [])
+        self.assertTrue(all(shards.commands(plan, ["tool"], index) == [] for index in range(4)))
 
     def test_new_target_automatically_enters_exactly_one_shard(self):
         data = metadata()
@@ -155,8 +237,8 @@ class FoundationShardTests(unittest.TestCase):
         data = metadata()
         resolved = shards.resolved_features(data, ["runtime", "tool"], unit_graph(data), "native-target")
         plan = shards.partition(data, ["runtime", "tool"], 4, resolved)
-        self.assertIn(("runtime", "doc", "runtime"), plan["shards"][0])
-        self.assertIn(("tool", "doc", "tool"), plan["shards"][0])
+        self.assertIn(("runtime", "doc", "runtime"), plan["shards"][1])
+        self.assertIn(("tool", "doc", "tool"), plan["shards"][1])
 
     def test_gated_package_without_roots_and_partial_feature_map_fail_closed(self):
         data = metadata()

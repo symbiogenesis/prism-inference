@@ -304,9 +304,11 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
 )]
 mod native {
     use core::arch::aarch64::{
-        vaddq_f32, vaddq_f64, vandq_u32, vcltq_u32, vcvt_f64_f32, vcvt_high_f64_f32, vdupq_n_f32,
-        vdupq_n_f64, vdupq_n_u32, vget_low_f32, vld1q_f32, vminvq_u32, vmulq_f32, vmulq_f64,
-        vreinterpretq_u32_f32, vst1q_f32, vst1q_f64, vsubq_f32,
+        float32x4_t, uint8x16x4_t, vaddq_f32, vaddq_f64, vandq_u32, vcltq_u32, vcvt_f64_f32,
+        vcvt_high_f64_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u32, vget_low_f32, vld1q_f32,
+        vld1q_s32, vld1q_u8, vld1q_u8_x4, vminvq_u32, vmulq_f32, vmulq_f64, vmulq_u32, vorrq_u8,
+        vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u32, vreinterpretq_u32_f32, vshlq_u32,
+        vst1q_f32, vst1q_f64, vsubq_f32,
     };
 
     use super::DIMENSION;
@@ -317,20 +319,35 @@ mod native {
         centroids: &[f32; 16],
         query: &[f32; DIMENSION],
     ) -> f64 {
-        // SAFETY: the safe public caller proves baseline NEON at runtime and
-        // validates exactly 256 codes and finite fixed-array inputs.
-        unsafe { dot_neon(packed, bits, centroids, query) }
+        if bits == 4 {
+            // SAFETY: the safe public caller proves baseline NEON at runtime and
+            // validates exactly 256 four-bit codes and finite fixed-array inputs.
+            unsafe { dot_neon::<4>(packed, centroids, query) }
+        } else {
+            // SAFETY: the same caller admits only three- or four-bit codes;
+            // this branch has exactly 256 three-bit codes and detected NEON.
+            unsafe { dot_neon::<3>(packed, centroids, query) }
+        }
     }
 
     #[target_feature(enable = "neon")]
-    fn dot_neon(packed: &[u8], bits: u8, centroids: &[f32; 16], query: &[f32; DIMENSION]) -> f64 {
+    fn dot_neon<const BITS: u8>(
+        packed: &[u8],
+        centroids: &[f32; 16],
+        query: &[f32; DIMENSION],
+    ) -> f64 {
         let mut low_sum = vdupq_n_f64(0.0);
         let mut high_sum = vdupq_n_f64(0.0);
+        let table = codebook_bytes(centroids);
         for (index, query) in query.as_chunks::<4>().0.iter().enumerate() {
-            let values = super::tile(packed, bits, centroids, index * 4);
-            // SAFETY: values contains four initialized coordinates and NEON
-            // permits an unaligned load; the temporary outlives the load.
-            let values = unsafe { vld1q_f32(values.as_ptr()) };
+            let values = if BITS == 4 {
+                four_bit_tile(packed, index, table)
+            } else {
+                let values = super::tile(packed, BITS, centroids, index * 4);
+                // SAFETY: values contains four initialized coordinates and NEON
+                // permits an unaligned load; the temporary outlives the load.
+                unsafe { vld1q_f32(values.as_ptr()) }
+            };
             // SAFETY: the chunk contains exactly four initialized query values.
             let query = unsafe { vld1q_f32(query.as_ptr()) };
             let low = vmulq_f64(
@@ -357,15 +374,20 @@ mod native {
         scale: f32,
         output: &mut [f32; DIMENSION],
     ) -> bool {
-        // SAFETY: caller detects baseline NEON, validates code length and
-        // finite inputs, and supplies a unique 256-coordinate staging array.
-        unsafe { accumulate_neon(packed, bits, centroids, scale, output) }
+        if bits == 4 {
+            // SAFETY: caller detects NEON, validates 256 four-bit codes and
+            // finite inputs, and supplies a unique 256-coordinate staging array.
+            unsafe { accumulate_neon::<4>(packed, centroids, scale, output) }
+        } else {
+            // SAFETY: the same caller admits only three- or four-bit codes;
+            // this branch has exactly 256 three-bit codes and detected NEON.
+            unsafe { accumulate_neon::<3>(packed, centroids, scale, output) }
+        }
     }
 
     #[target_feature(enable = "neon")]
-    fn accumulate_neon(
+    fn accumulate_neon<const BITS: u8>(
         packed: &[u8],
-        bits: u8,
         centroids: &[f32; 16],
         scale: f32,
         output: &mut [f32; DIMENSION],
@@ -374,10 +396,15 @@ mod native {
         let magnitude = vdupq_n_u32(0x7fff_ffff);
         let infinity = vdupq_n_u32(0x7f80_0000);
         let mut finite = vdupq_n_u32(u32::MAX);
+        let table = codebook_bytes(centroids);
         for (index, output) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let values = super::tile(packed, bits, centroids, index * 4);
-            // SAFETY: values is a valid initialized four-element array.
-            let values = unsafe { vld1q_f32(values.as_ptr()) };
+            let values = if BITS == 4 {
+                four_bit_tile(packed, index, table)
+            } else {
+                let values = super::tile(packed, BITS, centroids, index * 4);
+                // SAFETY: values is a valid initialized four-element array.
+                unsafe { vld1q_f32(values.as_ptr()) }
+            };
             // SAFETY: output is a unique four-element chunk of the staging row.
             let previous = unsafe { vld1q_f32(output.as_ptr()) };
             let product = vmulq_f32(scale, values);
@@ -391,6 +418,36 @@ mod native {
             unsafe { vst1q_f32(output.as_mut_ptr(), result) };
         }
         vminvq_u32(finite) != 0
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn codebook_bytes(centroids: &[f32; 16]) -> uint8x16x4_t {
+        // SAFETY: sixteen initialized binary32 centroids occupy exactly the
+        // sixty-four bytes required by the four unaligned vector loads.
+        unsafe { vld1q_u8_x4(centroids.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn four_bit_tile(packed: &[u8], index: usize, table: uint8x16x4_t) -> float32x4_t {
+        let byte = index * 2;
+        let pair = u16::from_le_bytes([packed[byte], packed[byte + 1]]);
+        // SAFETY: this initialized fixed array supplies exactly four shifts.
+        let shifts = unsafe { vld1q_s32([0, -4, -8, -12].as_ptr()) };
+        let codes = vandq_u32(
+            vshlq_u32(vdupq_n_u32(u32::from(pair)), shifts),
+            vdupq_n_u32(15),
+        );
+        // Each nibble selects four consecutive bytes of its binary32 centroid.
+        // Multiplication broadcasts code * 4 into every byte of its lane; those
+        // bases are multiples of four, so OR appends the offsets 0, 1, 2, 3.
+        let bases = vreinterpretq_u8_u32(vmulq_u32(codes, vdupq_n_u32(0x0404_0404)));
+        // SAFETY: the initialized array supplies sixteen byte offsets. Loading
+        // explicit bytes keeps the table order independent of integer endianness.
+        let offsets =
+            unsafe { vld1q_u8([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3].as_ptr()) };
+        vreinterpretq_f32_u8(vqtbl4q_u8(table, vorrq_u8(bases, offsets)))
     }
 
     pub(super) fn hadamard(values: &mut [f32; DIMENSION]) {
@@ -435,6 +492,61 @@ mod native {
             let scaled = vmulq_f32(value, normalization);
             // SAFETY: chunk is unique and has room for all four result values.
             unsafe { vst1q_f32(chunk.as_mut_ptr(), scaled) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn four_bit_lookup_preserves_every_nibble_lane_and_centroid_bits() {
+            if !std::arch::is_aarch64_feature_detected!("neon") {
+                return;
+            }
+            let centroids = [
+                -f32::MAX,
+                -17.25,
+                -1.0,
+                -f32::MIN_POSITIVE,
+                -f32::from_bits(1),
+                -0.0,
+                0.0,
+                f32::from_bits(1),
+                f32::MIN_POSITIVE,
+                0.125,
+                0.5,
+                1.0,
+                3.25,
+                17.25,
+                f32::MAX * 0.5,
+                f32::MAX,
+            ];
+            // SAFETY: NEON was detected above and the array owns all 64 bytes.
+            let table = unsafe { super::codebook_bytes(&centroids) };
+            for offset in 0_u8..16 {
+                let codes: [u8; super::DIMENSION] =
+                    std::array::from_fn(|index| index.to_le_bytes()[0].wrapping_add(offset) & 15);
+                // Independent bit-at-a-time packing exercises both nibble
+                // positions and all four output lanes, including the last tile.
+                let mut packed = [0_u8; super::DIMENSION / 2];
+                for (index, code) in codes.iter().enumerate() {
+                    for bit in 0..4 {
+                        let position = index * 4 + bit;
+                        packed[position / 8] |= ((code >> bit) & 1) << (position % 8);
+                    }
+                }
+                for (index, codes) in codes.as_chunks::<4>().0.iter().enumerate() {
+                    // SAFETY: NEON was detected, packed owns 128 initialized
+                    // bytes, and the enumerated tile is within its 64 tiles.
+                    let tile = unsafe { super::four_bit_tile(&packed, index, table) };
+                    let mut decoded = [0.0; 4];
+                    // SAFETY: decoded is a unique initialized four-value array.
+                    unsafe { super::vst1q_f32(decoded.as_mut_ptr(), tile) };
+                    assert_eq!(
+                        decoded.map(f32::to_bits),
+                        codes.map(|code| centroids[usize::from(code)].to_bits()),
+                    );
+                }
+            }
         }
     }
 }

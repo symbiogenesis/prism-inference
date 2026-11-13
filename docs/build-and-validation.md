@@ -5,24 +5,29 @@
 ## Install from source
 
 GitHub bundles and crates.io packages are separate deliveries. The published
-registry runtime is [0.1.26](release-0.1.26.md), with exact NEON helper pin
+registry runtime is [0.1.27](release-0.1.27.md), with exact NEON helper pin
 `bonsai-neon-dot =0.1.3`. The other four public helpers retain their published
 versions because their source has not changed. The current Windows ARM64 binary
-bundle is [0.1.26](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.26).
-Its registry source `53f2fcbc89bbdd43ca4b83aea234096626f26040` and binary source
-`ac941f2668ae93dba9824002b4597081457aa09f` retain distinct identities and checks.
-The published five-executable bundle imports `vcruntime140.dll` and requires
-the external ARM64 Visual C++ runtime. The local [0.1.27 preparation](release-0.1.27.md)
-adds target-specific static CRT linkage, a separate normal/delay-import gate,
-and exact-geometry full K4/V4 context accounting. Its registry and binary
-deliveries remain pending; larger-window qualification is separate.
+bundle is [0.1.27](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.27).
+Both deliveries use source `1429a33772089dfd3a50a96c698b9dbe0b36836a`, with
+separate archive and verification records. The five-executable bundle statically
+links Microsoft's runtime; normal and delay-load import checks reject separately
+installed VC runtimes. No external Visual C++ runtime installation is required.
+The release also adds exact-geometry full K4/V4 context accounting; actual-model,
+larger-window and clean-machine qualification remain pending.
+
+The historical [0.1.26 delivery](release-0.1.26.md) retains registry source
+`53f2fcbc89bbdd43ca4b83aea234096626f26040` and distinct binary source
+`ac941f2668ae93dba9824002b4597081457aa09f`. Its immutable five-executable
+archive imports `vcruntime140.dll` and requires the external ARM64 Visual C++
+runtime. That prerequisite applies to 0.1.26, not the current 0.1.27 bundle.
 Earlier [0.1.25 registry](release-0.1.25.md) and
 [0.1.23 binary](release-0.1.23.md) delivery records retain their original
 identities and qualification limits. Install the published registry source with
 the pinned nightly:
 
 ```powershell
-cargo +nightly-2026-11-09 install prism-inference --version '=0.1.26' --locked
+cargo +nightly-2026-11-09 install prism-inference --version '=0.1.27' --locked
 prism-inference --help
 ```
 
@@ -39,7 +44,7 @@ The package name is `prism-inference`; the existing Rust import path remains
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.26", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.27", default-features = false }
 ```
 
 Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
@@ -597,10 +602,10 @@ The aggregate Foundation check requires both Windows targets, the Linux native
 overlay, Rust regression, native codec and source-package matrix whenever their
 respective groups are selected.
 
-The source installation and library examples above select registry `0.1.26`.
-The current Windows ARM64 bundle is also `0.1.26`, with its separate source,
-archive and receipt identities recorded in
-the [0.1.26 delivery notes](release-0.1.26.md#separate-binary-source-and-pending-gates).
+The source installation and library examples above select registry `0.1.27`.
+The current Windows ARM64 bundle is also `0.1.27`. Both use source
+`1429a33772089dfd3a50a96c698b9dbe0b36836a`; their separate archive and receipt
+identities are recorded in the [0.1.27 delivery notes](release-0.1.27.md).
 Earlier published bundles keep their original identities. Packaging rejects a
 changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
 versions or a toolchain string that differs from the pinned channel and target. The receipt
@@ -616,10 +621,12 @@ include all five.
 
 For an authorized hosted release build, the manually dispatched
 [Foundation bundle workflow](../.github/workflows/foundation-bundle.yml) builds
-those five executables on hosted Windows ARM64 after nine focused receipt/version
-controls, formatting, strict Release all-target analyzers for the runtime, server
-and Hexagon crates, and a feature-disabled runtime library compilation check.
-It executes no numerical correctness suite or model. The owner's explicit
+those five executables on hosted Windows ARM64 after three version, six receipt
+and five data-only PE controls, formatting, strict Release all-target analyzers
+for the runtime, server and Hexagon crates, and a feature-disabled runtime library
+compilation check. Two exact unwind/drain controls and six exact context controls
+also run; their scope is recorded in the [delivery notes](release-0.1.27.md#verified-delivery-scope).
+It executes no complete correctness suite or model. The owner's explicit
 release instruction selects GitHub's own hosted job cap: this workflow defines
 no job timeout, timeout input or aggregate operator cancellation deadline for
 release compilation. Model captures, benchmarks and owner-device diagnostics
@@ -654,10 +661,11 @@ commands. This checks source delivery independently of building inside the origi
 
 The five current registry helpers are published as `bonsai-native-hash =0.1.3`,
 `bonsai-neon-dot =0.1.3`, `bonsai-ternary =0.1.3`, `bonsai-gguf =0.1.5` and
-`bonsai-prism =0.1.5`, alongside runtime `0.1.26`. The
-[0.1.26 delivery record](release-0.1.26.md) binds the two new packages to their
-registry source and digests, separately from the published binary source and
-bundle verification. The
+`bonsai-prism =0.1.5`, alongside runtime `0.1.27`. The
+[0.1.27 delivery record](release-0.1.27.md) binds the current runtime and binary
+to their shared source and separate archive digests. The historical
+[0.1.26 delivery record](release-0.1.26.md) retains the runtime/NEON publication
+and its distinct binary source and verification. The
 [0.1.25 delivery record](release-0.1.25.md) retains checks and limits for the
 unchanged helpers; the [0.1.24 delivery](release-0.1.24.md) remains historical.
 Registry publication and hosted checks alone do not qualify model serving.

@@ -56,11 +56,12 @@ setup and a guarded launcher that consumes the prebuilt private server.
 
 For source installation or Rust library integration, follow the
 [build and library guide](docs/build-and-validation.md#install-from-source).
-It pins registry runtime **0.1.26** and the compiler. The
-[delivery record](docs/release-0.1.26.md) identifies its source, the updated
-`bonsai-neon-dot 0.1.3` helper and the published Windows ARM64 **0.1.26** bundle.
-GitHub binary releases and crates.io packages remain separate deliveries with
-distinct source revisions and verification records.
+It pins registry runtime **0.1.27** and the compiler. The
+[delivery record](docs/release-0.1.27.md) identifies the shared registry/binary
+source, unchanged helper versions and the published Windows ARM64 **0.1.27**
+bundle. That bundle statically links Microsoft's runtime and needs no separately
+installed Visual C++ runtime. GitHub binaries and crates.io packages remain
+separately verified deliveries; model qualification remains pending.
 
 ## Included tools
 

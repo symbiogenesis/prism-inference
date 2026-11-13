@@ -481,22 +481,22 @@ fn private_context_capacity_controls_admission_and_readiness() -> Result<(), Nat
     );
     assert!(matches!(
         pending(true, 128)?.admit_with_context(profile.context_tokens, |_| Ok(prompt + 1)),
-        Err(crate::Rejection::ContextLimit),
+        Err(Rejection::ContextLimit),
     ));
     assert!(matches!(
         pending(true, 128)?.admit(|_| Ok(prompt)),
-        Err(crate::Rejection::ContextLimit),
+        Err(Rejection::ContextLimit),
     ));
     assert!(matches!(
         pending(true, 128)?
             .admit_with_context(4_352, |_| Ok(
                 4_352 - 128 - crate::TEMPLATE_MARGIN_TOKENS + 1
             )),
-        Err(crate::Rejection::ContextLimit),
+        Err(Rejection::ContextLimit),
     ));
     assert!(matches!(
         pending(true, 128)?.admit_with_context(profile.context_tokens, |_| Ok(usize::MAX)),
-        Err(crate::Rejection::ContextLimit),
+        Err(Rejection::ContextLimit),
     ));
     Ok(())
 }

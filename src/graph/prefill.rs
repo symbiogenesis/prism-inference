@@ -245,7 +245,7 @@ impl Qwen35 {
     /// The explicit reservation covers additional tile storage, and must be
     /// charged by a model owner without reducing existing reserves. Cancellation
     /// checks occur between tokens, layers and packed matrix projections. An
-    /// error may leave provisional layer state; as for [`Decoder::ingest_block`],
+    /// error may leave provisional layer state; as for [`crate::Decoder::ingest_block`],
     /// the owner must restore the entire request checkpoint or reset before reuse.
     ///
     /// # Errors

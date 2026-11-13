@@ -50,9 +50,9 @@ its 1,971-byte receipt has SHA-256
 `ea54d93d9367122c372b5bc3396ccf112ecaca7900714ed19ed1f08a5ef42bbf`.
 These are historical 0.1.25 identities, independent of the new registry source.
 
-The selected Windows binary source is
-`3d735627df43056d3bf569002af2c23af30a3e6a`. It follows the registry source with
-two explicit raw-pointer fixture references and removal of two stale Clippy
+The source selected for the first two Windows bundle attempts was
+`3d735627df43056d3bf569002af2c23af30a3e6a`. That revision follows the registry
+source with two explicit raw-pointer fixture references and removal of two stale Clippy
 expectations in three runtime source files. NEON helper source is unchanged.
 These revisions must remain distinct even though both identify runtime 0.1.26;
 registry archive verification does not validate a binary built from later source.
@@ -60,9 +60,14 @@ registry archive verification does not validate a binary built from later source
 The first [Foundation bundle attempt](https://github.com/symbiogenesis/prism-inference/actions/runs/43477092273)
 was cancelled without producing artifacts. The owner-authorized
 [subsequent attempt](https://github.com/symbiogenesis/prism-inference/actions/runs/43478391022)
-is pending. No 0.1.26 binary release, archive digest or source-bound receipt is
-claimed here. Registry publication and the five-executable bundle remain
-independent deliveries.
+reached its five-minute job limit while compiling the five executables, without
+producing artifacts. Both attempts remain closed. The owner's subsequent
+instruction removes repository-imposed hosted release-build deadlines in favor
+of GitHub's own cap. The workflow retains its exact-source and operation-ID
+guards and all nine receipt/version controls. Owner-device diagnostic, model
+and benchmark limits remain unchanged. No 0.1.26 binary release, archive digest
+or source-bound receipt is claimed here. Registry publication and the
+five-executable bundle remain independent deliveries.
 
 Complete Foundation, the independent source-package consumer matrix and
 actual-model/state/resource qualification remain pending. Earlier focused checks

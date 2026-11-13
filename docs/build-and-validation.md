@@ -608,30 +608,28 @@ the workspace; `cargo install prism-inference` alone installs the first three
 executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
 include all five.
 
-For a separately authorized short packaging operation, the manually dispatched
+For an authorized hosted release build, the manually dispatched
 [Foundation bundle workflow](../.github/workflows/foundation-bundle.yml) builds
 those five executables on hosted Windows ARM64 after nine focused receipt/version
 controls, formatting, strict Release all-target analyzers for the runtime, server
 and Hexagon crates, and a feature-disabled runtime library compilation check.
-It executes no numerical correctness suite or model. Its one job has a five-minute
-upper limit. The standing agent operation allowance remains five minutes total,
-including setup, queueing, monitoring, cancellation and artifact retention. A
-selected fixed operation conservatively estimated at 350 seconds needs an explicit
-owner-approved six-minute aggregate exception; six minutes is the smallest
-whole-minute allowance above that estimate. The job timeout grants no exception.
-The operator must reserve cancellation/retention time and cancel before its own
-work cutoff even when the hosted job has time left. It derives the version from
-matching runtime/server manifests and the server's exact runtime pin, then uses
-the ordinary source-bound bundle producer and genuine GitHub run identity.
+It executes no numerical correctness suite or model. The owner's explicit
+release instruction selects GitHub's own hosted job cap: this workflow defines
+no job timeout, timeout input or aggregate operator cancellation deadline for
+release compilation. Model captures, benchmarks and owner-device diagnostics
+retain their separate execution and power-observation limits. This hosted release
+policy does not extend those workloads or reopen their historical deadlines.
+The build derives the version from matching runtime/server manifests and the
+server's exact runtime pin, then uses the ordinary source-bound bundle producer
+and genuine GitHub run identity.
 Dispatch requires the exact expected main revision and a unique one-to-48-character
 operation ID containing letters, digits, underscores or hyphens and starting with
 a letter or digit. The first step rejects a source mismatch, and the run name
-includes the operation ID so an operator can identify and cancel only its own
-bounded operation.
+includes the operation ID so an operator can identify its exact release build.
 The retained `bundle-scope.json` explicitly leaves full Foundation correctness,
 model acceptance and performance unqualified. This separate workflow cannot serve
-as Foundation's successful-ancestor validation baseline. A missing cache or a
-timeout leaves packaging incomplete; it does not authorize another attempt.
+as Foundation's successful-ancestor validation baseline. A failed or cancelled
+build without its source-bound artifacts leaves packaging incomplete.
 
 The historical `0.1.23` runtime and Windows ARM64 development prerelease preserve
 all older full and prerelease artifacts. Its

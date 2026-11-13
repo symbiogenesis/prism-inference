@@ -1991,6 +1991,7 @@ fn transform_tile_inputs<'a>(
 
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
 )]
 fn project_tile_pair<'a>(
@@ -2071,6 +2072,45 @@ fn project_tile_pair<'a>(
         return Ok(TileReuse {
             basis: Some(tensors[1]),
             prepared: None,
+        });
+    }
+    // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
+    // sequential base/adapter order, including their original error precedence.
+    if executor.is_none()
+        && adapter.is_none_or(|adapter| {
+            tensors
+                .iter()
+                .all(|tensor| !adapter.affects_linear(&tensor.name, adapter_scale))
+        })
+        && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
+        && ProjectionTile::supports_siblings(&tensors)
+    {
+        let reuse_basis = previous
+            .basis
+            .is_some_and(|prev| transforms.basis(prev) == transforms.basis(tensors[0]));
+        let activation = transform_tile_inputs(
+            transforms,
+            geometry,
+            tensors[0],
+            reuse_basis,
+            inputs,
+            transformed,
+            projector.row_parallelism(),
+        )?;
+        let prepared = previous
+            .prepared
+            .filter(|prev| reuse_basis && transforms.basis(prev) == transforms.basis(tensors[0]));
+        projector.project_siblings_with_previous(
+            prepared,
+            &tensors,
+            activation,
+            &mut [outputs_a, outputs_b],
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+            check,
+        )?;
+        return Ok(TileReuse {
+            basis: Some(tensors[1]),
+            prepared: Some(tensors[1]),
         });
     }
     let reuse = project_tile(
@@ -2493,6 +2533,46 @@ fn project_tile_triple<'a>(
         return Ok(TileReuse {
             basis: Some(tensors[2]),
             prepared: None,
+        });
+    }
+    // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
+    // sequential base/adapter order, including their original error precedence.
+    if executor.is_none()
+        && adapter.is_none_or(|adapter| {
+            tensors
+                .iter()
+                .all(|tensor| !adapter.affects_linear(&tensor.name, adapter_scale))
+        })
+        && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
+        && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
+        && ProjectionTile::supports_siblings(&tensors)
+    {
+        let reuse_basis = previous
+            .basis
+            .is_some_and(|prev| transforms.basis(prev) == transforms.basis(tensors[0]));
+        let activation = transform_tile_inputs(
+            transforms,
+            geometry,
+            tensors[0],
+            reuse_basis,
+            inputs,
+            transformed,
+            projector.row_parallelism(),
+        )?;
+        let prepared = previous
+            .prepared
+            .filter(|prev| reuse_basis && transforms.basis(prev) == transforms.basis(tensors[0]));
+        projector.project_siblings_with_previous(
+            prepared,
+            &tensors,
+            activation,
+            &mut [outputs_a, outputs_b, outputs_c],
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+            check,
+        )?;
+        return Ok(TileReuse {
+            basis: Some(tensors[2]),
+            prepared: Some(tensors[2]),
         });
     }
     let reuse = project_tile_pair(

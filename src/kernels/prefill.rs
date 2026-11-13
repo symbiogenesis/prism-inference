@@ -123,11 +123,6 @@ impl ProjectionTile {
         self.project_with_previous(None, tensor, inputs, outputs, pinned, check)
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        clippy::too_many_lines,
-        reason = "Retain the separately rounded source arithmetic and auditable packed block order."
-    )]
     pub(crate) fn project_with_previous(
         &mut self,
         previous: Option<&Tensor>,
@@ -137,11 +132,80 @@ impl ProjectionTile {
         pinned: bool,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        for output in outputs.iter_mut() {
-            output.clear();
+        self.project_group_internal(previous, &[tensor], inputs, &mut [outputs], pinned, check)
+    }
+
+    pub(crate) fn supports_siblings(tensors: &[&Tensor]) -> bool {
+        let Some(first) = tensors.first() else {
+            return false;
+        };
+        let Ok((columns, rows, row_bytes)) = dimensions(first) else {
+            return false;
+        };
+        (2..=3).contains(&tensors.len())
+            && first.kind == PQ2
+            && rows >= 4
+            && columns.is_multiple_of(256)
+            && tensors.iter().all(|tensor| {
+                tensor.kind == PQ2
+                    && dimensions(tensor).is_ok_and(|(cols, rows, bytes)| {
+                        cols == columns && rows > 0 && bytes == row_bytes
+                    })
+            })
+    }
+
+    pub(crate) fn project_siblings_with_previous(
+        &mut self,
+        previous: Option<&Tensor>,
+        tensors: &[&Tensor],
+        inputs: &[Vec<f32>],
+        outputs: &mut [&mut [Vec<f32>]],
+        pinned: bool,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if !Self::supports_siblings(tensors) || tensors.len() != outputs.len() {
+            for group in outputs {
+                for output in group.iter_mut() {
+                    output.clear();
+                }
+            }
+            return Err(invalid("incompatible CPU projection siblings"));
+        }
+        self.project_group_internal(previous, tensors, inputs, outputs, pinned, check)
+    }
+
+    #[expect(
+        clippy::suboptimal_flops,
+        clippy::too_many_lines,
+        reason = "Retain the separately rounded source arithmetic and auditable packed block order."
+    )]
+    fn project_group_internal(
+        &mut self,
+        previous: Option<&Tensor>,
+        tensors: &[&Tensor],
+        inputs: &[Vec<f32>],
+        all_outputs: &mut [&mut [Vec<f32>]],
+        pinned: bool,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let tensor = tensors[0];
+        for group in all_outputs.iter_mut() {
+            for output in group.iter_mut() {
+                output.clear();
+            }
         }
         let result = (|| {
             let (columns, rows, block_bytes) = dimensions(tensor)?;
+            for (sibling, outputs) in tensors.iter().zip(all_outputs.iter_mut()).skip(1) {
+                if outputs.len() != inputs.len() {
+                    return Err(invalid("invalid bounded projection tile"));
+                }
+                let (_, sibling_rows, _) = dimensions(sibling)?;
+                for output in outputs.iter_mut() {
+                    output.try_reserve_exact(sibling_rows)?;
+                }
+            }
+            let outputs = &mut *all_outputs[0];
             if inputs.is_empty() || inputs.len() > MAX_TILE_TOKENS || outputs.len() != inputs.len()
             {
                 return Err(invalid("invalid bounded projection tile"));
@@ -376,7 +440,9 @@ impl ProjectionTile {
                 }
                 return Ok(());
             }
-            self.packed_projections = self.packed_projections.saturating_add(1);
+            self.packed_projections = self
+                .packed_projections
+                .saturating_add(u64::try_from(tensors.len())?);
             let backend = self.backend;
             let preparations = &self.preparations[..inputs.len()];
             let dot_one = |row: &[u8],
@@ -507,65 +573,89 @@ impl ProjectionTile {
                 }
                 Ok(sums)
             };
-            self.row_parallelism.fill_tile_four_rows(
-                &tensor.data,
+            let dot_eight = |rows8: [&[u8]; 8], decoded_blocks: &mut u64| {
+                if let Some(res) = dot::dot_eight_rows::<MAX_TILE_TOKENS>(
+                    rows8,
+                    preparations,
+                    tensor.kind,
+                    columns,
+                    pinned,
+                    backend,
+                    decoded_blocks,
+                ) {
+                    return res;
+                }
+                Ok([
+                    dot_one(rows8[0], decoded_blocks)?,
+                    dot_one(rows8[1], decoded_blocks)?,
+                    dot_one(rows8[2], decoded_blocks)?,
+                    dot_one(rows8[3], decoded_blocks)?,
+                    dot_one(rows8[4], decoded_blocks)?,
+                    dot_one(rows8[5], decoded_blocks)?,
+                    dot_one(rows8[6], decoded_blocks)?,
+                    dot_one(rows8[7], decoded_blocks)?,
+                ])
+            };
+            let dot_four = |rows4: [&[u8]; 4], decoded_blocks: &mut u64| {
+                if let Some(res) = dot::dot_four_rows::<MAX_TILE_TOKENS>(
+                    rows4,
+                    preparations,
+                    tensor.kind,
+                    columns,
+                    pinned,
+                    backend,
+                    decoded_blocks,
+                ) {
+                    return res;
+                }
+                Ok([
+                    dot_one(rows4[0], decoded_blocks)?,
+                    dot_one(rows4[1], decoded_blocks)?,
+                    dot_one(rows4[2], decoded_blocks)?,
+                    dot_one(rows4[3], decoded_blocks)?,
+                ])
+            };
+            if tensors.len() == 1 {
+                return self.row_parallelism.fill_tile_four_rows(
+                    &tensor.data,
+                    block_bytes,
+                    all_outputs[0],
+                    &mut self.decoded_blocks,
+                    check,
+                    dot_eight,
+                    dot_four,
+                    dot_one,
+                );
+            }
+            let mut data = [&[][..]; 3];
+            for (slot, tensor) in data.iter_mut().zip(tensors) {
+                *slot = &tensor.data;
+            }
+            self.row_parallelism.fill_tile_siblings_four_rows(
+                &data[..tensors.len()],
                 block_bytes,
-                outputs,
+                all_outputs,
                 &mut self.decoded_blocks,
                 check,
-                |rows8, decoded_blocks| {
-                    if let Some(res) = dot::dot_eight_rows::<MAX_TILE_TOKENS>(
-                        rows8,
-                        preparations,
-                        tensor.kind,
-                        columns,
-                        pinned,
-                        backend,
-                        decoded_blocks,
-                    ) {
-                        return res;
-                    }
-                    Ok([
-                        dot_one(rows8[0], decoded_blocks)?,
-                        dot_one(rows8[1], decoded_blocks)?,
-                        dot_one(rows8[2], decoded_blocks)?,
-                        dot_one(rows8[3], decoded_blocks)?,
-                        dot_one(rows8[4], decoded_blocks)?,
-                        dot_one(rows8[5], decoded_blocks)?,
-                        dot_one(rows8[6], decoded_blocks)?,
-                        dot_one(rows8[7], decoded_blocks)?,
-                    ])
-                },
-                |rows4, decoded_blocks| {
-                    if let Some(res) = dot::dot_four_rows::<MAX_TILE_TOKENS>(
-                        rows4,
-                        preparations,
-                        tensor.kind,
-                        columns,
-                        pinned,
-                        backend,
-                        decoded_blocks,
-                    ) {
-                        return res;
-                    }
-                    Ok([
-                        dot_one(rows4[0], decoded_blocks)?,
-                        dot_one(rows4[1], decoded_blocks)?,
-                        dot_one(rows4[2], decoded_blocks)?,
-                        dot_one(rows4[3], decoded_blocks)?,
-                    ])
-                },
+                dot_eight,
+                dot_four,
                 dot_one,
             )
         })();
         if result.is_err() {
-            for output in outputs {
-                output.clear();
+            for group in all_outputs {
+                for output in group.iter_mut() {
+                    output.clear();
+                }
             }
         }
         result
     }
 }
+
+#[cfg(test)]
+#[path = "prefill_sibling_tests.rs"]
+mod sibling_tests;
 
 #[cfg(test)]
 mod tests {

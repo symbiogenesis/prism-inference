@@ -243,6 +243,12 @@ impl RankOneAdapter {
         }
     }
 
+    /// Whether a linear correction can do work for this exact target and scale.
+    /// Keep this identical to the no-op admission in `linear_tokens`.
+    pub(crate) fn affects_linear(&self, target: &str, scale: f32) -> bool {
+        scale != 0.0 && possible_factor_target(target) && self.factors.contains_key(target)
+    }
+
     pub(crate) fn linear(
         &self,
         target: &str,
@@ -516,6 +522,30 @@ mod tests {
             ]),
         };
         RankOneAdapter::from_model(factors, &base)
+    }
+
+    #[test]
+    fn x1_cpu_sibling_adapter_eligibility_matches_exact_noop_contract() -> Result<()> {
+        let adapter = adapter(0.0, 0.0)?;
+        let target = "blk.0.ffn_down.weight";
+        // Numerically zero factors still execute their correction and may
+        // change signed zero or fail; only actual no-op admission permits grouping.
+        assert!(adapter.affects_linear(target, 1.3));
+        for scale in [0.0, -0.0] {
+            assert!(!adapter.affects_linear(target, scale));
+        }
+        let mut scratch = Scratch::default();
+        for name in [
+            "blk.0.ssm_in.weight",
+            "blk.0.ffn_up.weight",
+            "blk.1.ffn_down.weight",
+        ] {
+            assert!(!adapter.affects_linear(name, 1.3));
+            let mut output = vec![vec![f32::from_bits(0x8000_0000)]];
+            adapter.linear_tokens(name, &[vec![f32::NAN]], 1.3, &mut output, &mut scratch)?;
+            assert_eq!(output[0][0].to_bits(), 0x8000_0000);
+        }
+        Ok(())
     }
 
     #[test]

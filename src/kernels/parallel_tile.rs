@@ -63,6 +63,140 @@ fn wait_for_tile_tasks(
     }
 }
 
+#[cfg(feature = "parallel-rows")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Share the existing exact 8/4/1-row worker and ordered failure replay across single and sibling tiles."
+)]
+fn fill_tile_task<const TOKENS: usize>(
+    task: &mut Task<'_, TOKENS>,
+    bytes: &[u8],
+    row_bytes: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+    dot_eight: &(impl Fn([&[u8]; 8], &mut u64) -> Result<[[f32; TOKENS]; 8]> + Sync),
+    dot_four: &(impl Fn([&[u8]; 4], &mut u64) -> Result<[[f32; TOKENS]; 4]> + Sync),
+    dot: &(impl Fn(&[u8], &mut u64) -> Result<[f32; TOKENS]> + Sync),
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut row = 0;
+    let mut chunks8 = bytes.chunks_exact(row_bytes * 8);
+    for chunk in chunks8.by_ref() {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        let rows8: [&[u8]; 8] =
+            std::array::from_fn(|idx| &chunk[idx * row_bytes..(idx + 1) * row_bytes]);
+        let before_blocks = task.decoded_blocks;
+        if let Ok(out8) = dot_eight(rows8, &mut task.decoded_blocks) {
+            for (tok, output) in task.outputs.iter_mut().enumerate() {
+                if !output.is_empty() {
+                    for r in 0..8 {
+                        output[row + r] = out8[r][tok];
+                    }
+                }
+            }
+            row += 8;
+        } else {
+            task.decoded_blocks = before_blocks;
+            for single in rows8 {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                match dot(single, &mut task.decoded_blocks) {
+                    Ok(values) => {
+                        for (output, value) in task.outputs.iter_mut().zip(values) {
+                            if !output.is_empty() {
+                                output[row] = value;
+                            }
+                        }
+                        row += 1;
+                    }
+                    Err(error) => {
+                        task.error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if task.error.is_some() {
+                break;
+            }
+        }
+    }
+    let mut chunks4 = chunks8.remainder().chunks_exact(row_bytes * 4);
+    if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
+        for chunk in chunks4.by_ref() {
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            let r0 = &chunk[..row_bytes];
+            let r1 = &chunk[row_bytes..row_bytes * 2];
+            let r2 = &chunk[row_bytes * 2..row_bytes * 3];
+            let r3 = &chunk[row_bytes * 3..];
+            let before_blocks = task.decoded_blocks;
+            if let Ok(rows4) = dot_four([r0, r1, r2, r3], &mut task.decoded_blocks) {
+                for (tok, output) in task.outputs.iter_mut().enumerate() {
+                    if !output.is_empty() {
+                        output[row] = rows4[0][tok];
+                        output[row + 1] = rows4[1][tok];
+                        output[row + 2] = rows4[2][tok];
+                        output[row + 3] = rows4[3][tok];
+                    }
+                }
+                row += 4;
+            } else {
+                task.decoded_blocks = before_blocks;
+                for single in [r0, r1, r2, r3] {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match dot(single, &mut task.decoded_blocks) {
+                        Ok(values) => {
+                            for (output, value) in task.outputs.iter_mut().zip(values) {
+                                if !output.is_empty() {
+                                    output[row] = value;
+                                }
+                            }
+                            row += 1;
+                        }
+                        Err(error) => {
+                            task.error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if task.error.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
+        for single in chunks4.remainder().chunks_exact(row_bytes) {
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            match dot(single, &mut task.decoded_blocks) {
+                Ok(values) => {
+                    for (output, value) in task.outputs.iter_mut().zip(values) {
+                        if !output.is_empty() {
+                            output[row] = value;
+                        }
+                    }
+                    row += 1;
+                }
+                Err(error) => {
+                    task.error = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[path = "parallel_tile_siblings.rs"]
+mod siblings;
+
 impl RowParallelism {
     /// Fill disjoint token-major row slices without duplicating weight decoding.
     /// The callback stays on its calling thread and needs neither `Send` nor `Sync`.
@@ -204,7 +338,7 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && self.uses_pool(rows)
         {
-            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicBool, AtomicUsize};
 
             let task_rows = rows.div_ceil(self.workers());
             let task_count = rows.div_ceil(task_rows);
@@ -235,126 +369,7 @@ impl RowParallelism {
                     let caller = &caller;
                     scope.spawn(move |_| {
                         let _completion = Completion { remaining, caller };
-                        let mut row = 0;
-                        let mut chunks8 = bytes.chunks_exact(row_bytes * 8);
-                        for chunk in chunks8.by_ref() {
-                            if cancelled.load(Ordering::Acquire) {
-                                break;
-                            }
-                            let rows8: [&[u8]; 8] = std::array::from_fn(|idx| {
-                                &chunk[idx * row_bytes..(idx + 1) * row_bytes]
-                            });
-                            let before_blocks = task.decoded_blocks;
-                            if let Ok(out8) = dot_eight(rows8, &mut task.decoded_blocks) {
-                                for (tok, output) in task.outputs.iter_mut().enumerate() {
-                                    if !output.is_empty() {
-                                        for r in 0..8 {
-                                            output[row + r] = out8[r][tok];
-                                        }
-                                    }
-                                }
-                                row += 8;
-                            } else {
-                                task.decoded_blocks = before_blocks;
-                                for single in rows8 {
-                                    if cancelled.load(Ordering::Acquire) {
-                                        break;
-                                    }
-                                    match dot(single, &mut task.decoded_blocks) {
-                                        Ok(values) => {
-                                            for (output, value) in
-                                                task.outputs.iter_mut().zip(values)
-                                            {
-                                                if !output.is_empty() {
-                                                    output[row] = value;
-                                                }
-                                            }
-                                            row += 1;
-                                        }
-                                        Err(error) => {
-                                            task.error = Some(error);
-                                            break;
-                                        }
-                                    }
-                                }
-                                if task.error.is_some() {
-                                    break;
-                                }
-                            }
-                        }
-                        let mut chunks4 = chunks8.remainder().chunks_exact(row_bytes * 4);
-                        if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
-                            for chunk in chunks4.by_ref() {
-                                if cancelled.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                let r0 = &chunk[..row_bytes];
-                                let r1 = &chunk[row_bytes..row_bytes * 2];
-                                let r2 = &chunk[row_bytes * 2..row_bytes * 3];
-                                let r3 = &chunk[row_bytes * 3..];
-                                let before_blocks = task.decoded_blocks;
-                                if let Ok(rows4) =
-                                    dot_four([r0, r1, r2, r3], &mut task.decoded_blocks)
-                                {
-                                    for (tok, output) in task.outputs.iter_mut().enumerate() {
-                                        if !output.is_empty() {
-                                            output[row] = rows4[0][tok];
-                                            output[row + 1] = rows4[1][tok];
-                                            output[row + 2] = rows4[2][tok];
-                                            output[row + 3] = rows4[3][tok];
-                                        }
-                                    }
-                                    row += 4;
-                                } else {
-                                    task.decoded_blocks = before_blocks;
-                                    for single in [r0, r1, r2, r3] {
-                                        if cancelled.load(Ordering::Acquire) {
-                                            break;
-                                        }
-                                        match dot(single, &mut task.decoded_blocks) {
-                                            Ok(values) => {
-                                                for (output, value) in
-                                                    task.outputs.iter_mut().zip(values)
-                                                {
-                                                    if !output.is_empty() {
-                                                        output[row] = value;
-                                                    }
-                                                }
-                                                row += 1;
-                                            }
-                                            Err(error) => {
-                                                task.error = Some(error);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if task.error.is_some() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if task.error.is_none() && !cancelled.load(Ordering::Acquire) {
-                            for single in chunks4.remainder().chunks_exact(row_bytes) {
-                                if cancelled.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                match dot(single, &mut task.decoded_blocks) {
-                                    Ok(values) => {
-                                        for (output, value) in task.outputs.iter_mut().zip(values) {
-                                            if !output.is_empty() {
-                                                output[row] = value;
-                                            }
-                                        }
-                                        row += 1;
-                                    }
-                                    Err(error) => {
-                                        task.error = Some(error);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        fill_tile_task(task, bytes, row_bytes, cancelled, dot_eight, dot_four, dot);
                     });
                 }
                 wait_for_tile_tasks(&remaining, &cancelled, &mut cancellation, check);

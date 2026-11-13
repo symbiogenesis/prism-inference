@@ -115,7 +115,10 @@ if ($MyInvocation.InvocationName -ne '.') {
         $identity = @(& $ActionlintPath -version)
         if ($identity[0] -cne $version) { throw "Expected actionlint $version; received $($identity[0])." }
         Invoke-CiWorkflowLint $Root $ActionlintPath
-        if ($CheckFixtures) { & (Join-Path $PSScriptRoot 'Test-WorkflowControls.ps1') -ActionlintPath $ActionlintPath }
+        if ($CheckFixtures) {
+            & (Join-Path $PSScriptRoot 'Test-WorkflowControls.ps1') -ActionlintPath $ActionlintPath
+            & (Join-Path $PSScriptRoot 'Test-WorkflowExit.ps1') -ActionlintPath $ActionlintPath
+        }
         'Workflow preflight passed: syntax, job graph, local action inputs and immutable action references.'
     } finally {
         if ($scratch) {
@@ -125,4 +128,8 @@ if ($MyInvocation.InvocationName -ne '.') {
             Remove-Item -LiteralPath $absolute -Recurse -Force
         }
     }
+    # Successful script completion is independent of any expected native
+    # rejection inside the negative controls or a caller's previous command.
+    # Keep this inside the executable entrypoint so dot-sourcing stays safe.
+    exit 0
 }

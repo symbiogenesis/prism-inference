@@ -344,7 +344,10 @@ It checks every workflow with checksum-pinned actionlint 1.7.12, including YAML,
 expressions, job dependencies and local action inputs. It separately rejects
 mutable external action references and missing local actions, including references
 inside composites. Eleven negative controls prove rejection of common startup
-mistakes. Optional script linters are disabled; no additional language runtime is
+mistakes. Three process controls reproduce GitHub's PowerShell wrapper and verify
+successful exit status, preservation of the caller's native status by negative
+controls, and a nonzero result for a genuinely invalid workflow. Optional script
+linters are disabled; no additional language runtime is
 installed. Downloads have finite retries and scratch storage is removed on exit.
 For an already trusted offline binary, pass `-ActionlintPath <absolute-path>`.
 Source checks runs the same preflight before selecting expensive jobs. This

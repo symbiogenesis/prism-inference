@@ -6,6 +6,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 . (Join-Path $PSScriptRoot 'Test-Workflow.ps1') -ActionlintPath $ActionlintPath
+# Expected native failures must not become the caller's process result. GitHub's
+# PowerShell wrapper exits with LASTEXITCODE even when every assertion passed.
+$previousExitVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+$previousExitCode = if ($null -ne $previousExitVariable) { $previousExitVariable.Value } else { $null }
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('Prism-Workflow-Control-' + [guid]::NewGuid().ToString('N'))
 try {
     # actionlint enables local action-input validation only within a repository.
@@ -41,8 +45,13 @@ try {
     }
     "Workflow negative controls passed: $($mutations.Count)."
 } finally {
-    $absolute = [IO.Path]::GetFullPath($scratch)
-    $temporary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) + [IO.Path]::DirectorySeparatorChar
-    if (-not $absolute.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or -not [IO.Path]::GetFileName($absolute).StartsWith('Prism-Workflow-Control-')) { throw 'Workflow control cleanup escaped temporary storage.' }
-    Remove-Item -LiteralPath $absolute -Recurse -Force
+    try {
+        $absolute = [IO.Path]::GetFullPath($scratch)
+        $temporary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) + [IO.Path]::DirectorySeparatorChar
+        if (-not $absolute.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or -not [IO.Path]::GetFileName($absolute).StartsWith('Prism-Workflow-Control-')) { throw 'Workflow control cleanup escaped temporary storage.' }
+        Remove-Item -LiteralPath $absolute -Recurse -Force
+    } finally {
+        if ($null -ne $previousExitVariable) { Set-Variable -Name LASTEXITCODE -Scope Global -Value $previousExitCode }
+        else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    }
 }

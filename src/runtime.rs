@@ -13,6 +13,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
+mod sampled_speculation;
 mod timing;
 mod verification;
 use timing::measure;

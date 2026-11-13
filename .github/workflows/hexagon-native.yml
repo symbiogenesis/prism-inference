@@ -51,8 +51,8 @@ jobs:
           # This reaches the real Windows ARM64 cfg and private FFI code while
           # requiring neither an ARM64 linker nor a vendor driver. It cannot
           # replace the independent Windows ARM64 test/doc/device gates below.
-          python -B "$GITHUB_WORKSPACE/.github/ci/run_ci_command.py" --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --target-dir "$RUNNER_TEMP/Prism-Hexagon-Cross-Target" --locked --release -p bonsai-hexagon-native --all-targets
-          python -B "$GITHUB_WORKSPACE/.github/ci/run_ci_command.py" --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" clippy --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --target-dir "$RUNNER_TEMP/Prism-Hexagon-Cross-Target" --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings
+          python -B "$GITHUB_WORKSPACE/.github/ci/run_ci_command.py" --label 'Hexagon Cargo check' -- cargo "+$toolchain" check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --target-dir "$RUNNER_TEMP/Prism-Hexagon-Cross-Target" --locked --release -p bonsai-hexagon-native --all-targets
+          python -B "$GITHUB_WORKSPACE/.github/ci/run_ci_command.py" --label 'Hexagon Cargo clippy' -- cargo "+$toolchain" clippy --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --target-dir "$RUNNER_TEMP/Prism-Hexagon-Cross-Target" --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings
   native-contracts:
     name: Native contracts / ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -85,11 +85,11 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           $target = Join-Path $env:RUNNER_TEMP 'Prism-Hexagon-Native-Target'
           $toolchain = 'nightly-2026-11-09-' + $env:CARGO_BUILD_TARGET
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" fmt --manifest-path $manifest -p bonsai-hexagon-native -- --check
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --doc
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" doc --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --no-deps
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo fmt' -- cargo "+$toolchain" fmt --manifest-path $manifest -p bonsai-hexagon-native -- --check
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo test' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo clippy' -- cargo "+$toolchain" clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo test' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --doc
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo doc' -- cargo "+$toolchain" doc --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --no-deps
       - name: Check exact projection executors and native graph integration without a device
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -100,8 +100,8 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           $target = Join-Path $env:RUNNER_TEMP 'Prism-Hexagon-Runtime-Target'
           $toolchain = 'nightly-2026-11-09-' + $env:CARGO_BUILD_TARGET
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" fmt --manifest-path $manifest -p prism-inference -p bonsai-hexagon-runtime -- --check
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-runtime --all-targets
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p prism-inference --test graph projection_scope
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-runtime --all-targets -- -D warnings
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo "+$toolchain"' -- cargo "+$toolchain" doc --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-runtime --no-deps
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo fmt' -- cargo "+$toolchain" fmt --manifest-path $manifest -p prism-inference -p bonsai-hexagon-runtime -- --check
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo test' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-runtime --all-targets
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo test' -- cargo "+$toolchain" test --manifest-path $manifest --target-dir $target --locked --release -p prism-inference --test graph projection_scope
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo clippy' -- cargo "+$toolchain" clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-runtime --all-targets -- -D warnings
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Hexagon Cargo doc' -- cargo "+$toolchain" doc --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-runtime --no-deps

@@ -7,7 +7,7 @@ use bonsai_prism_runtime::{
         swift::{self, Representation},
     },
     runtime::PromptReuse,
-    swift_session::CpuPrefill,
+    swift_session::{CpuPrefill, CpuSpeculation},
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -21,6 +21,7 @@ pub(super) struct ModelProfile {
     pub context_tokens: usize,
     pub kv_cache: KvCachePolicy,
     pub cpu_prefill: Option<CpuPrefill>,
+    pub cpu_speculation: Option<CpuSpeculation>,
     pub startup_graph_identity: Option<Arc<str>>,
 }
 
@@ -34,6 +35,7 @@ impl Default for ModelProfile {
             context_tokens: swift::CONTEXT_TOKENS,
             kv_cache: KvCachePolicy::F16,
             cpu_prefill: None,
+            cpu_speculation: None,
             startup_graph_identity: None,
         }
     }
@@ -68,6 +70,11 @@ impl ModelProfile {
         if let Some(prefill) = self.cpu_prefill {
             model["cpu_prefill_tokens"] = json!(prefill.tokens());
             model["cpu_prefill_scratch_bytes"] = json!(prefill.scratch_bytes());
+        }
+        if let Some(speculation) = self.cpu_speculation {
+            model["cpu_speculative_tokens"] = json!(speculation.tokens());
+            model["cpu_verification_scratch_bytes"] = json!(speculation.verification_scratch_bytes());
+            model["cpu_speculative_checkpoint_bytes"] = json!(speculation.checkpoint_bytes());
         }
         if self.kv_cache != KvCachePolicy::F16 || self.cpu_prefill.is_some() {
             // Adapter scales may change between requests. This records the

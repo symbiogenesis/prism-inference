@@ -51,6 +51,7 @@ impl Engine for SwiftSession {
             context_tokens: self.context_tokens(),
             kv_cache: self.kv_cache_policy(),
             cpu_prefill: self.cpu_prefill(),
+            cpu_speculation: self.cpu_speculation(),
             startup_graph_identity: (self.kv_cache_policy() != KvCachePolicy::F16
                 || self.cpu_prefill().is_some())
             .then(|| Arc::from(self.decoder_identity())),
@@ -506,17 +507,34 @@ impl Drop for Settlement<'_> {
 }
 
 fn valid_graph_profile(profile: &ModelProfile) -> bool {
+    if profile.cpu_speculation.is_some() && profile.cpu_prefill.is_none() {
+        return false;
+    }
     let Some(identity) = profile.startup_graph_identity.as_deref() else {
         return profile.kv_cache == KvCachePolicy::F16 && profile.cpu_prefill.is_none();
     };
     if identity.is_empty() || identity.len() > 4096 {
         return false;
     }
+    // Match one complete typed cache identity component, never an arbitrary
+    // substring: rsq4 and rsq4k3v must not validate one another or FP16.
+    let mut cache_components = identity.split(':').filter(|part| part.starts_with("kv-"));
+    let expected_cache = format!("kv-{}-d256-rht3-v1", profile.kv_cache.name());
+    let cache_matches = match profile.kv_cache {
+        KvCachePolicy::F16 => cache_components.next().is_none(),
+        _ => cache_components.next() == Some(expected_cache.as_str()) && cache_components.next().is_none(),
+    };
+    if !cache_matches { return false; }
     if let Some(prefill) = profile.cpu_prefill {
-        profile.kv_cache == KvCachePolicy::F16
-            && identity.ends_with(&format!(":cpu-tiled-ffn-v1:{}", prefill.tokens()))
+        let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());
+        if profile.cpu_speculation.is_some() { suffix.push_str(":cpu-tiled-verify-v1"); }
+        identity.strip_suffix(&suffix).is_some_and(|base| {
+            !base.contains(":cpu-tiled-") && !base.contains(":gdn-wy-f32-v1")
+        })
     } else {
         profile.kv_cache != KvCachePolicy::F16
+            && !identity.contains(":cpu-tiled-")
+            && !identity.contains(":gdn-wy-f32-v1")
     }
 }
 
@@ -524,6 +542,9 @@ impl Worker {
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
         let profile = engine.profile()?;
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
+            || bonsai_prism_runtime::swift_session::validate_execution_capacity(
+                profile.context_tokens, u64::MAX, profile.cpu_prefill, profile.cpu_speculation,
+            ).is_err()
             || !valid_graph_profile(&profile)
         {
             return Err(NativeBackendError::Configuration);

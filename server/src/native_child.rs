@@ -8,7 +8,7 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     runtime::PromptReuse,
     swift_session::{
-        CpuPrefill, SwiftSession, validate_context_capacity, validate_prefill_capacity,
+        CpuPrefill, CpuSpeculation, SwiftSession, validate_context_capacity, validate_execution_capacity,
     },
 };
 use bonsai_windows_credentials::validate_read_path;
@@ -29,6 +29,7 @@ struct Config {
     prompt_reuse: PromptReuse,
     kv_cache: KvCachePolicy,
     cpu_prefill: Option<CpuPrefill>,
+    cpu_speculation: Option<CpuSpeculation>,
     capacity: Option<(usize, u64)>,
 }
 
@@ -53,6 +54,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut prompt_reuse = None;
     let mut kv_cache = None;
     let (mut prefill_tokens, mut prefill_scratch) = (None, None);
+    let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) = (None, None, None);
     let (mut context_tokens, mut memory_limit_bytes) = (None, None);
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
@@ -77,6 +79,15 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             }
             Some("--cpu-prefill-scratch-bytes") if prefill_scratch.is_none() => {
                 prefill_scratch = Some(value)
+            }
+            Some("--cpu-speculative-tokens") if speculative_tokens.is_none() => {
+                speculative_tokens = Some(value)
+            }
+            Some("--cpu-verification-scratch-bytes") if verification_scratch.is_none() => {
+                verification_scratch = Some(value)
+            }
+            Some("--cpu-speculative-checkpoint-bytes") if speculative_checkpoint.is_none() => {
+                speculative_checkpoint = Some(value)
             }
             Some("--port") if port.is_none() => {
                 port = Some(
@@ -138,14 +149,16 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
         cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch)?,
+        cpu_speculation: parse_speculation(speculative_tokens, verification_scratch, speculative_checkpoint)?,
         capacity: parse_capacity(context_tokens, memory_limit_bytes)?,
     };
-    if let Some(prefill) = config.cpu_prefill {
+    if config.cpu_prefill.is_some() || config.cpu_speculation.is_some() {
         let (context, memory) = config.capacity.ok_or_else(invalid)?;
-        if config.kv_cache != KvCachePolicy::F16 {
+        if kv_cache.is_none() {
             return Err(invalid());
         }
-        validate_prefill_capacity(context, memory, Some(prefill)).map_err(|_| invalid())?;
+        validate_execution_capacity(context, memory, config.cpu_prefill, config.cpu_speculation)
+            .map_err(|_| invalid())?;
     }
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -184,6 +197,24 @@ fn parse_prefill(
             CpuPrefill::new(tokens, scratch)
                 .map(Some)
                 .map_err(|_| invalid())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn parse_speculation(
+    tokens: Option<OsString>,
+    scratch: Option<OsString>,
+    checkpoint: Option<OsString>,
+) -> io::Result<Option<CpuSpeculation>> {
+    match (tokens, scratch, checkpoint) {
+        (None, None, None) => Ok(None),
+        (Some(tokens), Some(scratch), Some(checkpoint)) => {
+            let parse_number = |value: OsString| -> io::Result<usize> {
+                value.to_str().ok_or_else(invalid)?.parse().map_err(|_| invalid())
+            };
+            CpuSpeculation::new(parse_number(tokens)?, parse_number(scratch)?, parse_number(checkpoint)?)
+                .map(Some).map_err(|_| invalid())
         }
         _ => Err(invalid()),
     }
@@ -250,7 +281,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         .map_err(|error| startup::at(Stage::Key, &error))?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_prefill(
+    let mut session = SwiftSession::load_profile_with_execution(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
@@ -263,6 +294,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
             |(tokens, _)| tokens,
         ),
         config.cpu_prefill,
+        config.cpu_speculation,
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     session
@@ -347,7 +379,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "One admission control retains valid tile/reuse profiles beside all paired-option rejections."
     )]
-    fn native_child_cpu_prefill_is_paired_fp16_and_memory_admitted() -> io::Result<()> {
+    fn native_child_cpu_prefill_is_paired_and_memory_admitted() -> io::Result<()> {
         use bonsai_prism_runtime::swift_session::{
             CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES,
         };
@@ -396,6 +428,11 @@ mod tests {
             );
             assert_eq!(config.prompt_reuse, PromptReuse::Latest);
             assert_eq!(config.kv_cache, KvCachePolicy::F16);
+            for cache in ["rsq4", "rsq4k3v"] {
+                let mut rotated = selected.clone();
+                rotated[10] = cache.into();
+                assert_eq!(parse(rotated)?.kv_cache.name(), cache);
+            }
             let mut insufficient = selected.clone();
             insufficient[16] = OsString::from((memory - 1).to_string());
             assert!(parse(insufficient).is_err());
@@ -420,8 +457,6 @@ mod tests {
                 "67108864",
             ],
             vec![
-                "--kv-cache",
-                "rsq4",
                 "--context-tokens",
                 "8192",
                 "--memory-limit-bytes",
@@ -459,6 +494,73 @@ mod tests {
             let mut arguments = base.clone();
             arguments.extend(options.into_iter().map(OsString::from));
             assert!(parse(arguments).is_err());
+        }
+        Ok(())
+    }
+
+    fn speculation_arguments() -> io::Result<(bonsai_windows_credentials::PrivateDirectory, Vec<OsString>, u64)> {
+        use bonsai_prism_runtime::swift_session::{CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES};
+        let (directory, [model, key, _adapter]) = files()?;
+        let tile = 64 * 1024 * 1024;
+        let logits = 16 * 1024 * 1024;
+        let checkpoint = STATE_MEMORY_BYTES;
+        let memory = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES
+            + u64::try_from(tile + logits + checkpoint).map_err(io::Error::other)?;
+        let base = vec![
+            OsString::from("--native-engine-child"), "--model".into(), model,
+            "--key-file".into(), key, "--port".into(), "8081".into(), "--seed".into(), "42".into(),
+            "--kv-cache".into(), "f16".into(), "--context-tokens".into(), "8192".into(),
+            "--memory-limit-bytes".into(), memory.to_string().into(),
+            "--cpu-prefill-tokens".into(), "8".into(),
+            "--cpu-prefill-scratch-bytes".into(), tile.to_string().into(),
+        ];
+        Ok((directory, base, memory))
+    }
+
+    #[test]
+    fn native_child_cpu_speculation_requires_complete_triple_and_both_reserves() -> io::Result<()> {
+        let (_directory, base, memory) = speculation_arguments()?;
+        let logits = 16 * 1024 * 1024;
+        let checkpoint = bonsai_prism_runtime::swift_session::STATE_MEMORY_BYTES;
+        assert!(parse(base.clone())?.cpu_speculation.is_none());
+        for tokens in [1, 4, 8] {
+            let mut selected = base.clone();
+            selected.extend([
+                "--cpu-speculative-tokens".into(), tokens.to_string().into(),
+                "--cpu-verification-scratch-bytes".into(), logits.to_string().into(),
+                "--cpu-speculative-checkpoint-bytes".into(), checkpoint.to_string().into(),
+            ]);
+            for cache in ["f16", "rsq4", "rsq4k3v"] {
+                selected[10] = cache.into();
+                let config = parse(selected.clone())?;
+                let speculation = config.cpu_speculation.ok_or_else(invalid)?;
+                assert_eq!(speculation.tokens(), tokens);
+                assert_eq!(speculation.verification_scratch_bytes(), logits);
+                assert_eq!(speculation.checkpoint_bytes(), checkpoint);
+                assert_eq!(config.kv_cache.name(), cache);
+            }
+            let mut insufficient = selected.clone();
+            insufficient[14] = (memory - 1).to_string().into();
+            assert!(parse(insufficient).is_err());
+            let mut no_tiles = selected.clone();
+            no_tiles.drain(15..19);
+            assert!(parse(no_tiles).is_err());
+            let mut small_checkpoint = selected.clone();
+            small_checkpoint[24] = (checkpoint - 1).to_string().into();
+            assert!(parse(small_checkpoint).is_err());
+            selected.extend(["--cpu-speculative-tokens".into(), "4".into()]);
+            assert!(parse(selected).is_err());
+        }
+        for (tokens, scratch, checkpoint) in [
+            (None, Some("1"), Some("1073741824")),
+            (Some("4"), None, Some("1073741824")),
+            (Some("4"), Some("1"), None),
+            (Some("0"), Some("1"), Some("1073741824")),
+            (Some("9"), Some("1"), Some("1073741824")),
+            (Some("4"), Some("0"), Some("1073741824")),
+            (Some("4"), Some("1"), Some("0")),
+        ] {
+            assert!(parse_speculation(tokens.map(OsString::from), scratch.map(OsString::from), checkpoint.map(OsString::from)).is_err());
         }
         Ok(())
     }

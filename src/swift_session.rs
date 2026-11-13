@@ -150,24 +150,36 @@ impl CpuSpeculation {
         if !(1..=crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS).contains(&tokens)
             || verification_scratch_bytes == 0
             || checkpoint_bytes == 0
-            || verification_scratch_bytes.checked_add(checkpoint_bytes).is_none()
+            || verification_scratch_bytes
+                .checked_add(checkpoint_bytes)
+                .is_none()
         {
             return Err(invalid("invalid CPU speculation selection or reserves"));
         }
-        Ok(Self { tokens, verification_scratch_bytes, checkpoint_bytes })
+        Ok(Self {
+            tokens,
+            verification_scratch_bytes,
+            checkpoint_bytes,
+        })
     }
 
     /// Maximum deterministic suffix positions proposed in one target round.
     #[must_use]
-    pub const fn tokens(self) -> usize { self.tokens }
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
 
     /// Additional process allowance reserved for complete per-position logits.
     #[must_use]
-    pub const fn verification_scratch_bytes(self) -> usize { self.verification_scratch_bytes }
+    pub const fn verification_scratch_bytes(self) -> usize {
+        self.verification_scratch_bytes
+    }
 
     /// Additional complete-prefix recovery allowance, separate from request rollback.
     #[must_use]
-    pub const fn checkpoint_bytes(self) -> usize { self.checkpoint_bytes }
+    pub const fn checkpoint_bytes(self) -> usize {
+        self.checkpoint_bytes
+    }
 
     fn suffix_config(self) -> Result<SuffixDraftConfig> {
         SuffixDraftConfig::new(2, crate::speculative::MAX_SUFFIX_MATCH_TOKENS, self.tokens)
@@ -175,7 +187,11 @@ impl CpuSpeculation {
 }
 
 const fn selected_state_budget(context_tokens: usize) -> usize {
-    if context_tokens == swift::CONTEXT_TOKENS { STATE_MEMORY_BYTES } else { crate::graph::MAX_STATE_BYTES }
+    if context_tokens == swift::CONTEXT_TOKENS {
+        STATE_MEMORY_BYTES
+    } else {
+        crate::graph::MAX_STATE_BYTES
+    }
 }
 
 /// Validate all explicitly selected CPU execution reserves before artifact I/O.
@@ -193,13 +209,21 @@ pub fn validate_execution_capacity(
     speculation: Option<CpuSpeculation>,
 ) -> Result<()> {
     let additional = if let Some(speculation) = speculation {
-        if prefill.is_none() || speculation.checkpoint_bytes < selected_state_budget(context_tokens) {
-            return Err(invalid("CPU speculation requires tiles and a complete prefix reserve"));
+        if prefill.is_none() || speculation.checkpoint_bytes < selected_state_budget(context_tokens)
+        {
+            return Err(invalid(
+                "CPU speculation requires tiles and a complete prefix reserve",
+            ));
         }
-        speculation.verification_scratch_bytes.checked_add(speculation.checkpoint_bytes)
+        speculation
+            .verification_scratch_bytes
+            .checked_add(speculation.checkpoint_bytes)
             .ok_or_else(|| invalid("Swift CPU execution reserve overflow"))?
-    } else { 0 };
-    let available = memory_limit_bytes.checked_sub(u64::try_from(additional)?)
+    } else {
+        0
+    };
+    let available = memory_limit_bytes
+        .checked_sub(u64::try_from(additional)?)
         .ok_or_else(|| invalid("Swift CPU speculation memory allowance rejected"))?;
     validate_prefill_capacity(context_tokens, available, prefill)
 }
@@ -457,8 +481,16 @@ impl SwiftSession {
         cpu_prefill: Option<CpuPrefill>,
     ) -> Result<Self> {
         Self::load_profile_with_execution(
-            path, representation, adapter_path, backend, seed, parallelism,
-            kv_cache, context_tokens, cpu_prefill, None,
+            path,
+            representation,
+            adapter_path,
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            context_tokens,
+            cpu_prefill,
+            None,
         )
     }
 
@@ -490,7 +522,8 @@ impl SwiftSession {
     ) -> Result<Self> {
         validate_execution_capacity(context_tokens, u64::MAX, cpu_prefill, cpu_speculation)?;
         let state_budget = selected_state_budget(context_tokens);
-        let checkpoint_budget = CHECKPOINT_MEMORY_BYTES.max(state_budget)
+        let checkpoint_budget = CHECKPOINT_MEMORY_BYTES
+            .max(state_budget)
             .checked_add(cpu_speculation.map_or(0, CpuSpeculation::checkpoint_bytes))
             .ok_or_else(|| invalid("Swift checkpoint reservation overflow"))?;
         let sampler = SwiftSampler::new(seed)?;
@@ -868,7 +901,9 @@ impl SwiftSession {
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
         if timings.is_some() && self.cpu_speculation.is_some() {
-            return Err(invalid("runtime phase timings are unavailable for CPU speculation"));
+            return Err(invalid(
+                "runtime phase timings are unavailable for CPU speculation",
+            ));
         }
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
@@ -894,16 +929,18 @@ impl SwiftSession {
             })
         };
         let completion = if let Some(speculation) = self.cpu_speculation {
-            self.runtime.generate_sampled_speculative_until(
-                &prompt.tokens,
-                &options,
-                Prefill { block_tokens: 64 },
-                speculation.suffix_config()?,
-                cancellation,
-                deadline,
-                &mut self.sampler,
-                consume,
-            )?.0
+            self.runtime
+                .generate_sampled_speculative_until(
+                    &prompt.tokens,
+                    &options,
+                    Prefill { block_tokens: 64 },
+                    speculation.suffix_config()?,
+                    cancellation,
+                    deadline,
+                    &mut self.sampler,
+                    consume,
+                )?
+                .0
         } else if self.prompt_reuse == PromptReuse::Disabled {
             self.runtime.generate_sampled_until_for_reset(
                 &prompt.tokens,
@@ -997,7 +1034,7 @@ fn check_request(cancellation: &Cancellation, deadline: Instant) -> Result<()> {
 mod tests {
     use super::{
         CONTEXT_TOKEN_MEMORY_BYTES, CpuPrefill, CpuSpeculation, MAX_CONTEXT_TOKENS,
-        NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES, PreparedChat, SwiftSession,
+        NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftSession,
         validate_adapter_scale, validate_context_capacity, validate_execution_capacity,
         validate_prefill_capacity, validate_prompt_owner,
     };
@@ -1052,7 +1089,10 @@ mod tests {
             assert_eq!(selection.checkpoint_bytes(), reserve);
             let required = base + u64::try_from(tile.scratch_bytes() + scratch + reserve)?;
             validate_execution_capacity(context, required, Some(tile), Some(selection))?;
-            assert!(validate_execution_capacity(context, required - 1, Some(tile), Some(selection)).is_err());
+            assert!(
+                validate_execution_capacity(context, required - 1, Some(tile), Some(selection))
+                    .is_err()
+            );
             assert!(validate_execution_capacity(context, required, None, Some(selection)).is_err());
         }
         Ok(())
@@ -1074,15 +1114,29 @@ mod tests {
         let selected = CpuSpeculation::new(4, scratch, reserve)?;
         for (prefill, speculation) in [(None, selected), (Some(tile), undersized)] {
             let error = SwiftSession::load_profile_with_execution(
-                Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"), Representation::Pq2, None,
-                MatvecBackend::Scalar, 42, RowParallelism::default(), KvCachePolicy::Rotated4,
-                context, prefill, Some(speculation),
-            ).err().ok_or("invalid execution selection reached artifact loading")?;
-            assert_eq!(error.to_string(), "CPU speculation requires tiles and a complete prefix reserve");
+                Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
+                Representation::Pq2,
+                None,
+                MatvecBackend::Scalar,
+                42,
+                RowParallelism::default(),
+                KvCachePolicy::Rotated4,
+                context,
+                prefill,
+                Some(speculation),
+            )
+            .err()
+            .ok_or("invalid execution selection reached artifact loading")?;
+            assert_eq!(
+                error.to_string(),
+                "CPU speculation requires tiles and a complete prefix reserve"
+            );
         }
         assert!(validate_execution_capacity(32_768, u64::MAX, Some(tile), Some(selected)).is_err());
         let excessive = CpuSpeculation::new(4, 1, usize::MAX - 1)?;
-        assert!(validate_execution_capacity(context, u64::MAX, Some(tile), Some(excessive)).is_err());
+        assert!(
+            validate_execution_capacity(context, u64::MAX, Some(tile), Some(excessive)).is_err()
+        );
         Ok(())
     }
 

@@ -73,7 +73,8 @@ impl ModelProfile {
         }
         if let Some(speculation) = self.cpu_speculation {
             model["cpu_speculative_tokens"] = json!(speculation.tokens());
-            model["cpu_verification_scratch_bytes"] = json!(speculation.verification_scratch_bytes());
+            model["cpu_verification_scratch_bytes"] =
+                json!(speculation.verification_scratch_bytes());
             model["cpu_speculative_checkpoint_bytes"] = json!(speculation.checkpoint_bytes());
         }
         if self.kv_cache != KvCachePolicy::F16 || self.cpu_prefill.is_some() {

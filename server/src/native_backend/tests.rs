@@ -635,14 +635,17 @@ fn private_cpu_prefill_readiness_binds_tiles_scratch_and_latest_reuse() -> TestR
 
     run(async {
         for (tokens, cache) in [8, 16, 32].into_iter().flat_map(|tokens| {
-            [bonsai_prism_runtime::graph::KvCachePolicy::F16,
+            [
+                bonsai_prism_runtime::graph::KvCachePolicy::F16,
                 bonsai_prism_runtime::graph::KvCachePolicy::Rotated4,
-                bonsai_prism_runtime::graph::KvCachePolicy::Rotated4Keys3Values]
-                .map(|cache| (tokens, cache))
+                bonsai_prism_runtime::graph::KvCachePolicy::Rotated4Keys3Values,
+            ]
+            .map(|cache| (tokens, cache))
         }) {
             let prefill = CpuPrefill::new(tokens, 64 * 1024 * 1024)?;
             let identity: Arc<str> = Arc::from(format!(
-                "{}:cpu-tiled-ffn-v1:{tokens}", cpu_base_graph_identity(cache),
+                "{}:cpu-tiled-ffn-v1:{tokens}",
+                cpu_base_graph_identity(cache),
             ));
             let observed = Observation {
                 kv_cache: Some(cache),
@@ -672,7 +675,9 @@ fn private_cpu_prefill_readiness_binds_tiles_scratch_and_latest_reuse() -> TestR
                 assert_eq!(profile["startup_graph_identity"], identity.as_ref());
                 if cache == bonsai_prism_runtime::graph::KvCachePolicy::F16 {
                     assert!(profile.get("kv_cache").is_none());
-                } else { assert_eq!(profile["kv_cache"], cache.name()); }
+                } else {
+                    assert_eq!(profile["kv_cache"], cache.name());
+                }
                 assert!(profile.get("cpu_speculative_tokens").is_none());
             }
             let original = pending(true, 128)
@@ -704,7 +709,9 @@ fn private_cpu_prefill_rejects_mismatched_precision_or_graph_selection() -> Test
         ),
         (
             KvCachePolicy::F16,
-            Some(Arc::from("verified-model:kv-f16:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1")),
+            Some(Arc::from(
+                "verified-model:kv-f16:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1",
+            )),
         ),
         (
             KvCachePolicy::Rotated4,
@@ -727,41 +734,69 @@ fn private_cpu_prefill_rejects_mismatched_precision_or_graph_selection() -> Test
 
 #[test]
 fn private_cpu_speculation_readiness_binds_sampler_profile_and_all_reserves() -> TestResult {
-    use bonsai_prism_runtime::{graph::KvCachePolicy, runtime::PromptReuse,
-        swift_session::{CpuPrefill, CpuSpeculation, STATE_MEMORY_BYTES}};
+    use bonsai_prism_runtime::{
+        graph::KvCachePolicy,
+        runtime::PromptReuse,
+        swift_session::{CpuPrefill, CpuSpeculation, STATE_MEMORY_BYTES},
+    };
     run(async {
         for (tokens, cache) in [1, 4, 8].into_iter().flat_map(|tokens| {
-            [KvCachePolicy::F16, KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values]
-                .map(|cache| (tokens, cache))
+            [
+                KvCachePolicy::F16,
+                KvCachePolicy::Rotated4,
+                KvCachePolicy::Rotated4Keys3Values,
+            ]
+            .map(|cache| (tokens, cache))
         }) {
             let prefill = CpuPrefill::new(8, 64 * 1024 * 1024)?;
             let speculation = CpuSpeculation::new(tokens, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
             let identity: Arc<str> = Arc::from(format!(
-                "{}:rank-one-lora-v1:adapter:3fa66666:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1", cpu_base_graph_identity(cache),
+                "{}:rank-one-lora-v1:adapter:3fa66666:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+                cpu_base_graph_identity(cache),
             ));
             let observed = Observation {
-                kv_cache: Some(cache), cpu_prefill: Some(prefill), cpu_speculation: Some(speculation),
-                prompt_reuse: PromptReuse::Latest, startup_graph_identity: Some(identity.clone()),
+                kv_cache: Some(cache),
+                cpu_prefill: Some(prefill),
+                cpu_speculation: Some(speculation),
+                prompt_reuse: PromptReuse::Latest,
+                startup_graph_identity: Some(identity.clone()),
                 ..Observation::default()
             };
             let mut worker = Worker::new(FakeEngine(observed.clone()), 42)
                 .map_err(|error| format!("{error:?}"))?;
             let (result, reply) = perform(&mut worker, request("/v1/models", &[], true)).await?;
             assert_eq!(result, Ok(()));
-            let end = reply.array_windows().position(|part| part == b"\r\n\r\n")
-                .ok_or("missing readiness response head")? + 4;
+            let end = reply
+                .array_windows()
+                .position(|part| part == b"\r\n\r\n")
+                .ok_or("missing readiness response head")?
+                + 4;
             let body: Value = serde_json::from_slice(&reply[end..])?;
             let profile = &body["data"][0];
             assert_eq!(profile["cpu_speculative_tokens"], tokens);
-            assert_eq!(profile["cpu_verification_scratch_bytes"], speculation.verification_scratch_bytes());
-            assert_eq!(profile["cpu_speculative_checkpoint_bytes"], speculation.checkpoint_bytes());
+            assert_eq!(
+                profile["cpu_verification_scratch_bytes"],
+                speculation.verification_scratch_bytes()
+            );
+            assert_eq!(
+                profile["cpu_speculative_checkpoint_bytes"],
+                speculation.checkpoint_bytes()
+            );
             assert_eq!(profile["startup_graph_identity"], identity.as_ref());
             assert_eq!(profile["prompt_reuse"], "latest");
-            let original = pending(true, 128).map_err(|error| format!("{error:?}"))?.body;
-            for field in ["cpu_speculative_tokens", "cpu_verification_scratch_bytes", "cpu_speculative_checkpoint_bytes"] {
+            let original = pending(true, 128)
+                .map_err(|error| format!("{error:?}"))?
+                .body;
+            for field in [
+                "cpu_speculative_tokens",
+                "cpu_verification_scratch_bytes",
+                "cpu_speculative_checkpoint_bytes",
+            ] {
                 let mut value: Value = serde_json::from_slice(&original)?;
                 value[field] = json!(4);
-                assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile).is_err());
+                assert!(
+                    canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile).is_err()
+                );
             }
             assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
         }
@@ -770,36 +805,94 @@ fn private_cpu_speculation_readiness_binds_sampler_profile_and_all_reserves() ->
 }
 
 #[test]
-fn private_cpu_speculation_rejects_missing_or_mismatched_graph_and_recovery_profiles() -> TestResult {
-    use bonsai_prism_runtime::{graph::KvCachePolicy,
-        swift_session::{CpuPrefill, CpuSpeculation, STATE_MEMORY_BYTES}};
+fn private_cpu_speculation_rejects_missing_or_mismatched_graph_and_recovery_profiles() -> TestResult
+{
+    use bonsai_prism_runtime::{
+        graph::KvCachePolicy,
+        swift_session::{CpuPrefill, CpuSpeculation, STATE_MEMORY_BYTES},
+    };
     let prefill = CpuPrefill::new(8, 64 * 1024 * 1024)?;
     let speculation = CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
     for (cache, tile, identity) in [
-        (KvCachePolicy::F16, None, "verified-model:kv-f16:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:kv-f16:cpu-tiled-ffn-v1:8"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:kv-f16:kv-f16:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:kv-f16-unknown:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:kv-f16:cpu-tiled-ffn-v1:16:cpu-tiled-verify-v1"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:kv-f16:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1:cpu-tiled-verify-v1"),
-        (KvCachePolicy::Rotated4, Some(prefill), "verified-model:kv-rsq4k3v-d256-rht3-v1:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
-        (KvCachePolicy::F16, Some(prefill), "verified-model:kv-rsq4-d256-rht3-v1:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
-        (KvCachePolicy::Rotated4, Some(prefill), "verified-model:kv-rsq4-d256-rht3-v1:kv-rsq4k3v-d256-rht3-v1:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1"),
+        (
+            KvCachePolicy::F16,
+            None,
+            "verified-model:kv-f16:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:kv-f16:cpu-tiled-ffn-v1:8",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:kv-f16:kv-f16:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:kv-f16-unknown:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:kv-f16:cpu-tiled-ffn-v1:16:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:kv-f16:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::Rotated4,
+            Some(prefill),
+            "verified-model:kv-rsq4k3v-d256-rht3-v1:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(prefill),
+            "verified-model:kv-rsq4-d256-rht3-v1:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
+        (
+            KvCachePolicy::Rotated4,
+            Some(prefill),
+            "verified-model:kv-rsq4-d256-rht3-v1:kv-rsq4k3v-d256-rht3-v1:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        ),
     ] {
         let observed = Observation {
-            kv_cache: Some(cache), cpu_prefill: tile, cpu_speculation: Some(speculation),
-            startup_graph_identity: Some(Arc::from(identity)), ..Observation::default()
+            kv_cache: Some(cache),
+            cpu_prefill: tile,
+            cpu_speculation: Some(speculation),
+            startup_graph_identity: Some(Arc::from(identity)),
+            ..Observation::default()
         };
-        assert!(matches!(Worker::new(FakeEngine(observed), 42), Err(NativeBackendError::Configuration)));
+        assert!(matches!(
+            Worker::new(FakeEngine(observed), 42),
+            Err(NativeBackendError::Configuration)
+        ));
     }
     let observed = Observation {
         cpu_prefill: Some(prefill),
-        cpu_speculation: Some(CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES - 1)?),
-        startup_graph_identity: Some(Arc::from("verified-model:kv-f16:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1")),
+        cpu_speculation: Some(CpuSpeculation::new(
+            4,
+            16 * 1024 * 1024,
+            STATE_MEMORY_BYTES - 1,
+        )?),
+        startup_graph_identity: Some(Arc::from(
+            "verified-model:kv-f16:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+        )),
         ..Observation::default()
     };
-    assert!(matches!(Worker::new(FakeEngine(observed), 42), Err(NativeBackendError::Configuration)));
+    assert!(matches!(
+        Worker::new(FakeEngine(observed), 42),
+        Err(NativeBackendError::Configuration)
+    ));
     Ok(())
 }
 

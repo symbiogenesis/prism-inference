@@ -526,13 +526,17 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
     };
     let cache_matches = cache_components.next() == Some(expected_cache.as_str())
         && cache_components.next().is_none();
-    if !cache_matches { return false; }
+    if !cache_matches {
+        return false;
+    }
     if let Some(prefill) = profile.cpu_prefill {
         let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());
-        if profile.cpu_speculation.is_some() { suffix.push_str(":cpu-tiled-verify-v1"); }
-        identity.strip_suffix(&suffix).is_some_and(|base| {
-            !base.contains(":cpu-tiled-") && !base.contains(":gdn-wy-f32-v1")
-        })
+        if profile.cpu_speculation.is_some() {
+            suffix.push_str(":cpu-tiled-verify-v1");
+        }
+        identity
+            .strip_suffix(&suffix)
+            .is_some_and(|base| !base.contains(":cpu-tiled-") && !base.contains(":gdn-wy-f32-v1"))
     } else {
         profile.kv_cache != KvCachePolicy::F16
             && !identity.contains(":cpu-tiled-")
@@ -545,8 +549,12 @@ impl Worker {
         let profile = engine.profile()?;
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
             || bonsai_prism_runtime::swift_session::validate_execution_capacity(
-                profile.context_tokens, u64::MAX, profile.cpu_prefill, profile.cpu_speculation,
-            ).is_err()
+                profile.context_tokens,
+                u64::MAX,
+                profile.cpu_prefill,
+                profile.cpu_speculation,
+            )
+            .is_err()
             || !valid_graph_profile(&profile)
         {
             return Err(NativeBackendError::Configuration);

@@ -8,7 +8,8 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     runtime::PromptReuse,
     swift_session::{
-        CpuPrefill, CpuSpeculation, SwiftSession, validate_context_capacity, validate_execution_capacity,
+        CpuPrefill, CpuSpeculation, SwiftSession, validate_context_capacity,
+        validate_execution_capacity,
     },
 };
 use bonsai_windows_credentials::validate_read_path;
@@ -54,7 +55,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut prompt_reuse = None;
     let mut kv_cache = None;
     let (mut prefill_tokens, mut prefill_scratch) = (None, None);
-    let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) = (None, None, None);
+    let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) =
+        (None, None, None);
     let (mut context_tokens, mut memory_limit_bytes) = (None, None);
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
@@ -149,7 +151,11 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
         cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch)?,
-        cpu_speculation: parse_speculation(speculative_tokens, verification_scratch, speculative_checkpoint)?,
+        cpu_speculation: parse_speculation(
+            speculative_tokens,
+            verification_scratch,
+            speculative_checkpoint,
+        )?,
         capacity: parse_capacity(context_tokens, memory_limit_bytes)?,
     };
     if config.cpu_prefill.is_some() || config.cpu_speculation.is_some() {
@@ -211,10 +217,19 @@ fn parse_speculation(
         (None, None, None) => Ok(None),
         (Some(tokens), Some(scratch), Some(checkpoint)) => {
             let parse_number = |value: OsString| -> io::Result<usize> {
-                value.to_str().ok_or_else(invalid)?.parse().map_err(|_| invalid())
+                value
+                    .to_str()
+                    .ok_or_else(invalid)?
+                    .parse()
+                    .map_err(|_| invalid())
             };
-            CpuSpeculation::new(parse_number(tokens)?, parse_number(scratch)?, parse_number(checkpoint)?)
-                .map(Some).map_err(|_| invalid())
+            CpuSpeculation::new(
+                parse_number(tokens)?,
+                parse_number(scratch)?,
+                parse_number(checkpoint)?,
+            )
+            .map(Some)
+            .map_err(|_| invalid())
         }
         _ => Err(invalid()),
     }
@@ -498,21 +513,41 @@ mod tests {
         Ok(())
     }
 
-    fn speculation_arguments() -> io::Result<(bonsai_windows_credentials::PrivateDirectory, Vec<OsString>, u64)> {
-        use bonsai_prism_runtime::swift_session::{CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES};
+    fn speculation_arguments() -> io::Result<(
+        bonsai_windows_credentials::PrivateDirectory,
+        Vec<OsString>,
+        u64,
+    )> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
+        };
         let (directory, [model, key, _adapter]) = files()?;
         let tile = 64 * 1024 * 1024;
         let logits = 16 * 1024 * 1024;
         let checkpoint = STATE_MEMORY_BYTES;
-        let memory = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES
+        let memory = NON_CONTEXT_MEMORY_BYTES
+            + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES
             + u64::try_from(tile + logits + checkpoint).map_err(io::Error::other)?;
         let base = vec![
-            OsString::from("--native-engine-child"), "--model".into(), model,
-            "--key-file".into(), key, "--port".into(), "8081".into(), "--seed".into(), "42".into(),
-            "--kv-cache".into(), "f16".into(), "--context-tokens".into(), "8192".into(),
-            "--memory-limit-bytes".into(), memory.to_string().into(),
-            "--cpu-prefill-tokens".into(), "8".into(),
-            "--cpu-prefill-scratch-bytes".into(), tile.to_string().into(),
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+            "--kv-cache".into(),
+            "f16".into(),
+            "--context-tokens".into(),
+            "8192".into(),
+            "--memory-limit-bytes".into(),
+            memory.to_string().into(),
+            "--cpu-prefill-tokens".into(),
+            "8".into(),
+            "--cpu-prefill-scratch-bytes".into(),
+            tile.to_string().into(),
         ];
         Ok((directory, base, memory))
     }
@@ -526,9 +561,12 @@ mod tests {
         for tokens in [1, 4, 8] {
             let mut selected = base.clone();
             selected.extend([
-                "--cpu-speculative-tokens".into(), tokens.to_string().into(),
-                "--cpu-verification-scratch-bytes".into(), logits.to_string().into(),
-                "--cpu-speculative-checkpoint-bytes".into(), checkpoint.to_string().into(),
+                "--cpu-speculative-tokens".into(),
+                tokens.to_string().into(),
+                "--cpu-verification-scratch-bytes".into(),
+                logits.to_string().into(),
+                "--cpu-speculative-checkpoint-bytes".into(),
+                checkpoint.to_string().into(),
             ]);
             for cache in ["f16", "rsq4", "rsq4k3v"] {
                 selected[10] = cache.into();
@@ -560,7 +598,14 @@ mod tests {
             (Some("4"), Some("0"), Some("1073741824")),
             (Some("4"), Some("1"), Some("0")),
         ] {
-            assert!(parse_speculation(tokens.map(OsString::from), scratch.map(OsString::from), checkpoint.map(OsString::from)).is_err());
+            assert!(
+                parse_speculation(
+                    tokens.map(OsString::from),
+                    scratch.map(OsString::from),
+                    checkpoint.map(OsString::from)
+                )
+                .is_err()
+            );
         }
         Ok(())
     }

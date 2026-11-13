@@ -178,7 +178,10 @@ fn rotated_kv_tiled_prefill_retains_policy_bits_and_packed_page_storage() -> Res
                     );
                     let checkpoint = actual.checkpoint()?;
                     for token in [1, 0] {
-                        assert_eq!(bits(actual.evaluate(token)?), bits(expected.evaluate(token)?));
+                        assert_eq!(
+                            bits(actual.evaluate(token)?),
+                            bits(expected.evaluate(token)?)
+                        );
                     }
                     let sealed = graph_bits(&expected)?;
                     actual.restore(&checkpoint)?;
@@ -296,7 +299,11 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
         assert!(actual.restore(&checkpoint).is_err());
         assert_eq!(actual.batched_evaluation_capacity(), 8);
         assert!(actual.identity().contains(":cpu-tiled-verify-v1"));
-        assert!(actual.identity().contains(&format!("kv-{}-d256-rht3-v1", policy.name())));
+        assert!(
+            actual
+                .identity()
+                .contains(&format!("kv-{}-d256-rht3-v1", policy.name()))
+        );
         let mut reference = build(0.0)?;
         let draft = [0, 1, 0, 1];
         let expected_rows = draft
@@ -304,7 +311,10 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
             .map(|token| reference.evaluate(token).map(bits))
             .collect::<Result<Vec<_>>>()?;
         actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
-        assert_eq!(rows.into_iter().map(bits).collect::<Vec<_>>(), expected_rows);
+        assert_eq!(
+            rows.into_iter().map(bits).collect::<Vec<_>>(),
+            expected_rows
+        );
         assert_eq!(graph_bits(&actual)?, graph_bits(&reference)?);
     }
     Ok(())
@@ -330,7 +340,10 @@ fn parallel_rotated_kv_tiled_verification_retains_shared_head_workers() -> Resul
                 .collect::<Result<Vec<_>>>()?;
             let mut rows = Vec::new();
             actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
-            assert_eq!(rows.into_iter().map(bits).collect::<Vec<_>>(), expected_rows);
+            assert_eq!(
+                rows.into_iter().map(bits).collect::<Vec<_>>(),
+                expected_rows
+            );
             assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
             actual.restore(&checkpoint)?;
             actual.ingest_block(&draft, &|| Ok(()))?;

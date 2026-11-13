@@ -1,6 +1,7 @@
 #Requires -Version 7.6
 <# Validate workflow syntax, expressions, dependencies, local action inputs and immutable action references. #>
 [CmdletBinding()]
+[OutputType([string])]
 param(
     [string]$Root = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
     [string]$ActionlintPath,
@@ -10,7 +11,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
-function Test-CiActionReferences([string]$RepositoryRoot) {
+function Test-CiActionReferences {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
     $errors = [Collections.Generic.List[string]]::new()
     $sources = @(Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot '.github/workflows') -File |
         Where-Object Extension -cin @('.yml', '.yaml'))
@@ -26,13 +30,18 @@ function Test-CiActionReferences([string]$RepositoryRoot) {
                 if (-not $line.Trim() -or $indent -gt $blockIndent) { continue }
                 $blockIndent = -1
             }
-            if ($line -match ':\s*[|>][+-]?\s*(?:#.*)?$') { $blockIndent = $indent; continue }
-            if ($line -notmatch '^\s*(?:-\s*)?(?:uses|''uses''|"uses"):\s*(.+?)\s*$') { continue }
+            if ($line -notmatch '^\s*(?:-\s*)?(?:uses|''uses''|"uses")\s*:\s*(.*?)\s*$') {
+                if (-not $line.TrimStart().StartsWith('#') -and $line -cmatch '\{.*(?:\buses|[''"]uses[''"])\s*:') {
+                    $errors.Add("$($source.Name):${number}: write uses as a block mapping for pin inspection")
+                }
+                if ($line -match ':\s*[|>][1-9+-]*\s*(?:#.*)?$') { $blockIndent = $indent }
+                continue
+            }
             $reference = ($Matches[1] -split '\s+#', 2)[0].Trim().Trim('"', "'")
             $location = [IO.Path]::GetRelativePath($RepositoryRoot, $source.FullName) + ':' + $number
             if ($reference.StartsWith('./', [StringComparison]::Ordinal)) {
                 $relative = $reference.Substring(2)
-                if ($relative.Contains('@') -or $relative.Contains('\') -or '..' -cin ($relative -split '/')) {
+                if (($relative -cnotmatch '^\.github/(?:actions|workflows)/[A-Za-z0-9_./-]+$') -or $relative.Contains('@') -or $relative.Contains('\') -or '..' -cin ($relative -split '/')) {
                     $errors.Add("${location}: invalid local action path $reference")
                     continue
                 }
@@ -55,7 +64,13 @@ function Test-CiActionReferences([string]$RepositoryRoot) {
     return ,$errors.ToArray()
 }
 
-function Invoke-CiWorkflowLint([string]$RepositoryRoot, [string]$Linter) {
+function Invoke-CiWorkflowLint {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$Linter
+    )
     $errors = Test-CiActionReferences $RepositoryRoot
     if ($errors.Count) { throw ($errors -join "`n") }
     $workflows = @(Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot '.github/workflows') -File |

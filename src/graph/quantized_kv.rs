@@ -87,6 +87,7 @@ pub(super) struct PackedCache {
     pages: Vec<Arc<Vec<u8>>>,
     tail: Vec<u8>,
     prepared: Vec<u8>,
+    prepared_ready: bool,
     quantizer: Quantizer,
     heads: usize,
     row_bytes: usize,
@@ -111,6 +112,7 @@ impl PackedCache {
             pages: Vec::new(),
             tail: Vec::new(),
             prepared: Vec::new(),
+            prepared_ready: false,
             quantizer,
             heads,
             row_bytes,
@@ -121,6 +123,7 @@ impl PackedCache {
     }
 
     fn prepare(&mut self, values: &[f32]) -> Result<()> {
+        self.prepared_ready = false;
         if values.len() != self.heads * HEAD_DIM {
             return Err(invalid("packed KV row width mismatch"));
         }
@@ -164,6 +167,7 @@ impl PackedCache {
         debug_assert_eq!(self.prepared.len(), self.row_bytes);
         self.tail.extend_from_slice(&self.prepared);
         self.len += self.row_bytes;
+        self.prepared_ready = false;
         if self.tail.len() == self.page_bytes || self.len == self.maximum {
             self.pages.push(Arc::new(std::mem::take(&mut self.tail)));
         }
@@ -188,6 +192,7 @@ impl PackedCache {
             pages,
             tail: super::copy_values(&self.tail)?,
             prepared: Vec::new(),
+            prepared_ready: false,
             quantizer: self.quantizer.clone(),
             heads: self.heads,
             row_bytes: self.row_bytes,
@@ -201,6 +206,7 @@ impl PackedCache {
         self.pages.clear();
         self.tail.clear();
         self.prepared.clear();
+        self.prepared_ready = false;
         self.len = 0;
     }
 
@@ -218,6 +224,23 @@ impl PackedCache {
 }
 
 impl KvCache {
+    pub(super) fn invalidate_prepared(&mut self) {
+        if let Some(packed) = &mut self.packed {
+            packed.prepared_ready = false;
+        }
+    }
+
+    // Only ordinary attention in this evaluation attempt can establish this
+    // private staged row. Narrowed KV-only layers retain normal preparation.
+    pub(super) fn prepare_staged_append(&mut self, values: &[f32]) -> Result<()> {
+        if let Some(packed) = &mut self.packed
+            && packed.prepared_ready
+        {
+            return packed.reserve();
+        }
+        self.prepare_append(values)
+    }
+
     pub(super) fn with_policy(
         width: usize,
         context: usize,
@@ -286,6 +309,36 @@ struct AttentionTask<'a> {
     scores: &'a mut [f32],
 }
 
+// Stage exactly the bytes attention will read and a successful token will
+// publish. Keep the original per-head key/value failure order. Tail/page
+// reservation remains at the graph's later all-layer publication boundary.
+fn prepare_current(
+    keys: &mut PackedCache,
+    values: &mut PackedCache,
+    current_key: &[f32],
+    current_value: &[f32],
+) -> Result<()> {
+    resize_bytes(keys.row_bytes, &mut keys.prepared)?;
+    resize_bytes(values.row_bytes, &mut values.prepared)?;
+    for ((key, output), (value, value_output)) in current_key
+        .as_chunks::<HEAD_DIM>()
+        .0
+        .iter()
+        .zip(keys.prepared.chunks_exact_mut(keys.quantizer.encoded_len()))
+        .zip(
+            current_value.as_chunks::<HEAD_DIM>().0.iter().zip(
+                values
+                    .prepared
+                    .chunks_exact_mut(values.quantizer.encoded_len()),
+            ),
+        )
+    {
+        keys.quantizer.encode(key, output)?;
+        values.quantizer.encode(value, value_output)?;
+    }
+    Ok(())
+}
+
 /// Stream packed history directly: query rotation once, one score row per task,
 /// and one bounded rotated value accumulator per active worker. Independent
 /// query heads use the existing private row pool, with each head retaining its
@@ -299,8 +352,8 @@ struct AttentionTask<'a> {
     reason = "Borrow immutable history and provisional current projections separately."
 )]
 pub(super) fn attend(
-    keys: &KvCache,
-    values: &KvCache,
+    keys: &mut KvCache,
+    values: &mut KvCache,
     queries: &[f32],
     projected: &[f32],
     current_key: &[f32],
@@ -314,12 +367,14 @@ pub(super) fn attend(
 ) -> Result<()> {
     let key_cache = keys
         .packed
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| invalid("missing packed keys"))?;
     let value_cache = values
         .packed
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| invalid("missing packed values"))?;
+    key_cache.prepared_ready = false;
+    value_cache.prepared_ready = false;
     let tokens = keys.len / keys.width;
     let stride = checked_sum(tokens, 1)?;
     if heads == 0
@@ -335,33 +390,14 @@ pub(super) fn attend(
     {
         return Err(invalid("invalid packed attention geometry"));
     }
-    let mut key_records = Vec::new();
-    let mut value_records = Vec::new();
-    resize_bytes(key_cache.row_bytes, &mut key_records)?;
-    resize_bytes(value_cache.row_bytes, &mut value_records)?;
-    for ((key, output), (value, value_output)) in current_key
-        .as_chunks::<HEAD_DIM>()
-        .0
-        .iter()
-        .zip(key_records.chunks_exact_mut(key_cache.quantizer.encoded_len()))
-        .zip(
-            current_value
-                .as_chunks::<HEAD_DIM>()
-                .0
-                .iter()
-                .zip(value_records.chunks_exact_mut(value_cache.quantizer.encoded_len())),
-        )
-    {
-        key_cache.quantizer.encode(key, output)?;
-        value_cache.quantizer.encode(value, value_output)?;
-    }
+    prepare_current(key_cache, value_cache, current_key, current_value)?;
     let input = PackedAttention {
         keys: key_cache,
         values: value_cache,
         queries,
         projected,
-        current_keys: &key_records,
-        current_values: &value_records,
+        current_keys: &key_cache.prepared,
+        current_values: &value_cache.prepared,
         heads_per_kv: heads / key_cache.heads,
         scale,
         arithmetic,
@@ -377,6 +413,8 @@ pub(super) fn attend(
         {
             input.attend_head(head, result, scores)?;
         }
+        key_cache.prepared_ready = true;
+        value_cache.prepared_ready = true;
         return Ok(());
     }
     // Keep the bounded borrowed task descriptors on the stack. This preserves
@@ -408,7 +446,10 @@ pub(super) fn attend(
             }
         }
         Ok(())
-    })
+    })?;
+    key_cache.prepared_ready = true;
+    value_cache.prepared_ready = true;
+    Ok(())
 }
 
 struct PackedAttention<'a> {

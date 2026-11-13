@@ -2979,10 +2979,14 @@ impl Qwen35 {
         for (layer_idx, ((layer, state), delta)) in self
             .layers
             .iter()
-            .zip(&self.state)
+            .zip(&mut self.state)
             .zip(deltas.iter_mut())
             .enumerate()
         {
+            if let LayerState::Full { keys, values } = &mut *state {
+                keys.invalidate_prepared();
+                values.invalidate_prepared();
+            }
             let is_narrow_final = narrow_final && layer_idx + 1 == total_layers;
             let first_attn_target = match &layer.attention {
                 Attention::Full(weights) if is_narrow_final => &weights.key,
@@ -3094,8 +3098,8 @@ impl Qwen35 {
             if let (LayerState::Full { keys, values }, LayerDelta::Full { key, value }) =
                 (state, delta)
             {
-                keys.prepare_append(key)?;
-                values.prepare_append(value)?;
+                keys.prepare_staged_append(key)?;
+                values.prepare_staged_append(value)?;
             }
         }
         for (state, delta) in self.state.iter_mut().zip(deltas.iter_mut()) {
@@ -3418,8 +3422,8 @@ impl Evaluation<'_, '_> {
         &mut self,
         layer: &FullAttention,
         input: &[f32],
-        keys: &KvCache,
-        values: &KvCache,
+        keys: &mut KvCache,
+        values: &mut KvCache,
         scratch: &mut AttentionScratch,
         delta: &mut LayerDelta,
         output: &mut Vec<f32>,
@@ -3506,8 +3510,8 @@ impl Evaluation<'_, '_> {
         projected: &[f32],
         key: &mut [f32],
         value: &mut [f32],
-        keys: &KvCache,
-        values: &KvCache,
+        keys: &mut KvCache,
+        values: &mut KvCache,
         query_scratch: &mut Vec<f32>,
         scores_scratch: &mut Vec<f32>,
         frequencies_scratch: &mut Vec<(f32, f32)>,
@@ -5598,8 +5602,8 @@ mod tests {
         };
         let kv_width = geometry.kv_heads * geometry.head;
         assert_eq!(original_values.len(), kv_width);
-        let keys = KvCache::new(kv_width, 2)?;
-        let values = KvCache::new(kv_width, 2)?;
+        let mut keys = KvCache::new(kv_width, 2)?;
+        let mut values = KvCache::new(kv_width, 2)?;
         let mut scratch = super::AttentionScratch::default();
         let mut key = vec![0.0; kv_width];
         let mut value = original_values.to_vec();
@@ -5613,8 +5617,8 @@ mod tests {
                     projected,
                     &mut key,
                     &mut value,
-                    &keys,
-                    &values,
+                    &mut keys,
+                    &mut values,
                     &mut scratch.query,
                     &mut scratch.scores,
                     &mut scratch.frequencies,
@@ -5633,8 +5637,8 @@ mod tests {
             projected,
             &mut key,
             &mut value,
-            &keys,
-            &values,
+            &mut keys,
+            &mut values,
             &mut scratch.query,
             &mut scratch.scores,
             &mut scratch.frequencies,

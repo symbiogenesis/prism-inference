@@ -140,7 +140,7 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
     let heads = 12;
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
         for scalar_only in [false, true] {
-            let (keys, values) = populated_caches(policy, 2, 65, scalar_only)?;
+            let (mut keys, mut values) = populated_caches(policy, 2, 65, scalar_only)?;
             let before_keys = packed_bytes(&keys);
             let before_values = packed_bytes(&values);
             let queries = input(heads * HEAD_DIM, 9)?;
@@ -167,8 +167,8 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                 let mut attended = vec![0.0; queries.len()];
                 let mut scores = vec![0.0; 66];
                 attend(
-                    &keys,
-                    &values,
+                    &mut keys,
+                    &mut values,
                     &queries,
                     &projected,
                     &current_key,
@@ -180,6 +180,10 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                     arithmetic,
                     &RowParallelism::default(),
                 )?;
+                let key_cache = keys
+                    .packed
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing keys"))?;
                 for head in 0..heads {
                     let expected = defensive_probabilities(
                         key_cache, &current, &queries, head, 6, arithmetic,
@@ -234,11 +238,158 @@ fn packed_bytes(cache: &KvCache) -> Vec<u8> {
 }
 
 #[test]
+fn packed_attention_reuses_current_encoding_for_commit_without_extra_records() -> Result<()> {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
+        for scalar in [true, false] {
+            let (mut keys, mut values) = populated_caches(policy, 2, 63, scalar)?;
+            let current_key = input(keys.width, 31)?;
+            let current_value = input(values.width, 41)?;
+            let mut expected_keys = keys.copy()?;
+            let mut expected_values = values.copy()?;
+            expected_keys.prepare_append(&current_key)?;
+            expected_values.prepare_append(&current_value)?;
+            expected_keys.append(&current_key);
+            expected_values.append(&current_value);
+            let queries = input(4 * HEAD_DIM, 9)?;
+            let projected = input(8 * HEAD_DIM, 11)?;
+            let mut output = vec![0.0; queries.len()];
+            attend(
+                &mut keys,
+                &mut values,
+                &queries,
+                &projected,
+                &current_key,
+                &current_value,
+                &mut output,
+                &mut [0.0; 64],
+                4,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &RowParallelism::default(),
+            )?;
+            for cache in [&keys, &values] {
+                let packed = cache.packed.as_ref().ok_or_else(|| invalid("cache"))?;
+                assert!(packed.prepared_ready);
+                let copied = cache.copy()?;
+                let snapshot = copied.packed.as_ref().ok_or_else(|| invalid("snapshot"))?;
+                assert!(snapshot.prepared.is_empty());
+                assert!(!snapshot.prepared_ready);
+            }
+            let key_pointer = keys
+                .packed
+                .as_ref()
+                .ok_or_else(|| invalid("keys"))?
+                .prepared
+                .as_ptr();
+            let value_pointer = values
+                .packed
+                .as_ref()
+                .ok_or_else(|| invalid("values"))?
+                .prepared
+                .as_ptr();
+            keys.prepare_staged_append(&current_key)?;
+            values.prepare_staged_append(&current_value)?;
+            keys.append(&current_key);
+            values.append(&current_value);
+            assert_eq!(packed_bytes(&keys), packed_bytes(&expected_keys));
+            assert_eq!(packed_bytes(&values), packed_bytes(&expected_values));
+            assert_eq!(keys.len, expected_keys.len);
+            assert_eq!(values.len, expected_values.len);
+            for (cache, pointer) in [(&keys, key_pointer), (&values, value_pointer)] {
+                let packed = cache.packed.as_ref().ok_or_else(|| invalid("cache"))?;
+                assert_eq!(packed.prepared.as_ptr(), pointer);
+                assert!(!packed.prepared_ready);
+                assert_eq!(packed.pages.len(), 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn packed_attention_failed_attempt_and_narrowing_cannot_publish_stale_encoding() -> Result<()> {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
+        let (mut keys, mut values) = populated_caches(policy, 2, 2, false)?;
+        let old_key = input(keys.width, 31)?;
+        let old_value = input(values.width, 41)?;
+        let next_key = input(keys.width, 33)?;
+        let next_value = input(values.width, 43)?;
+        let queries = input(4 * HEAD_DIM, 9)?;
+        let mut projected = input(8 * HEAD_DIM, 11)?;
+        let mut output = vec![0.0; queries.len()];
+        for fail in [false, true] {
+            let frozen_keys = packed_bytes(&keys);
+            let frozen_values = packed_bytes(&values);
+            projected[HEAD_DIM] = if fail { f32::NAN } else { 0.0 };
+            let mut scores = vec![0.0; keys.len / keys.width + 1];
+            let result = attend(
+                &mut keys,
+                &mut values,
+                &queries,
+                &projected,
+                &old_key,
+                &old_value,
+                &mut output,
+                &mut scores,
+                4,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &RowParallelism::default(),
+            );
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(packed_bytes(&keys), frozen_keys);
+            assert_eq!(packed_bytes(&values), frozen_values);
+            if fail {
+                assert!(
+                    !keys
+                        .packed
+                        .as_ref()
+                        .ok_or_else(|| invalid("keys"))?
+                        .prepared_ready
+                );
+                assert!(
+                    !values
+                        .packed
+                        .as_ref()
+                        .ok_or_else(|| invalid("values"))?
+                        .prepared_ready
+                );
+            }
+            let mut expected_keys = keys.copy()?;
+            let mut expected_values = values.copy()?;
+            expected_keys.prepare_append(&next_key)?;
+            expected_values.prepare_append(&next_value)?;
+            expected_keys.append(&next_key);
+            expected_values.append(&next_value);
+            // A new attempt may narrow its final layer to KV-only work. Its
+            // invalidation must force current projections to encode afresh.
+            keys.invalidate_prepared();
+            values.invalidate_prepared();
+            keys.prepare_staged_append(&next_key)?;
+            values.prepare_staged_append(&next_value)?;
+            keys.append(&next_key);
+            values.append(&next_value);
+            assert_eq!(packed_bytes(&keys), packed_bytes(&expected_keys));
+            assert_eq!(packed_bytes(&values), packed_bytes(&expected_values));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<()> {
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
         for scalar_only in [false, true] {
-            let (keys, mut values) = populated_caches(policy, 1, 65, scalar_only)?;
-            let correct_values = values.copy()?;
+            let (mut keys, mut values) = populated_caches(policy, 1, 65, scalar_only)?;
+            let mut correct_values = values.copy()?;
             let frozen_keys = packed_bytes(&keys);
             let cache = values
                 .packed
@@ -253,9 +404,9 @@ fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<(
             let projected = input(2 * HEAD_DIM, 11)?;
             let current_key = input(keys.width, 31)?;
             let current_value = input(values.width, 41)?;
-            let run = |values: &KvCache, output: &mut [f32]| {
+            let run = |keys: &mut KvCache, values: &mut KvCache, output: &mut [f32]| {
                 attend(
-                    &keys,
+                    keys,
                     values,
                     &queries,
                     &projected,
@@ -270,7 +421,7 @@ fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<(
                 )
             };
             let mut output = [13.0; HEAD_DIM];
-            let error = run(&values, &mut output)
+            let error = run(&mut keys, &mut values, &mut output)
                 .err()
                 .ok_or_else(|| invalid("late invalid value record must fail"))?;
             assert!(
@@ -288,8 +439,8 @@ fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<(
                 .tail[..4]
                 .copy_from_slice(&scale);
             let mut expected = [0.0; HEAD_DIM];
-            run(&correct_values, &mut expected)?;
-            run(&values, &mut output)?;
+            run(&mut keys, &mut correct_values, &mut expected)?;
+            run(&mut keys, &mut values, &mut output)?;
             assert_eq!(output.map(f32::to_bits), expected.map(f32::to_bits));
         }
     }
@@ -394,8 +545,8 @@ fn packed_gqa_attention_matches_independently_decoded_dense_reference() -> Resul
         let mut actual = vec![0.0; 4 * HEAD_DIM];
         let mut scores = vec![0.0; 4];
         attend(
-            &keys,
-            &values,
+            &mut keys,
+            &mut values,
             &queries,
             &projected,
             &current_key,
@@ -524,8 +675,8 @@ fn populated_caches(
 
 #[cfg(feature = "parallel-rows")]
 fn attention_bits(
-    keys: &KvCache,
-    values: &KvCache,
+    keys: &mut KvCache,
+    values: &mut KvCache,
     heads: usize,
     arithmetic: super::super::Arithmetic,
     parallelism: &RowParallelism,
@@ -594,14 +745,14 @@ fn parallel_packed_attention_preserves_serial_bits_across_pages_and_head_tails()
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
         for scalar in [true, false] {
             for (kv_heads, heads, history) in [(1, 1, 2), (2, 4, 0), (2, 12, 65), (3, 9, 2)] {
-                let (keys, values) = populated_caches(policy, kv_heads, history, scalar)?;
+                let (mut keys, mut values) = populated_caches(policy, kv_heads, history, scalar)?;
                 for arithmetic in [
                     super::super::Arithmetic::Source,
                     super::super::Arithmetic::PinnedSwift,
                 ] {
                     let expected = attention_bits(
-                        &keys,
-                        &values,
+                        &mut keys,
+                        &mut values,
                         heads,
                         arithmetic,
                         &RowParallelism::default(),
@@ -609,8 +760,8 @@ fn parallel_packed_attention_preserves_serial_bits_across_pages_and_head_tails()
                     for workers in [2, 4, 18] {
                         assert_eq!(
                             attention_bits(
-                                &keys,
-                                &values,
+                                &mut keys,
+                                &mut values,
                                 heads,
                                 arithmetic,
                                 &RowParallelism::new(workers)?,
@@ -631,7 +782,7 @@ fn parallel_packed_attention_preserves_serial_bits_across_pages_and_head_tails()
 fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> Result<()> {
     let heads = 12;
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
-        let (keys, values) = populated_caches(policy, 2, 65, false)?;
+        let (mut keys, mut values) = populated_caches(policy, 2, 65, false)?;
         let frozen_keys = packed_bytes(&keys);
         let frozen_values = packed_bytes(&values);
         let current_key = input(keys.width, 31)?;
@@ -651,8 +802,8 @@ fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> R
                 let parallelism = RowParallelism::new(workers)?;
                 let mut scores = vec![17.0; score_rows(heads, &parallelism) * 66];
                 let error = attend(
-                    &keys,
-                    &values,
+                    &mut keys,
+                    &mut values,
                     &queries,
                     &projected,
                     &current_key,
@@ -678,15 +829,15 @@ fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> R
                 // an unjoined worker or inherit provisional attention output.
                 assert_eq!(
                     attention_bits(
-                        &keys,
-                        &values,
+                        &mut keys,
+                        &mut values,
                         heads,
                         super::super::Arithmetic::PinnedSwift,
                         &RowParallelism::new(workers)?,
                     )?,
                     attention_bits(
-                        &keys,
-                        &values,
+                        &mut keys,
+                        &mut values,
                         heads,
                         super::super::Arithmetic::PinnedSwift,
                         &RowParallelism::default(),

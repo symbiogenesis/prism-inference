@@ -27,6 +27,10 @@ mod six_tests;
 #[path = "prefill_ffn_tests.rs"]
 mod ffn_tests;
 
+#[cfg(test)]
+#[path = "prefill_sibling_tests.rs"]
+mod sibling_tests;
+
 fn tiled_attention_scratch_bytes(
     geometry: &Geometry,
     arithmetic: Arithmetic,

@@ -447,6 +447,7 @@ pub(crate) fn step_silu_tokens_in_place(
         ProjectionRows {
             rows: &[],
             offset: 0,
+            history: None,
         },
     )
 }
@@ -483,6 +484,7 @@ pub(crate) fn step_silu_token_rows_into(
 ///
 /// # Errors
 /// Rejects invalid geometry before mutation, or nonfinite outputs.
+#[cfg(test)]
 pub(crate) fn step_silu_token_rows_into_coefficients(
     history: &mut [f32],
     rows: &[Vec<f32>],
@@ -504,6 +506,62 @@ pub(crate) fn step_silu_token_rows_into_coefficients(
     let projections = ProjectionRows {
         rows,
         offset: channel_range.start,
+        history: None,
+    };
+    if coefficients.prepared {
+        step_tokens_inner::<true, true, true>(
+            history,
+            output,
+            channels,
+            coefficients.values,
+            width,
+            projections,
+        )
+    } else {
+        step_tokens_inner::<true, true, false>(
+            history,
+            output,
+            channels,
+            coefficients.values,
+            width,
+            projections,
+        )
+    }
+}
+
+/// Convolves projected rows directly from immutable committed history.
+///
+/// Eligible multi-token NEON execution loads each original history group once
+/// and writes its final history directly, without a preliminary history copy.
+/// Unsupported shapes retain the copy-then-step path. Failure may change only
+/// provisional output and next history; committed history is never mutated.
+///
+/// # Errors
+/// Rejects invalid geometry before mutation, or nonfinite convolution outputs.
+pub(crate) fn step_silu_token_rows_from_coefficients(
+    previous: &[f32],
+    history: &mut [f32],
+    rows: &[Vec<f32>],
+    channel_range: &std::ops::Range<usize>,
+    coefficients: CoefficientSlice<'_>,
+    width: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    let channels = channel_range
+        .end
+        .checked_sub(channel_range.start)
+        .filter(|&channels| channels != 0)
+        .ok_or_else(|| invalid("pinned convolution projection range mismatch"))?;
+    if previous.len() != history.len()
+        || rows.iter().any(|row| row.len() < channel_range.end)
+        || rows.len().checked_mul(channels) != Some(output.len())
+    {
+        return Err(invalid("pinned convolution projection row mismatch"));
+    }
+    let projections = ProjectionRows {
+        rows,
+        offset: channel_range.start,
+        history: Some(previous),
     };
     if coefficients.prepared {
         step_tokens_inner::<true, true, true>(
@@ -530,6 +588,7 @@ pub(crate) fn step_silu_token_rows_into_coefficients(
 struct ProjectionRows<'a> {
     rows: &'a [Vec<f32>],
     offset: usize,
+    history: Option<&'a [f32]>,
 }
 
 impl<'a> ProjectionRows<'a> {
@@ -564,11 +623,17 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
     }
     let count = tokens.len() / channels;
     if count == 0 {
+        if let Some(previous) = projections.history {
+            history.copy_from_slice(previous);
+        }
         return Ok(());
     }
     if count == 1 {
         if DIRECT {
             tokens.copy_from_slice(projections.chunk(0, 0, channels));
+        }
+        if let Some(previous) = projections.history {
+            history.copy_from_slice(previous);
         }
         return step_in_place_inner::<SILU, PREPARED>(history, tokens, coefficients, width);
     }
@@ -594,15 +659,27 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
                 coefficient_taps::<PREPARED>(neon, &c_pair[0..16]);
             let [tap1_0, tap1_1, tap1_2, tap1_3] =
                 coefficient_taps::<PREPARED>(neon, &c_pair[16..32]);
-            let mut h0_t0 = f32x4::load_array(neon, [h_pair[0], h_pair[3], h_pair[6], h_pair[9]]);
-            let mut h0_t1 = f32x4::load_array(neon, [h_pair[1], h_pair[4], h_pair[7], h_pair[10]]);
-            let mut h0_t2 = f32x4::load_array(neon, [h_pair[2], h_pair[5], h_pair[8], h_pair[11]]);
-            let mut h1_t0 =
-                f32x4::load_array(neon, [h_pair[12], h_pair[15], h_pair[18], h_pair[21]]);
-            let mut h1_t1 =
-                f32x4::load_array(neon, [h_pair[13], h_pair[16], h_pair[19], h_pair[22]]);
-            let mut h1_t2 =
-                f32x4::load_array(neon, [h_pair[14], h_pair[17], h_pair[20], h_pair[23]]);
+            let h_source = projections
+                .history
+                .map_or(&h_pair[..], |previous| &previous[pair_idx * 24..][..24]);
+            let mut h0_t0 =
+                f32x4::load_array(neon, [h_source[0], h_source[3], h_source[6], h_source[9]]);
+            let mut h0_t1 =
+                f32x4::load_array(neon, [h_source[1], h_source[4], h_source[7], h_source[10]]);
+            let mut h0_t2 =
+                f32x4::load_array(neon, [h_source[2], h_source[5], h_source[8], h_source[11]]);
+            let mut h1_t0 = f32x4::load_array(
+                neon,
+                [h_source[12], h_source[15], h_source[18], h_source[21]],
+            );
+            let mut h1_t1 = f32x4::load_array(
+                neon,
+                [h_source[13], h_source[16], h_source[19], h_source[22]],
+            );
+            let mut h1_t2 = f32x4::load_array(
+                neon,
+                [h_source[14], h_source[17], h_source[20], h_source[23]],
+            );
             let col = pair_idx * 8;
             for token in 0..count {
                 let offset = token * channels + col;
@@ -660,12 +737,16 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
         let (c_chunks, _) = c_rem32.as_chunks::<16>();
         for (group, (h_chunk, c_chunk)) in h_chunks.iter_mut().zip(c_chunks).enumerate() {
             let [tap0, tap1, tap2, tap3] = coefficient_taps::<PREPARED>(neon, &c_chunk[0..16]);
+            let history_offset = (base_group + group) * 12;
+            let h_source = projections.history.map_or(&h_chunk[..], |previous| {
+                &previous[history_offset..history_offset + 12]
+            });
             let mut h_t0 =
-                f32x4::load_array(neon, [h_chunk[0], h_chunk[3], h_chunk[6], h_chunk[9]]);
+                f32x4::load_array(neon, [h_source[0], h_source[3], h_source[6], h_source[9]]);
             let mut h_t1 =
-                f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
+                f32x4::load_array(neon, [h_source[1], h_source[4], h_source[7], h_source[10]]);
             let mut h_t2 =
-                f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
+                f32x4::load_array(neon, [h_source[2], h_source[5], h_source[8], h_source[11]]);
             let col = (base_group + group) * 4;
             for token in 0..count {
                 let offset = token * channels + col;
@@ -706,6 +787,9 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
     }
     // Unsupported shapes and targets retain the original complete raw staging
     // before scalar execution, including unchanged later tokens on failure.
+    if let Some(previous) = projections.history {
+        history.copy_from_slice(previous);
+    }
     if DIRECT {
         for (token, token_slice) in tokens.chunks_exact_mut(channels).enumerate() {
             token_slice.copy_from_slice(projections.chunk(token, 0, channels));
@@ -1208,6 +1292,159 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn x1_convolution_history_direct_matches_copied_history_bits() -> Result<()> {
+        let samples = [-0.0, 0.0, f32::from_bits(1), -0.375, 0.125, 0.75];
+        for channels in [1, 4, 8, 12, 65] {
+            for width in [1, 2, 4, 5] {
+                let previous: Vec<_> = samples
+                    .into_iter()
+                    .cycle()
+                    .take(channels * (width - 1))
+                    .collect();
+                let raw: Vec<_> = [0.125, -0.25, 0.5, 0.0]
+                    .into_iter()
+                    .cycle()
+                    .take(channels * width)
+                    .collect();
+                let coefficients = super::Coefficients::new(raw.clone(), width, true);
+                for count in [0, 1, 3, 8] {
+                    let rows: Vec<Vec<_>> = (0..count)
+                        .map(|token| {
+                            let mut row = vec![f32::NAN; 2];
+                            row.extend(samples.into_iter().cycle().skip(token).take(channels));
+                            row.push(f32::INFINITY);
+                            row
+                        })
+                        .collect();
+                    let original_rows: Vec<_> = rows.iter().map(|row| bits(row)).collect();
+                    let original_previous = bits(&previous);
+                    let mut expected_history = previous.clone();
+                    let expected = scalar_projected_rows(
+                        &mut expected_history,
+                        &rows,
+                        2,
+                        channels,
+                        &raw,
+                        width,
+                    );
+                    let mut actual_history = vec![f32::NAN; previous.len()];
+                    let mut actual = vec![f32::NAN; count * channels];
+                    super::step_silu_token_rows_from_coefficients(
+                        &previous,
+                        &mut actual_history,
+                        &rows,
+                        &(2..2 + channels),
+                        coefficients.view(),
+                        width,
+                        &mut actual,
+                    )?;
+                    assert_eq!(bits(&actual), bits(&expected), "{channels}/{width}/{count}");
+                    assert_eq!(bits(&actual_history), bits(&expected_history));
+                    assert_eq!(bits(&previous), original_previous);
+                    assert_eq!(
+                        rows.iter().map(|row| bits(row)).collect::<Vec<_>>(),
+                        original_rows
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn x1_convolution_history_failures_preserve_publication_and_inputs() {
+        for channels in [4, 8, 12, 65] {
+            for width in [2, 4] {
+                for count in [1, 3] {
+                    for fault in 0..3 {
+                        let mut previous = vec![0.25; channels * (width - 1)];
+                        let mut rows = vec![vec![0.5; channels + 2]; count];
+                        let mut raw = vec![0.125; channels * width];
+                        match fault {
+                            0 => rows[count - 1][channels] = f32::INFINITY,
+                            1 => raw[channels * width - 2] = f32::NAN,
+                            _ => previous[channels * (width - 1) - 1] = f32::INFINITY,
+                        }
+                        let coefficients = super::Coefficients::new(raw, width, true);
+                        let original_previous = bits(&previous);
+                        let original_rows: Vec<_> = rows.iter().map(|row| bits(row)).collect();
+                        let mut expected_history = previous.clone();
+                        let mut expected = vec![-999.0; count * channels];
+                        assert!(
+                            super::step_silu_token_rows_into_coefficients(
+                                &mut expected_history,
+                                &rows,
+                                &(1..1 + channels),
+                                coefficients.view(),
+                                width,
+                                &mut expected,
+                            )
+                            .is_err()
+                        );
+                        let mut actual_history = vec![-999.0; previous.len()];
+                        let mut actual = vec![-999.0; count * channels];
+                        assert!(
+                            super::step_silu_token_rows_from_coefficients(
+                                &previous,
+                                &mut actual_history,
+                                &rows,
+                                &(1..1 + channels),
+                                coefficients.view(),
+                                width,
+                                &mut actual,
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(bits(&actual), bits(&expected));
+                        assert_eq!(bits(&actual_history), bits(&expected_history));
+                        assert_eq!(bits(&previous), original_previous);
+                        assert_eq!(
+                            rows.iter().map(|row| bits(row)).collect::<Vec<_>>(),
+                            original_rows
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn x1_convolution_history_rejects_geometry_before_mutation() {
+        let coefficients = super::Coefficients::new(vec![0.125; 16], 4, true);
+        let previous = vec![0.25; 12];
+        for fault in 0..4 {
+            let mut next = vec![-999.0; 12];
+            let mut output = vec![-999.0; 8];
+            let rows = vec![vec![0.5; if fault == 1 { 3 } else { 4 }]; 2];
+            assert!(
+                super::step_silu_token_rows_from_coefficients(
+                    if fault == 0 {
+                        &previous[..11]
+                    } else {
+                        &previous
+                    },
+                    &mut next,
+                    &rows,
+                    &(0..4),
+                    coefficients.view(),
+                    if fault == 2 {
+                        0
+                    } else if fault == 3 {
+                        3
+                    } else {
+                        4
+                    },
+                    &mut output,
+                )
+                .is_err()
+            );
+            assert_eq!(next, vec![-999.0; 12]);
+            assert_eq!(output, vec![-999.0; 8]);
+            assert_eq!(previous, vec![0.25; 12]);
+        }
     }
 
     #[test]

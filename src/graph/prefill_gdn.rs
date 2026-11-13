@@ -517,8 +517,6 @@ pub(super) fn recurrent_tile<'a>(
         reborrow_executor(&mut executor),
         check,
     )?;
-    copy_into(history, convolution)?;
-    resize_into(previous.len(), matrix)?;
     let width = geometry.ssm_head;
     let hist_width = geometry.convolution - 1;
     let conv_aligned = hist_width > 0
@@ -527,6 +525,12 @@ pub(super) fn recurrent_tile<'a>(
     let parallelize_conv = conv_aligned && tile.projector.row_parallelism().workers() > 1;
     let parallelize_post_conv = tile.projector.row_parallelism().workers() > 1 && count > 1;
     let conv_head_major = conv_aligned && count > 1;
+    if conv_head_major && matches!(arithmetic, Arithmetic::PinnedSwift) {
+        resize_into(history.len(), convolution)?;
+    } else {
+        copy_into(history, convolution)?;
+    }
+    resize_into(previous.len(), matrix)?;
     if conv_head_major {
         for attended in tile.attended.iter_mut().take(count) {
             check()?;
@@ -556,7 +560,8 @@ pub(super) fn recurrent_tile<'a>(
                         .convolution
                         .range(head * head_coeff..(head + 1) * head_coeff);
                     if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                        crate::kernels::pinned_convolution::step_silu_token_rows_into_coefficients(
+                        crate::kernels::pinned_convolution::step_silu_token_rows_from_coefficients(
+                            &history[head * head_hist..(head + 1) * head_hist],
                             head_conv,
                             mixed_ref,
                             &(head * width..(head + 1) * width),

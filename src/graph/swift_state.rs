@@ -48,9 +48,10 @@ pub(super) fn ceiling(
             .as_array()
             .ok_or_else(|| invalid("extended Swift recurrence map rejected"))?;
         if flags.len() != 64
-            || flags.iter().enumerate().any(|(index, value)| {
-                value.as_bool() != Some(!(index + 1).is_multiple_of(4))
-            })
+            || flags
+                .iter()
+                .enumerate()
+                .any(|(index, value)| value.as_bool() != Some(!(index + 1).is_multiple_of(4)))
         {
             return Err(invalid("extended Swift recurrence map rejected"));
         }
@@ -100,7 +101,15 @@ mod tests {
                 assert!(ceiling(identity, &metadata, tokens, KvCachePolicy::Rotated4).is_err());
             }
         }
-        assert!(ceiling("other model", &metadata, CONTEXT_TOKENS, KvCachePolicy::Rotated4).is_err());
+        assert!(
+            ceiling(
+                "other model",
+                &metadata,
+                CONTEXT_TOKENS,
+                KvCachePolicy::Rotated4
+            )
+            .is_err()
+        );
         for cache in [KvCachePolicy::F16, KvCachePolicy::Rotated4Keys3Values] {
             assert!(ceiling(swift::MODEL_SHA256, &metadata, CONTEXT_TOKENS, cache).is_err());
         }
@@ -113,21 +122,46 @@ mod tests {
         for key in original.keys() {
             let mut changed = original.clone();
             changed.insert(key.clone(), MetadataValue::U64(1));
-            assert!(ceiling(swift::MODEL_SHA256, &changed, CONTEXT_TOKENS, KvCachePolicy::Rotated4).is_err());
+            assert!(
+                ceiling(
+                    swift::MODEL_SHA256,
+                    &changed,
+                    CONTEXT_TOKENS,
+                    KvCachePolicy::Rotated4
+                )
+                .is_err()
+            );
         }
         let mut changed = original.clone();
         changed.insert("qwen35.nextn_predict_layers".into(), MetadataValue::U64(1));
-        assert!(ceiling(swift::MODEL_SHA256, &changed, CONTEXT_TOKENS, KvCachePolicy::Rotated4).is_err());
+        assert!(
+            ceiling(
+                swift::MODEL_SHA256,
+                &changed,
+                CONTEXT_TOKENS,
+                KvCachePolicy::Rotated4
+            )
+            .is_err()
+        );
         changed = original;
         changed.insert(
             "qwen35.attention.recurrent_layers".into(),
             MetadataValue::Array(MetadataArray::Bool(vec![true; 64])),
         );
-        assert!(ceiling(swift::MODEL_SHA256, &changed, CONTEXT_TOKENS, KvCachePolicy::Rotated4).is_err());
+        assert!(
+            ceiling(
+                swift::MODEL_SHA256,
+                &changed,
+                CONTEXT_TOKENS,
+                KvCachePolicy::Rotated4
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn generic_constructors_and_excess_selected_budgets_reject_before_tensor_loading() -> Result<()> {
+    fn generic_constructors_and_excess_selected_budgets_reject_before_tensor_loading() -> Result<()>
+    {
         use super::super::Qwen35;
         use crate::{kernels::MatvecBackend, model::Model};
         let model = || Model {
@@ -135,18 +169,39 @@ mod tests {
             metadata: metadata(),
             tensors: std::collections::BTreeMap::new(),
         };
-        for cache in [KvCachePolicy::F16, KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for cache in [
+            KvCachePolicy::F16,
+            KvCachePolicy::Rotated4,
+            KvCachePolicy::Rotated4Keys3Values,
+        ] {
             let error = Qwen35::with_state_budget_and_kv(
-                model(), CONTEXT_TOKENS, super::super::MAX_STATE_BYTES + 1,
-                MatvecBackend::Scalar, cache,
-            ).err().ok_or_else(|| invalid("generic graph unexpectedly accepted extended state"))?;
-            assert_eq!(error.to_string(), "invalid native live-state payload budget");
+                model(),
+                CONTEXT_TOKENS,
+                super::super::MAX_STATE_BYTES + 1,
+                MatvecBackend::Scalar,
+                cache,
+            )
+            .err()
+            .ok_or_else(|| invalid("generic graph unexpectedly accepted extended state"))?;
+            assert_eq!(
+                error.to_string(),
+                "invalid native live-state payload budget"
+            );
         }
         let error = Qwen35::with_swift_state_budget_and_kv(
-            model(), CONTEXT_TOKENS, SWIFT_RSQ4_FULL_STATE_BYTES + 1,
-            MatvecBackend::Scalar, KvCachePolicy::Rotated4, None,
-        ).err().ok_or_else(|| invalid("Swift graph unexpectedly accepted excess state"))?;
-        assert_eq!(error.to_string(), "invalid native live-state payload budget");
+            model(),
+            CONTEXT_TOKENS,
+            SWIFT_RSQ4_FULL_STATE_BYTES + 1,
+            MatvecBackend::Scalar,
+            KvCachePolicy::Rotated4,
+            None,
+        )
+        .err()
+        .ok_or_else(|| invalid("Swift graph unexpectedly accepted excess state"))?;
+        assert_eq!(
+            error.to_string(),
+            "invalid native live-state payload budget"
+        );
         Ok(())
     }
 }

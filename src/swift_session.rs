@@ -649,7 +649,12 @@ impl SwiftSession {
             .as_ref()
             .map(|_| crate::model::lora::SWIFT_ADAPTER_SHA256.to_owned());
         let mut decoder = Qwen35::with_swift_state_budget_and_kv(
-            model, context_tokens, state_budget, backend, kv_cache, adapter,
+            model,
+            context_tokens,
+            state_budget,
+            backend,
+            kv_cache,
+            adapter,
         )?;
         decoder.set_row_parallelism(parallelism);
         if let Some(prefill) = cpu_prefill {
@@ -1130,8 +1135,8 @@ mod tests {
         CONTEXT_TOKEN_MEMORY_BYTES, CpuPrefill, CpuSpeculation, MAX_CONTEXT_TOKENS,
         NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftSession,
         context_token_memory_bytes, kv_token_memory_bytes, max_context_tokens,
-        selected_state_budget, state_limit_bytes, validate_adapter_scale, validate_context_capacity,
-        validate_context_capacity_with_kv, validate_execution_capacity,
+        selected_state_budget, state_limit_bytes, validate_adapter_scale,
+        validate_context_capacity, validate_context_capacity_with_kv, validate_execution_capacity,
         validate_execution_capacity_with_kv, validate_prefill_capacity, validate_prompt_owner,
     };
     use crate::{
@@ -1296,37 +1301,43 @@ mod tests {
     #[test]
     fn selected_cache_speculation_reserves_full_scaled_checkpoint() -> Result<()> {
         for context in [131_072, 262_144] {
-        let cache = KvCachePolicy::Rotated4;
-        let tile = CpuPrefill::new(8, 64 * 1024 * 1024)?;
-        let checkpoint = selected_state_budget(context, cache)?;
-        let scratch = 16 * 1024 * 1024;
-        let selection = CpuSpeculation::new(4, scratch, checkpoint)?;
-        let required = NON_CONTEXT_MEMORY_BYTES
-            + u64::try_from(context)? * context_token_memory_bytes(cache)
-            + u64::try_from(tile.scratch_bytes() + scratch + checkpoint)?;
-        validate_execution_capacity_with_kv(context, required, Some(tile), Some(selection), cache)?;
-        assert!(
+            let cache = KvCachePolicy::Rotated4;
+            let tile = CpuPrefill::new(8, 64 * 1024 * 1024)?;
+            let checkpoint = selected_state_budget(context, cache)?;
+            let scratch = 16 * 1024 * 1024;
+            let selection = CpuSpeculation::new(4, scratch, checkpoint)?;
+            let required = NON_CONTEXT_MEMORY_BYTES
+                + u64::try_from(context)? * context_token_memory_bytes(cache)
+                + u64::try_from(tile.scratch_bytes() + scratch + checkpoint)?;
             validate_execution_capacity_with_kv(
                 context,
-                required - 1,
+                required,
                 Some(tile),
                 Some(selection),
                 cache,
-            )
-            .is_err()
-        );
-        let undersized = CpuSpeculation::new(4, scratch, checkpoint - 1)?;
-        assert!(
-            validate_execution_capacity_with_kv(
-                context,
-                u64::MAX,
-                Some(tile),
-                Some(undersized),
-                cache,
-            )
-            .is_err()
-        );
-        assert!(selected_state_budget(context, cache)? <= state_limit_bytes(cache));
+            )?;
+            assert!(
+                validate_execution_capacity_with_kv(
+                    context,
+                    required - 1,
+                    Some(tile),
+                    Some(selection),
+                    cache,
+                )
+                .is_err()
+            );
+            let undersized = CpuSpeculation::new(4, scratch, checkpoint - 1)?;
+            assert!(
+                validate_execution_capacity_with_kv(
+                    context,
+                    u64::MAX,
+                    Some(tile),
+                    Some(undersized),
+                    cache,
+                )
+                .is_err()
+            );
+            assert!(selected_state_budget(context, cache)? <= state_limit_bytes(cache));
         }
         Ok(())
     }

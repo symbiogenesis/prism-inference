@@ -2107,11 +2107,21 @@ impl Qwen35 {
         kv_cache_policy: KvCachePolicy,
     ) -> Result<Self> {
         Self::with_rank_one_adapter_and_kv_scope(
-            model, context_limit, state_budget_bytes, backend, adapter, scale, kv_cache_policy, false,
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            adapter,
+            scale,
+            kv_cache_policy,
+            false,
         )
     }
 
-    #[expect(clippy::too_many_arguments, reason = "Private construction preserves the existing adapter profile plus its state scope.")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Private construction preserves the existing adapter profile plus its state scope."
+    )]
     fn with_rank_one_adapter_and_kv_scope(
         model: Model,
         context_limit: usize,
@@ -2258,7 +2268,12 @@ impl Qwen35 {
         kv_cache_policy: KvCachePolicy,
     ) -> Result<Self> {
         Self::with_state_budget_and_kv_scope(
-            model, context_limit, state_budget_bytes, backend, kv_cache_policy, false,
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            kv_cache_policy,
+            false,
         )
     }
 
@@ -2274,11 +2289,23 @@ impl Qwen35 {
     ) -> Result<Self> {
         if let Some(adapter) = adapter {
             Self::with_rank_one_adapter_and_kv_scope(
-                model, context_limit, state_budget_bytes, backend, adapter, 1.3, kv_cache_policy, true,
+                model,
+                context_limit,
+                state_budget_bytes,
+                backend,
+                adapter,
+                1.3,
+                kv_cache_policy,
+                true,
             )
         } else {
             Self::with_state_budget_and_kv_scope(
-                model, context_limit, state_budget_bytes, backend, kv_cache_policy, true,
+                model,
+                context_limit,
+                state_budget_bytes,
+                backend,
+                kv_cache_policy,
+                true,
             )
         }
     }
@@ -2296,7 +2323,12 @@ impl Qwen35 {
         swift_full_state: bool,
     ) -> Result<Self> {
         let ceiling = if swift_full_state && state_budget_bytes > MAX_STATE_BYTES {
-            swift_state::ceiling(&model.identity, &model.metadata, context_limit, kv_cache_policy)?
+            swift_state::ceiling(
+                &model.identity,
+                &model.metadata,
+                context_limit,
+                kv_cache_policy,
+            )?
         } else {
             MAX_STATE_BYTES
         };

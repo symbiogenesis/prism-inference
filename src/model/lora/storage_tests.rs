@@ -117,7 +117,10 @@ fn rank_one_storage_releases_linear_raw_a_and_preserves_decoded_b_sharing() -> R
     } else {
         (-0.0_f32).to_bits()
     };
-    assert_eq!(linear.map(f32::to_bits), [0.0_f32.to_bits(), corrected_zero]);
+    assert_eq!(
+        linear.map(f32::to_bits),
+        [0.0_f32.to_bits(), corrected_zero]
+    );
     let mut embedding = [0.0, -0.0];
     adapter.embedding(0, 1.0, &mut embedding, &mut scratch)?;
     assert_eq!(

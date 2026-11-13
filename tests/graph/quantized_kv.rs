@@ -1,7 +1,7 @@
 //! Synthetic graph/state controls for separately selected lossy KV profiles.
 //!
 //! Two hidden coordinates project to one 256-coordinate attention head, then a
-//! second block retains the original tiny FP32 GDN geometry. The shared RoPE
+//! second block retains the original tiny FP32 GDN geometry. The shared `RoPE`
 //! geometry supports both source and pinned arithmetic. These fixtures do not
 //! qualify actual Swift quality, performance or target-device memory use.
 

@@ -2,62 +2,36 @@
 
 [Documentation index](index.md) · [CLI and workers](cli-and-workers.md)
 
-The [CI failure review](ci-failure-review.md) records the latest audited failure snapshot,
-its source-bound diagnoses and the selected CI safeguards.
-
 ## Install from source
 
-GitHub bundles and crates.io packages are separate deliveries. The published
-registry runtime is [0.1.27](release-0.1.27.md), with exact NEON helper pin
-`bonsai-neon-dot =0.1.3`. The other four public helpers retain their published
-versions because their source has not changed. The current Windows ARM64 binary
-bundle is [0.1.27](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.27).
-Both deliveries use source `1429a33772089dfd3a50a96c698b9dbe0b36836a`, with
-separate archive and verification records. The five-executable bundle statically
-links Microsoft's runtime; normal and delay-load import checks reject separately
-installed VC runtimes. No external Visual C++ runtime installation is required.
-The release also adds exact-geometry full K4/V4 context accounting; actual-model,
-larger-window and clean-machine qualification remain pending.
-
-The historical [0.1.26 delivery](release-0.1.26.md) retains registry source
-`53f2fcbc89bbdd43ca4b83aea234096626f26040` and distinct binary source
-`ac941f2668ae93dba9824002b4597081457aa09f`. Its immutable five-executable
-archive imports `vcruntime140.dll` and requires the external ARM64 Visual C++
-runtime. That prerequisite applies to 0.1.26, not the current 0.1.27 bundle.
-Earlier [0.1.25 registry](release-0.1.25.md) and
-[0.1.23 binary](release-0.1.23.md) delivery records retain their original
-identities and qualification limits. Install the published registry source with
-the pinned nightly:
+Use the compiler pinned in [rust-toolchain.toml](../rust-toolchain.toml).
+Install the CLI and two JSONL workers from a checkout:
 
 ```powershell
-cargo +nightly-2026-11-09 install prism-inference --version '=0.1.27' --locked
+cargo +nightly-2026-11-09 install --path <absolute-repo> --locked
 prism-inference --help
 ```
 
-`cargo install` compiles source. Consumers using a prebuilt binary bundle should
-pin its version, target and SHA-256 rather than rebuild the runtime on startup.
-The root package installs the CLI and two JSONL workers; the private server and
-GGUF tool are separate workspace packages. See [release bundles](#release-bundles-and-compatibility)
-for the five-executable distribution and registry prerequisites.
+The private server and GGUF tool are separate workspace packages. To build all
+five executables, use [Build a checkout](#build-a-checkout). Prebuilt consumers
+should verify source, target and file hashes from the bundle receipt.
 
 ## Use the Rust library
 
-The package name is `prism-inference`; the existing Rust import path remains
-`bonsai_prism_runtime`. An exact registry scalar library dependency is:
+The package name is `prism-inference`; its Rust import path is
+`bonsai_prism_runtime`. For a sibling source checkout:
 
 ```toml
 [dependencies]
-bonsai-prism-runtime = { package = "prism-inference", version = "=0.1.27", default-features = false }
+bonsai-prism-runtime = { package = "prism-inference", path = "../prism-inference", default-features = false }
 ```
 
-Use the same pinned nightly in the consuming project's `rust-toolchain.toml`
-and retain its `Cargo.lock`, which records the registry package checksum. Enable
-`experimental-neon` for eligible Windows
-ARM64 kernels, or retain default features when using `swift_session::SwiftSession`
-and the JSON-based chat APIs.
+Pin the same compiler and retain the consuming application's `Cargo.lock`.
+Enable `experimental-neon` for eligible Windows ARM64 kernels. JSON chat and
+`swift_session::SwiftSession` require `cli`.
 
-This example verifies the pinned original-PQ2 artifact and reuses its tokenizer
-without allocating model weights or constructing an inference graph:
+This example verifies the original-PQ2 artifact and reuses its tokenizer without
+loading weights or constructing a graph:
 
 ```rust
 use std::path::Path;
@@ -87,45 +61,34 @@ fn prompt_ids(model: &Path, text: &str) -> Result<Vec<u32>> {
 }
 ```
 
-Pass an absolute artifact path. The metadata budget does not bound whole-process
-memory, and verification reads the entire file. Retain the `TokenizationSession`
-when encoding multiple prompts. This plain-text API applies no chat template.
-For generation, `SwiftSession::load` verifies the same original-PQ2 model;
-`prepare` renders and reserves a complete chat request, and `complete` accepts
-an absolute deadline, shared cancellation and a fallible text callback. Use
-[session profiles](swift-session-profiles.md) for explicit PTQ1/adapter selection
-and [runtime contracts](runtime-contracts.md) for ownership and rollback.
+Pass an absolute model path. Verification reads the entire file; the metadata
+budget does not bound whole-process memory. Retain `TokenizationSession` for
+repeated prompts. This API applies no chat template.
+
+For generation, `SwiftSession::load` verifies the model, `prepare` renders and
+reserves a complete chat request, and `complete` takes an absolute deadline,
+shared cancellation and a fallible text callback. See
+[session profiles](swift-session-profiles.md) for model/adapter selection and
+[runtime contracts](runtime-contracts.md) for ownership and rollback.
 
 ## Cargo features
 
-Default features are `cli` (JSON token driver) and `experimental-neon`.
-
-| Cargo feature selection | Result |
+| Selection | Result |
 | --- | --- |
-| Defaults | Token driver/library with eligible NEON selection |
-| `--features parallel-rows` | Opt-in persistent packed-row pool; trusted worker count still defaults to one |
-| `--no-default-features --features experimental-neon --lib` | NEON-enabled library without JSON driver |
-| `--no-default-features --lib` | Scalar-only library |
-| `--no-default-features --features cli` | Scalar-only token driver |
+| Defaults: `cli`, `experimental-neon` | JSON driver and eligible Windows ARM64 NEON |
+| `--features parallel-rows` | Persistent packed-row pool; worker count still defaults to one |
+| `--no-default-features --features experimental-neon --lib` | NEON library without JSON APIs |
+| `--no-default-features --lib` | Scalar library |
+| `--no-default-features --features cli` | Scalar JSON driver |
 
-See [explicit row workers](parallel-rows.md) for worker budgets, unchanged row
-arithmetic, CLI/service configuration and qualification limits.
-
-GGUF artifact verification uses the safe streaming API from
-[`bonsai-native-hash`](../tools/native-hash/README.md). Windows delegates SHA-256
-CPU dispatch to its CNG provider through a private owned-handle boundary; other
-targets retain the portable Rust baseline. Every model byte is still checked
-through the retained handle before metadata parsing. The GGUF crate remains
-unsafe-free, and full-file reads, load progress and cancellation contracts are
-unchanged. This implementation alone establishes no startup timing improvement.
-The current registry delivery uses published `bonsai-native-hash 0.1.3`,
-`bonsai-gguf 0.1.5` and `bonsai-neon-dot 0.1.3`; future helper changes still
-require their registry prerequisites before dependent package publication.
+See [row workers](parallel-rows.md) for execution budgets and configuration.
+[Cargo.toml](../Cargo.toml) is authoritative for package versions and dependencies.
+[Native hashing](../tools/native-hash/README.md) documents artifact verification.
 
 ## Build a checkout
 
-Use the pinned Rust nightly-2026-11-09 and an absolute manifest/target path from
-a unique system-temp working directory. After fetching locked dependencies:
+Run builds and checks from a unique system-temp directory, with absolute
+manifest and target paths. Fetch locked dependencies before using `--offline`.
 
 ```powershell
 $repo = 'C:\Users\symbi\source\repos\prism-inference'
@@ -148,47 +111,13 @@ try {
 
 ## Correctness checks
 
-The current [Foundation workflow](../.github/workflows/foundation.yml) runs
-formatting, Release Clippy/rustdoc and complete correctness tests for affected
-workspace crates and their transitive consumers on Windows ARM64 and x64.
-Each Windows target runs analyzers, feature variants and four correctness shards
-concurrently. Cargo metadata assigns every enabled correctness target to
-exactly one shard. Library unit tests use shard zero and doctests use shard one;
-binary, example and integration selectors are balanced deterministically across
-the four runners. Same-kind, same-named targets share a shard. Each shard batches
-its non-doc selectors into one Cargo invocation so independent compilation and
-linking can overlap. Default binary/release packaging uses shard two and ARM64
-mutations use shard three, removing their serial tail from library unit tests.
-Every shard retains its full target inventory and executed command list. The
-`windows` matrix remains required by the fail-closed Foundation aggregate.
-Every Cargo test command keeps the complete selected package set to preserve
-dependency feature unification. The unit-test invocation also selects the three
-empty `test = false` library roots; dormant feature-gated native targets remain
-disabled. Unsupported dependency activation of a gated target fails selection.
-Compiler caches are isolated by architecture and lane; locked registry downloads
-have their own shared cache, avoiding a complete workspace cache in every shard.
-The source-package matrix caches only external `debug` and `release` compiler
-outputs, isolated by target, verified compiler and runner image. Normalized
-archives, temporary registries, extracted sources, all three consumer feature
-variants and receipts are constructed or executed on every run. Hexagon checks
-also reuse compiler outputs with separate native/cross identities; native and
-runtime checks share one target directory per job. Every format, strict lint,
-test, documentation and projection check still runs on cache hits. Content
-freshness remains enabled; cached outputs supply no acceptance verdict.
+Foundation runs formatting, strict Release Clippy/rustdoc and selected workspace
+correctness tests on Windows ARM64 and x64, plus applicable native-overlay,
+codec and source-package checks. Synthetic fixtures cover loading, arithmetic,
+state, checkpoints and recovery; they do not establish full-model parity.
 
-Owner-managed hosted acceptance of these scheduling and cache changes remains
-pending: compare cold and warm runs on matching runner images, verify a relevant
-source edit rebuilds, and require every selected check and fresh artifact. Local
-workflow and inventory regressions establish no measured hosted speedup.
-
-Feature variants, loader-ABI checks and mutation guards run only when their
-packages or inputs are selected. Its Linux ARM64 gate builds the pinned Prism
-engine with the Rust storage overlay only when that overlay's inputs change.
-Fixtures cover
-bounded loading, exact codecs/rounding, graph state, output reuse, checkpoint
-isolation and transactional recovery. They do not load the full model. Locally
-run focused named regressions, from the same external working directory
-convention, for example:
+Full suites and benchmarks run only in CI. Local checks should name the affected
+regression, for example:
 
 ```powershell
 cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline --release `
@@ -196,167 +125,67 @@ cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline --rele
     --test runtime edited_turns_restore_complete_recurrent_prefix_and_failed_stream_rolls_back -- --exact
 ```
 
-The [R0–R7 roadmap](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/native-rust-engine.md) still requires profiling, full-model logits/states/tokens, complete
-tokenizer/template and Prism sampler/RNG parity, adapter numerical/service qualification, broader
-process/OS ownership qualification, SIMD/Adreno support and device correctness/TPS/quality/security
-acceptance. Full suites and every benchmark remain CI-only under [validation policy](https://github.com/symbiogenesis/SwiftBonsai2/blob/370084c530e2271f10a1c55a5a10bba7c806aacb/docs/validation.md).
-
 ### Owner-device budgets
 
-Diagnostics, model qualification and benchmarks on the owner's laptop default
-to **five minutes total, preferably less**. A dedicated, predeclared workload
-may use the smallest justified longer allowance, with an absolute **fifteen-minute
-maximum**, only when the entire supervising harness supports that declaration.
-Record the fixed work, conservative time estimate and reason before starting.
-Setup, tool intake, loading, every comparison arm, power observations, cleanup
-and evidence retention share one original clock. Stop early on completion or a
-known no-go; do not restart clocks, retry a failed trial or split a longer matrix
-into repeated owner runs. Historical sessions retain their original closed clocks.
-Full suites and every benchmark remain CI-only, with dispatch and monitoring
-owned by the owner.
+Follow [AGENTS.md](../AGENTS.md#owner-device-execution-budgets) for aggregate
+allowances and [CI ownership](../AGENTS.md#ci-ownership-and-completion).
+Record AC power before and after each workload and each comparison arm, with
+battery saver and charge when available. Unknown or mismatched power conditions
+cannot qualify performance comparisons; equal endpoints do not prove stability
+throughout a run. Existing narrower tool limits remain binding.
 
-Existing narrower source-checker, accelerator, workflow and external-helper
-limits remain effective until explicitly extended and reviewed together. Runner's
-native-runtime acceptance workflow offers explicit 5/10/15-minute jobs; selecting
-one does not lengthen Prism's numerical or accelerator lanes, the 240-second
-request-timing entry bound below, or an older external owner watchdog. Hosted
-cloud CI keeps its independent workflow limits.
-
-Reduce device time through offline review of retained data, hosted preparation
-of source-bound tools, reuse of verified immutable downloads and the shortest
-prompt/output that exercises each required behavior. Reuse a loaded service only
-where the declared test permits it; fresh-owner isolation, replay and rollback
-controls still require fresh owners. Estimate full-context/output work from
-measured prefill/decode costs before scheduling it. Short smoke checks do not
-replace full numerical, long-output or human-quality acceptance.
+Prepare source-bound native capture helpers before the device allowance starts.
+Retain only replay inputs, identities and actionable diagnostics required by the
+gate; routine source checks need commands, results and limits in the delivery
+message rather than a new evidence bundle.
 
 ### Owning workflows
 
-This repository also owns the [complete upstream conformance guide](prism-upstream-tests.md).
-Routine pushes use the regression jobs in [Foundation](../.github/workflows/foundation.yml):
-23 existing Rust source contracts in one cached native ARM64 job, affected native
-codec parity and a fail-closed aggregate. Its receipts explicitly record
-`FullSourceGate=false`; it does not replay the C++ reference or replace full release
-qualification. The manual [Runtime conformance workflow](../.github/workflows/runtime-conformance.yml)
-preserves four ordinary source partitions, 16 planning partitions, 32 execution
-partitions, codec parity and the full aggregate gate. Dispatch it on `main` before
-release. Measurements and gradients remain explicit manual opt-ins.
-The [focused workflow](../.github/workflows/prism-focused.yml)
-diagnoses one named source without replacing the complete gate.
+The [impact map](../.github/ci/impact.json) combines changed paths with Cargo
+dependencies. Shared or unclassified inputs select full validation. Planning
+uses the latest successful ancestor; unavailable history falls back to full
+selection. Aggregate gates require every selected job to succeed.
 
-[Source checks](../.github/workflows/source-checks.yml) selects independent jobs
-for Markdown, PowerShell/embedded-C# analysis, compiler probes and model-free
-Swift parity. Markdown keeps push and pull-request coverage with pinned `rumdl`
-and [`.rumdl.toml`](../.rumdl.toml). Script standards remain main-only; Rust-only
-pushes do not select them. Compiler acceptance compares
-isolated stable/nightly language probes and preserves the fail-closed
-`compatibility` check. It runs when probe inputs change or on manual dispatch;
-[`tools/rust-trial/tests/compiler.rs`](../tools/rust-trial/tests/compiler.rs)
-gates Polonius Alpha and the next-generation trait solver through ordinary Cargo
-compilation, and workspace packages prefer scoped `#[expect(..., reason = "...")]`
-for known diagnostics. Dispatch Foundation to rerun complete workspace validation.
-Runner contains only app/provisioning/released-runtime integration gates; none of
-these runtime suites bootstrap through its maintenance executable or released source.
-All full suites and every benchmark remain hosted-only.
-
-Foundation skips pushes limited to root Markdown files and `docs/`.
-Source checks still selects Markdown validation for those changes.
-For other pushes, the [impact map](../.github/ci/impact.json) combines changed
-paths with Cargo's local dependency graph. A server-only change checks the
-server; a ternary-codec change also checks its GGUF/runtime/server consumers and
-the native codec lane. Runtime changes select routine upstream regression; unrelated
-server or policy-tool changes do not start its regression job. Shared
-manifests, lockfiles, toolchains, CI policy and unclassified inputs select full
-validation. Manual dispatch always selects every group in that workflow.
-Known unrelated server, compiler-trial, policy-tool, packaging and C# analyzer
-paths do not select Foundation's Rust regression job. The native codec lane
-builds its probe and checks parity; Foundation owns its Rust analyzers.
-The independent source-package matrix verifies Windows ARM64, Windows x64 and
-Linux ARM64 archives and external consumers within the same Foundation run.
-The Foundation aggregate requires each selected regression, codec and package job,
-alongside selected workspace and native-overlay jobs.
-
-Each workflow compares with its most recent successful push revision on the
-current ancestry, so changes from failed or cancelled pushes remain covered.
-If that baseline cannot be established, selection falls back to full validation.
-Automatic Foundation and Source checks runs supersede older pushes on the same
-branch, releasing runners for the newest revision. Successful-ancestor
-selection carries changes from cancelled and failed pushes into Foundation's
-next plan. Manual dispatches retain independent complete validation requests.
-Aggregate gates require successful planning
-and successful selected jobs; they permit skips only for unselected groups.
+Foundation skips changes limited to root Markdown and `docs/`; Source checks
+still validates Markdown. Manual dispatch selects the workflow's complete scope.
+Caches store compiler outputs or verified immutable inputs, never verdicts.
+Every selected check and generated receipt runs afresh.
 
 ### Workflow inventory
 
-The seven entry points separate routine source validation from explicit qualification
-and bounded release preparation. No hosted verdict transfers across those scopes.
-
-| Workflow | Current responsibility |
+| Workflow | Responsibility |
 | --- | --- |
-| Foundation | Selected workspace, Hexagon cross-target, overlay, regression, codec and source-package checks |
-| Source checks | Workflow preflight, selected Markdown, scripts, compiler probes and model-free parity or exact efficiency controls |
-| Foundation bundle | Manual exact-source ARM64 binary preparation under GitHub's hosted execution cap |
-| Runtime conformance | Manual complete source/reference and backend release gate |
-| Prism focused reference | Manual diagnosis of one named source contract |
-| Released private-service acceptance | Pinned released-service lifecycle and receipt acceptance |
-| Swift request timing tool preparation | Source-bound standalone actual-model diagnostic tool |
+| [Foundation](../.github/workflows/foundation.yml) | Selected workspace, cross-target, overlay, regression, codec and source-package checks |
+| [Source checks](../.github/workflows/source-checks.yml) | Workflow preflight, Markdown, scripts, compiler probes and model-free parity |
+| [Foundation bundle](../.github/workflows/foundation-bundle.yml) | Exact-source hosted ARM64 bundle preparation |
+| [Runtime conformance](../.github/workflows/runtime-conformance.yml) | Complete upstream source/reference and backend gate |
+| [Focused reference](../.github/workflows/prism-focused.yml) | One named source contract or backend plan |
+| [Private-service acceptance](../.github/workflows/private-service-acceptance.yml) | Source-bound service lifecycle and receipt checks |
+| [Request timing preparation](../.github/workflows/request-timing-preparation.yml) | Standalone actual-model diagnostic tool preparation |
 
-Foundation owns the native Hexagon contracts in its existing Windows correctness
-and analyzer lanes, retaining a separate scalar-runtime feature check. Its selected
-Linux-to-Windows ARM64 check preserves the independent native boundary typecheck
-and strict all-target lint. The aggregate requires that check whenever selected;
-the retired Hexagon entry point supplied duplicate Windows jobs.
-
-Source checks retains the Windows ARM64, Windows x64 and Linux ARM64 model-free
-matrix for relevant pull requests and manual dispatch. Pull requests always select
-parity; manual dispatch defaults to `model_free: parity`. Choose
-`model_free: efficiency` to produce the exact named efficiency admission receipts
-with strict analyzers and production linking in the same matrix. This replaces
-the separate efficiency workflow without adding its workload to ordinary pushes
-or pull requests. Compiler outputs are isolated by target, verified compiler and
-runner image; evidence is always fresh. Parity exercises model-free serving,
-workers, hashing and documentation; it does not qualify actual-model parity.
-Its strict all-target Clippy invocation explicitly selects the NEON helper and
-Hexagon native/runtime crates on every target. This includes helper test code
-and non-ARM fallback branches that are absent from an ARM64 dependency build.
-Changes to those helpers, their runtime dependencies, examples/tests, Clippy,
-rustfmt and Cargo configuration select this matrix. Main pushes retain
-Foundation's owning coverage without a duplicate parity matrix.
-The separate qualification and preparation workflows remain tied to open gates.
-Foundation bundle remains outside Foundation's successful-ancestor baseline.
-
-The shared Rust setup treats compiler caches as optional. A bad exact hosted
-cache hit can be discarded once and reinstalled, followed by the same host,
-sysroot and component verification. Fresh installation failures remain fatal;
-owner-managed installations are never uninstalled by this recovery. Verified
-compilers are saved before later source checks can fail, and cache-save failures
-do not change a correctness verdict. Cache hits never skip source validation.
+Choose `model_free: efficiency` in Source checks for the
+[exact efficiency controls](inference-efficiency.md); its default parity matrix
+does not substitute for them. Neither matrix loads the full model.
+See [runtime conformance](prism-upstream-tests.md) for complete reference coverage
+and [server acceptance](../server/README.md) for the private-service protocol.
 
 ### Focused checks before local delivery
 
-Before committing a workflow or composite action, run the compiler-free preflight:
+Before committing a workflow or composite action, run:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File .github/ci/Test-Workflow.ps1 -CheckFixtures
 ```
 
-It checks every workflow with checksum-pinned actionlint 1.7.12, including YAML,
-expressions, job dependencies and local action inputs. It separately rejects
-mutable external action references and missing local actions, including references
-inside composites. Eleven negative controls prove rejection of common startup
-mistakes. Three process controls reproduce GitHub's PowerShell wrapper and verify
-successful exit status, preservation of the caller's native status by negative
-controls, and a nonzero result for a genuinely invalid workflow. Optional script
-linters are disabled; no additional language runtime is
-installed. Downloads have finite retries and scratch storage is removed on exit.
-For an already trusted offline binary, pass `-ActionlintPath <absolute-path>`.
-Source checks runs the same preflight before selecting expensive jobs. This
-validation supplies no hosted job verdict or upstream action-provenance claim.
+This compiler-free preflight runs checksum-pinned actionlint, validates action
+references and local inputs, and exercises rejection and PowerShell exit-status
+controls. Use `-ActionlintPath <absolute-path>` for a trusted offline binary.
+A local preflight supplies no hosted verdict.
 
-A passing ARM64 build does not cover x64 fallback code, and `cargo test` does not
-run Clippy. For cfg-sensitive helper changes, select the package itself with
-`--all-targets`, using the pinned compiler and the workspace lint configuration.
-For the NEON/Hexagon helpers, the focused strict commands are:
+For cfg-sensitive Rust changes, follow
+[the cross-target policy](../AGENTS.md#cross-target-lint-checks).
+A dependency build does not lint a helper's tests. Select changed packages
+explicitly with `--all-targets`, covering native and fallback branches:
 
 ```powershell
 cargo +nightly-2026-11-09-aarch64-pc-windows-msvc clippy --locked --offline --release `
@@ -369,377 +198,112 @@ cargo +nightly-2026-11-09-aarch64-pc-windows-msvc clippy --locked --offline --re
     -p bonsai-hexagon-runtime --all-targets -- -D warnings
 ```
 
-Run from the external working directory convention above. Cross-target Clippy
-type-checks without linking or executing the other architecture; it does not
-replace native hosted tests. On the owner's laptop, predeclare only the fixed
-selection that can fit the aggregate allowance, including setup, power snapshots
-and cleanup. Reuse installed targets and cached dependencies; report unavailable
-or unfinished arms as pending hosted checks. Keep full suites in CI and preserve
-the owner's push and dispatch ownership.
-
-## Checkpoint restore storage
-
-Checkpoint restoration stages every fallible KV page-table and mutable-tail copy
-before changing live state. Convolution and recurrent matrices then restore their
-exact binary32 bits into existing live allocations. Independently owned snapshots
-and sealed KV-page sharing retain their previous contracts. For Swift, this avoids
-another 156,893,184 bytes (149.625 MiB) of transient recurrent/convolution payload
-during restore. It is a storage-lifetime bound, not a measured decrease in process
-peak RAM or admission requirements. Focused ownership, staging-failure and frozen
-hybrid-state recovery regressions cover the change.
+Cross-target Clippy checks types without executing the other architecture.
+Report unavailable targets and pending native hosted checks.
 
 ## Bounded actual-model correctness captures
 
-Build the `swift_model_check` example explicitly from the external working lane.
-Its `forward` mode retains the existing 1–16 supplied-token captures. For a
-verified chat prefix, `trajectory` reads an absolute JSON token-ID file and
-reserves all requested 1–16 greedy steps within the 8,192-token context:
+Build `swift_model_check` explicitly before a device capture. Use absolute
+external paths and process/Job/deadline supervision. The
+[checker](../examples/swift_model_check.rs) enforces artifact identities and
+capture bounds; a successful source build alone qualifies no model behavior.
+
+| Mode | Scope |
+| --- | --- |
+| `forward` | Logits and complete logical state for 1–16 supplied token IDs |
+| `trajectory` | Final prompt state and 1–16 fed-back greedy steps within 8,192 tokens; 8 GiB snapshot cap |
+| `rollback` | Committed state, cancelled provisional step, exact restoration and fresh one-token continuation; 2 GiB snapshot cap |
+| `request-timing` | One production SwiftSession request, at most 128 rendered prompt tokens and 1–16 output tokens |
 
 ```text
 swift_model_check trajectory <absolute-model> <existing-absolute-evidence-dir> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>
-```
-
-The qualifier ingests intermediate prompt tokens without logits, then captures
-logits and complete logical hybrid state for the final prefix and every
-fed-back greedy token. It reports exact prompt/generated IDs and includes
-special tokens in this fixed-step diagnostic. Service stop and sampler
-qualification remain separate. Snapshots never overwrite files; their combined
-payload is capped at 8 GiB. Retain absolute external outputs and the existing
-process-memory/deadline supervision. No timings or throughput are measured.
-The evidence-write guards run in the ordinary hosted correctness suite.
-
-The `rollback` mode supplies the missing complete-state observation before any
-reset. With 1–16 exact public input IDs, it commits the prefix, captures all
-logical KV/convolution/recurrent state and logits, appends the final supplied ID
-and cancels after the first evaluated provisional greedy token. Successful
-recovery must return `Interrupted`, restore the exact committed token IDs and
-match every captured binary32 bit. It then compares a one-token continuation
-with fresh recomputation, including full logits and state:
-
-```text
 swift_model_check --row-workers 4 --rank-one-adapter <absolute-approved-adapter> 1.3 rollback <absolute-original-PQ2> <new-existing-absolute-evidence-dir> auto 248045
 ```
 
-Use one worker explicitly when qualifying that independent profile; four workers
-require the existing `parallel-rows` build. The representation, worker and adapter
-prefixes compose as in `forward`. `rollback.json` records completed steps and
-failure without overwriting prior evidence. Its four capture directories retain
-exact token IDs, complete state/logit files, lengths and SHA-256 digests, with one
-aggregate 2 GiB snapshot-payload cap. Missing or differing components fail.
+Rollback must return `Interrupted`, preserve committed token IDs and restore
+every captured logit/state bit before reset. Its stop-token probe inspects
+existing logits without advancing the graph. Greedy captures include special
+IDs and qualify neither production stop behavior nor sampling. Cancellation
+occurs after a model step, not inside a kernel.
 
-The capture sampler returns the explicitly declared stop token `0` only to inspect
-the existing logits without advancing the graph. After cancellation these probes
-must be exact live-prefix hits. Ordinary greedy continuation includes special IDs;
-neither mechanism qualifies production sampling or model-stop behavior. Cancellation
-is cooperative after a completed model step, not interruption inside a graph kernel.
-This source checker does not qualify released private HTTP cancellation, the
-reset-every-request serving policy, numerical parity with an independent engine,
-quality, resources or performance. Actual-model evidence is pending until a
-source-bound hosted build and an audited owning device capture pass. All device
-setup, loading, capture, comparison and cleanup must fit this lane's existing
-five-minute owner allowance under external process/Job/deadline supervision;
-the general fifteen-minute ceiling does not extend this capture. Do not execute a
-second model trial to complete a larger matrix.
+These numerical captures retain their five-minute aggregate owner allowance;
+the general fifteen-minute ceiling does not extend them. Include setup,
+loading, comparison, power observations, cleanup and retention in that clock.
 
-The `request-timing` mode captures one production `SwiftSession` request with
-the fixed Swift sampler, seed 42, native stop set, thinking disabled and no
-prefix reuse. The input is a bounded JSON messages array, admitted to at most
-128 rendered prompt tokens and 1 through 16 reserved output tokens.
+### Model and adapter selection
 
-The manual main-only [request timing preparation workflow](../.github/workflows/request-timing-preparation.yml)
-checks the focused model-free controls and builds the standalone Windows ARM64
-tool with `parallel-rows`. Its artifact includes the executable and exact
-source/run/compiler/file-hash receipt; build and check logs are retained even
-on failure. It starts no owner-device job and executes no actual model.
-The attribution API is included in the prepared 0.1.13 library. The standalone
-checker remains a separately built source tool outside the five CPU bundle
-executables. Its preparation does not update Runner's runtime pin or transfer
-earlier application evidence. The package-version string alone never binds a
-source-built executable to released runtime bytes; use the exact preparation
-receipt even when both report the same version.
+Prefix a command with `--use-repacked-ptq1` to select the exact current-weight
+PTQ1 export. [swift.rs](../src/model/swift.rs) defines its accepted size, hash and
+inventory. The prefix applies to `inspect`, `load`, `forward`, `trajectory`,
+`rollback` and `request-timing`; the ordinary loader selects original PQ2.
 
-Use its exact source-bound executable under the external owner:
+Compare PTQ1 against the same file in the pinned native engine using frozen
+same-format tolerances and matched tokens, context, transforms and state types.
+Scalar/NEON self-comparison is insufficient. PQ2 and PTQ1 use different activation
+quantization, so cross-representation quality is a separate decision.
+
+The optional `--rank-one-adapter <absolute-approved-adapter> <scale>` follows
+the representation prefix. See [rank-one adapters](rank-one-adapter.md) for
+verification, residual-writer basis and native numerical controls, and
+[session profiles](swift-session-profiles.md) for private-service selection.
+Loading an adapter or changing generated text does not qualify its arithmetic.
+
+### Request timing
+
+The [preparation workflow](../.github/workflows/request-timing-preparation.yml)
+checks model-free controls and produces a Windows ARM64 checker with
+`parallel-rows` and a source/run/compiler/file-hash receipt. It executes no model.
 
 ```text
 swift_model_check --use-repacked-ptq1 --row-workers 4 --rank-one-adapter <absolute-approved-adapter> 1.3 request-timing <absolute-current-PTQ1> <new-existing-evidence-dir> auto <absolute-messages.json> 1 <original-work-deadline-unix-ms> <exact-hosted-source-commit>
 ```
 
-The absolute work deadline must leave between one and 240 seconds at entry.
-It maps once to a monotonic deadline before input intake, executable hashing,
-loading and request work; loading never starts a new allowance. The external
-owner must bind the declared source commit and executable SHA-256 to the exact
-hosted build receipt, supervise synchronous loading, and reserve final receipt
-writing and process cleanup within the same aggregate five-minute limit.
+The absolute deadline must leave 1–240 seconds at entry and maps once to a
+monotonic clock before intake, hashing and loading. The external owner binds
+the executable to its hosted receipt, supervises blocking load, and reserves
+receipt writing and teardown inside the five-minute aggregate allowance.
 
-The create-new `request-timing-started.json` and `request-timing.json` retain
-input-byte/executable hashes, selected model/adapter/scale, backend and worker
-identities, and completed operation timings on returned failure as well as
-success. They omit input/output text, token IDs, paths and raw error messages.
-A missing or incomplete final receipt leaves work unknown. Successful prefill
-blocks supply a completed lower bound; a failed block may have executed more
-tokens. Callback counts are provisional token-consumer calls, distinct from
-sampled stops, graph evaluations, decoded text chunks and committed output.
-Runtime success, session terminal delivery and the final aggregate deadline
-have separate result fields. The no-op text consumer measures no HTTP or
-network backpressure, so this diagnostic attributes source-session work without
-qualifying app throughput, private-service lifecycle or release promotion.
+The request uses SwiftSampler, seed 42, native stops, thinking disabled and no
+prefix reuse. Create-new `request-timing-started.json` and `request-timing.json`
+record input/executable hashes, selected profile and completed phase timings,
+including returned failures. A missing final receipt leaves completion unknown.
+They omit prompt/output text, token IDs, paths and raw errors.
 
-PQ2 without an adapter remains the default service profile.
-For the verified lossless export of those same current weights, prefix the
-offline checker command with `--use-repacked-ptq1`:
+Provisional callbacks differ from committed output, sampled stops and text
+chunks. The no-op consumer measures neither HTTP nor backpressure. These
+timings attribute session work; they do not qualify app throughput, model parity
+or service lifecycle. For a controlled multi-arm experiment, use the
+[CPU bundle comparison protocol](cpu-bundle-comparison.md).
 
-```text
-swift_model_check --use-repacked-ptq1 forward <absolute-current-repacked-PTQ1-model> <existing-absolute-evidence-dir> <scalar|auto|neon> <id,id,...>
-```
+## Binary bundles
 
-The prefix also applies to `inspect`, `load`, `trajectory`, `rollback` and
-`request-timing`. It admits only
-the current-weight export with SHA-256
-`e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5`,
-5,946,648,928 complete file bytes and the strict 851-tensor PTQ1/F32/BF16
-inventory. The older publisher PTQ1 checkpoint is not admitted. Receipts include
-the selected representation and its actual artifact identity. The existing
-`swift::load` and `swift::inspect` continue to select PQ2; the explicit
-`load_representation`/`inspect_representation` APIs serve this correctness lane.
-The private service separately admits explicit PTQ1/approved-adapter selections
-through the [verified session profile](swift-session-profiles.md); selection is
-not full-model or device qualification.
+A bundle contains `prism-inference`, `bonsai-token-worker`,
+`bonsai-swift-worker`, `prism-inference-server` and `bonsai-gguf`, plus root
+licenses and notices. The root package supplies the first three executables;
+the server and GGUF tool are separate packages.
 
-Compare PTQ1 snapshots against the same verified PTQ1 file executed by the pinned
-publisher Prism CPU implementation, using the existing declared full-model
-numerical tolerances. Scalar/NEON self-comparison alone is insufficient. Keep
-the exact supplied token IDs, context, KV/state types, transforms and per-token
-logical state extents matched. Equal PQ2/PTQ1 decoded weights do not establish
-equal logits: PQ2 uses Q8_K activations on complete rows, while PTQ1 uses Q8_0.
-A comparison between representations therefore has a separate quality decision;
-do not loosen the trusted same-format correctness tolerance to make it pass.
+Packaging rejects dirty source, revision/target mismatches, inconsistent
+runtime/server versions and an unexpected compiler. Receipts bind source,
+target, features, executable hashes and archive bytes. PE checks enforce
+architecture and static Microsoft runtime linkage. Source-to-binary trust
+still depends on the reviewed hosted build.
 
-The source graph implements an explicit [rank-one adapter correctness path](rank-one-adapter.md);
-the offline checker accepts `--rank-one-adapter <absolute-approved-adapter> <scale>`
-after the optional `--use-repacked-ptq1` prefix for `load`, `forward`, `trajectory`,
-`rollback` and `request-timing`. Both base selection and approved adapter
-verification remain exact;
-the existing PQ2 constructor defaults do not admit the export implicitly.
-The JSONL workers remain adapter-free. The explicit private service requires the
-exact approved adapter and pinned-slot request scale. An approved LoRA's
-load-at-zero logits identity, nonzero correction and Swift grouped-SSM input
-ordering must be verified at native residual writers before adapter qualification.
-Neither a successful PTQ1 load nor changed generated text settles the adapter's
-authoring basis. These correctness captures contain no benchmarks and cannot
-substitute for the separate target-device quality/performance gates.
+The [Foundation bundle workflow](../.github/workflows/foundation-bundle.yml)
+requires the exact main revision and a unique 1–48-character operation ID:
+letters, digits, underscores or hyphens, starting with a letter or digit.
+It runs packaging controls, strict analyzers, scalar compilation and named
+unwind/context regressions before linking the five executables. Its
+`bundle-scope.json` records that complete Foundation, model acceptance and
+performance remain unqualified. Follow [CI ownership](../AGENTS.md#ci-ownership-and-completion)
+for authorization and hosted execution limits.
 
-The bounded 2026-10-26 capture at runtime revision `934fb13` is **not qualified**.
-It used the exact current-weight PTQ1 export, pinned publisher runtime
-`73bfe6cc`, supplied token IDs `[248045, 872, 198]`, an 8K context, FP16 KV,
-F32 recurrent state and the existing `1e-3 + 1e-3 * abs(reference)` tolerance:
+Foundation's independent source-package matrix verifies normalized archives and
+external scalar/default/parallel-row consumers on Windows ARM64, Windows x64 and
+Linux ARM64. Archive hashes, source identity, consumer locks and commands are
+retained in its receipt. Registry publication requires dependency helpers to be
+available first; package and binary verification remain separate gates.
 
-| Comparison | Bounded result |
-| --- | --- |
-| Rust scalar PTQ1 against native PTQ1 | 2,691,842 of 118,611,456 logits/state values exceed tolerance across 483 files; maximum absolute error 0.19140625; no file is byte-identical. |
-| Native PTQ1 against compatible prior native PQ2 | 593,835 of 744,960 logits exceed the same bound; maximum absolute error 0.10386914014816284. Prior report controls and each reused logits hash were verified. |
-
-Both comparisons retain the greedy IDs `[198, 198, 220]` for these three supplied
-inputs. This small observation establishes neither output-quality equivalence
-nor successful same-format numerical parity. The PTQ1 scalar/native mismatch
-must be diagnosed without relaxing the frozen tolerance. The comparison between
-representations remains a distinct question because activation arithmetic differs.
-NEON, adapter correctness, longer contexts and quality/performance qualification
-were not run in this quick local check. Successful native loading and the exact
-weight repack remain separate, narrower results. No default, service selection
-or production memory requirement was changed by this diagnostic evidence.
-
-### PTQ1 arithmetic repair, 2026-10-26
-
-The earlier capture exposed three implementation differences, repaired in the
-code through `e2d8d6f`:
-
-- The graph selected pinned arithmetic only for the PQ2 hash. The exact verified
-  current-weight PTQ1 hash now selects the same pinned graph contract, including
-  normalization, activations, attention and recurrent-state arithmetic.
-- Pinned Q8_0 activation preparation now rounds binary32 products to nearest,
-  ties to even, matching the ARM64 quantizer. Public reference encoding retains
-  ties away from zero. Six independent native Q8_0/Q8_1 captures match completely.
-- Pinned PTQ1 scalar and baseline NEON kernels now preserve the native DOTPROD
-  binary's four partial integer lanes, per-group scale multiplication, fused
-  accumulation across the row and final pairwise reduction. Forty independent
-  native rows matched this order; the prior implementation differed in thirty.
-  The checked-in fixtures distinguish these orders without loading a model.
-
-The native dot captures use `nrc=1`; the type trait's two-row capability does
-not establish 2x2-tile parity. Public source-order kernels and the PQ2 fallback
-keep their prior behavior. Focused graph selection/recovery and native fixture
-regressions accompany the repair; full suites remain hosted.
-
-A single-token actual-model recheck was attempted with the existing supervisor,
-16 GiB admission, 12 GiB committed limit and 4 GiB physical reserve. Admission
-was rejected before the model process started: minimum available physical memory
-was 14,668,292,096 bytes. The guard was preserved. Therefore these operator and
-dispatch repairs do **not** establish new full-model parity or supersede the
-retained failed capture. No new model snapshot, adapter/quality qualification,
-performance measurement, service enablement, default or memory-policy change
-is claimed. The prepared one-token check can reuse the existing pinned native
-reference when the unchanged admission requirements are available.
-
-### Conditional PTQ1 admission trial
-
-The owner subsequently authorized a provisional reduction of 1,259,520,000 bytes
-from the 16 GiB admission requirement, conditional on successful checks. At
-15,920,349,184 bytes (about 14.827 GiB), the corrected automatic backend completed
-one supplied token `[248045]` with the unchanged 12 GiB Job limit and 4 GiB
-physical reserve. The checker was built from `45fdd85`; later repair commits
-only changed a test assertion and fixture metadata. No further production
-arithmetic changed between that build and `e2d8d6f`.
-
-Against the retained pinned native PTQ1 reference, 430,526 of 39,504,384 complete
-logits/live-state values exceeded `1e-3 + 1e-3 * abs(reference)` across 129 files.
-Maximum absolute error was 0.06584501266479492. The greedy ID was 198 in both
-implementations, and 28 state files were byte-identical. The first nonexact
-stored state belongs to zero-based block 14; the first stored state outside
-tolerance belongs to block 15. This localizes the next investigation boundary,
-not the exact first divergent graph operation.
-
-The resource checks passed, but numerical parity did not. The conditional
-admission reduction was therefore reverted, with production admission retained
-at 16 GiB. The provisional policy patch, snapshots, comparison hashes and failure
-receipt remain outside Git in the admission-trial evidence lane. Runner's
-[repair receipt](https://github.com/symbiogenesis/SwiftBonsai2Runner/blob/main/docs/ptq1-arithmetic-evidence.json)
-records the bounded result. No benchmark, quality/adapter qualification, default
-change or additional model capture followed this failure.
-
-### Bounded floating-projection follow-up
-
-Native operator captures identified a separate pinned F32/F16 projection
-accumulation gap. Rows divisible by sixteen now use the native four-register
-binary32 FMA reduction. Twelve checked native rows cover F32, F16 and BF16 at
-widths 16, 32, 128 and 5120. Three controls distinguish the repair from the
-previous generic binary64 sum. Generic arithmetic, BF16 and unqualified tail
-widths retain their previous behavior. The fixture records the pinned native
-runtime/DLL and source identities; it does not establish full-model PTQ1 parity.
-
-A new one-token intermediate capture was rejected before model launch by the
-current Runner development budget: 11,230,294,016 available physical bytes versus
-15.5 GiB required. The 11.5 GiB Job ceiling and 4 GiB physical reserve remained
-unchanged. The earlier failed full-model comparison therefore remains the latest
-numerical verdict. No PTQ1 default, service selection or admission reduction is
-qualified by these operator fixtures.
-
-### PTQ1 activation preparation repair
-
-A later one-token Rust recheck completed under a separate diagnostic envelope:
-12 GiB available admission, 8 GiB Job commit and the same 4 GiB physical reserve.
-Peak Job commit was 6,275,588,096 bytes; minimum available physical RAM was
-7,574,892,544 bytes. All 129 outputs matched the earlier Rust capture, including
-its numerical failure. This is bounded resource evidence, not a service profile.
-
-A native-backed intermediate trace localized the first difference to block 13's
-FFN down-projection. Its input and Hadamard transform matched exactly; one Q8_0
-activation code differed. The pinned DLL uses amax multiplied by rounded
-binary32 1/127 for scale and direct 127/amax division for inverse scale. The
-previous division-then-reciprocal sequence rounded a halfway value differently.
-The pinned PTQ1 path now reproduces the native sequence and has a distinct
-activation-sharing contract. Generic/PQ2 behavior remains unchanged. Four small
-synthetic native controls and the entire isolated 17,408-by-5,120 projection
-match exactly. A new full-model comparison after this repair remains pending;
-production defaults, service selection and admission are unqualified.
-
-The unchanged DSpark real-eval case passed in isolated main CI run 40446869313
-but exhausted its native session lifetime in concurrent ordinary partition 3.
-That partition now runs adapters serially; the other ordinary partitions retain
-their prior concurrency. Source coverage, inputs, assertions and deadlines stay
-unchanged. CI on the final combined revision is handed to the owner for monitoring.
-
-## Release bundles and compatibility
-
-Manual Foundation dispatch and shared or packaging-input changes build five
-executables and package them with the four root
-license/notice files. Each bundle has a receipt identifying its exact source
-revision, target, version, file hashes and archive hash. Isolated crate changes
-check and build their affected packages without rebuilding a complete bundle.
-The aggregate Foundation check requires both Windows targets, the Linux native
-overlay, Rust regression, native codec and source-package matrix whenever their
-respective groups are selected.
-
-The source installation and library examples above select registry `0.1.27`.
-The current Windows ARM64 bundle is also `0.1.27`. Both use source
-`1429a33772089dfd3a50a96c698b9dbe0b36836a`; their separate archive and receipt
-identities are recorded in the [0.1.27 delivery notes](release-0.1.27.md).
-Earlier published bundles keep their original identities. Packaging rejects a
-changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
-versions or a toolchain string that differs from the pinned channel and target. The receipt
-records the resulting bytes; its source-to-binary trust still depends on the
-checked Foundation build. The synthetic release-bundle regressions verify
-identity rejection, PE target checks and every archive entry's recorded hash.
-
-The main CLI, token worker and Swift worker come from the `prism-inference`
-package. `prism-inference-server` and `bonsai-gguf` are separate packages in
-the workspace; `cargo install prism-inference` alone installs the first three
-executables. The [release bundles](https://github.com/symbiogenesis/prism-inference/releases)
-include all five.
-
-For an authorized hosted release build, the manually dispatched
-[Foundation bundle workflow](../.github/workflows/foundation-bundle.yml) builds
-those five executables on hosted Windows ARM64 after three version, six receipt
-and five data-only PE controls, formatting, strict Release all-target analyzers
-for the runtime, server and Hexagon crates, and a feature-disabled runtime library
-compilation check. Two exact unwind/drain controls and six exact context controls
-also run; their scope is recorded in the [delivery notes](release-0.1.27.md#verified-delivery-scope).
-It executes no complete correctness suite or model. The owner's explicit
-release instruction selects GitHub's own hosted job cap: this workflow defines
-no job timeout, timeout input or aggregate operator cancellation deadline for
-release compilation. Model captures, benchmarks and owner-device diagnostics
-retain their separate execution and power-observation limits. This hosted release
-policy does not extend those workloads or reopen their historical deadlines.
-The build derives the version from matching runtime/server manifests and the
-server's exact runtime pin, then uses the ordinary source-bound bundle producer
-and genuine GitHub run identity.
-Dispatch requires the exact expected main revision and a unique one-to-48-character
-operation ID containing letters, digits, underscores or hyphens and starting with
-a letter or digit. The first step rejects a source mismatch, and the run name
-includes the operation ID so an operator can identify its exact release build.
-The retained `bundle-scope.json` explicitly leaves full Foundation correctness,
-model acceptance and performance unqualified. This separate workflow cannot serve
-as Foundation's successful-ancestor validation baseline. A failed or cancelled
-build without its source-bound artifacts leaves packaging incomplete.
-
-The historical `0.1.23` runtime and Windows ARM64 development prerelease preserve
-all older full and prerelease artifacts. Its
-[delivery scope](release-0.1.23.md) records exact source
-`055c7430cb4771dfddb24ddaa30494af6ad182da`, the successful bounded bundle checks
-and independently pending qualification. The server pins registry
-`bonsai-windows-credentials =0.1.4` and retains `publish = false` because its
-Hexagon helpers are unpublished path dependencies. Verified GitHub bundles and
-exact source checkouts remain its supported delivery paths. The hosted
-[Foundation source-package matrix](../.github/workflows/foundation.yml) verifies
-normalized Cargo archives together before registry publication on Windows ARM64,
-Windows x64 and Linux ARM64. A separate application consumes the extracted runtime,
-GGUF and hash archives and runs model-free public API checks with scalar, default and parallel-row
-features. Its receipt retains archive digests, source identity, consumer lockfile and executed
-commands. This checks source delivery independently of building inside the original workspace.
-
-The five current registry helpers are published as `bonsai-native-hash =0.1.3`,
-`bonsai-neon-dot =0.1.3`, `bonsai-ternary =0.1.3`, `bonsai-gguf =0.1.5` and
-`bonsai-prism =0.1.5`, alongside runtime `0.1.27`. The
-[0.1.27 delivery record](release-0.1.27.md) binds the current runtime and binary
-to their shared source and separate archive digests. The historical
-[0.1.26 delivery record](release-0.1.26.md) retains the runtime/NEON publication
-and its distinct binary source and verification. The
-[0.1.25 delivery record](release-0.1.25.md) retains checks and limits for the
-unchanged helpers; the [0.1.24 delivery](release-0.1.24.md) remains historical.
-Registry publication and hosted checks alone do not qualify model serving.
-
-The published development bundle build explicitly enables
-`prism-inference/parallel-rows` and `prism-inference-server/parallel-rows` in the
-retained Foundation build command. The receipt's exact source revision, binary
-hashes and archive hash bind that build; its schema is unchanged. Library and
-server constructors, including the private HTTP server, still default to one
-row worker. Feature availability does not enable multiple workers in Runner or
-establish model parity, speed, resource suitability or default-runtime promotion.
-
-The worker executable names, Swift readiness identity `bonsai-prism-runtime`
-and library import `bonsai_prism_runtime` preserve the existing SwiftBonsai
-protocol/API. Their names do not restrict the repository's broader model scope.
-
-Complete suites and every benchmark run only in CI. Local builds, formatting,
-analyzers and focused named regressions are allowed. Avoid approximating a full
-suite by batching filtered local runs. Build outputs, logs and native working
-directories belong in unique system-temp lanes, outside checkouts.
+The server is not registry-publishable while it depends on unpublished Hexagon
+helpers. Use a verified bundle or exact source checkout. Worker names, readiness
+identity `bonsai-prism-runtime` and library import `bonsai_prism_runtime` are
+the current protocol identifiers.

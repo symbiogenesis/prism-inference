@@ -24,8 +24,14 @@ class HexagonWorkflowTests(unittest.TestCase):
         return match[1]
 
     def cargo_commands(self, job):
-        return [shlex.split(line.strip()) for line in job.splitlines()
-                if line.strip().startswith("cargo ")]
+        commands = []
+        for line in job.splitlines():
+            command = line.strip()
+            if "run_ci_command.py" in command and " -- cargo " in command:
+                command = "cargo " + command.split(" -- cargo ", 1)[1]
+            if command.startswith("cargo "):
+                commands.append(shlex.split(command))
+        return commands
 
     def assert_native_lint(self, job):
         commands = self.cargo_commands(job)

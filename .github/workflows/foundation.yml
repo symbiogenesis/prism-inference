@@ -133,7 +133,7 @@ jobs:
           $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
           if (-not $packages.Count) { throw 'A selected Windows lane requires affected packages.' }
           [void][IO.Directory]::CreateDirectory($env:PRISM_CHECK_EVIDENCE)
-          cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo fetch' -- cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
       - name: Save locked downloads once per architecture
         if: matrix.lane == 'correctness-0' && steps.downloads.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -155,10 +155,10 @@ jobs:
           $selection = @($packages | ForEach-Object { '--package'; $_ })
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'workspace.log') | Out-Null
           try {
-            cargo +nightly-2026-11-09 fmt --manifest-path $manifest @selection -- --check
+            python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo fmt' -- cargo +nightly-2026-11-09 fmt --manifest-path $manifest @selection -- --check
             # Native linking is covered separately by the selected overlay gate.
-            cargo +nightly-2026-11-09 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
-            cargo +nightly-2026-11-09 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
+            python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest @selection --all-targets --locked --offline --release -- -D warnings
+            python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo doc' -- cargo +nightly-2026-11-09 doc --manifest-path $manifest @selection --no-deps --locked --offline --release
           } finally { Stop-Transcript | Out-Null }
       - name: Run this shard's complete Cargo correctness targets
         if: startsWith(matrix.lane, 'correctness-')
@@ -197,7 +197,7 @@ jobs:
             }
             if ($buildPackages.Count) {
               $buildSelection = @($buildPackages | ForEach-Object { '--package'; $_ })
-              cargo +nightly-2026-11-09 build --manifest-path $manifest @buildSelection @buildFeatures --bins --locked --offline --release
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest @buildSelection @buildFeatures --bins --locked --offline --release
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Check feature variants, scalar fallback and loader ABI
@@ -213,32 +213,32 @@ jobs:
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'feature-variants.log') | Out-Null
           try {
             if ('prism-inference' -cin $packages) {
-              cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
-              cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
-              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
-              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::packed_pq2::
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test simd simd_
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::packed_pq2::
               if ($env:CARGO_BUILD_TARGET -ceq 'aarch64-pc-windows-msvc') {
-                cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::neon::tests::simd_neon_packed_consumption_
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::neon::tests::simd_neon_packed_consumption_
               }
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test parallel_rows
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
             }
             if ('prism-inference-server' -cin $packages) {
-              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --all-targets -- -D warnings
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_child::tests::
-              cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_backend::tests::private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts -- --exact
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --all-targets -- -D warnings
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_child::tests::
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_backend::tests::private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts -- --exact
             }
             if ('bonsai-gguf' -cin $packages) {
-              cargo +nightly-2026-11-09 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
             }
             if ('bonsai-prism' -cin $packages) {
               # Check the loader ABI without enabling the native-tests link feature.
-              cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
-              cargo +nightly-2026-11-09 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --all-targets -- -D warnings
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo doc' -- cargo +nightly-2026-11-09 doc --manifest-path $manifest -p bonsai-prism --locked --offline --release --features engine-loader --no-deps
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Verify immutable reference fixtures and kill the bounded mutation catalog
@@ -384,7 +384,7 @@ jobs:
           if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Expected native ARM64 source build.' }
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'tools/prism/Cargo.toml'
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismRustChecks'
-          cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo fetch' -- cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
           $checks = Join-Path $env:RUNNER_TEMP ('SwiftBonsai-PrismChecks-' + [guid]::NewGuid().ToString('N'))
           "PRISM_CHECK_EVIDENCE=$checks" >> $env:GITHUB_ENV
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-prism -Toolchain nightly-2026-11-09 -TargetDirectory $env:CARGO_TARGET_DIR -EvidenceDirectory (Join-Path $checks 'policy') -FullTests -Offline | ConvertTo-Json -Depth 8
@@ -460,7 +460,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo +nightly-2026-11-09-aarch64-pc-windows-msvc build --locked --release --package prism-inference --example upstream_prism
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09-aarch64-pc-windows-msvc build --locked --release --package prism-inference --example upstream_prism
       - name: Require every selected runtime regression
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -518,7 +518,7 @@ jobs:
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           Start-Transcript -LiteralPath (Join-Path $checks 'codec-workflow.log') | Out-Null
           try {
-            cargo +nightly-2026-11-09-aarch64-pc-windows-msvc fetch --manifest-path $manifest --locked
+            python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo fetch' -- cargo +nightly-2026-11-09-aarch64-pc-windows-msvc fetch --manifest-path $manifest --locked
             & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Rust.ps1') -Package bonsai-codec-probe -Phase build -TargetDirectory $target -EvidenceDirectory (Join-Path $checks 'rust') -Offline | ConvertTo-Json -Depth 8
             Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Common.psm1')
             $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'tools/codec-probe/native.lock.json') -Raw | ConvertFrom-Json

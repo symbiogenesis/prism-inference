@@ -1034,8 +1034,8 @@ fn full_attention_tile(
                 &mut tile.frequencies[index],
             );
             step_result?;
-            keys.prepare_append(&tile.recurrent_gate[index])?;
-            values.prepare_append(&tile.beta[index])?;
+            keys.prepare_staged_append(&tile.recurrent_gate[index])?;
+            values.prepare_staged_append(&tile.beta[index])?;
             keys.append(&tile.recurrent_gate[index]);
             values.append(&tile.beta[index]);
             check()?;

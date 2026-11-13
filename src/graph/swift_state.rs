@@ -9,6 +9,7 @@ const STATE_TOKEN_BYTES: usize = KV_TOKEN_BYTES + 24 * 4 + 128;
 
 // Complete selected live/checkpoint allowance, including sequential scores and
 // bookkeeping, rather than a new cap on any individual allocation or scratch.
+#[cfg(any(feature = "cli", test))]
 pub(super) const SWIFT_RSQ4_FULL_STATE_BYTES: usize =
     CONTEXT_TOKENS * STATE_TOKEN_BYTES + RECURRENT_BYTES;
 

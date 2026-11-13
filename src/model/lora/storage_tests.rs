@@ -104,15 +104,16 @@ fn rank_one_storage_releases_linear_raw_a_and_preserves_decoded_b_sharing() -> R
     let mut scratch = Scratch::new(MatvecBackend::Scalar, true);
     let mut linear = [-16_785_408.0, -0.0];
     adapter.linear(LINEAR[0], &[4097.0, 1.0], 1.0, &mut linear, &mut scratch)?;
+    // The existing B reduction starts at +0, so its -0 product sums to +0.
     assert_eq!(
         linear.map(f32::to_bits),
-        [0.0_f32.to_bits(), (-0.0_f32).to_bits()]
+        [0.0_f32.to_bits(), 0.0_f32.to_bits()]
     );
     let mut embedding = [0.0, -0.0];
     adapter.embedding(0, 1.0, &mut embedding, &mut scratch)?;
     assert_eq!(
         embedding.map(f32::to_bits),
-        [4097.0_f32.to_bits(), (-0.0_f32).to_bits()]
+        [4097.0_f32.to_bits(), 0.0_f32.to_bits()]
     );
     for scale in [0.0, -0.0] {
         let mut output = [-0.0, -0.0];

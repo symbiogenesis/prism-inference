@@ -2,9 +2,23 @@
 
 The local runtime and private server identify the next development candidate as
 0.1.26. The server's exact path dependency and workspace lockfile advance
-together. Public helper versions remain unchanged: native-hash/ternary 0.1.3,
-NEON 0.1.2 and GGUF/Prism 0.1.5. No package, tag, GitHub release or binary bundle
-has been published by this preparation.
+together. The changed public NEON helper advances from 0.1.2 to 0.1.3, and the
+runtime pins it exactly. Native-hash/ternary remain 0.1.3 and GGUF/Prism remain
+0.1.5: their source has not changed since the 0.1.25 delivery. No package, tag,
+GitHub release or binary bundle has been published by this preparation.
+
+Publish `bonsai-neon-dot 0.1.3` before `prism-inference 0.1.26`, using ordinary
+Cargo package/publication verification for both. The server, Hexagon helpers
+and qualification tools remain private. Registry publication and the
+five-executable bundle are independent deliveries; one cannot substitute for
+the other.
+
+The NEON helper adds borrowed, prechecked finite queries for packed-key scans
+and an owned packed-value accumulator. Each row still checks extent and finite
+results; an invalid append permanently prevents publication of its accumulated
+sum. Native and portable paths retain their existing arithmetic. The runtime
+consumes those APIs and includes prepared PQ2 row validation and compatible
+CPU sibling prefill projections. Source changes alone establish no speed gain.
 
 The candidate includes
 [selected-cache context accounting](runtime-contracts.md#memory-and-ownership)

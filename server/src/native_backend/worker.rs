@@ -548,11 +548,12 @@ impl Worker {
     pub(super) fn new(engine: impl Engine, seed: u32) -> Result<Self, NativeBackendError> {
         let profile = engine.profile()?;
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
-            || bonsai_prism_runtime::swift_session::validate_execution_capacity(
+            || bonsai_prism_runtime::swift_session::validate_execution_capacity_with_kv(
                 profile.context_tokens,
                 u64::MAX,
                 profile.cpu_prefill,
                 profile.cpu_speculation,
+                profile.kv_cache,
             )
             .is_err()
             || !valid_graph_profile(&profile)

@@ -205,6 +205,30 @@ adaptations also retain Camelid's MIT terms in
 
 ## Memory and ownership
 
+Local Swift source sizes native context against the immutable selected KV policy.
+Per-token process allowances are 131,296 bytes for FP16, 34,016 for K4/V4 and
+29,920 for K4/V3: two full caches, including packed scales, 96 bytes of sequential
+attention scores and 128 bytes of page/token metadata. The unchanged 11 GiB fixed
+allowance retains recurrent state, codec/prepared rows, weights and runtime
+headroom. Publishers and explicit CPU tiles have separate scratch accounting;
+FP16 tiles reserve every four/six-head score row for every tile token.
+
+`validate_context_capacity_with_kv` and the selected-cache prefill/execution
+validators bind that policy before artifact I/O. Existing validation entry points
+retain FP16 policy. The 4 GiB state ceiling and 256-token selection granularity
+permit at most 62,720 FP16, 241,664 K4/V4 or 262,144 K4/V3 tokens. Live state and
+rollback budgets scale with the selected payload, retaining the historical 1 GiB
+floor for fixed checkpoint/logit overhead. Speculation additionally reserves a
+complete second prefix and its full tile/logit scratch; divergent histories still
+charge two full caches regardless of shared pages.
+
+These source allowances are not measured memory, quality or larger-window
+qualification. The private child validates paired `--context-tokens` and
+`--memory-limit-bytes` against the final cache selection independent of argument
+order. Runner's published 0.1.25 remains fixed at 8K until a genuine source-bound
+compatible release is reviewed and repinned. Its 4 GiB host and 256 MiB startup
+reserves remain separate. Larger token bounds retain all wire-byte limits.
+
 `--memory-bytes` bounds retained model storage, not process memory. Allow additional
 headroom for parser/conversion scratch, graph workspace, active state, checkpoints,
 optional decoded-vocabulary/output storage and allocator overhead. Text mode admits

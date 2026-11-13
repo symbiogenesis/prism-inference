@@ -8,8 +8,8 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     runtime::PromptReuse,
     swift_session::{
-        CpuPrefill, CpuSpeculation, SwiftSession, validate_context_capacity,
-        validate_execution_capacity,
+        CpuPrefill, CpuSpeculation, SwiftSession, validate_context_capacity_with_kv,
+        validate_execution_capacity_with_kv,
     },
 };
 use bonsai_windows_credentials::validate_read_path;
@@ -156,15 +156,25 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             verification_scratch,
             speculative_checkpoint,
         )?,
-        capacity: parse_capacity(context_tokens, memory_limit_bytes)?,
+        capacity: parse_capacity(
+            context_tokens,
+            memory_limit_bytes,
+            kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
+        )?,
     };
     if config.cpu_prefill.is_some() || config.cpu_speculation.is_some() {
         let (context, memory) = config.capacity.ok_or_else(invalid)?;
         if kv_cache.is_none() {
             return Err(invalid());
         }
-        validate_execution_capacity(context, memory, config.cpu_prefill, config.cpu_speculation)
-            .map_err(|_| invalid())?;
+        validate_execution_capacity_with_kv(
+            context,
+            memory,
+            config.cpu_prefill,
+            config.cpu_speculation,
+            config.kv_cache,
+        )
+        .map_err(|_| invalid())?;
     }
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -238,6 +248,7 @@ fn parse_speculation(
 fn parse_capacity(
     context_tokens: Option<OsString>,
     memory_limit_bytes: Option<OsString>,
+    kv_cache: KvCachePolicy,
 ) -> io::Result<Option<(usize, u64)>> {
     match (context_tokens, memory_limit_bytes) {
         (None, None) => Ok(None),
@@ -258,7 +269,7 @@ fn parse_capacity(
             {
                 return Err(invalid());
             }
-            validate_context_capacity(context, memory).map_err(|_| invalid())?;
+            validate_context_capacity_with_kv(context, memory, kv_cache).map_err(|_| invalid())?;
             Ok(Some((context, memory)))
         }
         _ => Err(invalid()),
@@ -354,21 +365,23 @@ mod tests {
         use bonsai_prism_runtime::swift_session::{
             CONTEXT_TOKEN_MEMORY_BYTES, MAX_CONTEXT_TOKENS, NON_CONTEXT_MEMORY_BYTES,
         };
-        assert_eq!(parse_capacity(None, None)?, None);
+        assert_eq!(parse_capacity(None, None, KvCachePolicy::F16)?, None);
         for tokens in [4_352, 8_192, 32_768, MAX_CONTEXT_TOKENS] {
             let memory = NON_CONTEXT_MEMORY_BYTES
                 + u64::try_from(tokens).map_err(io::Error::other)? * CONTEXT_TOKEN_MEMORY_BYTES;
             assert_eq!(
                 parse_capacity(
                     Some(tokens.to_string().into()),
-                    Some(memory.to_string().into())
+                    Some(memory.to_string().into()),
+                    KvCachePolicy::F16,
                 )?,
                 Some((tokens, memory)),
             );
             assert!(
                 parse_capacity(
                     Some(tokens.to_string().into()),
-                    Some((memory - 1).to_string().into())
+                    Some((memory - 1).to_string().into()),
+                    KvCachePolicy::F16,
                 )
                 .is_err()
             );
@@ -383,8 +396,60 @@ mod tests {
             (Some("8192"), Some("18446744073709551615")),
         ] {
             assert!(
-                parse_capacity(tokens.map(OsString::from), memory.map(OsString::from)).is_err()
+                parse_capacity(
+                    tokens.map(OsString::from),
+                    memory.map(OsString::from),
+                    KvCachePolicy::F16,
+                )
+                .is_err()
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_capacity_uses_final_cache_selection_in_either_argument_order() -> io::Result<()>
+    {
+        use bonsai_prism_runtime::swift_session::NON_CONTEXT_MEMORY_BYTES;
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        for context in [65_536_u64, 131_072] {
+            let memory = NON_CONTEXT_MEMORY_BYTES + context * 34_016;
+            for cache_first in [false, true] {
+                let capacity: [OsString; 4] = [
+                    "--context-tokens".into(),
+                    context.to_string().into(),
+                    "--memory-limit-bytes".into(),
+                    memory.to_string().into(),
+                ];
+                let cache = [OsString::from("--kv-cache"), "rsq4".into()];
+                let mut args = base.clone();
+                if cache_first {
+                    args.extend(cache);
+                    args.extend(capacity);
+                } else {
+                    args.extend(capacity);
+                    args.extend(cache);
+                }
+                let selected = parse(args.clone())?;
+                assert_eq!(
+                    selected.capacity,
+                    Some((usize::try_from(context).map_err(io::Error::other)?, memory))
+                );
+                let cache_index = if cache_first { 10 } else { 14 };
+                args[cache_index] = "f16".into();
+                assert!(parse(args).is_err());
+            }
         }
         Ok(())
     }
@@ -577,6 +642,7 @@ mod tests {
                 assert_eq!(speculation.checkpoint_bytes(), checkpoint);
                 assert_eq!(config.kv_cache.name(), cache);
             }
+            selected[10] = "f16".into();
             let mut insufficient = selected.clone();
             insufficient[14] = (memory - 1).to_string().into();
             assert!(parse(insufficient).is_err());

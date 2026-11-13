@@ -29,14 +29,18 @@ to a caller-supplied additional reserve. Existing SwiftSession loaders preserve
 ordinary ingestion; `load_profile_with_prefill` supplies the explicit selection.
 The graph independently checks its geometry-derived minimum. Owners must add
 the full supplied reserve to the existing context/process allowance using
-`validate_prefill_capacity`, while retaining worker, allocator and host reserves.
+`validate_prefill_capacity_with_kv` for the immutable selected cache, while retaining
+worker, allocator and host reserves. The FP16 compatibility validator retains its
+FP16 policy. Tiled score reservations cover the complete four/six-head high water
+per tile token independently of the ordinary sequential attention allowance.
 
 The private server accepts paired trusted `--cpu-prefill-tokens` and
 `--cpu-prefill-scratch-bytes` arguments with explicit `--kv-cache` and paired
 `--context-tokens` / `--memory-limit-bytes`. The selected FP16, K4/V4 or K4/V3
 policy is retained; packed-cache attention runs causally through its ordinary
 codec without FP16 history expansion. Invalid pairing, bounds or insufficient
-total allowance rejects before artifact I/O. Requests cannot change this selection. Startup readiness reports `cpu_prefill_tokens`,
+total allowance rejects before artifact I/O. Requests cannot change this selection.
+Startup readiness reports `cpu_prefill_tokens`,
 `cpu_prefill_scratch_bytes` and the exact `startup_graph_identity`.
 
 This profile retains sequential GDN arithmetic and skips implicit Hexagon

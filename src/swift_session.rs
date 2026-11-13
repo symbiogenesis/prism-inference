@@ -37,23 +37,59 @@ pub const STATE_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 pub const CHECKPOINT_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Conservative fixed model/runtime allowance, excluding context growth.
 pub const NON_CONTEXT_MEMORY_BYTES: u64 = 11 * 1024 * 1024 * 1024;
-/// Live and rollback FP16 KV, bounded attention scores and context bookkeeping
-/// charged for each selected context token.
-///
-/// Quantized caches retain this conservative FP16 capacity charge. Bookkeeping
-/// includes token histories and checkpoint/page metadata. Fixed workspace and
-/// recurrent state use the non-context allowance. The shared launcher charge
-/// reserves 64-token, 24-head F32 scores for publisher microbatch attention.
-/// Native ordinary block prefill is sequential and retains 24 score rows;
-/// optional tiled-prefill APIs still need their separate reservation review.
-/// This source estimate is not a measured peak or a memory qualification.
-pub const CONTEXT_TOKEN_MEMORY_BYTES: u64 = 2 * 65_536 + 64 * 24 * 4 + 128;
+/// Native sequential FP16 live/rollback KV, attention scores and bookkeeping.
+/// Publisher microbatch scratch is a separate execution profile.
+pub const CONTEXT_TOKEN_MEMORY_BYTES: u64 = 2 * 65_536 + 24 * 4 + 128;
+/// Pinned Swift F32 recurrent/convolution payload, unchanged by KV precision.
+pub const RECURRENT_MEMORY_BYTES: usize = 156_893_184;
 /// Maximum context fitting the existing graph state bound at FP16 precision.
 ///
 /// Preserve the graph's 4 GiB cap and the pinned 156,893,184-byte recurrent
 /// payload. The extra scratch charge and 256-token rounding leave metadata room.
-pub const MAX_CONTEXT_TOKENS: usize =
-    (crate::graph::MAX_STATE_BYTES - 156_893_184) / (65_536 + 96 + 128) / 256 * 256;
+pub const MAX_CONTEXT_TOKENS: usize = max_context_tokens(KvCachePolicy::F16);
+
+/// Selected immutable cache payload per token across all 16 attention layers.
+/// Packed records include one F32 scale for every key and value head.
+#[must_use]
+pub const fn kv_token_memory_bytes(kv_cache: KvCachePolicy) -> usize {
+    match kv_cache {
+        KvCachePolicy::F16 => 65_536,
+        KvCachePolicy::Rotated4 => 16_896,
+        KvCachePolicy::Rotated4Keys3Values => 14_848,
+    }
+}
+
+/// Complete per-token native process allowance for two independently live caches.
+///
+/// The 96-byte score allowance covers 24 sequential query heads. The 128-byte
+/// metadata allowance covers token histories, both page tables and Arc headers;
+/// pages contain 64 tokens. Fixed codec/transform and prepared-row storage remains
+/// in the unchanged 11 GiB allowance, along with recurrence and runtime headroom.
+/// Explicit tiles and speculative recovery are additionally charged in full.
+#[must_use]
+pub const fn context_token_memory_bytes(kv_cache: KvCachePolicy) -> u64 {
+    let kv_bytes = match kv_cache {
+        KvCachePolicy::F16 => 65_536,
+        KvCachePolicy::Rotated4 => 16_896,
+        KvCachePolicy::Rotated4Keys3Values => 14_848,
+    };
+    2 * kv_bytes + 96 + 128
+}
+
+/// Largest page-aligned context admitted by this cache's 4 GiB state bound.
+/// This source allowance does not establish measured memory or long-range quality.
+#[must_use]
+pub const fn max_context_tokens(kv_cache: KvCachePolicy) -> usize {
+    let state_max = (crate::graph::MAX_STATE_BYTES - RECURRENT_MEMORY_BYTES)
+        / (kv_token_memory_bytes(kv_cache) + 96 + 128)
+        / 256
+        * 256;
+    if state_max < swift::TRAINING_CONTEXT_TOKENS {
+        state_max
+    } else {
+        swift::TRAINING_CONTEXT_TOKENS
+    }
+}
 
 /// Validate a launcher's selected context and conservative process allowance.
 ///
@@ -63,12 +99,24 @@ pub const MAX_CONTEXT_TOKENS: usize =
 /// # Errors
 /// Rejects a context outside the model/state bounds or an insufficient allowance.
 pub fn validate_context_capacity(context_tokens: usize, memory_limit_bytes: u64) -> Result<()> {
+    validate_context_capacity_with_kv(context_tokens, memory_limit_bytes, KvCachePolicy::F16)
+}
+
+/// Validate selected-cache process and state accounting before artifact I/O.
+///
+/// # Errors
+/// Rejects a context above the selected cache/model bound or an insufficient allowance.
+pub fn validate_context_capacity_with_kv(
+    context_tokens: usize,
+    memory_limit_bytes: u64,
+    kv_cache: KvCachePolicy,
+) -> Result<()> {
     let required = u64::try_from(context_tokens)?
-        .checked_mul(CONTEXT_TOKEN_MEMORY_BYTES)
+        .checked_mul(context_token_memory_bytes(kv_cache))
         .and_then(|bytes| bytes.checked_add(NON_CONTEXT_MEMORY_BYTES))
         .ok_or_else(|| invalid("Swift context memory allowance overflow"))?;
     if context_tokens == 0
-        || context_tokens > MAX_CONTEXT_TOKENS
+        || context_tokens > max_context_tokens(kv_cache)
         || context_tokens > swift::TRAINING_CONTEXT_TOKENS
         || memory_limit_bytes < required
     {
@@ -186,12 +234,15 @@ impl CpuSpeculation {
     }
 }
 
-const fn selected_state_budget(context_tokens: usize) -> usize {
-    if context_tokens == swift::CONTEXT_TOKENS {
-        STATE_MEMORY_BYTES
-    } else {
-        crate::graph::MAX_STATE_BYTES
-    }
+fn selected_state_budget(context_tokens: usize, kv_cache: KvCachePolicy) -> Result<usize> {
+    validate_context_capacity_with_kv(context_tokens, u64::MAX, kv_cache)?;
+    let bytes = context_tokens
+        .checked_mul(kv_token_memory_bytes(kv_cache) + 96 + 128)
+        .and_then(|bytes| bytes.checked_add(RECURRENT_MEMORY_BYTES))
+        .ok_or_else(|| invalid("Swift selected state budget overflow"))?;
+    // Preserve fixed graph/checkpoint/logits overhead for short contexts. At
+    // larger capacities the per-token allowance also covers the page metadata.
+    Ok(bytes.max(STATE_MEMORY_BYTES))
 }
 
 /// Validate all explicitly selected CPU execution reserves before artifact I/O.
@@ -208,8 +259,29 @@ pub fn validate_execution_capacity(
     prefill: Option<CpuPrefill>,
     speculation: Option<CpuSpeculation>,
 ) -> Result<()> {
+    validate_execution_capacity_with_kv(
+        context_tokens,
+        memory_limit_bytes,
+        prefill,
+        speculation,
+        KvCachePolicy::F16,
+    )
+}
+
+/// Validate selected-cache context plus complete tile and speculative reserves.
+///
+/// # Errors
+/// Rejects context/state limits, missing tiles, insufficient reserves or overflow.
+pub fn validate_execution_capacity_with_kv(
+    context_tokens: usize,
+    memory_limit_bytes: u64,
+    prefill: Option<CpuPrefill>,
+    speculation: Option<CpuSpeculation>,
+    kv_cache: KvCachePolicy,
+) -> Result<()> {
     let additional = if let Some(speculation) = speculation {
-        if prefill.is_none() || speculation.checkpoint_bytes < selected_state_budget(context_tokens)
+        if prefill.is_none()
+            || speculation.checkpoint_bytes < selected_state_budget(context_tokens, kv_cache)?
         {
             return Err(invalid(
                 "CPU speculation requires tiles and a complete prefix reserve",
@@ -225,7 +297,7 @@ pub fn validate_execution_capacity(
     let available = memory_limit_bytes
         .checked_sub(u64::try_from(additional)?)
         .ok_or_else(|| invalid("Swift CPU speculation memory allowance rejected"))?;
-    validate_prefill_capacity(context_tokens, available, prefill)
+    validate_prefill_capacity_with_kv(context_tokens, available, prefill, kv_cache)
 }
 
 /// Validate context plus the entire explicitly selected CPU tile reservation.
@@ -240,11 +312,29 @@ pub fn validate_prefill_capacity(
     memory_limit_bytes: u64,
     prefill: Option<CpuPrefill>,
 ) -> Result<()> {
+    validate_prefill_capacity_with_kv(
+        context_tokens,
+        memory_limit_bytes,
+        prefill,
+        KvCachePolicy::F16,
+    )
+}
+
+/// Validate selected-cache context and the entire additional tile reservation.
+///
+/// # Errors
+/// Rejects invalid context capacity, insufficient memory and reservation overflow.
+pub fn validate_prefill_capacity_with_kv(
+    context_tokens: usize,
+    memory_limit_bytes: u64,
+    prefill: Option<CpuPrefill>,
+    kv_cache: KvCachePolicy,
+) -> Result<()> {
     let reserve = prefill.map_or(0, CpuPrefill::scratch_bytes);
     let available = memory_limit_bytes
         .checked_sub(u64::try_from(reserve)?)
         .ok_or_else(|| invalid("Swift CPU prefill memory allowance rejected"))?;
-    validate_context_capacity(context_tokens, available)
+    validate_context_capacity_with_kv(context_tokens, available, kv_cache)
 }
 
 /// Largest complete displayed output retained or delivered by one request.
@@ -520,8 +610,14 @@ impl SwiftSession {
         cpu_prefill: Option<CpuPrefill>,
         cpu_speculation: Option<CpuSpeculation>,
     ) -> Result<Self> {
-        validate_execution_capacity(context_tokens, u64::MAX, cpu_prefill, cpu_speculation)?;
-        let state_budget = selected_state_budget(context_tokens);
+        validate_execution_capacity_with_kv(
+            context_tokens,
+            u64::MAX,
+            cpu_prefill,
+            cpu_speculation,
+            kv_cache,
+        )?;
+        let state_budget = selected_state_budget(context_tokens, kv_cache)?;
         let checkpoint_budget = CHECKPOINT_MEMORY_BYTES
             .max(state_budget)
             .checked_add(cpu_speculation.map_or(0, CpuSpeculation::checkpoint_bytes))
@@ -1035,8 +1131,10 @@ mod tests {
     use super::{
         CONTEXT_TOKEN_MEMORY_BYTES, CpuPrefill, CpuSpeculation, MAX_CONTEXT_TOKENS,
         NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftSession,
-        validate_adapter_scale, validate_context_capacity, validate_execution_capacity,
-        validate_prefill_capacity, validate_prompt_owner,
+        context_token_memory_bytes, kv_token_memory_bytes, max_context_tokens,
+        selected_state_budget, validate_adapter_scale, validate_context_capacity,
+        validate_context_capacity_with_kv, validate_execution_capacity,
+        validate_execution_capacity_with_kv, validate_prefill_capacity, validate_prompt_owner,
     };
     use crate::{
         Result,
@@ -1152,6 +1250,85 @@ mod tests {
         assert!(validate_context_capacity(MAX_CONTEXT_TOKENS + 1, u64::MAX).is_err());
         assert!(validate_context_capacity(usize::MAX, u64::MAX).is_err());
         assert_eq!(MAX_CONTEXT_TOKENS, 62_720);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cache_capacity_covers_packed_geometry_and_staged_windows() -> Result<()> {
+        for (cache, ceiling) in [
+            (KvCachePolicy::F16, 62_720),
+            (KvCachePolicy::Rotated4, 241_664),
+            (KvCachePolicy::Rotated4Keys3Values, 262_144),
+        ] {
+            // The graph codec independently computes packed records and scales.
+            assert_eq!(
+                kv_token_memory_bytes(cache),
+                cache.layer_payload_bytes(256, 4, 1)? * 16
+            );
+            assert_eq!(max_context_tokens(cache), ceiling);
+            for context in [4_352, 8_192, ceiling] {
+                let memory = NON_CONTEXT_MEMORY_BYTES
+                    + u64::try_from(context)? * context_token_memory_bytes(cache);
+                validate_context_capacity_with_kv(context, memory, cache)?;
+                assert!(validate_context_capacity_with_kv(context, memory - 1, cache).is_err());
+                let state = selected_state_budget(context, cache)?;
+                assert!(state >= STATE_MEMORY_BYTES);
+                assert!(state <= crate::graph::MAX_STATE_BYTES);
+            }
+            assert!(validate_context_capacity_with_kv(0, u64::MAX, cache).is_err());
+            assert!(validate_context_capacity_with_kv(ceiling + 1, u64::MAX, cache).is_err());
+            assert!(validate_context_capacity_with_kv(usize::MAX, u64::MAX, cache).is_err());
+        }
+        for context in [65_536, 131_072] {
+            let memory = NON_CONTEXT_MEMORY_BYTES + u64::try_from(context)? * 34_016;
+            validate_context_capacity_with_kv(context, memory, KvCachePolicy::Rotated4)?;
+            assert!(
+                validate_context_capacity_with_kv(context, u64::MAX, KvCachePolicy::F16).is_err()
+            );
+        }
+        let packed_8k_memory = NON_CONTEXT_MEMORY_BYTES + 8_192 * 34_016;
+        validate_context_capacity_with_kv(8_192, packed_8k_memory, KvCachePolicy::Rotated4)?;
+        assert!(
+            validate_context_capacity_with_kv(8_192, packed_8k_memory, KvCachePolicy::F16,)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cache_speculation_reserves_full_scaled_checkpoint() -> Result<()> {
+        let context = 131_072;
+        let cache = KvCachePolicy::Rotated4;
+        let tile = CpuPrefill::new(8, 64 * 1024 * 1024)?;
+        let checkpoint = selected_state_budget(context, cache)?;
+        let scratch = 16 * 1024 * 1024;
+        let selection = CpuSpeculation::new(4, scratch, checkpoint)?;
+        let required = NON_CONTEXT_MEMORY_BYTES
+            + u64::try_from(context)? * context_token_memory_bytes(cache)
+            + u64::try_from(tile.scratch_bytes() + scratch + checkpoint)?;
+        validate_execution_capacity_with_kv(context, required, Some(tile), Some(selection), cache)?;
+        assert!(
+            validate_execution_capacity_with_kv(
+                context,
+                required - 1,
+                Some(tile),
+                Some(selection),
+                cache,
+            )
+            .is_err()
+        );
+        let undersized = CpuSpeculation::new(4, scratch, checkpoint - 1)?;
+        assert!(
+            validate_execution_capacity_with_kv(
+                context,
+                u64::MAX,
+                Some(tile),
+                Some(undersized),
+                cache,
+            )
+            .is_err()
+        );
+        assert!(selected_state_budget(context, cache)? < crate::graph::MAX_STATE_BYTES);
         Ok(())
     }
 

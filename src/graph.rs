@@ -4166,6 +4166,17 @@ impl Decoder for Qwen35 {
     fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
         self.ingest_prefill_block(tokens, check)
     }
+    fn batched_evaluation_capacity(&self) -> usize {
+        self.verification_capacity()
+    }
+    fn evaluate_batch_into(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.evaluate_verification_block(tokens, output, check)
+    }
     fn checkpoint_bytes(&self) -> usize {
         // Deliberately charge each referenced page in full for every snapshot,
         // including its Arc header and page table. Runtime admission therefore

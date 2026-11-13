@@ -9,6 +9,8 @@ mod prefill;
 mod projection;
 #[path = "graph/quantized_kv.rs"]
 mod quantized_kv;
+#[path = "graph/verification.rs"]
+mod verification;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

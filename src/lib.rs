@@ -241,6 +241,37 @@ pub trait Decoder {
         }
         Ok(())
     }
+    /// Maximum token count supported by an explicitly selected, weight-sharing
+    /// evaluation path, or zero when that path is unavailable.
+    ///
+    /// Ordinary decoders retain zero. A nonzero value does not grant new memory
+    /// admission: the model owner must reserve all per-position logits and graph
+    /// scratch before enabling this capability.
+    fn batched_evaluation_capacity(&self) -> usize {
+        0
+    }
+    /// Include a bounded causal block and return next-token logits at every
+    /// position using the explicitly admitted weight-sharing implementation.
+    ///
+    /// On success the final decoder state matches sequential evaluation under
+    /// its declared arithmetic contract. Every row must contain exactly the
+    /// vocabulary's finite logits. On error `output` is empty and decoder state
+    /// may be provisional; the owner must restore its whole-block checkpoint.
+    /// The default refuses without changing state, rather than disguising
+    /// sequential evaluation as a batched capability.
+    ///
+    /// # Errors
+    /// Rejects unavailable capability, invalid bounds/tokens, cancellation,
+    /// context/resource exhaustion, allocation and numerical failures.
+    fn evaluate_batch_into(
+        &mut self,
+        _tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+        _check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        output.clear();
+        Err(invalid("batched decoder evaluation is not selected"))
+    }
     /// Capture every mutable component needed for exact prefix restoration.
     ///
     /// # Errors

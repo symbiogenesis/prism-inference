@@ -79,6 +79,7 @@ pub(super) struct TiledPrefill {
     gdn_head_outputs: Vec<f32>,
     gdn_key_dots: Vec<f32>,
     chunkwise_gdn: bool,
+    verification: bool,
     projector: ProjectionTile,
     statistics: TiledPrefillStatistics,
 }
@@ -138,6 +139,7 @@ impl TiledPrefill {
             gdn_head_outputs: Vec::new(),
             gdn_key_dots: Vec::new(),
             chunkwise_gdn: false,
+            verification: false,
             projector,
             statistics: TiledPrefillStatistics::default(),
         })
@@ -154,6 +156,9 @@ impl Qwen35 {
             write!(identity, ":cpu-tiled-ffn-v1:{}", tile.tokens)?;
             if tile.chunkwise_gdn {
                 identity.push_str(":gdn-wy-f32-v1");
+            }
+            if tile.verification {
+                identity.push_str(":cpu-tiled-verify-v1");
             }
         }
         Ok(())
@@ -265,7 +270,7 @@ impl Qwen35 {
         let Some(tile) = self.tiled_prefill.as_mut() else {
             return Err(invalid("chunkwise GDN requires explicit tiled prefill"));
         };
-        if self.position != 0 || tile.chunkwise_gdn {
+        if self.position != 0 || tile.chunkwise_gdn || tile.verification {
             return Err(invalid("chunkwise GDN requires an empty, unselected graph"));
         }
         let suffix = ":gdn-wy-f32-v1";
@@ -295,6 +300,101 @@ impl Qwen35 {
                 statistics.decoded_weight_blocks = tile.projector.decoded_blocks;
                 statistics
             })
+    }
+
+    /// Additional reservation for at most eight per-position vocabulary rows.
+    ///
+    /// This is additional to [`Self::tiled_prefill_scratch_bytes`], live state,
+    /// checkpoints, worker stacks and ordinary logits. The caller-owned output
+    /// rows are charged even when allocation reuse later makes them cheaper.
+    ///
+    /// # Errors
+    /// Rejects absent tiles, triangular GDN and arithmetic overflow.
+    pub fn tiled_verification_scratch_bytes(&self) -> Result<usize> {
+        let tile = self.tiled_prefill.as_ref().ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
+        if tile.chunkwise_gdn {
+            return Err(invalid("verification requires exact sequential GDN arithmetic"));
+        }
+        let rows = tile.tokens.min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS);
+        checked_product(&[rows, self.vocabulary, size_of::<f32>()])?
+            .checked_add(checked_product(&[rows, size_of::<Vec<f32>>()])?)
+            .ok_or_else(|| invalid("verification logits reservation overflow"))
+    }
+
+    /// Explicitly enable exact tiled target verification on an empty FP16 graph.
+    ///
+    /// Eligible packed layer projections and the vocabulary head share weights
+    /// across tokens; GDN/convolution retain causal, original arithmetic order.
+    /// This selects no drafter, sampler correction or serving default. Rejection
+    /// recovery still requires a complete checkpoint and accepted-prefix replay.
+    ///
+    /// # Errors
+    /// Rejects nonempty/already selected graphs, triangular GDN, insufficient
+    /// additional reservation and identity-allocation failure.
+    pub fn with_tiled_verification(mut self, additional_bytes: usize) -> Result<Self> {
+        if self.projection_executor.is_some() {
+            return Err(invalid("tiled verification requires CPU-only projections"));
+        }
+        let required = self.tiled_verification_scratch_bytes()?;
+        let tile = self.tiled_prefill.as_mut().ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
+        if self.position != 0 || tile.verification || additional_bytes < required {
+            return Err(invalid("tiled verification requires an empty graph and admitted logits"));
+        }
+        let total = tile.scratch_bytes.checked_add(required).ok_or_else(|| invalid("verification scratch reservation overflow"))?;
+        let suffix = ":cpu-tiled-verify-v1";
+        self.identity.try_reserve_exact(suffix.len())?;
+        self.identity.push_str(suffix);
+        self.provenance = std::sync::Arc::new(());
+        tile.scratch_bytes = total;
+        tile.verification = true;
+        Ok(self)
+    }
+
+    pub(super) fn verification_capacity(&self) -> usize {
+        self.tiled_prefill.as_ref().filter(|tile| tile.verification)
+            .map_or(0, |tile| tile.tokens.min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS))
+    }
+
+    pub(super) fn evaluate_verification_block(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        output.clear();
+        if tokens.is_empty() || tokens.len() > self.verification_capacity()
+            || self.projection_executor.is_some()
+            || tokens.iter().any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
+            || self.position.checked_add(tokens.len()).is_none_or(|end| end > self.context_limit)
+        {
+            return Err(invalid("invalid tiled verification bounds, tokens or context"));
+        }
+        // Allocate every output row before layer-major state can change. These
+        // are the caller-owned bytes charged by the explicit selection above.
+        let allocation = (|| -> Result<()> {
+            output.try_reserve_exact(tokens.len())?;
+            for _ in tokens {
+                let mut row = Vec::new();
+                row.try_reserve_exact(self.vocabulary)?;
+                output.push(row);
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            output.clear();
+            return Err(error);
+        }
+        let mut tile = self.tiled_prefill.take().ok_or_else(|| invalid("missing verification tile"))?;
+        let result = (|| {
+            check()?;
+            self.ingest_cpu_tile(tokens, check, &mut tile, None, Some(output.as_mut_slice()))?;
+            check()
+        })();
+        self.tiled_prefill = Some(tile);
+        if result.is_err() {
+            output.clear();
+        }
+        result
     }
 
     pub(super) fn ingest_prefill_block(
@@ -350,7 +450,7 @@ impl Qwen35 {
         let result = (|| {
             for tokens in tokens.chunks(tile.tokens) {
                 check()?;
-                self.ingest_cpu_tile(tokens, check, &mut tile, reborrow_executor(&mut executor))?;
+                self.ingest_cpu_tile(tokens, check, &mut tile, reborrow_executor(&mut executor), None)?;
                 tile.statistics.completed_tiles = tile.statistics.completed_tiles.saturating_add(1);
                 tile.statistics.completed_tokens = tile
                     .statistics
@@ -374,6 +474,7 @@ impl Qwen35 {
         check: &dyn Fn() -> Result<()>,
         tile: &mut TiledPrefill,
         mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        logits: Option<&mut [Vec<f32>]>,
     ) -> Result<()> {
         let count = tokens.len();
         let base = self.position;
@@ -400,7 +501,7 @@ impl Qwen35 {
         self.position = base + count;
         let mut frequencies_ready = false;
         let total_layers = self.layers.len();
-        let narrow_final = self.narrow_last_layer;
+        let narrow_final = logits.is_none() && self.narrow_last_layer;
         for (layer_idx, ((layer, state), delta)) in self
             .layers
             .iter()
@@ -650,6 +751,28 @@ impl Qwen35 {
                 }
             }
             check()?;
+        }
+        if let Some(logits) = logits {
+            let reuse = normalize_for_tile_into(
+                &self.transforms, &self.geometry, self.arithmetic, &self.output_norm,
+                &self.output, &tile.hidden[..count], &mut tile.normalized[..count],
+                &mut tile.transformed[..count], tile.projector.row_parallelism(),
+            )?;
+            check()?;
+            let _ = project_tile(
+                &self.transforms, &self.geometry, self.arithmetic, self.adapter.as_ref(),
+                self.adapter_scale, &mut self.workspace.adapter,
+                &mut self.workspace.projection.matvec, reuse, &self.output,
+                &tile.normalized[..count], logits, &mut tile.transformed[..count],
+                &mut tile.projector, reborrow_executor(&mut executor), check,
+            )?;
+            for row in logits {
+                if row.len() != self.vocabulary {
+                    return Err(invalid("invalid tiled verification vocabulary extent"));
+                }
+                finite(row, "tiled verification output logits")?;
+                check()?;
+            }
         }
         Ok(())
     }

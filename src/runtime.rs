@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::Instant;
 
 mod timing;
+mod verification;
 use timing::measure;
 pub use timing::{GenerationPhase, GenerationTimings, PhaseTiming};
 
@@ -1026,6 +1027,10 @@ impl<D: Decoder> Runtime<D> {
     /// # Errors
     /// Rejects faulted runtimes, empty committed state, invalid draft lengths or token IDs,
     /// context overflow, cancellation, or decoder checkpoint/restore failures.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep shared validation, optional batched work admission and the legacy sequential transaction together."
+    )]
     pub fn verify_draft_block(
         &mut self,
         draft: &[u32],
@@ -1064,10 +1069,22 @@ impl<D: Decoder> Runtime<D> {
                 "speculative draft block exceeds context token limit",
             ));
         }
-        self.decoder.admit_work(0, max_advance)?;
+        let batched = draft.len() > 1 && draft.len() <= self.decoder.batched_evaluation_capacity();
+        // A rejection pays for every proposed token plus replay of the accepted
+        // prefix and its correction. Device work is never refunded by restore.
+        let evaluations = if batched {
+            draft.len().checked_mul(2).and_then(|tokens| tokens.checked_add(1))
+                .ok_or_else(|| invalid("speculative verification work overflow"))?
+        } else {
+            max_advance
+        };
+        self.decoder.admit_work(0, evaluations)?;
         let check = || cancellation.check();
         let rollback = self.capture(0, &check)?;
         let result = (|| {
+            if batched {
+                return self.verify_batched_draft(draft, &rollback, &check);
+            }
             let mut stats = SpeculativeStats {
                 draft_rounds: 1,
                 draft_tokens_proposed: draft.len(),
@@ -1106,6 +1123,11 @@ impl<D: Decoder> Runtime<D> {
             Ok((committed, stats))
         })();
         if let Err(error) = result {
+            if self.faulted {
+                // A failed accepted-prefix restore already closed admission.
+                // Do not retry that restore or resume from provisional state.
+                return Err(error);
+            }
             self.faulted = true;
             let restored = self.decoder.restore(&rollback.state);
             self.tokens = rollback.tokens;

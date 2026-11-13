@@ -107,11 +107,22 @@ pub(super) fn accumulate(
     out: &mut [f32; HEAD_DIM],
 ) -> Result<()> {
     let mut next = *out;
-    for (index, value) in next.iter_mut().enumerate() {
+    accumulate_in_place(codes, bits, centroids, scale, &mut next)?;
+    *out = next;
+    Ok(())
+}
+
+/// Only scan-owned provisional sums use the nontransactional inner update.
+pub(super) fn accumulate_in_place(
+    codes: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    scale: f32,
+    out: &mut [f32; HEAD_DIM],
+) -> Result<()> {
+    for (index, value) in out.iter_mut().enumerate() {
         let increment = scale * centroids[read_code(codes, bits, index)];
         *value += increment;
     }
-    finite_values(&next)?;
-    *out = next;
-    Ok(())
+    finite_values(out)
 }

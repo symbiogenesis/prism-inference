@@ -9,6 +9,67 @@ fn input(width: usize, salt: u16) -> Result<Vec<f32>> {
         .collect()
 }
 
+fn defensive_value_result(
+    values: &KvCache,
+    current_value: &[f32],
+    projected: &[f32],
+    head: usize,
+    kv_head: usize,
+    probabilities: &[f32],
+) -> Result<[f32; HEAD_DIM]> {
+    let cache = values
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("missing values"))?;
+    let mut output = [0.0; HEAD_DIM];
+    for (&weight, row) in probabilities.iter().zip(cache.rows()) {
+        cache
+            .quantizer
+            .accumulate(cache.record(row, kv_head), weight, &mut output)?;
+    }
+    let mut current = vec![0; cache.quantizer.encoded_len()];
+    cache.quantizer.encode(
+        &current_value[kv_head * HEAD_DIM..(kv_head + 1) * HEAD_DIM],
+        &mut current,
+    )?;
+    cache.quantizer.accumulate(
+        &current,
+        *probabilities
+            .last()
+            .ok_or_else(|| invalid("missing current weight"))?,
+        &mut output,
+    )?;
+    cache.quantizer.inverse(&mut output)?;
+    super::super::mul_sigmoid_in_place(
+        &mut output,
+        super::super::attention_gate(projected, head, HEAD_DIM),
+    );
+    Ok(output)
+}
+
+fn defensive_probabilities(
+    keys: &PackedCache,
+    current: &[u8],
+    queries: &[f32],
+    head: usize,
+    arithmetic: super::super::Arithmetic,
+) -> Result<Vec<f32>> {
+    let mut query = [0.0; HEAD_DIM];
+    keys.quantizer
+        .rotate(&queries[head * HEAD_DIM..(head + 1) * HEAD_DIM], &mut query)?;
+    let mut expected = Vec::new();
+    for row in keys.rows().chain(std::iter::once(current)) {
+        expected.push(keys.quantizer.score(&query, keys.record(row, head / 6))? * (1.0 / 16.0));
+    }
+    match arithmetic {
+        super::super::Arithmetic::Source => crate::kernels::softmax_round_f16(&mut expected)?,
+        super::super::Arithmetic::PinnedSwift => {
+            crate::kernels::pinned_attention::softmax_rotated_kv(&mut expected)?;
+        }
+    }
+    Ok(expected)
+}
+
 #[test]
 fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()> {
     let heads = 12;
@@ -55,27 +116,8 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                     &RowParallelism::default(),
                 )?;
                 for (head, actual) in scores.as_chunks::<66>().0.iter().enumerate() {
-                    let mut query = [0.0; HEAD_DIM];
-                    key_cache
-                        .quantizer
-                        .rotate(&queries[head * HEAD_DIM..(head + 1) * HEAD_DIM], &mut query)?;
-                    let mut expected = Vec::new();
-                    for row in key_cache.rows().chain(std::iter::once(current.as_slice())) {
-                        expected.push(
-                            key_cache
-                                .quantizer
-                                .score(&query, key_cache.record(row, head / 6))?
-                                * (1.0 / 16.0),
-                        );
-                    }
-                    match arithmetic {
-                        super::super::Arithmetic::Source => {
-                            crate::kernels::softmax_round_f16(&mut expected)?;
-                        }
-                        super::super::Arithmetic::PinnedSwift => {
-                            crate::kernels::pinned_attention::softmax_rotated_kv(&mut expected)?;
-                        }
-                    }
+                    let expected =
+                        defensive_probabilities(key_cache, &current, &queries, head, arithmetic)?;
                     assert_eq!(
                         actual
                             .iter()
@@ -85,6 +127,21 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                             .iter()
                             .map(|value| value.to_bits())
                             .collect::<Vec<_>>()
+                    );
+                    let output = defensive_value_result(
+                        &values,
+                        &current_value,
+                        &projected,
+                        head,
+                        head / 6,
+                        &expected,
+                    )?;
+                    assert_eq!(
+                        attended[head * HEAD_DIM..(head + 1) * HEAD_DIM]
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        output.map(f32::to_bits),
                     );
                 }
                 assert_eq!(packed_bytes(&keys), before_keys);
@@ -104,6 +161,69 @@ fn packed_bytes(cache: &KvCache) -> Vec<u8> {
         .flatten()
         .copied()
         .collect()
+}
+
+#[test]
+fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for scalar_only in [false, true] {
+            let (keys, mut values) = populated_caches(policy, 1, 65, scalar_only)?;
+            let correct_values = values.copy()?;
+            let frozen_keys = packed_bytes(&keys);
+            let cache = values
+                .packed
+                .as_mut()
+                .ok_or_else(|| invalid("missing values"))?;
+            let scale: [u8; 4] = cache.tail[..4].try_into()?;
+            // The tail is the 65th cached row, after a complete sealed page.
+            // Reject its scale only after 64 successful value updates.
+            cache.tail[..4].copy_from_slice(&(-0.0_f32).to_le_bytes());
+            let malformed_values = packed_bytes(&values);
+            let queries = input(HEAD_DIM, 9)?;
+            let projected = input(2 * HEAD_DIM, 11)?;
+            let current_key = input(keys.width, 31)?;
+            let current_value = input(values.width, 41)?;
+            let run = |values: &KvCache, output: &mut [f32]| {
+                attend(
+                    &keys,
+                    values,
+                    &queries,
+                    &projected,
+                    &current_key,
+                    &current_value,
+                    output,
+                    &mut [0.0; 66],
+                    1,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &RowParallelism::default(),
+                )
+            };
+            let mut output = [13.0; HEAD_DIM];
+            let error = run(&values, &mut output)
+                .err()
+                .ok_or_else(|| invalid("late invalid value record must fail"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("scale must be finite and nonnegative")
+            );
+            assert_eq!(output.map(f32::to_bits), [13.0_f32.to_bits(); HEAD_DIM]);
+            assert_eq!(packed_bytes(&keys), frozen_keys);
+            assert_eq!(packed_bytes(&values), malformed_values);
+            values
+                .packed
+                .as_mut()
+                .ok_or_else(|| invalid("missing values"))?
+                .tail[..4]
+                .copy_from_slice(&scale);
+            let mut expected = [0.0; HEAD_DIM];
+            run(&correct_values, &mut expected)?;
+            run(&values, &mut output)?;
+            assert_eq!(output.map(f32::to_bits), expected.map(f32::to_bits));
+        }
+    }
+    Ok(())
 }
 
 #[test]

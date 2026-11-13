@@ -405,18 +405,15 @@ impl PackedAttention<'_> {
                 crate::kernels::pinned_attention::softmax_rotated_kv(probabilities)?;
             }
         }
-        let mut output = [0.0; HEAD_DIM];
+        let mut accumulator = self.values.quantizer.value_accumulator()?;
         for (&weight, row) in probabilities.iter().zip(
             self.values
                 .rows()
                 .chain(std::iter::once(self.current_values)),
         ) {
-            self.values.quantizer.accumulate(
-                self.values.record(row, kv_head),
-                weight,
-                &mut output,
-            )?;
+            accumulator.accumulate(self.values.record(row, kv_head), weight)?;
         }
+        let mut output = accumulator.finish()?;
         self.values.quantizer.inverse(&mut output)?;
         super::mul_sigmoid_in_place(
             &mut output,

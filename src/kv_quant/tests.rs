@@ -35,6 +35,56 @@ fn record(bits: Bits, scale: f32) -> Vec<u8> {
 }
 
 #[test]
+fn x1_value_scan_preserves_record_rounding_and_rejects_late_failure() -> Result<()> {
+    for bits in [Bits::Three, Bits::Four] {
+        for scalar_only in [false, true] {
+            let quantizer = if scalar_only {
+                Quantizer::scalar(bits, 91)
+            } else {
+                Quantizer::new(bits, 91)
+            };
+            let mut scan = quantizer.value_accumulator()?;
+            let mut expected = [0.0_f32; HEAD_DIM];
+            let mut defensive = expected;
+            for (scale, weight) in [(0.25, 0.125), (1.0, -0.5), (7.0, 0.375), (1.0, -0.0)] {
+                let packed = record(bits, scale);
+                scan.accumulate(&packed, weight)?;
+                quantizer.accumulate(&packed, weight, &mut defensive)?;
+                for (index, value) in expected.iter_mut().enumerate() {
+                    let code = index % usize::from(bits.levels());
+                    *value += (weight * scale) * quantizer.centroids()[code];
+                }
+            }
+            let zero = vec![0; quantizer.encoded_len()];
+            scan.accumulate(&zero, -0.0)?;
+            assert_eq!(scan.finish()?.map(f32::to_bits), expected.map(f32::to_bits));
+            assert_eq!(defensive.map(f32::to_bits), expected.map(f32::to_bits));
+            let mut malformed_zero = zero;
+            malformed_zero[4] = 1;
+            for invalid in [
+                Vec::new(),
+                malformed_zero,
+                record(bits, -0.0),
+                record(bits, f32::NAN),
+                record(bits, f32::INFINITY),
+                record(bits, f32::MAX),
+            ] {
+                let mut scan = quantizer.value_accumulator()?;
+                scan.accumulate(&record(bits, 1.0), 0.25)?;
+                assert!(scan.accumulate(&invalid, 2.0).is_err());
+                assert!(scan.accumulate(&record(bits, 1.0), 0.25).is_err());
+                assert!(scan.finish().is_err());
+            }
+            let mut scan = quantizer.value_accumulator()?;
+            scan.accumulate(&record(bits, 1.0), 0.25)?;
+            assert!(scan.accumulate(&record(bits, 1.0), f32::NAN).is_err());
+            assert!(scan.finish().is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn x1_prepared_kv_scores_preserve_order_records_and_failure_precedence() -> Result<()> {
     let query = input_row();
     for bits in [Bits::Three, Bits::Four] {

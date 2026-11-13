@@ -131,6 +131,91 @@ impl PreparedQuery<'_> {
     }
 }
 
+enum AccumulatorState {
+    Scalar([f32; HEAD_DIM]),
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    Native(bonsai_neon_dot::kv_quant::ValueAccumulator<'static>),
+}
+
+/// Owns a provisional finite sum, so prior successful rows need no input rescan.
+pub(crate) struct ValueAccumulator<'a> {
+    quantizer: &'a Quantizer,
+    state: AccumulatorState,
+    failed: bool,
+}
+
+impl ValueAccumulator<'_> {
+    /// Each row still checks its record, weight and resulting finite sum.
+    pub(crate) fn accumulate(&mut self, packed: &[u8], weight: f32) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self.append(packed, weight);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append(&mut self, packed: &[u8], weight: f32) -> Result<()> {
+        if !weight.is_finite() {
+            return Err(invalid("KV codec weight must be finite"));
+        }
+        let (scale, codes) = self.quantizer.record(packed)?;
+        let weighted_scale = weight * scale;
+        if !weighted_scale.is_finite() {
+            return Err(invalid("KV codec weighted scale overflow"));
+        }
+        if scale == 0.0 {
+            return Ok(());
+        }
+        match &mut self.state {
+            AccumulatorState::Scalar(output) => scalar::accumulate_in_place(
+                codes,
+                self.quantizer.identity.bits.bit_width(),
+                self.quantizer.centroids(),
+                weighted_scale,
+                output,
+            ),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            AccumulatorState::Native(output) => {
+                if output.accumulate(codes, weighted_scale) {
+                    Ok(())
+                } else {
+                    Err(invalid("KV codec native accumulation rejected arithmetic"))
+                }
+            }
+        }
+    }
+
+    /// Failure is sticky; no intermediate or invalid sum can be published.
+    pub(crate) fn finish(self) -> Result<[f32; HEAD_DIM]> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        match self.state {
+            AccumulatorState::Scalar(output) => Ok(output),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            AccumulatorState::Native(output) => output
+                .finish()
+                .ok_or_else(|| invalid("KV codec native accumulation rejected arithmetic")),
+        }
+    }
+}
+
 impl Quantizer {
     /// Construct a codec, using native helpers when compiled for Windows ARM64.
     #[must_use]
@@ -342,6 +427,57 @@ impl Quantizer {
             return Ok(());
         }
         self.add_codes(codes, weighted_scale, out)
+    }
+
+    /// Starts one exclusive packed-value scan without retaining a second row.
+    #[cfg_attr(
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "The native branch validates its helper codebook before starting the scan; portable construction is infallible."
+        )
+    )]
+    #[cfg_attr(
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "The shared native entry performs runtime ISA selection; portable construction keeps the same non-const API."
+        )
+    )]
+    pub(crate) fn value_accumulator(&self) -> Result<ValueAccumulator<'_>> {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        if !self.scalar_only {
+            let state = bonsai_neon_dot::kv_quant::ValueAccumulator::new(
+                self.identity.bits.bit_width(),
+                self.centroids(),
+            )
+            .ok_or_else(|| invalid("KV codec native accumulation rejected codebook"))?;
+            return Ok(ValueAccumulator {
+                quantizer: self,
+                state: AccumulatorState::Native(state),
+                failed: false,
+            });
+        }
+        Ok(ValueAccumulator {
+            quantizer: self,
+            state: AccumulatorState::Scalar([0.0; HEAD_DIM]),
+            failed: false,
+        })
     }
 
     /// Decode one row into the original basis, for diagnostics or explicit replay.

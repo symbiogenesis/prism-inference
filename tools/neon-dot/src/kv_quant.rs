@@ -76,6 +76,71 @@ pub fn dot(
     PreparedQuery::new(bits, centroids, query)?.dot(packed)
 }
 
+/// An exclusively owned running value sum for one packed-attention scan.
+///
+/// The codebook and native dispatch are checked once. Each row retains its
+/// extent, scale and finite-result checks, with separate binary32 multiply/add
+/// rounding. A failed append permanently prevents publication; no partially
+/// accumulated or nonfinite row can be retrieved through this safe API.
+pub struct ValueAccumulator<'a> {
+    bits: u8,
+    centroids: &'a [f32; 16],
+    output: [f32; DIMENSION],
+    failed: bool,
+    #[cfg(target_arch = "aarch64")]
+    neon: bool,
+}
+
+impl<'a> ValueAccumulator<'a> {
+    /// Starts a zero sum, rejecting unsupported precision or nonfinite centroids.
+    #[must_use]
+    pub fn new(bits: u8, centroids: &'a [f32; 16]) -> Option<Self> {
+        if !matches!(bits, 3 | 4) || !centroids.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        Some(Self {
+            bits,
+            centroids,
+            output: [0.0; DIMENSION],
+            failed: false,
+            #[cfg(target_arch = "aarch64")]
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+        })
+    }
+
+    /// Adds one code-only row without copying or rescanning the previous sum.
+    ///
+    /// Returns false on invalid input, overflow or any earlier failed append.
+    /// Failure makes [`Self::finish`] return `None`, including after later valid
+    /// appends. The private sum cannot escape while it is being accumulated.
+    #[must_use]
+    pub fn accumulate(&mut self, packed: &[u8], scale: f32) -> bool {
+        if self.failed
+            || packed.len() != DIMENSION * usize::from(self.bits) / 8
+            || !scale.is_finite()
+        {
+            self.failed = true;
+            return false;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            native::accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
+        } else {
+            portable_accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        portable_accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
+        self.failed = !self.output.iter().all(|value| value.is_finite());
+        !self.failed
+    }
+
+    /// Publishes the completed sum only if every append succeeded.
+    #[must_use]
+    pub const fn finish(self) -> Option<[f32; DIMENSION]> {
+        if self.failed { None } else { Some(self.output) }
+    }
+}
+
 /// Adds a scaled code-only rotated value row into the supplied accumulator.
 ///
 /// Every multiply and addition rounds separately to binary32. Invalid input or
@@ -388,6 +453,68 @@ mod tests {
         std::array::from_fn(|index: usize| {
             index.to_le_bytes()[0].wrapping_add(offset) & ((1 << bits) - 1)
         })
+    }
+
+    #[test]
+    fn x1_value_scan_matches_independent_rounding_and_poisoned_failure() -> Result<(), &'static str>
+    {
+        let centroids = codebook();
+        for bits in [3, 4] {
+            let mut sum = super::ValueAccumulator::new(bits, &centroids)
+                .ok_or("finite accumulator must be accepted")?;
+            let mut expected = [0.0_f32; DIMENSION];
+            for (offset, scale) in [0.125, -0.25, -0.0, f32::from_bits(1), 0.375]
+                .into_iter()
+                .enumerate()
+            {
+                let codes = codes(bits, offset.to_le_bytes()[0]);
+                assert!(sum.accumulate(&packed(&codes, bits), scale));
+                for (value, code) in expected.iter_mut().zip(codes) {
+                    *value += scale * centroids[usize::from(code)];
+                }
+            }
+            assert_eq!(
+                sum.finish().map(|values| values.map(f32::to_bits)),
+                Some(expected.map(f32::to_bits))
+            );
+            let bytes = packed(&codes(bits, 0), bits);
+            for invalid_scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut sum = super::ValueAccumulator::new(bits, &centroids)
+                    .ok_or("finite accumulator must be accepted")?;
+                assert!(sum.accumulate(&bytes, 0.25));
+                assert!(!sum.accumulate(&bytes, invalid_scale));
+                assert!(!sum.accumulate(&bytes, 0.25));
+                assert!(sum.finish().is_none());
+            }
+            let mut sum = super::ValueAccumulator::new(bits, &centroids)
+                .ok_or("finite accumulator must be accepted")?;
+            assert!(sum.accumulate(&bytes, 0.25));
+            assert!(!sum.accumulate(&bytes[..bytes.len() - 1], 0.25));
+            assert!(sum.finish().is_none());
+            let huge = [f32::MAX; 16];
+            let mut sum = super::ValueAccumulator::new(bits, &huge)
+                .ok_or("finite extreme codebook must be accepted")?;
+            assert!(sum.accumulate(&bytes, 0.25));
+            assert!(!sum.accumulate(&bytes, 2.0));
+            assert!(!sum.accumulate(&bytes, 0.0));
+            assert!(sum.finish().is_none());
+            let mut last_code = [0; DIMENSION];
+            last_code[DIMENSION - 1] = (1 << bits) - 1;
+            let mut last_huge = [1.0; 16];
+            last_huge[usize::from((1_u8 << bits) - 1)] = f32::MAX;
+            let bytes = packed(&last_code, bits);
+            let mut sum = super::ValueAccumulator::new(bits, &last_huge)
+                .ok_or("finite late-lane codebook must be accepted")?;
+            assert!(sum.accumulate(&bytes, 0.25));
+            // All earlier lanes update finitely before the final addition overflows.
+            assert!(!sum.accumulate(&bytes, 1.0));
+            assert!(sum.finish().is_none());
+        }
+        assert!(super::ValueAccumulator::new(2, &centroids).is_none());
+        let mut invalid = centroids;
+        invalid[15] = f32::NAN;
+        assert!(super::ValueAccumulator::new(4, &invalid).is_none());
+        Ok(())
     }
 
     #[test]

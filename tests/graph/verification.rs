@@ -181,7 +181,7 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
             .evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(()))
             .is_err()
     );
-    assert!(rows.is_empty());
+    assert_eq!(rows, Vec::<Vec<f32>>::new());
     assert!(plain.with_tiled_verification(usize::MAX).is_err());
     let graph = Qwen35::new(paged_hybrid_fixture(), 192)?;
     let tile_bytes = graph.tiled_prefill_scratch_bytes(8)?;
@@ -203,7 +203,7 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
             .evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(()))
             .is_err()
     );
-    assert!(rows.is_empty());
+    assert_eq!(rows, Vec::<Vec<f32>>::new());
     assert_eq!(graph_bits(&actual)?, initial);
     actual.set_projection_executor(None);
     for draft in [&[][..], &[0; 9][..], &[2][..]] {
@@ -213,7 +213,7 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
                 .evaluate_batch_into(draft, &mut rows, &|| Ok(()))
                 .is_err()
         );
-        assert!(rows.is_empty());
+        assert_eq!(rows, Vec::<Vec<f32>>::new());
         assert_eq!(graph_bits(&actual)?, initial);
     }
     let checkpoint = actual.checkpoint()?;
@@ -230,7 +230,7 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
             })
             .is_err()
     );
-    assert!(rows.is_empty());
+    assert_eq!(rows, Vec::<Vec<f32>>::new());
     actual.restore(&checkpoint)?;
     assert_eq!(graph_bits(&actual)?, initial);
     let mut fresh = Qwen35::new(paged_hybrid_fixture(), 192)?;

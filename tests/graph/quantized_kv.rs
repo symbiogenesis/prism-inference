@@ -12,6 +12,10 @@ const CONTEXT: usize = 70;
 const GDN_BYTES: usize = 40;
 const BUDGET: usize = 1_048_576;
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "The private fixture is shared with sibling graph-test modules."
+)]
 pub(super) fn profile_fixture() -> Model {
     let mut model = hybrid_fixture();
     for (key, value) in [
@@ -133,12 +137,10 @@ fn ordered_profile_fixture(pinned: bool, full_last: bool) -> Model {
             .tensors
             .into_iter()
             .map(|(name, mut tensor)| {
-                let name = if let Some(suffix) = name.strip_prefix("blk.0.") {
-                    format!("blk.1.{suffix}")
-                } else if let Some(suffix) = name.strip_prefix("blk.1.") {
-                    format!("blk.0.{suffix}")
-                } else {
-                    name
+                let name = match (name.strip_prefix("blk.0."), name.strip_prefix("blk.1.")) {
+                    (Some(suffix), _) => format!("blk.1.{suffix}"),
+                    (None, Some(suffix)) => format!("blk.0.{suffix}"),
+                    (None, None) => name,
                 };
                 tensor.name.clone_from(&name);
                 (name, tensor)
@@ -292,7 +294,7 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
                 })
                 .is_err()
         );
-        assert!(rows.is_empty());
+        assert_eq!(rows, Vec::<Vec<f32>>::new());
         actual.restore(&checkpoint)?;
         assert_eq!(graph_bits(&actual)?, before);
         assert_eq!(bits(actual.evaluate(1)?), bits(expected.evaluate(1)?));

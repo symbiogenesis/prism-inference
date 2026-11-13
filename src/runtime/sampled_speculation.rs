@@ -802,8 +802,8 @@ mod tests {
             );
             assert!(result.is_err());
             assert_eq!(sampler.draws, 0);
-            assert!(sampler.observed.is_empty());
-            assert!(speculative.tokens.is_empty());
+            assert_eq!(sampler.observed, Vec::<Vec<u32>>::new());
+            assert_eq!(speculative.tokens, Vec::<u32>::new());
             assert!(speculative.logits.is_empty());
             assert_eq!(speculative.is_faulted(), failure == 4);
             if failure == 4 {

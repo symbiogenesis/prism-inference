@@ -276,7 +276,7 @@ fn packed_attention_reuses_current_encoding_for_commit_without_extra_records() -
                 assert!(packed.prepared_ready);
                 let copied = cache.copy()?;
                 let snapshot = copied.packed.as_ref().ok_or_else(|| invalid("snapshot"))?;
-                assert!(snapshot.prepared.is_empty());
+                assert_eq!(snapshot.prepared, [] as [u8; 0]);
                 assert!(!snapshot.prepared_ready);
             }
             let key_pointer = keys

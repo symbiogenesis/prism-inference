@@ -4118,8 +4118,8 @@ impl Evaluation<'_, '_> {
                         };
                         let decay = (softplus * layer.decay[head]).exp();
                         let update = sigmoid(beta_ref[head]);
-                        let handled = if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                            crate::kernels::pinned_gdn::try_step_head_provisional(
+                        let handled = matches!(arithmetic, Arithmetic::PinnedSwift)
+                            && crate::kernels::pinned_gdn::try_step_head_provisional(
                                 prev_state,
                                 state,
                                 crate::kernels::pinned_gdn::ChunkInput {
@@ -4133,10 +4133,7 @@ impl Evaluation<'_, '_> {
                                 output,
                             )
                             .transpose()?
-                            .is_some()
-                        } else {
-                            false
-                        };
+                            .is_some();
                         if !handled {
                             let row_stride = g.ssm_head;
                             let row_count = v.len();

@@ -322,6 +322,128 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
     Ok(())
 }
 
+fn adapted_runtime_graph(policy: KvCachePolicy, tiled: bool) -> Result<Qwen35> {
+    let model = profile_fixture();
+    let factors = rank_one_factors(
+        &model,
+        &["blk.0.attn_output.weight", "blk.1.ssm_out.weight"],
+        0.125,
+    );
+    let adapter = RankOneAdapter::from_model(factors, &model)?;
+    let graph = Qwen35::with_rank_one_adapter_and_kv(
+        model,
+        CONTEXT,
+        BUDGET,
+        MatvecBackend::Auto,
+        adapter,
+        1.3,
+        policy,
+    )?;
+    if tiled {
+        tile_profile(graph, false)
+    } else {
+        Ok(graph)
+    }
+}
+
+#[test]
+fn rotated_kv_tiled_latest_prefix_restores_committed_history_on_cancel_and_edit() -> Result<()> {
+    let limits = Limits {
+        context_tokens: CONTEXT,
+        checkpoints: 0,
+        checkpoint_bytes: BUDGET,
+    };
+    let generation = Generation {
+        max_tokens: 1,
+        stop_tokens: Vec::new(),
+    };
+    let prefill = Prefill { block_tokens: 8 };
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for cancel in [false, true] {
+            let mut actual = Runtime::new(adapted_runtime_graph(policy, true)?, limits)?;
+            actual.generate_with_prefill(
+                &tokens(63),
+                &generation,
+                prefill,
+                &Cancellation::default(),
+                |_| Ok(()),
+            )?;
+            // The first response seals page 64. Its complete hybrid state must
+            // survive a different conversation's failed tiled computation.
+            let committed_tokens = actual.tokens().to_vec();
+            let committed_state = graph_bits(actual.decoder())?;
+            assert_eq!(committed_tokens.len(), 64);
+            let mut edited = tokens(67);
+            edited[31] ^= 1;
+            actual.prepare_profile_request(Some(1.3), PromptReuse::Latest)?;
+            let cancellation = Cancellation::default();
+            let mut delivered = 0;
+            let result = actual.generate_with_prefill(
+                &edited,
+                &Generation {
+                    max_tokens: 2,
+                    stop_tokens: Vec::new(),
+                },
+                prefill,
+                &cancellation,
+                |_| {
+                    delivered += 1;
+                    if cancel {
+                        cancellation.cancel();
+                        Ok(())
+                    } else {
+                        Err("injected edited-history stream failure".into())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(delivered, 1);
+            assert_eq!(actual.tokens(), committed_tokens);
+            assert_eq!(graph_bits(actual.decoder())?, committed_state);
+            assert!(!actual.is_faulted());
+            let mut continued = committed_tokens;
+            continued.extend_from_slice(&[0, 1, 0]);
+            // First reuse the restored page, then replace the edited history.
+            // A fresh untiled graph independently recomputes each full prompt.
+            for (prompt, reused) in [(&continued, 64), (&edited, 0)] {
+                actual.prepare_profile_request(Some(1.3), PromptReuse::Latest)?;
+                let mut expected = Runtime::new(adapted_runtime_graph(policy, false)?, limits)?;
+                let mut actual_output = Vec::new();
+                let completion = actual.generate_with_prefill(
+                    prompt,
+                    &generation,
+                    prefill,
+                    &Cancellation::default(),
+                    |token| {
+                        actual_output.push(token);
+                        Ok(())
+                    },
+                )?;
+                let mut expected_output = Vec::new();
+                expected.generate(prompt, &generation, &Cancellation::default(), |token| {
+                    expected_output.push(token);
+                    Ok(())
+                })?;
+                assert_eq!(completion.reused_tokens, reused);
+                assert_eq!(actual_output, expected_output);
+                assert_eq!(actual.tokens(), expected.tokens());
+                assert_eq!(
+                    graph_bits(actual.decoder())?,
+                    graph_bits(expected.decoder())?
+                );
+                let state = actual.decoder().state_memory()?;
+                assert_eq!(
+                    state.kv_payload_bytes,
+                    policy.layer_payload_bytes(256, 1, state.position)?
+                );
+            }
+            assert!(actual.decoder().tiled_prefill_statistics().completed_tiles > 0);
+            assert_eq!(actual.decoder().kv_cache_policy(), policy);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "parallel-rows")]
 #[test]
 fn parallel_rotated_kv_tiled_verification_retains_shared_head_workers() -> Result<()> {

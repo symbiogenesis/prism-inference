@@ -317,6 +317,22 @@ Foundation bundle remains outside Foundation's successful-ancestor baseline.
 
 ### Focused checks before local delivery
 
+Before committing a workflow or composite action, run the compiler-free preflight:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .github/ci/Test-Workflow.ps1 -CheckFixtures
+```
+
+It checks every workflow with checksum-pinned actionlint 1.7.12, including YAML,
+expressions, job dependencies and local action inputs. It separately rejects
+mutable external action references and missing local actions, including references
+inside composites. Five negative controls prove rejection of common startup
+mistakes. Optional script linters are disabled; no additional language runtime is
+installed. Downloads have finite retries and scratch storage is removed on exit.
+For an already trusted offline binary, pass `-ActionlintPath <absolute-path>`.
+Source checks runs the same preflight before selecting expensive jobs. This
+validation supplies no hosted job verdict or upstream action-provenance claim.
+
 A passing ARM64 build does not cover x64 fallback code, and `cargo test` does not
 run Clippy. For cfg-sensitive helper changes, select the package itself with
 `--all-targets`, using the pinned compiler and the workspace lint configuration.

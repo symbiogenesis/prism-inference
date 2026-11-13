@@ -33,6 +33,9 @@ jobs:
       - name: Verify source-check selection and fail-closed aggregation
         shell: bash
         run: python3 -B -m unittest discover -s .github/ci -p test_source_checks.py
+      - name: Validate workflow syntax and immutable action references
+        shell: pwsh
+        run: ./.github/ci/Test-Workflow.ps1 -CheckFixtures
       - name: Select checks within their supported event scope
         id: select
         shell: bash

@@ -3,7 +3,7 @@
 use super::*;
 use bonsai_prism_runtime::graph::KvCachePolicy;
 use bonsai_prism_runtime::sampling::{FiniteLogits, ReferenceSampler, Sampler, Sampling};
-use bonsai_prism_runtime::speculative::SuffixDraftConfig;
+use bonsai_prism_runtime::speculative::{SuffixDraftConfig, SuffixDrafter};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -123,14 +123,22 @@ fn sampled_suffix_stops_inside_a_quantized_tile_without_committing_the_suffix() 
         for stop in [0, 1, 3, 7] {
             let mut actual = Runtime::new(graph(policy, true)?, LIMITS)?;
             let mut expected = Runtime::new(graph(policy, false)?, LIMITS)?;
-            let prompt = [0; 63];
+            // The unique two-token anchor has eight historical continuation
+            // tokens. An all-zero history would prefer an overlapping match
+            // with only one continuation and would never enter a batch.
+            let mut prompt = vec![0; 51];
+            prompt.extend_from_slice(&[1, 1]);
+            prompt.extend_from_slice(&[0; 8]);
+            prompt.extend_from_slice(&[1, 1]);
+            let suffix = SuffixDraftConfig::new(2, 2, 8)?;
+            assert_eq!(SuffixDrafter::propose(&prompt, suffix, 9)?, [0; 8]);
             let options = Generation { max_tokens: 9, stop_tokens: vec![1] };
             let cancellation = Cancellation::default();
             let mut actual_sampler = StopAt { position: 0, stop };
             let mut expected_sampler = actual_sampler.clone();
-            let (completion, _) = actual.generate_sampled_speculative_until(
+            let (completion, stats) = actual.generate_sampled_speculative_until(
                 &prompt, &options, Prefill { block_tokens: 8 },
-                SuffixDraftConfig::new(1, 64, 8)?, &cancellation, deadline(),
+                suffix, &cancellation, deadline(),
                 &mut actual_sampler, |_| Ok(()),
             )?;
             let reference = expected.generate_sampled_until(
@@ -140,6 +148,8 @@ fn sampled_suffix_stops_inside_a_quantized_tile_without_committing_the_suffix() 
             assert_eq!(completion, reference);
             assert_eq!(completion.finish, bonsai_prism_runtime::runtime::Finish::Stop);
             assert_eq!(completion.generated_tokens, stop);
+            assert_eq!(stats.draft_tokens_proposed, 8);
+            assert!(stats.target_evaluations >= 8);
             assert_eq!(actual_sampler.position, expected_sampler.position);
             assert_eq!(actual.tokens(), expected.tokens());
             assert_eq!(graph_bits(actual.decoder())?, graph_bits(expected.decoder())?);

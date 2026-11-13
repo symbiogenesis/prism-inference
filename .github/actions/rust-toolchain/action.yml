@@ -65,26 +65,13 @@ runs:
       id: cache
       # Owner-managed runners retain their installation between jobs already.
       if: runner.environment == 'github-hosted'
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      continue-on-error: true
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         # Never retain rustup settings, Cargo home, credentials or proxy binaries.
         path: ${{ steps.paths.outputs.toolchain-path }}
-        key: rust-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.image-key }}-${{ inputs.toolchain }}-${{ steps.paths.outputs.component-key }}
-    - name: Install the pinned compiler on a cache miss
-      if: steps.cache.outputs.cache-hit != 'true'
-      shell: pwsh
-      working-directory: ${{ runner.temp }}
-      env:
-        PINNED_TOOLCHAIN: ${{ inputs.toolchain }}
-        REQUIRED_COMPONENTS: ${{ steps.paths.outputs.components }}
-      run: |
-        Set-StrictMode -Version Latest
-        $ErrorActionPreference = 'Stop'
-        $PSNativeCommandUseErrorActionPreference = $true
-        $arguments = @('toolchain', 'install', $env:PINNED_TOOLCHAIN, '--profile', 'minimal', '--no-self-update')
-        if ($env:REQUIRED_COMPONENTS) { $arguments += @('--component', $env:REQUIRED_COMPONENTS) }
-        rustup @arguments
-    - name: Verify the compiler and all required components
+        key: rust-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.image-key }}-${{ inputs.toolchain }}-${{ steps.paths.outputs.component-key }}
+    - name: Install and verify the compiler, repairing only invalid hosted cache hits
       id: verify
       shell: pwsh
       working-directory: ${{ runner.temp }}
@@ -93,19 +80,27 @@ runs:
         REQUIRED_COMPONENTS: ${{ steps.paths.outputs.components }}
         EXPECTED_HOST: ${{ steps.paths.outputs.host }}
         TOOLCHAIN_PATH: ${{ steps.paths.outputs.toolchain-path }}
+        CACHE_RESTORED: ${{ steps.cache.outcome == 'success' && steps.cache.outputs.cache-hit == 'true' }}
+        HOSTED_RUNNER: ${{ runner.environment == 'github-hosted' }}
       run: |
         Set-StrictMode -Version Latest
         $ErrorActionPreference = 'Stop'
         $PSNativeCommandUseErrorActionPreference = $true
-        # rustup run does not implicitly install a missing toolchain.
-        $identity = @(rustup run $env:PINNED_TOOLCHAIN rustc -vV)
-        if ($identity -cnotcontains "host: $env:EXPECTED_HOST") { throw 'Restored Rust compiler has an unexpected host.' }
-        $sysroot = (rustup run $env:PINNED_TOOLCHAIN rustc --print sysroot | Out-String).Trim()
-        if ([IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($sysroot)) -cne [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($env:TOOLCHAIN_PATH))) { throw 'Rust compiler resolved outside the exact toolchain directory.' }
-        $installed = @(rustup component list --toolchain $env:PINNED_TOOLCHAIN --installed --quiet)
-        foreach ($component in @($env:REQUIRED_COMPONENTS -split ',' | Where-Object { $_ })) {
-          if ($installed -cnotcontains $component -and $installed -cnotcontains "$component-$env:EXPECTED_HOST") { throw "Required Rust component is missing: $component" }
+        Import-Module (Join-Path $env:GITHUB_ACTION_PATH 'Toolchain.psm1') -Force
+        $options = @{
+          Toolchain = $env:PINNED_TOOLCHAIN
+          ExpectedHost = $env:EXPECTED_HOST
+          ToolchainPath = $env:TOOLCHAIN_PATH
+          Components = @($env:REQUIRED_COMPONENTS -split ',' | Where-Object { $_ })
+          CacheRestored = $env:CACHE_RESTORED -ceq 'true'
+          HostedRunner = $env:HOSTED_RUNNER -ceq 'true'
         }
-        $identity | Write-Output
-        $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($identity -join "`n")))).ToLowerInvariant()
+        $digest = Install-VerifiedRustToolchain @options
         "compiler-identity=$digest" >> $env:GITHUB_OUTPUT
+    - name: Save only the verified compiler without blocking source checks
+      if: runner.environment == 'github-hosted' && steps.cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.paths.outputs.toolchain-path }}
+        key: rust-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.image-key }}-${{ inputs.toolchain }}-${{ steps.paths.outputs.component-key }}

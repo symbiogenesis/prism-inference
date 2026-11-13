@@ -75,7 +75,7 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
 pub(super) fn identity() -> Value {
     json!({"Kind": "independent-rust-mathematical", "SupportedSourceIds": [MTP_ID],
         "UpstreamCommit": super::UPSTREAM,
-        "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183232, "Sha256": SOURCE_SHA256},
+        "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,

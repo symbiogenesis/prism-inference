@@ -8,9 +8,10 @@ GitHub bundles and crates.io packages are separate deliveries. The published
 registry runtime is [0.1.26](release-0.1.26.md), with exact NEON helper pin
 `bonsai-neon-dot =0.1.3`. The other four public helpers retain their published
 versions because their source has not changed. The current Windows ARM64 binary
-bundle is [0.1.25](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.25).
-The 0.1.26 registry source and selected binary source have distinct revisions;
-its Windows bundle remains pending. Earlier [0.1.25 registry](release-0.1.25.md) and
+bundle is [0.1.26](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.26).
+Its registry source `53f2fcbc89bbdd43ca4b83aea234096626f26040` and binary source
+`ac941f2668ae93dba9824002b4597081457aa09f` retain distinct identities and checks.
+Earlier [0.1.25 registry](release-0.1.25.md) and
 [0.1.23 binary](release-0.1.23.md) delivery records retain their original
 identities and qualification limits. Install the published registry source with
 the pinned nightly:
@@ -591,9 +592,9 @@ The aggregate Foundation check requires both Windows targets, the Linux native
 overlay, Rust regression, native codec and source-package matrix whenever their
 respective groups are selected.
 
-The source installation and library examples above select registry `0.1.26`;
-the corresponding Windows binary bundle remains pending. The current Windows
-ARM64 bundle remains `0.1.25`, with source and archive identities recorded in
+The source installation and library examples above select registry `0.1.26`.
+The current Windows ARM64 bundle is also `0.1.26`, with its separate source,
+archive and receipt identities recorded in
 the [0.1.26 delivery notes](release-0.1.26.md#separate-binary-source-and-pending-gates).
 Earlier published bundles keep their original identities. Packaging rejects a
 changed or untracked source checkout, a revision mismatch, inconsistent runtime/server
@@ -649,8 +650,9 @@ commands. This checks source delivery independently of building inside the origi
 The five current registry helpers are published as `bonsai-native-hash =0.1.3`,
 `bonsai-neon-dot =0.1.3`, `bonsai-ternary =0.1.3`, `bonsai-gguf =0.1.5` and
 `bonsai-prism =0.1.5`, alongside runtime `0.1.26`. The
-[0.1.26 registry record](release-0.1.26.md) binds the two new packages to their
-source, archive digests and separate pending binary delivery. The
+[0.1.26 delivery record](release-0.1.26.md) binds the two new packages to their
+registry source and digests, separately from the published binary source and
+bundle verification. The
 [0.1.25 delivery record](release-0.1.25.md) retains checks and limits for the
 unchanged helpers; the [0.1.24 delivery](release-0.1.24.md) remains historical.
 Registry publication and hosted checks alone do not qualify model serving.

@@ -121,6 +121,7 @@ fn packed_gqa_attention_matches_independently_decoded_dense_reference() -> Resul
             4,
             1.0 / 16.0,
             super::super::Arithmetic::Source,
+            &RowParallelism::default(),
         )?;
         let mut all_keys = Vec::new();
         let mut all_values = Vec::new();
@@ -214,5 +215,168 @@ fn payload_accounts_for_scales_and_extended_softmax_preserves_old_boundary() -> 
             .iter()
             .all(|value| value.is_finite() && *value > 0.0)
     );
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+fn populated_caches(
+    policy: KvCachePolicy,
+    kv_heads: usize,
+    history: usize,
+    scalar: bool,
+) -> Result<(KvCache, KvCache)> {
+    let mut keys = KvCache::with_policy(kv_heads * HEAD_DIM, 67, policy, true, scalar)?;
+    let mut values = KvCache::with_policy(kv_heads * HEAD_DIM, 67, policy, false, scalar)?;
+    for position in 0..history {
+        let salt = u16::try_from(position)?;
+        let key = input(kv_heads * HEAD_DIM, salt)?;
+        let value = input(kv_heads * HEAD_DIM, salt + 17)?;
+        keys.prepare_append(&key)?;
+        values.prepare_append(&value)?;
+        keys.append(&key);
+        values.append(&value);
+    }
+    Ok((keys, values))
+}
+
+#[cfg(feature = "parallel-rows")]
+fn attention_bits(
+    keys: &KvCache,
+    values: &KvCache,
+    heads: usize,
+    arithmetic: super::super::Arithmetic,
+    parallelism: &RowParallelism,
+) -> Result<Vec<u32>> {
+    let queries = input(heads * HEAD_DIM, 9)?;
+    let projected = input(2 * heads * HEAD_DIM, 11)?;
+    let current_key = input(keys.width, 31)?;
+    let current_value = input(values.width, 41)?;
+    let mut attended = vec![0.0; queries.len()];
+    let mut scores = vec![0.0; heads * (keys.len / keys.width + 1)];
+    attend(
+        keys,
+        values,
+        &queries,
+        &projected,
+        &current_key,
+        &current_value,
+        &mut attended,
+        &mut scores,
+        heads,
+        1.0 / 16.0,
+        arithmetic,
+        parallelism,
+    )?;
+    Ok(attended
+        .iter()
+        .chain(&scores)
+        .map(|value| value.to_bits())
+        .collect())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn parallel_packed_attention_preserves_serial_bits_across_pages_and_head_tails() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for scalar in [true, false] {
+            for (kv_heads, heads, history) in [(2, 4, 0), (2, 12, 65), (3, 9, 2)] {
+                let (keys, values) = populated_caches(policy, kv_heads, history, scalar)?;
+                for arithmetic in [super::super::Arithmetic::Source, super::super::Arithmetic::PinnedSwift]
+                {
+                    let expected = attention_bits(
+                        &keys,
+                        &values,
+                        heads,
+                        arithmetic,
+                        &RowParallelism::default(),
+                    )?;
+                    for workers in [2, 4, 18] {
+                        assert_eq!(
+                            attention_bits(
+                                &keys,
+                                &values,
+                                heads,
+                                arithmetic,
+                                &RowParallelism::new(workers)?,
+                            )?,
+                            expected,
+                            "policy {policy:?}, scalar {scalar}, heads {heads}, history {history}, workers {workers}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> Result<()> {
+    let heads = 12;
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        let (keys, values) = populated_caches(policy, 2, 65, false)?;
+        let frozen_keys = packed_bytes(&keys);
+        let frozen_values = packed_bytes(&values);
+        let current_key = input(keys.width, 31)?;
+        let current_value = input(values.width, 41)?;
+        let mut queries = input(heads * HEAD_DIM, 9)?;
+        let mut projected = input(2 * heads * HEAD_DIM, 11)?;
+        projected[(2 * (heads - 1) + 1) * HEAD_DIM + 7] = f32::NAN;
+        for invalid_query in [false, true] {
+            if invalid_query {
+                // This earlier failure wins even when the final head's late
+                // output failure is returned by a different worker first.
+                queries[2 * HEAD_DIM + 3] = f32::NAN;
+            }
+            let mut expected_error = None;
+            for workers in [1, 4, 18] {
+                let mut attended = vec![13.0; queries.len()];
+                let mut scores = vec![17.0; heads * 66];
+                let error = attend(
+                    &keys,
+                    &values,
+                    &queries,
+                    &projected,
+                    &current_key,
+                    &current_value,
+                    &mut attended,
+                    &mut scores,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &RowParallelism::new(workers)?,
+                )
+                .err()
+                .ok_or_else(|| invalid("the invalid query or final gate must fail"))?
+                .to_string();
+                if let Some(expected) = &expected_error {
+                    assert_eq!(&error, expected);
+                } else {
+                    expected_error = Some(error);
+                }
+                assert_eq!(packed_bytes(&keys), frozen_keys);
+                assert_eq!(packed_bytes(&values), frozen_values);
+                // Reusing the same committed caches after failure cannot race
+                // an unjoined worker or inherit provisional attention output.
+                assert_eq!(
+                    attention_bits(
+                        &keys,
+                        &values,
+                        heads,
+                        super::super::Arithmetic::PinnedSwift,
+                        &RowParallelism::new(workers)?,
+                    )?,
+                    attention_bits(
+                        &keys,
+                        &values,
+                        heads,
+                        super::super::Arithmetic::PinnedSwift,
+                        &RowParallelism::default(),
+                    )?
+                );
+            }
+        }
+    }
     Ok(())
 }

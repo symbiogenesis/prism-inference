@@ -4,6 +4,7 @@
 //! change; recurrent/convolution state and checkpoint ownership stay exact.
 
 use super::{KvCache, checked_product, checked_sum};
+use crate::kernels::RowParallelism;
 use crate::kv_quant::{Bits, HEAD_DIM, Quantizer};
 use crate::{Result, invalid};
 use std::sync::Arc;
@@ -267,8 +268,13 @@ impl KvCache {
 }
 
 /// Stream packed history directly: query rotation once, cache-sized scores only,
-/// and one bounded rotated value accumulator per query head. Never expands a
-/// context-sized FP16/F32 key or value buffer.
+/// and one bounded rotated value accumulator per active worker. Independent
+/// query heads use the existing private row pool, with each head retaining its
+/// original score, softmax, value and inverse-transform order. Dispatch joins
+/// every worker before returning the earliest head-chunk failure; only the
+/// caller's provisional scratch can change. Cancellation retains the ordinary
+/// graph's synchronous-token boundary. Never expands a context-sized FP16/F32
+/// key or value buffer or creates a second worker pool.
 #[expect(
     clippy::too_many_arguments,
     reason = "Borrow immutable history and provisional current projections separately."
@@ -285,6 +291,7 @@ pub(super) fn attend(
     heads: usize,
     scale: f32,
     arithmetic: super::Arithmetic,
+    parallelism: &RowParallelism,
 ) -> Result<()> {
     let key_cache = keys
         .packed
@@ -329,24 +336,67 @@ pub(super) fn attend(
         key_cache.quantizer.encode(key, output)?;
         value_cache.quantizer.encode(value, value_output)?;
     }
-    for head in 0..heads {
-        let kv_head = head / (heads / key_cache.heads);
+    let input = PackedAttention {
+        keys: key_cache,
+        values: value_cache,
+        queries,
+        projected,
+        current_keys: &key_records,
+        current_values: &value_records,
+        heads_per_kv: heads / key_cache.heads,
+        scale,
+        arithmetic,
+    };
+    parallelism.update_paired_chunks(
+        attended,
+        HEAD_DIM,
+        scores,
+        stride,
+        |base_head, attended_chunk, score_chunk| {
+            for (offset, (result, probabilities)) in attended_chunk
+                .chunks_exact_mut(HEAD_DIM)
+                .zip(score_chunk.chunks_exact_mut(stride))
+                .enumerate()
+            {
+                input.attend_head(base_head + offset, result, probabilities)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+struct PackedAttention<'a> {
+    keys: &'a PackedCache,
+    values: &'a PackedCache,
+    queries: &'a [f32],
+    projected: &'a [f32],
+    current_keys: &'a [u8],
+    current_values: &'a [u8],
+    heads_per_kv: usize,
+    scale: f32,
+    arithmetic: super::Arithmetic,
+}
+
+impl PackedAttention<'_> {
+    fn attend_head(&self, head: usize, result: &mut [f32], probabilities: &mut [f32]) -> Result<()> {
+        let kv_head = head / self.heads_per_kv;
         let mut query = [0.0; HEAD_DIM];
-        key_cache
-            .quantizer
-            .rotate(&queries[head * HEAD_DIM..(head + 1) * HEAD_DIM], &mut query)?;
-        let probabilities = &mut scores[head * stride..(head + 1) * stride];
+        self.keys.quantizer.rotate(
+            &self.queries[head * HEAD_DIM..(head + 1) * HEAD_DIM],
+            &mut query,
+        )?;
         for (score, row) in probabilities.iter_mut().zip(
-            key_cache
+            self.keys
                 .rows()
-                .chain(std::iter::once(key_records.as_slice())),
+                .chain(std::iter::once(self.current_keys)),
         ) {
-            *score = key_cache
+            *score = self
+                .keys
                 .quantizer
-                .score(&query, key_cache.record(row, kv_head))?
-                * scale;
+                .score(&query, self.keys.record(row, kv_head))?
+                * self.scale;
         }
-        match arithmetic {
+        match self.arithmetic {
             super::Arithmetic::Source => crate::kernels::softmax_round_f16(probabilities)?,
             super::Arithmetic::PinnedSwift => {
                 crate::kernels::pinned_attention::softmax_rotated_kv(probabilities)?;
@@ -354,25 +404,25 @@ pub(super) fn attend(
         }
         let mut output = [0.0; HEAD_DIM];
         for (&weight, row) in probabilities.iter().zip(
-            value_cache
+            self.values
                 .rows()
-                .chain(std::iter::once(value_records.as_slice())),
+                .chain(std::iter::once(self.current_values)),
         ) {
-            value_cache.quantizer.accumulate(
-                value_cache.record(row, kv_head),
+            self.values.quantizer.accumulate(
+                self.values.record(row, kv_head),
                 weight,
                 &mut output,
             )?;
         }
-        value_cache.quantizer.inverse(&mut output)?;
+        self.values.quantizer.inverse(&mut output)?;
         super::mul_sigmoid_in_place(
             &mut output,
-            super::attention_gate(projected, head, HEAD_DIM),
+            super::attention_gate(self.projected, head, HEAD_DIM),
         );
         super::finite(&output, "packed attention output")?;
-        attended[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&output);
+        result.copy_from_slice(&output);
+        Ok(())
     }
-    Ok(())
 }
 
 fn resize_bytes(count: usize, output: &mut Vec<u8>) -> Result<()> {

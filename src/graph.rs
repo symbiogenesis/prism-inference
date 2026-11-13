@@ -3538,6 +3538,7 @@ impl Evaluation<'_, '_> {
                 g.heads,
                 scale,
                 arithmetic,
+                self.projection.matvec.row_parallelism(),
             );
         }
         // Preserve whole six-head KV groups when partitioning Swift decode.

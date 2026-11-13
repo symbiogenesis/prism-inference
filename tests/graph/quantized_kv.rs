@@ -57,6 +57,48 @@ fn graph(policy: KvCachePolicy, backend: MatvecBackend) -> Result<Qwen35> {
     Qwen35::with_state_budget_and_kv(profile_fixture(), CONTEXT, BUDGET, backend, policy)
 }
 
+#[cfg(feature = "parallel-rows")]
+fn parallel_profile_graph(policy: KvCachePolicy, workers: usize) -> Result<Qwen35> {
+    const HEADS: usize = 12;
+    const KV_HEADS: usize = 2;
+    const HEAD: usize = 256;
+    let mut model = profile_fixture();
+    model.metadata.insert(
+        "qwen35.attention.head_count".to_owned(),
+        MetadataValue::from(12_u64),
+    );
+    model.metadata.insert(
+        "qwen35.attention.head_count_kv".to_owned(),
+        MetadataValue::from(2_u64),
+    );
+    for (name, rows, salt) in [
+        ("blk.0.attn_q.weight", HEADS * HEAD * 2, 3_u8),
+        ("blk.0.attn_k.weight", KV_HEADS * HEAD, 5_u8),
+        ("blk.0.attn_v.weight", KV_HEADS * HEAD, 11_u8),
+    ] {
+        let values: Vec<f32> = (0..rows * 2)
+            .map(|index| {
+                let code = index.to_le_bytes()[0].wrapping_mul(salt) % 17;
+                (f32::from(code) - 8.0) * 0.03125
+            })
+            .collect();
+        model
+            .tensors
+            .insert(name.to_owned(), weight(name, &[2, rows], &values));
+    }
+    let name = "blk.0.attn_output.weight";
+    let values: Vec<f32> = (0..HEADS * HEAD * 2)
+        .map(|index| (f32::from(index.to_le_bytes()[0] % 7) - 2.0) * 0.003_906_25)
+        .collect();
+    model
+        .tensors
+        .insert(name.to_owned(), weight(name, &[HEADS * HEAD, 2], &values));
+    let mut graph =
+        Qwen35::with_state_budget_and_kv(model, CONTEXT, BUDGET, MatvecBackend::Auto, policy)?;
+    graph.set_row_parallelism(bonsai_prism_runtime::kernels::RowParallelism::new(workers)?);
+    Ok(graph)
+}
+
 fn tokens(count: usize) -> Vec<u32> {
     [0, 1, 1, 0, 1].into_iter().cycle().take(count).collect()
 }
@@ -414,6 +456,91 @@ fn rotated_kv_runtime_delivery_and_cancellation_roll_back_across_page_seal() -> 
             graph_bits(runtime.decoder())?,
             graph_bits(&graph(policy, MatvecBackend::Scalar)?)?
         );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn parallel_rotated_kv_preserves_complete_state_logits_and_page_restore() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        let mut serial = parallel_profile_graph(policy, 1)?;
+        let mut parallel = parallel_profile_graph(policy, 4)?;
+        assert_eq!(serial.identity(), parallel.identity());
+        let mut checkpoints = None;
+        for (index, token) in tokens(65).into_iter().enumerate() {
+            assert_eq!(bits(parallel.evaluate(token)?), bits(serial.evaluate(token)?));
+            assert_eq!(graph_bits(&parallel)?, graph_bits(&serial)?);
+            if index == 62 {
+                checkpoints = Some((serial.checkpoint()?, parallel.checkpoint()?));
+            }
+        }
+        let (serial_checkpoint, parallel_checkpoint) = checkpoints
+            .ok_or_else(|| std::io::Error::other("missing partial-page checkpoint"))?;
+        serial.restore(&serial_checkpoint)?;
+        parallel.restore(&parallel_checkpoint)?;
+        assert_eq!(graph_bits(&parallel)?, graph_bits(&serial)?);
+        for token in [1, 0, 1] {
+            assert_eq!(bits(parallel.evaluate(token)?), bits(serial.evaluate(token)?));
+            assert_eq!(graph_bits(&parallel)?, graph_bits(&serial)?);
+        }
+        assert_eq!(parallel.row_workers(), 4);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn parallel_rotated_kv_delivery_and_cancellation_restore_complete_page_boundary() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        let limits = Limits {
+            context_tokens: CONTEXT,
+            checkpoints: 0,
+            checkpoint_bytes: BUDGET,
+        };
+        let mut runtime = Runtime::new(parallel_profile_graph(policy, 4)?, limits)?;
+        let mut serial = Runtime::new(parallel_profile_graph(policy, 1)?, limits)?;
+        let prefix = tokens(63);
+        let stop = Generation {
+            max_tokens: 1,
+            stop_tokens: vec![0, 1],
+        };
+        runtime.generate(&prefix, &stop, &Cancellation::default(), |_| Ok(()))?;
+        serial.generate(&prefix, &stop, &Cancellation::default(), |_| Ok(()))?;
+        let before = graph_bits(runtime.decoder())?;
+        let committed = runtime.tokens().to_vec();
+        assert_eq!(before, graph_bits(serial.decoder())?);
+        let changed = tokens(65);
+        let options = Generation {
+            max_tokens: 2,
+            stop_tokens: vec![],
+        };
+        for cancel in [false, true] {
+            let cancellation = Cancellation::default();
+            let emitted = Cell::new(0);
+            assert!(
+                runtime
+                    .generate(&changed, &options, &cancellation, |_| {
+                        emitted.set(emitted.get() + 1);
+                        if cancel {
+                            cancellation.cancel();
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::other("synthetic parallel consumer failure").into())
+                        }
+                    })
+                    .is_err()
+            );
+            assert_eq!(emitted.get(), 1);
+            assert_eq!(runtime.tokens(), committed);
+            assert_eq!(graph_bits(runtime.decoder())?, before);
+            assert!(!runtime.is_faulted());
+        }
+        runtime.generate(&changed, &stop, &Cancellation::default(), |_| Ok(()))?;
+        serial.generate(&changed, &stop, &Cancellation::default(), |_| Ok(()))?;
+        assert_eq!(runtime.tokens(), serial.tokens());
+        assert_eq!(graph_bits(runtime.decoder())?, graph_bits(serial.decoder())?);
+        assert_eq!(runtime.decoder().row_workers(), 4);
     }
     Ok(())
 }

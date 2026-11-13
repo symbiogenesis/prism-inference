@@ -1,6 +1,6 @@
 {
   "shared": [
-    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", ".cargo/**",
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml", ".cargo/**",
     ".github/ci/**", ".github/actions/rust-toolchain/**",
     ".github/workflows/foundation.yml", ".github/workflows/runtime-conformance.yml",
     ".github/workflows/source-checks.yml",
@@ -47,6 +47,7 @@
       "tools/gguf/**", "tools/native-hash/**", "tools/neon-dot/**", "tools/prism/**", "tools/ternary/**",
       ".github/actions/rust-toolchain/**", ".github/ci/source_package.py"
     ]},
+    "hexagon": {"packages": ["bonsai-hexagon-native"]},
     "probes": {"paths": ["tools/rust-trial/fixtures/**", "config/rust-nightly-trial.json", "tests/Test-RustNightly.ps1"]},
     "standards": {
       "paths": ["tests/Test-Standards.ps1", "PSScriptAnalyzerSettings.psd1", "tools/validation/**", ".editorconfig", "global.json"],
@@ -56,7 +57,7 @@
   "workflows": {
     "foundation": {
       "windows": "windows", "native-overlay": "overlay", "rust-regression": "conformance",
-      "codec-native": "codec", "source-package": "package"
+      "codec-native": "codec", "source-package": "package", "cross-native-arm64": "hexagon"
     },
     "runtime-conformance": {
       "prism-upstream": "conformance", "prism-upstream-grammar": "conformance",

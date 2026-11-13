@@ -34,7 +34,7 @@ class FoundationWorkflowTests(unittest.TestCase):
         self.assertIn("fail-fast: false", windows)
         self.assertIn("--index $index --count 4", windows)
         self.assertIn("needs.changes.outputs.windows == 'true'", windows)
-        self.assertIn("needs: [changes, windows, native-overlay, rust-regression, codec-native, source-package]",
+        self.assertIn("needs: [changes, windows, native-overlay, rust-regression, codec-native, source-package, cross-native-arm64]",
                       self.job("foundation"))
 
     def test_release_version_build_package_and_upload_share_one_owner(self):

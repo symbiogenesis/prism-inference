@@ -1,6 +1,7 @@
-"""Protect native cfg lint coverage when compiler and check inputs change."""
+"""Protect distinct native cfg coverage after consolidation into Foundation."""
 
 from pathlib import Path
+import json
 import re
 import shlex
 import sys
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class HexagonWorkflowTests(unittest.TestCase):
     def setUp(self):
-        self.workflow = (ROOT / ".github/workflows/hexagon-native.yml").read_text(encoding="utf-8")
+        self.workflow = (ROOT / ".github/workflows/foundation.yml").read_text(encoding="utf-8")
 
     def job(self, name):
         jobs = self.workflow.split("\njobs:\n", 1)[1]
@@ -43,12 +44,6 @@ class HexagonWorkflowTests(unittest.TestCase):
         ), "Keep strict release Clippy over native library and test targets")
 
     def test_compiler_configuration_and_action_changes_select_native_checks(self):
-        push = re.search(r"(?ms)^  push:\n(.*?)(?=^  [\w-]+:|\Z)", self.workflow)
-        self.assertIsNotNone(push)
-        paths = re.search(r"(?m)^    paths:\n((?:      - .*\n)+)", push[1])
-        self.assertIsNotNone(paths)
-        patterns = [line.removeprefix("      - ").strip("'\"")
-                    for line in paths[1].splitlines()]
         for path in (
             "rust-toolchain.toml", "clippy.toml", "rustfmt.toml",
             ".cargo/config.toml", ".cargo/nested/check.toml",
@@ -56,11 +51,15 @@ class HexagonWorkflowTests(unittest.TestCase):
             ".github/actions/rust-toolchain/scripts/install.ps1",
             "tools/hexagon-native/src/native_q2_forwarding_tests.rs",
             "tools/hexagon-runtime/src/lib.rs", "Cargo.toml", "Cargo.lock",
-            ".github/workflows/hexagon-native.yml",
+            ".github/workflows/foundation.yml",
         ):
             with self.subTest(path=path):
-                self.assertTrue(impact.any_match(path, patterns),
-                                f"{path} must select independent native cfg checks")
+                plan = impact.select(ROOT, [path])
+                self.assertTrue(plan["groups"]["windows"])
+                # Only the isolated native crate needs the Linux-hosted cross
+                # lint. Its runtime consumer does not change native FFI cfgs.
+                if path != "tools/hexagon-runtime/src/lib.rs":
+                    self.assertTrue(plan["groups"]["hexagon"])
 
     def test_linux_cross_check_reaches_windows_arm64_tests_with_strict_clippy(self):
         cross = self.job("cross-native-arm64")
@@ -73,28 +72,28 @@ class HexagonWorkflowTests(unittest.TestCase):
         self.assert_native_lint(cross)
 
     def test_cross_check_keeps_independent_native_arm64_and_x64_contract_jobs(self):
-        native = self.job("native-contracts")
+        native = self.job("windows")
         self.assertRegex(native, r"(?m)^    runs-on: \$\{\{ matrix\.runner \}\}$")
         self.assertRegex(native, r"(?m)^      CARGO_BUILD_TARGET: \$\{\{ matrix\.target \}\}$")
         for runner, target in (("windows-11-arm", "aarch64-pc-windows-msvc"),
                                ("windows-2025", "x86_64-pc-windows-msvc")):
             with self.subTest(target=target):
                 self.assertRegex(native, rf"- runner: {runner}\n\s+target: {target}\n")
+        self.assertIn(".github/ci/foundation_shards.py", native)
         commands = self.cargo_commands(native)
-        self.assertTrue(any({"test", "--all-targets", "bonsai-hexagon-native"}.issubset(command)
-                            for command in commands))
-        self.assertTrue(any({"test", "--doc", "bonsai-hexagon-native"}.issubset(command)
-                            for command in commands))
-        self.assertTrue(any({"doc", "--no-deps", "bonsai-hexagon-native"}.issubset(command)
-                            for command in commands))
-        self.assert_native_lint(native)
+        for required in ({"clippy", "@selection", "--all-targets", "--release", "-D", "warnings"},
+                         {"doc", "@selection", "--no-deps", "--release"}):
+            self.assertTrue(any(required.issubset(command) for command in commands))
+        for package in ("bonsai-hexagon-native", "bonsai-hexagon-runtime"):
+            plan = impact.select(ROOT, ["tools/" + package.removeprefix("bonsai-") + "/src/lib.rs"])
+            self.assertIn(package, plan["packages"])
+            self.assertTrue(plan["groups"]["windows"])
 
     def test_cache_keys_isolate_compiler_image_target_and_lane(self):
         self.assertRegex(self.workflow, r"(?m)^  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'$")
         self.assertRegex(self.workflow, r"(?m)^  CARGO_BUILD_FINGERPRINT: content$")
         for name, lane, target in (
             ("cross-native-arm64", "cross", "aarch64-pc-windows-msvc"),
-            ("native-contracts", "native", "${{ matrix.target }}"),
         ):
             with self.subTest(job=name):
                 job = self.job(name)
@@ -110,37 +109,33 @@ class HexagonWorkflowTests(unittest.TestCase):
                     self.assertIn("'" + source + "'", job)
 
     def test_cached_builds_never_skip_commands_or_restore_results(self):
-        for name, directory in (("cross-native-arm64", "Prism-Hexagon-Cross-Target"),
-                                ("native-contracts", "Prism-Hexagon-Native-Target")):
+        for name, directory in (("cross-native-arm64", "Prism-Hexagon-Cross-Target"),):
             with self.subTest(job=name):
                 job = self.job(name)
                 # A cache hit reuses compiler inputs, never a prior check verdict.
                 self.assertNotIn("cache-hit", job)
-                self.assertNotRegex(job, r"(?m)^\s+if:")
+                self.assertEqual(len(re.findall(r"(?m)^\s+if:", job)), 1)
+                self.assertIn("needs.changes.outputs.hexagon == 'true'", job)
                 paths = re.findall(r"(?m)^          path: (.+)$", job)
                 self.assertEqual(paths, ["|", "${{ runner.temp }}/" + directory])
                 self.assertNotIn("continue-on-error", job)
                 commands = self.cargo_commands(job)
-                expected = 2 if name == "cross-native-arm64" else 10
-                self.assertEqual(len(commands), expected)
+                self.assertEqual(len(commands), 2)
                 for command in commands:
                     if "fmt" not in command:
                         self.assertTrue({"--locked", "--release", "--target-dir"}.issubset(command))
 
-    def test_runtime_contracts_keep_all_checks_and_share_only_build_directory(self):
-        job = self.job("native-contracts")
-        directories = re.findall(r"\$target = Join-Path \$env:RUNNER_TEMP '([^']+)'", job)
-        self.assertEqual(directories, ["Prism-Hexagon-Native-Target"] * 2)
+    def test_scalar_runtime_control_and_required_cross_job_replace_duplicate_workflow(self):
+        job = self.job("windows")
         commands = self.cargo_commands(job)
-        for required in (
-            {"fmt", "prism-inference", "bonsai-hexagon-runtime"},
-            {"test", "bonsai-hexagon-runtime", "--all-targets"},
-            {"test", "prism-inference", "--test", "graph", "projection_scope"},
-            {"clippy", "bonsai-hexagon-runtime", "--all-targets", "-D", "warnings"},
-            {"doc", "bonsai-hexagon-runtime", "--no-deps"},
-        ):
-            with self.subTest(required=required):
-                self.assertTrue(any(required.issubset(command) for command in commands))
+        self.assertTrue(any({"test", "bonsai-hexagon-runtime", "--all-targets", "--locked",
+                             "--offline", "--release"}.issubset(command) for command in commands))
+        # Foundation now owns all Windows package tests and graph projections;
+        # there is no second workflow competing for the same hosted runners.
+        self.assertFalse((ROOT / ".github/workflows/hexagon-native.yml").exists())
+        self.assertIn("cross-native-arm64", self.job("foundation"))
+        config = json.loads((ROOT / ".github/ci/impact.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["workflows"]["foundation"]["cross-native-arm64"], "hexagon")
 
 
 if __name__ == "__main__":

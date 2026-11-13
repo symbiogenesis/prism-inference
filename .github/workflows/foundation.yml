@@ -33,6 +33,7 @@ jobs:
       conformance: ${{ steps.impact.outputs.conformance }}
       codec: ${{ steps.impact.outputs.codec }}
       package: ${{ steps.impact.outputs.package }}
+      hexagon: ${{ steps.impact.outputs.hexagon }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -212,6 +213,11 @@ jobs:
           $packages = @($env:PRISM_PACKAGES | ConvertFrom-Json)
           Start-Transcript -LiteralPath (Join-Path $env:PRISM_CHECK_EVIDENCE 'feature-variants.log') | Out-Null
           try {
+            if ('bonsai-hexagon-runtime' -cin $packages) {
+              # Keep the standalone scalar-dependency control: the full workspace
+              # correctness shards otherwise unify the root's default NEON feature.
+              cargo +nightly-2026-11-09 test --manifest-path $manifest -p bonsai-hexagon-runtime --locked --offline --release --all-targets
+            }
             if ('prism-inference' -cin $packages) {
               python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --lib
               python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
@@ -609,9 +615,57 @@ jobs:
             ${{ env.PRISM_PACKAGE_EVIDENCE }}/consumer/Cargo.lock
           if-no-files-found: error
 
+  cross-native-arm64:
+    name: Native ARM64 cross-target lint / Linux host
+    needs: changes
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.hexagon == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        id: rust
+        with:
+          toolchain: nightly-2026-11-09-x86_64-unknown-linux-gnu
+          components: clippy
+      - name: Reuse locked Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Reuse only this cross-target compiler's build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/Prism-Hexagon-Cross-Target
+          key: prism-hexagon-v1-cross-${{ runner.os }}-${{ runner.arch }}-aarch64-pc-windows-msvc-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', 'clippy.toml', 'rustfmt.toml', '.cargo/**', 'src/**', 'tools/**', 'tests/**', 'server/**', '.github/workflows/foundation.yml') }}-content-v1
+          restore-keys: |
+            prism-hexagon-v1-cross-${{ runner.os }}-${{ runner.arch }}-aarch64-pc-windows-msvc-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-
+      - name: Type-check the native Windows ARM64 boundary without linking or execution
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $toolchain = 'nightly-2026-11-09-x86_64-unknown-linux-gnu'
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $target = Join-Path $env:RUNNER_TEMP 'Prism-Hexagon-Cross-Target'
+          rustup target add --toolchain $toolchain aarch64-pc-windows-msvc
+          # This reaches the real Windows ARM64 cfg and private FFI code while
+          # requiring neither an ARM64 linker nor a vendor driver. It cannot
+          # replace Foundation's Windows ARM64 tests/docs or device gates.
+          cargo "+$toolchain" check --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets
+          cargo "+$toolchain" clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-hexagon-native --all-targets -- -D warnings
+
   foundation:
     if: always() && github.ref == 'refs/heads/main'
-    needs: [changes, windows, native-overlay, rust-regression, codec-native, source-package]
+    needs: [changes, windows, native-overlay, rust-regression, codec-native, source-package, cross-native-arm64]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     steps:

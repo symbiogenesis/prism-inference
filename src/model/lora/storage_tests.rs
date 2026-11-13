@@ -98,7 +98,7 @@ fn rank_one_storage_releases_linear_raw_a_and_preserves_decoded_b_sharing() -> R
     assert!(Arc::ptr_eq(&factors[0].b_values, &factors[1].b_values));
     assert!(Arc::ptr_eq(&factors[0].b_values, &factors[2].b_values));
     assert_eq!(factors[0].b_values[1].to_bits(), (-0.0_f32).to_bits());
-    assert_eq!(factors[2].a_values, [] as [f32; 0]);
+    assert_eq!(factors[2].a_values, Vec::<f32>::new());
 
     // Arithmetic still rounds A's product before B scaling and the base add.
     let mut scratch = Scratch::new(MatvecBackend::Scalar, true);

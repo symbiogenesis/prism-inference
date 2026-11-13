@@ -1349,6 +1349,63 @@ fn step_eight_rows_from_blocks<const BLOCKS: usize>(
     Some(outputs)
 }
 
+/// Selects baseline NEON once for an admitted complete head, retaining the
+/// existing eight-row arithmetic, group output boundary and defensive replay.
+pub(super) fn try_step_head_provisional(
+    previous: &[f32],
+    state: &mut [f32],
+    input: super::ChunkInput<'_>,
+    scale: f32,
+    output: &mut [f32],
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let width = input.key.len();
+    for (((previous, state), values), output) in previous
+        .chunks_exact(width * 8)
+        .zip(state.chunks_exact_mut(width * 8))
+        .zip(input.value.as_chunks::<8>().0)
+        .zip(output.as_chunks_mut::<8>().0)
+    {
+        let previous = std::array::from_fn(|row| &previous[row * width..(row + 1) * width]);
+        let (h0, h1) = state.split_at_mut(4 * width);
+        let (s01, s23) = h0.split_at_mut(2 * width);
+        let (s45, s67) = h1.split_at_mut(2 * width);
+        let (s0, s1) = s01.split_at_mut(width);
+        let (s2, s3) = s23.split_at_mut(width);
+        let (s4, s5) = s45.split_at_mut(width);
+        let (s6, s7) = s67.split_at_mut(width);
+        let mut states = [s0, s1, s2, s3, s4, s5, s6, s7];
+        let values = match step_eight_rows_into(
+            neon,
+            previous,
+            &mut states,
+            input.key,
+            input.query,
+            input.decay,
+            *values,
+            input.beta,
+        ) {
+            Some(values) => values,
+            None => match super::step_eight_rows_from(
+                previous,
+                states,
+                input.key,
+                input.query,
+                input.decay,
+                *values,
+                input.beta,
+            ) {
+                Ok(values) => values,
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        for (output, value) in output.iter_mut().zip(values) {
+            *output = value * scale;
+        }
+    }
+    Some(Ok(()))
+}
+
 /// Uses disposable graph delta rows for decayed and updated state. The source
 /// remains immutable, allowing the ordinary helper to recover original errors
 /// after any native failure without reading a partly updated destination.

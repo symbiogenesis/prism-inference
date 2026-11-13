@@ -4118,76 +4118,100 @@ impl Evaluation<'_, '_> {
                         };
                         let decay = (softplus * layer.decay[head]).exp();
                         let update = sigmoid(beta_ref[head]);
-                        let row_stride = g.ssm_head;
-                        let row_count = v.len();
-                        let eight_row_blocks = row_count / 8;
-                        for block_idx in 0..eight_row_blocks {
-                            let row_idx = block_idx * 8;
-                            let prev_rows: [&[f32]; 8] = std::array::from_fn(|r| {
-                                &prev_state
-                                    [(row_idx + r) * row_stride..(row_idx + r + 1) * row_stride]
-                            });
-                            let state_slice =
-                                &mut state[row_idx * row_stride..(row_idx + 8) * row_stride];
-                            let (h0, h1) = state_slice.split_at_mut(4 * row_stride);
-                            let (s01, s23) = h0.split_at_mut(2 * row_stride);
-                            let (s45, s67) = h1.split_at_mut(2 * row_stride);
-                            let (s0, s1) = s01.split_at_mut(row_stride);
-                            let (s2, s3) = s23.split_at_mut(row_stride);
-                            let (s4, s5) = s45.split_at_mut(row_stride);
-                            let (s6, s7) = s67.split_at_mut(row_stride);
-                            let values: [f32; 8] = std::array::from_fn(|r| v[row_idx + r]);
-                            let outs = arithmetic.gdn_step_eight_rows_from(
-                                prev_rows,
-                                [s0, s1, s2, s3, s4, s5, s6, s7],
-                                k,
-                                q,
-                                decay,
-                                values,
-                                update,
-                            )?;
-                            for (r, &out_val) in outs.iter().enumerate() {
-                                output[row_idx + r] = out_val * scale;
+                        let handled = if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                            crate::kernels::pinned_gdn::try_step_head_provisional(
+                                prev_state,
+                                state,
+                                crate::kernels::pinned_gdn::ChunkInput {
+                                    query: q,
+                                    key: k,
+                                    value: v,
+                                    decay,
+                                    beta: update,
+                                },
+                                scale,
+                                output,
+                            )
+                            .transpose()?
+                            .is_some()
+                        } else {
+                            false
+                        };
+                        if !handled {
+                            let row_stride = g.ssm_head;
+                            let row_count = v.len();
+                            let eight_row_blocks = row_count / 8;
+                            for block_idx in 0..eight_row_blocks {
+                                let row_idx = block_idx * 8;
+                                let prev_rows: [&[f32]; 8] = std::array::from_fn(|r| {
+                                    &prev_state
+                                        [(row_idx + r) * row_stride..(row_idx + r + 1) * row_stride]
+                                });
+                                let state_slice =
+                                    &mut state[row_idx * row_stride..(row_idx + 8) * row_stride];
+                                let (h0, h1) = state_slice.split_at_mut(4 * row_stride);
+                                let (s01, s23) = h0.split_at_mut(2 * row_stride);
+                                let (s45, s67) = h1.split_at_mut(2 * row_stride);
+                                let (s0, s1) = s01.split_at_mut(row_stride);
+                                let (s2, s3) = s23.split_at_mut(row_stride);
+                                let (s4, s5) = s45.split_at_mut(row_stride);
+                                let (s6, s7) = s67.split_at_mut(row_stride);
+                                let values: [f32; 8] = std::array::from_fn(|r| v[row_idx + r]);
+                                let outs = arithmetic.gdn_step_eight_rows_from(
+                                    prev_rows,
+                                    [s0, s1, s2, s3, s4, s5, s6, s7],
+                                    k,
+                                    q,
+                                    decay,
+                                    values,
+                                    update,
+                                )?;
+                                for (r, &out_val) in outs.iter().enumerate() {
+                                    output[row_idx + r] = out_val * scale;
+                                }
                             }
-                        }
-                        let four_row_blocks = row_count / 4;
-                        for block_idx in (eight_row_blocks * 2)..four_row_blocks {
-                            let row_idx = block_idx * 4;
-                            let prev_rows = [
-                                &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride],
-                                &prev_state[(row_idx + 1) * row_stride..(row_idx + 2) * row_stride],
-                                &prev_state[(row_idx + 2) * row_stride..(row_idx + 3) * row_stride],
-                                &prev_state[(row_idx + 3) * row_stride..(row_idx + 4) * row_stride],
-                            ];
-                            let state_slice =
-                                &mut state[row_idx * row_stride..(row_idx + 4) * row_stride];
-                            let (s01, s23) = state_slice.split_at_mut(2 * row_stride);
-                            let (s0, s1) = s01.split_at_mut(row_stride);
-                            let (s2, s3) = s23.split_at_mut(row_stride);
-                            let values =
-                                [v[row_idx], v[row_idx + 1], v[row_idx + 2], v[row_idx + 3]];
-                            let outs = arithmetic.gdn_step_four_rows_from(
-                                prev_rows,
-                                [s0, s1, s2, s3],
-                                k,
-                                q,
-                                decay,
-                                values,
-                                update,
-                            )?;
-                            output[row_idx] = outs[0] * scale;
-                            output[row_idx + 1] = outs[1] * scale;
-                            output[row_idx + 2] = outs[2] * scale;
-                            output[row_idx + 3] = outs[3] * scale;
-                        }
-                        for row_idx in (four_row_blocks * 4)..row_count {
-                            let prev_row =
-                                &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride];
-                            let state_row =
-                                &mut state[row_idx * row_stride..(row_idx + 1) * row_stride];
-                            output[row_idx] = arithmetic.gdn_step_row_from(
-                                prev_row, state_row, k, q, decay, v[row_idx], update,
-                            )? * scale;
+                            let four_row_blocks = row_count / 4;
+                            for block_idx in (eight_row_blocks * 2)..four_row_blocks {
+                                let row_idx = block_idx * 4;
+                                let prev_rows = [
+                                    &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride],
+                                    &prev_state
+                                        [(row_idx + 1) * row_stride..(row_idx + 2) * row_stride],
+                                    &prev_state
+                                        [(row_idx + 2) * row_stride..(row_idx + 3) * row_stride],
+                                    &prev_state
+                                        [(row_idx + 3) * row_stride..(row_idx + 4) * row_stride],
+                                ];
+                                let state_slice =
+                                    &mut state[row_idx * row_stride..(row_idx + 4) * row_stride];
+                                let (s01, s23) = state_slice.split_at_mut(2 * row_stride);
+                                let (s0, s1) = s01.split_at_mut(row_stride);
+                                let (s2, s3) = s23.split_at_mut(row_stride);
+                                let values =
+                                    [v[row_idx], v[row_idx + 1], v[row_idx + 2], v[row_idx + 3]];
+                                let outs = arithmetic.gdn_step_four_rows_from(
+                                    prev_rows,
+                                    [s0, s1, s2, s3],
+                                    k,
+                                    q,
+                                    decay,
+                                    values,
+                                    update,
+                                )?;
+                                output[row_idx] = outs[0] * scale;
+                                output[row_idx + 1] = outs[1] * scale;
+                                output[row_idx + 2] = outs[2] * scale;
+                                output[row_idx + 3] = outs[3] * scale;
+                            }
+                            for row_idx in (four_row_blocks * 4)..row_count {
+                                let prev_row =
+                                    &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride];
+                                let state_row =
+                                    &mut state[row_idx * row_stride..(row_idx + 1) * row_stride];
+                                output[row_idx] = arithmetic.gdn_step_row_from(
+                                    prev_row, state_row, k, q, decay, v[row_idx], update,
+                                )? * scale;
+                            }
                         }
                         // Pinned qwen35.cpp build_norm_gated explicitly uses
                         // ggml_swiglu_split(gate, normalized), not separate SiLU/MUL nodes.

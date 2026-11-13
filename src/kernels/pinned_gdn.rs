@@ -647,6 +647,58 @@ pub(crate) fn step_eight_rows_provisional(
     }
 }
 
+/// Attempts a complete eligible head using the graph's disposable delta.
+///
+/// Shared geometry and native selection are checked once for all eight-row
+/// groups. Unsupported widths, row counts and targets return `None`, allowing
+/// the graph to retain its existing generic grouping. Like the eight-row
+/// provisional helper, failure may dirty the destination but never its source.
+/// Output groups are published only after all eight rows succeed.
+///
+/// # Errors
+/// An eligible head with mismatched extents rejects before any mutation. Native
+/// failures replay the failing group against its immutable committed source.
+pub(crate) fn try_step_head_provisional(
+    previous: &[f32],
+    state: &mut [f32],
+    input: ChunkInput<'_>,
+    scale: f32,
+    output: &mut [f32],
+) -> Option<Result<()>> {
+    let width = input.key.len();
+    if !matches!(width, 128 | 256) || !input.value.len().is_multiple_of(8) {
+        return None;
+    }
+    if input.query.len() != width
+        || input.value.len().checked_mul(width) != Some(previous.len())
+        || state.len() != previous.len()
+        || output.len() != input.value.len()
+    {
+        return Some(Err(invalid("pinned GDN step requires matching vectors")));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::try_step_head_provisional(previous, state, input, scale, output)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        let _ = scale;
+        None
+    }
+}
+
 /// Steps 8 GDN state rows across `inputs.len()` tokens from `previous` into `states`,
 /// writing `out * scale` to `output[token * stride + row + r]` for each token and row `r in 0..8`.
 ///

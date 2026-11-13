@@ -1,6 +1,9 @@
 //! Disposable GDN decode state, independent arithmetic and retry controls.
 
-use super::{dot_scalar, scalar_add_scaled, step_eight_rows_from, step_eight_rows_provisional};
+use super::{
+    ChunkInput, dot_scalar, scalar_add_scaled, step_eight_rows_from, step_eight_rows_provisional,
+    try_step_head_provisional,
+};
 use crate::{Result, invalid};
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -167,5 +170,140 @@ fn x1_provisional_gdn_geometry_rejects_before_destination_changes() -> Result<()
         .is_err()
     );
     assert_eq!(bits(&actual), before);
+    Ok(())
+}
+
+#[test]
+fn x2_provisional_head_matches_scalar_bits_and_preserves_failure_boundaries() -> Result<()> {
+    for width in [128, 256] {
+        let row_count = 24;
+        let committed = values(row_count * width);
+        let committed_bits = bits(&committed);
+        let key = values(width);
+        let mut query = values(width);
+        query.reverse();
+        let value = values(row_count);
+        let scale = 0.088_388_346;
+        let input = ChunkInput {
+            query: &query,
+            key: &key,
+            value: &value,
+            decay: 0.875,
+            beta: 0.625,
+        };
+        let mut expected = committed.clone();
+        let mut expected_output = vec![0.0; row_count];
+        for ((state, &value), output) in expected
+            .chunks_exact_mut(width)
+            .zip(&value)
+            .zip(&mut expected_output)
+        {
+            for element in &mut *state {
+                *element *= input.decay;
+            }
+            let delta = (value - dot_scalar(state, &key)?) * input.beta;
+            scalar_add_scaled(state, &key, delta)?;
+            *output = dot_scalar(state, &query)? * scale;
+        }
+        let mut state = vec![-5.0; committed.len()];
+        let mut output = vec![-7.0; row_count];
+        let Some(result) =
+            try_step_head_provisional(&committed, &mut state, input, scale, &mut output)
+        else {
+            // Feature-disabled and non-ARM targets retain the graph's old path.
+            assert_eq!(bits(&state), bits(&vec![-5.0; committed.len()]));
+            assert_eq!(output, vec![-7.0; row_count]);
+            continue;
+        };
+        result?;
+        assert_eq!(bits(&state), bits(&expected));
+        assert_eq!(bits(&output), bits(&expected_output));
+        assert_eq!(bits(&committed), committed_bits);
+
+        let mut bad_values = value.clone();
+        bad_values[15] = f32::NAN;
+        state.fill(-5.0);
+        output.fill(-7.0);
+        let error = try_step_head_provisional(
+            &committed,
+            &mut state,
+            ChunkInput {
+                value: &bad_values,
+                ..input
+            },
+            scale,
+            &mut output,
+        )
+        .ok_or_else(|| invalid("eligible native head unexpectedly unavailable"))?
+        .err()
+        .ok_or_else(|| invalid("late head failure was accepted"))?;
+        let mut control = vec![-5.0; width * 8];
+        let mut bad_group = [0.0; 8];
+        bad_group.copy_from_slice(&bad_values[8..16]);
+        let expected_error = step_eight_rows_from(
+            std::array::from_fn(|row| &committed[(8 + row) * width..(9 + row) * width]),
+            rows(&mut control, width)?,
+            &key,
+            &query,
+            input.decay,
+            bad_group,
+            input.beta,
+        )
+        .err()
+        .ok_or_else(|| invalid("defensive late head failure was accepted"))?;
+        assert_eq!(error.to_string(), expected_error.to_string());
+        assert_eq!(bits(&output[..8]), bits(&expected_output[..8]));
+        assert_eq!(output[8..], [-7.0; 16]);
+        assert!(state[16 * width..].iter().all(|&value| value == -5.0));
+        assert_eq!(bits(&committed), committed_bits);
+
+        try_step_head_provisional(&committed, &mut state, input, scale, &mut output)
+            .ok_or_else(|| invalid("eligible native head unexpectedly unavailable"))??;
+        assert_eq!(bits(&state), bits(&expected));
+        assert_eq!(bits(&output), bits(&expected_output));
+    }
+    Ok(())
+}
+
+#[test]
+fn x2_provisional_head_geometry_rejects_before_mutation_and_keeps_fallback() -> Result<()> {
+    let width = 128;
+    let committed = values(8 * width);
+    let key = values(width);
+    let query = values(width - 1);
+    let value = [0.125; 8];
+    let input = ChunkInput {
+        query: &query,
+        key: &key,
+        value: &value,
+        decay: 0.875,
+        beta: 0.625,
+    };
+    let mut state = vec![-5.0; committed.len()];
+    let before = bits(&state);
+    let mut output = [-7.0; 8];
+    assert!(
+        try_step_head_provisional(&committed, &mut state, input, 0.125, &mut output)
+            .ok_or_else(|| invalid("malformed admitted head did not reject"))?
+            .is_err()
+    );
+    assert_eq!(bits(&state), before);
+    assert_eq!(output, [-7.0; 8]);
+    for input in [
+        ChunkInput {
+            key: &key[..127],
+            ..input
+        },
+        ChunkInput {
+            value: &value[..7],
+            ..input
+        },
+    ] {
+        assert!(
+            try_step_head_provisional(&committed, &mut state, input, 0.125, &mut output).is_none()
+        );
+        assert_eq!(bits(&state), before);
+        assert_eq!(output, [-7.0; 8]);
+    }
     Ok(())
 }

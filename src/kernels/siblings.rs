@@ -1,4 +1,4 @@
-//! CPU PQ2 sibling execution sharing one prepared activation and pool join.
+//! CPU sibling execution sharing one prepared activation and pool join.
 
 #[cfg(all(
     feature = "experimental-neon",
@@ -14,6 +14,9 @@ use crate::{Result, invalid, model::Tensor};
 #[cfg(test)]
 #[path = "siblings_tests.rs"]
 mod tests;
+
+#[path = "bf16_siblings.rs"]
+mod bf16;
 
 impl PreparedMatvec<'_> {
     /// One atomic output group; original row arithmetic and partitioning remain.

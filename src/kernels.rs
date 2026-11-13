@@ -78,7 +78,7 @@ const Q5_1: u32 = 7;
 const Q8_0: u32 = 8;
 const Q8_1: u32 = 9;
 const Q8_K: u32 = 15;
-const BF16: u32 = 30;
+pub(crate) const BF16: u32 = 30;
 pub(crate) const PQ2: u32 = 142;
 const PTQ1: u32 = 143;
 
@@ -1786,7 +1786,7 @@ pub struct MatvecStatistics {
     /// Packed matrix attempts using the explicit persistent row-worker pool.
     /// Grouped matrices count individually, including single-row siblings.
     pub parallel_row_operations: u64,
-    /// Single worker-pool submissions combining two through four PQ2 matrices.
+    /// Single worker-pool submissions combining two through four PQ2 or BF16 matrices.
     ///
     /// Each participating matrix still counts in `parallel_row_operations`.
     /// This counter describes submitted source work, not a timing measurement.

@@ -1638,18 +1638,20 @@ impl Transforms {
                     completed[index..index + group_len].fill(true);
                     continue;
                 }
-                // Compatible CPU PQ2 siblings already share their exact basis
-                // and Q8_K preparation. Submit their original row partitions
+                // Compatible CPU PQ2/BF16 siblings already share their exact
+                // basis and activation preparation. Submit their row partitions
                 // together, replacing one pool join per matrix with one join
                 // per group. Other formats and external executors stay on
                 // their existing independently checked execution paths.
                 let cpu_group_len = weights[index..index + group_len]
                     .iter()
-                    .take_while(|weight| weight.kind == crate::kernels::PQ2)
+                    .take_while(|weight| weight.kind == weights[index].kind)
                     .count();
                 if cpu_siblings
                     && cpu_group_len >= 2
-                    && weights[index].dimensions[0].is_multiple_of(256)
+                    && (weights[index].kind == crate::kernels::PQ2
+                        && weights[index].dimensions[0].is_multiple_of(256)
+                        || weights[index].kind == crate::kernels::BF16)
                     && weights.iter().enumerate().skip(index + cpu_group_len).all(
                         |(candidate, weight)| {
                             completed[candidate]
@@ -1658,10 +1660,13 @@ impl Transforms {
                         },
                     )
                 {
-                    prepared.matvec_pq2_siblings_into(
-                        &weights[index..index + cpu_group_len],
-                        &mut outputs[index..index + cpu_group_len],
-                    )?;
+                    let tensors = &weights[index..index + cpu_group_len];
+                    let outputs = &mut outputs[index..index + cpu_group_len];
+                    if weights[index].kind == crate::kernels::BF16 {
+                        prepared.matvec_bf16_siblings_into(tensors, outputs)?;
+                    } else {
+                        prepared.matvec_pq2_siblings_into(tensors, outputs)?;
+                    }
                     completed[index..index + cpu_group_len].fill(true);
                     continue;
                 }

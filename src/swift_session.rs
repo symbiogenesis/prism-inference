@@ -76,11 +76,24 @@ pub const fn context_token_memory_bytes(kv_cache: KvCachePolicy) -> u64 {
     2 * kv_bytes + 96 + 128
 }
 
-/// Largest page-aligned context admitted by this cache's 4 GiB state bound.
+/// Geometry-derived state/checkpoint ceiling for one explicitly selected Swift cache.
+///
+/// K4/V4 admits the full model context with its narrow verified-geometry graph
+/// constructor. Generic graphs, FP16 and K4/V3 retain their 4 GiB ceiling.
+/// This is source accounting, not measured memory or quality qualification.
+#[must_use]
+pub const fn state_limit_bytes(kv_cache: KvCachePolicy) -> usize {
+    match kv_cache {
+        KvCachePolicy::Rotated4 => crate::graph::SWIFT_RSQ4_FULL_STATE_BYTES,
+        KvCachePolicy::F16 | KvCachePolicy::Rotated4Keys3Values => crate::graph::MAX_STATE_BYTES,
+    }
+}
+
+/// Largest page-aligned context admitted by this immutable Swift cache/state scope.
 /// This source allowance does not establish measured memory or long-range quality.
 #[must_use]
 pub const fn max_context_tokens(kv_cache: KvCachePolicy) -> usize {
-    let state_max = (crate::graph::MAX_STATE_BYTES - RECURRENT_MEMORY_BYTES)
+    let state_max = (state_limit_bytes(kv_cache) - RECURRENT_MEMORY_BYTES)
         / (kv_token_memory_bytes(kv_cache) + 96 + 128)
         / 256
         * 256;
@@ -511,10 +524,11 @@ impl SwiftSession {
     /// Fixed callers retain the 8,192-token default through existing loading
     /// methods. A launcher may select a larger or smaller context from current
     /// memory and must enforce its separate process and host-reserve allowance.
-    /// The graph's existing 4 GiB live-state ceiling is never increased.
+    /// Generic/FP16 graphs retain 4 GiB. Explicit full-context Swift K4/V4
+    /// uses its geometry-derived 4,644,798,464-byte state/checkpoint ceiling.
     ///
     /// # Errors
-    /// Rejects a context beyond the conservative FP16 state capacity and the
+    /// Rejects a context beyond its selected cache/state capacity and the
     /// artifact, adapter, cache and allocation errors of other loading methods.
     #[expect(
         clippy::too_many_arguments,
@@ -634,25 +648,9 @@ impl SwiftSession {
         let adapter_identity = adapter
             .as_ref()
             .map(|_| crate::model::lora::SWIFT_ADAPTER_SHA256.to_owned());
-        let mut decoder = if let Some(adapter) = adapter {
-            Qwen35::with_rank_one_adapter_and_kv(
-                model,
-                context_tokens,
-                state_budget,
-                backend,
-                adapter,
-                1.3,
-                kv_cache,
-            )?
-        } else {
-            Qwen35::with_state_budget_and_kv(
-                model,
-                context_tokens,
-                state_budget,
-                backend,
-                kv_cache,
-            )?
-        };
+        let mut decoder = Qwen35::with_swift_state_budget_and_kv(
+            model, context_tokens, state_budget, backend, kv_cache, adapter,
+        )?;
         decoder.set_row_parallelism(parallelism);
         if let Some(prefill) = cpu_prefill {
             decoder = decoder.with_tiled_prefill(prefill.tokens, prefill.scratch_bytes)?;
@@ -1132,7 +1130,7 @@ mod tests {
         CONTEXT_TOKEN_MEMORY_BYTES, CpuPrefill, CpuSpeculation, MAX_CONTEXT_TOKENS,
         NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftSession,
         context_token_memory_bytes, kv_token_memory_bytes, max_context_tokens,
-        selected_state_budget, validate_adapter_scale, validate_context_capacity,
+        selected_state_budget, state_limit_bytes, validate_adapter_scale, validate_context_capacity,
         validate_context_capacity_with_kv, validate_execution_capacity,
         validate_execution_capacity_with_kv, validate_prefill_capacity, validate_prompt_owner,
     };
@@ -1257,7 +1255,7 @@ mod tests {
     fn selected_cache_capacity_covers_packed_geometry_and_staged_windows() -> Result<()> {
         for (cache, ceiling) in [
             (KvCachePolicy::F16, 62_720),
-            (KvCachePolicy::Rotated4, 241_664),
+            (KvCachePolicy::Rotated4, 262_144),
             (KvCachePolicy::Rotated4Keys3Values, 262_144),
         ] {
             // The graph codec independently computes packed records and scales.
@@ -1273,7 +1271,7 @@ mod tests {
                 assert!(validate_context_capacity_with_kv(context, memory - 1, cache).is_err());
                 let state = selected_state_budget(context, cache)?;
                 assert!(state >= STATE_MEMORY_BYTES);
-                assert!(state <= crate::graph::MAX_STATE_BYTES);
+                assert!(state <= state_limit_bytes(cache));
             }
             assert!(validate_context_capacity_with_kv(0, u64::MAX, cache).is_err());
             assert!(validate_context_capacity_with_kv(ceiling + 1, u64::MAX, cache).is_err());
@@ -1297,7 +1295,7 @@ mod tests {
 
     #[test]
     fn selected_cache_speculation_reserves_full_scaled_checkpoint() -> Result<()> {
-        let context = 131_072;
+        for context in [131_072, 262_144] {
         let cache = KvCachePolicy::Rotated4;
         let tile = CpuPrefill::new(8, 64 * 1024 * 1024)?;
         let checkpoint = selected_state_budget(context, cache)?;
@@ -1328,7 +1326,8 @@ mod tests {
             )
             .is_err()
         );
-        assert!(selected_state_budget(context, cache)? < crate::graph::MAX_STATE_BYTES);
+        assert!(selected_state_budget(context, cache)? <= state_limit_bytes(cache));
+        }
         Ok(())
     }
 

@@ -472,7 +472,7 @@ mod tests {
             "--seed".into(),
             "42".into(),
         ];
-        for context in [65_536_u64, 131_072] {
+        for context in [65_536_u64, 131_072, 262_144] {
             let memory = NON_CONTEXT_MEMORY_BYTES + context * 34_016;
             for cache_first in [false, true] {
                 let capacity: [OsString; 4] = [

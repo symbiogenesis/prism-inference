@@ -95,7 +95,9 @@ remain charged in work statistics and conservative admission.
 1 through 8 suffix positions to two additional memory reserves. The logits
 reserve must cover the graph's complete verification rows; the extra checkpoint
 reserve covers a round prefix beside the existing request rollback. Its minimum
-is the ordinary selected state budget (1 GiB at 8K, 4 GiB at other capacities).
+is the ordinary selected state budget (at least 1 GiB; it scales with context
+and cache). The unreleased full-context K4/V4 candidate requires the complete
+4,644,798,464-byte prefix reserve at 262,144 tokens; a 4 GiB reserve rejects.
 The complete caller reserves are charged before artifact I/O by
 `validate_execution_capacity`; they do not reduce existing context, worker or
 host reserves. `load_profile_with_execution` supplies this explicit selection;

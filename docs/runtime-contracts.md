@@ -215,15 +215,25 @@ FP16 tiles reserve every four/six-head score row for every tile token.
 
 `validate_context_capacity_with_kv` and the selected-cache prefill/execution
 validators bind that policy before artifact I/O. Existing validation entry points
-retain FP16 policy. The 4 GiB state ceiling and 256-token selection granularity
-permit at most 62,720 FP16, 241,664 K4/V4 or 262,144 K4/V3 tokens. Live state and
-rollback budgets scale with the selected payload, retaining the historical 1 GiB
-floor for fixed checkpoint/logit overhead. Speculation additionally reserves a
+retain FP16 policy. Generic graphs, FP16 and K4/V3 retain the 4 GiB state
+ceiling; FP16 permits at most 62,720 tokens and K4/V3 reaches 262,144. The unreleased
+full-context K4/V4 source candidate reaches the same 262,144-token model bound
+with a geometry-derived 4,644,798,464-byte live/checkpoint allowance. Its narrow
+constructor requires an exact Swift PQ2/PTQ1 identity and the pinned geometry,
+including all 16 attention and 48 recurrent layers. Existing generic constructors
+and individual allocation/scratch guards do not gain this larger scope. Live
+state and rollback budgets scale with the selected payload, retaining the
+historical 1 GiB floor for fixed checkpoint/logit overhead. Speculation additionally reserves a
 complete second prefix and its full tile/logit scratch; divergent histories still
 charge two full caches regardless of shared pages.
 
 These source allowances are not measured memory, quality or larger-window
-qualification. The private child validates paired `--context-tokens` and
+qualification. The published 0.1.26 K4/V4 state ceiling remains 241,664 tokens;
+this full-context source candidate requires a new genuine source-bound release
+and matching Runner gate before activation. At 24 GiB available it projects
+262,144 tokens under the unchanged process/fixed/host/startup charges. No cache
+precision, arithmetic, general two-cache rollback charge or model ceiling changes.
+The private child validates paired `--context-tokens` and
 `--memory-limit-bytes` against the final cache selection independent of argument
 order. Runner's published 0.1.25 remains fixed at 8K until a genuine source-bound
 compatible release is reviewed and repinned. Its 4 GiB host and 256 MiB startup

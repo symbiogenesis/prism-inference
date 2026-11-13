@@ -51,9 +51,13 @@ speedup or actual-model qualification is claimed.
 
 The selected context is immutable and identical in exact chat tokenization,
 server admission, decoder/runtime bounds and authenticated `context_tokens`
-readiness. Live-state payload remains capped at the graph's existing 4 GiB;
-complete rollback accounting increases with a selected context beyond the
-legacy default. Missing, partial, duplicate, unaligned, overflowing or
+readiness. The unreleased full-context K4/V4 source candidate admits up to
+262,144 tokens with a geometry-derived 4,644,798,464-byte state/checkpoint bound.
+Only the exact Swift identities and pinned 16-attention/48-recurrent-layer
+geometry can use this larger aggregate scope; generic constructors, FP16 and
+K4/V3 keep the existing 4 GiB limit. Individual allocations and scratch retain
+their old bounds. Complete rollback accounting increases with a selected context
+beyond the legacy default. Missing, partial, duplicate, unaligned, overflowing or
 underfunded capacity options reject rather than resize after loading. Owners
 must enforce the selected Job memory allowance and monitor pressure. Available
 memory is an observation, not a reservation or full-context qualification.

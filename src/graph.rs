@@ -25,6 +25,8 @@ use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
 use crate::{Decoder, Result, invalid};
 
+mod swift_state;
+pub(crate) use swift_state::SWIFT_RSQ4_FULL_STATE_BYTES;
 mod projection;
 pub use projection::ProjectedQwen35;
 mod prefill;
@@ -40,10 +42,11 @@ mod ffn_preparation;
 #[path = "graph/sibling_projection_tests.rs"]
 mod sibling_projection_tests;
 
-/// Maximum admitted live KV/recurrent element payload, also the default budget.
+/// Maximum generic live KV/recurrent element payload, also the default budget.
 ///
 /// This excludes model storage, scratch, checkpoints, page-table/Arc metadata
-/// and allocator overhead.
+/// and allocator overhead. The verified Swift session has a separate,
+/// geometry-derived aggregate K4/V4 scope; generic constructors retain this cap.
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// Graph identity suffix for the generic source-order Qwen35 text decoder.
 ///
@@ -2103,16 +2106,33 @@ impl Qwen35 {
         scale: f32,
         kv_cache_policy: KvCachePolicy,
     ) -> Result<Self> {
+        Self::with_rank_one_adapter_and_kv_scope(
+            model, context_limit, state_budget_bytes, backend, adapter, scale, kv_cache_policy, false,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "Private construction preserves the existing adapter profile plus its state scope.")]
+    fn with_rank_one_adapter_and_kv_scope(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        adapter: RankOneAdapter,
+        scale: f32,
+        kv_cache_policy: KvCachePolicy,
+        swift_full_state: bool,
+    ) -> Result<Self> {
         RankOneAdapter::validate_scale(scale)?;
         if adapter.base_identity() != model.identity {
             return Err(invalid("rank-one adapter belongs to another base model"));
         }
-        let mut graph = Self::with_state_budget_and_kv(
+        let mut graph = Self::with_state_budget_and_kv_scope(
             model,
             context_limit,
             state_budget_bytes,
             backend,
             kv_cache_policy,
+            swift_full_state,
         )?;
         for target in adapter.targets() {
             if target == graph.embedding.name && graph.output.name == graph.embedding.name {
@@ -2230,10 +2250,6 @@ impl Qwen35 {
     ///
     /// # Errors
     /// Rejects unsupported head dimensions and the ordinary graph/budget errors.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Validate all geometry and storage bounds before loading graph state."
-    )]
     pub fn with_state_budget_and_kv(
         model: Model,
         context_limit: usize,
@@ -2241,7 +2257,50 @@ impl Qwen35 {
         backend: MatvecBackend,
         kv_cache_policy: KvCachePolicy,
     ) -> Result<Self> {
-        if state_budget_bytes == 0 || state_budget_bytes > MAX_STATE_BYTES {
+        Self::with_state_budget_and_kv_scope(
+            model, context_limit, state_budget_bytes, backend, kv_cache_policy, false,
+        )
+    }
+
+    // Only the verified Swift session can request the larger packed-state scope.
+    // Public/generic graph constructors retain their existing 4 GiB ceiling.
+    pub(crate) fn with_swift_state_budget_and_kv(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        kv_cache_policy: KvCachePolicy,
+        adapter: Option<RankOneAdapter>,
+    ) -> Result<Self> {
+        if let Some(adapter) = adapter {
+            Self::with_rank_one_adapter_and_kv_scope(
+                model, context_limit, state_budget_bytes, backend, adapter, 1.3, kv_cache_policy, true,
+            )
+        } else {
+            Self::with_state_budget_and_kv_scope(
+                model, context_limit, state_budget_bytes, backend, kv_cache_policy, true,
+            )
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Validate all geometry and storage bounds before loading graph state."
+    )]
+    fn with_state_budget_and_kv_scope(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        kv_cache_policy: KvCachePolicy,
+        swift_full_state: bool,
+    ) -> Result<Self> {
+        let ceiling = if swift_full_state && state_budget_bytes > MAX_STATE_BYTES {
+            swift_state::ceiling(&model.identity, &model.metadata, context_limit, kv_cache_policy)?
+        } else {
+            MAX_STATE_BYTES
+        };
+        if state_budget_bytes == 0 || state_budget_bytes > ceiling {
             return Err(invalid("invalid native live-state payload budget"));
         }
         let metadata = &model.metadata;

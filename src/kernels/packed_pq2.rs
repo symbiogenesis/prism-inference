@@ -824,6 +824,70 @@ mod native_tests {
     }
 
     #[test]
+    fn x1_scoped_pq2_rejection_preserves_extent_precedence_and_numeric_diagnostics() -> Result<()> {
+        let input = [Q8KBlock {
+            scale: 0.125,
+            values: [3; 256],
+            sums: [0; 16],
+        }];
+        let mut detected = super::Activations::default();
+        let mut baseline = super::Activations::default();
+        prepare(&input, &mut detected)?;
+        super::prepare_with_layout(&input, &mut baseline, true)?;
+        let mut weights = [0xaa; 68];
+        weights[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        // A numerical defect in the first row must not hide malformed extents
+        // in a later row. The helper rejects complete geometry before work.
+        weights[34..36].copy_from_slice(&0x7c01_u16.to_le_bytes());
+        let oversized = [0_u8; 69];
+        for activations in [&detected, &baseline] {
+            let consumer = super::Consumer::new(activations)?;
+            for malformed in [
+                &weights[..0],
+                &weights[..34],
+                &weights[..67],
+                oversized.as_slice(),
+            ] {
+                assert_eq!(
+                    consumer
+                        .dot_row::<true>(malformed)
+                        .err()
+                        .map(|error| error.to_string())
+                        .as_deref(),
+                    Some("incompatible packed consumption activation extent")
+                );
+                assert_eq!(
+                    consumer
+                        .dot_four_rows::<false>([&weights, &weights, &weights, malformed])
+                        .err()
+                        .map(|error| error.to_string())
+                        .as_deref(),
+                    Some("incompatible packed consumption activation extent")
+                );
+                let mut rows = [weights.as_slice(); 8];
+                rows[7] = malformed;
+                assert_eq!(
+                    consumer
+                        .dot_eight_rows::<true>(rows)
+                        .err()
+                        .map(|error| error.to_string())
+                        .as_deref(),
+                    Some("incompatible packed consumption activation extent")
+                );
+            }
+            assert_eq!(
+                consumer
+                    .dot_eight_rows::<false>([&weights; 8])
+                    .err()
+                    .map(|error| error.to_string())
+                    .as_deref(),
+                Some("nonfinite tensor or activation value")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn x1_pq2_prepared_dispatch_matches_forced_baseline_and_clears_on_failure() -> Result<()> {
         let mut input = [Q8KBlock {
             scale: f32::from_bits(0x3eaa_aaab),

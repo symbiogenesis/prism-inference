@@ -23,10 +23,9 @@ impl<'a> Consumer<'a> {
 
     pub(in crate::kernels) fn dot_row<const FUSED: bool>(&self, bytes: &[u8]) -> Result<f32> {
         if let Some(dotprod) = self.dotprod {
-            self.check_extents([bytes])?;
             return dotprod
                 .dot_scaled_rows::<1, FUSED>([bytes])
-                .ok_or_else(|| invalid("nonfinite tensor or activation value"))
+                .ok_or_else(|| self.failure([bytes]))
                 .map(|output| output[0]);
         }
         super::dot_row::<FUSED>(bytes, self.input)
@@ -37,10 +36,9 @@ impl<'a> Consumer<'a> {
         rows: [&[u8]; 4],
     ) -> Result<[f32; 4]> {
         if let Some(dotprod) = self.dotprod {
-            self.check_extents(rows)?;
             return dotprod
                 .dot_scaled_rows::<4, FUSED>(rows)
-                .ok_or_else(|| invalid("nonfinite tensor or activation value"));
+                .ok_or_else(|| self.failure(rows));
         }
         super::dot_four_rows::<FUSED>(rows, self.input)
     }
@@ -50,22 +48,25 @@ impl<'a> Consumer<'a> {
         rows: [&[u8]; 8],
     ) -> Result<[f32; 8]> {
         if let Some(dotprod) = self.dotprod {
-            self.check_extents(rows)?;
             return dotprod
                 .dot_scaled_rows::<8, FUSED>(rows)
-                .ok_or_else(|| invalid("nonfinite tensor or activation value"));
+                .ok_or_else(|| self.failure(rows));
         }
         super::dot_eight_rows::<FUSED>(rows, self.input)
     }
 
-    fn check_extents<const ROWS: usize>(&self, rows: [&[u8]; ROWS]) -> Result<()> {
+    // The safe helper checks every row extent before touching a packed block.
+    // Only repeat that classification after rejection to preserve diagnostics;
+    // successful row tiles do not need a second geometry scan here.
+    fn failure<const ROWS: usize>(&self, rows: [&[u8]; ROWS]) -> crate::Error {
         if self.input.is_empty()
             || rows.iter().any(|bytes| {
                 bytes.len() / 34 != self.input.len() || !bytes.len().is_multiple_of(34)
             })
         {
-            return Err(invalid("incompatible packed consumption activation extent"));
+            invalid("incompatible packed consumption activation extent")
+        } else {
+            invalid("nonfinite tensor or activation value")
         }
-        Ok(())
     }
 }

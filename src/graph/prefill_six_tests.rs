@@ -161,6 +161,32 @@ impl Harness {
 }
 
 #[test]
+fn tiled_attention_reservation_covers_real_score_storage() -> Result<()> {
+    for count in [8, 16, 32] {
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            let mut actual = Harness::new(count, 1)?;
+            actual.run(arithmetic, &|| Ok(()))?;
+            let reserved = tiled_attention_scratch_bytes(
+                &actual.geometry,
+                arithmetic,
+                super::super::KvCachePolicy::F16,
+                128,
+                count,
+            )?;
+            assert!(reserved >= actual.attention_scratch.scores.len() * size_of::<f32>());
+            // At full context every row needs a slot, even for serial workers.
+            let heads = if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                6
+            } else {
+                4
+            };
+            assert_eq!(reserved, count * 128 * heads * size_of::<f32>());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation() -> Result<()> {
     #[cfg(feature = "parallel-rows")]
     let worker_counts = [2, 4, 18];

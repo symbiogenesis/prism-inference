@@ -27,6 +27,26 @@ mod six_tests;
 #[path = "prefill_ffn_tests.rs"]
 mod ffn_tests;
 
+fn tiled_attention_scratch_bytes(
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    policy: super::KvCachePolicy,
+    context: usize,
+    tokens: usize,
+) -> Result<usize> {
+    if policy != super::KvCachePolicy::F16 {
+        return Ok(0);
+    }
+    let heads = if matches!(arithmetic, Arithmetic::PinnedSwift)
+        && geometry.heads / geometry.kv_heads == 6
+    {
+        6
+    } else {
+        4
+    };
+    checked_product(&[tokens, context, heads, size_of::<f32>()])
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct TileReuse<'a> {
     basis: Option<&'a Tensor>,
@@ -184,19 +204,20 @@ impl Qwen35 {
             .max(self.geometry.value_width())
             .max(self.geometry.query_gate_width())
             .max(self.geometry.kv_width());
-        // Six-head prefill keeps two more score rows than the four-head
-        // path for each tile token. Charge their full-context high water even
-        // when the configured row policy later selects serial execution.
-        let six_head_scores = if matches!(self.arithmetic, Arithmetic::PinnedSwift)
-            && self.geometry.heads / self.geometry.kv_heads == 6
-        {
-            checked_product(&[tokens, self.context_limit, 2, size_of::<f32>()])?
-        } else {
-            0
-        };
+        // FP16 tiles retain four or six full-context score rows per tile
+        // token. Reserve the complete high water independently of the ordinary
+        // sequential score allowance and any later worker-policy selection.
+        // Rotated tiles use ordinary per-token attention without tiled scores.
+        let tiled_scores = tiled_attention_scratch_bytes(
+            &self.geometry,
+            self.arithmetic,
+            self.kv_cache_policy,
+            self.context_limit,
+            tokens,
+        )?;
         checked_product(&[tokens, width, 80])?
             .checked_add(checked_product(&[tokens, 2048])?)
-            .and_then(|bytes| bytes.checked_add(six_head_scores))
+            .and_then(|bytes| bytes.checked_add(tiled_scores))
             // The four fixed 32x32 coefficient/product tables and their small
             // temporary vectors exist even for an eight-token, narrow graph.
             .and_then(|bytes| bytes.checked_add(64 * 1024))

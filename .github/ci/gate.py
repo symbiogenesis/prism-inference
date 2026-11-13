@@ -26,6 +26,28 @@ def failures(needs, jobs):
         return ["Missing or malformed CI selection/job result"]
 
 
+
+def report(needs, errors, workflow):
+    """Show dependency outcomes without presenting the aggregate as a root cause."""
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary:
+        return
+    # JSON string escaping keeps multiline or malformed values in one table row.
+    def cell(value):
+        return json.dumps(value, ensure_ascii=True).replace("|", "&#124;")
+    with open(summary, "a", encoding="utf-8") as stream:
+        stream.write(f"CI aggregate: {cell(workflow)}\n\n")
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+            stream.write(f"{key}: {cell(os.environ.get(key, 'unknown'))}\n\n")
+        stream.write("| Dependency | Result |\n| --- | --- |\n")
+        if isinstance(needs, dict):
+            for name, value in sorted(needs.items()):
+                result = value.get("result", "missing") if isinstance(value, dict) else "malformed"
+                stream.write(f"| {cell(name)} | {cell(result)} |\n")
+        stream.write("\n" + ("Rejected" if errors else "Passed") + ": " + cell(errors) + "\n\n")
+        stream.write("This aggregate reports dependency results. Open a failed dependency's first failing step for its original command and diagnostic. A selected skip, cancellation or missing result still rejects.\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workflow", required=True)
@@ -34,6 +56,7 @@ def main():
     config = json.loads((root / ".github/ci/impact.json").read_text(encoding="utf-8"))
     needs = json.loads(os.environ["CI_NEEDS"])
     errors = failures(needs, config["workflows"][arguments.workflow])
+    report(needs, errors, arguments.workflow)
     if errors:
         raise SystemExit("\n".join(errors))
     print("All selected CI groups passed; unselected groups were skipped.")

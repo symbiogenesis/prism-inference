@@ -101,7 +101,9 @@ def main():
     parser.add_argument("--gate", action="store_true")
     args = parser.parse_args()
     if args.gate:
-        errors = failures(json.loads(os.environ["CI_NEEDS"]))
+        needs = json.loads(os.environ["CI_NEEDS"])
+        errors = failures(needs)
+        gate.report(needs, errors, WORKFLOW)
         if errors:
             raise SystemExit("\n".join(errors))
         print("All selected source checks passed; unselected checks were skipped.")

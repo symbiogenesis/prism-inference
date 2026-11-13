@@ -61,3 +61,31 @@ Reports use `SchemaVersion: 1`, `UpstreamCommit`, `Target` and `Cases` with
 failures exit nonzero. Full catalogs, timed sources and all benchmarks are CI-only.
 See [building and validation](../../../docs/build-and-validation.md) for execution
 policy and the workflow inventory.
+
+## Independent Rust observation provider
+
+`--target rust-reference --case test-mtp-catchup-batch` selects the independent
+mathematical MTP bounds provider. It runs the same six original ordered assertions
+through the shared source adapter. The provider reserves nonnegative anchors from
+the available batch and compares catch-up demand with the remainder; it calls
+neither production implementation and performs no fixture lookup. Signed boundary
+controls include negative inputs and the complete `i32` extrema.
+
+The implementation binds reviewed upstream revision
+`b87ca7225456b06b0975b8239c66b5aecf07e37c`:
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| [common/speculative.cpp](https://github.com/PrismML-Eng/llama.cpp/blob/b87ca7225456b06b0975b8239c66b5aecf07e37c/common/speculative.cpp) | 183,232 | `c8cad0219bc9c8c11c04574d3020876646835966412cc9e39eaae5aca805d92d` |
+| [tests/test-mtp-catchup-batch.cpp](https://github.com/PrismML-Eng/llama.cpp/blob/b87ca7225456b06b0975b8239c66b5aecf07e37c/tests/test-mtp-catchup-batch.cpp) | 812 | `48d136ab03706c888eb393a771a6e1c7ec0c4ac0be1d7581d58a35bb57f1aae0` |
+
+Retain the upstream MIT terms in [LICENSE](LICENSE). Source identities are reviewed
+source observations, not captured native output. Reports identify target
+`rust-reference` and `ObservationProvider.Kind: independent-rust-mathematical`,
+with `NativeReferenceReplay`, `CompleteSourceGate` and `NativeRetirementQualified`
+false. The selector rejects other sources, full catalogs, benchmarks, diagnostics
+and native bridge options. Existing `cpp` and `rust` routes and their native
+acceptance remain unchanged; this provider does not replace the complete owning
+reference gate or authorize deleting the common dispatcher. Backend geometries,
+source inventories, approved green IDs and separate performance schedules remain
+required.

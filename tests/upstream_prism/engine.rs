@@ -22,6 +22,7 @@ const BRIDGE_TIMEOUT: Duration = Duration::from_secs(90);
 pub(super) enum Target {
     Cpp,
     Rust,
+    RustReference,
 }
 
 pub(super) struct Pq2Input {
@@ -71,6 +72,12 @@ impl Engine {
         source_directory: Option<PathBuf>,
         asset_directory: Option<PathBuf>,
     ) -> Result<Self> {
+        if matches!(target, Target::RustReference) && (bridge.is_some() || common_bridge.is_some())
+        {
+            return Err(invalid(
+                "the independent Rust reference cannot load native bridges",
+            ));
+        }
         for path in [&bridge, &common_bridge].into_iter().flatten() {
             if !path.is_absolute() || !path.is_file() {
                 return Err(invalid("native bridge must be an existing absolute file"));
@@ -218,6 +225,9 @@ impl Engine {
         match self.target {
             Target::Cpp => self.cpp(name, requests),
             Target::Rust => Ok(requests.iter().map(rust_operation).collect()),
+            Target::RustReference => Err(invalid(
+                "the independent Rust reference has no GGML provider",
+            )),
         }
     }
 
@@ -268,6 +278,9 @@ impl Engine {
             return Err(invalid(
                 "extended graph-controller deadlines require the main CI backend lane",
             ));
+        }
+        if matches!(self.target, Target::RustReference) {
+            return super::reference_provider::execute(request).map(Some);
         }
         if matches!(self.target, Target::Rust) {
             if let Some(response) = super::engine_schema::execute(request)? {
@@ -337,6 +350,9 @@ impl Engine {
         match self.target {
             Target::Cpp => self.execute_common(name, request),
             Target::Rust => super::engine_codec::execute(request),
+            Target::RustReference => Err(invalid(
+                "the independent Rust reference has no codec provider",
+            )),
         }
     }
 

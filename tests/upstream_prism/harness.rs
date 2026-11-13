@@ -90,6 +90,7 @@ mod quantize_perf;
 mod quantize_stats;
 mod reasoning_budget;
 mod recurrent_rollback;
+mod reference_provider;
 mod schema_python;
 mod tokenizer_roundtrip;
 mod validator;
@@ -633,7 +634,8 @@ fn options() -> Result<Options> {
                 target = Some(match value.to_str() {
                     Some("cpp") => Target::Cpp,
                     Some("rust") => Target::Rust,
-                    _ => return Err(invalid("--target must be cpp or rust")),
+                    Some("rust-reference") => Target::RustReference,
+                    _ => return Err(invalid("--target must be cpp, rust or rust-reference")),
                 });
             }
             Some("--case") if case.is_none() => {
@@ -698,6 +700,17 @@ fn options() -> Result<Options> {
 
 impl Options {
     fn validate(&self) -> Result<()> {
+        if matches!(self.target, Target::RustReference)
+            && (self.case.is_none_or(|case| case.id != MTP_ID)
+                || self.benchmark.is_some()
+                || self.diagnostic.is_some()
+                || self.bridge.is_some()
+                || self.common_bridge.is_some())
+        {
+            return Err(invalid(
+                "rust-reference supports only the explicit MTP source case without native bridges, benchmarks or diagnostics",
+            ));
+        }
         if self.case.is_none()
             && self.benchmark.is_none()
             && self.diagnostic.is_none()
@@ -928,13 +941,16 @@ fn main() -> Result<()> {
             .map(|case| (case.run)(&engine))
             .collect::<Result<Vec<_>>>()?
     };
-    let report = json!({
+    let mut report = json!({
         "SchemaVersion": 1,
         "UpstreamCommit": UPSTREAM,
-        "Target": match options.target { Target::Cpp => "cpp", Target::Rust => "rust" },
+        "Target": match options.target { Target::Cpp => "cpp", Target::Rust => "rust", Target::RustReference => "rust-reference" },
         "Cases": cases,
         "Measure": if options.benchmark.is_some() { "benchmark-workloads" } else if options.diagnostic.is_some() { "diagnostic-workloads" } else { "upstream-source-files" },
     });
+    if matches!(options.target, Target::RustReference) {
+        report["ObservationProvider"] = reference_provider::identity();
+    }
     fs::write(options.output, serde_json::to_vec_pretty(&report)?)?;
     // Measured failures belong in the report. Nonzero exits indicate an
     // infrastructure failure, including corrupt inputs or bridge responses.

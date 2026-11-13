@@ -151,6 +151,8 @@ fn ordered_profile_fixture(pinned: bool, full_last: bool) -> Model {
 #[test]
 fn rotated_kv_tiled_prefill_retains_policy_bits_and_packed_page_storage() -> Result<()> {
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        let empty = tile_profile(graph(policy, MatvecBackend::Scalar)?, false)?;
+        assert!(empty.with_chunkwise_gdn_prefill().is_err());
         for pinned in [false, true] {
             for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
                 for full_last in [false, true] {

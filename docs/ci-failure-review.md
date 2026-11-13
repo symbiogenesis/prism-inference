@@ -2,8 +2,8 @@
 
 The review selected the newest 30 runs with conclusion `failure` from
 `symbiogenesis/prism-inference`, ordered by creation time. The fixed snapshot spans
-2026-11-12 10:25:20 UTC through 2026-11-13 19:13:46 UTC: 17 Foundation runs, eight
-Hexagon boundary runs, four Foundation bundle runs and one Source checks run.
+2026-11-12 13:28:30 UTC through 2026-11-13 21:07:12 UTC: 18 Foundation runs, six
+Hexagon boundary runs, four Foundation bundle runs and two Source checks runs.
 All 30 job inventories and failed-step logs were available and read. Later failures
 are outside this snapshot. Cancelled runs and individual failed jobs are not separate
 entries in this run-level sample.
@@ -12,9 +12,15 @@ The repeated shard rejection is a CI inventory false positive: optional or unrel
 workspace feature forwarding is treated as proof that a selected default test needs
 an unresolved feature. Fourteen runs contain it, often alongside genuine failures.
 One run also exposes a stale exact-output fixture after useful CLI diagnostics were
-added. Compiler, lint, formatting and documentation failures remain real source
-failures under the repository's strict contracts. The sample supplies no reason to
-retry whole tests automatically, weaken lint policy or accept incomplete coverage.
+added. The newest Source checks run reports a successful workflow preflight but
+fails because an expected negative control leaves a native exit status of one for
+GitHub's PowerShell wrapper. This is a second CI false positive. The newest three
+Foundation runs instead reach the tests: their tiny packed-KV graph fixtures request
+production-only Swift RoPE geometry, and the newest run also exposes an x64
+signed-zero assumption. The current shard planner succeeds in those runs.
+Compiler, lint, formatting and documentation failures remain real source failures
+under the repository's strict contracts. The sample supplies no reason to retry
+whole tests automatically, weaken lint policy or accept incomplete coverage.
 
 ## Run inventory
 
@@ -25,14 +31,21 @@ Findings use these codes:
 - **D**: unresolved `Decoder::ingest_block` rustdoc link in `src/graph/prefill.rs`.
 - **C**: Swift state constant/re-export visibility, dead-code or import lints.
 - **U**: `unused_self` in the feature-disabled sibling-matrix implementation.
-- **T**: strict test lints: empty assertions, raw-pointer borrow or unfulfilled expectation.
+- **T**: strict test lints: empty assertions, raw-pointer borrow, unfulfilled
+  expectation or oversized test helper.
 - **E**: CPU bundle example lints: unchecked deadline subtraction and event ownership.
-- **N**: ARM64 helper takes a trivially copied array by reference.
 - **F**: Rust formatting differences.
 - **M**: Markdown line-length violation.
+- **W**: successful workflow controls leak their expected native failure status.
+- **R**: tiny packed-KV fixtures request production-only Swift RoPE geometry.
+- **Z**: x64 zero-storage fixture assumes an architecture-independent zero sign.
 
 | Run | Workflow | Source revision | Findings |
 | --- | --- | --- | --- |
+| [43507784313](https://github.com/symbiogenesis/prism-inference/actions/runs/43507784313) | Source checks | `77f1f43ff3de3a037a3c86775da70d59fab76c03` | W |
+| [43507784211](https://github.com/symbiogenesis/prism-inference/actions/runs/43507784211) | Foundation | `77f1f43ff3de3a037a3c86775da70d59fab76c03` | R, Z |
+| [43497455964](https://github.com/symbiogenesis/prism-inference/actions/runs/43497455964) | Foundation | `9846c00d1a746ca58451debe974e9fc285d25536` | R, T |
+| [43494239120](https://github.com/symbiogenesis/prism-inference/actions/runs/43494239120) | Foundation | `4b21a9497ff3d196aba342997e2812199d1cceb7` | R, T |
 | [43490203477](https://github.com/symbiogenesis/prism-inference/actions/runs/43490203477) | Foundation | `1429a33772089dfd3a50a96c698b9dbe0b36836a` | S, D |
 | [43489026858](https://github.com/symbiogenesis/prism-inference/actions/runs/43489026858) | Bundle | `40118969e69d490634a9cd480ea68bd69758bfc8` | C |
 | [43488946876](https://github.com/symbiogenesis/prism-inference/actions/runs/43488946876) | Hexagon | `40118969e69d490634a9cd480ea68bd69758bfc8` | C |
@@ -59,12 +72,11 @@ Findings use these codes:
 | [43231093290](https://github.com/symbiogenesis/prism-inference/actions/runs/43231093290) | Hexagon | `d31a196cc68030723297a1440945c0c401145f35` | U |
 | [43231092924](https://github.com/symbiogenesis/prism-inference/actions/runs/43231092924) | Foundation | `d31a196cc68030723297a1440945c0c401145f35` | S, U |
 | [43227626826](https://github.com/symbiogenesis/prism-inference/actions/runs/43227626826) | Foundation | `8d2b3067e5f17369f579857a180c01a422a58211` | U, J |
-| [43227626785](https://github.com/symbiogenesis/prism-inference/actions/runs/43227626785) | Hexagon | `8d2b3067e5f17369f579857a180c01a422a58211` | U |
-| [43220096954](https://github.com/symbiogenesis/prism-inference/actions/runs/43220096954) | Hexagon | `85048102d133dc649029ca2d0e49910814681410` | U |
-| [43220096847](https://github.com/symbiogenesis/prism-inference/actions/runs/43220096847) | Foundation | `85048102d133dc649029ca2d0e49910814681410` | N, U, T |
-| [43200223412](https://github.com/symbiogenesis/prism-inference/actions/runs/43200223412) | Foundation | `a5ee5b6d47fb0a2031c3e6bd410a875f0afbf0a7` | D |
 
 ## Improvements selected from the evidence
+
+The existing source already contains the first five safeguards below. The newer
+failures distinguish those repairs from the additional corrections required now.
 
 1. Resolve the actual selected Cargo unit graph and target before sharding in
    [the shard planner](../.github/ci/foundation_shards.py).
@@ -86,6 +98,20 @@ Findings use these codes:
 5. Surface source/run/attempt, runner image, compiler, target, selected packages,
    feature flags and lane alongside failures. Distinguish the failing command
    from downstream aggregate rejection and preserve the original nonzero result.
+6. Restore the caller's native exit status after expected workflow-control
+   failures, and make successful standalone preflight completion explicit.
+   Exercise the actual GitHub PowerShell exit wrapper in a subprocess so printed
+   success cannot conceal a failing job status. Real preflight rejection must
+   retain its nonzero result.
+7. Give the packed-KV profile fixture the valid Swift RoPE metadata required
+   by its selected pinned kernel: rotary width 64, sections `[16, 8, 8, 0]` and
+   frequency base 10,000,000. Use the same fixture for the scalar and pinned
+   controls. Preserve production geometry checks and the full policy, storage,
+   causal-state and row-by-row verification assertions.
+8. Derive the zero-adapter fixture's expected output bits from the same target
+   selection as its arithmetic. Windows ARM64 NEON explicitly adds positive zero
+   before scaling; the portable sum preserves negative zero. Keep exact output-bit and
+   stored-factor-bit assertions for both paths.
 
 These changes preserve the original correctness obligations and the bundle lane's
 limited qualification scope. They add no model run, benchmark, push or CI dispatch.

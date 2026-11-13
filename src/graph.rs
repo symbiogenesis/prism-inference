@@ -26,7 +26,7 @@ use crate::model::{Model, Tensor};
 use crate::{Decoder, Result, invalid};
 
 mod swift_state;
-pub(crate) use swift_state::SWIFT_RSQ4_FULL_STATE_BYTES;
+pub(crate) const SWIFT_RSQ4_FULL_STATE_BYTES: usize = swift_state::SWIFT_RSQ4_FULL_STATE_BYTES;
 mod projection;
 pub use projection::ProjectedQwen35;
 mod prefill;

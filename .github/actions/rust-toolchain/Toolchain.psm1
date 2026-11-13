@@ -1,8 +1,11 @@
 #Requires -Version 7.6
 Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 
 function Install-VerifiedRustToolchain {
     [CmdletBinding()]
+    [OutputType([string])]
     param(
         [Parameter(Mandatory)][string]$Toolchain,
         [Parameter(Mandatory)][string]$ExpectedHost,
@@ -30,7 +33,7 @@ function Install-VerifiedRustToolchain {
     $install = {
         $arguments = @('toolchain', 'install', $Toolchain, '--profile', 'minimal', '--no-self-update')
         if ($Components.Count) { $arguments += @('--component', ($Components -join ',')) }
-        & $RunRustup -Arguments $arguments | ForEach-Object { Write-Host $_ }
+        & $RunRustup -Arguments $arguments | ForEach-Object { Write-Information -MessageData $_ -InformationAction Continue }
     }
     $verify = {
         # rustup run never installs a missing compiler implicitly.
@@ -57,11 +60,11 @@ function Install-VerifiedRustToolchain {
         # fresh install, and require the replacement to pass the same checks.
         if (-not ($CacheRestored -and $HostedRunner)) { throw }
         Write-Warning "Discarding the invalid restored compiler: $_"
-        & $RunRustup -Arguments @('toolchain', 'uninstall', $Toolchain) | ForEach-Object { Write-Host $_ }
+        & $RunRustup -Arguments @('toolchain', 'uninstall', $Toolchain) | ForEach-Object { Write-Information -MessageData $_ -InformationAction Continue }
         & $install
         $identity = & $verify
     }
-    $identity | Write-Host
+    foreach ($line in $identity) { Write-Information -MessageData $line -InformationAction Continue }
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($identity -join "`n")))).ToLowerInvariant()
 }
 

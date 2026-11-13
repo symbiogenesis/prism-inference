@@ -1,14 +1,22 @@
 #Requires -Version 7.6
 [CmdletBinding()]
+[OutputType([void])]
 param([string]$Case = '*')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 Import-Module (Join-Path $PSScriptRoot '../actions/rust-toolchain/Toolchain.psm1') -Force
 
-function Assert-Condition([bool]$Condition, [string]$Message) {
+function Assert-Condition {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
 }
 function New-RustupFixture {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
     $toolchain = 'nightly-2026-11-09-aarch64-pc-windows-msvc'
     $path = Join-Path ([IO.Path]::GetTempPath()) "fixture-rustup/toolchains/$toolchain"
     $state = @{
@@ -125,6 +133,6 @@ $selected = @($cases.Keys | Where-Object { $_ -like $Case })
 if (-not $selected.Count) { throw "Unknown toolchain fixture: $Case" }
 foreach ($name in $selected) {
     & $cases[$name]
-    Write-Host "PASS $name"
+    Write-Information -MessageData "PASS $name" -InformationAction Continue
 }
-Write-Host "Passed $($selected.Count) toolchain fixture(s)."
+Write-Information -MessageData "Passed $($selected.Count) toolchain fixture(s)." -InformationAction Continue

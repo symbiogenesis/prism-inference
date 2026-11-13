@@ -54,7 +54,7 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                     arithmetic,
                     &RowParallelism::default(),
                 )?;
-                for (head, actual) in scores.chunks_exact(66).enumerate() {
+                for (head, actual) in scores.as_chunks::<66>().0.iter().enumerate() {
                     let mut query = [0.0; HEAD_DIM];
                     key_cache
                         .quantizer
@@ -70,10 +70,10 @@ fn x1_prepared_kv_attention_matches_defensive_scores_across_pages() -> Result<()
                     }
                     match arithmetic {
                         super::super::Arithmetic::Source => {
-                            crate::kernels::softmax_round_f16(&mut expected)?
+                            crate::kernels::softmax_round_f16(&mut expected)?;
                         }
                         super::super::Arithmetic::PinnedSwift => {
-                            crate::kernels::pinned_attention::softmax_rotated_kv(&mut expected)?
+                            crate::kernels::pinned_attention::softmax_rotated_kv(&mut expected)?;
                         }
                     }
                     assert_eq!(

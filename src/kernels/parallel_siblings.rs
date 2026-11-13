@@ -15,6 +15,13 @@ struct Task<'a> {
 impl RowParallelism {
     /// Retain each matrix's original contiguous worker partitions and row order.
     /// Task slots are sibling-major, so completion order cannot select an error.
+    #[cfg_attr(
+        not(feature = "parallel-rows"),
+        expect(
+            clippy::unused_self,
+            reason = "The shared receiver selects the worker pool only when parallel rows are enabled."
+        )
+    )]
     pub(in crate::kernels) fn fill_siblings(
         &self,
         data: &[&[u8]],

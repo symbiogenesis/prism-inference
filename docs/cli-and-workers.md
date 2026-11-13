@@ -2,168 +2,140 @@
 
 [Documentation index](index.md) · [Build and validation](build-and-validation.md) · [Runtime contracts](runtime-contracts.md)
 
+Use each executable's `--help` for its complete startup arguments.
+
 ## Inspect compiled support
 
-Run `prism-inference --capabilities` alone to emit one bounded version-one JSON
-record without model I/O or device execution. The `runtime.target` facts describe
-the executable target, including an emulated process. `cpu.neon_build_eligible`
-uses the same production kernel predicate as actual dispatch; it is a build fact,
-not a host ISA probe or a promise that every operation uses NEON. Unsupported
-targets and builds without the `experimental-neon` feature report false.
+Run `prism-inference --capabilities` alone for a version-one JSON record without
+model I/O or device execution. `runtime.target` describes the executable target,
+including emulation. `cpu.neon_build_eligible` reports build eligibility, not host
+ISA detection or per-operation dispatch. It is false on unsupported targets and
+without `experimental-neon`.
 
-`supported_contracts` lists the graph identity suffixes used by the generic
-Qwen35 decoder and the exact pinned Swift artifact. Complete decoder identities
-also include the verified model SHA-256. These suffixes identify implementation
-contracts; they do not establish portable checkpoints or qualify a model/device.
-Vulkan and Hexagon are unavailable and `qualification` remains `unqualified`.
-Consumers must reject unsupported schema versions and retain independent artifact,
-evidence and resource admission. This inventory does not select a profile or
-change generation defaults. Additional options alongside `--capabilities` reject.
+`supported_contracts` lists generic Qwen35 and pinned Swift graph-identity
+suffixes; complete decoder identities also include the verified model SHA-256.
+These identify arithmetic contracts, not portable checkpoints. Vulkan and Hexagon
+are unavailable through this entry point; `qualification` is `unqualified`.
+Consumers must reject unsupported schema versions and independently verify
+artifacts and resource admission.
 
 ## Generate from text or token IDs
 
-Generation (the default `--mode generate`) requires an absolute model path,
+Generation defaults to `--mode generate`. It requires an absolute model path,
 expected length/SHA-256, retained-model and context/checkpoint budgets, one input
-form and a generation limit. It validates
-identity syntax, positive bounds, prompt-plus-generation capacity and the
-256-stop-token limit before model I/O; vocabulary checks follow verified loading.
-Supply `--tokens <id,id,...>` from the reference tokenizer, or use experimental
-`--prompt <text>` for plain UTF-8 encoding. `--prompt-file <absolute-path>` reads
-exact UTF-8 from a file, and `--prompt-file -` reads stdin through EOF. These
-input options and `--tokens-file <absolute-path|->` are mutually exclusive.
-Token files contain one strict JSON array of unsigned 32-bit IDs, for example
-`[42,17,42]`. Whitespace is allowed; comments, trailing JSON, negative/fractional
-IDs and values above `4294967295` reject. The driver requires a nonempty array
-within the prompt allowance and preserves exact order and duplicates. A token
-file has the same 1 MiB byte bound, including whitespace, and no text parsing or
-BOS/EOS insertion applies. The byte bound is independent of the token allowance;
-a sequence that fits the context can still exceed the JSON byte bound.
-Vocabulary validation follows verified model loading.
-File/stdin input keeps prompt bodies out of process arguments. Text prompts
-preserve every byte, including CR/LF and a UTF-8 BOM; empty, malformed UTF-8 and
-inputs larger than 1 MiB reject before model verification. Other option
-validation precedes stdin reading; input reads have no timeout. The generation
-timeout still begins after model loading.
-`--special-input literal|parse` is available only with text input;
-literal is the default. Text encoding applies no chat template or BOS/EOS
-insertion by default, even if insertion flags are present in metadata. Supply
-explicitly formatted text when control tokens are intended. `--insert-special model` opts
-text input into the verified model's BOS/EOS insertion flags; `none` is the
-default. Only true flags insert IDs. Insertion does not suppress existing
-boundary IDs, and all inserted IDs consume the prompt allowance. Token-ID input
-rejects this option and remains exact. Text input records
-`input_mode: "text"` and the effective `special_input` policy in the completion.
-Its exact encoded count must leave the entire output allowance in the context;
-overflow rejects before graph execution. The verified model must
-declare a valid EOS ID; its EOS and optional EOT/EOM IDs always stop generation.
-`--stop-tokens` adds IDs to that set, deduplicated under a combined 256-ID bound.
-Stops are neither emitted nor committed to the conversation. BOS/padding IDs and
-insertion flags are validated; supplied token-ID prompts remain unchanged.
+form and a generation limit. Bounds and identity syntax are checked before model
+I/O; vocabulary IDs are checked after verified loading.
+
+| Input | Format |
+| --- | --- |
+| `--prompt <text>` | Plain UTF-8 text |
+| `--prompt-file <absolute-path\|->` | Exact UTF-8 from a file or stdin through EOF |
+| `--tokens <id,id,...>` | Exact token IDs |
+| `--tokens-file <absolute-path\|->` | One strict JSON array of unsigned 32-bit IDs |
+
+Inputs are mutually exclusive and must be nonempty. File/stdin input has a 1 MiB
+byte bound, independent of the prompt-token allowance. Text preserves CR/LF and
+a UTF-8 BOM; malformed UTF-8 rejects. Token arrays preserve order and duplicates;
+comments, trailing JSON, negative/fractional IDs and values above `4294967295`
+reject. File/stdin reads have no timeout; other option validation precedes them.
+
+Text encoding applies no chat template. `--special-input literal|parse` defaults
+to literal. `--insert-special none|model` defaults to none; model mode applies the
+verified BOS/EOS insertion flags without suppressing existing boundary IDs.
+Inserted IDs consume the prompt allowance. Token-ID input accepts neither option
+and applies no parsing or insertion.
+
+The encoded prompt must leave the full output allowance in context. The model
+must declare a valid EOS ID; EOS and optional EOT/EOM always stop generation.
+`--stop-tokens` adds IDs under a combined 256-distinct-ID bound. Stops are neither
+emitted nor committed. Completion accounting records the effective input and stop
+policies.
 
 ## Streaming output and generation controls
 
-The source development default for the exact verified Swift PQ2/PTQ1 identities
-is K4/V4 `--kv-cache rsq4`; other models retain FP16. Rotated profiles require
-256-channel full-attention heads. Use `--kv-cache f16` for explicit reference or
-comparison/recovery; unsupported rotated geometry rejects without fallback.
-`rsq4k3v` remains opt-in. Completion records identify the selected
-cache and numerical graph; this choice does not establish quality or device benefit.
+The exact verified Swift PQ2/PTQ1 identities default to K4/V4 `--kv-cache rsq4`;
+other models use FP16. Rotated profiles require 256-channel full-attention heads
+and reject unsupported geometry. Select `f16` for reference/recovery or opt into
+`rsq4k3v`; see [quantized KV](quantized-kv.md).
 
-Output defaults to one JSON token object per line followed by accounting, which
-includes the effective `stop_tokens`. Optional `--output text` adds `bytes`,
-`text` and `special` to each token record. It requires matching `gpt2`/`qwen35`
-vocabulary metadata. `bytes` preserves the decoded token exactly; `text` buffers
-incomplete UTF-8 across records and displays invalid byte sequences as U+FFFD.
-Literal control-token spellings are retained and marked `special: true`.
-The final accounting record has a `text` field that flushes any truncated UTF-8
-suffix as U+FFFD; concatenate all `text` fields for display, or all token `bytes`
-for lossless output. These records remain provisional until final success.
-Optional `--timeout-seconds <1..3600>` bounds generation from immediately before
-the runtime request, including prefill, delivery and checkpoint work. Model
-verification/loading and graph construction precede that deadline. Omit the
-option to retain cancellation-only behavior. A timeout fails the command;
-already streamed tokens are provisional and no success record follows.
-Optional `--prefill-block-tokens <1..256>` selects the reference block boundary;
-the default is one. `prefill_block_tokens` records the selected size. This changes
-scheduling boundaries while retaining sequential graph operations.
-Optional `--sampling reference --seed <u64>` selects experimental stochastic
-sampling. `--temperature`, `--top-k` and `--top-p` default to 1, 20 and 0.95;
-top-k zero retains the full vocabulary, and top-p must be in `(0, 1]`.
-All sampling controls require that explicit mode. The completion's `sampling`
-object records the mode, effective options, seed and RNG. The reference draws
+Output is one JSON token object per line followed by accounting. `--output text`
+adds `bytes`, `text` and `special`, requiring matching `gpt2`/`qwen35` vocabulary
+metadata. `bytes` preserves the token exactly. `text` buffers incomplete UTF-8
+across records and replaces invalid sequences with U+FFFD. Control-token spellings
+remain literal and carry `special: true`. Final accounting flushes any incomplete
+suffix. Concatenate all `text` fields for display or all token `bytes` for
+lossless output. All output is provisional until final success.
+
+| Option | Behavior |
+| --- | --- |
+| `--timeout-seconds <1..3600>` | Bounds the runtime request, including prefill, delivery and checkpoints; excludes model loading and graph construction. Omission leaves cancellation-only behavior. |
+| `--prefill-block-tokens <1..256>` | Reference block boundary, default one; graph operations remain sequential. |
+| `--sampling reference --seed <u64>` | Experimental stochastic mode; greedy is the default. |
+| `--temperature`, `--top-k`, `--top-p` | Require reference sampling; defaults 1, 20 and 0.95. Top-k zero keeps the full vocabulary; top-p is in `(0, 1]`. |
+
+A timeout fails without a success record. The completion records the selected
+cache, graph, prefill boundary and sampling settings. Reference sampling draws
 the upper 32 SplitMix64 bits after ranking, temperature, top-k and nucleus
-selection; it does not reproduce Prism's C++ RNG or establish stochastic parity.
-Greedy remains the default and records only its mode. Model stops still apply.
+selection; it does not reproduce Prism's C++ RNG.
 
 ## Sampling and stop policies
 
-Library callers can pass an independently cloneable `Sampler` through
-`Runtime::generate_sampled` or `generate_sampled_until`. Any returned error
-restores the sampler alongside graph state, even when decoder recovery fails.
-Successful stop-token draws advance the sampler without emitting the stop.
-Shared mutable state and external side effects are outside this recovery contract.
-`SpecialTokens::generation(max_tokens, caller_stops)` builds the driver's same
-checked EOS/EOT/EOM-plus-caller stop set. It validates vocabulary IDs, preserves
-first occurrence order and admits at most 256 distinct stops. Output must leave
-room for a nonempty prompt within the maximum context; the runtime still checks
-the actual prompt/context. Insertion flags do not disable declared generation stops.
-The driver does not render chat templates, launch the broker or promote a profile.
+Library callers supply an independently cloneable `Sampler` to
+`Runtime::generate_sampled` or `generate_sampled_until`. Errors restore sampler
+and graph state, even if decoder recovery fails. Successful stop-token draws
+advance the sampler. External side effects and shared mutable sampler state are
+outside this rollback contract.
+
+`SpecialTokens::generation(max_tokens, caller_stops)` builds the same checked
+EOS/EOT/EOM-plus-caller stop set as the driver, preserving first occurrence order.
+It validates IDs, the 256-stop bound and space for a nonempty prompt. Insertion
+flags do not disable generation stops.
 
 ## Tokenize without constructing the graph
 
-Use `--mode tokenize` to inspect exact input IDs/count without graph allocation.
-This mode requires `--model`, `--bytes`, `--sha256`, `--memory-bytes`, `--context`
-and exactly one nonempty `--prompt`, `--prompt-file`, `--tokens` or `--tokens-file`
-input. Optional `--max-tokens` reserves that many context slots for future output;
-its default is zero. Text input uses the
-same special-token and insertion policies as generation. Generation-only options,
-including `--checkpoint-bytes`, are rejected. A single JSON record reports
-`token_ids`, `token_count`, `context`, `reserved_output_tokens`, effective input
-policies and artifact identity. Length/SHA-256 verification still reads the
-whole file, and bounded header buffering can read ahead into tensor data. The
-command retains only bounded metadata, materializes no tensors and executes no
-inference. The metadata budget excludes tokenizer scratch
-and output buffers; this is not process-memory admission or broker integration.
+`--mode tokenize` requires `--model`, `--bytes`, `--sha256`, `--memory-bytes`,
+`--context` and one input form from the table above. `--max-tokens` reserves future
+output slots and defaults to zero. Text uses the same parsing/insertion policies
+as generation. Generation-only options, including `--checkpoint-bytes`, reject.
+
+One JSON record reports IDs, count, context, reserved output, input policies and
+artifact identity. Verification reads the whole file, but the command retains
+only bounded metadata and constructs no inference graph. The metadata budget
+excludes tokenizer scratch and output buffers; it is not a process-memory cap.
 
 ## Reusable tokenization and text sessions
 
-Library callers can retain `tokenization::TokenizationSession` across requests.
-`TextTokenizationPolicy` makes literal/parse handling, boundary insertion and
-`TokenBudget { context, reserved_output_tokens }` explicit. `encode` returns
-exact `token_ids` and their prompt/context/output accounting; `check_tokens`
-validates and copies raw IDs with the same budget and never inserts tokens.
-`validate_tokens` applies those checks to borrowed IDs without allocating, for
-callers that only need a count or can serialize their existing storage. The session
-builds its tokenizer and special declarations from the same verified artifact,
-then releases the metadata and file handle. Invalid requests leave it reusable.
-Session construction requires a supported complete tokenizer even for later
-raw-ID requests. The CLI's existing raw-ID mode remains metadata-only and does
-not require BPE or pretokenizer support. Persistent broker transport and template
-rendering remain separate work.
+Retain `tokenization::TokenizationSession` for repeated requests.
+`TextTokenizationPolicy` selects special-input handling, boundary insertion and
+`TokenBudget { context, reserved_output_tokens }`.
 
-Service callers can similarly load `text_session::TextOutputSession` once with
-an independently pinned artifact length/hash and metadata budget. `piece(id)`
-borrows exact bytes; `is_control(id)` reports the declared type without choosing
-stop or display policy. The session retains no weights, graph, model handle or
-request state. Its vocabulary has separate count/per-piece/decoded-byte bounds;
-the metadata budget does not bound process memory. Feed each request's pieces
-to its own `Utf8Output`, preserving original bytes for lossless output, finishing
-on success and resetting abandoned output on cancellation. Neither session
-construction nor these synthetic checks establish full-model parity.
+| Method | Result |
+| --- | --- |
+| `encode` | Text IDs and prompt/context/output accounting |
+| `check_tokens` | Validated copy of raw IDs, with no insertion |
+| `validate_tokens` | Same raw-ID checks on borrowed storage, without allocation |
+
+Construction verifies the artifact and complete tokenizer, then releases the file
+handle and metadata. Invalid requests leave the session reusable. Raw CLI input
+can use metadata alone and does not require BPE/pretokenizer support.
+
+`text_session::TextOutputSession` separately verifies the artifact and retains
+only vocabulary data. `piece(id)` borrows exact bytes; `is_control(id)` reports
+the declared type. Feed pieces to a request-local `Utf8Output`, finish on success
+and reset abandoned output. Vocabulary count, per-piece size and decoded-byte
+bounds are independent of whole-process memory.
 
 ## Persistent token worker
 
-The default `cli` feature also builds `bonsai-token-worker`; `--help` lists its startup contract.
-Every setting is required: absolute `--model`, verified `--bytes`/`--sha256`, `--memory-bytes`,
-`--context`, `--reserved-output-tokens`, `--special-input literal|parse`,
-`--insert-special none|model` and `--max-frame-bytes` (1 through 1,048,576). Run it from an explicit
-external system-temp working directory, using the [checkout build commands](build-and-validation.md#build-a-checkout). `cargo run` still
-selects the original token driver by default.
+`bonsai-token-worker` requires absolute `--model`, verified `--bytes`/`--sha256`,
+`--memory-bytes`, `--context`, `--reserved-output-tokens`,
+`--special-input literal|parse`, `--insert-special none|model` and
+`--max-frame-bytes` (1 through 1,048,576). Run from an external system-temp working
+directory; see [building](build-and-validation.md#build-a-checkout).
 
-Read the flushed `type: "ready"` record before sending input. It identifies
-protocol `bonsai-token-worker-v1`, the verified model SHA-256, vocabulary and all
-fixed text/context/transport settings. Each request is one LF-terminated JSON
-object with exactly these fields:
+Wait for the flushed `type: "ready"` record. It identifies protocol
+`bonsai-token-worker-v1`, verified model SHA-256, vocabulary and fixed settings.
+Requests are LF-terminated JSON objects:
 
 ```json
 {"id":1,"op":"count","text":"Draft a scene."}
@@ -172,103 +144,77 @@ object with exactly these fields:
 {"id":4,"op":"encode_tokens","token_ids":[42,17]}
 ```
 
-Responses carry the request ID and exact `prompt_token_count`; `type: "encoded"`
-also returns ordered `token_ids`, while `type: "count"` omits them. Empty text
-follows the library's counting/insertion contract. Raw operations validate every
-ID against the verified vocabulary and preserve the exact sequence, including
-duplicates, boundary IDs and empty arrays. They apply no parsing or insertion;
-their count still reserves the complete startup output allowance. `text` and
-`token_ids` are exclusive and must match the selected operation.
-IDs are correlation values; the worker retains no global ID registry.
-Raw operations validate and reuse the decoded request array without making a
-second ID vector. Unescaped text borrows the frame; escaped JSON strings decode
-to owned text with the same tokenization policy.
-Duplicate/unknown fields and malformed
-frames return `invalid_request` with a null ID; encoding/context rejection returns
-`rejected_input` with the parsed ID. These failures preserve the session for later
-requests and expose no prompt text or underlying diagnostics.
+Responses echo the ID and `prompt_token_count`; `type: "encoded"` adds ordered
+`token_ids`, while `type: "count"` omits them. Raw operations preserve exact IDs,
+including empty arrays, with no parsing/insertion. Every operation reserves the
+startup output allowance. `text` and `token_ids` are exclusive and must match the
+operation. IDs are correlation values without a global registry.
+
+Duplicate/unknown fields and malformed frames return `invalid_request` with a
+null ID. Encoding/context rejection returns `rejected_input` with the parsed ID.
+Both preserve the session and omit prompt text and internal diagnostics.
 
 The frame bound counts bytes before LF, including CR in CRLF. An unterminated
-final frame receives `invalid_request`, followed by clean exit. Oversized frames
-and transport/allocation errors terminate the worker without draining input;
-discard incomplete output and restart. The synchronous transport has no deadline
-or cancellation protocol. Readiness establishes a verified tokenizer, not a
-rendered chat template, broker endpoint, inference backend or daily-service gate.
+final frame receives `invalid_request` and clean exit. Oversized frames and
+transport/allocation errors terminate without draining input: discard incomplete
+output and restart. The synchronous transport has no deadline or cancellation
+protocol.
 
 ## Token worker client
 
-With `cli` enabled, `token_client::TokenClient::connect` accepts caller-owned
-buffered input/output and an `ExpectedWorker`: independently pinned lowercase
-model SHA-256, vocabulary size, exact `WorkerConfig` and a separate response-frame
-bound. Readiness must match every identity/policy field before requests are sent.
-`count(text)` returns the checked count; `encode(text)` returns checked ordered
-IDs and fixed context/output accounting. `count_tokens(ids)` and
-`encode_tokens(ids)` preserve raw sequences, including empty input, independently
-of the pinned text parsing/insertion policy. Invalid vocabulary IDs or an exceeded
-prompt allowance reject locally before writing or consuming a correlation ID.
-Raw counts must equal the submitted length, and raw encode replies must match
-every submitted ID in order; a mismatch permanently disables the client.
-Request and response bounds each range from 1 byte through 1 MiB; an encoded
-response can exceed its request size, so choose the response budget explicitly.
+`token_client::TokenClient::connect` takes caller-owned buffered streams and
+`ExpectedWorker`: pinned lowercase model SHA-256, vocabulary size, exact
+`WorkerConfig` and a response-frame bound. Readiness must match before requests.
+
+`count`/`encode` handle text; `count_tokens`/`encode_tokens` preserve exact raw
+sequences. Invalid IDs or prompt overflow reject locally before writing or
+consuming an ID. Raw counts must equal the submitted length; raw encode replies
+must match every ID. Request and response bounds independently range from 1 byte
+through 1 MiB; encoded responses can exceed request size.
+
 Malformed, oversized, uncorrelated or inconsistent responses and transport errors
-disable the client. Local request-size rejection sends nothing, and a correlated
-`rejected_input` leaves the connection reusable. Errors contain static diagnostics.
-The caller owns transport deadlines, cancellation, process lifetime and shutdown;
-`into_parts` returns its streams without claiming a faulted connection is reusable.
+disable the client. Local size rejection sends nothing; correlated
+`rejected_input` leaves the connection reusable. Errors use static diagnostics.
+The caller owns deadlines, cancellation, process lifetime and shutdown.
+`into_parts` returns the streams without clearing a fault.
 
 ## Input readers and tokenizer APIs
 
-`prompt_input::read_prompt` is the driver's public file/stream reader. It preserves
-valid UTF-8 exactly, consumes at most 1 MiB plus one overflow byte and rejects
-empty, oversized or malformed input without returning partial text. I/O errors
-retain their kind with sanitized messages and return immediately, including
-interruption. Callers own input deadlines and must rewind or replace a failed
-stream before retrying a whole prompt.
+`prompt_input::read_prompt` reads at most 1 MiB plus one overflow byte and
+preserves exact UTF-8. Empty, oversized, malformed or failed reads return no
+partial text. I/O errors retain their kind with sanitized messages, including
+interruption. Callers own deadlines and must rewind or replace a failed stream.
 
-`token_input::read_tokens` similarly reads one strict JSON array with an explicit
-token limit and the independent 1 MiB byte bound. It consumes at most one overflow
-byte, uses checked unsigned decimal parsing and returns no partial sequence on
-failure. The library accepts an empty array; the driver requires a nonempty
-prompt. Neither reading path supplies cancellation or an input deadline.
+`token_input::read_tokens` applies a token limit and the same independent byte
+bound to one strict unsigned-32-bit JSON array. The library accepts an empty
+array; the driver requires a nonempty prompt. Failed reads return no partial IDs.
 
-`Bpe::from_metadata` validates normal vocabulary pieces and ranked merge rules.
-Input-only construction checks the full vocabulary without materializing decoded
-output pieces; composed tokenizers reuse that checked view for special spellings.
-`encode_piece` accepts one already pretokenized byte slice; `encode_pieces`
-preserves caller-supplied boundaries. Neither API finds Qwen35 regex boundaries,
-recognizes special input tokens, inserts BOS/EOS or renders a chat template.
-`Tokenizer::encode` composes those boundaries and the special-input policy for
-plain text. `encode_with_special_tokens` additionally applies a validated
-`SpecialTokens` contract with the same vocabulary size and explicit insertion
-flags; the caller must supply metadata from the same model. Using the merge core
-directly on arbitrary text does not establish tokenizer parity.
+`Bpe::from_metadata` validates vocabulary and ranked merges.
+`encode_piece` takes pretokenized bytes; `encode_pieces` preserves supplied
+boundaries. Use `Tokenizer::encode` to apply Qwen35 boundaries and special-input
+policy, or `encode_with_special_tokens` with a validated same-model
+`SpecialTokens` contract for insertion. These APIs do not render chat templates.
 
-Multi-piece encoding reuses one request-local node vector and candidate heap;
-scratch capacity is bounded by the largest admitted piece. The tokenizer consumes
-`Qwen35PreTokenizer::pieces` directly without collecting a slice vector. This
-checked iterator borrows the original text and stops after an error; callers must
-consume it completely to validate all piece limits. The collecting `split` API
-remains available. These changes retain immutable shared tokenizer state and do
-not establish measured allocation counts, throughput or full-model parity.
+`Qwen35PreTokenizer::pieces` borrows text and stops on error; consume the complete
+iterator to validate all piece limits. `split` collects the pieces. Request-local
+encoding scratch is bounded by the largest admitted piece.
 
 ## Swift worker and private HTTP server
 
-`bonsai-swift-worker` serves the currently pinned Swift model over JSONL.
-`SwiftClient` verifies readiness before count/completion/reset exchanges; the
-caller owns process lifetime, transport deadlines, cancellation and shutdown.
-`SwiftChatSession` applies the verified template and tokenizer, while
-`SwiftSession` supplies the production MT19937 sampler and transactional
-decoding. See [runtime contracts](runtime-contracts.md#status-and-integration).
-The worker uses the K4/V4 development default and accepts trusted startup
-`--kv-cache f16|rsq4|rsq4k3v`; client requests cannot change it. Non-FP16 readiness
-adds `kv_cache` and `startup_graph_identity`. `SwiftClient::connect` verifies the
-default; `connect_with_kv_cache` verifies an explicit comparison/recovery profile.
+`bonsai-swift-worker` serves the pinned Swift model over JSONL.
+`SwiftClient` checks readiness before count/completion/reset exchanges.
+`SwiftChatSession` applies the verified template and tokenizer; `SwiftSession`
+provides the MT19937 sampler and transactional decoding. See
+[runtime contracts](runtime-contracts.md#status-and-integration) and
+[session profiles](swift-session-profiles.md).
 
-`prism-inference-server` supplies the private authenticated HTTP contract used
-by SwiftBonsai's guarded Windows launcher. The owner verifies executable and
-model identity and retains process/Job ownership. See the
-[server guide](../server/README.md) for its ownership and streaming contract.
-Use each executable's `--help` for its startup arguments.
-The private server also defaults to K4/V4 and preserves explicit `--kv-cache f16`
-recovery. Application use requires the matching verified bundle and strict broker
-readiness contract; source defaults do not change a released application's pin.
+The worker defaults to K4/V4 and accepts trusted startup
+`--kv-cache f16|rsq4|rsq4k3v`; requests cannot change it. Non-FP16 readiness adds
+`kv_cache` and `startup_graph_identity`. `SwiftClient::connect` checks the default;
+`connect_with_kv_cache` checks an explicit profile. The caller owns transport
+deadlines, cancellation and process lifetime.
+
+`prism-inference-server` provides the private authenticated HTTP contract for an
+owning launcher. It also defaults to K4/V4 with explicit `f16` recovery. The owner
+verifies executable/model identity, readiness and process/Job ownership. See the
+[server guide](../server/README.md).

@@ -1,69 +1,26 @@
-<div align="center">
+# Prism Inference
 
-# 🔷 Prism Inference
+A Rust CPU runtime for Prism-compatible GGUF language models, with packed
+quantized weights, tokenization and streamed output. The first generation path
+supports the dense Qwen35 architecture used by Swift/Bonsai. The runtime is an
+independent implementation and links no C/C++ inference library.
 
-**A Rust CPU runtime for Prism-compatible language models.**
-
-GGUF models · Packed quantization · Local inference
-
-![Platform: Windows ARM64 and x64](https://img.shields.io/badge/Windows-ARM64_%26_x64-0078D4?style=flat-square)
-![Status: early development](https://img.shields.io/badge/status-early_development-D99A28?style=flat-square)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-50855B?style=flat-square)](LICENSE)
-
-[Download](https://github.com/symbiogenesis/prism-inference/releases) · [Documentation](docs/index.md) · [Roadmap](docs/roadmap.md)
-
-</div>
-
----
-
-Prism Inference runs language models on the CPU using Rust, with packed
-quantized weights, GGUF loading, tokenization and streamed output. It links no
-C/C++ inference library.
-
-The first generation path supports the dense Qwen35 architecture used by
-**Swift/Bonsai**. Broader Prism architectures and general model selection are
-in scope and planned. Prism Inference is an independent implementation, separate
-from PrismML's upstream runtime.
-
-> [!IMPORTANT]
-> **Early development.** Bounded original-PQ2 Swift workloads have retained
-> numerical evidence. Broader full-model, PTQ1/adapter and device qualification
-> remain open. See the [current status and roadmap](docs/roadmap.md) before
-> choosing it for an application.
-
-## At a glance
-
-| | Current support |
-| --- | --- |
-| **Runtime** | Rust CPU inference with bounded model and conversation storage |
-| **First model path** | Swift/Bonsai · dense Qwen35 · Prism GGUF |
-| **Acceleration** | Scalar reference kernels; eligible Windows ARM64 NEON |
-| **Windows bundles** | ARM64 and x64 executables, licenses and integrity receipts |
+**Experimental:** broader model support, full-model numerical qualification and
+device acceptance remain open. See the [roadmap](docs/roadmap.md).
 
 ## Get started
 
-[Download a release bundle](https://github.com/symbiogenesis/prism-inference/releases)
-for your Windows architecture, extract it, and start with:
+Follow the [build guide](docs/build-and-validation.md#build-a-checkout), then run:
 
 ```powershell
 .\prism-inference.exe --help
 ```
 
-Bundles contain prebuilt executables, so running them needs no Rust build.
-Models are separate downloads; the [CLI guide](docs/cli-and-workers.md) explains
-model identity, input options and resource budgets. SwiftBonsai provides model
-setup and a guarded launcher that consumes the prebuilt private server.
+Models are separate downloads. The [CLI guide](docs/cli-and-workers.md) explains
+artifact verification, input formats and resource budgets. For Rust integration,
+see the [library example](docs/build-and-validation.md#use-the-rust-library).
 
-For source installation or Rust library integration, follow the
-[build and library guide](docs/build-and-validation.md#install-from-source).
-It pins registry runtime **0.1.27** and the compiler. The
-[delivery record](docs/release-0.1.27.md) identifies the shared registry/binary
-source, unchanged helper versions and the published Windows ARM64 **0.1.27**
-bundle. That bundle statically links Microsoft's runtime and needs no separately
-installed Visual C++ runtime. GitHub binaries and crates.io packages remain
-separately verified deliveries; model qualification remains pending.
-
-## Included tools
+## Executables
 
 | Executable | Purpose |
 | --- | --- |
@@ -75,17 +32,13 @@ separately verified deliveries; model qualification remains pending.
 
 ## Documentation
 
-| Guide | What you'll find |
-| --- | --- |
-| [Documentation index](docs/index.md) | Where to start for each task |
-| [CLI and workers](docs/cli-and-workers.md) | Inputs, streaming, tokenization and service protocols |
-| [Runtime contracts](docs/runtime-contracts.md) | Implemented behavior, memory, ownership and SIMD |
-| [Building and validation](docs/build-and-validation.md) | Source builds, tests, CI and release bundles |
-| [Roadmap](docs/roadmap.md) | Current evidence, broader model support and remaining work |
+- [Documentation index](docs/index.md): task and reference guides.
+- [Runtime contracts](docs/runtime-contracts.md): API behavior, memory and ownership.
+- [Building and validation](docs/build-and-validation.md): compiler, checks and packaging.
+- [Roadmap](docs/roadmap.md): remaining work and qualification limits.
 
 ## License
 
 Original code and documentation use the [Apache License 2.0](LICENSE).
-Third-party material retains its terms, including Prism/ggml and Camelid MIT
-attributions in [NOTICE](NOTICE). Model weights and adapters are separate
-artifacts governed by their publishers' licenses.
+Third-party terms and attributions are listed in [NOTICE](NOTICE). Model weights
+and adapters are governed by their publishers' licenses.

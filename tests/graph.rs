@@ -2665,6 +2665,14 @@ fn native_driver_executes_verified_synthetic_gguf_and_enforces_state_budget() ->
         MetadataValue::U32(0),
     );
     let artifact = DriverArtifact::new(&model)?;
+    // Check the CLI's complete memory record against fixed fixture geometry.
+    // Only allocation/enum layout comes from a separate scalar decoder, so a
+    // compiler or target layout change does not stale the wire fixture.
+    let mut memory_control = Qwen35::with_backend(model, 16, MatvecBackend::Scalar)?;
+    for token in [0, 1, 1, 1] {
+        memory_control.ingest(token)?;
+    }
+    let live_state_storage_bytes = memory_control.state_memory()?.live_state_storage_bytes;
     for (backend, state_bytes, valid_digest, success) in [
         (None, None, true, true),
         (Some("auto"), None, true, true),
@@ -2709,6 +2717,17 @@ fn native_driver_executes_verified_synthetic_gguf_and_enforces_state_budget() ->
                         "stop_tokens": [0],
                         "sampling": { "mode": "greedy" },
                         "backend_requested": backend.unwrap_or("auto"),
+                        "graph_identity": format!("{}:qwen35-text-v1:nonflash-f16:kv-f16:gdn-f32", artifact.digest),
+                        "kv_cache": "f16",
+                        "state_memory": {
+                            "position": 4,
+                            "context_tokens": 16,
+                            "kv_payload_bytes": 32,
+                            "full_context_kv_payload_bytes": 128,
+                            "recurrent_payload_bytes": 0,
+                            "live_state_storage_bytes": live_state_storage_bytes,
+                            "scope": "live state capacities and metadata; excludes model, workspace, external checkpoints, allocator overhead and process/device memory",
+                        },
                         "state_budget_bytes": state_bytes.unwrap_or(bonsai_prism_runtime::graph::MAX_STATE_BYTES),
                         "prefill_block_tokens": if backend == Some("neon") { 4 } else { 1 },
                         "backend_statistics": {

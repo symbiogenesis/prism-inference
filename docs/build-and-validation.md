@@ -4,6 +4,10 @@
 
 ## Install from source
 
+The local runtime/server workspace is the unreleased [0.1.26
+candidate](release-0.1.26.md). The registry commands below intentionally retain
+the published 0.1.25 package; a local version bump supplies no release bytes.
+
 GitHub bundles and crates.io packages are separate deliveries. The published
 registry runtime is `0.1.25`; the latest verified Windows ARM64 development
 bundle remains `0.1.23`. The [0.1.25 registry delivery](release-0.1.25.md) and

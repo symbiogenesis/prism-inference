@@ -14,6 +14,10 @@ worker, private HTTP server, GGUF tooling, ternary codecs and native storage
 overlay. SwiftBonsai consumes a prebuilt server inside its guarded Windows Job;
 ordinary SwiftBonsai builds do not compile this runtime.
 
+Local runtime/server source now identifies the unreleased [0.1.26
+candidate](release-0.1.26.md). It includes selected-cache context accounting;
+the version change supplies no published package, binary bundle or Runner repin.
+
 The [0.1.25 registry delivery](release-0.1.25.md) advances all five public
 helpers and the runtime, including refreshed direct dependencies. Normal Cargo
 verification and all six public checksums passed. Its binary bundle and Runner

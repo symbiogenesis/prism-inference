@@ -467,7 +467,7 @@ fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> 
 }
 
 #[test]
-fn private_context_capacity_controls_admission_and_readiness() -> TestResult {
+fn private_context_capacity_controls_admission_and_readiness() -> Result<(), NativeBackendError> {
     let profile = ModelProfile {
         context_tokens: 32_768,
         ..ModelProfile::default()

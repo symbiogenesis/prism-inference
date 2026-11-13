@@ -4,7 +4,7 @@
 //! They do not establish that its authoring basis matches a particular model,
 //! and do not enable adapters in the private Swift HTTP service.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use bonsai_gguf::MetadataValue;
 
@@ -27,9 +27,8 @@ pub const SWIFT_ADAPTER_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAIRS: usize = 513;
 
 struct Factors {
-    a: Tensor,
     a_values: Vec<f32>,
-    b_values: Vec<f32>,
+    b_values: Arc<Vec<f32>>,
 }
 
 /// An immutable, explicitly admitted rank-one adapter for one base model.
@@ -41,6 +40,7 @@ pub struct RankOneAdapter {
     identity: String,
     base_identity: String,
     alpha: f32,
+    embedding: Option<(Tensor, Arc<Vec<f32>>)>,
     factors: BTreeMap<String, Factors>,
 }
 
@@ -153,6 +153,8 @@ impl RankOneAdapter {
             ));
         }
         let mut factors = BTreeMap::new();
+        let mut decoded_b: Vec<(&Tensor, Arc<Vec<f32>>)> = Vec::new();
+        let mut embedding = None;
         for (name, a) in &model.tensors {
             if let Some(target) = name.strip_suffix(".lora_a") {
                 let base_tensor = base
@@ -187,15 +189,13 @@ impl RankOneAdapter {
                     },
                 ];
                 validate_factor(b, &format!("{target}.lora_b"), &b_shape)?;
-                let b_values = decode_factor(b)?;
-                factors.insert(
-                    target.to_owned(),
-                    Factors {
-                        a: a.clone(),
-                        a_values,
-                        b_values,
-                    },
-                );
+                let b_values = decode_shared_factor(b, &mut decoded_b)?;
+                if target == "token_embd.weight" {
+                    // Embedding row lookup alone needs serialized A. Keep its
+                    // already shared B nearby to avoid another target lookup.
+                    embedding = Some((a.clone(), Arc::clone(&b_values)));
+                }
+                factors.insert(target.to_owned(), Factors { a_values, b_values });
             } else if let Some(target) = name.strip_suffix(".lora_b") {
                 if !model.tensors.contains_key(&format!("{target}.lora_a")) {
                     return Err(invalid("rank-one adapter A factor missing"));
@@ -211,6 +211,9 @@ impl RankOneAdapter {
             identity: model.identity,
             base_identity: base.identity.clone(),
             alpha: *alpha,
+            // Linear sites consume only decoded A values. Retaining their raw
+            // tensors would keep an unused second complete factor payload.
+            embedding,
             factors,
         })
     }
@@ -384,15 +387,11 @@ impl RankOneAdapter {
         output: &mut [f32],
         scratch: &mut Scratch,
     ) -> Result<()> {
-        let Some(factors) = self
-            .factors
-            .get("token_embd.weight")
-            .filter(|_| scale != 0.0)
-        else {
+        let Some((a, b_values)) = self.embedding.as_ref().filter(|_| scale != 0.0) else {
             return Ok(());
         };
-        row_into(&factors.a, token, &mut scratch.rank)?;
-        self.scale_and_finish(&factors.b_values, scale, output, scratch)
+        row_into(a, token, &mut scratch.rank)?;
+        self.scale_and_finish(b_values, scale, output, scratch)
     }
 
     fn scale_and_finish(
@@ -467,6 +466,28 @@ fn decode_factor(tensor: &Tensor) -> Result<Vec<f32>> {
     }
     Ok(values)
 }
+
+fn decode_shared_factor<'a>(
+    tensor: &'a Tensor,
+    decoded: &mut Vec<(&'a Tensor, Arc<Vec<f32>>)>,
+) -> Result<Arc<Vec<f32>>> {
+    // The approved loader already proves identical B storage. Keep that sharing
+    // after decoding without float equality, which collapses signed-zero bits.
+    if let Some((_, values)) = decoded.iter().find(|(other, _)| {
+        other.kind == tensor.kind
+            && other.dimensions == tensor.dimensions
+            && Arc::ptr_eq(&other.data, &tensor.data)
+    }) {
+        return Ok(Arc::clone(values));
+    }
+    let values = Arc::new(decode_factor(tensor)?);
+    decoded.try_reserve_exact(1)?;
+    decoded.push((tensor, Arc::clone(&values)));
+    Ok(values)
+}
+
+#[cfg(test)]
+mod storage_tests;
 
 #[cfg(test)]
 mod tests {

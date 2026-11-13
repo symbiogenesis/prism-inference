@@ -11,6 +11,10 @@ versions because their source has not changed. The current Windows ARM64 binary
 bundle is [0.1.26](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.26).
 Its registry source `53f2fcbc89bbdd43ca4b83aea234096626f26040` and binary source
 `ac941f2668ae93dba9824002b4597081457aa09f` retain distinct identities and checks.
+The published five-executable bundle imports `vcruntime140.dll` and requires
+the external ARM64 Visual C++ runtime. The local [0.1.27 preparation](release-0.1.27.md)
+adds target-specific static CRT linkage and a separate normal/delay-import gate;
+its registry and binary deliveries remain pending.
 Earlier [0.1.25 registry](release-0.1.25.md) and
 [0.1.23 binary](release-0.1.23.md) delivery records retain their original
 identities and qualification limits. Install the published registry source with

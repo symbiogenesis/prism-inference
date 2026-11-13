@@ -11,7 +11,8 @@ param(
     [Parameter(Mandatory)][ValidateSet('aarch64-pc-windows-msvc','x86_64-pc-windows-msvc')][string]$Target,
     [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{40}$')][string]$SourceRevision,
     [Parameter(Mandatory)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')][string]$Version,
-    [Parameter(Mandatory)][string]$Toolchain
+    [Parameter(Mandatory)][string]$Toolchain,
+    [switch]$RequireStaticRuntime
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -47,9 +48,6 @@ $channel = [regex]::Match($toolchainPin, '(?m)^channel = "(?<Channel>nightly-[0-
 if (-not $channel.Success -or $Toolchain -cne "$($channel.Groups['Channel'].Value)-$Target") {
     throw 'The release toolchain must match the pinned channel and target.'
 }
-[void][IO.Directory]::CreateDirectory($output)
-$files = Join-Path $output 'files'
-[void][IO.Directory]::CreateDirectory($files)
 $executables = @('prism-inference.exe','bonsai-token-worker.exe','bonsai-swift-worker.exe','prism-inference-server.exe','bonsai-gguf.exe')
 $machine = if ($Target -ceq 'aarch64-pc-windows-msvc') { 0xaa64 } else { 0x8664 }
 foreach ($name in $executables) {
@@ -64,7 +62,19 @@ foreach ($name in $executables) {
         $stream.Position = $offset
         if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne $machine) { throw "Executable target differs from bundle target: $name" }
     } finally { $reader.Dispose() }
-    [IO.File]::Copy($source, (Join-Path $files $name), $false)
+}
+if ($RequireStaticRuntime) {
+    $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $importArguments = @('-B', (Join-Path $PSScriptRoot 'check_release_imports.py'), '--machine', [string]$machine)
+    $importArguments += @($executables | ForEach-Object { Join-Path $build $_ })
+    $importCheck = Invoke-BonsaiNativeProcess -Executable $python -ArgumentList $importArguments -WorkingDirectory $build
+    if ($importCheck.ExitCode) { throw "Release import policy rejected the bundle: $($importCheck.StandardError.Trim())" }
+}
+[void][IO.Directory]::CreateDirectory($output)
+$files = Join-Path $output 'files'
+[void][IO.Directory]::CreateDirectory($files)
+foreach ($name in $executables) {
+    [IO.File]::Copy((Join-Path $build $name), (Join-Path $files $name), $false)
 }
 foreach ($name in @('LICENSE','NOTICE','PRISM-LICENSE.txt','CAMELID-LICENSE.txt')) {
     [IO.File]::Copy((Join-Path $repo $name), (Join-Path $files $name), $false)

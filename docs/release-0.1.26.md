@@ -43,6 +43,12 @@ matching exact source; actual-model qualification remains separate.
 
 ## Separate binary source and pending gates
 
+Subsequent read-only PE inspection found `vcruntime140.dll` imports in all five
+published executables. The archive contains no runtime DLL, so 0.1.26 requires
+the compatible external ARM64 Visual C++ runtime. Its published assets remain
+unchanged. The [0.1.27 preparation](release-0.1.27.md) targets a separately
+verified static-runtime replacement and supplies no new release bytes yet.
+
 The published experimental [0.1.26 Windows ARM64 bundle](https://github.com/symbiogenesis/prism-inference/releases/tag/v0.1.26)
 comes from source `ac941f2668ae93dba9824002b4597081457aa09f` and successful
 [Foundation bundle run 43480377743](https://github.com/symbiogenesis/prism-inference/actions/runs/43480377743).

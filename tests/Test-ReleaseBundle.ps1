@@ -21,7 +21,7 @@ $build = Join-Path $scratch 'build'
 foreach ($directory in @($fixture, $build, (Join-Path $fixture 'scripts'), (Join-Path $fixture 'server'))) {
     [void][IO.Directory]::CreateDirectory($directory)
 }
-foreach ($name in @('New-ReleaseBundle.ps1','Bonsai.Common.psm1','Bonsai.Native.psm1')) {
+foreach ($name in @('New-ReleaseBundle.ps1','check_release_imports.py','Bonsai.Common.psm1','Bonsai.Native.psm1')) {
     [IO.File]::Copy((Join-Path $repo "scripts/$name"), (Join-Path $fixture "scripts/$name"), $false)
 }
 foreach ($name in @('LICENSE','NOTICE','PRISM-LICENSE.txt','CAMELID-LICENSE.txt')) {
@@ -31,11 +31,15 @@ foreach ($name in @('LICENSE','NOTICE','PRISM-LICENSE.txt','CAMELID-LICENSE.txt'
 [IO.File]::WriteAllText((Join-Path $fixture 'server/Cargo.toml'), "[package]`nname = `"prism-inference-server`"`nversion = `"0.1.2`"`n[dependencies]`nbonsai-prism-runtime = { package = `"prism-inference`", path = `"..`", version = `"=0.1.2`" }`n")
 [IO.File]::WriteAllText((Join-Path $fixture 'rust-toolchain.toml'), "[toolchain]`nchannel = `"nightly-2026-11-09`"`n")
 foreach ($name in @('prism-inference.exe','bonsai-token-worker.exe','bonsai-swift-worker.exe','prism-inference-server.exe','bonsai-gguf.exe')) {
-    $bytes = [byte[]]::new(128)
+    $bytes = [byte[]]::new(512)
     [BitConverter]::GetBytes([uint16]0x5a4d).CopyTo($bytes, 0)
     [BitConverter]::GetBytes([uint32]0x40).CopyTo($bytes, 0x3c)
     [BitConverter]::GetBytes([uint32]0x4550).CopyTo($bytes, 0x40)
     [BitConverter]::GetBytes([uint16]0xaa64).CopyTo($bytes, 0x44)
+    [BitConverter]::GetBytes([uint16]240).CopyTo($bytes, 0x54)
+    [BitConverter]::GetBytes([uint16]0x20b).CopyTo($bytes, 0x58)
+    [BitConverter]::GetBytes([uint32]512).CopyTo($bytes, 0x94)
+    [BitConverter]::GetBytes([uint32]16).CopyTo($bytes, 0xc4)
     [IO.File]::WriteAllBytes((Join-Path $build $name), $bytes)
 }
 function Invoke-FixtureGit {
@@ -78,6 +82,7 @@ $parameters = @{
     SourceRevision = $revision
     Version = '0.1.2'
     Toolchain = 'nightly-2026-11-09-aarch64-pc-windows-msvc'
+    RequireStaticRuntime = $true
 }
 if ($Case -in @('Identity','Archive','All')) {
     $receipt = & (Join-Path $fixture 'scripts/New-ReleaseBundle.ps1') @parameters

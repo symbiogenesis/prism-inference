@@ -20,6 +20,7 @@ env:
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
   CARGO_BUILD_FINGERPRINT: content
   CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+  CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
 jobs:
   bundle:
     if: github.ref == 'refs/heads/main'
@@ -90,10 +91,37 @@ jobs:
           if ($receiptControls -notmatch '(?m)^Ran 6 tests in ' -or $receiptControls -notmatch '(?m)^OK\r?$') {
             throw 'All six inference-efficiency receipt controls must pass.'
           }
+          $importControls = (python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/test_release_imports.py') -v 2>&1 | Out-String)
+          $importControls | Write-Output
+          if ($importControls -notmatch '(?m)^Ran 5 tests in ' -or $importControls -notmatch '(?m)^OK\r?$') {
+            throw 'All five data-only PE import controls must pass.'
+          }
           cargo +nightly-2026-11-09 fetch --manifest-path $manifest --locked
           cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
           cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --offline --release -p prism-inference -p prism-inference-server -p bonsai-hexagon-native -p bonsai-hexagon-runtime --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
           cargo +nightly-2026-11-09 check --manifest-path $manifest --locked --offline --release -p prism-inference --lib --no-default-features
+      - name: Verify only the named static-runtime unwind and drain controls
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $panicOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --lib kernels::parallel_rows::tile::tests::tiled_parallel_rows_worker_panic_cannot_strand_caller -- --exact 2>&1 | Out-String)
+          $drainOutput = (cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --offline --release -p prism-inference --features parallel-rows --test backend_threadpool failed_worker_group_drains_before_the_plan_is_reused -- --exact 2>&1 | Out-String)
+          foreach ($control in @(
+            @{ Name = 'kernels::parallel_rows::tile::tests::tiled_parallel_rows_worker_panic_cannot_strand_caller'; Output = $panicOutput },
+            @{ Name = 'failed_worker_group_drains_before_the_plan_is_reused'; Output = $drainOutput }
+          )) {
+            $control.Output | Write-Output
+            $expected = '(?m)^test ' + [regex]::Escape($control.Name) + ' \.\.\. ok\r?$'
+            $summary = '(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+'
+            if ([regex]::Matches($control.Output, '(?m)^running 1 test\r?$').Count -ne 1 -or
+                [regex]::Matches($control.Output, $expected).Count -ne 1 -or [regex]::Matches($control.Output, $summary).Count -ne 1) {
+              throw "The exact static-runtime control did not pass once: $($control.Name)"
+            }
+          }
       - name: Build and package only the five release executables
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -109,7 +137,7 @@ jobs:
             & (Join-Path $build ($name + '.exe')) --help
           }
           $output = Join-Path $env:RUNNER_TEMP ('PrismInference-ShortBundle-' + [guid]::NewGuid().ToString('N'))
-          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $target -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-11-09-$target" | ConvertTo-Json -Depth 8
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $target -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-11-09-$target" -RequireStaticRuntime | ConvertTo-Json -Depth 8
           [ordered]@{
             SchemaVersion = 1
             Kind = 'hosted-foundation-bundle-only'
@@ -120,8 +148,11 @@ jobs:
             RunId = $env:GITHUB_RUN_ID
             RunAttempt = $env:GITHUB_RUN_ATTEMPT
             ReceiptControlsPassed = 9
+            PeImportControlsPassed = 5
+            StaticRuntimeUnwindControlsPassed = 2
             FinalSourceChecksPassed = $true
             ProductionLinkingPassed = $true
+            ExternalVcRuntimeImportsAbsent = $true
             FullFoundationQualified = $false
             ModelAcceptanceQualified = $false
             PerformanceQualified = $false

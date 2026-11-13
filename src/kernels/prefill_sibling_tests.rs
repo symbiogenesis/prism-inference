@@ -18,10 +18,6 @@ fn bits(values: &[f32]) -> Vec<u32> {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep independent scalar arithmetic, all-output failure clearing and unsupported geometry controls together."
-)]
 fn x1_tiled_cpu_siblings_match_independent_matvec_and_clear_late_failure() -> Result<()> {
     let workers = if cfg!(feature = "parallel-rows") {
         4

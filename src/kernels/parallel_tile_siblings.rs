@@ -17,13 +17,6 @@ impl RowParallelism {
         clippy::too_many_arguments,
         reason = "Keep bounded sibling borrows, joined cancellation and ordered failures together."
     )]
-    #[cfg_attr(
-        feature = "parallel-rows",
-        expect(
-            clippy::too_many_lines,
-            reason = "The parallel branch keeps bounded task storage and joined cancellation auditable together."
-        )
-    )]
     pub(in crate::kernels) fn fill_tile_siblings_four_rows<const TOKENS: usize>(
         &self,
         data: &[&[u8]],

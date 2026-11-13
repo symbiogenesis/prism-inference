@@ -229,12 +229,12 @@ impl Fixture {
         assert!(
             previous
                 .basis
-                .is_some_and(|tensor| std::ptr::eq(tensor, &self.tensors[count - 1]))
+                .is_some_and(|tensor| std::ptr::eq(tensor, &raw const self.tensors[count - 1]))
         );
         assert!(
             previous
                 .prepared
-                .is_some_and(|tensor| std::ptr::eq(tensor, &self.tensors[count - 1]))
+                .is_some_and(|tensor| std::ptr::eq(tensor, &raw const self.tensors[count - 1]))
         );
         // Consume the returned proof again, ensuring it owns current prepared
         // activations rather than stale data from the prior projection.

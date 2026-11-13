@@ -1,378 +1,196 @@
-# CPU inference efficiency candidate
+# Inference execution
 
-The current source combines direct one-column F32 adapter and streaming BF16 projections,
-canonical-empty rollback checkpoint, native-order top-20 sampler, redundant
-empty-reset elimination and exact masked-attention padding pruning. Runner's
-released 0.1.22 pin does not include later local source changes described below.
-Source work and storage reductions are not measured end-to-end gains or permission
-to lower admission limits.
+This reference describes CPU/host execution and its invariants. Source work and
+storage counts do not establish machine traffic, latency, process-memory savings
+or permission to lower admission limits. Selection/resource contracts live in
+[runtime contracts](runtime-contracts.md), [row workers](parallel-rows.md),
+[CPU tiles](cpu-tiled-prefill.md) and [session profiles](swift-session-profiles.md).
 
-BF16 projections now consume each immutable weight directly from its two-byte
-payload after one complete tensor-geometry check. They preserve BF16 activation
-rounding, each separately rounded F32 product, the original binary64 sum and its
-final F32 rounding, including pinned execution. Every stored weight still receives
-its finite check; malformed geometry, nonfinite payloads/activations and overflow
-still reject with empty output. The decoded-row allocation is neither populated
-nor changed, and rows remain sequential. Swift's 48 recurrent layers each have
-two 5,120-by-48 BF16 alpha/beta matrices. Avoiding their F32 row materialization
-removes a nominal 90 MiB of scratch writes and the matching rereads per processed
-token; this is a source work count, not measured memory traffic or throughput.
-Independent decoded-row controls cover pinned/unpinned requests, backend requests,
-awkward widths through 5,120, signed zeros, subnormals, finite extremes, failed
-payload/activation/geometry admission, output clearing and scratch preservation.
+## Projection preparation
 
-The sampler now checks every logit while selecting the bounded heap, avoiding a
-separate full-vocabulary validation traversal. A nonfinite value anywhere,
-including an otherwise discarded tail candidate, rejects before drawing RNG.
-The reusable allocation survives rejection, and ties, signed zeros, heap order,
-probability arithmetic and the distribution's draws retain their existing contract.
+Scoped prepared matvecs share activation preparation only for identical borrowed
+input, transform/permutation, width and quantizer contract. Complete-input finite
+validation precedes mutation. Its borrowed proof permits Q8_K/Q8_0/pinned PTQ1
+maximum scans to omit repeated finite predicates; scale/code/rounding checks
+remain. Standalone encoders validate their own input.
 
-Runtime-owned sampling now passes an immutable `FiniteLogits` view after the
-complete decoder-output validation. Public views validate the whole
-nonempty bounded slice once, and their borrow prevents subsequent mutation.
-Greedy selection and the fixed Swift top-20 heap omit finite predicates for
-that view, including the four vector finiteness masks per skipped 16-logit
-NEON block; their threshold comparisons and token order are unchanged. Ordinary
-public sampling still rejects nonfinite values anywhere. Custom `Sampler`
-implementations keep their existing `sample` entry point through the default
-`sample_finite` method; the CLI's sampler wrapper forwards the typed view.
+BF16 projection reads immutable two-byte weights after geometry validation.
+Activation rounding, separately rounded F32 products, F64 accumulation and final
+F32 rounding retain their order. Every stored weight receives a finite check;
+malformed/nonfinite/overflowing work clears output. One-column F32 adapter
+projections use the same streaming principle without decoded-row materialization.
 
-The additive `Decoder::evaluate_finite_into` boundary now carries that proof
-from native Qwen35 and scoped projected Qwen35 evaluation into Runtime. Both
-graphs already check every output before committing layer state; Runtime checks
-the proof's storage pointer, complete extent and current vocabulary size instead
-of scanning every float again. Its compatibility default independently checks
-custom `evaluate_into` implementations. A checked view of unrelated storage or
-only a slice of the output rejects before token publication or sampling.
-At Swift's 248,320-logit vocabulary, native evaluation omits one traversal of
-993,280 bytes per evaluated token, including the final generated token. This is
-a source traversal count, not measured cache traffic or latency.
+### Packed PQ2 consumption layout
 
-Every prefix publication still requires complete finite output, including the
-last generated token. Only its private validated logits and independent
-snapshots create runtime sampling views. Ingestion
-invalidates old logits; cancellation, malformed output and failed continuation
-restore the earlier validated snapshot and sampler state. Focused controls cover
-all NEON lanes, finite extremes, signed-zero/tie ordering, candidate/probability
-bits, seeded draws, clone/reset/rejection, custom dispatch and decoder failures
-before and after sampling. These are source work reductions, with unchanged
-sampling vocabulary reads, storage, admission and qualification gates; no measured
-request-time or throughput benefit is asserted.
+Eligible baseline-NEON PQ2 projections prepare activation bytes in weight-digit
+consumption order once per `PreparedMatvec`. Four two-bit fields of sixteen
+packed weight bytes pair directly with four activation vectors. Two integer
+accumulators preserve exact dots without DOTPROD/I8MM.
 
-The fixed Swift chain now retains its validated top-p state at sampler
-construction. Native min-p zero returns without mutation, and temperature one
-preserves every admitted finite logit bit, so those identity stages need no
-temporary states. This omits three temporary configuration-vector allocations
-per output token and retains one additional sampler-state metadata value.
-Independent controls replay the original three-stage chain across candidate
-bits, ties, signed zero, subnormals, extremes, RNG draws, cloning, reset and
-full-vocabulary rejection. This is a source allocation/work reduction; it does
-not establish lower process RAM, request latency or reduced admission.
+Selection requires original PQ2 and columns divisible by 256. Original Q8_K
+blocks/scales/sums remain available to other formats/executors; PQ2's fourth
+symbol is +2. Odd-group PQ2 and PTQ1 use Q8_0. Unsupported/scalar builds allocate
+no derived layout.
 
-The fixed Swift top-p/distribution pair now retains its 20 binary32
-unnormalized softmax weights in an 80-byte stack array. Both stages use the
-same sorted maximum and separately rounded subtraction/exponential, so the
-distribution can reuse those values after top-p truncation. Top-p still divides
-every original candidate by its binary32 sum; the distribution independently
-sums retained raw weights in binary64, consumes its original draw and performs
-its original division/rounding. Candidates outside the retained view preserve
-their original top-p probability bits. The generic sampler stages and private
-unsorted fallback remain independent. This omits one exponential per retained
-candidate when there are at least two, at most 20 per generated token; the
-singleton distribution still consumes one draw and stores probability one.
-Independent original-chain controls cover all backing bits, singleton and
-truncated views, ties, signed zero, subnormals, extremes, underflow, clone/reset
-and RNG progression. Existing full-vocabulary rejection and transactional
-cancelled/abandoned-stream controls remain required. This is a source work
-reduction; actual stack frames, model parity and matched complete-request
-benefit remain pending without a latency, RAM or admission claim.
+Preparation resets logical layout length even before rejected dispatch; addresses
+or retained capacity never authorize content reuse. Growth is fallible and errors
+clear layout/output. Row workers borrow the single immutable allocation.
 
-Full-attention decode and tiled prefill also read immutable gate heads from
-their original interleaved projection output. The separate gate copy is
-omitted while query normalization, sigmoid and attention arithmetic keep their
-order. See the [tiled-prefill contract](cpu-tiled-prefill.md) for source work
-counts and the unchanged resource and qualification boundaries.
+Each 128-weight block retains its scale order (pinned FMA; generic multiply/add)
+and complete-dot absolute bound 32,768. Derived payload for `C` columns is
+`C + 4 * C / 128` bytes: 5,280 bytes at width 5,120, additional to Q8_K scratch.
+Capacity remains at its high water; weights are neither repacked nor expanded.
 
-The explicit suffix drafter now uses reverse Z matching against the current
-suffix with the existing 64-token maximum window. Its private 64-byte prefix
-table reuses already proved matches instead of comparing a long common suffix
-again at every historical end. Prefix preparation and the history scan require
-fewer than `2 * (history tokens + maximum match tokens)` token equalities;
-this includes failed comparisons. It preserves overlapping matches,
-longest-match priority and the most recent start on ties. The previous
-backwards scan could repeat up to 64 comparisons per historical end.
-Runtime generation copies at most eight continuation tokens into a fixed
-stack buffer reused for the request; it no longer allocates a proposal vector for
-each round. The public `SuffixDrafter::propose` API still returns an independently
-owned, fallibly allocated vector. Invalid configurations reject before proposal
-storage changes, even with zero remaining tokens.
+## Finite logits and sampling
 
-This is bounded source-work reduction in the opt-in suffix path, not evidence
-that serial greedy verification is faster than ordinary decoding. Decoder work,
-state checkpoints, cancellation checks around proposal/verification, output limits
-and exact greedy decisions retain their contracts. Exhaustive binary histories
-through ten tokens and 8K maximum-window controls compare both proposal routes
-against the retained original forward, length-first search. Periodic, overlapping
-and adversarial near-match controls count the actual algorithm's equalities and
-check the linear bound. The 64-byte table is additional private source payload;
-actual stack use, code generation and typical-prompt costs remain unmeasured.
-Owning hosted checks, actual-model state/adapter parity and matched
-complete-request benefit remain
-pending before any performance qualification or default change.
+Complete decoder-output validation creates an immutable `FiniteLogits` view.
+`Decoder::evaluate_finite_into` lets native/projected Qwen35 pass that proof to
+Runtime, which verifies storage pointer, full extent and vocabulary size.
+Custom decoders use a validating default. Foreign/partial views reject before
+sampling/publication.
 
-Exact NEON GDN multi-token helpers now reuse the private state staging array for
-decay and update. Each old block is dead after its decay multiplication; each
-decayed block is dead after its checked update. Removing the duplicate array
-eliminates 1 KiB, 4 KiB or 8 KiB of declared staging payload in the one-, four-
-and eight-row helpers, respectively. The two floating passes, reduction trees
-and token order are unchanged. Grouped helpers still publish state and outputs
-only after every token succeeds, and single-row failure still publishes exactly
-the updated finite prefix followed by untouched decayed elements. Caller-owned
-snapshots never share the private staging array. Direct Windows ARM64 controls
-compare all state/output bits with an independent scalar oracle and exercise
-late key-dot, update and query-dot failure without relying on dispatch fallback.
-These are source storage reductions; Release code generation, actual stack use,
-full-model parity and matched request benefit remain pending. No scratch or
-worker-stack admission reserve is reduced.
+Greedy and fixed Swift top-20 selection can omit duplicate finite predicates.
+Public sampling validates the entire slice, including losing candidates, before
+RNG mutation. Custom `Sampler` implementations retain `sample` through the
+default `sample_finite` adapter. Ingestion invalidates logits; failed continuation
+restores validated output and sampler state.
 
-Single-token NEON GDN steps, including normal four/eight-row groups, now select
-an eight-block private staging capacity
-for rows up to 128 elements, retaining sixteen blocks for eligible wider rows
-through 256 elements. Both capacities instantiate the same arithmetic and error
-publication implementation. Swift's 128-wide rows therefore declare 512 bytes
-of staging instead of 1,024 per row; four/eight-row groups halve their 4/8 KiB
-payloads to 2/4 KiB. This source payload reduction does not establish
-generated zero stores, actual stack use or memory traffic. Independent scalar
-bit controls cover both sides of the capacity boundary, exceptional values,
-late failures and unchanged unsupported-width refusal. Conservative resource
-reserves remain charged.
+Swift's bounded heap retains token-order ties and native probability/RNG order.
+NEON visits winner-mask lanes in increasing token-ID order; nonfinite blocks
+restore scalar rejection behavior. The fixed chain retains validated top-p
+configuration, skips identity min-p-zero/temperature-one stages and reuses an
+80-byte stack array of 20 unnormalized softmax weights. Top-p sums/divides in
+F32; distribution resums retained weights in F64 and consumes its ordinary draw.
+Singleton distributions still draw once. Generic stages remain independent.
 
-Exact multi-token NEON GDN prefill and state-only replay now select the same
-eight-block capacity for rows through 128 elements, retaining sixteen blocks
-for supported wider rows through 256. The one-, four- and eight-row prefill
-helpers and four/eight-row replay helpers instantiate their existing arithmetic
-with the selected capacity. For Swift's 128-wide rows, their private state
-staging declares 512 bytes per row instead of 1,024; eight-row groups declare
-4 KiB instead of 8 KiB. Output staging, token limits, FMA/reduction order,
-publication and scalar failure fallback remain unchanged. This does not prove
-fewer generated stores, smaller compiled stack frames or measured latency.
-Direct scalar-bit controls cover zero through 64 tokens, both capacity ranges,
-strided output sentinels, late key/update/query failure and unsupported shapes
-or excessive token counts. Release ARM64 code generation/stack review, hosted
-controls, complete-model state/adapter parity and matched request benefit remain
-pending. No admitted scratch or worker-stack reserve is reduced.
+## Attention locality
 
-Suffix generation retains the already validated target token when a proposal
-is rejected. The correction boundary consumes that token without a second
-full-vocabulary greedy scan; no evaluation or callback changes logits between
-the two points. Cancellation checks remain on both sides of correction
-selection. Independent fixed token sequences and ordinary-generation controls
-cover initial and partial rejection, accepted chains, bonus tokens, EOS,
-output limits, decoder traces, logits and transactional cancellation/recovery.
-This omits one greedy traversal per rejected round in the opt-in path; it
-does not qualify speculative benefit or alter selection defaults.
+Pinned Swift has 24 query heads and four KV heads. Decode partitions workers by
+complete six-head groups when the worker count does not exceed KV-head count;
+larger policies retain finer partitions. Each group shares cached key conversion
+and value traversal. Other geometries/source arithmetic use their own dispatch.
 
-Resident native-Q2 handles retain their immutable HVX solver parameters from
-weight preparation. Every resident descriptor reuses those parameters,
-including batched members, extra arenas and fused FFN projections; transient
-descriptors continue to solve their active geometry. Portable controls compare
-independent allocation algebra and kernel-parameter bytes across the 6,144-column
-VTCM threshold, complete resident/transient frames and rejected reservation
-publication. The runtime charges the larger handles through its existing
-`size_of`-based metadata reservation within the unchanged cap. No registry
-allocation, signed kernel, wire layout, placement or session limit changes.
-Avoiding repeated host solver searches does not establish end-to-end benefit.
+Six-head values use 64-channel tiles and 24 KiB of temporal accumulators.
+Paired prompt tokens use twelve 32-channel rows with the same payload. They share
+the common FP16 prefix, while token one uses its F32 current value and token two
+sees that position through committed FP16 plus its own F32 current value.
+A single-token tail uses the six-head route. No future row is reachable.
 
-Grouped NEON GDN decode, multi-token prefill and state-only replay now combine
-updated-lane finite masks while their rows remain private, with one horizontal
-mask reduction before group publication. At width 128 this replaces 32 or 64
-update-mask reductions per four/eight-row token group with one per helper call;
-multi-token helpers combine the masks across their bounded token sequence.
-Floating arithmetic, key/query checks, single-row partial publication and scalar
-failure replay remain unchanged. Direct independent scalar-bit controls cover
-both staging capacities, late overflow and untouched grouped destinations.
-This source reduction needs Release ARM64 codegen, full-model state/adapter parity
-and matched whole-request benefit before performance qualification.
+Every channel retains sixteen temporal FMA lanes, padding signed-zero effects,
+the native reduction tree, globally normalized F16 probabilities and sigmoid
+gate order. Source arithmetic retains F32 products/F64 accumulation. Masked
+attention runs the first zero FMA per affected lane (at most sixteen padding
+steps); repeated zero FMAs are idempotent for finite values. Softmax retains the
+partially masked score group and omits later all-zero groups.
 
-Native-Q2 multi-operation packet construction now serializes each distinct
-resident geometry once per packet. Repeated geometry copies only populated
-immutable tensor/operation fields and relocates all member-specific offsets,
-buffer/tensor indices and operation references. It shares no template across
-packets and adds no persistent allocation or metadata charge. Handle/arena
-validation, activation deduplication, output poisoning, operation order and
-submission limits remain unchanged. Full-frame controls compare the original
-serial descriptors across packet widths, arenas, activation identities and
-fused wrappers; rejected geometry must preserve its original failure behavior.
-Avoiding repeated field conversions establishes no measured DSP or request speedup;
-the extra descriptor reads still need a matched total-cost comparison.
+Grouped reduction validates all heads before gated publication. Paired tiles
+validate both rows before either output is published; malformed geometry rejects
+before mutation. Eligible four-head NEON value tiles fuse the gate into their
+final store, retaining their ordered partial-error publication. Scalar atomic
+fallback retains its own failure boundary. These destinations are private graph
+scratch; complete-request rollback governs committed state.
+
+## Provisional GDN decode state
+
+Pinned Swift CPU decode writes eight recurrent rows into unpublished
+`LayerDelta::Recurrent.matrix`. Eligible baseline NEON uses that destination
+for decay/update, avoiding a separate staging array and flush. Committed state
+and checkpoints remain immutable sources. Unsupported/portable/tiled recurrence
+uses defensive helpers.
+
+Native refusal/nonfinite work replays the defensive helper from committed rows,
+preserving error precedence. Failed deltas never become recurrence inputs;
+retry overwrites dirty scratch. Arithmetic retains separate decay, four-register
+FMA dots, `(value - dot_k) * beta`, fused update/query, with all eight key dots
+before updates. Two four-row phases reuse sixteen accumulators.
+
+Other one/four/eight-row helpers use staging capacity eight through width 128
+and sixteen through width 256. Multi-token helpers reuse staging for decay/
+update and combine finite masks before grouped publication. Floating pass/order
+and scalar partial-failure replay remain intact. Direct convolution tiles read
+immutable projection rows and write convolved SiLU values; unsupported shapes
+retain complete raw staging. Conservative stack/scratch charges are unchanged.
+
+## Suffix proposals
+
+The opt-in suffix drafter uses reverse-Z matching with a maximum 64-token window
+and 64-byte prefix table. It preserves overlap, longest match and most-recent
+start on ties, bounding token equalities below
+`2 * (history tokens + maximum match tokens)`.
+
+Runtime copies at most eight proposals into a reused stack buffer; public
+`SuffixDrafter::propose` returns independently owned fallible storage.
+A rejected proposal retains its validated correction token without a second
+greedy vocabulary scan. Cancellation remains checked around proposal/verification/
+correction, and request rollback includes sampler state.
+[Sampled suffix verification](cpu-tiled-prefill.md#explicit-sampled-suffix-consumer)
+defines the separate target-sampling contract.
+
+## Native-Q2 prefill packets
+
+Resident native-Q2 parameters are solved at preparation and reused by immutable
+handles. Packet construction serializes each distinct resident geometry once,
+then relocates member offsets/indices. Validation, activation deduplication,
+output poisoning and operation order remain mandatory.
+
+`NativeQ2Submitter::maximum_resident_token_batch` advertises single-packet
+support: default one for arbitrary submitters, eight for a healthy native session.
+Only 1/2/3/4/8 are accepted; other values choose scalar submission without probing
+and retry. Resident tiles batch ordered `N=1` operations across prompt tokens.
+Groups of eight use `submit_resident_multi8`; tails use four/three/two/one.
+
+For `T` weight tiles and `n` tokens, queue writes are
+`T * (n / 8 + ceil((n % 8) / 4))` (integer division), while logical operations
+remain `T * n`. Each token preserves column-tile addition order. Transient weights
+pack once per token tile but retain single-operation queue submission.
+
+Preparation releases packed scratch before allocating up to eight padded
+output rows: at most `32 * P` bytes for padded extent `P`, within the existing
+`36 * P + 4 * P` conservative reservation. Caller output/metadata remain charged.
+Native descriptors validate dimensions, registry ownership, operation capacity,
+sequence, ranges and finite output. Runtime checks padding and partial sums.
+Counters advance only after packet validation/accumulation; later failure clears
+all output and faults the executor without CPU replay.
+
+These packets do not implement `N > 1` matrix solving.
+`hvx_mv_params`, kernel `HTP_MM_KERNEL_HVX_QUANT_ROW_N1` (7), eight HVX workers,
+VTCM layout and one-row descriptors are specific to `N=1`. Multirow solving
+requires separate kernel/solver/stride/scratch/numerical and signed-device review.
+
+### Native-Q2 finite-output evidence
+
+Scalar and two/three-sibling resident single-token projections carry borrowed
+evidence from the session's checked output copy. Exact ordered pointers/lengths
+must match every output. Arbitrary submitters use a validating default; foreign,
+reordered or partial evidence cannot waive checks. Nonfinite reported success
+rejects as `native-rpc-contract-failed`, clears output and publishes no successful
+counters. Submission errors preserve their own diagnostics.
+
+Transient, multitoken, fused-FFN and partial-row paths retain independent
+validation. Fake-arena/queue controls do not open a driver or execute a DSP graph.
 
 ## Exact hosted correctness gate
 
-Dispatch the owner-operated [Source checks workflow](../.github/workflows/source-checks.yml)
-with `model_free: efficiency` for the exact efficiency gate. It runs only on
-hosted Windows ARM64, Windows x64 and Linux ARM64 against local main's
-published source. It never queues an owner-device job. Its fixed inventory tests
-direct projections against decoded rows, full-vocabulary selection against the
-old full-candidate route, independent full-padding attention controls, empty and
-nonempty snapshot ownership, adapter provenance, cancellation and seeded rollback.
-The fused copy/decay test remains a synthetic control, not production selection.
+The owner-operated [Source checks workflow](../.github/workflows/source-checks.yml)
+with `model_free: efficiency` selects hosted Windows ARM64/x64 and Linux ARM64.
+Its exact-name inventory rejects missing, ignored, duplicate or failed controls.
+Receipts bind revision, source/executable hashes and raw results. Strict Release
+all-target Clippy and production linking remain separate workflow steps.
 
-The runner compiles its selected test targets once and requires exactly one passed,
-nonignored test for every exact name. Missing or renamed controls, zero matches,
-ignored tests, duplicate executables and failures reject. Receipts retain the
-revision, source hashes, executable digests and raw results. Strict Release
-all-target Clippy and production executable linking are separate required steps;
-a correctness receipt alone does not imply that later steps passed. The complete
-workflow result is the model-free hosted gate.
+Independent controls cover decoded-row projections, full-vocabulary sampling,
+attention padding/grouped values, checkpoint ownership, adapter provenance,
+suffix search, GDN arithmetic/failure, bounded tokenization and mock native-Q2
+layout/queue behavior. Synthetic controls do not establish full-model or
+signed-device qualification.
 
-The source receipt also binds the root `clippy.toml` policy. Its two named
-duplicate-crate allowances cover incompatible pinned requirements:
+## Qualification
 
-- `windows-sys`: containment's `mxc-sdk`/`winreg` route requires 0.59, while
-  native hashing and other current consumers require 0.61.2.
-- `syn`: `bonsai-hexagon-runtime -> serde 1.0.229 -> serde_derive 1.0.229`
-  requires major 3 (locked 3.0.9). Its Windows containment route through
-  `bonsai-windows-process =0.1.2 -> mxc-sdk =1.0.1 -> windows-core 0.62.2`
-  requires the nonoptional `windows-implement 0.60.2` and
-  `windows-interface 0.59.3` macros, which each require major 2 (locked
-  2.0.119). Static inspection of the lockfile and cached normalized manifests
-  establishes these incompatible requirements; it is not a compiled result.
+Before selecting an execution profile, retain exact-source PQ2 and separately
+scoped PTQ1/adapter logits and complete-state comparisons, zero/nonzero adapter
+scales, seeded output, reset, rollback and original-PQ2 recovery. Measure matched
+complete requests/resources on the intended target, separating prompt ingestion,
+first-token latency and generation intervals. ARM64 code generation/spills and
+effective accelerator placement require independent review.
 
-Neither allowance replaces dependencies or disables other duplicate-crate
-diagnostics. Clippy's policy names crates rather than individual versions, so
-future changes to either route require review. Changing or removing the policy
-changes the admitted source identity. The `syn` extension is source-only after
-the closed local check's strict analyzer failure and has not been compiled or
-checked. The earlier failure remains failed; final-source owning hosted
-validation is pending.
-
-The fixed inventory also covers suffix-search reference parity and speculative
-rollback, staged GDN row reuse on Windows ARM64, and direct native-Q2 resident
-weight initialization. Accelerator controls use host-only fake arenas and mock
-submitters; they neither open a driver nor execute a DSP graph. Windows ARM64
-alone selects the native arena controls. Portable runtime controls still compare
-directly packed bytes with the existing copied route. The receipt hashes both
-accelerator tool crates, and their Release analyzers and linking remain part of
-the same hosted workflow. This expands correctness coverage without qualifying
-NPU placement, model output or startup benefit.
-
-Lazy native-Q2 resident preparation now shares the direct initialization path
-without allocating an unused packed-weight vector first. Copied preparation
-grows bounded scratch only after resident admission; transient execution sizes
-its scratch after selecting that route. Fake-arena controls cover direct/copied
-bytes, refused capacity, malformed scales and terminal publication failure
-across all eight lazy entry families, with a separate successful transient
-control. The ordinary prewarmed default is unchanged by this follow-up.
-Conservative admission remains charged; no startup or execution gain is measured.
-
-Single-operation transient native-Q2 token tiles now pack immutable PQ2 weights
-once for the tile when residency is absent or refused. The call-local packed
-buffer is reused across the same ordered `N = 1` submissions and then released;
-no persistent expanded copy or new DSP batch is introduced. For an 8/16/32-token
-tile this omits 7/15/31 full host transcoding passes and their scratch allocations,
-while operation counts, queue writes and conservative payload admission stay
-unchanged. Multi-operation tiled shapes and resident dispatch retain their
-existing routes. Independent digit-level layout/scalar controls cover original
-fourth-symbol values, token order, absent/refused residency, input and scale
-failure precedence, late failure, output clearing and terminal refusal. These
-host-only controls do not qualify signed-device arithmetic or prompt latency.
-
-Scoped matrix preparation now carries its existing complete-input finite proof
-into the Q8_K, Q8_0 and pinned PTQ1 quantizers. Their mandatory maximum scans
-omit duplicate finite predicates, including the baseline NEON input masks and
-their horizontal reductions. The original complete-input preflight still runs
-before any quantizer mutation, preserving malformed-shape, nonfinite-input and
-scale-overflow precedence. At 5,120 columns this omits 5,120 repeated input
-finite predicates per preparation; it does not omit the maximum traversal or
-measure a latency gain. Standalone row encoders retain their own input checks.
-Scale, code, output-rounding and finite-result checks remain in every path.
-The proof borrows immutable input only for the call and adds no retained storage.
-Controls compare every prepared scale/code/sum bit with the original quantizer
-entry points, preserve failure precedence and scratch invalidation, and cover
-overflow, subsequent recovery and external-executor validation. Defaults,
-arithmetic, admission and installed runtime identities remain unchanged.
-
-## Native-Q2 single-token finite-output evidence
-
-Scalar and two/three-sibling resident single-token projections now carry borrowed
-finite-output evidence from the native session's existing checked output copy.
-The executor consumes that evidence against the ordered pointer and length of
-every original output before publishing successful counters. An immutable borrow
-keeps those exact elements unchanged until consumption; another allocation,
-reordered siblings or a shortened member cannot waive validation. Arbitrary
-submitters use a conservative default that scans the returned elements. Only the
-native crate can construct evidence from an already validated checked copy, and
-borrowed, owned and public-session wrappers preserve that path.
-An arbitrary submitter that reports success but supplies nonfinite output now
-receives the evidence boundary's `native-rpc-contract-failed` diagnostic in place
-of `nonfinite Hexagon projection value`. Both outcomes remain terminal, clear all
-outputs and publish no completed counters. Errors returned by submission itself
-retain their original stage and diagnostic.
-
-This omits one extra host finite-validation traversal of each selected output
-element for those entry points, or `4 * output_rows` nominal bytes read per
-projection. The evidence itself contains a fixed stack array of slice borrows,
-with no heap allocation. Transient execution, multitoken batches, fused FFN and
-partial-row accumulation retain their existing validation. Signed kernels,
-floating-point bits, packets, operation order, resource admission and defaults
-are unchanged. No device speed or memory-traffic improvement is measured.
-
-Portable controls preserve signed zero, subnormals and finite extremes, reject
-NaNs/infinities and bind exact output regions. Custom-submitter controls cover
-scalar and both sibling families, success, malformed output, returned failures,
-foreign/reordered/partial evidence, output clearing and terminal rejection.
-Native fake-queue controls retain checked-copy bits and reject poisoned scalar
-and final-sibling responses without evidence or successful-counter publication.
-They open no driver and do not execute a DSP graph.
-
-## Device and delivery acceptance
-
-Paired six-head prompt tokens now also share cached value conversion through
-the [paired value contract](paired-prefill-values.md). Their common FP16 prefix
-is read once per channel tile, while each current binary32 row and causal
-extent remains independent. Twelve 32-channel accumulator rows retain the
-existing 24 KiB temporal payload. Independent native-dot and atomic-publication
-controls join the existing full-model-shaped prefill/page/worker controls in
-the exact hosted inventory. ARM64 spills and actual-model benefit remain pending.
-
-Request preparation uses [bounded special-token windows](windowed-special-input.md)
-instead of input-wide match indexes and eager maximum-segment output storage.
-The fixed 8 KiB window retains longest/earliest reverse-trie semantics across
-UTF-8 and maximum-spelling boundaries. Three independent window/bounds controls
-and the composed tokenizer token/error-precedence control join the exact hosted
-inventory. This changes storage and bounded overlap work, and establishes no
-measured request-time or process-memory gain.
-
-Resident multi-operation projection tiles now use the submitter's explicit
-single-packet token capacity, conservatively one for arbitrary submitters and
-eight for the real native session. Existing `multi2`/`multi3`/`multi4`/`multi8`
-operations share the immutable tile across token rows; every token retains its
-original column-tile addition order. Partial packets and padded rows validate
-before successful counters, and failure clears the complete public output and
-faults the owner without replay. Bounded simultaneous outputs replace released
-packing scratch within its existing conservative reservation. Three independent
-layout/arithmetic/queue-count and failure controls join the hosted inventory,
-with the existing public forwarding and native transport controls. These are
-existing `N = 1` operations, not a qualified multi-token matrix solver.
-
-No workflow dispatch, source change or source check qualifies actual Swift
-logits, full live state, complete answers, resources or performance. Before release
-integration, retain exact-source PQ2 and independently scoped PTQ1/adapter checks,
-including zero-scale identity and nonzero application, seeded output, reset,
-request rollback and explicit original-PQ2 recovery. Compare matched complete
-requests and resource observations with the released source on a qualified target.
-Keep prompt ingestion, first-token latency and generation intervals separate.
-
-Owner-device setup, loading, every arm, power observations, cleanup and retention
-share one predeclared aggregate allowance under AGENTS.md. The default is five
-minutes; choose a longer supported allowance only from a fixed conservative work
-estimate. A failed or infeasible attempt closes its clock, and full suites and
-benchmarks remain CI-only. This document declares no new model workload.
-
-Production recurrence keeps copy-then-scale. Fused copy/decay needs its own
-actual-model state/logit, throughput and resource gate before production use;
-removing a 144 MiB copy per processed token is not evidence that this gate passed.
-After successful owning checks, the owner publishes an immutable qualified release.
-Runner must verify that release's source, archive and executable identities before
-repinning. No workflow here publishes, pushes, dispatches another workflow or
-changes the installed application.
+Use [building and validation](build-and-validation.md) for acceptance procedures
+and [AGENTS.md](../AGENTS.md) for CI ownership and owner-device limits.

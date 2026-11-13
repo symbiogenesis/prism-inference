@@ -1,106 +1,72 @@
-# Rank-one adapter correctness path
+# Rank-one adapters
 
-The source graph implements an explicit rank-one F32 adapter path for numerical
-qualification. The private HTTP server now admits the exact approved adapter
-only through an explicit selection; the Swift JSONL worker and ordinary token
-driver retain their adapter-free subset. This source support is not a qualified
-Runner default, a released-runtime claim or evidence of adapter effectiveness.
+The graph and private HTTP server admit an explicitly selected approved rank-one
+F32 adapter. JSONL workers and the ordinary token driver remain adapter-free.
+Actual-model correctness, authoring basis and adapter effectiveness require
+independent qualification.
 
-`model::lora::RankOneAdapter::load_swift` verifies the approved Orca file's exact
-9,682,464-byte length and SHA-256
-`f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42`.
-It requires the original pinned Swift PQ2 base and all 129 rank-one pairs with
-alpha one. `load_swift_representation` admits the exact current-weight PTQ1
-export only when explicitly selected; its base SHA-256 must match the selected
-representation. Both APIs verify the same approved adapter bytes and preserve
-the same factor and basis checks. The older publisher PTQ1 checkpoint rejects.
-The general
-`RankOneAdapter::from_model` constructor admits a bounded explicit subset after
-checking metadata, complete F32 factor pairs, finite payloads and matching base
-shapes; callers of that constructor own artifact authenticity.
+## Admission and arithmetic
 
-Only `token_embd.weight`, `blk.N.attn_output.weight`, `blk.N.ssm_out.weight` and
-`blk.N.ffn_down.weight` are admitted. `Qwen35::with_rank_one_adapter` checks that
-every target is in the live graph. It seals the exact adapter identity and scale
-bits into the graph identity. Scale must be finite within 0..2. The narrow
-`reset_with_adapter_scale` operation clears complete state and renews checkpoint
-provenance before changing scale, while retaining immutable weights and factors.
-No state computed under another correction can be reused. The
-[session contract](swift-session-profiles.md) defines request ownership and recovery.
+`model::lora::RankOneAdapter::load_swift` verifies the approved Orca artifact:
 
-An embedding adapter requires a separate `output.weight`. Graphs whose output
-head reuses `token_embd.weight` reject embedding adapters at every scale,
-including zero: the embedding lookup factors do not implement a tied output
-projection. Such graphs can still admit supported residual-writer adapters.
-Both pinned current-weight Swift representations have a separate output head.
+- Length: 9,682,464 bytes.
+- SHA-256: `f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42`.
+- Original pinned Swift PQ2 base, 129 rank-one pairs, alpha one.
 
-The [pinned native graph](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-graph.cpp)
-defines the operation stages: base projection, independent A/B products on the
-original activation, scale, then add. Folded base Hadamard and grouped SSM
-permutations stay on the base branch. Embedding corrections follow inverse
-embedding transformation. The implementation retains each F32 rounding stage,
-uses the existing pinned Swift accumulation contract for aligned factor rows
-and bypasses correction arithmetic entirely at either signed zero scale.
+`load_swift_representation` also admits the exact current-weight PTQ1 export
+when explicitly selected, with a matching base hash. Other PTQ1 artifacts reject.
+General `RankOneAdapter::from_model` checks bounded metadata, complete finite
+F32 pairs and base shapes; its caller owns artifact authenticity.
 
-The loader shares identical immutable B payloads only after kind, shape and
-bytes match. Correction scratch is separate from base projection scratch and
-reuses one rank value and one output-width vector. No dense vocabulary-sized
-correction is constructed. These storage properties do not establish process
-peak RAM, a lower admission budget or a speed improvement.
+Targets are limited to `token_embd.weight`, `blk.N.attn_output.weight`,
+`blk.N.ssm_out.weight` and `blk.N.ffn_down.weight`.
+`Qwen35::with_rank_one_adapter` requires every target in the live graph and seals
+adapter identity and scale bits into graph identity. Scale must be finite in
+0..2. Either signed zero bypasses corrections. Scale reset clears state and
+renews checkpoint provenance; see [session ownership](swift-session-profiles.md).
 
-One-column F32 projections stream each B scalar directly from its immutable
-payload after one geometry check. They retain the existing scalar dot's F32
-product and binary64 reduction, including signed zero, and reject nonfinite
-weights and products before publishing output. This removes decoded-row
-validation and scratch preparation for every B output channel (660,480 across
-the approved Swift adapter per token), without a second factor copy. Focused
-bitwise controls compare the previous decoded-row route, including subnormals,
-signed zero, product overflow and recovery. Whole-model speed and parity remain
-separate qualification gates.
+Embedding adapters require a separate output head. A tied
+`token_embd.weight` output rejects them even at zero scale. Both pinned Swift
+representations have separate output heads.
+
+The [native graph reference](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-graph.cpp)
+orders base projection, independent A/B products on original activations, scale,
+then addition. Folded base Hadamard/grouped SSM permutations stay on the base
+branch; embedding correction follows inverse transformation. F32 rounding stages
+and pinned aligned-row accumulation are preserved.
+
+Identical immutable B payloads share storage only after kind/shape/byte equality.
+Correction scratch holds one rank value and one output-width vector, separate
+from base scratch. One-column B projections stream immutable F32 scalars with
+separately rounded products and binary64 reduction. No dense correction matrix
+is constructed or process-memory benefit assumed.
 
 ## Capture actual-model correctness evidence
 
-Build the `swift_model_check` example through the external working-directory and
-pinned compiler convention in [building and validation](build-and-validation.md).
-From a new external native working directory, use the absolute executable path:
+Use the [source-bound capture procedure](build-and-validation.md) and absolute paths:
 
 ```powershell
 & $qualifier --rank-one-adapter $approvedAdapter 0 forward $originalPq2 $zeroEvidence scalar '248045'
 & $qualifier --rank-one-adapter $approvedAdapter 1.3 forward $originalPq2 $nonzeroEvidence scalar '248045'
 & $qualifier --rank-one-adapter $approvedAdapter 1.3 trajectory $originalPq2 $trajectoryEvidence auto $promptIds 16
-& $qualifier --use-repacked-ptq1 --rank-one-adapter $approvedAdapter 0 forward $currentPtq1 $ptq1ZeroEvidence scalar '248045'
-& $qualifier --use-repacked-ptq1 --rank-one-adapter $approvedAdapter 1.3 forward $currentPtq1 $ptq1NonzeroEvidence neon '248045'
+& $qualifier --use-repacked-ptq1 --rank-one-adapter $approvedAdapter 1.3 forward $currentPtq1 $ptq1Evidence neon '248045'
 ```
 
-Every path variable must contain an expanded absolute path; evidence directories must already exist
-and be distinct. The adapter must be the exact approved file. `load` also accepts the prefix;
-`inspect`, relative adapter paths, unresolved environment tokens and invalid scales reject. The
-example remains a source correctness tool and is not added to release bundles or ordinary service
-launch. It reports the selected representation/base hash, adapter hash, target count and scale bits
-and retains existing create-new logits, complete logical KV/recurrent/convolution snapshots, raw
-greedy IDs and evidence-byte bounds. It produces no timing or benchmark verdict. No full-model
-adapter capture was performed as part of the implementation.
+Evidence directories must exist and differ. `load` accepts the adapter prefix;
+`inspect`, relative paths and invalid scales reject. Captures include exact base/
+adapter hashes, target count, scale bits, create-new logits, complete logical
+KV/recurrent/convolution state and raw greedy IDs. They provide no benchmark verdict.
 
-Before adapter qualification, compare the same approved artifacts against pinned
-native execution at loaded scale zero and intended nonzero scales. Establish
-residual-writer inputs/corrections, especially grouped SSM authoring order;
-complete logits and live state must retain the existing
-`1e-3 + 1e-3 * abs(reference)` bound. Synthetic tests prove that this Rust branch
-uses original input order; they cannot establish the publisher's authoring basis.
-Final logits/state captures alone do not replace native writer-level evidence.
-
-The explicit [private service](../server/README.md) binds adapter and representation
-readiness and preserves exact count/generation scale policy. Review its immutable
-release independently and qualify scale changes, cancellation, reset, streaming and
-rollback on the actual target. Then run full-context/long-output, resource, same-engine
-TPS and independent human quality gates on the actual target before promoting
-Runner's adapter-enabled default. All benchmarks and complete suites remain
-main-only CI work; focused synthetic tests and builds may run locally.
+Compare loaded scale zero and intended nonzero scales against pinned native
+execution. Capture residual-writer inputs/corrections, especially grouped SSM
+authoring order, plus complete logits/state within
+`1e-3 + 1e-3 * abs(reference)`. Synthetic input-order tests and final logits alone
+cannot establish native authoring basis. Qualify private-service scale changes,
+reset, streaming, cancellation and rollback separately on the actual target.
 
 ## Focused regressions
 
-`rank_one_` tests cover malformed factors/metadata/base identities, finite scale
-bounds, both signed zero bypasses, separately rounded products and addition,
-post-inverse embedding correction, unrotated attention/recurrent writers,
-untiled grouped SSM input order, and checkpoint/request rollback. They use small
-synthetic graphs and make no full-model or native-adapter qualification claim.
+`rank_one_` controls cover metadata/factor/base rejection, scale bounds, signed
+zero, rounded arithmetic, post-inverse embeddings, original writer input order,
+checkpoint isolation and request rollback. Full-context, quality, resource and
+performance acceptance follow the [validation guide](build-and-validation.md).

@@ -1,11 +1,7 @@
-# Explicit CPU tiled prefill
+# CPU tiled prefill
 
-The experimental graph API now consumes bounded packed multi-token projections
-inside real state-only Qwen3.5 prompt ingestion. Ordinary graphs retain their
-current policy. New local source also exposes an explicitly admitted private
-service profile and a sampled suffix consumer of the batched target verifier.
-These consumers are not in Runner's published 0.1.25 bundle; they change no
-runtime release, Runner pin or application default.
+The experimental Qwen35 graph supports explicit 8-, 16- or 32-token CPU tiles for
+state-only prompt ingestion. Select on an empty graph:
 
 ```rust,ignore
 let graph = Qwen35::new(model, context)?;
@@ -14,288 +10,139 @@ let graph = graph.with_tiled_prefill(8, reservation)?;
 // Optional, separate numerical contract:
 let graph = graph.with_chunkwise_gdn_prefill()?;
 let runtime = Runtime::new(graph, limits)?;
-// generate_with_prefill(... Prefill { block_tokens: 32 }, ...) calls real tiles.
 ```
 
-Select only 8, 16 or 32 token tiles on an empty graph. Both APIs renew checkpoint
-provenance and append a phase-specific identity. Ordinary token evaluation stays
-unchanged. External projection-executor scopes retain their existing sequential
-ingestion and do not dispatch these CPU tiles.
+Selection renews checkpoint provenance and adds a phase identity. Runtime
+`generate_with_prefill` calls the graph through `Decoder::ingest_block`.
+Ordinary token evaluation and external projection-executor ingestion retain
+their separate paths. Actual-model parity and prompt-time benefit require
+qualification.
 
 ## Explicit private-service consumer
 
-`swift_session::CpuPrefill::new(tokens, scratch_bytes)` binds 8, 16 or 32 tokens
-to a caller-supplied additional reserve. Existing SwiftSession loaders preserve
-ordinary ingestion; `load_profile_with_prefill` supplies the explicit selection.
-The graph independently checks its geometry-derived minimum. Owners must add
-the full supplied reserve to the existing context/process allowance using
-`validate_prefill_capacity_with_kv` for the immutable selected cache, while retaining
-worker, allocator and host reserves. The FP16 compatibility validator retains its
-FP16 policy. Tiled score reservations cover the complete four/six-head high water
-per tile token independently of the ordinary sequential attention allowance.
+`CpuPrefill::new(tokens, scratch_bytes)` binds tile size to an additional reserve;
+`SwiftSession::load_profile_with_prefill` selects it. The graph checks the
+geometry-derived minimum. Charge the complete reserve with
+`validate_prefill_capacity_with_kv` before artifact I/O, in addition to state,
+checkpoint, worker, allocator and host allowances.
 
-The private server accepts paired trusted `--cpu-prefill-tokens` and
-`--cpu-prefill-scratch-bytes` arguments with explicit `--kv-cache` and paired
-`--context-tokens` / `--memory-limit-bytes`. The selected FP16, K4/V4 or K4/V3
-policy is retained; packed-cache attention runs causally through its ordinary
-codec without FP16 history expansion. Invalid pairing, bounds or insufficient
-total allowance rejects before artifact I/O. Requests cannot change this selection.
-Startup readiness reports `cpu_prefill_tokens`,
-`cpu_prefill_scratch_bytes` and the exact `startup_graph_identity`.
+Trusted server startup requires paired `--cpu-prefill-tokens` and
+`--cpu-prefill-scratch-bytes`, explicit `--kv-cache`, and paired
+`--context-tokens` / `--memory-limit-bytes`. Invalid combinations reject.
+Readiness binds `cpu_prefill_tokens`, `cpu_prefill_scratch_bytes` and
+`startup_graph_identity`; requests cannot alter them.
 
-This profile retains sequential GDN arithmetic and skips implicit Hexagon
-discovery/installation. Explicit `--prompt-reuse latest` remains compatible;
-reset and adapter scale changes retain the immutable tile policy. Triangular
-GDN remains a separate FP16 profile. Full-model, long-prefix, adapter,
-cancellation/recovery and matched whole-request benefit remain pending.
+FP16/K4/V4/K4/V3 retain their selected causal attention arithmetic, without
+expanded packed history. This profile uses sequential GDN, skips implicit Hexagon
+discovery/installation and supports explicit latest-prefix reuse. Reset/scale
+changes retain tile policy. Triangular GDN remains a separate FP16 selection.
 
 ## Explicit target-verification consumer
 
-After selecting tiles on an empty CPU graph at the chosen KV precision, call
-`Qwen35::tiled_verification_scratch_bytes` and charge that additional reservation
-before `with_tiled_verification`. The separate `cpu-tiled-verify-v1` identity
-admits at most eight candidate positions. It charges each full vocabulary row
-and row metadata in addition to ordinary tile, state and checkpoint budgets.
+After tile selection, charge `tiled_verification_scratch_bytes` before calling
+`with_tiled_verification`. Identity `cpu-tiled-verify-v1` admits at most eight
+positions and charges complete vocabulary rows/metadata beyond tile/state/
+checkpoint storage.
 
-`Decoder::evaluate_batch_into` then produces every position's complete target
-logits while layer-major packed projections, including a packed output head,
-share decoded weight blocks across candidates. Final-layer state-only narrowing
-is disabled for verification. Causal attention, convolution and sequential GDN
-remain complete. Rotated policies retain their selected approximate values and
-ordinary attention arithmetic; this does not establish FP16 equivalence.
-Triangular GDN and installed external projection executors reject the verifier.
+`Decoder::evaluate_batch_into` returns every position's target logits while
+sharing decoded packed blocks across candidates. Causal attention, convolution
+and sequential GDN remain complete; final-layer state-only narrowing is disabled.
+Triangular GDN and external executors reject verification.
 
-`Runtime::verify_draft_block` uses this capability for eligible multi-token
-drafts; ordinary graphs keep sequential verification. Candidate zero uses the
-committed prefix's logits; later candidates use the preceding returned row.
-Full acceptance keeps the computed state and evaluates one bonus token. A
-rejection restores the complete checkpoint, replays the accepted prefix and
-evaluates the correction. Work admission conservatively charges the proposed
-block plus possible replay; failed restore closes admission without retry.
+`Runtime::verify_draft_block` uses prefix logits for candidate zero and the
+preceding returned row for later candidates. Full acceptance keeps state and
+evaluates a bonus token. Rejection restores the round checkpoint, replays accepted
+tokens and evaluates the correction. Admission charges verification plus possible
+replay; failed restore closes admission.
 
 ## Explicit sampled suffix consumer
 
-`Runtime::generate_sampled_speculative_until` consumes deterministic prompt/history
-suffix proposals with the actual caller sampler. Each position draws once from
-the target distribution. A matching draw accepts the point-mass proposal; a
-different draw already samples its conditional residual. No extra acceptance draw
-or separate draft sampler is used. Under identical per-position logits this keeps
-ordinary target filters, sampler history and RNG order. It does not implement
-correction for a probabilistic learned drafter.
+`Runtime::generate_sampled_speculative_until` verifies deterministic history-suffix
+proposals with the caller's sampler. Each position draws once from the target:
+a matching draw accepts; a different draw supplies the conditional residual.
+This preserves filter/RNG progression under identical positional logits. It
+does not implement a probabilistic learned drafter.
 
-Eligible multi-token proposals use the real tiled target graph. Consecutive
-all-accepted blocks retain computed state and share weights again. Rejection or a
-stop restores the complete round checkpoint, replays the accepted prefix, and
-evaluates a non-stop correction. Stop tokens never enter state. Callback failure,
-cancellation or deadline expiry restores the whole request and caller sampler;
-a failed restore closes admission without retry. Rejected blocks and replay
-remain charged in work statistics and conservative admission.
+Eligible proposals use tiled verification. Stop or rejection restores the round
+checkpoint and replays accepted tokens before a non-stop correction. Stops never
+enter state. Callback failure, cancellation or expiry restores the entire request
+and sampler; failed restore closes admission. Rejected/replayed work remains
+charged.
 
-`CpuSpeculation::new(tokens, verification_scratch_bytes, checkpoint_bytes)` binds
-1 through 8 suffix positions to two additional memory reserves. The logits
-reserve must cover the graph's complete verification rows; the extra checkpoint
-reserve covers a round prefix beside the existing request rollback. Its minimum
-is the ordinary selected state budget (at least 1 GiB; it scales with context
-and cache). The unreleased full-context K4/V4 candidate requires the complete
-4,644,798,464-byte prefix reserve at 262,144 tokens; a 4 GiB reserve rejects.
-The complete caller reserves are charged before artifact I/O by
-`validate_execution_capacity`; they do not reduce existing context, worker or
-host reserves. `load_profile_with_execution` supplies this explicit selection;
-older loaders keep speculation absent.
+`CpuSpeculation::new(tokens, verification_scratch_bytes, checkpoint_bytes)`
+accepts 1..8 positions and two extra reserves. Verification covers all output rows;
+the extra checkpoint covers a round prefix beside request rollback, at least the
+selected state budget with a 1 GiB floor. Full-context K4/V4 at 262,144 tokens
+requires 4,644,798,464 bytes per prefix reserve. `validate_execution_capacity`
+charges both before artifact I/O; `load_profile_with_execution` selects them.
 
-Trusted service startup supplies all three `--cpu-speculative-tokens`,
-`--cpu-verification-scratch-bytes` and `--cpu-speculative-checkpoint-bytes` options,
-plus admitted CPU tiles and paired context/process limits. Ordinary completion
-then uses the actual Swift temperature 1, top-20, top-p 0.95 sampler. Readiness
-binds the immutable suffix bound, both reserves, tile and selected graph identity.
-Existing phase-timing requests reject speculative selection before state changes
-because those counters cannot represent rejected and replayed work.
-
-Legacy greedy APIs and standalone `verify_stochastic_step` remain separate.
-Focused synthetic controls do not establish actual-model parity, stochastic
-quality or speed. Published bundles and Runner defaults are unchanged.
+Server startup requires all three `--cpu-speculative-tokens`,
+`--cpu-verification-scratch-bytes` and `--cpu-speculative-checkpoint-bytes`,
+admitted tiles and paired context/process limits. Completion uses Swift's
+temperature-1/top-20/top-p-0.95 sampler. Readiness binds the full selection.
+Phase-timing requests reject speculation before mutation because those counters
+cannot represent replay. Greedy and standalone stochastic-verifier APIs remain
+separate.
 
 ## Exact packed tiles
 
-The graph runs layer-major over a tile, retains causal attention/cache updates,
-and then computes FFN up, gate and down projections across all tile tokens.
-For each packed output row, one 128-weight block is decoded once, followed by
-all token dots. PQ2 retains the +2 fourth symbol, Q8_K activation preparation and
-original per-128 scale/FMA order. Odd-block PQ2 retains Q8_0. PTQ1 retains its
-quantizer, scale grouping and pinned four-lane FMA/reduction order. Floating and
-other supported formats use the existing matvec contract. Each token is
-transformed independently; adapters consume the original untransformed input.
-No decoded matrix or persistent repacked weight copy is retained.
+Layer-major execution retains causal state updates and batches FFN projections.
+Each 128-weight block is decoded once per output row for all token dots.
+PQ2 preserves its +2 fourth symbol, Q8_K preparation and per-128 scale/FMA order;
+odd-group PQ2 uses Q8_0. PTQ1 preserves quantization and pinned four-lane
+FMA/reduction order. Adapters consume original inputs. No expanded matrix persists.
 
-Full-attention decode and tiles borrow gate heads directly from the immutable
-interleaved query/gate projection. Only queries are normalized into separate
-scratch; the original gate values remain available until score/value work has
-finished. This omits one gate materialization without changing sigmoid, rounded
-probabilities, value accumulation, adapters or cancellation/rollback behavior.
-For Swift's 24 heads of width 256 across 16 full-attention layers, the omitted
-copy payload is 384 KiB per token (768 KiB of logical copy reads/writes), excluding
-the unchanged later gate reads. Actual traffic, latency and peak RAM are
-unmeasured. Recurrent/FFN gate scratch and conservative admission remain charged.
+Eligible Windows ARM64 baseline NEON reuses sixteen decoded vectors across dots;
+signed products widen before summation. A stack-scoped 256-byte decoded block
+adds no retained storage. Scalar forcing/unsupported targets use scalar reductions;
+DOTPROD/I8MM are not selected. Packed tasks share the existing
+[row-worker pool](parallel-rows.md), borrowing activations and writing disjoint
+rows. Floating fallback remains sequential.
 
-Without the separate chunkwise selection, full attention, recurrent attention,
-convolution and FP32 GDN retain their previous per-token operations. The graph's
-`ingest_block` path is the consumer; this is more than a standalone tiled helper.
-The tile inherits the graph's requested matrix backend. On the existing eligible
-Windows ARM64 MSVC build, Auto/NEON prepare sixteen baseline NEON vectors from
-the one decoded block and reuse them across token dots. Signed products widen
-before summation; the complete PQ2 dot is bounded by 32,768, and PTQ1 keeps its
-four native integer lanes separate until the original floating FMAs. Explicit
-scalar forcing and unsupported builds retain scalar reductions. The fixed
-256-byte decoded payload is stack-scoped, with no new retained activation or
-weight allocation. Optional DOTPROD/I8MM instructions are not selected.
-
-Packed tiles inherit the graph's existing private row-worker pool, including
-selection before or after enabling tiles. The pool is shared with ordinary
-matvec work; projections create no additional workers. Each worker borrows
-original weights and prepared activations, owns disjoint output row slices
-and decodes each packed row block once across all tile tokens. One worker and
-builds without `parallel-rows` retain sequential execution. Floating fallback
-continues to use the ordinary sequential projection contract. This source path
-still needs comparison against ordinary NEON/worker matvec before assuming that
-shared decoding and explicit SIMD improve complete prompt time.
+Full attention borrows immutable interleaved gate heads and normalizes queries
+into separate scratch. [Attention locality](inference-efficiency.md#attention-locality)
+defines grouped/paired cache traversal. Ordinary recurrent arithmetic remains
+sequential unless chunkwise GDN is explicitly selected.
 
 ## Separate chunkwise GDN
 
-The `gdn-wy-f32-v1` selection batches recurrent input projections, keeps causal
-convolution and normalization, and solves the bounded lower-triangular delta
-system for each recurrent value head. Every head uses `head % ssm_keys`.
+`gdn-wy-f32-v1` batches recurrent projections, preserves causal convolution/
+normalization, and solves a lower-triangular delta system per value head
+(`head % ssm_keys`). With cumulative decay `P_t` and decay product `D[t,j]`
+over `(j,t]`:
 
-With `P_t` the cumulative decay and `D[t,j]` the product of decays over `(j,t]`,
-the implementation solves
+`delta_t = beta_t * (v_t - P_t * S0*k_t - sum(j<t, D[t,j]*dot(k_j,k_t)*delta_j))`
 
-`delta_t = beta_t * (v_t - P_t * S0*k_t - sum(j<t, D[t,j]*dot(k_j,k_t)*delta_j))`.
+Outputs combine `P_t*S0*q_t` with causal deltas; final state combines
+`P_last*S0` with all deltas. Products avoid cumulative-product division, including
+zero/underflowed decay. Decays and sigmoid updates must lie in `[0,1]`.
+No inverse-state rollback or reduced precision is used.
 
-Outputs combine `P_t*S0*q_t` with the accepted causal deltas, and the final state
-combines `P_last*S0` with all deltas. Initial recurrent rows are read row-major
-and the final recurrent matrix is written once per chunk. Products are formed
-without cumulative-product division, including zero and underflowed decay.
-No inverse-state rollback, truncated series or reduced state precision is used.
-Finite decays and sigmoid updates must lie in `[0,1]`; other gates reject.
-
-This changes floating evaluation order. Its initial qualification tolerance is
-`1e-3 + 1e-3 * abs(reference)` for complete logits and logical state. Full-model,
-long-prefix, adapter and restored-continuation evidence remains required before
-service selection. Different numerical identities cannot share prefix state.
-
-## Direct GDN convolution input
-
-The source candidate reads immutable original projection rows directly during
-head-major pinned GDN convolution. Eligible multi-token width-four NEON groups
-write only the convolved `SiLU` values into the existing output storage, rather
-than copying raw projections there and reading them back first. The shared
-kernel keeps the same FMA sequence, register-sliding history, finite-result
-checks and failure publication. Unsupported shapes and targets retain complete
-raw staging before their original scalar execution, including later token
-contents on an error. Input rows remain immutable and the graph's callbacks,
-request rollback and conservative scratch reservation are unchanged.
-
-For Swift's 10,240 convolution channels, a 32-token tile and 48 recurrent layers,
-the omitted copy accounts for 60 MiB of nominal raw staging writes and 60 MiB of
-matching reads. These are source payload counts, not measured memory traffic or
-latency. Independent scalar controls cover FMA/`SiLU`/history bits, signed zero
-and subnormal inputs, history sliding, unsupported widths and tails, geometry
-rejection and complete copied-route failure publication. Release code generation,
-complete-model logits/state/adapter recovery and whole-prompt benefit remain
-pending before release integration.
-
-## Grouped GDN finite checks
-
-The staged baseline NEON four/eight-row GDN helpers combine all updated-lane
-finite masks before one horizontal predicate reduction at their existing
-publication boundary. Every updated vector is still checked. Key-dot and
-query-dot checks retain their order, and arithmetic, private staging capacities
-and output bits are unchanged. Any failure leaves all grouped destinations
-untouched, allowing the checked facade to replay the original row-ordered
-scalar failure path. Single-row helpers retain their earlier blockwise checks
-and exact partial-error publication.
-
-At Swift's width 128, an eight-row decode group has one updated-lane horizontal
-predicate reduction instead of 64. Across 48 recurrent layers, 48 value heads
-and 16 groups per head, this is 36,864 reductions instead of 2,359,296 per token.
-A 32-token exact tile combines 2,048 such predicates per group into one. These
-are source work counts; every vector finite predicate and separate dot-result
-check remains. They establish no instruction count or measured speedup. Release
-ARM64 code generation and spill review, complete-model state/logit/adapter and
-cancellation parity, and matched whole-request benefit remain required.
-
-Direct NEON controls compare successful state/output bits to independent scalar
-recurrence and reject early/late key, update and output failures without any
-publication across both staging capacities. A separate checked-facade control
-compares scalar replay's complete partial state and output bits after a late
-update overflow.
+This changes floating order. Initial complete-logit/state tolerance is
+`1e-3 + 1e-3 * abs(reference)`; long-prefix, adapter and restored-continuation
+qualification remain required. Different numerical identities cannot share state.
 
 ## Bounds and recovery
 
-Pinned Swift's six query heads per KV head now share key/value conversion as a
-complete group during tiled prefill. Each token reads only its causal prefix
-from the already-appended tile cache; the current token keeps its original F32
-key/value arithmetic. Other geometries and source arithmetic retain their prior
-path. The six-head path removes the old two single-head tails, while the old
-four-head path also shared scans across tokens: total iterator sweeps are not
-uniformly lower and no measured prompt benefit is established.
+Scratch conservatively reserves all tile vectors, both activation contracts,
+floating fallback, every four/six-head score row per token, 64 KiB for triangular
+tables/metadata and 16 KiB for row-task metadata. The latter covers at most
+16 tasks and 32 output slices, including serial execution. Add it to ordinary
+live/checkpoint/scratch/worker charges; allocator overhead is separate.
 
-Six-head scores reserve two extra full-context rows per tile token:
-`2 * tile_tokens * context_limit * sizeof(f32)`, at most 2 MiB for 32 tokens at
-context 8192. The graph charges this even under serial execution. Complete-model
-state/logit/adapter and recovery parity, ARM64 code generation/resources and
-matched whole-prompt benefit remain required before release qualification.
+Cancellation checks surround preprocessing, causal attention, recurrent heads,
+layers and projections. Serial packed work checks each output row. Parallel
+callbacks stay on the caller thread with nominal one-millisecond waits; workers
+check before each row and all tasks join before error/cancellation return.
+Worker-unwind guards release waiting callers. This is cooperative scheduling.
 
-The additional reservation conservatively charges all tile vectors, both packed
-activation contracts, floating fallback high-water storage and small triangular
-matrices at once. The graph reports this reservation separately. It includes a
-fixed 64 KiB allowance for the maximum triangular
-tables and temporary metadata, including eight-token or very narrow fixtures.
-A further fixed 16 KiB covers the maximum sixteen row-task descriptors, their
-32 token-output slices, errors, counters and cancellation synchronization.
-The descriptors are stack-scoped; no row-major result matrix, transpose copy or
-retained packed-weight expansion is introduced. This charge is present even
-under one worker so a later row-policy change cannot exceed the reservation.
-Owners must add it to ordinary live state, checkpoint, scratch and worker-stack charges; allocator
-overhead remains separate. No existing admission limit is reduced.
+Failures can leave provisional layer-major state; Runtime restores the request
+checkpoint. Position becomes nonempty before mutation so reset clears a failed
+first tile. Outputs clear on failure. Counters include rolled-back work.
 
-Cancellation/deadline checks surround token preprocessing, causal attention,
-recurrent heads, layers and projections. Serial projections check every packed
-output row. During a parallel projection the original callback stays on its
-calling thread, with nominal one-millisecond waits between checks; it needs
-neither `Send` nor `Sync`. Workers observe cancellation before each next row.
-This is a cooperative bound rather than a real-time scheduling guarantee.
-All scoped tasks join before a callback cancellation or the earliest failing
-row chunk is returned and all provisional outputs are cleared. Completion
-guards also release the caller's wait if a worker unwinds. The implementation
-does not initialize or use Rayon's global pool.
-As allowed by the decoder block contract, failure can leave provisional
-layer-major state. The runtime restores its entire request checkpoint before
-reuse. Position is marked nonempty before the first mutation so explicit reset
-clears a failed first tile as well. Successful tiles retain complete logical
-state. Diagnostic counters include work later rolled back.
+## Validation
 
-## Owning checks and pending acceptance
-
-Pinned full-attention four-head value tiles fuse the original sigmoid gate into
-their final NEON publication store, in both single-token decode and two-token
-tiled prefill. The reduced vectors reuse the now-dead first temporal accumulator
-lane; no additional output buffer or stack payload is reserved. Successful
-grouped tiles omit the separate attended-output reread and rewrite. Scalar,
-non-ARM and single-head tails retain their existing arithmetic paths.
-Every reduction must pass the complete finite mask before any gate is applied.
-On eligible NEON tiles, failed reductions publish the original ungated partial
-output in increasing token/head/channel order. Scalar fallback retains atomic
-staging and leaves all destinations untouched on reduction failure. Graph
-rollback and each dispatch path's original error behavior are preserved.
-The exponentials and separate binary32 add, divide and multiply operations match
-the original gate. Independent per-channel FMA controls cover channel tails,
-temporal padding, causal token boundaries and failed partial publication.
-These source-level store reductions establish no measured request-time benefit;
-actual-model state/logit/adapter, cancellation and matched performance acceptance
-remain required before release integration.
-
-Foundation already discovers the library unit tests and the `graph` integration
-target on its hosted platforms. Focused commands for this source are:
+Focused commands, subject to [local-check policy](build-and-validation.md):
 
 ```text
 cargo test --release --locked --features parallel-rows --lib tiled_
@@ -304,19 +151,8 @@ cargo test --release --locked --features parallel-rows --test graph tiled_prefil
 cargo test --release --locked --features parallel-rows --test graph chunkwise_gdn_prefill_
 ```
 
-Independent existing matvec rows cover both quantizers and pinned FMA ordering;
-tile controls compare all requested backends and repeated pinned/unpinned reuse
-bit for bit against scalar matvec, plus extreme integer/native-lane reductions
-and cancellation or an invalid final scale after a complete output row.
-Parallel controls cover awkward row counts, two/four-worker exact PQ2/Q8_K,
-odd PQ2/Q8_0 and PTQ1 tiles, invalid-scale clearing/retry, callback thread affinity,
-joined cancellation, deterministic failure and worker unwind. A fixed-size
-assertion checks task metadata against the explicit reservation. Graph controls
-set workers before/after tile selection and preserve adapter/state bits through
-continuation, policy change, checkpoint restoration and reset.
-The chunk unit control uses ordinary recurrence, signed key correlations and zero
-decay. Graph controls exercise packed FFN, nonzero/zero adapters, hybrid KV page
-boundaries, continuation, checkpoint restore, cancellation/reset and runtime
-request rollback. Prepared tests are not a compiled verdict. Owner-managed
-hosted checks, complete-model numerical and resource acceptance and matched
-target-device prompt-time measurements remain pending. No TPS gain is claimed.
+Controls cover scalar/NEON and quantizer bits, packed extremes, awkward rows,
+worker selection, deterministic errors, callback affinity, joined cancellation,
+unwind, causal page boundaries, adapters, continuation, checkpoint/reset and
+request rollback. Hosted checks, full-model correctness/resources and matched
+target-device prompt measurements remain distinct gates.

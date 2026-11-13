@@ -1,109 +1,96 @@
-# Explicit Swift session profiles
+# Swift session profiles
 
-`SwiftSession::load` and `load_with_row_parallelism` retain the original pinned
-PQ2 model without an adapter. The explicit
-`load_profile_with_row_parallelism(path, representation, adapter_path, backend,
-seed, parallelism)` API admits either original PQ2 or its exact current-weight
-PTQ1 export, with an optional approved rank-one adapter. It uses each selected
-representation's full artifact and metadata verification. There is no arbitrary
-checkpoint or model-path fallback.
+`SwiftSession::load` and `load_with_row_parallelism` load the pinned original
+PQ2 model without an adapter. `load_profile_with_row_parallelism` explicitly
+selects original PQ2 or its exact current-weight PTQ1 export and an optional
+approved [rank-one adapter](rank-one-adapter.md). Each selection verifies the
+complete artifact and metadata; arbitrary model-path fallback is unavailable.
 
-These ordinary loading APIs select the owner-directed K4/V4 (`rsq4`) development
-cache. Use `load_profile_with_kv_cache(..., KvCachePolicy::F16)` explicitly for
-FP16 comparison/recovery. A session never changes precision after a failure or
-through a request body. This default does not establish actual-model quality,
-memory benefit or device qualification; [rotated KV](quantized-kv.md) records the
-remaining evidence and the generic graph constructors' FP16 reference behavior.
-
-Representation and adapter identity are immutable for the session. The accessors
-`representation()` and `adapter_identity()` expose the selected format and exact
-approved adapter artifact SHA-256. Model receipt accounting retains its original
-scope; adapter storage, graph scratch and process overhead are separate. Source
-support does not lower process admission or establish native authoring basis,
-full-model arithmetic, resource, speed, quality or release qualification.
+Ordinary loaders select K4/V4 (`rsq4`). Use
+`load_profile_with_kv_cache(..., KvCachePolicy::F16)` for FP16 comparison.
+[KV precision](quantized-kv.md), representation and adapter identity are immutable
+for a session. `representation()` and `adapter_identity()` expose the latter two.
+These experimental profiles require actual-model and device qualification.
 
 ## Request settings and ownership
 
 `prepare_with_settings(messages, output_tokens, enable_thinking, adapter_scale)`
-renders and counts once. A loaded adapter requires an explicit `Some(scale)`
-finite within 0..2; an adapter-free session requires `None`, including when the
-caller would otherwise supply zero. Both signed zero scales bypass correction
-arithmetic while retaining their exact scale bits in graph identity. Existing
-`prepare` and `prepare_with_thinking` use scale 1.3 when an adapter was explicitly
-loaded; their original adapter-free behavior is unchanged.
+renders and counts once. An adapter requires an explicit finite `Some(scale)`
+within 0..2; an adapter-free session requires `None`. Both signed zeros bypass
+correction arithmetic but retain distinct graph identities. `prepare` and
+`prepare_with_thinking` use scale 1.3 when an adapter is loaded.
 
-`PreparedChat` seals the exact token sequence, output reservation, thinking mode
-and scale to its originating session. Another session cannot complete it, even
-when both sessions selected identical files and settings. A prepared prompt can
-be replayed after an explicit reset of its original session, preserving the
-existing seeded replay API. It never carries mutable graph state.
+`PreparedChat` seals tokens, output reservation, thinking mode and scale to its
+originating session. It carries no mutable graph state and remains replayable
+after that session's explicit reset. Another session cannot complete it.
 
-## Fresh state and experimental exact reuse
+By default, completions start from empty model state.
+`Runtime<Qwen35>::reset_with_adapter_scale` clears tokens, logits and prefixes
+after renewing decoder provenance. `Qwen35::reset_with_adapter_scale` retains
+immutable weights/factors, clears selected KV and F32 recurrent/convolution state,
+and invalidates every old checkpoint, including at the same scale or after
+changing back. Invalid scales and absent adapters reject before mutation.
+Identity-allocation failure preserves the graph but closes runtime admission
+until reset succeeds.
 
-By default every completion starts from empty model state. Adapter requests use
-`Runtime<Qwen35>::reset_with_adapter_scale`, which clears committed tokens,
-logits and saved prefixes only after renewing the decoder's empty-state identity.
-`Qwen35::reset_with_adapter_scale` reuses immutable weights and factors, clears
-the selected KV representation and F32 convolution/recurrent state, and creates
-fresh checkpoint provenance. No prior checkpoint can restore afterward, including after the same
-scale or a change back to an earlier scale. Neither API exposes general mutable
-decoder access or duplicates the model.
+Cancellation/expiry is checked before request reset. Generation rolls back model
+and sampler state on failure; failed final text/accounting delivery closes
+admission until reset. Successful requests and scale changes preserve sampler
+progression. `SwiftSession::reset` clears model state and restores the initial
+seeded sampler.
 
-Invalid scales and absent adapters reject before mutation. Graph identity
-allocation failure preserves the old graph; the owning runtime closes admission
-until successful explicit reset. A cancelled or expired request is checked before
-request-state reset. Generation retains transactional model and sampler rollback;
-failed final text/accounting delivery closes session admission until reset.
+## Latest-prefix reuse
 
-The reset-only sampled path omits unused next-token logits after the final emitted
-token at the output cap through [terminal state-only ingestion](terminal-state-only.md).
-Exact latest-prefix reuse retains terminal logits; stop-token behavior and the
-explicit greedy suffix path keep their existing contracts.
+`set_prompt_reuse(PromptReuse::Latest)` enables the latest committed live sequence
+as an exact prefix candidate. The private server accepts `--prompt-reuse latest`;
+omission or `disabled` selects fresh recomputation. JSONL workers always recompute.
+Enabled HTTP readiness at `/v1/models` and `/props` includes
+`"prompt_reuse":"latest"`. Counting never mutates live state.
 
-Sampler draws retain the established session behavior across successful requests
-and scale changes. Scale reset does not silently reseed the sampler. Explicit
-`SwiftSession::reset` clears model state and restores the initial seeded sampler.
-The per-session prepared-prompt seal remains valid across that reset.
+Reuse requires the same model, adapter and bit-identical scale. Any scale-bit
+change clears state and renews checkpoint provenance. Edited or switched histories
+without the complete live prefix recompute from empty; recurrent state cannot
+be truncated. Cancellation or provisional-delivery failure restores the committed
+state and sampler at an unchanged scale; after a scale change, rollback preserves
+the new scale's empty state. Changing reuse policy clears live state while
+preserving sampler progression. No saved-prefix cache or budget discount is added.
 
-`set_prompt_reuse(PromptReuse::Latest)` explicitly enables the latest committed
-live sequence as an exact prefix candidate. The private server accepts
-`--native-engine-child ... --prompt-reuse latest`; omission and explicit
-`--prompt-reuse disabled` retain fresh recomputation. Unknown values and duplicate
-options reject before loading. The JSONL Swift worker retains fresh recomputation.
-Only selected native HTTP readiness adds `"prompt_reuse":"latest"`, allowing an
-owner to verify the explicit policy without changing the default response shape.
+Graph and private-service controls cover fresh/reused state and logits, RNG
+progression, page boundaries, edited histories, scale changes, cancellation,
+count seals, delivery failure and explicit reset. Actual-model turn re-encoding,
+service lifecycle, resources and latency remain separate qualification gates.
 
-The live candidate is eligible only within its original immutable model/adapter
-profile and at bit-identical scale. A scale change, including positive/negative
-zero or change-back, clears state and renews checkpoint provenance before execution.
-An edited or switched token sequence without the complete live prefix recomputes
-from empty under the runtime transaction; recurrent state is never truncated.
-Cancellation or provisional delivery failure at an unchanged scale restores the
-previous committed state and sampler. At a changed scale, rollback retains the
-new scale's empty state, matching the existing fresh-request contract. Failed
-terminal delivery closes admission until explicit reset. Changing reuse policy
-clears the live sequence while preserving sampler progression; an explicit reset
-clears it and reseeds. No retained snapshot cache is added, and snapshot budget
-admission remains unchanged.
+## Terminal state-only ingestion
 
-Focused synthetic full-attention and recurrent graph tests compare exact live
-reuse, edited/switched histories and provisional failure/cancellation replay with
-fresh logits/state and a cloned reference sampler. Scale tests cover signed zero,
-change-back, invalid-setting atomicity, disabled mode and explicit reset. These
-are model-free controls; they do not qualify Swift token re-encoding across turn
-boundaries, complete-model arithmetic, production sampling, resource or latency
-benefit. Reuse remains opt-in pending actual-model private-service qualification.
+With `PromptReuse::Disabled`, the final non-stop token at the output cap uses
+state-only ingestion: complete KV/recurrent/convolution state is checked, while
+unused output normalization/projection is omitted. Earlier tokens compute logits.
+A stop token consumes its sampler draw but enters neither state nor output.
 
-The mixed full-attention/recurrent regression also repeats and extends exact live
-prefixes across 64-token KV page seals, then shortens the history. It compares
-every sampled logit and complete logical state with fresh computation, verifies
-that stop tokens are neither delivered nor committed, and checks the next
-ordinary draw against an independently progressed reference sampler. This is
-synthetic page/stop coverage, separate from full-model or device qualification.
+Callback, cancellation and deadline checks surround ingestion within the request
+transaction. Failure clears logits and restores the committed snapshot; failed
+restore closes admission. The crate-private service path requires zero retained
+prefix checkpoints and clears terminal logits on success. An internal continuation
+therefore recomputes its prompt. Public Runtime APIs, latest-prefix reuse and the
+greedy suffix path retain complete terminal logits.
 
-Focused synthetic graph checks cover same-scale/change-back checkpoint rejection,
-complete state clearing, invalid-setting atomicity, prefix eviction, cancellation
-and failed delivery at a new scale. These checks do not load the full Swift model.
-Full-model numerical comparisons, actual private-service lifecycle/device
-qualification and release integration remain independent requirements under the
-[rank-one contract](rank-one-adapter.md) and [validation policy](build-and-validation.md).
+Timing adds `terminal-ingestion` after the eleven existing phases.
+`decode-evaluation` counts only generated-token evaluations that compute logits.
+Conservative work and memory admission still reserve complete evaluation costs.
+
+## Bounded request preparation
+
+Special-token splitting uses reverse-trie windows of at most 4,096 positions in
+an 8 KiB array of 16-bit indices. Each window scans up to 255 overlap bytes
+(the longest spelling minus one), preserving earliest-start/longest-match
+selection across boundaries. A match crossing a boundary advances the next window
+past the complete spelling. Byte scanning may cross UTF-8 scalars; only validated
+complete spellings create text-slice boundaries.
+
+Segments grow fallibly within the limits: 1 MiB input, 256 bytes per spelling,
+4,096 specials and 65,536 segments. Text segments borrow the input; literal mode
+uses its direct path. Recognition finishes before BPE, preserving segmentation
+errors ahead of token-output-limit errors. No match cache survives a request.
+
+See [runtime memory accounting](runtime-contracts.md#memory-and-ownership) and
+[validation](build-and-validation.md) for shared limits and qualification procedures.

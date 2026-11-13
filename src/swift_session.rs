@@ -894,7 +894,10 @@ impl SwiftSession {
         Ok(())
     }
 
-    /// Generate sampled text under the complete output cap and absolute deadline.
+    /// Generate sampled text under the complete output cap and optional deadline.
+    ///
+    /// None leaves ordinary generation uncapped in elapsed time; cancellation,
+    /// context/output bounds and transactional recovery still apply.
     ///
     /// Callbacks provide backpressure and must report failed delivery. Deadlines
     /// and cancellation are cooperative between synchronous decoder operations.
@@ -908,10 +911,10 @@ impl SwiftSession {
         &mut self,
         prompt: &PreparedChat,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
-        self.complete_observed(prompt, cancellation, deadline, None, emit)
+        self.complete_observed(prompt, cancellation, deadline.into(), None, emit)
     }
 
     /// Complete with optional fixed-size runtime attribution and unchanged sampling.
@@ -929,12 +932,12 @@ impl SwiftSession {
         &mut self,
         prompt: &PreparedChat,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         timings: &mut GenerationTimings,
         emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
         *timings = GenerationTimings::default();
-        self.complete_observed(prompt, cancellation, deadline, Some(timings), emit)
+        self.complete_observed(prompt, cancellation, deadline.into(), Some(timings), emit)
     }
 
     /// Generate greedy text with prompt/history suffix speculation (`SuffixDecoding`)
@@ -947,9 +950,10 @@ impl SwiftSession {
         prompt: &PreparedChat,
         suffix_config: SuffixDraftConfig,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<(Completion, SpeculativeStats)> {
+        let deadline = deadline.into();
         suffix_config.validate()?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
@@ -998,7 +1002,7 @@ impl SwiftSession {
         &mut self,
         prompt: &PreparedChat,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: Option<Instant>,
         timings: Option<&mut GenerationTimings>,
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
@@ -1116,7 +1120,7 @@ fn charge_output(total: &mut usize, bytes: usize) -> Result<()> {
     Ok(())
 }
 
-fn check_request(cancellation: &Cancellation, deadline: Instant) -> Result<()> {
+fn check_request(cancellation: &Cancellation, deadline: Option<Instant>) -> Result<()> {
     if cancellation.is_cancelled() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
@@ -1124,7 +1128,7 @@ fn check_request(cancellation: &Cancellation, deadline: Instant) -> Result<()> {
         )
         .into());
     }
-    if Instant::now() >= deadline {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(
             std::io::Error::new(std::io::ErrorKind::TimedOut, "Swift request expired").into(),
         );

@@ -356,7 +356,8 @@ impl<D: Decoder> Runtime<D> {
 
     /// Generate synchronously before an absolute monotonic request deadline.
     ///
-    /// The deadline includes prefill, generation, callbacks and snapshot work.
+    /// An optional deadline includes prefill, generation, callbacks and snapshot work.
+    /// Passing None keeps cancellation and all non-time bounds without a total cutoff.
     /// Expiry is cooperative: a running decoder operation or callback completes
     /// before the next check detects it. Recovery is allowed to finish after the
     /// deadline. Emitted output remains provisional until this call succeeds.
@@ -372,9 +373,10 @@ impl<D: Decoder> Runtime<D> {
         prompt: &[u32],
         options: &Generation,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
+        let deadline = deadline.into();
         self.generate_until_with_prefill(
             prompt,
             options,
@@ -400,9 +402,10 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
+        let deadline = deadline.into();
         self.generate_checked(
             prompt,
             options,
@@ -464,10 +467,11 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         sampler: &mut S,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
+        let deadline = deadline.into();
         self.generate_sampled_checked(
             prompt,
             options,
@@ -498,11 +502,12 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         sampler: &mut S,
         timings: &mut GenerationTimings,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
+        let deadline = deadline.into();
         self.generate_sampled_observed(
             prompt,
             options,
@@ -534,11 +539,12 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         sampler: &mut S,
         timings: Option<&mut GenerationTimings>,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
+        let deadline = deadline.into();
         if self.limits.checkpoints != 0 {
             return Err(invalid(
                 "reset-only generation cannot retain prefix checkpoints",
@@ -1008,9 +1014,10 @@ impl<D: Decoder> Runtime<D> {
         prefill: Prefill,
         suffix_config: SuffixDraftConfig,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<(Completion, SpeculativeStats)> {
+        let deadline = deadline.into();
         self.generate_speculative_checked(
             prompt,
             options,
@@ -1298,9 +1305,13 @@ impl<D: Decoder> Runtime<D> {
     }
 }
 
-fn check_deadline(cancellation: &Cancellation, deadline: Instant, now: Instant) -> Result<()> {
+fn check_deadline(
+    cancellation: &Cancellation,
+    deadline: impl Into<Option<Instant>>,
+    now: Instant,
+) -> Result<()> {
     cancellation.check()?;
-    if now >= deadline {
+    if deadline.into().is_some_and(|deadline| now >= deadline) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "native generation deadline exceeded",
@@ -2068,5 +2079,32 @@ mod deadline_tests {
             assert_continues(&mut runtime)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod optional_deadline_tests {
+    use super::{Cancellation, check_deadline};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn uncapped_generation_checks_cancellation_without_an_elapsed_cutoff() {
+        let cancel = Cancellation::default();
+        let start = Instant::now();
+        let later = start + Duration::from_mins(11);
+        assert!(check_deadline(&cancel, None, later).is_ok());
+        let expired = check_deadline(&cancel, start + Duration::from_mins(10), later);
+        assert!(expired.is_err_and(|error| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        }));
+        cancel.cancel();
+        let cancelled = check_deadline(&cancel, None, later);
+        assert!(cancelled.is_err_and(|error| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+        }));
     }
 }

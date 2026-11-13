@@ -196,7 +196,7 @@ struct Delivery<W> {
     client: W,
     streaming: bool,
     prompt_tokens: usize,
-    deadline: Instant,
+    deadline: Option<Instant>,
     started: bool,
     sent: usize,
     collected: CollectedSegments,
@@ -223,7 +223,12 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
     ///
     /// No response bytes are sent until a delta or completion is delivered.
     #[must_use]
-    pub fn new(client: W, streaming: bool, prompt_tokens: usize, deadline: Instant) -> Self {
+    pub fn new(
+        client: W,
+        streaming: bool,
+        prompt_tokens: usize,
+        deadline: impl Into<Option<Instant>>,
+    ) -> Self {
         Self::with_thinking(client, streaming, prompt_tokens, deadline, true)
     }
 
@@ -236,7 +241,7 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
         client: W,
         streaming: bool,
         prompt_tokens: usize,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         enable_thinking: bool,
     ) -> Self {
         let capacity = if streaming {
@@ -250,7 +255,7 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
                 client,
                 streaming,
                 prompt_tokens,
-                deadline,
+                deadline: deadline.into(),
                 started: false,
                 sent: 0,
                 collected: CollectedSegments::default(),
@@ -446,8 +451,11 @@ fn charge(sent: &mut usize, bytes: usize) -> Result<(), ResponseError> {
     Ok(())
 }
 
-fn ensure_time(deadline: Instant) -> Result<(), ResponseError> {
-    if Instant::now() >= deadline {
+fn ensure_time(deadline: impl Into<Option<Instant>>) -> Result<(), ResponseError> {
+    if deadline
+        .into()
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
         Err(ResponseError::Deadline)
     } else {
         Ok(())
@@ -457,10 +465,11 @@ fn ensure_time(deadline: Instant) -> Result<(), ResponseError> {
 async fn write_group<W: AsyncWrite + Unpin>(
     client: &mut W,
     pieces: &[&[u8]],
-    supervisor_deadline: Instant,
+    supervisor_deadline: Option<Instant>,
     shutdown: bool,
 ) -> Result<(), ResponseError> {
-    let deadline = supervisor_deadline.min(Instant::now() + CLIENT_WRITE_TIMEOUT);
+    let write_deadline = Instant::now() + CLIENT_WRITE_TIMEOUT;
+    let deadline = supervisor_deadline.map_or(write_deadline, |limit| limit.min(write_deadline));
     ensure_time(deadline)?;
     timeout_at(deadline, async {
         for piece in pieces {

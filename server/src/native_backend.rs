@@ -16,9 +16,7 @@ use crate::{
     native_response::NativeResponse,
     reception::{HEADER_TIMEOUT, INTAKE_TIMEOUT},
     response::{CLIENT_WRITE_TIMEOUT, ResponseError},
-    singleton,
-    supervisor::REQUEST_TIMEOUT,
-    wire,
+    singleton, wire,
 };
 use bonsai_prism_runtime::{runtime::Cancellation, swift_session::SwiftSession};
 
@@ -34,7 +32,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::TcpListener,
-    time::{Instant, sleep_until, timeout_at},
+    time::{Instant, timeout_at},
 };
 #[cfg(windows)]
 pub(super) use worker::register_hexagon_model_path;
@@ -83,6 +81,8 @@ pub enum NativeBackendError {
 /// Readiness is reachable only after the caller has loaded the pinned graph.
 /// All routes require the private key, including `/health`. `/v1/models` rejects
 /// missing credentials with 401 for the existing launcher authentication probe.
+/// Ordinary requests have no aggregate elapsed-time cutoff. Intake and each
+/// response write retain their independent deadlines; cancellation stays active.
 /// Counting retains its exact prepared input for one matching completion. The
 /// authenticated private `/reset` route clears failed admission and the sampler.
 /// There is no frontend administrative route or automatic reset/retry here.
@@ -141,14 +141,23 @@ pub async fn serve_with_placement(
         client
             .set_nodelay(true)
             .map_err(|_| NativeBackendError::Io)?;
-        let _ = serve_connection(
-            client,
-            &policy,
-            &mut worker,
-            Instant::now() + REQUEST_TIMEOUT,
-        )
-        .await;
+        if let Err(error) = serve_connection(client, &policy, &mut worker, None).await {
+            let _ = write_request_failure(&mut std::io::stderr().lock(), error);
+        }
     }
+}
+
+fn write_request_failure(
+    writer: &mut impl std::io::Write,
+    error: NativeBackendError,
+) -> std::io::Result<()> {
+    if matches!(
+        error,
+        NativeBackendError::Unauthorized | NativeBackendError::Admission(Rejection::ContextLimit)
+    ) {
+        return Ok(());
+    }
+    writeln!(writer, "private-inference-request-failed error={error:?}")
 }
 
 enum Route {
@@ -180,8 +189,9 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     mut client: C,
     policy: &RequestPolicy,
     worker: &mut Worker,
-    deadline: Instant,
+    deadline: impl Into<Option<Instant>>,
 ) -> Result<(), NativeBackendError> {
+    let deadline = deadline.into();
     let received = match receive(&mut client, policy, &worker.profile, deadline).await {
         Ok(value) => value,
         Err(error) => {
@@ -236,9 +246,9 @@ async fn exchange<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     worker: &mut Worker,
     input: Input,
     cancellation: &Cancellation,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(), NativeBackendError> {
-    let events = worker.start(input, cancellation.clone(), deadline.into_std())?;
+    let events = worker.start(input, cancellation.clone(), deadline.map(Instant::into_std))?;
     // Dropping a connection future must stop its model work even when the
     // worker remains owned by the server and no error result is observed.
     let mut cancel_on_drop = CancelOnDrop {
@@ -250,9 +260,17 @@ async fn exchange<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     let mut abandoned = pin!(input.read(&mut byte));
     let delivered = AtomicBool::new(false);
     let mut pipeline = pin!(deliver(output, events, &delivered, deadline));
-    let mut timer = pin!(sleep_until(deadline));
+    let mut timer = pin!(async {
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(deadline).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    });
     let result = poll_fn(|cx| {
-        if Instant::now() >= deadline || timer.as_mut().poll(cx).is_ready() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || timer.as_mut().poll(cx).is_ready()
+        {
             return std::task::Poll::Ready(Err(NativeBackendError::Deadline));
         }
         if !delivered.load(Ordering::Acquire) && abandoned.as_mut().poll(cx).is_ready() {
@@ -273,7 +291,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
     output: W,
     mut events: tokio::sync::mpsc::Receiver<Event>,
     delivered: &AtomicBool,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(), NativeBackendError> {
     let mut writer = Some(output);
     let mut response = None;
@@ -362,11 +380,15 @@ async fn receive<C: AsyncRead + Unpin>(
     client: &mut C,
     policy: &RequestPolicy,
     profile: &ModelProfile,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Received, NativeBackendError> {
     let start = Instant::now();
-    let header_deadline = deadline.min(start + HEADER_TIMEOUT);
-    let intake_deadline = deadline.min(start + INTAKE_TIMEOUT);
+    let header_deadline = deadline.map_or(start + HEADER_TIMEOUT, |limit| {
+        limit.min(start + HEADER_TIMEOUT)
+    });
+    let intake_deadline = deadline.map_or(start + INTAKE_TIMEOUT, |limit| {
+        limit.min(start + INTAKE_TIMEOUT)
+    });
     let mut bytes = vec![0; MAX_HEADER_BYTES];
     let mut used = 0;
     let head = loop {
@@ -617,7 +639,7 @@ async fn write_json<W: AsyncWrite + Unpin>(
     client: &mut W,
     status: u16,
     body: &Value,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(), NativeBackendError> {
     let bytes = serde_json::to_vec(body).map_err(|_| NativeBackendError::Schema)?;
     let reason = if status == 200 {
@@ -633,7 +655,8 @@ async fn write_json<W: AsyncWrite + Unpin>(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
         bytes.len()
     );
-    let deadline = deadline.min(Instant::now() + CLIENT_WRITE_TIMEOUT);
+    let write_deadline = Instant::now() + CLIENT_WRITE_TIMEOUT;
+    let deadline = deadline.map_or(write_deadline, |limit| limit.min(write_deadline));
     ensure_time(deadline)?;
     timeout_at(deadline, async {
         client.write_all(head.as_bytes()).await?;
@@ -647,8 +670,11 @@ async fn write_json<W: AsyncWrite + Unpin>(
     ensure_time(deadline)
 }
 
-fn ensure_time(deadline: Instant) -> Result<(), NativeBackendError> {
-    if Instant::now() >= deadline {
+fn ensure_time(deadline: impl Into<Option<Instant>>) -> Result<(), NativeBackendError> {
+    if deadline
+        .into()
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
         Err(NativeBackendError::Deadline)
     } else {
         Ok(())

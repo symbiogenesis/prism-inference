@@ -33,3 +33,8 @@ for performance by its availability alone.
 
 Model weights and adapters follow their publishers' licenses. Code attribution
 and upstream source identities are recorded in [NOTICE](../NOTICE).
+
+- [ ] Publish and qualify uncapped ordinary native HTTP generation: source-bound
+  bundle and Runner repin, explicit diagnostic deadlines, long-prefill Stop/retry
+  and confirmed owner cleanup. Model-free virtual-time checks do not qualify
+  actual-model long-prompt behavior or throughput.

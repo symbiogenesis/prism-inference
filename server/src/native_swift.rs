@@ -102,7 +102,7 @@ pub fn complete(
     session: &mut SwiftSession,
     chat: &NativeChat,
     cancellation: &Cancellation,
-    deadline: Instant,
+    deadline: impl Into<Option<Instant>>,
     emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
 ) -> bonsai_prism_runtime::Result<Completion> {
     session.complete(&chat.prompt, cancellation, deadline, emit)

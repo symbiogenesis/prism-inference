@@ -28,7 +28,7 @@ pub(super) trait Engine: Send + 'static {
         &mut self,
         prepared: &Self::Prepared,
         cancel: &Cancellation,
-        deadline: Instant,
+        deadline: Option<Instant>,
         emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion>;
     fn reset(&mut self) -> bonsai_prism_runtime::Result<()>;
@@ -79,7 +79,7 @@ impl Engine for SwiftSession {
         &mut self,
         prepared: &Self::Prepared,
         cancel: &Cancellation,
-        deadline: Instant,
+        deadline: Option<Instant>,
         emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion> {
         crate::native_swift::complete(self, prepared, cancel, deadline, emit)
@@ -487,7 +487,7 @@ struct Command {
 
 struct CommandContext {
     cancel: Cancellation,
-    deadline: Instant,
+    deadline: Option<Instant>,
     events: channel::Sender<Event>,
 }
 
@@ -623,8 +623,9 @@ impl Worker {
         &mut self,
         input: Input,
         cancellation: Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
     ) -> Result<channel::Receiver<Event>, NativeBackendError> {
+        let deadline = deadline.into();
         if self.busy.swap(true, Ordering::AcqRel) {
             return Err(NativeBackendError::Engine);
         }
@@ -766,7 +767,10 @@ fn check(context: &CommandContext) -> Result<(), NativeBackendError> {
     if context.cancel.is_cancelled() {
         return Err(NativeBackendError::ClientAbandoned);
     }
-    if Instant::now() >= context.deadline {
+    if context
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
         return Err(NativeBackendError::Deadline);
     }
     Ok(())
@@ -786,8 +790,11 @@ fn acknowledge(context: &CommandContext, output: Output) -> Result<(), NativeBac
         check(context)?;
         let remaining = context
             .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(NativeBackendError::Deadline)?;
+            .map_or(Ok(Duration::from_millis(50)), |deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(NativeBackendError::Deadline)
+            })?;
         match receive.recv_timeout(remaining.min(Duration::from_millis(50))) {
             Ok(()) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}

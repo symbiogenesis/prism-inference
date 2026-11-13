@@ -100,6 +100,9 @@ struct Observation {
     cpu_speculation: Option<bonsai_prism_runtime::swift_session::CpuSpeculation>,
     startup_graph_identity: Option<Arc<str>>,
     preparation_rejection: Option<(usize, Rejection)>,
+    generation_gate: Option<Arc<AtomicBool>>,
+    finite_deadlines: Arc<AtomicUsize>,
+    generation_cancelled: Arc<AtomicBool>,
 }
 struct FakeEngine(Observation);
 
@@ -160,11 +163,14 @@ impl worker::Engine for FakeEngine {
     fn complete(
         &mut self,
         _prepared: &Self::Prepared,
-        _cancel: &Cancellation,
-        _deadline: std::time::Instant,
+        cancel: &Cancellation,
+        deadline: Option<std::time::Instant>,
         mut emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion> {
-        self.0.executions.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .finite_deadlines
+            .fetch_add(usize::from(deadline.is_some()), Ordering::Relaxed);
+        self.0.executions.fetch_add(1, Ordering::Release);
         let original = self.0.state.fetch_add(1, Ordering::Relaxed);
         let completion = Completion {
             prompt_tokens: 100,
@@ -173,6 +179,22 @@ impl worker::Engine for FakeEngine {
             finish: Finish::Length,
         };
         let result = (|| {
+            while self
+                .0
+                .generation_gate
+                .as_ref()
+                .is_some_and(|gate| !gate.load(Ordering::Acquire))
+            {
+                if cancel.is_cancelled() {
+                    self.0.generation_cancelled.store(true, Ordering::Release);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "fake generation cancelled",
+                    )
+                    .into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             emit(TextEvent::Delta("draft"))?;
             emit(TextEvent::Delta("</think>answer"))?;
             emit(TextEvent::Complete(completion))?;
@@ -1527,4 +1549,154 @@ fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admis
         }
         Ok(())
     })
+}
+
+#[test]
+fn private_uncapped_generation_survives_ten_minutes_and_finite_deadlines_cancel() -> TestResult {
+    run(async {
+        for finite in [false, true] {
+            let gate = Arc::new(AtomicBool::new(false));
+            let observed = Observation {
+                generation_gate: Some(gate.clone()),
+                ..Observation::default()
+            };
+            let mut worker = Worker::new(FakeEngine(observed.clone()), 42)
+                .map_err(|error| format!("{error:?}"))?;
+            let body = pending(true, 128)
+                .map_err(|error| format!("{error:?}"))?
+                .body;
+            let (result, _) = perform(
+                &mut worker,
+                request("/v1/chat/completions/input_tokens", &body, true),
+            )
+            .await?;
+            assert_eq!(result, Ok(()));
+            let policy = RequestPolicy::new(8080, KEY).map_err(|error| format!("{error:?}"))?;
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(&request("/v1/chat/completions", &body, true))
+                .await?;
+            let deadline = finite.then(|| Instant::now() + Duration::from_mins(10));
+            let mut serving = pin!(serve_connection(server, &policy, &mut worker, deadline));
+            poll_fn(|cx| {
+                assert!(serving.as_mut().poll(cx).is_pending());
+                if observed.executions.load(Ordering::Acquire) != 0 {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(
+                observed.finite_deadlines.load(Ordering::Relaxed),
+                usize::from(finite)
+            );
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_mins(11)).await;
+            tokio::time::resume();
+            if !finite {
+                poll_fn(|cx| {
+                    assert!(serving.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                gate.store(true, Ordering::Release);
+            }
+            let receiving = async {
+                let mut bytes = Vec::new();
+                client.read_to_end(&mut bytes).await?;
+                Ok::<_, std::io::Error>(bytes)
+            };
+            let (result, bytes) = together(serving, receiving).await;
+            let bytes = bytes?;
+            if finite {
+                assert_eq!(result, Err(NativeBackendError::Deadline));
+                assert!(bytes.is_empty());
+                assert!(observed.generation_cancelled.load(Ordering::Acquire));
+                assert_eq!(observed.state.load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(result, Ok(()));
+                assert!(std::str::from_utf8(&bytes)?.contains("answer"));
+                assert!(std::str::from_utf8(&bytes)?.contains("[DONE]"));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn private_request_failure_diagnostic_contains_only_fixed_error_category() -> TestResult {
+    for (error, category) in [
+        (NativeBackendError::Deadline, "Deadline"),
+        (NativeBackendError::Engine, "Engine"),
+        (NativeBackendError::CountMismatch, "CountMismatch"),
+    ] {
+        let mut bytes = Vec::new();
+        write_request_failure(&mut bytes, error)?;
+        assert_eq!(
+            std::str::from_utf8(&bytes)?,
+            format!("private-inference-request-failed error={category}\n")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn private_uncapped_requests_preserve_header_intake_and_write_limits() -> TestResult {
+    run(async {
+        let policy = RequestPolicy::new(8080, KEY).map_err(|error| format!("{error:?}"))?;
+        for body_intake in [false, true] {
+            let (mut client, mut server) = duplex(4096);
+            if body_intake {
+                let body = pending(true, 128)
+                    .map_err(|error| format!("{error:?}"))?
+                    .body;
+                let bytes = request("/v1/chat/completions/input_tokens", &body, true);
+                client.write_all(&bytes[..bytes.len() - 1]).await?;
+            }
+            let profile = ModelProfile::default();
+            let mut receiving = pin!(receive(&mut server, &policy, &profile, None));
+            poll_fn(|cx| {
+                assert!(receiving.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::pause();
+            tokio::time::advance(if body_intake {
+                INTAKE_TIMEOUT
+            } else {
+                HEADER_TIMEOUT
+            })
+            .await;
+            tokio::time::resume();
+            assert!(matches!(receiving.await, Err(NativeBackendError::Deadline)));
+        }
+        let (_client, mut server) = duplex(1);
+        let body = json!({"status":"ok"});
+        let mut writing = pin!(write_json(&mut server, 200, &body, None));
+        poll_fn(|cx| {
+            assert!(writing.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(CLIENT_WRITE_TIMEOUT).await;
+        tokio::time::resume();
+        assert_eq!(writing.await, Err(NativeBackendError::Deadline));
+        Ok(())
+    })
+}
+
+#[test]
+fn private_expected_probe_and_context_rejections_are_not_failure_diagnostics() -> TestResult {
+    for error in [
+        NativeBackendError::Unauthorized,
+        NativeBackendError::Admission(Rejection::ContextLimit),
+    ] {
+        let mut bytes = Vec::new();
+        write_request_failure(&mut bytes, error)?;
+        assert!(bytes.is_empty());
+    }
+    Ok(())
 }

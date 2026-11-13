@@ -59,6 +59,12 @@ Prepared input cannot survive reset or a replacement count. Requests recompute
 from fresh model state unless latest-prefix reuse is explicitly enabled.
 See [session profiles](../docs/swift-session-profiles.md) for scale changes,
 prefix eligibility, sampler progression, cancellation and reset semantics.
+Ordinary private HTTP counting and generation have no total elapsed-time cutoff.
+Header/body intake remain bounded to 5/30 seconds, and each response write retains
+its 5-second allowance. Explicit library/diagnostic deadlines and owner-process
+lifetime limits still apply; Stop/disconnect cancellation remains active during
+prefill and generation. JSONL worker timeout settings are unchanged.
+
 One acknowledged event bounds provisional streaming; failed delivery or
 cancellation closes admission until explicit reset.
 
@@ -120,3 +126,8 @@ The checker establishes visible interruption/recovery, not graph execution at th
 disconnect instant, cancellation acknowledgement, complete-state rollback or
 performance. It does not exercise the JSONL worker. Model/state, lifecycle,
 long-context, quality and device qualification remain separate gates.
+
+Request failures retain one value-free `private-inference-request-failed error=Deadline`
+line (or another fixed error category) in private stderr; no prompt, generated text
+or credential is included. The uncapped HTTP change needs a published source-bound
+bundle, Runner repin and actual-model owner acceptance before installed use changes.

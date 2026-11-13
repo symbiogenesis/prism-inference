@@ -53,10 +53,11 @@ impl<D: Decoder> Runtime<D> {
         prefill: Prefill,
         suffix_config: SuffixDraftConfig,
         cancellation: &Cancellation,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         sampler: &mut S,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<(Completion, SpeculativeStats)> {
+        let deadline = deadline.into();
         self.generate_sampled_speculative_checked(
             prompt,
             options,

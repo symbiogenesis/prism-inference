@@ -152,9 +152,13 @@ The current [Foundation workflow](../.github/workflows/foundation.yml) runs
 formatting, Release Clippy/rustdoc and complete correctness tests for affected
 workspace crates and their transitive consumers on Windows ARM64 and x64.
 Each Windows target runs analyzers, feature variants and four correctness shards
-concurrently. Cargo metadata assigns every enabled integration-test target to
-exactly one shard; same-named targets share a shard, while unit tests, doctests,
-test-enabled examples and default binary/release packaging run on shard zero.
+concurrently. Cargo metadata assigns every enabled correctness target to
+exactly one shard. Library unit tests use shard zero and doctests use shard one;
+binary, example and integration selectors are balanced deterministically across
+the four runners. Same-kind, same-named targets share a shard. Each shard batches
+its non-doc selectors into one Cargo invocation so independent compilation and
+linking can overlap. Default binary/release packaging uses shard two and ARM64
+mutations use shard three, removing their serial tail from library unit tests.
 Every shard retains its full target inventory and executed command list. The
 `windows` matrix remains required by the fail-closed Foundation aggregate.
 Every Cargo test command keeps the complete selected package set to preserve
@@ -163,6 +167,20 @@ empty `test = false` library roots; dormant feature-gated native targets remain
 disabled. Unsupported dependency activation of a gated target fails selection.
 Compiler caches are isolated by architecture and lane; locked registry downloads
 have their own shared cache, avoiding a complete workspace cache in every shard.
+The source-package matrix caches only external `debug` and `release` compiler
+outputs, isolated by target, verified compiler and runner image. Normalized
+archives, temporary registries, extracted sources, all three consumer feature
+variants and receipts are constructed or executed on every run. Hexagon checks
+also reuse compiler outputs with separate native/cross identities; native and
+runtime checks share one target directory per job. Every format, strict lint,
+test, documentation and projection check still runs on cache hits. Content
+freshness remains enabled; cached outputs supply no acceptance verdict.
+
+Owner-managed hosted acceptance of these scheduling and cache changes remains
+pending: compare cold and warm runs on matching runner images, verify a relevant
+source edit rebuilds, and require every selected check and fresh artifact. Local
+workflow and inventory regressions establish no measured hosted speedup.
+
 Feature variants, loader-ABI checks and mutation guards run only when their
 packages or inputs are selected. Its Linux ARM64 gate builds the pinned Prism
 engine with the Rust storage overlay only when that overlay's inputs change.

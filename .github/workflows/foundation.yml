@@ -57,9 +57,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Start expensive test compilation first. Unit/doc/default binaries and
-        # release receipts belong to correctness-0; every integration test is
-        # assigned exactly once by Cargo metadata, independently of file names.
+        # Keep unit tests, doctests, release builds and mutations on different
+        # runners. Cargo metadata assigns every correctness target exactly once;
+        # each shard batches its non-doc selectors in one compiler invocation.
         lane: [correctness-0, correctness-1, correctness-2, correctness-3, checks, variants]
         runner: [windows-11-arm, windows-2025]
         include:
@@ -77,7 +77,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Read the exact bundled package version
-        if: matrix.lane == 'correctness-0' && needs.changes.outputs.release == 'true'
+        if: matrix.lane == 'correctness-2' && needs.changes.outputs.release == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -174,7 +174,7 @@ jobs:
             python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/foundation_shards.py') --index $index --count 4 --manifest (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --evidence $env:PRISM_CHECK_EVIDENCE
           } finally { Stop-Transcript | Out-Null }
       - name: Build selected default-feature executables
-        if: matrix.lane == 'correctness-0'
+        if: matrix.lane == 'correctness-2'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -242,7 +242,7 @@ jobs:
             }
           } finally { Stop-Transcript | Out-Null }
       - name: Verify immutable reference fixtures and kill the bounded mutation catalog
-        if: matrix.lane == 'correctness-0' && matrix.target == 'aarch64-pc-windows-msvc' && needs.changes.outputs.mutations == 'true'
+        if: matrix.lane == 'correctness-3' && matrix.target == 'aarch64-pc-windows-msvc' && needs.changes.outputs.mutations == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
@@ -254,7 +254,7 @@ jobs:
           if ((Get-FileHash -LiteralPath (Join-Path $fixtures 'ptq-reference.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $provenance.fixtureSha256) { throw 'The immutable C++ codec corpus differs from its provenance.' }
           & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-Mutations.ps1') -EvidenceDirectory (Join-Path $env:PRISM_CHECK_EVIDENCE 'mutations')
       - name: Package the five checked Windows executables
-        if: matrix.lane == 'correctness-0' && needs.changes.outputs.release == 'true'
+        if: matrix.lane == 'correctness-2' && needs.changes.outputs.release == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         env:
@@ -271,7 +271,7 @@ jobs:
           & (Join-Path $env:GITHUB_WORKSPACE 'scripts/New-ReleaseBundle.ps1') -BuildDirectory $build -OutputDirectory $output -Target $env:RELEASE_TARGET -SourceRevision $env:GITHUB_SHA -Version $env:PRISM_VERSION -Toolchain "nightly-2026-11-09-$env:RELEASE_TARGET" | ConvertTo-Json -Depth 8
           "PRISM_BUNDLE_DIRECTORY=$output" >> $env:GITHUB_ENV
       - name: Retain the checked release bundle and source receipt
-        if: matrix.lane == 'correctness-0' && needs.changes.outputs.release == 'true'
+        if: matrix.lane == 'correctness-2' && needs.changes.outputs.release == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: prism-inference-${{ env.PRISM_VERSION }}-${{ matrix.target }}
@@ -567,7 +567,8 @@ jobs:
         run: |
           "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'Prism-SourcePackage-Build')" >> $env:GITHUB_ENV
           "PRISM_PACKAGE_EVIDENCE=$(Join-Path $env:RUNNER_TEMP 'Prism-SourcePackage-Evidence')" >> $env:GITHUB_ENV
-      - uses: ./.github/actions/rust-toolchain
+      - id: package-toolchain
+        uses: ./.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-11-09-${{ matrix.target }}
           components: ''
@@ -578,6 +579,17 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
           key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Reuse only source-package compiler outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Normalized archives, temporary registries, extracted sources and
+          # consumer receipts must be constructed anew on every run.
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}/debug
+            ${{ env.CARGO_TARGET_DIR }}/release
+          key: prism-source-package-v1-${{ matrix.target }}-${{ steps.package-toolchain.outputs.image-identity }}-${{ steps.package-toolchain.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'examples/**', 'tools/**', '.github/ci/source_package.py') }}-content-v1
+          restore-keys: |
+            prism-source-package-v1-${{ matrix.target }}-${{ steps.package-toolchain.outputs.image-identity }}-${{ steps.package-toolchain.outputs.compiler-identity }}-
       - name: Verify normalized packages and an external library consumer
         shell: pwsh
         working-directory: ${{ runner.temp }}

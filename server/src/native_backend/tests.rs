@@ -112,7 +112,9 @@ impl Drop for FakeEngine {
 impl worker::Engine for FakeEngine {
     type Prepared = FakePrepared;
     fn initialize_worker_thread(&mut self) {
-        self.0.worker_initializations.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .worker_initializations
+            .fetch_add(1, Ordering::Relaxed);
     }
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
         Ok(ModelProfile {

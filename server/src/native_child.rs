@@ -77,22 +77,22 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
             Some("--context-tokens") if context_tokens.is_none() => context_tokens = Some(value),
             Some("--memory-limit-bytes") if memory_limit_bytes.is_none() => {
-                memory_limit_bytes = Some(value)
+                memory_limit_bytes = Some(value);
             }
             Some("--cpu-prefill-tokens") if prefill_tokens.is_none() => {
-                prefill_tokens = Some(value)
+                prefill_tokens = Some(value);
             }
             Some("--cpu-prefill-scratch-bytes") if prefill_scratch.is_none() => {
-                prefill_scratch = Some(value)
+                prefill_scratch = Some(value);
             }
             Some("--cpu-speculative-tokens") if speculative_tokens.is_none() => {
-                speculative_tokens = Some(value)
+                speculative_tokens = Some(value);
             }
             Some("--cpu-verification-scratch-bytes") if verification_scratch.is_none() => {
-                verification_scratch = Some(value)
+                verification_scratch = Some(value);
             }
             Some("--cpu-speculative-checkpoint-bytes") if speculative_checkpoint.is_none() => {
-                speculative_checkpoint = Some(value)
+                speculative_checkpoint = Some(value);
             }
             Some("--port") if port.is_none() => {
                 port = Some(

@@ -536,19 +536,22 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
     if !cache_matches {
         return false;
     }
-    if let Some(prefill) = profile.cpu_prefill {
-        let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());
-        if profile.cpu_speculation.is_some() {
-            suffix.push_str(":cpu-tiled-verify-v1");
-        }
-        identity
-            .strip_suffix(&suffix)
-            .is_some_and(|base| !base.contains(":cpu-tiled-") && !base.contains(":gdn-wy-f32-v1"))
-    } else {
-        profile.kv_cache != KvCachePolicy::F16
-            && !identity.contains(":cpu-tiled-")
-            && !identity.contains(":gdn-wy-f32-v1")
-    }
+    profile.cpu_prefill.map_or_else(
+        || {
+            profile.kv_cache != KvCachePolicy::F16
+                && !identity.contains(":cpu-tiled-")
+                && !identity.contains(":gdn-wy-f32-v1")
+        },
+        |prefill| {
+            let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());
+            if profile.cpu_speculation.is_some() {
+                suffix.push_str(":cpu-tiled-verify-v1");
+            }
+            identity.strip_suffix(&suffix).is_some_and(|base| {
+                !base.contains(":cpu-tiled-") && !base.contains(":gdn-wy-f32-v1")
+            })
+        },
+    )
 }
 
 impl Worker {

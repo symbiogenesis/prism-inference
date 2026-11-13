@@ -100,9 +100,9 @@ pub(super) fn prepare(input: &[Q8KBlock], output: &mut Activations) -> Result<()
 }
 
 impl super::MatvecScratch {
-    /// Only the internal quantizers populate this private Q8_K owner. Their
+    /// Only the internal quantizers populate this private `Q8_K` owner. Their
     /// exact per-sixteen sums can replace a second reduction during rearranging.
-    /// Public arbitrary Q8_K inputs never enter this method.
+    /// Public arbitrary `Q8_K` inputs never enter this method.
     pub(super) fn prepare_pq2_consumption(&mut self) -> Result<()> {
         prepare_detected::<true>(&self.q8k, &mut self.pq2_consumption)
     }

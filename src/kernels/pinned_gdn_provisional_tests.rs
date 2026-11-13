@@ -212,7 +212,7 @@ fn x2_provisional_head_matches_scalar_bits_and_preserves_failure_boundaries() ->
         else {
             // Feature-disabled and non-ARM targets retain the graph's old path.
             assert_eq!(bits(&state), bits(&vec![-5.0; committed.len()]));
-            assert_eq!(output, vec![-7.0; row_count]);
+            assert_eq!(bits(&output), bits(&vec![-7.0; row_count]));
             continue;
         };
         result?;
@@ -253,8 +253,12 @@ fn x2_provisional_head_matches_scalar_bits_and_preserves_failure_boundaries() ->
         .ok_or_else(|| invalid("defensive late head failure was accepted"))?;
         assert_eq!(error.to_string(), expected_error.to_string());
         assert_eq!(bits(&output[..8]), bits(&expected_output[..8]));
-        assert_eq!(output[8..], [-7.0; 16]);
-        assert!(state[16 * width..].iter().all(|&value| value == -5.0));
+        assert_eq!(bits(&output[8..]), bits(&[-7.0; 16]));
+        assert!(
+            state[16 * width..]
+                .iter()
+                .all(|value| value.to_bits() == (-5.0_f32).to_bits())
+        );
         assert_eq!(bits(&committed), committed_bits);
 
         try_step_head_provisional(&committed, &mut state, input, scale, &mut output)
@@ -288,7 +292,7 @@ fn x2_provisional_head_geometry_rejects_before_mutation_and_keeps_fallback() -> 
             .is_err()
     );
     assert_eq!(bits(&state), before);
-    assert_eq!(output, [-7.0; 8]);
+    assert_eq!(bits(&output), bits(&[-7.0; 8]));
     for input in [
         ChunkInput {
             key: &key[..127],
@@ -303,7 +307,7 @@ fn x2_provisional_head_geometry_rejects_before_mutation_and_keeps_fallback() -> 
             try_step_head_provisional(&committed, &mut state, input, 0.125, &mut output).is_none()
         );
         assert_eq!(bits(&state), before);
-        assert_eq!(output, [-7.0; 8]);
+        assert_eq!(bits(&output), bits(&[-7.0; 8]));
     }
     Ok(())
 }

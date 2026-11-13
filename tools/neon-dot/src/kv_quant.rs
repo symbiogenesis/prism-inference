@@ -123,14 +123,15 @@ impl<'a> ValueAccumulator<'a> {
             return false;
         }
         #[cfg(target_arch = "aarch64")]
-        if self.neon {
-            native::accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
+        let finite = if self.neon {
+            native::accumulate(packed, self.bits, self.centroids, scale, &mut self.output)
         } else {
-            portable_accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
-        }
+            portable_accumulate(packed, self.bits, self.centroids, scale, &mut self.output)
+        };
         #[cfg(not(target_arch = "aarch64"))]
-        portable_accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
-        self.failed = !self.output.iter().all(|value| value.is_finite());
+        let finite =
+            portable_accumulate(packed, self.bits, self.centroids, scale, &mut self.output);
+        self.failed = !finite;
         !self.failed
     }
 
@@ -162,14 +163,14 @@ pub fn accumulate(
     }
     let mut staged = *output;
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("neon") {
-        native::accumulate(packed, bits, centroids, scale, &mut staged);
+    let finite = if std::arch::is_aarch64_feature_detected!("neon") {
+        native::accumulate(packed, bits, centroids, scale, &mut staged)
     } else {
-        portable_accumulate(packed, bits, centroids, scale, &mut staged);
-    }
+        portable_accumulate(packed, bits, centroids, scale, &mut staged)
+    };
     #[cfg(not(target_arch = "aarch64"))]
-    portable_accumulate(packed, bits, centroids, scale, &mut staged);
-    if !staged.iter().all(|value| value.is_finite()) {
+    let finite = portable_accumulate(packed, bits, centroids, scale, &mut staged);
+    if !finite {
         return false;
     }
     *output = staged;
@@ -264,10 +265,13 @@ fn portable_accumulate(
     centroids: &[f32; 16],
     scale: f32,
     output: &mut [f32; DIMENSION],
-) {
+) -> bool {
+    let mut finite = true;
     for (index, output) in output.iter_mut().enumerate() {
         *output += scale * coordinate(packed, bits, centroids, index);
+        finite &= output.is_finite();
     }
+    finite
 }
 
 fn butterfly(values: &mut [f32; DIMENSION], half: usize) {
@@ -300,8 +304,9 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
 )]
 mod native {
     use core::arch::aarch64::{
-        vaddq_f32, vaddq_f64, vcvt_f64_f32, vcvt_high_f64_f32, vdupq_n_f32, vdupq_n_f64,
-        vget_low_f32, vld1q_f32, vmulq_f32, vmulq_f64, vst1q_f32, vst1q_f64, vsubq_f32,
+        vaddq_f32, vaddq_f64, vandq_u32, vcltq_u32, vcvt_f64_f32, vcvt_high_f64_f32, vdupq_n_f32,
+        vdupq_n_f64, vdupq_n_u32, vget_low_f32, vld1q_f32, vminvq_u32, vmulq_f32, vmulq_f64,
+        vreinterpretq_u32_f32, vst1q_f32, vst1q_f64, vsubq_f32,
     };
 
     use super::DIMENSION;
@@ -351,10 +356,10 @@ mod native {
         centroids: &[f32; 16],
         scale: f32,
         output: &mut [f32; DIMENSION],
-    ) {
+    ) -> bool {
         // SAFETY: caller detects baseline NEON, validates code length and
         // finite inputs, and supplies a unique 256-coordinate staging array.
-        unsafe { accumulate_neon(packed, bits, centroids, scale, output) };
+        unsafe { accumulate_neon(packed, bits, centroids, scale, output) }
     }
 
     #[target_feature(enable = "neon")]
@@ -364,8 +369,11 @@ mod native {
         centroids: &[f32; 16],
         scale: f32,
         output: &mut [f32; DIMENSION],
-    ) {
+    ) -> bool {
         let scale = vdupq_n_f32(scale);
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        let mut finite = vdupq_n_u32(u32::MAX);
         for (index, output) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let values = super::tile(packed, bits, centroids, index * 4);
             // SAFETY: values is a valid initialized four-element array.
@@ -374,9 +382,15 @@ mod native {
             let previous = unsafe { vld1q_f32(output.as_ptr()) };
             let product = vmulq_f32(scale, values);
             let result = vaddq_f32(previous, product);
+            // Check each result while it is live, rather than reading the
+            // complete output row again. Infinity and every NaN encoding have
+            // magnitudes at least the binary32 infinity exponent pattern.
+            let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
+            finite = vandq_u32(finite, vcltq_u32(absolute, infinity));
             // SAFETY: the same unique four-element chunk covers the store.
             unsafe { vst1q_f32(output.as_mut_ptr(), result) };
         }
+        vminvq_u32(finite) != 0
     }
 
     pub(super) fn hadamard(values: &mut [f32; DIMENSION]) {
@@ -518,6 +532,46 @@ mod tests {
     }
 
     #[test]
+    fn packed_value_finite_checks_cover_each_vector_lane_and_late_overflow()
+    -> Result<(), &'static str> {
+        for bits in [3, 4] {
+            for lane in [0, 1, 2, 3, 124, 125, 126, 127, 252, 253, 254, 255] {
+                let mut codes = [0; DIMENSION];
+                codes[lane] = 1;
+                let bytes = packed(&codes, bits);
+                for extreme in [f32::MAX, -f32::MAX] {
+                    let mut centroids = [1.0; 16];
+                    centroids[1] = extreme;
+                    for scale in [1.0, 2.0] {
+                        let mut sum = super::ValueAccumulator::new(bits, &centroids)
+                            .ok_or("finite codebook must be accepted")?;
+                        assert!(sum.accumulate(&bytes, 0.25));
+                        // Scale one overflows on addition; scale two overflows
+                        // on multiplication. Both failures poison the scan.
+                        assert!(!sum.accumulate(&bytes, scale));
+                        assert!(!sum.accumulate(&bytes, 0.0));
+                        assert!(sum.finish().is_none());
+
+                        let mut output = [0.25; DIMENSION];
+                        output[lane] = extreme * 0.25;
+                        let before = output.map(f32::to_bits);
+                        assert!(!accumulate(&bytes, bits, &centroids, scale, &mut output));
+                        assert_eq!(output.map(f32::to_bits), before);
+                        assert!(!super::portable_accumulate(
+                            &bytes,
+                            bits,
+                            &centroids,
+                            scale,
+                            &mut output,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn x1_prepared_kv_dot_matches_independent_lanes_and_checks_every_row()
     -> Result<(), &'static str> {
         let centroids = codebook();
@@ -597,7 +651,13 @@ mod tests {
                 });
                 assert_eq!(output.map(f32::to_bits), expected.map(f32::to_bits));
                 let mut scalar = initial;
-                super::portable_accumulate(&bytes, bits, &centroids, -0.125, &mut scalar);
+                assert!(super::portable_accumulate(
+                    &bytes,
+                    bits,
+                    &centroids,
+                    -0.125,
+                    &mut scalar,
+                ));
                 assert_eq!(output.map(f32::to_bits), scalar.map(f32::to_bits));
             }
         }

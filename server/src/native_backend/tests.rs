@@ -636,21 +636,31 @@ fn private_cpu_prefill_readiness_binds_tiles_scratch_and_latest_reuse() -> TestR
             for route in ["/v1/models", "/props"] {
                 let (result, reply) = perform(&mut worker, request(route, &[], true)).await?;
                 assert_eq!(result, Ok(()));
-                let end = reply.array_windows().position(|part| part == b"\r\n\r\n")
-                    .ok_or("missing readiness response head")? + 4;
+                let end = reply
+                    .array_windows()
+                    .position(|part| part == b"\r\n\r\n")
+                    .ok_or("missing readiness response head")?
+                    + 4;
                 let body: Value = serde_json::from_slice(&reply[end..])?;
                 let profile = &body["data"][0];
                 assert_eq!(profile["cpu_prefill_tokens"], tokens);
-                assert_eq!(profile["cpu_prefill_scratch_bytes"], prefill.scratch_bytes());
+                assert_eq!(
+                    profile["cpu_prefill_scratch_bytes"],
+                    prefill.scratch_bytes()
+                );
                 assert_eq!(profile["prompt_reuse"], "latest");
                 assert_eq!(profile["startup_graph_identity"], identity.as_ref());
                 assert!(profile.get("kv_cache").is_none());
             }
-            let original = pending(true, 128).map_err(|error| format!("{error:?}"))?.body;
+            let original = pending(true, 128)
+                .map_err(|error| format!("{error:?}"))?
+                .body;
             for field in ["cpu_prefill_tokens", "cpu_prefill_scratch_bytes"] {
                 let mut value: Value = serde_json::from_slice(&original)?;
                 value[field] = json!(8);
-                assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile).is_err());
+                assert!(
+                    canonical_for_profile(&serde_json::to_vec(&value)?, &worker.profile).is_err()
+                );
             }
             assert_eq!(observed.executions.load(Ordering::Relaxed), 0);
         }
@@ -665,16 +675,29 @@ fn private_cpu_prefill_rejects_mismatched_precision_or_graph_selection() -> Test
     let prefill = CpuPrefill::new(8, 64 * 1024 * 1024)?;
     for (cache, identity) in [
         (KvCachePolicy::F16, None),
-        (KvCachePolicy::F16, Some(Arc::from("verified-model:cpu-tiled-ffn-v1:16"))),
-        (KvCachePolicy::F16, Some(Arc::from("verified-model:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1"))),
-        (KvCachePolicy::Rotated4, Some(Arc::from("verified-model:cpu-tiled-ffn-v1:8"))),
+        (
+            KvCachePolicy::F16,
+            Some(Arc::from("verified-model:cpu-tiled-ffn-v1:16")),
+        ),
+        (
+            KvCachePolicy::F16,
+            Some(Arc::from("verified-model:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1")),
+        ),
+        (
+            KvCachePolicy::Rotated4,
+            Some(Arc::from("verified-model:cpu-tiled-ffn-v1:8")),
+        ),
     ] {
         let observed = Observation {
-            kv_cache: Some(cache), cpu_prefill: Some(prefill),
+            kv_cache: Some(cache),
+            cpu_prefill: Some(prefill),
             startup_graph_identity: identity,
             ..Observation::default()
         };
-        assert!(matches!(Worker::new(FakeEngine(observed), 42), Err(NativeBackendError::Configuration)));
+        assert!(matches!(
+            Worker::new(FakeEngine(observed), 42),
+            Err(NativeBackendError::Configuration)
+        ));
     }
     Ok(())
 }

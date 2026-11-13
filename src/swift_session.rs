@@ -98,9 +98,14 @@ impl CpuPrefill {
     /// Rejects tile sizes other than 8, 16 or 32 and an empty scratch reserve.
     pub fn new(tokens: usize, scratch_bytes: usize) -> Result<Self> {
         if !matches!(tokens, 8 | 16 | 32) || scratch_bytes == 0 {
-            return Err(invalid("invalid CPU tiled prefill selection or scratch reserve"));
+            return Err(invalid(
+                "invalid CPU tiled prefill selection or scratch reserve",
+            ));
         }
-        Ok(Self { tokens, scratch_bytes })
+        Ok(Self {
+            tokens,
+            scratch_bytes,
+        })
     }
 
     /// Maximum prompt tokens sharing one layer-major projection tile.
@@ -114,7 +119,6 @@ impl CpuPrefill {
     pub const fn scratch_bytes(self) -> usize {
         self.scratch_bytes
     }
-
 }
 
 /// Validate context plus the entire explicitly selected CPU tile reservation.
@@ -862,22 +866,33 @@ mod tests {
         PreparedChat, SwiftSession, validate_adapter_scale, validate_context_capacity,
         validate_prefill_capacity, validate_prompt_owner,
     };
-    use crate::{Result, graph::KvCachePolicy, kernels::{MatvecBackend, RowParallelism}, model::swift::Representation};
+    use crate::{
+        Result,
+        graph::KvCachePolicy,
+        kernels::{MatvecBackend, RowParallelism},
+        model::swift::Representation,
+    };
     use std::{path::Path, sync::Arc};
 
     #[test]
     fn cpu_prefill_requires_fp16_before_artifact_io_and_charges_full_reserve() -> Result<()> {
         let reserve = 64 * 1024 * 1024;
         let context = 8_192;
-        let base = NON_CONTEXT_MEMORY_BYTES
-            + u64::try_from(context)? * CONTEXT_TOKEN_MEMORY_BYTES;
+        let base = NON_CONTEXT_MEMORY_BYTES + u64::try_from(context)? * CONTEXT_TOKEN_MEMORY_BYTES;
         validate_prefill_capacity(context, base, None)?;
         for tokens in [8, 16, 32] {
             let selected = CpuPrefill::new(tokens, reserve)?;
             assert_eq!(selected.tokens(), tokens);
             assert_eq!(selected.scratch_bytes(), reserve);
             validate_prefill_capacity(context, base + u64::try_from(reserve)?, Some(selected))?;
-            assert!(validate_prefill_capacity(context, base + u64::try_from(reserve)? - 1, Some(selected)).is_err());
+            assert!(
+                validate_prefill_capacity(
+                    context,
+                    base + u64::try_from(reserve)? - 1,
+                    Some(selected)
+                )
+                .is_err()
+            );
             for cache in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
                 let error = SwiftSession::load_profile_with_prefill(
                     Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
@@ -892,7 +907,10 @@ mod tests {
                 )
                 .err()
                 .ok_or("incompatible cache was accepted")?;
-                assert_eq!(error.to_string(), "CPU tiled prefill requires explicit FP16 KV");
+                assert_eq!(
+                    error.to_string(),
+                    "CPU tiled prefill requires explicit FP16 KV"
+                );
             }
         }
         for tokens in [0, 1, 4, 7, 9, 64, usize::MAX] {

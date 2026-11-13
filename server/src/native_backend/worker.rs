@@ -53,7 +53,7 @@ impl Engine for SwiftSession {
             cpu_prefill: self.cpu_prefill(),
             startup_graph_identity: (self.kv_cache_policy() != KvCachePolicy::F16
                 || self.cpu_prefill().is_some())
-                .then(|| Arc::from(self.decoder_identity())),
+            .then(|| Arc::from(self.decoder_identity())),
         })
     }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {

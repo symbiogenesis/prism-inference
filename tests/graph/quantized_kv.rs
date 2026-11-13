@@ -469,19 +469,25 @@ fn parallel_rotated_kv_preserves_complete_state_logits_and_page_restore() -> Res
         assert_eq!(serial.identity(), parallel.identity());
         let mut checkpoints = None;
         for (index, token) in tokens(65).into_iter().enumerate() {
-            assert_eq!(bits(parallel.evaluate(token)?), bits(serial.evaluate(token)?));
+            assert_eq!(
+                bits(parallel.evaluate(token)?),
+                bits(serial.evaluate(token)?)
+            );
             assert_eq!(graph_bits(&parallel)?, graph_bits(&serial)?);
             if index == 62 {
                 checkpoints = Some((serial.checkpoint()?, parallel.checkpoint()?));
             }
         }
-        let (serial_checkpoint, parallel_checkpoint) = checkpoints
-            .ok_or_else(|| std::io::Error::other("missing partial-page checkpoint"))?;
+        let (serial_checkpoint, parallel_checkpoint) =
+            checkpoints.ok_or_else(|| std::io::Error::other("missing partial-page checkpoint"))?;
         serial.restore(&serial_checkpoint)?;
         parallel.restore(&parallel_checkpoint)?;
         assert_eq!(graph_bits(&parallel)?, graph_bits(&serial)?);
         for token in [1, 0, 1] {
-            assert_eq!(bits(parallel.evaluate(token)?), bits(serial.evaluate(token)?));
+            assert_eq!(
+                bits(parallel.evaluate(token)?),
+                bits(serial.evaluate(token)?)
+            );
             assert_eq!(graph_bits(&parallel)?, graph_bits(&serial)?);
         }
         assert_eq!(parallel.row_workers(), 4);
@@ -539,7 +545,10 @@ fn parallel_rotated_kv_delivery_and_cancellation_restore_complete_page_boundary(
         runtime.generate(&changed, &stop, &Cancellation::default(), |_| Ok(()))?;
         serial.generate(&changed, &stop, &Cancellation::default(), |_| Ok(()))?;
         assert_eq!(runtime.tokens(), serial.tokens());
-        assert_eq!(graph_bits(runtime.decoder())?, graph_bits(serial.decoder())?);
+        assert_eq!(
+            graph_bits(runtime.decoder())?,
+            graph_bits(serial.decoder())?
+        );
         assert_eq!(runtime.decoder().row_workers(), 4);
     }
     Ok(())

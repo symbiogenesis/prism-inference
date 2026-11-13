@@ -281,8 +281,10 @@ fn parallel_packed_attention_preserves_serial_bits_across_pages_and_head_tails()
         for scalar in [true, false] {
             for (kv_heads, heads, history) in [(2, 4, 0), (2, 12, 65), (3, 9, 2)] {
                 let (keys, values) = populated_caches(policy, kv_heads, history, scalar)?;
-                for arithmetic in [super::super::Arithmetic::Source, super::super::Arithmetic::PinnedSwift]
-                {
+                for arithmetic in [
+                    super::super::Arithmetic::Source,
+                    super::super::Arithmetic::PinnedSwift,
+                ] {
                     let expected = attention_bits(
                         &keys,
                         &values,

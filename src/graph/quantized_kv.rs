@@ -354,7 +354,9 @@ pub(super) fn attend(
         stride,
         |base_head, attended_chunk, score_chunk| {
             for (offset, (result, probabilities)) in attended_chunk
-                .chunks_exact_mut(HEAD_DIM)
+                .as_chunks_mut::<HEAD_DIM>()
+                .0
+                .iter_mut()
                 .zip(score_chunk.chunks_exact_mut(stride))
                 .enumerate()
             {
@@ -378,18 +380,22 @@ struct PackedAttention<'a> {
 }
 
 impl PackedAttention<'_> {
-    fn attend_head(&self, head: usize, result: &mut [f32], probabilities: &mut [f32]) -> Result<()> {
+    fn attend_head(
+        &self,
+        head: usize,
+        result: &mut [f32],
+        probabilities: &mut [f32],
+    ) -> Result<()> {
         let kv_head = head / self.heads_per_kv;
         let mut query = [0.0; HEAD_DIM];
         self.keys.quantizer.rotate(
             &self.queries[head * HEAD_DIM..(head + 1) * HEAD_DIM],
             &mut query,
         )?;
-        for (score, row) in probabilities.iter_mut().zip(
-            self.keys
-                .rows()
-                .chain(std::iter::once(self.current_keys)),
-        ) {
+        for (score, row) in probabilities
+            .iter_mut()
+            .zip(self.keys.rows().chain(std::iter::once(self.current_keys)))
+        {
             *score = self
                 .keys
                 .quantizer

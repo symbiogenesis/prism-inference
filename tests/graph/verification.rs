@@ -7,9 +7,19 @@ use super::*;
 struct RefusingExecutor;
 
 impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for RefusingExecutor {
-    fn identity(&self) -> &'static str { "verification-refused-executor" }
-    fn supports(&self, _: &Tensor) -> bool { false }
-    fn project(&mut self, _: &Tensor, _: &[bonsai_ternary::Q8KBlock], _: bool, _: &mut Vec<f32>) -> Result<()> {
+    fn identity(&self) -> &'static str {
+        "verification-refused-executor"
+    }
+    fn supports(&self, _: &Tensor) -> bool {
+        false
+    }
+    fn project(
+        &mut self,
+        _: &Tensor,
+        _: &[bonsai_ternary::Q8KBlock],
+        _: bool,
+        _: &mut Vec<f32>,
+    ) -> Result<()> {
         Err("verification must not invoke an external executor".into())
     }
 }
@@ -20,13 +30,18 @@ fn verified(model: Model) -> Result<Qwen35> {
     let graph = graph.with_tiled_prefill(8, tile_bytes)?;
     let logits_bytes = graph.tiled_verification_scratch_bytes()?;
     let graph = graph.with_tiled_verification(logits_bytes)?;
-    assert_eq!(graph.tiled_prefill_reserved_bytes(), tile_bytes + logits_bytes);
+    assert_eq!(
+        graph.tiled_prefill_reserved_bytes(),
+        tile_bytes + logits_bytes
+    );
     assert!(graph.identity().contains(":cpu-tiled-verify-v1"));
     Ok(graph)
 }
 
 fn bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {
-    rows.iter().map(|row| row.iter().map(|value| value.to_bits()).collect()).collect()
+    rows.iter()
+        .map(|row| row.iter().map(|value| value.to_bits()).collect())
+        .collect()
 }
 
 #[test]
@@ -80,15 +95,23 @@ fn tiled_verification_shares_packed_output_head_and_adapter() -> Result<()> {
             let mut actual = graph.with_tiled_verification(logits_bytes)?;
             let mut rows = Vec::new();
             let draft = [0, 1, 1, 0];
-            let reference: Vec<_> = draft.into_iter().map(|token| expected.evaluate(token)).collect::<Result<_>>()?;
+            let reference: Vec<_> = draft
+                .into_iter()
+                .map(|token| expected.evaluate(token))
+                .collect::<Result<_>>()?;
             actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
             assert_eq!(bits(&rows), bits(&reference));
             assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
             let packed = packed_output_fixture(recurrent);
-            let projections: Vec<_> = packed.tensors.values()
+            let projections: Vec<_> = packed
+                .tensors
+                .values()
                 .filter(|tensor| tensor.kind == 142 && tensor.name != "token_embd.weight")
                 .collect();
-            let blocks = projections.iter().map(|tensor| tensor.dimensions[0] / 128 * tensor.dimensions[1]).sum::<usize>();
+            let blocks = projections
+                .iter()
+                .map(|tensor| tensor.dimensions[0] / 128 * tensor.dimensions[1])
+                .sum::<usize>();
             // This includes output.weight. A sequential vocabulary projection
             // would omit its projection and blocks from these exact counts.
             let stats = actual.tiled_prefill_statistics();
@@ -106,24 +129,41 @@ fn tiled_verification_shares_packed_output_head_and_adapter() -> Result<()> {
 
 fn packed_output_fixture(recurrent: bool) -> Model {
     let mut model = fixture(recurrent);
-    model.metadata.insert("qwen35.embedding_length".into(), MetadataValue::from(256_u64));
+    model.metadata.insert(
+        "qwen35.embedding_length".into(),
+        MetadataValue::from(256_u64),
+    );
     for tensor in model.tensors.values_mut() {
         let name = tensor.name.as_str();
-        if matches!(name,
-            "token_embd.weight" | "output.weight" | "blk.0.ffn_up.weight"
-            | "blk.0.ffn_gate.weight" | "blk.0.attn_q.weight" | "blk.0.attn_k.weight"
-            | "blk.0.attn_v.weight" | "blk.0.attn_qkv.weight" | "blk.0.attn_gate.weight"
-            | "blk.0.ssm_beta.weight" | "blk.0.ssm_alpha.weight")
-        {
+        if matches!(
+            name,
+            "token_embd.weight"
+                | "output.weight"
+                | "blk.0.ffn_up.weight"
+                | "blk.0.ffn_gate.weight"
+                | "blk.0.attn_q.weight"
+                | "blk.0.attn_k.weight"
+                | "blk.0.attn_v.weight"
+                | "blk.0.attn_qkv.weight"
+                | "blk.0.attn_gate.weight"
+                | "blk.0.ssm_beta.weight"
+                | "blk.0.ssm_alpha.weight"
+        ) {
             tensor.dimensions[0] = 256;
             tensor.kind = 142;
             let mut block = [0x66; 34];
             block[..2].copy_from_slice(&0x2800_u16.to_le_bytes());
             tensor.data = Arc::from(block.repeat(2 * tensor.dimensions[1]));
-        } else if matches!(name, "blk.0.attn_output.weight" | "blk.0.ssm_out.weight" | "blk.0.ffn_down.weight") {
+        } else if matches!(
+            name,
+            "blk.0.attn_output.weight" | "blk.0.ssm_out.weight" | "blk.0.ffn_down.weight"
+        ) {
             tensor.dimensions[1] = 256;
             tensor.data = Arc::from(vec![0; tensor.dimensions.iter().product::<usize>() * 4]);
-        } else if matches!(name, "output_norm.weight" | "blk.0.attn_norm.weight" | "blk.0.post_attention_norm.weight") {
+        } else if matches!(
+            name,
+            "output_norm.weight" | "blk.0.attn_norm.weight" | "blk.0.post_attention_norm.weight"
+        ) {
             tensor.dimensions[0] = 256;
             tensor.data = Arc::from(1.0_f32.to_le_bytes().repeat(256));
         }
@@ -136,7 +176,11 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
     let mut plain = Qwen35::new(paged_hybrid_fixture(), 192)?;
     assert_eq!(plain.batched_evaluation_capacity(), 0);
     let mut rows = vec![vec![1.0]];
-    assert!(plain.evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(())).is_err());
+    assert!(
+        plain
+            .evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(()))
+            .is_err()
+    );
     assert!(rows.is_empty());
     assert!(plain.with_tiled_verification(usize::MAX).is_err());
     let graph = Qwen35::new(paged_hybrid_fixture(), 192)?;
@@ -154,22 +198,38 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
     let mut actual = verified(paged_hybrid_fixture())?;
     let initial = graph_bits(&actual)?;
     actual.set_projection_executor(Some(Box::new(RefusingExecutor)));
-    assert!(actual.evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(())).is_err());
+    assert!(
+        actual
+            .evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(()))
+            .is_err()
+    );
     assert!(rows.is_empty());
     assert_eq!(graph_bits(&actual)?, initial);
     actual.set_projection_executor(None);
     for draft in [&[][..], &[0; 9][..], &[2][..]] {
         rows.push(vec![f32::NAN]);
-        assert!(actual.evaluate_batch_into(draft, &mut rows, &|| Ok(())).is_err());
+        assert!(
+            actual
+                .evaluate_batch_into(draft, &mut rows, &|| Ok(()))
+                .is_err()
+        );
         assert!(rows.is_empty());
         assert_eq!(graph_bits(&actual)?, initial);
     }
     let checkpoint = actual.checkpoint()?;
     let checks = Cell::new(0);
-    assert!(actual.evaluate_batch_into(&[0, 1, 0, 1], &mut rows, &|| {
-        checks.set(checks.get() + 1);
-        if checks.get() >= 10 { Err("verification cancellation".into()) } else { Ok(()) }
-    }).is_err());
+    assert!(
+        actual
+            .evaluate_batch_into(&[0, 1, 0, 1], &mut rows, &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() >= 10 {
+                    Err("verification cancellation".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
     assert!(rows.is_empty());
     actual.restore(&checkpoint)?;
     assert_eq!(graph_bits(&actual)?, initial);
@@ -180,11 +240,18 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
 
 #[test]
 fn tiled_verification_runtime_accepts_bonus_and_replays_every_rejected_prefix() -> Result<()> {
-    let limits = Limits { context_tokens: 192, checkpoints: 0, checkpoint_bytes: 1_048_576 };
+    let limits = Limits {
+        context_tokens: 192,
+        checkpoints: 0,
+        checkpoint_bytes: 1_048_576,
+    };
     for rejected in 0..=4 {
         let mut actual = Runtime::new(verified(paged_hybrid_fixture())?, limits)?;
         let mut expected = Runtime::new(Qwen35::new(paged_hybrid_fixture(), 192)?, limits)?;
-        let generation = Generation { max_tokens: 1, stop_tokens: Vec::new() };
+        let generation = Generation {
+            max_tokens: 1,
+            stop_tokens: Vec::new(),
+        };
         let cancellation = Cancellation::default();
         actual.generate(&[0, 1], &generation, &cancellation, |_| Ok(()))?;
         expected.generate(&[0, 1], &generation, &cancellation, |_| Ok(()))?;
@@ -203,19 +270,38 @@ fn tiled_verification_runtime_accepts_bonus_and_replays_every_rejected_prefix() 
             draft[rejected] ^= 1;
         }
         let (actual_tokens, actual_stats) = actual.verify_draft_block(&draft, &cancellation)?;
-        let (expected_tokens, expected_stats) = expected.verify_draft_block(&draft, &cancellation)?;
+        let (expected_tokens, expected_stats) =
+            expected.verify_draft_block(&draft, &cancellation)?;
         assert_eq!(actual_tokens, expected_tokens);
-        assert_eq!(actual_stats.draft_tokens_accepted, expected_stats.draft_tokens_accepted);
-        assert_eq!(actual_stats.target_evaluations, 4 + if rejected == 4 { 1 } else { rejected + 1 });
+        assert_eq!(
+            actual_stats.draft_tokens_accepted,
+            expected_stats.draft_tokens_accepted
+        );
+        assert_eq!(
+            actual_stats.target_evaluations,
+            4 + if rejected == 4 { 1 } else { rejected + 1 }
+        );
         assert_eq!(actual.tokens(), expected.tokens());
-        assert_eq!(graph_bits(actual.decoder())?, graph_bits(expected.decoder())?);
+        assert_eq!(
+            graph_bits(actual.decoder())?,
+            graph_bits(expected.decoder())?
+        );
         let prompt = actual.tokens().to_vec();
         let mut a = Vec::new();
         let mut e = Vec::new();
-        actual.generate(&prompt, &generation, &cancellation, |token| { a.push(token); Ok(()) })?;
-        expected.generate(&prompt, &generation, &cancellation, |token| { e.push(token); Ok(()) })?;
+        actual.generate(&prompt, &generation, &cancellation, |token| {
+            a.push(token);
+            Ok(())
+        })?;
+        expected.generate(&prompt, &generation, &cancellation, |token| {
+            e.push(token);
+            Ok(())
+        })?;
         assert_eq!(a, e);
-        assert_eq!(graph_bits(actual.decoder())?, graph_bits(expected.decoder())?);
+        assert_eq!(
+            graph_bits(actual.decoder())?,
+            graph_bits(expected.decoder())?
+        );
     }
     Ok(())
 }

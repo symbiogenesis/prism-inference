@@ -1027,10 +1027,6 @@ impl<D: Decoder> Runtime<D> {
     /// # Errors
     /// Rejects faulted runtimes, empty committed state, invalid draft lengths or token IDs,
     /// context overflow, cancellation, or decoder checkpoint/restore failures.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep shared validation, optional batched work admission and the legacy sequential transaction together."
-    )]
     pub fn verify_draft_block(
         &mut self,
         draft: &[u32],
@@ -1073,7 +1069,10 @@ impl<D: Decoder> Runtime<D> {
         // A rejection pays for every proposed token plus replay of the accepted
         // prefix and its correction. Device work is never refunded by restore.
         let evaluations = if batched {
-            draft.len().checked_mul(2).and_then(|tokens| tokens.checked_add(1))
+            draft
+                .len()
+                .checked_mul(2)
+                .and_then(|tokens| tokens.checked_add(1))
                 .ok_or_else(|| invalid("speculative verification work overflow"))?
         } else {
             max_advance

@@ -93,7 +93,8 @@ pub struct SpeculativeStats {
     pub draft_tokens_proposed: usize,
     /// Total proposed continuation tokens accepted by the target verifier.
     pub draft_tokens_accepted: usize,
-    /// Total target decoder forward evaluations executed during generation.
+    /// Total target-token forward evaluations, including batched proposals and
+    /// accepted-prefix replay; excludes prompt preparation.
     pub target_evaluations: usize,
     /// Number of transactional decoder checkpoint restores triggered by rejected block steps.
     pub rollback_restores: usize,

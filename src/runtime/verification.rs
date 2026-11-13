@@ -1,6 +1,8 @@
 //! Opt-in weight-sharing target verification with complete-prefix replay.
 
-use super::*;
+use super::{
+    Arc, Decoder, FiniteLogits, Result, Runtime, Snapshot, SpeculativeStats, greedy_finite, invalid,
+};
 
 impl<D: Decoder> Runtime<D> {
     pub(super) fn verify_batched_draft(
@@ -37,7 +39,11 @@ impl<D: Decoder> Runtime<D> {
         };
         for (index, &candidate) in draft.iter().enumerate() {
             check()?;
-            let logits = if index == 0 { &self.logits[..] } else { &rows[index - 1] };
+            let logits = if index == 0 {
+                &self.logits[..]
+            } else {
+                &rows[index - 1]
+            };
             let expected = greedy_finite(FiniteLogits::from_validated(logits)?)?;
             if candidate != expected {
                 // The batched graph contains the complete proposed suffix.
@@ -63,7 +69,10 @@ impl<D: Decoder> Runtime<D> {
         // All proposed state is already present. Publish its final distribution
         // and advance precisely one bonus token from that distribution.
         self.tokens.extend_from_slice(draft);
-        self.logits = Arc::new(rows.pop().ok_or_else(|| invalid("missing final batch logits"))?);
+        self.logits = Arc::new(
+            rows.pop()
+                .ok_or_else(|| invalid("missing final batch logits"))?,
+        );
         committed.extend_from_slice(draft);
         let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
         self.evaluate(bonus, check)?;
@@ -76,6 +85,7 @@ impl<D: Decoder> Runtime<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{Cancellation, Generation, Limits};
     use std::cell::Cell;
 
     #[derive(Default)]
@@ -92,46 +102,87 @@ mod tests {
     impl Decoder for BatchControl {
         type Checkpoint = Vec<u32>;
 
-        fn identity(&self) -> &'static str { "batched-verification-control" }
-        fn vocab_size(&self) -> usize { 2 }
-        fn checkpoint_bytes(&self) -> usize { 256 }
+        fn identity(&self) -> &'static str {
+            "batched-verification-control"
+        }
+        fn vocab_size(&self) -> usize {
+            2
+        }
+        fn checkpoint_bytes(&self) -> usize {
+            256
+        }
         fn admit_work(&self, _: usize, evaluations: usize) -> Result<()> {
             self.admitted.set(evaluations);
             Ok(())
         }
-        fn reset(&mut self) -> Result<()> { self.tokens.clear(); Ok(()) }
+        fn reset(&mut self) -> Result<()> {
+            self.tokens.clear();
+            Ok(())
+        }
         fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
             if self.fail_replay && self.restores > 0 {
                 self.replay_steps += 1;
-                if self.replay_steps == 2 { return Err(invalid("replay failed")); }
+                if self.replay_steps == 2 {
+                    return Err(invalid("replay failed"));
+                }
             }
             self.tokens.push(token);
-            Ok(if token == 0 { vec![2.0, 0.0] } else { vec![0.0, 2.0] })
+            Ok(if token == 0 {
+                vec![2.0, 0.0]
+            } else {
+                vec![0.0, 2.0]
+            })
         }
-        fn batched_evaluation_capacity(&self) -> usize { 8 }
-        fn evaluate_batch_into(&mut self, tokens: &[u32], rows: &mut Vec<Vec<f32>>, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        fn batched_evaluation_capacity(&self) -> usize {
+            8
+        }
+        fn evaluate_batch_into(
+            &mut self,
+            tokens: &[u32],
+            rows: &mut Vec<Vec<f32>>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
             rows.clear();
             for &token in tokens {
                 check()?;
                 rows.push(self.evaluate(token)?);
             }
-            if self.malformed { rows[1][0] = f32::NAN; }
+            if self.malformed {
+                rows[1][0] = f32::NAN;
+            }
             Ok(())
         }
-        fn checkpoint(&self) -> Result<Self::Checkpoint> { Ok(self.tokens.clone()) }
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            Ok(self.tokens.clone())
+        }
         fn restore(&mut self, state: &Self::Checkpoint) -> Result<()> {
             self.restores += 1;
-            if self.fail_restore { return Err(invalid("restore failed")); }
+            if self.fail_restore {
+                return Err(invalid("restore failed"));
+            }
             self.tokens.clone_from(state);
             Ok(())
         }
     }
 
     fn prepared() -> Result<Runtime<BatchControl>> {
-        let mut runtime = Runtime::new(BatchControl::default(), Limits {
-            context_tokens: 32, checkpoints: 0, checkpoint_bytes: 4096,
-        })?;
-        runtime.generate(&[0], &Generation { max_tokens: 1, stop_tokens: Vec::new() }, &Cancellation::default(), |_| Ok(()))?;
+        let mut runtime = Runtime::new(
+            BatchControl::default(),
+            Limits {
+                context_tokens: 32,
+                checkpoints: 0,
+                checkpoint_bytes: 4096,
+            },
+        )?;
+        runtime.generate(
+            &[0],
+            &Generation {
+                max_tokens: 1,
+                stop_tokens: Vec::new(),
+            },
+            &Cancellation::default(),
+            |_| Ok(()),
+        )?;
         Ok(runtime)
     }
 
@@ -156,7 +207,11 @@ mod tests {
             let logits = Arc::clone(&runtime.logits);
             runtime.decoder.malformed = malformed;
             runtime.decoder.fail_replay = !malformed;
-            assert!(runtime.verify_draft_block(&[0, 0, 1], &Cancellation::default()).is_err());
+            assert!(
+                runtime
+                    .verify_draft_block(&[0, 0, 1], &Cancellation::default())
+                    .is_err()
+            );
             assert_eq!(runtime.tokens, before);
             assert_eq!(runtime.decoder.tokens, before);
             assert_eq!(runtime.logits, logits);
@@ -169,10 +224,18 @@ mod tests {
     fn batched_verification_failed_prefix_restore_latches_without_retry() -> Result<()> {
         let mut runtime = prepared()?;
         runtime.decoder.fail_restore = true;
-        assert!(runtime.verify_draft_block(&[0, 1], &Cancellation::default()).is_err());
+        assert!(
+            runtime
+                .verify_draft_block(&[0, 1], &Cancellation::default())
+                .is_err()
+        );
         assert_eq!(runtime.decoder.restores, 1);
         assert!(runtime.is_faulted());
-        assert!(runtime.verify_draft_block(&[0, 1], &Cancellation::default()).is_err());
+        assert!(
+            runtime
+                .verify_draft_block(&[0, 1], &Cancellation::default())
+                .is_err()
+        );
         assert_eq!(runtime.decoder.restores, 1);
         Ok(())
     }

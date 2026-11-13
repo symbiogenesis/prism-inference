@@ -7,7 +7,9 @@ use bonsai_prism_runtime::{
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
     model::swift::Representation,
     runtime::PromptReuse,
-    swift_session::{CpuPrefill, SwiftSession, validate_context_capacity, validate_prefill_capacity},
+    swift_session::{
+        CpuPrefill, SwiftSession, validate_context_capacity, validate_prefill_capacity,
+    },
 };
 use bonsai_windows_credentials::validate_read_path;
 
@@ -179,7 +181,9 @@ fn parse_prefill(
                 .ok_or_else(invalid)?
                 .parse::<usize>()
                 .map_err(|_| invalid())?;
-            CpuPrefill::new(tokens, scratch).map(Some).map_err(|_| invalid())
+            CpuPrefill::new(tokens, scratch)
+                .map(Some)
+                .map_err(|_| invalid())
         }
         _ => Err(invalid()),
     }
@@ -350,25 +354,46 @@ mod tests {
         let (_directory, [model, key, _adapter]) = files()?;
         let base = vec![
             OsString::from("--native-engine-child"),
-            "--model".into(), model,
-            "--key-file".into(), key,
-            "--port".into(), "8081".into(),
-            "--seed".into(), "42".into(),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
         ];
         assert!(parse(base.clone())?.cpu_prefill.is_none());
         let reserve = 64 * 1024 * 1024;
         let memory = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES + reserve;
         for tokens in ["8", "16", "32"] {
             let mut selected = base.clone();
-            selected.extend([
-                "--kv-cache", "f16", "--prompt-reuse", "latest",
-                "--context-tokens", "8192", "--memory-limit-bytes", &memory.to_string(),
-                "--cpu-prefill-tokens", tokens,
-                "--cpu-prefill-scratch-bytes", &reserve.to_string(),
-            ].map(OsString::from));
+            selected.extend(
+                [
+                    "--kv-cache",
+                    "f16",
+                    "--prompt-reuse",
+                    "latest",
+                    "--context-tokens",
+                    "8192",
+                    "--memory-limit-bytes",
+                    &memory.to_string(),
+                    "--cpu-prefill-tokens",
+                    tokens,
+                    "--cpu-prefill-scratch-bytes",
+                    &reserve.to_string(),
+                ]
+                .map(OsString::from),
+            );
             let config = parse(selected.clone())?;
-            assert_eq!(config.cpu_prefill.map(CpuPrefill::tokens), Some(tokens.parse().map_err(io::Error::other)?));
-            assert_eq!(config.cpu_prefill.map(CpuPrefill::scratch_bytes), Some(usize::try_from(reserve).map_err(io::Error::other)?));
+            assert_eq!(
+                config.cpu_prefill.map(CpuPrefill::tokens),
+                Some(tokens.parse().map_err(io::Error::other)?)
+            );
+            assert_eq!(
+                config.cpu_prefill.map(CpuPrefill::scratch_bytes),
+                Some(usize::try_from(reserve).map_err(io::Error::other)?)
+            );
             assert_eq!(config.prompt_reuse, PromptReuse::Latest);
             assert_eq!(config.kv_cache, KvCachePolicy::F16);
             let mut insufficient = selected.clone();
@@ -380,11 +405,56 @@ mod tests {
         for options in [
             vec!["--cpu-prefill-tokens", "8"],
             vec!["--cpu-prefill-scratch-bytes", "67108864"],
-            vec!["--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "67108864"],
-            vec!["--kv-cache", "f16", "--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "67108864"],
-            vec!["--kv-cache", "rsq4", "--context-tokens", "8192", "--memory-limit-bytes", "20000000000", "--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "67108864"],
-            vec!["--kv-cache", "f16", "--context-tokens", "8192", "--memory-limit-bytes", "20000000000", "--cpu-prefill-tokens", "7", "--cpu-prefill-scratch-bytes", "67108864"],
-            vec!["--kv-cache", "f16", "--context-tokens", "8192", "--memory-limit-bytes", "20000000000", "--cpu-prefill-tokens", "8", "--cpu-prefill-scratch-bytes", "0"],
+            vec![
+                "--cpu-prefill-tokens",
+                "8",
+                "--cpu-prefill-scratch-bytes",
+                "67108864",
+            ],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--cpu-prefill-tokens",
+                "8",
+                "--cpu-prefill-scratch-bytes",
+                "67108864",
+            ],
+            vec![
+                "--kv-cache",
+                "rsq4",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                "20000000000",
+                "--cpu-prefill-tokens",
+                "8",
+                "--cpu-prefill-scratch-bytes",
+                "67108864",
+            ],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                "20000000000",
+                "--cpu-prefill-tokens",
+                "7",
+                "--cpu-prefill-scratch-bytes",
+                "67108864",
+            ],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                "20000000000",
+                "--cpu-prefill-tokens",
+                "8",
+                "--cpu-prefill-scratch-bytes",
+                "0",
+            ],
         ] {
             let mut arguments = base.clone();
             arguments.extend(options.into_iter().map(OsString::from));

@@ -311,11 +311,18 @@ impl Qwen35 {
     /// # Errors
     /// Rejects absent tiles, triangular GDN and arithmetic overflow.
     pub fn tiled_verification_scratch_bytes(&self) -> Result<usize> {
-        let tile = self.tiled_prefill.as_ref().ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
+        let tile = self
+            .tiled_prefill
+            .as_ref()
+            .ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
         if tile.chunkwise_gdn {
-            return Err(invalid("verification requires exact sequential GDN arithmetic"));
+            return Err(invalid(
+                "verification requires exact sequential GDN arithmetic",
+            ));
         }
-        let rows = tile.tokens.min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS);
+        let rows = tile
+            .tokens
+            .min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS);
         checked_product(&[rows, self.vocabulary, size_of::<f32>()])?
             .checked_add(checked_product(&[rows, size_of::<Vec<f32>>()])?)
             .ok_or_else(|| invalid("verification logits reservation overflow"))
@@ -336,11 +343,19 @@ impl Qwen35 {
             return Err(invalid("tiled verification requires CPU-only projections"));
         }
         let required = self.tiled_verification_scratch_bytes()?;
-        let tile = self.tiled_prefill.as_mut().ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
+        let tile = self
+            .tiled_prefill
+            .as_mut()
+            .ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
         if self.position != 0 || tile.verification || additional_bytes < required {
-            return Err(invalid("tiled verification requires an empty graph and admitted logits"));
+            return Err(invalid(
+                "tiled verification requires an empty graph and admitted logits",
+            ));
         }
-        let total = tile.scratch_bytes.checked_add(required).ok_or_else(|| invalid("verification scratch reservation overflow"))?;
+        let total = tile
+            .scratch_bytes
+            .checked_add(required)
+            .ok_or_else(|| invalid("verification scratch reservation overflow"))?;
         let suffix = ":cpu-tiled-verify-v1";
         self.identity.try_reserve_exact(suffix.len())?;
         self.identity.push_str(suffix);
@@ -351,8 +366,13 @@ impl Qwen35 {
     }
 
     pub(super) fn verification_capacity(&self) -> usize {
-        self.tiled_prefill.as_ref().filter(|tile| tile.verification)
-            .map_or(0, |tile| tile.tokens.min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS))
+        self.tiled_prefill
+            .as_ref()
+            .filter(|tile| tile.verification)
+            .map_or(0, |tile| {
+                tile.tokens
+                    .min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS)
+            })
     }
 
     pub(super) fn evaluate_verification_block(
@@ -362,12 +382,20 @@ impl Qwen35 {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         output.clear();
-        if tokens.is_empty() || tokens.len() > self.verification_capacity()
+        if tokens.is_empty()
+            || tokens.len() > self.verification_capacity()
             || self.projection_executor.is_some()
-            || tokens.iter().any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
-            || self.position.checked_add(tokens.len()).is_none_or(|end| end > self.context_limit)
+            || tokens
+                .iter()
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
+            || self
+                .position
+                .checked_add(tokens.len())
+                .is_none_or(|end| end > self.context_limit)
         {
-            return Err(invalid("invalid tiled verification bounds, tokens or context"));
+            return Err(invalid(
+                "invalid tiled verification bounds, tokens or context",
+            ));
         }
         // Allocate every output row before layer-major state can change. These
         // are the caller-owned bytes charged by the explicit selection above.
@@ -384,7 +412,10 @@ impl Qwen35 {
             output.clear();
             return Err(error);
         }
-        let mut tile = self.tiled_prefill.take().ok_or_else(|| invalid("missing verification tile"))?;
+        let mut tile = self
+            .tiled_prefill
+            .take()
+            .ok_or_else(|| invalid("missing verification tile"))?;
         let result = (|| {
             check()?;
             self.ingest_cpu_tile(tokens, check, &mut tile, None, Some(output.as_mut_slice()))?;
@@ -450,7 +481,13 @@ impl Qwen35 {
         let result = (|| {
             for tokens in tokens.chunks(tile.tokens) {
                 check()?;
-                self.ingest_cpu_tile(tokens, check, &mut tile, reborrow_executor(&mut executor), None)?;
+                self.ingest_cpu_tile(
+                    tokens,
+                    check,
+                    &mut tile,
+                    reborrow_executor(&mut executor),
+                    None,
+                )?;
                 tile.statistics.completed_tiles = tile.statistics.completed_tiles.saturating_add(1);
                 tile.statistics.completed_tokens = tile
                     .statistics
@@ -754,17 +791,33 @@ impl Qwen35 {
         }
         if let Some(logits) = logits {
             let reuse = normalize_for_tile_into(
-                &self.transforms, &self.geometry, self.arithmetic, &self.output_norm,
-                &self.output, &tile.hidden[..count], &mut tile.normalized[..count],
-                &mut tile.transformed[..count], tile.projector.row_parallelism(),
+                &self.transforms,
+                &self.geometry,
+                self.arithmetic,
+                &self.output_norm,
+                &self.output,
+                &tile.hidden[..count],
+                &mut tile.normalized[..count],
+                &mut tile.transformed[..count],
+                tile.projector.row_parallelism(),
             )?;
             check()?;
             let _ = project_tile(
-                &self.transforms, &self.geometry, self.arithmetic, self.adapter.as_ref(),
-                self.adapter_scale, &mut self.workspace.adapter,
-                &mut self.workspace.projection.matvec, reuse, &self.output,
-                &tile.normalized[..count], logits, &mut tile.transformed[..count],
-                &mut tile.projector, reborrow_executor(&mut executor), check,
+                &self.transforms,
+                &self.geometry,
+                self.arithmetic,
+                self.adapter.as_ref(),
+                self.adapter_scale,
+                &mut self.workspace.adapter,
+                &mut self.workspace.projection.matvec,
+                reuse,
+                &self.output,
+                &tile.normalized[..count],
+                logits,
+                &mut tile.transformed[..count],
+                &mut tile.projector,
+                reborrow_executor(&mut executor),
+                check,
             )?;
             for row in logits {
                 if row.len() != self.vocabulary {

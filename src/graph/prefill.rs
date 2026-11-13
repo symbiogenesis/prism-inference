@@ -212,6 +212,8 @@ impl Qwen35 {
     /// default block ingestion unchanged. FFN packed blocks are decoded once
     /// across a tile; attention/GDN/convolution remain strictly causal in their
     /// existing token arithmetic order. This is not a chunkwise WY GDN kernel.
+    /// Rotated KV retains its selected codec and ordinary per-token attention;
+    /// surrounding projections still share packed weights across the tile.
     /// Separate identity prevents mixing runtime prefix/cache plans. No private
     /// service or application default selects this unqualified source path.
     ///
@@ -225,9 +227,6 @@ impl Qwen35 {
     /// Rejects nonempty/already-configured graphs, unsupported sizes, insufficient
     /// reservation and failed allocation before changing selection or identity.
     pub fn with_tiled_prefill(mut self, tokens: usize, scratch_bytes: usize) -> Result<Self> {
-        if self.kv_cache_policy != super::KvCachePolicy::F16 {
-            return Err(invalid("tiled prefill is not qualified for rotated KV"));
-        }
         let required = self.tiled_prefill_scratch_bytes(tokens)?;
         if self.position != 0 || self.tiled_prefill.is_some() || scratch_bytes < required {
             return Err(invalid(
@@ -257,7 +256,7 @@ impl Qwen35 {
 
     /// Select a separately identified FP32 triangular GDN chunk algorithm.
     ///
-    /// Requires explicit tiled prefill selection on an empty graph. This changes
+    /// Requires explicit FP16 tiled prefill selection on an empty graph. This changes
     /// floating evaluation order; it does not promise bit-identical recurrence.
     /// The initial qualification tolerance is `1e-3 + 1e-3 * abs(reference)` for
     /// complete logits and state, including long-prefix continuation and restore.
@@ -267,6 +266,9 @@ impl Qwen35 {
     /// # Errors
     /// Rejects nonempty, untiled or already selected graphs and failed identity allocation.
     pub fn with_chunkwise_gdn_prefill(mut self) -> Result<Self> {
+        if self.kv_cache_policy != super::KvCachePolicy::F16 {
+            return Err(invalid("chunkwise GDN requires the separate FP16 profile"));
+        }
         let Some(tile) = self.tiled_prefill.as_mut() else {
             return Err(invalid("chunkwise GDN requires explicit tiled prefill"));
         };
@@ -328,10 +330,12 @@ impl Qwen35 {
             .ok_or_else(|| invalid("verification logits reservation overflow"))
     }
 
-    /// Explicitly enable exact tiled target verification on an empty FP16 graph.
+    /// Explicitly enable tiled target verification on an empty CPU graph.
     ///
     /// Eligible packed layer projections and the vocabulary head share weights
     /// across tokens; GDN/convolution retain causal, original arithmetic order.
+    /// Rotated KV retains its selected lossy codec and causal per-token attention;
+    /// this does not imply equivalence to the separate FP16 numerical profile.
     /// This selects no drafter, sampler correction or serving default. Rejection
     /// recovery still requires a complete checkpoint and accepted-prefix replay.
     ///
@@ -925,8 +929,8 @@ fn full_attention_kv_only_tile(
         if index > 0 {
             check()?;
         }
-        keys.reserve_append()?;
-        values.reserve_append()?;
+        keys.prepare_append(&tile.recurrent_gate[index])?;
+        values.prepare_append(&tile.beta[index])?;
         keys.append(&tile.recurrent_gate[index]);
         values.append(&tile.beta[index]);
         check()?;
@@ -957,7 +961,16 @@ fn full_attention_tile(
     tile: &mut TiledPrefill,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    if count <= 1 || tile.projector.row_parallelism().workers() <= 1 {
+    // Packed history must retain the codec's ordinary current-token encoding,
+    // score/value order and causal append. The parallel-across-token path below
+    // reads FP16 pages directly, so it is only valid for the FP16 policy. Packed
+    // graphs still share every surrounding projection and the existing private
+    // head workers inside full_attention_state; no cache expansion is needed.
+    if count <= 1
+        || tile.projector.row_parallelism().workers() <= 1
+        || keys.packed.is_some()
+        || values.packed.is_some()
+    {
         for index in 0..count {
             check()?;
             if !*frequencies_ready {
@@ -996,8 +1009,8 @@ fn full_attention_tile(
                 &mut tile.frequencies[index],
             );
             step_result?;
-            keys.reserve_append()?;
-            values.reserve_append()?;
+            keys.prepare_append(&tile.recurrent_gate[index])?;
+            values.prepare_append(&tile.beta[index])?;
             keys.append(&tile.recurrent_gate[index]);
             values.append(&tile.beta[index]);
             check()?;

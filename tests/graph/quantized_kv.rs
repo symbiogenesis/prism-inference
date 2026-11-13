@@ -12,7 +12,7 @@ const CONTEXT: usize = 70;
 const GDN_BYTES: usize = 40;
 const BUDGET: usize = 1_048_576;
 
-fn profile_fixture() -> Model {
+pub(super) fn profile_fixture() -> Model {
     let mut model = hybrid_fixture();
     for (key, value) in [
         ("qwen35.context_length", 70_u64),
@@ -105,6 +105,240 @@ fn tokens(count: usize) -> Vec<u32> {
 
 fn bits(values: Vec<f32>) -> Vec<u32> {
     values.into_iter().map(f32::to_bits).collect()
+}
+
+fn tile_profile(graph: Qwen35, verification: bool) -> Result<Qwen35> {
+    let reserve = graph.tiled_prefill_scratch_bytes(8)?;
+    let graph = graph.with_tiled_prefill(8, reserve)?;
+    assert_eq!(graph.tiled_prefill_reserved_bytes(), reserve);
+    if verification {
+        let logits = graph.tiled_verification_scratch_bytes()?;
+        graph.with_tiled_verification(logits)
+    } else {
+        Ok(graph)
+    }
+}
+
+fn ordered_profile_fixture(pinned: bool, full_last: bool) -> Model {
+    let mut model = profile_fixture();
+    if pinned {
+        model.identity = bonsai_prism_runtime::model::swift::MODEL_SHA256.to_owned();
+    }
+    if full_last {
+        model.metadata.insert(
+            "qwen35.attention.recurrent_layers".to_owned(),
+            MetadataValue::from(vec![true, false]),
+        );
+        model.tensors = model
+            .tensors
+            .into_iter()
+            .map(|(name, mut tensor)| {
+                let name = if let Some(suffix) = name.strip_prefix("blk.0.") {
+                    format!("blk.1.{suffix}")
+                } else if let Some(suffix) = name.strip_prefix("blk.1.") {
+                    format!("blk.0.{suffix}")
+                } else {
+                    name
+                };
+                tensor.name.clone_from(&name);
+                (name, tensor)
+            })
+            .collect();
+    }
+    model
+}
+
+#[test]
+fn rotated_kv_tiled_prefill_retains_policy_bits_and_packed_page_storage() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for pinned in [false, true] {
+            for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                for full_last in [false, true] {
+                    let build = || {
+                        Qwen35::with_state_budget_and_kv(
+                            ordered_profile_fixture(pinned, full_last),
+                            CONTEXT,
+                            BUDGET,
+                            backend,
+                            policy,
+                        )
+                    };
+                    let mut expected = build()?;
+                    let mut actual = tile_profile(build()?, false)?;
+                    actual.set_last_layer_prefill_narrowing(true);
+                    for token in tokens(63) {
+                        expected.ingest(token)?;
+                    }
+                    actual.ingest_block(&tokens(63), &|| Ok(()))?;
+                    assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+                    assert_eq!(actual.kv_cache_policy(), policy);
+                    assert_eq!(
+                        actual.state_memory()?.kv_payload_bytes,
+                        policy.layer_payload_bytes(256, 1, 63)?,
+                    );
+                    let checkpoint = actual.checkpoint()?;
+                    for token in [1, 0] {
+                        assert_eq!(bits(actual.evaluate(token)?), bits(expected.evaluate(token)?));
+                    }
+                    let sealed = graph_bits(&expected)?;
+                    actual.restore(&checkpoint)?;
+                    actual.ingest_block(&[1, 0], &|| Ok(()))?;
+                    assert_eq!(graph_bits(&actual)?, sealed);
+                    assert_eq!(
+                        actual.state_memory()?.kv_payload_bytes,
+                        policy.layer_payload_bytes(256, 1, 65)?,
+                    );
+                    assert!(actual.with_chunkwise_gdn_prefill().is_err());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rotated_kv_tiled_verification_matches_every_row_and_restored_causal_state() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for pinned in [false, true] {
+            for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                for base in [0, 63] {
+                    let build = || {
+                        Qwen35::with_state_budget_and_kv(
+                            ordered_profile_fixture(pinned, true),
+                            CONTEXT,
+                            BUDGET,
+                            backend,
+                            policy,
+                        )
+                    };
+                    let mut expected = build()?;
+                    let mut actual = tile_profile(build()?, true)?;
+                    actual.set_last_layer_prefill_narrowing(true);
+                    if base > 0 {
+                        for token in tokens(base) {
+                            expected.ingest(token)?;
+                        }
+                        actual.ingest_block(&tokens(base), &|| Ok(()))?;
+                    }
+                    let checkpoint = actual.checkpoint()?;
+                    let draft = [1, 0, 1, 1];
+                    let reference = draft
+                        .into_iter()
+                        .map(|token| expected.evaluate(token).map(bits))
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut rows = Vec::new();
+                    actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
+                    assert_eq!(rows.into_iter().map(bits).collect::<Vec<_>>(), reference);
+                    assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+                    actual.restore(&checkpoint)?;
+                    let mut rows = Vec::new();
+                    actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
+                    assert_eq!(rows.into_iter().map(bits).collect::<Vec<_>>(), reference);
+                    assert_eq!(bits(actual.evaluate(0)?), bits(expected.evaluate(0)?));
+                    assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        let build = |scale| -> Result<Qwen35> {
+            let model = profile_fixture();
+            let factors = rank_one_factors(
+                &model,
+                &["blk.0.attn_output.weight", "blk.1.ssm_out.weight"],
+                0.125,
+            );
+            let adapter = RankOneAdapter::from_model(factors, &model)?;
+            Qwen35::with_rank_one_adapter_and_kv(
+                model,
+                CONTEXT,
+                BUDGET,
+                MatvecBackend::Auto,
+                adapter,
+                scale,
+                policy,
+            )
+        };
+        let mut expected = build(1.3)?;
+        let mut actual = tile_profile(build(1.3)?, true)?;
+        for token in tokens(63) {
+            expected.ingest(token)?;
+        }
+        actual.ingest_block(&tokens(63), &|| Ok(()))?;
+        let before = graph_bits(&actual)?;
+        assert_eq!(before, graph_bits(&expected)?);
+        let checkpoint = actual.checkpoint()?;
+        let checks = Cell::new(0);
+        let mut rows = vec![vec![f32::NAN]];
+        assert!(
+            actual
+                .evaluate_batch_into(&[1, 0, 1, 0], &mut rows, &|| {
+                    checks.set(checks.get() + 1);
+                    if checks.get() >= 10 {
+                        Err(std::io::Error::other("cancel rotated tile").into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert!(rows.is_empty());
+        actual.restore(&checkpoint)?;
+        assert_eq!(graph_bits(&actual)?, before);
+        assert_eq!(bits(actual.evaluate(1)?), bits(expected.evaluate(1)?));
+        assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+        actual.reset_with_adapter_scale(0.0)?;
+        assert!(actual.restore(&checkpoint).is_err());
+        assert_eq!(actual.batched_evaluation_capacity(), 8);
+        assert!(actual.identity().contains(":cpu-tiled-verify-v1"));
+        assert!(actual.identity().contains(&format!("kv-{}-d256-rht3-v1", policy.name())));
+        let mut reference = build(0.0)?;
+        let draft = [0, 1, 0, 1];
+        let expected_rows = draft
+            .into_iter()
+            .map(|token| reference.evaluate(token).map(bits))
+            .collect::<Result<Vec<_>>>()?;
+        actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
+        assert_eq!(rows.into_iter().map(bits).collect::<Vec<_>>(), expected_rows);
+        assert_eq!(graph_bits(&actual)?, graph_bits(&reference)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn parallel_rotated_kv_tiled_verification_retains_shared_head_workers() -> Result<()> {
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for workers in [1, 4, 16] {
+            let mut expected = parallel_profile_graph(policy, 1)?;
+            let mut actual = tile_profile(parallel_profile_graph(policy, workers)?, true)?;
+            for token in tokens(63) {
+                expected.ingest(token)?;
+            }
+            actual.ingest_block(&tokens(63), &|| Ok(()))?;
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+            let checkpoint = actual.checkpoint()?;
+            let draft = [1, 0, 1, 0];
+            let expected_rows = draft
+                .into_iter()
+                .map(|token| expected.evaluate(token).map(bits))
+                .collect::<Result<Vec<_>>>()?;
+            let mut rows = Vec::new();
+            actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
+            assert_eq!(rows.into_iter().map(bits).collect::<Vec<_>>(), expected_rows);
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+            actual.restore(&checkpoint)?;
+            actual.ingest_block(&draft, &|| Ok(()))?;
+            assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+            assert_eq!(actual.row_workers(), workers);
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -347,11 +581,15 @@ fn rotated_kv_scalar_auto_and_sequential_block_ingestion_preserve_profile_bits()
         }
         block.ingest_block(&prompt, &|| Ok(()))?;
         assert_eq!(graph_bits(&block)?, graph_bits(&scalar)?);
-        assert_eq!(bits(block.evaluate(1)?), bits(scalar.evaluate(1)?));
+        let continuation = bits(scalar.evaluate(1)?);
+        assert_eq!(bits(block.evaluate(1)?), continuation);
         assert_eq!(graph_bits(&block)?, graph_bits(&scalar)?);
-        let declined = graph(policy, MatvecBackend::Auto)?;
-        let reserve = declined.tiled_prefill_scratch_bytes(8)?;
-        assert!(declined.with_tiled_prefill(8, reserve).is_err());
+        let selected = graph(policy, MatvecBackend::Auto)?;
+        let reserve = selected.tiled_prefill_scratch_bytes(8)?;
+        let mut tiled = selected.with_tiled_prefill(8, reserve)?;
+        tiled.ingest_block(&prompt, &|| Ok(()))?;
+        assert_eq!(bits(tiled.evaluate(1)?), continuation);
+        assert_eq!(graph_bits(&tiled)?, graph_bits(&scalar)?);
     }
     Ok(())
 }

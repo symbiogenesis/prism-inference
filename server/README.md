@@ -27,8 +27,15 @@ checks at least 11 GiB of fixed runtime allowance plus 137,344 bytes per context
 token, then independently requires that allowance plus a 4 GiB physical host
 reserve. This conservative source charge covers live and rollback FP16 KV,
 64-token/24-head publisher-style attention scores and context bookkeeping even
-when native quantized KV is selected. Native ordinary prefill is sequential;
-optional tiled-prefill APIs retain their separate resource review.
+when native quantized KV is selected. Native ordinary prefill is sequential.
+New local source offers explicit exact FP16 CPU tiles through paired trusted
+`--cpu-prefill-tokens <8|16|32>` and `--cpu-prefill-scratch-bytes <usize>` options.
+Both require explicit `--kv-cache f16` and paired context/process-memory limits;
+the entire extra reserve is charged before model I/O. Readiness binds the tile,
+reserve and startup graph identity, and this CPU profile skips implicit Hexagon
+installation. Explicit latest-prefix reuse remains compatible. See
+[CPU tiled prefill](../docs/cpu-tiled-prefill.md#explicit-private-service-consumer);
+current published bundles and application defaults are unchanged.
 
 The selected context is immutable and identical in exact chat tokenization,
 server admission, decoder/runtime bounds and authenticated `context_tokens`

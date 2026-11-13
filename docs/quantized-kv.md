@@ -34,9 +34,15 @@ The safe codec uses a narrow audited `bonsai-neon-dot` boundary for runtime-dete
 128-bit NEON. X1 Elite and X2 Elite Extreme share these kernels and the same
 numerical identity. Explicit scalar construction supplies an independent fallback.
 No unmeasured SKU-specific thread count, optional ISA or speed advantage is assumed.
-The graph's existing projection worker policy is preserved; compressed attention
-currently streams query heads serially. Further GQA head tiling requires measured
-benefit and its own correctness checks.
+New local source shares the graph's existing private row-worker pool across
+independent compressed-attention query heads. Each head retains its exact
+score, softmax, value accumulation and inverse-transform order. Tasks own
+disjoint attended/score slices, borrow immutable packed/current records and join
+before returning the earliest head-chunk failure. Serial and feature-disabled
+paths retain their existing policy; no second pool or expanded cache is added.
+Cancellation retains the ordinary synchronous-token boundary. This source
+candidate is separate from the published 0.1.25 serial control and has no
+measured device or complete-request benefit.
 
 Queries rotate once per head. Key scoring reads packed codes directly. Weighted
 values accumulate in the rotated basis before one inverse transform. Attention

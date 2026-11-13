@@ -1,9 +1,11 @@
 # Explicit CPU tiled prefill
 
 The experimental graph API now consumes bounded packed multi-token projections
-inside real state-only Qwen3.5 prompt ingestion. Ordinary graphs and private
-services keep their current sequential policy. No runtime release, Runner pin,
-memory admission or application default changes here.
+inside real state-only Qwen3.5 prompt ingestion. Ordinary graphs retain their
+current policy. New local source also exposes an explicitly admitted FP16
+private-service profile and an independently selected batched target verifier.
+These consumers are not in Runner's published 0.1.25 bundle; they change no
+runtime release, Runner pin or application default.
 
 ```rust,ignore
 let graph = Qwen35::new(model, context)?;
@@ -19,6 +21,56 @@ Select only 8, 16 or 32 token tiles on an empty graph. Both APIs renew checkpoin
 provenance and append a phase-specific identity. Ordinary token evaluation stays
 unchanged. External projection-executor scopes retain their existing sequential
 ingestion and do not dispatch these CPU tiles.
+
+## Explicit private-service consumer
+
+`swift_session::CpuPrefill::new(tokens, scratch_bytes)` binds 8, 16 or 32 tokens
+to a caller-supplied additional reserve. Existing SwiftSession loaders preserve
+ordinary ingestion; `load_profile_with_prefill` supplies the explicit selection.
+The graph independently checks its geometry-derived minimum. Owners must add
+the full supplied reserve to the existing context/process allowance using
+`validate_prefill_capacity`, while retaining worker, allocator and host reserves.
+
+The private server accepts paired trusted `--cpu-prefill-tokens` and
+`--cpu-prefill-scratch-bytes` arguments only with explicit `--kv-cache f16` and
+paired `--context-tokens` / `--memory-limit-bytes`. Invalid pairing, precision,
+bounds or insufficient total allowance rejects before artifact I/O. Requests
+cannot change this selection. Startup readiness reports `cpu_prefill_tokens`,
+`cpu_prefill_scratch_bytes` and the exact `startup_graph_identity`.
+
+This profile retains sequential GDN arithmetic and skips implicit Hexagon
+discovery/installation. Explicit `--prompt-reuse latest` remains compatible;
+reset and adapter scale changes retain the immutable tile policy. Rotated KV
+and triangular GDN are separate profiles, not fallbacks. Full-model, long-prefix,
+adapter, cancellation/recovery and matched whole-request benefit remain pending.
+
+## Explicit target-verification consumer
+
+After selecting exact FP16 tiles on an empty CPU graph, call
+`Qwen35::tiled_verification_scratch_bytes` and charge that additional reservation
+before `with_tiled_verification`. The separate `cpu-tiled-verify-v1` identity
+admits at most eight candidate positions. It charges each full vocabulary row
+and row metadata in addition to ordinary tile, state and checkpoint budgets.
+
+`Decoder::evaluate_batch_into` then produces every position's complete target
+logits while layer-major packed projections, including a packed output head,
+share decoded weight blocks across candidates. Final-layer state-only narrowing
+is disabled for verification. Causal attention, convolution and sequential GDN
+remain complete. Triangular GDN, rotated KV and installed external projection
+executors reject the exact CPU verifier.
+
+`Runtime::verify_draft_block` uses this capability for eligible multi-token
+drafts; ordinary graphs keep sequential verification. Candidate zero uses the
+committed prefix's logits; later candidates use the preceding returned row.
+Full acceptance keeps the computed state and evaluates one bonus token. A
+rejection restores the complete checkpoint, replays the accepted prefix and
+evaluates the correction. Work admission conservatively charges the proposed
+block plus possible replay; failed restore closes admission without retry.
+
+This is greedy block verification, not sampled serving. The suffix-generation
+loop and SwiftSession speculative completion remain sequential; stochastic
+acceptance/residual sampling and a useful drafter still require integration.
+Focused synthetic controls do not establish actual-model parity or speed.
 
 ## Exact packed tiles
 

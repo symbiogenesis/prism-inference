@@ -311,7 +311,7 @@ def source_hashes(root):
     files.update(path for path in (root / "tests/fixtures").rglob("*") if path.is_file())
     files.update(root / path for path in [
         "tests/graph.rs", "tests/runtime.rs", "tests/tokenizer.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
-        ".github/ci/test_inference_efficiency.py", ".github/workflows/inference-efficiency.yml",
+        ".github/ci/test_inference_efficiency.py", ".github/workflows/source-checks.yml",
     ])
     return {str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(files)}

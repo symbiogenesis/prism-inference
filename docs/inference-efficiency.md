@@ -208,15 +208,16 @@ the extra descriptor reads still need a matched total-cost comparison.
 
 ## Exact hosted correctness gate
 
-The owner-operated [Inference efficiency candidate workflow](../.github/workflows/inference-efficiency.yml)
-runs only on hosted Windows ARM64, Windows x64 and Linux ARM64 against local main's
+Dispatch the owner-operated [Source checks workflow](../.github/workflows/source-checks.yml)
+with `model_free: efficiency` for the exact efficiency gate. It runs only on
+hosted Windows ARM64, Windows x64 and Linux ARM64 against local main's
 published source. It never queues an owner-device job. Its fixed inventory tests
 direct projections against decoded rows, full-vocabulary selection against the
 old full-candidate route, independent full-padding attention controls, empty and
 nonempty snapshot ownership, adapter provenance, cancellation and seeded rollback.
 The fused copy/decay test remains a synthetic control, not production selection.
 
-The runner compiles its six test targets once and requires exactly one passed,
+The runner compiles its selected test targets once and requires exactly one passed,
 nonignored test for every exact name. Missing or renamed controls, zero matches,
 ignored tests, duplicate executables and failures reject. Receipts retain the
 revision, source hashes, executable digests and raw results. Strict Release

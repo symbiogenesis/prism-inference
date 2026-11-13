@@ -5,6 +5,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      model_free:
+        description: Hosted model-free checks (efficiency retains exact named admission receipts)
+        type: choice
+        default: parity
+        options: [parity, efficiency]
 permissions:
   contents: read
 concurrency:
@@ -26,6 +32,10 @@ jobs:
       probe: ${{ steps.select.outputs.probe }}
       parity: ${{ steps.select.outputs.parity }}
     steps:
+      - name: Require main source for exact efficiency qualification
+        if: github.event_name == 'workflow_dispatch' && inputs.model_free == 'efficiency' && github.ref != 'refs/heads/main'
+        shell: pwsh
+        run: throw 'Exact efficiency qualification requires a dispatch from main.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -36,6 +46,9 @@ jobs:
       - name: Validate workflow syntax and immutable action references
         shell: pwsh
         run: ./.github/ci/Test-Workflow.ps1 -CheckFixtures
+      - name: Verify compiler cache recovery without installing a compiler
+        shell: pwsh
+        run: ./.github/ci/test_rust_toolchain.ps1
       - name: Select checks within their supported event scope
         id: select
         shell: bash
@@ -56,6 +69,7 @@ jobs:
           persist-credentials: false
       - name: Reuse the pinned rumdl linter
         id: rumdl-cache
+        continue-on-error: true
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/rumdl-bin
@@ -95,6 +109,7 @@ jobs:
           dotnet-version: '10.0.4xx'
       - name: Reuse the pinned PowerShell analyzer
         id: analyzer-cache
+        continue-on-error: true
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/Prism-Standards-Tools
@@ -197,6 +212,7 @@ jobs:
             exit 1
           fi
   model-free:
+    name: model-free / ${{ github.event_name == 'workflow_dispatch' && inputs.model_free || 'parity' }} / ${{ matrix.target }}
     needs: changes
     if: needs.changes.outputs.parity == 'true'
     runs-on: ${{ matrix.runner }}
@@ -214,24 +230,48 @@ jobs:
     env:
       CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
       CARGO_BUILD_FINGERPRINT: content
+      EFFICIENCY_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
+        id: rust
         with:
           toolchain: nightly-2026-11-09-${{ matrix.target }}
+      - name: Select fresh external compiler and evidence storage
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'Prism-ModelFree-Target')" >> $env:GITHUB_ENV
+          "SWIFT_PARITY_EVIDENCE=$(Join-Path $env:RUNNER_TEMP 'Swift-Parity-Evidence')" >> $env:GITHUB_ENV
+          "EFFICIENCY_EVIDENCE=$(Join-Path $env:RUNNER_TEMP 'Prism-Efficiency-Evidence')" >> $env:GITHUB_ENV
+      - name: Reuse locked Cargo downloads
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: prism-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Reuse only matching model-free compiler outputs
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: prism-model-free-v1-${{ matrix.target }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tests/**', 'tools/**', 'rust-toolchain.toml', 'clippy.toml', 'rustfmt.toml') }}-content-v1
+          restore-keys: |
+            prism-model-free-v1-${{ matrix.target }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-
       - name: Check native and fallback lints, transactional serving and worker protocol
+        if: github.event_name != 'workflow_dispatch' || inputs.model_free != 'efficiency'
         shell: pwsh
         working-directory: ${{ runner.temp }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'Swift-Parity-Target'
-          $evidence = Join-Path $env:RUNNER_TEMP 'Swift-Parity-Evidence'
+          $evidence = $env:SWIFT_PARITY_EVIDENCE
           [void][IO.Directory]::CreateDirectory($evidence)
-          "SWIFT_PARITY_EVIDENCE=$evidence" >> $env:GITHUB_ENV
           Start-Transcript -LiteralPath (Join-Path $evidence 'checks.log') | Out-Null
           try {
             $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
@@ -244,12 +284,33 @@ jobs:
             cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows
             cargo +nightly-2026-11-09 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --no-deps
           } finally { Stop-Transcript | Out-Null }
+      - name: Require exact efficiency controls, analyzers and production linking
+        if: github.event_name == 'workflow_dispatch' && inputs.model_free == 'efficiency'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          python -B -m unittest discover -s (Join-Path $env:GITHUB_WORKSPACE '.github/ci') -p test_inference_efficiency.py
+          cargo +nightly-2026-11-09 fmt --manifest-path $manifest --all -- --check
+          cargo +nightly-2026-11-09 check --manifest-path $manifest --locked --release -p prism-inference --lib --no-default-features
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/inference_efficiency.py') --manifest $manifest --evidence $env:EFFICIENCY_EVIDENCE
+          cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server -p bonsai-hexagon-native -p bonsai-hexagon-runtime --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
+          cargo +nightly-2026-11-09 build --manifest-path $manifest --locked --release -p prism-inference -p prism-inference-server -p bonsai-hexagon-native -p bonsai-hexagon-runtime --lib --bins --features prism-inference/parallel-rows,prism-inference-server/parallel-rows
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && env.SWIFT_PARITY_EVIDENCE != ''
+        if: always() && env.SWIFT_PARITY_EVIDENCE != '' && (github.event_name != 'workflow_dispatch' || inputs.model_free != 'efficiency')
         with:
           name: swift-parity-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ env.SWIFT_PARITY_EVIDENCE }}
           if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && env.EFFICIENCY_EVIDENCE != '' && github.event_name == 'workflow_dispatch' && inputs.model_free == 'efficiency'
+        with:
+          name: inference-efficiency-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.EFFICIENCY_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 14
   source-checks:
     if: always()
     needs: [changes, markdown, standards, probe, compatibility, model-free]

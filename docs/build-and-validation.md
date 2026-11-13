@@ -288,23 +288,33 @@ and successful selected jobs; they permit skips only for unselected groups.
 
 ### Workflow inventory
 
-The nine entry points separate routine source validation from explicit qualification
+The seven entry points separate routine source validation from explicit qualification
 and bounded release preparation. No hosted verdict transfers across those scopes.
 
 | Workflow | Current responsibility |
 | --- | --- |
-| Foundation | Selected workspace, overlay, regression, codec and source-package checks |
-| Source checks | Selected Markdown, scripts, compiler probes and model-free parity |
-| Foundation bundle | Manual exact-source five-minute ARM64 binary preparation |
+| Foundation | Selected workspace, Hexagon cross-target, overlay, regression, codec and source-package checks |
+| Source checks | Workflow preflight, selected Markdown, scripts, compiler probes and model-free parity or exact efficiency controls |
+| Foundation bundle | Manual exact-source ARM64 binary preparation under GitHub's hosted execution cap |
 | Runtime conformance | Manual complete source/reference and backend release gate |
 | Prism focused reference | Manual diagnosis of one named source contract |
-| Inference efficiency candidate | Exact named controls and source-bound admission receipts |
-| Experimental native Hexagon boundary | Independent cross-target and native accelerator checks |
 | Released private-service acceptance | Pinned released-service lifecycle and receipt acceptance |
 | Swift request timing tool preparation | Source-bound standalone actual-model diagnostic tool |
 
-Source checks retains parity's Windows ARM64, Windows x64 and Linux ARM64 matrix
-for relevant pull requests and manual dispatch. It exercises model-free serving,
+Foundation owns the native Hexagon contracts in its existing Windows correctness
+and analyzer lanes, retaining a separate scalar-runtime feature check. Its selected
+Linux-to-Windows ARM64 check preserves the independent native boundary typecheck
+and strict all-target lint. The aggregate requires that check whenever selected;
+the retired Hexagon entry point supplied duplicate Windows jobs.
+
+Source checks retains the Windows ARM64, Windows x64 and Linux ARM64 model-free
+matrix for relevant pull requests and manual dispatch. Pull requests always select
+parity; manual dispatch defaults to `model_free: parity`. Choose
+`model_free: efficiency` to produce the exact named efficiency admission receipts
+with strict analyzers and production linking in the same matrix. This replaces
+the separate efficiency workflow without adding its workload to ordinary pushes
+or pull requests. Compiler outputs are isolated by target, verified compiler and
+runner image; evidence is always fresh. Parity exercises model-free serving,
 workers, hashing and documentation; it does not qualify actual-model parity.
 Its strict all-target Clippy invocation explicitly selects the NEON helper and
 Hexagon native/runtime crates on every target. This includes helper test code
@@ -314,6 +324,13 @@ rustfmt and Cargo configuration select this matrix. Main pushes retain
 Foundation's owning coverage without a duplicate parity matrix.
 The separate qualification and preparation workflows remain tied to open gates.
 Foundation bundle remains outside Foundation's successful-ancestor baseline.
+
+The shared Rust setup treats compiler caches as optional. A bad exact hosted
+cache hit can be discarded once and reinstalled, followed by the same host,
+sysroot and component verification. Fresh installation failures remain fatal;
+owner-managed installations are never uninstalled by this recovery. Verified
+compilers are saved before later source checks can fail, and cache-save failures
+do not change a correctness verdict. Cache hits never skip source validation.
 
 ### Focused checks before local delivery
 
@@ -326,7 +343,7 @@ pwsh -NoLogo -NoProfile -File .github/ci/Test-Workflow.ps1 -CheckFixtures
 It checks every workflow with checksum-pinned actionlint 1.7.12, including YAML,
 expressions, job dependencies and local action inputs. It separately rejects
 mutable external action references and missing local actions, including references
-inside composites. Five negative controls prove rejection of common startup
+inside composites. Eleven negative controls prove rejection of common startup
 mistakes. Optional script linters are disabled; no additional language runtime is
 installed. Downloads have finite retries and scratch storage is removed on exit.
 For an already trusted offline binary, pass `-ActionlintPath <absolute-path>`.

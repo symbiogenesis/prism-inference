@@ -50,6 +50,24 @@ class WorkflowCoverageTests(unittest.TestCase):
     def test_model_free_lints_direct_helpers_on_native_and_fallback_targets(self):
         self.assert_cfg_lint_coverage(self.workflow)
 
+    def test_manual_efficiency_keeps_exact_receipts_without_changing_pr_parity(self):
+        root = Path(__file__).resolve().parents[2]
+        self.assertFalse((root / '.github/workflows/inference-efficiency.yml').exists())
+        self.assertIn('options: [parity, efficiency]', self.workflow)
+        self.assertIn("if: github.event_name != 'workflow_dispatch' || inputs.model_free != 'efficiency'", self.workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.model_free == 'efficiency'", self.workflow)
+        self.assertIn("'.github/ci/inference_efficiency.py') --manifest $manifest --evidence $env:EFFICIENCY_EVIDENCE", self.workflow)
+        self.assertIn('path: ${{ env.EFFICIENCY_EVIDENCE }}', self.workflow)
+        self.assertIn('--lib --bins --features prism-inference/parallel-rows,prism-inference-server/parallel-rows', self.workflow)
+        self.assertIn('steps.rust.outputs.image-identity', self.workflow)
+        self.assertIn('steps.rust.outputs.compiler-identity', self.workflow)
+
+    def test_efficiency_source_identity_binds_the_current_workflow(self):
+        import inference_efficiency
+        hashes = inference_efficiency.source_hashes(Path(__file__).resolve().parents[2])
+        self.assertIn('.github/workflows/source-checks.yml', hashes)
+        self.assertNotIn('.github/workflows/inference-efficiency.yml', hashes)
+
     def test_missing_helper_strict_flag_or_target_is_rejected(self):
         removals = ["-p " + package + " " for package in
                     ("bonsai-neon-dot", "bonsai-hexagon-native", "bonsai-hexagon-runtime")]

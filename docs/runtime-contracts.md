@@ -71,22 +71,53 @@ them. `generate_with_prefill` / `generate_until_with_prefill` select
 
 Validated model EOS/EOT/EOM stops combine with caller stops. BOS/padding IDs and
 insertion flags are checked; raw-ID prompts receive no automatic insertion.
-Bounded incremental output preserves exact token bytes across UTF-8 boundaries
-and leaves control-token spellings literal.
+Bounded incremental output preserves exact token bytes across UTF-8 boundaries,
+leaves control-token spellings literal, and flushes any incomplete UTF-8 lead
+sequence as `U+FFFD` via `Utf8Output::flush_incomplete` when
+`Vocabulary::is_control` identifies a control boundary.
+
+Worker and server cancellation distinguish persistent pipes from batch inputs:
+`bonsai-swift-worker` reads stdin asynchronously and activates `Cancellation`
+immediately upon stdin EOF or read failure without blocking on a stalled stdin
+thread at exit, whereas `bonsai-token-worker` drains buffered stdin chunks
+through a bounded channel reader (`sync_channel(4)`) before EOF. The private
+HTTP backend supports `Engine::prepare_until` for cancellation and deadlines
+during prompt preparation and bounds post-request recovery via
+`Worker::settled_within` (`WORKER_SETTLE_TIMEOUT = 10s`, returning
+`NativeBackendError::Deadline` on timeout).
 
 ### Checkpoints
 
 Full-attention checkpoints share sealed immutable 64-token pages and copy private
 tails plus complete F32 recurrent/convolution state. Subsequent append/reset/
 restore cannot mutate snapshots. Immutable complete logits share an `Arc`;
-evaluation detaches shared output without copying obsolete values, then reuses
-unique storage. Checkpoints never alias mutable graph scratch.
+evaluation detaches shared output via `Arc::try_unwrap` without copying obsolete
+values, then reuses unique logits scratch alongside `Decoder::checkpoint_into`
+and `Runtime`'s bounded 2-slot recycled checkpoint pool. Checkpoints never alias
+mutable graph scratch.
 
 Position-zero checkpoints retain provenance/metadata instead of canonical empty
-KV and positive-zero recurrent payload. Restore validates provenance before
-clearing live state. Nonempty snapshots remain complete. Reset skips already
-empty state; scale reset still renews identity/provenance.
+KV and positive-zero recurrent payload. Restore validates complete geometry,
+position alignment, `KvCache::same_representation` /
+`PackedCache::same_representation`, packed page/tail partitions, and
+`ProjectedQwen35`'s SHA-256 `projection_plan_digest` before clearing or mutating
+live state; `Qwen35::restore` clears `frequencies_ready` cleanly. Nonempty
+snapshots remain complete. `Qwen35` tracks `state_consistent` across
+`ingest_cpu_tile` and rejects subsequent decode/prefill/checkpoint calls after
+any mid-tile error until `reset` or valid `restore` succeeds.
+`CausalDepthwiseConv1d` performs atomic overlapping shifts (`steps < 3`, `== 3`,
+`> 3`) without corrupting its 3-tap logical history on nonfinite error, and
+`recurrent_decay` rejects positive `ssm_a > 0.0` at construction while guarding
+`alpha + time_bias >= 88.0` overflow (`decay == 1.0` when `ssm_a == 0.0`). Reset
+skips already empty state; scale reset still renews identity/provenance.
 
+Transient verification/rollback snapshots recycle without inserting into or
+evicting reusable prefix cache entries. Opt-in
+`PromptReuse::PromptEndAndLatest` retains the latest prompt-end checkpoint across
+assistant output; `HybridCheckpointBoundary::reconcile` computes the maximal
+shared boundary across token history, KV page alignment (or exact unaligned KV
+bounds), non-truncatable recurrent GDN/conv state and representation/adapter
+identity (`KvCache::truncate_to` and `PackedCache::truncate_to` stay pure-KV).
 Optional prefix replacement preserves older prefixes if capture/replacement
 fails. Count eviction follows successful capture; byte-pressure eviction precedes
 allocation to honor the hard bound. [Session profiles](swift-session-profiles.md)
@@ -166,6 +197,14 @@ and pinned 16-attention/48-recurrent geometry, admitting 4,644,798,464 bytes.
 Individual allocation/scratch limits remain in force. Live/rollback reserves
 scale with payload with a 1 GiB floor; speculation adds another complete prefix
 and verification scratch. Shared pages do not discount admission.
+
+`SwiftExecutionMemoryLedger` (`SwiftExecutionMemoryLedger::for_swift_profile`,
+`SwiftSession::execution_memory_ledger`) separates Windows Job-object commit
+components (`job_commit_total_bytes`: pinned host weights, live/checkpointed
+recurrent and KV state, verification logits, replay scratch, tile scratch and
+fragmentation margin) from `accelerator_external_bytes` (added only in
+`total_with_external_bytes`). `swift_worker_request` also bounds initial
+message `Vec` preallocation to 64 entries before enforcing `MAX_MESSAGES`.
 
 Private startup validates paired `--context-tokens`/`--memory-limit-bytes`
 against final cache selection regardless of argument order. Context must be at

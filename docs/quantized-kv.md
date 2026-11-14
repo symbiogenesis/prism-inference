@@ -76,10 +76,16 @@ Non-FP16 readiness includes `kv_cache` and `startup_graph_identity`.
 Changing precision requires a fresh session.
 
 Immutable 64-token pages retain packed records; checkpoints copy private tails.
-Every encode and storage reservation completes before graph state is committed.
-Restoration preserves exact packed bytes. Profile identities prevent cross-policy
-reuse; F32 recurrent/convolution state remains independent.
-[CPU tiles](cpu-tiled-prefill.md) retain causal per-token codec attention.
+`PackedCache::copy_into` and `restore_in_place` reuse `tail` and `prepared`
+capacities while cloning immutable page handles without mutating shared
+`Arc<PackedPage>` allocations. Every encode and storage reservation completes
+before graph state is committed. Restore validates complete geometry,
+page/tail partitioning, `PackedCache::same_representation` (including codec
+version/bits/seed, `NEON` dispatch and fitted-value parameters), and exact
+checkpoint position before touching live state. `PackedCache::truncate_to` and
+`KvCache::truncate_to` preserve exact page/tail partitions during pure-KV
+truncation; F32 recurrent/convolution state remains independent. [CPU
+tiles](cpu-tiled-prefill.md) retain causal per-token codec attention.
 Triangular GDN is a separate FP16 profile.
 
 ### Guarded fitted-value scale candidate
@@ -98,9 +104,10 @@ and does not guarantee better original-space error, logits or answers.
 Encoding adds two 256-coordinate scans and a division per nonzero value head.
 
 Records remain 132 bytes/head. Identity `kv-rsq4vf-d256-rht3-v1` binds version-1
-keys and version-2 value scales. Its 4 GiB state ceiling admits up to 241,664
-tokens, without qualifying that context. Compare encoding cost and held-out
-quality before default selection.
+keys and version-2 value scales. Its 4 GiB state ceiling
+(`state_limit_bytes(Rotated4FittedValues) == MAX_STATE_BYTES`) admits up to
+241,664 tokens, without qualifying that context. Compare encoding cost and
+held-out quality before default selection.
 
 ## Memory observations
 

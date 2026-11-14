@@ -198,19 +198,46 @@ failed group replays the existing defensive row-major path from committed source
 prior successful groups retain their ordinary publication. Source arithmetic,
 unsupported geometry and feature-disabled targets retain their existing grouping.
 
+### GDN Q/K normalization identity
+
+Recurrent query and key normalization (`l2_norm_in_place` in
+`src/kernels.rs`) retains the pinned clamped L2 formula (`ClampedL2`):
+`scale = 1.0 / sqrt(sum(x^2)).max(epsilon)`. This preserves the pinned
+`PrismML-Eng/llama.cpp` reference contract
+(`73bfe6cc485554822f80c473a3c0c4f25e80f41b`) and pinned Swift model profile,
+and intentionally rejects switching to `ggml-org/llama.cpp@5fdfa628`'s
+additive-epsilon `rsqrt(sum(x^2) + epsilon)` (`AdditiveRsqrt`) formula. Any
+future normalization change requires an explicit representation bump and paired
+full-model parity controls.
+
 ## Suffix proposals
 
 The opt-in suffix drafter uses reverse-Z matching with a maximum 64-token window
 and 64-byte prefix table. It preserves overlap, longest match and most-recent
 start on ties, bounding token equalities below
 `2 * (history tokens + maximum match tokens)`.
+`propose_lookup_then_fallback` composes suffix/lookup drafting ahead of a
+secondary fallback drafter without allocating redundant scratch.
 
-Runtime copies at most eight proposals into a reused stack buffer; public
-`SuffixDrafter::propose` returns independently owned fallible storage.
-A rejected proposal retains its validated correction token without a second
-greedy vocabulary scan. Cancellation remains checked around proposal/verification/
-correction, and request rollback includes sampler state.
-[Sampled suffix verification](cpu-tiled-prefill.md#explicit-sampled-suffix-consumer)
+Runtime copies at most eight proposals into a reused stack buffer and tracks
+warm-buffer vs growth behavior through `Runtime::reallocation_witness`
+(`ReallocationWitness`); public `SuffixDrafter::propose` returns independently
+owned fallible storage. `SpeculativeStats` and `VerifiedRound` record
+`draft_tokens_verified`, per-position `position_proposed`/`position_accepted`,
+`accepted_len_histogram`, `bonus_tokens`, `correction_tokens`,
+`fallback_tokens`, `replay_steps`, `replay_tokens`, `mean_accepted_length` and
+`position_acceptance_rate`, exposed on `SwiftSession::last_speculative_stats`
+(while `complete_with_timings` still rejects CPU speculation).
+`cumulative_rejection_complement` computes `1.0 - prod_i(1.0 - r_i)` stably via
+`ln_1p` and `exp_m1` over validated `[0.0, 1.0]` probabilities.
+
+`Runtime::verify_draft_block_bounded` enforces `VerificationLimits`
+(`max_new_tokens` and `stop_tokens`), and `GdnVerifyTape::replay_accepted_prefix`
+stages replayed outputs atomically and rejects nonfinite elements before
+mutating live recurrent matrices. A rejected proposal retains its validated
+correction token without a second greedy vocabulary scan. Cancellation remains
+checked around proposal/verification/correction, and request rollback includes
+sampler state. [Sampled suffix verification](cpu-tiled-prefill.md#explicit-sampled-suffix-consumer)
 defines the separate target-sampling contract.
 
 ## Native-Q2 prefill packets

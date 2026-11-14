@@ -50,10 +50,15 @@ and sequential GDN remain complete; final-layer state-only narrowing is disabled
 Triangular GDN and external executors reject verification.
 
 `Runtime::verify_draft_block` uses prefix logits for candidate zero and the
-preceding returned row for later candidates. Full acceptance keeps state and
-evaluates a bonus token. Rejection restores the round checkpoint, replays accepted
-tokens and evaluates the correction. Admission charges verification plus possible
-replay; failed restore closes admission.
+preceding returned row for later candidates. `Runtime::verify_draft_block_bounded`
+with `VerificationLimits` stops cleanly at `max_new_tokens` and `stop_tokens`
+without emitting surplus bonus or correction tokens. Full acceptance keeps
+state and evaluates a bonus token when limits allow. Rejection restores the
+round checkpoint, replays accepted tokens and evaluates a non-stop correction.
+Speculative verification allocates up to 9 tokens while retaining the 3-tap
+logical `CausalDepthwiseConv1d` history width with atomic non-finite rollback.
+Admission charges verification plus possible replay; failed restore closes
+admission.
 
 ## Explicit sampled suffix consumer
 
@@ -188,9 +193,15 @@ callbacks stay on the caller thread with nominal one-millisecond waits; workers
 check before each row and all tasks join before error/cancellation return.
 Worker-unwind guards release waiting callers. This is cooperative scheduling.
 
-Failures can leave provisional layer-major state; Runtime restores the request
-checkpoint. Position becomes nonempty before mutation so reset clears a failed
-first tile. Outputs clear on failure. Counters include rolled-back work.
+Failures can leave provisional layer-major state; `Qwen35` clears
+`state_consistent` before `ingest_cpu_tile` mutates layers and restores it only
+after full completion, rejecting subsequent decode, prefill, or checkpoint
+calls until `reset` or valid `restore` recovers. When final output logits are
+omitted, `recurrent_attention_state_only` skips unused `matrix^T * query` and
+uninitialized `scratch.gate` work and honors `narrow_final`. Runtime restores
+the request checkpoint. Position becomes nonempty before mutation so reset
+clears a failed first tile. Outputs clear on failure. Counters include
+rolled-back work.
 
 ## Validation
 

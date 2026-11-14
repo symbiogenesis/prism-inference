@@ -34,6 +34,13 @@ for performance by its availability alone.
 Model weights and adapters follow their publishers' licenses. Code attribution
 and upstream source identities are recorded in [NOTICE](../NOTICE).
 
+Completed structural hardening (awaiting full-model parity and device runs)
+covers atomic checkpoint/restore identity checks, checkpoint buffer recycling,
+transient vs `PromptEndAndLatest` checkpoints, `HybridCheckpointBoundary`,
+atomic conv shifts, mid-tile `state_consistent` and GDN decay/norm guards,
+bounded speculative verification telemetry (`SpeculativeStats`),
+`SwiftExecutionMemoryLedger`, worker EOF cancellation and server settle bounds.
+
 - [ ] Publish and qualify uncapped ordinary native HTTP generation: source-bound
   bundle and Runner repin, explicit diagnostic deadlines, long-prefill Stop/retry
   and confirmed owner cleanup. Model-free virtual-time checks do not qualify

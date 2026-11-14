@@ -9,9 +9,16 @@ fn weight(kind: u32, columns: usize, rows: usize) -> Result<Tensor> {
     let mut data = Vec::new();
     for index in 0..columns / 128 * rows {
         let mut block = [if index % 2 == 0 { 0x66 } else { 0x99 }; 34];
-        block[..2].copy_from_slice(&[0x3555_u16, 0xb800, 0, 0x0001][index % 4].to_le_bytes());
+        let scale = [0x3555_u16, 0xb800, 0, 0x0001, 0x8000][index % 5].to_le_bytes();
+        block[..2].copy_from_slice(&scale);
         if kind == PTQ1 {
-            data.extend_from_slice(&bonsai_ternary::pack_ptq(&block)?);
+            // The lossless wire codec rejects zero scales; native runtime
+            // tensors accept both zero signs. Pack valid trits at a nonzero
+            // scale, then restore the intended native scale bits unchanged.
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            let mut packed = bonsai_ternary::pack_ptq(&block)?;
+            packed[26..].copy_from_slice(&scale);
+            data.extend_from_slice(&packed);
         } else {
             // Include generic PQ2 +2 codes, which cannot be encoded as PTQ1.
             block[2] = 0xe4;
@@ -89,7 +96,7 @@ fn q8_siblings_match_independent_rows_for_pinned_source_and_fallback() -> Result
 }
 
 #[test]
-fn q8_siblings_reject_late_geometry_scales_and_codes_then_recover() -> Result<()> {
+fn q8_siblings_reject_late_geometry_and_nonfinite_scales_then_recover() -> Result<()> {
     for (kind, columns) in [(PQ2, 384), (PTQ1, 256)] {
         let tensors = [
             weight(kind, columns, 33)?,
@@ -118,18 +125,12 @@ fn q8_siblings_reject_late_geometry_scales_and_codes_then_recover() -> Result<()
         );
         assert!(outputs.iter().all(Vec::is_empty));
         assert!(!prepared.scratch.diagnostics().dispatched);
-        for corrupt_code in [false, true] {
+        for invalid_scale in [0x7c00_u16, 0xfc00, 0x7e00] {
             let mut failing = tensors[2].clone();
             let mut data = failing.data.to_vec();
             let len = data.len();
-            if kind == PTQ1 && corrupt_code {
-                // A zero-scale block still has to reject noncanonical trits.
-                data[len - 28] = 255;
-                data[len - 2..].copy_from_slice(&0_u16.to_le_bytes());
-            } else {
-                let scale = if kind == PTQ1 { len - 2 } else { len - 34 };
-                data[scale..scale + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-            }
+            let scale = if kind == PTQ1 { len - 2 } else { len - 34 };
+            data[scale..scale + 2].copy_from_slice(&invalid_scale.to_le_bytes());
             failing.data = Arc::from(data);
             assert!(
                 prepared
@@ -145,6 +146,57 @@ fn q8_siblings_reject_late_geometry_scales_and_codes_then_recover() -> Result<()
         assert!(outputs.iter().all(|output| !output.is_empty()));
         assert_eq!(scratch.preparation_count(), 1);
         assert_eq!(scratch.statistics().matrix_successes, 3);
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_siblings_accept_native_ptq1_aliases_and_signed_zero_scales() -> Result<()> {
+    let mut tensors = [weight(PTQ1, 256, 1)?, weight(PTQ1, 256, 5)?];
+    let input = vec![1.5; 256];
+    for scale in [0_u16, 0x8000, 0x3c00, 0xbc00] {
+        for tensor in &mut tensors {
+            let mut data = tensor.data.to_vec();
+            for block in data.chunks_exact_mut(28) {
+                // Every fractional trit byte is valid for native execution,
+                // independently of the stricter canonical wire-codec boundary.
+                block[0] = 1;
+                block[24] = 2;
+                block[26..].copy_from_slice(&scale.to_le_bytes());
+            }
+            tensor.data = Arc::from(data);
+        }
+        for pinned in [false, true] {
+            for backend in [
+                MatvecBackend::Scalar,
+                MatvecBackend::Auto,
+                MatvecBackend::ExperimentalNeon,
+            ] {
+                let make_scratch = |backend| {
+                    if pinned {
+                        MatvecScratch::with_pinned_backend(backend)
+                    } else {
+                        MatvecScratch::with_backend(backend)
+                    }
+                };
+                let mut expected: [Vec<f32>; 2] = std::array::from_fn(|_| Vec::new());
+                for (tensor, output) in tensors.iter().zip(&mut expected) {
+                    matvec_into(
+                        tensor,
+                        &input,
+                        output,
+                        &mut make_scratch(MatvecBackend::Scalar),
+                    )?;
+                }
+                let mut scratch = make_scratch(backend);
+                let mut outputs: [Vec<f32>; 2] = std::array::from_fn(|_| vec![f32::NAN]);
+                let mut prepared = scratch.prepare(&tensors[0], &input)?;
+                prepared.matvec_q8_siblings_into(&tensors.each_ref(), &mut outputs.each_mut())?;
+                for (actual, expected) in outputs.iter().zip(&expected) {
+                    assert_eq!(bits(actual), bits(expected));
+                }
+            }
+        }
     }
     Ok(())
 }

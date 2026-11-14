@@ -117,7 +117,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = ["tools/ternary", "tools/neon-dot", "tools/gguf", "tools/native-hash", "tools/prism", "server", "tools/conformance-policy", "tools/codec-probe", "tools/rust-trial", "tools/hexagon-native", "tools/hexagon-runtime"]
+members = ["tools/ternary", "tools/neon-dot", "tools/gguf", "tools/native-hash", "tools/prism", "server", "tools/conformance-policy", "tools/codec-probe", "tools/rust-trial", "tools/hexagon-native", "tools/hexagon-runtime", "tools/source-sanity"]
 
 [workspace.package]
 version = "0.1.0"

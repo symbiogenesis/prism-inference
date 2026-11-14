@@ -1061,6 +1061,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-source-sanity"
+version = "0.1.0"
+dependencies = [
+ "bonsai-windows-process",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"

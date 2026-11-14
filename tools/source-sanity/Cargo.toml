@@ -1,0 +1,22 @@
+[package]
+name = "prism-source-sanity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Bounded native source checks for immutable Prism outgoing Git tips"
+keywords = ["prism", "git", "validation"]
+categories = ["development-tools"]
+
+[dependencies]
+serde_json.workspace = true
+toml = { version = "=0.9.12", default-features = false, features = ["parse", "serde", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+bonsai-windows-process.workspace = true
+
+[lints]
+workspace = true

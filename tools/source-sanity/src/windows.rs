@@ -467,7 +467,7 @@ mod tests {
             ],
         )?;
         work.commit(root, "HEAD", false)?
-            .ok_or("Missing fixture commit.".into())
+            .ok_or_else(|| "Missing fixture commit.".into())
     }
 
     #[test]

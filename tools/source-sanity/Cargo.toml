@@ -13,7 +13,7 @@ categories = ["development-tools"]
 
 [dependencies]
 serde_json.workspace = true
-toml = { version = "=0.9.12", default-features = false, features = ["parse", "serde", "std"] }
+toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 bonsai-windows-process.workspace = true

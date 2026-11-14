@@ -338,13 +338,14 @@ fn trace(actions: Vec<Action>) -> Result<Value> {
                 event = json!({"State":sampler_mut(&mut samplers, sampler)?.map_or(0, |sampler| sampler.state)});
             }
             Action::Force { sampler } => {
-                let mut forced = false;
-                if let Some(sampler) = sampler_mut(&mut samplers, sampler)?
+                let forced = if let Some(sampler) = sampler_mut(&mut samplers, sampler)?
                     && sampler.state == 1
                 {
                     sampler.forcing();
-                    forced = true;
-                }
+                    true
+                } else {
+                    false
+                };
                 event = json!({"Forced":forced});
             }
             Action::EndMatch { sampler } => {

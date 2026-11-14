@@ -13,8 +13,6 @@ mod quantized_kv;
 mod sampled_suffix;
 #[path = "graph/verification.rs"]
 mod verification;
-#[path = "graph/weight_patch.rs"]
-mod weight_patch;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,6 +38,9 @@ macro_rules! metadata {
     ([$($value:expr),* $(,)?]) => { MetadataValue::from(vec![$($value),*]) };
     ($value:expr) => { MetadataValue::from($value) };
 }
+
+#[path = "graph/weight_patch.rs"]
+mod weight_patch;
 
 fn weight(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
     Tensor {

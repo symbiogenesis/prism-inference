@@ -127,7 +127,7 @@ impl Delimiters {
 
     fn accept(&mut self, token: i32) -> Option<Vec<i32>> {
         let mut next = Vec::new();
-        let mut matches = Vec::new();
+        let mut completed_indices = Vec::new();
         for (index, position) in self
             .active
             .iter()
@@ -139,12 +139,12 @@ impl Delimiters {
                 continue;
             }
             if position + 1 == word.len() {
-                matches.push(index);
+                completed_indices.push(index);
             } else {
                 next.push((index, position + 1));
             }
         }
-        let matched = matches
+        let matched = completed_indices
             .into_iter()
             .max_by_key(|&index| self.words[index].len());
         self.active = if matched.is_some() { Vec::new() } else { next };
@@ -339,11 +339,11 @@ fn trace(actions: Vec<Action>) -> Result<Value> {
             }
             Action::Force { sampler } => {
                 let mut forced = false;
-                if let Some(sampler) = sampler_mut(&mut samplers, sampler)? {
-                    if sampler.state == 1 {
-                        sampler.forcing();
-                        forced = true;
-                    }
+                if let Some(sampler) = sampler_mut(&mut samplers, sampler)?
+                    && sampler.state == 1
+                {
+                    sampler.forcing();
+                    forced = true;
                 }
                 event = json!({"Forced":forced});
             }
@@ -437,15 +437,18 @@ mod tests {
             {"Kind":"init","Sampler":0,"Vocabulary":null,"StartSequences":[],"EndSequences":[[9]],"ForcedTokens":[7,9],"Budget":0,"InitialState":2},
             {"Kind":"clone","Sampler":0,"Target":1},
             {"Kind":"accept","Sampler":0,"Token":7},
-            {"Kind":"apply","Sampler":1,"Candidates":[{"Id":7,"LogitBits":2143289345u32,"ProbabilityBits":2147483648u32},{"Id":9,"LogitBits":0,"ProbabilityBits":1}],"Selected":1,"Sorted":true},
+            {"Kind":"apply","Sampler":1,"Candidates":[{"Id":7,"LogitBits":2_143_289_345_u32,"ProbabilityBits":2_147_483_648_u32},{"Id":9,"LogitBits":0,"ProbabilityBits":1}],"Selected":1,"Sorted":true},
             {"Kind":"free","Sampler":0},{"Kind":"accept","Sampler":1,"Token":7},
             {"Kind":"accept","Sampler":1,"Token":9},{"Kind":"end-match","Sampler":1},
             {"Kind":"free","Sampler":1}
         ]}]});
         let response = execute(&request)?;
         let trace = &response["Results"][0]["Trace"];
-        assert_eq!(trace[3]["Candidates"][0]["LogitBits"], 2143289345u32);
-        assert_eq!(trace[3]["Candidates"][0]["ProbabilityBits"], 2147483648u32);
+        assert_eq!(trace[3]["Candidates"][0]["LogitBits"], 2_143_289_345_u32);
+        assert_eq!(
+            trace[3]["Candidates"][0]["ProbabilityBits"],
+            2_147_483_648_u32
+        );
         assert_eq!(trace[3]["Candidates"][1]["LogitBits"], 0xff80_0000u32);
         assert_eq!(trace[3]["Selected"], 1);
         assert_eq!(trace[3]["Sorted"], true);

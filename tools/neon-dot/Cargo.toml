@@ -1,11 +1,11 @@
 [package]
 name = "bonsai-neon-dot"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 rust-version.workspace = true
 publish = ["crates-io"]
 license.workspace = true
-description = "Audited ARMv8.2-A dotprod and i8mm SIMD dot-product primitives for Prism"
+description = "Checked ARM64 dot products, BF16 row reductions and packed KV operations with portable fallbacks for Prism"
 repository.workspace = true
 keywords = ["neon", "dotprod", "i8mm", "simd", "quantization"]
 categories = ["hardware-support", "science"]

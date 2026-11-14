@@ -13,6 +13,10 @@ use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::{Result, invalid};
 
 #[cfg(test)]
+#[path = "prefill_gdn_exact_tests.rs"]
+mod exact_tests;
+
+#[cfg(test)]
 fn head(
     arithmetic: Arithmetic,
     previous: &[f32],

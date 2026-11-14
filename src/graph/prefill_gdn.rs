@@ -147,6 +147,13 @@ fn exact_head_into(
     };
     let width = first.key.len();
     let scale = 1.0 / small_float(width)?.sqrt();
+    if matches!(arithmetic, Arithmetic::PinnedSwift)
+        && let Some(result) = crate::kernels::pinned_gdn::try_step_head_tokens_from(
+            previous, matrix, inputs, scale, output,
+        )
+    {
+        return result;
+    }
     let row_count = previous.len() / width;
     let eight_row_blocks = row_count / 8;
     for block_idx in 0..eight_row_blocks {
@@ -1065,6 +1072,73 @@ pub(super) fn recurrent_tile<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x1_temporal_gdn_prefill_consumer_matches_defensive_rows() -> Result<()> {
+        let width = 128;
+        let previous: Vec<_> = (0..width * width)
+            .map(|i| if i % 3 == 0 { -0.015_625 } else { 0.03125 })
+            .collect();
+        let key = vec![0.25; width];
+        let query = vec![-0.125; width];
+        let values = vec![0.0625; width];
+        let inputs = [
+            Input {
+                query: &query,
+                key: &key,
+                value: &values,
+                decay: 0.875,
+                beta: 0.625,
+            },
+            Input {
+                query: &key,
+                key: &query,
+                value: &values,
+                decay: -0.25,
+                beta: 0.375,
+            },
+        ];
+        let mut actual = vec![f32::NAN; previous.len()];
+        let mut output = vec![f32::NAN; inputs.len() * width];
+        exact_head_into(
+            Arithmetic::PinnedSwift,
+            &previous,
+            &inputs,
+            &mut actual,
+            &mut output,
+        )?;
+        let mut expected = vec![0.0; previous.len()];
+        let mut expected_output = vec![0.0; output.len()];
+        let scale = 1.0 / small_float(width)?.sqrt();
+        for (row, (previous, expected)) in previous
+            .chunks_exact(width)
+            .zip(expected.chunks_exact_mut(width))
+            .enumerate()
+        {
+            Arithmetic::PinnedSwift.gdn_step_row_tokens_from(
+                previous,
+                expected,
+                &inputs,
+                row,
+                width,
+                scale,
+                &mut expected_output,
+            )?;
+        }
+        assert!(
+            actual
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert!(
+            output
+                .iter()
+                .zip(&expected_output)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        Ok(())
+    }
 
     #[test]
     #[expect(

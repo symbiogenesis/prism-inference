@@ -35,6 +35,10 @@ mod neon;
 #[path = "pinned_gdn_provisional_tests.rs"]
 mod provisional_tests;
 
+#[cfg(test)]
+#[path = "pinned_gdn_tokens_tests.rs"]
+mod tokens_tests;
+
 /// Matches the pinned NEON F32 dot, including its scalar remainder.
 ///
 /// # Errors
@@ -768,6 +772,74 @@ pub(crate) fn step_eight_rows_tokens_from(
     step_row_tokens_from(previous[5], s5, inputs, row + 5, stride, scale, output)?;
     step_row_tokens_from(previous[6], s6, inputs, row + 6, stride, scale, output)?;
     step_row_tokens_from(previous[7], s7, inputs, row + 7, stride, scale, output)
+}
+
+/// Attempts exact temporal recurrence for a complete square tiled-prefill head.
+///
+/// Validate borrowed token geometry and select baseline NEON once for the head,
+/// retaining the existing eight-row temporal arithmetic, staging and publication.
+/// Unsupported widths, tile sizes or targets return `None` without mutation.
+/// A failed native group replays its existing defensive path from immutable
+/// `previous`; already completed groups retain their ordinary publication.
+///
+/// # Errors
+/// Eligible geometry with mismatched extents rejects before mutation. Arithmetic
+/// failures retain the defensive group's partial-state/output semantics.
+#[cfg_attr(
+    not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "The unsupported-target stub preserves the native destination signature."
+    )
+)]
+pub(crate) fn try_step_head_tokens_from(
+    previous: &[f32],
+    state: &mut [f32],
+    inputs: &[ChunkInput<'_>],
+    scale: f32,
+    output: &mut [f32],
+) -> Option<Result<()>> {
+    let first = inputs.first()?;
+    let width = first.key.len();
+    if !matches!(width, 128 | 256) || inputs.len() > 64 {
+        return None;
+    }
+    if previous.len() != width * width
+        || state.len() != previous.len()
+        || inputs.len().checked_mul(width) != Some(output.len())
+        || inputs.iter().any(|input| {
+            input.key.len() != width || input.query.len() != width || input.value.len() != width
+        })
+    {
+        return Some(Err(invalid("pinned GDN step requires matching vectors")));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::try_step_head_tokens_from(previous, state, inputs, scale, output)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    {
+        let _ = scale;
+        None
+    }
 }
 
 /// Steps all `value_dim` rows of a GDN head state in-place across `inputs.len()` tokens,

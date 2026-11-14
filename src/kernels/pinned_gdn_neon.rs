@@ -1606,6 +1606,75 @@ pub(super) fn step_eight_rows_tokens_from(
     }
 }
 
+/// Consumes the parent's complete head proof with one baseline selection.
+pub(super) fn try_step_head_tokens_from(
+    previous: &[f32],
+    state: &mut [f32],
+    inputs: &[super::ChunkInput<'_>],
+    scale: f32,
+    output: &mut [f32],
+) -> Option<Result<()>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let width = inputs[0].key.len();
+    for (group, (previous, state)) in previous
+        .chunks_exact(width * 8)
+        .zip(state.chunks_exact_mut(width * 8))
+        .enumerate()
+    {
+        let row = group * 8;
+        let previous = std::array::from_fn(|r| &previous[r * width..(r + 1) * width]);
+        let (h0, h1) = state.split_at_mut(4 * width);
+        let (s01, s23) = h0.split_at_mut(2 * width);
+        let (s45, s67) = h1.split_at_mut(2 * width);
+        let (s0, s1) = s01.split_at_mut(width);
+        let (s2, s3) = s23.split_at_mut(width);
+        let (s4, s5) = s45.split_at_mut(width);
+        let (s6, s7) = s67.split_at_mut(width);
+        let mut states = [s0, s1, s2, s3, s4, s5, s6, s7];
+        let stepped = if width == 128 {
+            step_eight_rows_tokens_from_selected::<8>(
+                neon,
+                previous,
+                states.each_mut().map(|state| &mut **state),
+                inputs,
+                row,
+                width,
+                scale,
+                output,
+            )
+        } else {
+            step_eight_rows_tokens_from_selected::<16>(
+                neon,
+                previous,
+                states.each_mut().map(|state| &mut **state),
+                inputs,
+                row,
+                width,
+                scale,
+                output,
+            )
+        };
+        if !stepped {
+            // The failed group published nothing. Retain the defensive
+            // row-major replay, including each row's native/scalar selection.
+            for (offset, (previous, state)) in previous.into_iter().zip(states).enumerate() {
+                if let Err(error) = super::step_row_tokens_from(
+                    previous,
+                    state,
+                    inputs,
+                    row + offset,
+                    width,
+                    scale,
+                    output,
+                ) {
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+    Some(Ok(()))
+}
+
 #[inline]
 fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
     previous: [&[f32]; 8],
@@ -1623,6 +1692,25 @@ fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
     if width == 0 || width > BLOCKS * 16 || !width.is_multiple_of(16) || inputs.len() > 64 {
         return false;
     }
+    step_eight_rows_tokens_from_selected::<BLOCKS>(
+        neon, previous, states, inputs, row, stride, scale, output,
+    )
+}
+
+/// Geometry, tile bound and baseline selection are established by either
+/// the defensive block entry point or the borrowed complete-head entry point.
+#[inline]
+fn step_eight_rows_tokens_from_selected<const BLOCKS: usize>(
+    neon: Neon,
+    previous: [&[f32]; 8],
+    states: [&mut [f32]; 8],
+    inputs: &[super::ChunkInput<'_>],
+    row: usize,
+    stride: usize,
+    scale: f32,
+    output: &mut [f32],
+) -> bool {
+    let width = states[0].len();
     let blocks = width / 16;
     // Every update remains private until the group commits. Preserve all lane
     // predicates while reducing their combined mask once before publication.

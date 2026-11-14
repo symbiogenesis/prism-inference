@@ -43,12 +43,14 @@ fn load_session(selection: &Selection) -> Result<SwiftSession> {
     )
 }
 
-fn profile_matches(selection: &Selection, _session: &SwiftSession) -> bool {
+const fn profile_matches(selection: &Selection, _session: &SwiftSession) -> bool {
     let Profile = selection.profile;
     true
 }
 
-fn extend_identity(_selection: &Selection, _identity: &mut Value) {}
+const fn extend_identity(_selection: &Selection, identity: Value) -> Value {
+    identity
+}
 
 const fn receipt_names() -> (&'static str, &'static str) {
     ("cpu-bundle-started.json", "cpu-bundle.json")

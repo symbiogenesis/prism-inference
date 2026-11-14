@@ -60,6 +60,7 @@ fn source_candidate_selection_requires_explicit_bounded_profile() -> Result<()> 
     input = arguments();
     input[7] = "k4-v3".into();
     assert!(selection(&input, started, now).is_err());
+    input = arguments();
     assert!(selection(&input[..7], started, now).is_err());
     assert!(selection(&input[..9], started, now).is_err());
     input.push("extra".into());

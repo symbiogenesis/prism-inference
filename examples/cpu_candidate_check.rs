@@ -59,7 +59,7 @@ fn profile_matches(selection: &Selection, session: &SwiftSession) -> bool {
         && session.context_tokens() == bonsai_prism_runtime::model::swift::CONTEXT_TOKENS
 }
 
-fn extend_identity(selection: &Selection, identity: &mut Value) {
+fn extend_identity(selection: &Selection, mut identity: Value) -> Value {
     identity["schema_version"] = json!(2);
     identity["kind"] = json!("swift-cpu-source-candidate-arm");
     identity["kv_cache"] = json!(if selection.profile.cache == KvCachePolicy::Rotated4 {
@@ -78,6 +78,7 @@ fn extend_identity(selection: &Selection, identity: &mut Value) {
     identity["comparison_scope"] = json!(
         "separate current-source profile; frozen CPU bundle evaluator must reject; matched build/profile/power/resource/cleanup and independent complete-state acceptance required"
     );
+    identity
 }
 
 const fn receipt_names() -> (&'static str, &'static str) {

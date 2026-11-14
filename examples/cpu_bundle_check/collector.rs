@@ -350,7 +350,7 @@ fn phase_records(timings: &GenerationTimings) -> Vec<Value> {
 }
 
 fn identity_record(selection: &Selection, observation: &Observation) -> Value {
-    let mut identity = json!({
+    let identity = json!({
         "schema_version":1, "kind":"swift-cpu-bundle-arm",
         "source_commit_declaration":selection.source_commit,
         "source_binding":"requires independent hosted build/executable/collector-source receipt verification",
@@ -370,8 +370,7 @@ fn identity_record(selection: &Selection, observation: &Observation) -> Value {
         "original_deadline_unix_milliseconds":selection.deadline_unix_milliseconds,
         "receipt_reserve_milliseconds":RECEIPT_RESERVE.as_millis(),
     });
-    extend_identity(selection, &mut identity);
-    identity
+    extend_identity(selection, identity)
 }
 
 fn record(

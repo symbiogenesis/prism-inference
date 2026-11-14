@@ -130,6 +130,16 @@ metadata payload. Full-allocation FD/cache coverage includes the extra arena on
 every submission. Host residency avoids repeated CPU packing/copying; it does
 not establish DSP residency, reduced DMA/cache work or measured speed.
 
+Native Q2 secondary arenas must be fully prepared before their first DSP import.
+Their initial host writes are cleaned before import; the supported mapping API
+supplies no later cache-clean fence for a persistently imported arena. Late
+preparation therefore faults the session before invoking an initializer, changing
+bytes or publishing a reservation. A dirty already-imported arena also rejects
+before submission. Primary-arena appends retain their existing queue-buffer
+flush: preparation after a warm operation restores the full populated-prefix
+dependency on the next submission. Unused secondary arenas are neither cleaned
+nor imported by an unrelated projection.
+
 Borrowed and owned `NativeQ2Session` forward direct in-place weight preparation,
 eight-operation packets, fused SwiGLU and complete FFN chains. The single-token
 chain is gate/up, SwiGLU, optional plain Hadamard, down and optional residual add.

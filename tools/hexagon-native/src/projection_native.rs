@@ -509,9 +509,13 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return Ok(());
         }
         let arena = self.extra_arenas[extra_idx];
-        if let Some(mapper) = self.mapper
-            && !arena.dsp_mapped
-        {
+        if arena.dsp_mapped {
+            // The supported clean-to-PoC operation below is valid only before
+            // DSP import. Never turn later host writes into a falsely clean
+            // cache entry or remap storage still imported by the DSP.
+            return Err(self.fail("projection-resident-imported-arena-dirty-pinned"));
+        }
+        if let Some(mapper) = self.mapper {
             // SAFETY: this secondary weight arena has not yet been imported by the
             // DSP (`!arena.dsp_mapped`). Re-mapping its exact aligned FD/pointer/extent
             // after host `memcpy` cleans the CPU data cache to PoC before the first
@@ -2176,6 +2180,13 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 || range.end > self.extra_arenas[extra_idx].allocation_bytes
             {
                 return Err(self.fail("projection-resident-reservation-refused-pinned"));
+            }
+            if self.extra_arenas[extra_idx].dsp_mapped {
+                // Secondary arenas must be completely prepared before their
+                // first DSP import. There is no supported later cache-clean
+                // fence for these persistent imported mappings. Refuse before
+                // invoking the writer or publishing the pending reservation.
+                return Err(self.fail("projection-resident-imported-arena-sealed-pinned"));
             }
             let arena_ptr = self.extra_arenas[extra_idx].memory;
             // SAFETY: this fresh append-only reservation is inside the explicitly
@@ -4011,6 +4022,29 @@ mod tests {
             STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
             warm_flush_size
         );
+        // Preparing more weights after a warm submission must restore the
+        // primary arena's upload dependency. Append enough to cross a page so
+        // a cached warm descriptor cannot accidentally pass this control.
+        for _ in 0..3 {
+            let _ = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights)?
+                .ok_or(Error::Contract)?;
+        }
+        let appended = NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights)?
+            .ok_or(Error::Contract)?;
+        let appended_flush_size = u32::try_from(
+            (working_bytes + session.native_resident_weights.arena_used_bytes(0))
+                .next_multiple_of(4096),
+        )
+        .map_err(|_| Error::Contract)?;
+        assert!(appended_flush_size > dirty_flush_size);
+        assert!(session.dirty_resident_weights);
+        NativeQ2Submitter::submit_resident(&mut session, &appended, &activation, &mut output)?;
+        assert_eq!(output, [7.0_f32; 32]);
+        assert!(!session.dirty_resident_weights);
+        assert_eq!(
+            STATE.lock().map_err(|_| Error::Contract)?.descriptor[1],
+            appended_flush_size
+        );
         STATE.lock().map_err(|_| Error::Contract)?.bad_numeric = true;
         assert!(
             NativeQ2Submitter::submit_resident_validated(
@@ -4023,8 +4057,8 @@ mod tests {
         );
         assert!(output.iter().all(|value| value.is_nan()));
         assert!(session.failed);
-        assert_eq!(session.report.operations_completed, 2);
-        assert_eq!(session.report.queue_writes_completed, 2);
+        assert_eq!(session.report.operations_completed, 3);
+        assert_eq!(session.report.queue_writes_completed, 3);
         assert!(
             NativeQ2Submitter::submit_resident_validated(
                 &mut session,
@@ -4034,7 +4068,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 4);
         assert_eq!(
             &memory[working_bytes..working_bytes + weights.len()],
             weights
@@ -4583,6 +4617,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep unused-arena, import sealing and prepared-view batch lifecycle in the same native session"
+    )]
     fn resident_native_q2_multi_arena_populates_secondary_buffer_and_batches_across_arenas()
     -> Result<(), Error> {
         let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
@@ -4601,7 +4639,7 @@ mod tests {
         }
         let limits = NativeQ2ProjectionLimits::new(128, 32, 6, Duration::from_secs(4))?
             .with_resident_weights(962_887_680)?;
-        let mut memory = vec![0_u8; 16_384];
+        let mut memory = vec![0_u8; 32_768];
         let mut extra_memory = vec![0_u8; 16_384];
         let pointer = memory.as_mut_ptr().cast::<c_void>();
         let extra_pointer = extra_memory.as_mut_ptr().cast::<c_void>();
@@ -4622,9 +4660,14 @@ mod tests {
             dsp_mapped: false,
         };
         let mut registry = NativeQ2WeightRegistry::new(962_887_680)?;
+        let primary = registry
+            .prepare(128, 32, &weights_32)?
+            .ok_or(Error::Contract)?;
+        let working_bytes = Mode::NativeQ2 { columns: 128 }.allocation_bytes(32);
+        memory[working_bytes..working_bytes + weights_32.len()].copy_from_slice(&weights_32);
         // Advance Arena 0 to full capacity (502,824,960 bytes) so the next prepare_weights lands in Arena 1.
         let _ = registry
-            .prepare_validated(5120, 17_408, 502_824_960)?
+            .prepare_validated(5120, 17_408, 502_824_960 - weights_32.len())?
             .ok_or(Error::Contract)?;
         let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
         report.queue.poisoned = true;
@@ -4666,6 +4709,13 @@ mod tests {
         assert!(extra_memory[2304..].iter().all(|&byte| byte == 0));
 
         let mut out_a = [99.0_f32; 32];
+        // The unrelated primary projection must not import or mark clean an
+        // unread secondary arena merely because its host bytes are prepared.
+        NativeQ2Submitter::submit_resident(&mut session, &primary, &activation, &mut out_a)?;
+        assert_eq!(out_a, [7.0_f32; 32]);
+        assert!(session.extra_arenas[0].dirty);
+        assert!(!session.extra_arenas[0].dsp_mapped);
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.n_bufs, 1);
         NativeQ2Submitter::submit_resident(&mut session, &h_a, &activation, &mut out_a)?;
         assert_eq!(out_a, [7.0_f32; 32]);
         assert!(!session.extra_arenas[0].dirty);
@@ -4682,8 +4732,55 @@ mod tests {
         assert_eq!(out_a, [7.0_f32; 32]);
         assert_eq!(out_b, [8.0_f32; 32]);
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.n_bufs, 2);
-        assert_eq!(session.report.operations_completed, 3);
-        assert_eq!(session.report.queue_writes_completed, 2);
+        assert_eq!(session.report.operations_completed, 4);
+        assert_eq!(session.report.queue_writes_completed, 3);
+
+        // An imported secondary arena is immutable. A late writer must not
+        // publish a new handle whose host bytes have no cache-clean fence.
+        let used_before = session.native_resident_weights.used_bytes();
+        let prepared_before = session.report.resident_weight_preparations;
+        let ranges_before = [
+            session.native_resident_weights.range(&h_a)?,
+            session.native_resident_weights.range(&h_b)?,
+        ];
+        assert_eq!(ranges_before, [0..1152, 1152..2304]);
+        let snapshot = extra_memory.clone();
+        let mut initializer_called = false;
+        assert!(
+            session
+                .prepare_weights_in_place(128, 32, &mut |destination| {
+                    initializer_called = true;
+                    destination.fill(0xa5);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!initializer_called);
+        assert_eq!(
+            session.report.queue.stage,
+            "projection-resident-imported-arena-sealed-pinned"
+        );
+        assert_eq!(extra_memory, snapshot);
+        assert_eq!(session.native_resident_weights.used_bytes(), used_before);
+        assert_eq!(session.report.resident_weight_preparations, prepared_before);
+        assert_eq!(
+            [
+                session.native_resident_weights.range(&h_a)?,
+                session.native_resident_weights.range(&h_b)?,
+            ],
+            ranges_before
+        );
+        assert!(session.failed);
+        assert_eq!(NativeQ2Submitter::remaining_operations(&session), Some(0));
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
+        assert!(NativeQ2Submitter::prepare_weights(&mut session, 128, 32, &weights_32).is_err());
+        assert_eq!(extra_memory, snapshot);
+        assert!(
+            NativeQ2Submitter::submit_resident(&mut session, &h_a, &activation, &mut out_a)
+                .is_err()
+        );
+        assert!(out_a.iter().all(|value| value.is_nan()));
+        assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, 3);
         Ok(())
     }
 

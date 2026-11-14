@@ -95,6 +95,16 @@ remain private until packing, scale checks and deadline checks pass. Error or
 unwinding publishes nothing; existing extents stay untouched. Submitters without
 this capability use scratch-and-copy preparation.
 
+The native submitter seals each secondary arena on its first DSP import: all
+weights destined for that arena must be prewarmed before it is first consumed.
+Later preparation into an imported arena fails before the initializer or handle
+publication, because the supported native mapping route has no later cache-clean
+fence. `select_and_prewarm_tensors` prepares the complete explicit selection
+before graph submission. Unselected projections do not trigger unrelated arena
+imports. Primary-arena late preparation remains supported through the next
+submission's populated-prefix flush; custom submitters retain their own declared
+preparation and completion contracts.
+
 ## Prefill packets
 
 Native resident dispatch batches up to eight ordered operations per packet and

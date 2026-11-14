@@ -13,6 +13,19 @@ fn tensor(columns: usize, rows: usize, symbol: u8) -> Tensor {
     }
 }
 
+fn q8_tensor(kind: u32, columns: usize, rows: usize, symbol: u8) -> Result<Tensor> {
+    let mut tensor = tensor(columns, rows, symbol);
+    if kind == PTQ1 {
+        let mut data = Vec::new();
+        for block in tensor.data.as_chunks::<34>().0 {
+            data.extend_from_slice(&bonsai_ternary::pack_ptq(block)?);
+        }
+        tensor.kind = PTQ1;
+        tensor.data = Arc::from(data);
+    }
+    Ok(tensor)
+}
+
 fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
@@ -249,6 +262,126 @@ fn x1_tiled_cpu_siblings_match_independent_matvec_and_clear_late_failure() -> Re
             .is_err()
         );
         assert!(a.iter().chain(&b).all(Vec::is_empty));
+    }
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep Q8_0 sibling scalar parity, scoped preparation, late failure and recovery in one control."
+)]
+fn tiled_q8_siblings_preserve_pinned_lanes_reuse_and_failure_atomicity() -> Result<()> {
+    let workers = if cfg!(feature = "parallel-rows") {
+        4
+    } else {
+        1
+    };
+    for (kind, columns) in [(PQ2, 128), (PQ2, 384), (PTQ1, 256), (PTQ1, 384)] {
+        let tensors = [
+            q8_tensor(kind, columns, 13, 0x66)?,
+            q8_tensor(kind, columns, 9, 0x19)?,
+            q8_tensor(kind, columns, 3, 0x44)?,
+        ];
+        assert!(ProjectionTile::supports_siblings(&tensors.each_ref()));
+        for count in [1, 9, 32] {
+            let inputs: Vec<Vec<f32>> = (0..count)
+                .map(|token| {
+                    (0..columns)
+                        .map(|index| [1.5, -128.0, 0.0, -0.0, 63.5, -3.25][(index + token) % 6])
+                        .collect()
+                })
+                .collect();
+            for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                for pinned in [false, true] {
+                    let mut tile = ProjectionTile::with_backend(backend);
+                    tile.set_row_parallelism(RowParallelism::new(workers)?);
+                    let mut outputs: [Vec<Vec<f32>>; 3] =
+                        std::array::from_fn(|_| vec![Vec::new(); count]);
+                    for previous in [None, Some(&tensors[2])] {
+                        let [a, b, c] = &mut outputs;
+                        tile.project_siblings_with_previous(
+                            previous,
+                            &tensors.each_ref(),
+                            &inputs,
+                            &mut [a, b, c],
+                            pinned,
+                            &|| Ok(()),
+                        )?;
+                        for (tensor, group) in tensors.iter().zip(&outputs) {
+                            for (input, output) in inputs.iter().zip(group) {
+                                let mut scratch = if pinned {
+                                    MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                                } else {
+                                    MatvecScratch::with_backend(MatvecBackend::Scalar)
+                                };
+                                let mut expected = Vec::new();
+                                matvec_into(tensor, input, &mut expected, &mut scratch)?;
+                                assert_eq!(bits(output), bits(&expected));
+                            }
+                        }
+                    }
+                    assert!(
+                        tile.preparations
+                            .iter()
+                            .all(|scratch| scratch.preparation_count() == 1)
+                    );
+                    let expected: Vec<Vec<Vec<u32>>> = outputs
+                        .iter()
+                        .map(|group| group.iter().map(|row| bits(row)).collect())
+                        .collect();
+                    let mut failing = tensors[2].clone();
+                    let mut data = failing.data.to_vec();
+                    let scale = if kind == PTQ1 {
+                        data.len() - 2
+                    } else {
+                        data.len() - 34
+                    };
+                    data[scale..scale + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
+                    failing.data = Arc::from(data);
+                    let [a, b, c] = &mut outputs;
+                    assert!(
+                        tile.project_siblings_with_previous(
+                            None,
+                            &[&tensors[0], &tensors[1], &failing],
+                            &inputs,
+                            &mut [a, b, c],
+                            pinned,
+                            &|| Ok(()),
+                        )
+                        .is_err()
+                    );
+                    assert!(outputs.iter().flatten().all(Vec::is_empty));
+                    let [a, b, c] = &mut outputs;
+                    tile.project_siblings_with_previous(
+                        None,
+                        &tensors.each_ref(),
+                        &inputs,
+                        &mut [a, b, c],
+                        pinned,
+                        &|| Ok(()),
+                    )?;
+                    let recovered: Vec<Vec<Vec<u32>>> = outputs
+                        .iter()
+                        .map(|group| group.iter().map(|row| bits(row)).collect())
+                        .collect();
+                    assert_eq!(recovered, expected);
+                    let [a, b, c] = &mut outputs;
+                    assert!(
+                        tile.project_siblings_with_previous(
+                            None,
+                            &tensors.each_ref(),
+                            &inputs,
+                            &mut [a, b, c],
+                            pinned,
+                            &|| Err(invalid("cancel Q8_0 siblings")),
+                        )
+                        .is_err()
+                    );
+                    assert!(outputs.iter().flatten().all(Vec::is_empty));
+                }
+            }
+        }
     }
     Ok(())
 }

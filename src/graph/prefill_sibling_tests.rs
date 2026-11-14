@@ -129,6 +129,17 @@ impl Fixture {
         self
     }
 
+    fn with_ptq1(mut self) -> Result<Self> {
+        for (index, tensor) in self.tensors.iter_mut().chain([&mut self.prior]).enumerate() {
+            let rows = tensor.dimensions[1];
+            let mut block = [[0x66, 0x19, 0x44, 0x99][index]; 34];
+            block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+            tensor.kind = 143;
+            tensor.data = Arc::from(bonsai_ternary::pack_ptq(&block)?.repeat(2 * rows));
+        }
+        Ok(self)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Keep production pair/triple invocation, scoped reuse and independent sequential oracle together."
@@ -325,6 +336,39 @@ fn production_cpu_siblings_preserve_adapter_and_prepared_reuse() -> Result<()> {
             !fixture
                 .adapter
                 .affects_linear(&fixture.tensors[2].name, 1.3)
+        );
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            for count in [2, 3] {
+                for reuse in [false, true] {
+                    let expected = fixture.run(arithmetic, &inputs, count, reuse, false)?;
+                    let actual = fixture.run(arithmetic, &inputs, count, reuse, true)?;
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn production_ptq1_siblings_preserve_adapter_and_prepared_reuse() -> Result<()> {
+    let inputs: Vec<Vec<f32>> = (0..9)
+        .map(|token| {
+            (0..256)
+                .map(|index| [-0.75, -0.0, 0.25, 0.5, 1.0][(index + token) % 5])
+                .collect()
+        })
+        .collect();
+    for targeted in [false, true] {
+        let fixture = Fixture::new(targeted)?.with_ptq1()?;
+        assert!(ProjectionTile::supports_siblings(
+            &fixture.tensors.each_ref()
+        ));
+        assert_eq!(
+            fixture
+                .adapter
+                .affects_linear(&fixture.tensors[1].name, 1.3),
+            targeted
         );
         for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
             for count in [2, 3] {

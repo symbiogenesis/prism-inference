@@ -139,12 +139,14 @@ impl ProjectionTile {
         let Some(first) = tensors.first() else {
             return false;
         };
-        let Ok((columns, rows, row_bytes)) = dimensions(first) else {
+        let Ok((columns, _, row_bytes)) = dimensions(first) else {
             return false;
         };
         (2..=3).contains(&tensors.len())
-            && (first.kind == BF16
-                || (first.kind == PQ2 && rows >= 4 && columns.is_multiple_of(256)))
+            // The joined scheduler retains the existing per-format row
+            // kernels, including Q8_0 for odd PQ2 and PTQ1. Row tails use the
+            // same one-row kernel; joining does not require a four-row head.
+            && matches!(first.kind, BF16 | PQ2 | PTQ1)
             && tensors.iter().all(|tensor| {
                 tensor.kind == first.kind
                     && dimensions(tensor).is_ok_and(|(cols, rows, bytes)| {

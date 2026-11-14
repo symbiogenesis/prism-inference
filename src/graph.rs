@@ -29,7 +29,7 @@ mod swift_state;
 #[cfg(feature = "cli")]
 pub(crate) const SWIFT_RSQ4_FULL_STATE_BYTES: usize = swift_state::SWIFT_RSQ4_FULL_STATE_BYTES;
 mod projection;
-pub use projection::ProjectedQwen35;
+pub use projection::{ProjectedCheckpoint, ProjectedQwen35};
 mod prefill;
 pub use prefill::TiledPrefillStatistics;
 #[cfg(test)]
@@ -1127,6 +1127,83 @@ impl KvCache {
         }
     }
 
+    fn same_representation(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.page_elements == other.page_elements
+            && self.maximum == other.maximum
+            && match (&self.packed, &other.packed) {
+                (None, None) => true,
+                (Some(left), Some(right)) => left.same_representation(right),
+                _ => false,
+            }
+    }
+
+    fn validate_restore(&self, live: &Self, expected_position: Option<usize>) -> Result<()> {
+        if !self.same_representation(live) {
+            return Err(invalid("checkpoint KV cache representation mismatch"));
+        }
+        if self.width == 0
+            || self.page_elements == 0
+            || self.maximum == 0
+            || !self.maximum.is_multiple_of(self.width)
+            || !self.page_elements.is_multiple_of(self.width)
+            || self.len > self.maximum
+            || !self.len.is_multiple_of(self.width)
+        {
+            return Err(invalid("malformed checkpoint KV cache geometry"));
+        }
+        let tokens = self.len / self.width;
+        if expected_position.is_some_and(|position| tokens != position) {
+            return Err(invalid(
+                "checkpoint KV cache position does not match checkpoint position",
+            ));
+        }
+        if let (Some(saved_packed), Some(live_packed)) = (&self.packed, &live.packed) {
+            if !self.pages.is_empty() || !self.tail.is_empty() {
+                return Err(invalid(
+                    "quantized checkpoint KV cache must not store F16 buffers",
+                ));
+            }
+            return saved_packed.validate_restore(live_packed, Some(tokens));
+        }
+        let max_tokens = self.maximum / self.width;
+        let page_tokens = self.page_elements / self.width;
+        if page_tokens != max_tokens.min(KV_PAGE_TOKENS) {
+            return Err(invalid("malformed checkpoint KV cache page geometry"));
+        }
+        if tokens == max_tokens {
+            if !self.tail.is_empty() {
+                return Err(invalid("full checkpoint KV cache must have an empty tail"));
+            }
+            let expected_pages = tokens.div_ceil(page_tokens);
+            if self.pages.len() != expected_pages {
+                return Err(invalid("malformed checkpoint KV cache page count"));
+            }
+            for (index, page) in self.pages.iter().enumerate() {
+                let expected_elements =
+                    if index + 1 < expected_pages || tokens.is_multiple_of(page_tokens) {
+                        self.page_elements
+                    } else {
+                        (tokens % page_tokens) * self.width
+                    };
+                if page.len() != expected_elements {
+                    return Err(invalid("malformed checkpoint KV sealed page length"));
+                }
+            }
+        } else if self.pages.len() != tokens / KV_PAGE_TOKENS
+            || self
+                .pages
+                .iter()
+                .any(|page| page.len() != self.page_elements)
+            || self.tail.len() != (tokens % KV_PAGE_TOKENS) * self.width
+        {
+            return Err(invalid(
+                "malformed checkpoint KV cache page or tail partition",
+            ));
+        }
+        Ok(())
+    }
+
     fn copy(&self) -> Result<Self> {
         let mut pages = capacity(self.pages.len())?;
         pages.extend(self.pages.iter().map(Arc::clone));
@@ -1143,6 +1220,69 @@ impl KvCache {
                 .map(|cache| cache.copy().map(Box::new))
                 .transpose()?,
         })
+    }
+
+    fn copy_into(&self, target: &mut Self) -> Result<()> {
+        if !self.same_representation(target) {
+            *target = self.copy()?;
+            return Ok(());
+        }
+        if self.pages.len() > target.pages.capacity() {
+            target
+                .pages
+                .try_reserve_exact(self.pages.len() - target.pages.len())?;
+        }
+        if self.tail.len() > target.tail.capacity() {
+            target
+                .tail
+                .try_reserve_exact(self.tail.len() - target.tail.len())?;
+        }
+        if let (Some(src), Some(dst)) = (&self.packed, &mut target.packed) {
+            src.copy_into(dst)?;
+        }
+        target.pages.clear();
+        target.pages.extend(self.pages.iter().map(Arc::clone));
+        target.tail.resize(self.tail.len(), 0);
+        target.tail.copy_from_slice(&self.tail);
+        target.len = self.len;
+        Ok(())
+    }
+
+    fn reserve_restore(&mut self, saved: &Self, expected_position: Option<usize>) -> Result<()> {
+        saved.validate_restore(self, expected_position)?;
+        if saved.pages.len() > self.pages.capacity() {
+            self.pages
+                .try_reserve_exact(saved.pages.len() - self.pages.len())?;
+        }
+        if saved.tail.len() > self.tail.capacity() {
+            self.tail
+                .try_reserve_exact(saved.tail.len() - self.tail.len())?;
+        }
+        if let (Some(live_packed), Some(saved_packed)) = (&mut self.packed, &saved.packed) {
+            live_packed.reserve_restore(saved_packed, expected_position)?;
+        }
+        Ok(())
+    }
+
+    fn apply_restore_in_place(&mut self, saved: &Self) {
+        self.pages.clear();
+        self.pages.extend(saved.pages.iter().map(Arc::clone));
+        self.tail.resize(saved.tail.len(), 0);
+        self.tail.copy_from_slice(&saved.tail);
+        if let (Some(live_packed), Some(saved_packed)) = (&mut self.packed, &saved.packed) {
+            live_packed.apply_restore_in_place(saved_packed);
+        }
+        self.len = saved.len;
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Direct single-cache in-place restore helper exercised alongside multi-layer restore."
+    )]
+    fn restore_in_place(&mut self, saved: &Self) -> Result<()> {
+        self.reserve_restore(saved, None)?;
+        self.apply_restore_in_place(saved);
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -1936,6 +2076,7 @@ pub struct Qwen35Checkpoint {
     context_limit: usize,
     position: usize,
     layers: Vec<LayerState>,
+    projection_plan_digest: Option<[u8; 32]>,
 }
 
 /// One logical state component observed for full-model numerical qualification.
@@ -4479,7 +4620,22 @@ impl Decoder for Qwen35 {
             } else {
                 copy_state(&self.state)?
             },
+            projection_plan_digest: None,
         })
+    }
+
+    fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> Result<()> {
+        copy_string_into(&self.identity, &mut target.identity)?;
+        if self.position == 0 {
+            target.layers.clear();
+        } else {
+            copy_state_into(&self.state, &mut target.layers)?;
+        }
+        target.provenance = self.provenance.clone();
+        target.context_limit = self.context_limit;
+        target.position = self.position;
+        target.projection_plan_digest = None;
+        Ok(())
     }
 
     fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
@@ -4489,7 +4645,7 @@ impl Decoder for Qwen35 {
             || if checkpoint.position == 0 {
                 !checkpoint.layers.is_empty()
             } else {
-                checkpoint.layers.len() != self.layers.len()
+                checkpoint.layers.len() != self.state.len()
             }
             || checkpoint.position > self.context_limit
         {
@@ -4502,7 +4658,7 @@ impl Decoder for Qwen35 {
             // existing live storage; scratch and other snapshots remain private.
             return self.reset();
         }
-        restore_state(&mut self.state, &checkpoint.layers, KvCache::copy)?;
+        restore_state_in_place(&mut self.state, &checkpoint.layers, checkpoint.position)?;
         self.position = checkpoint.position;
         Ok(())
     }
@@ -4926,6 +5082,18 @@ fn copy_string(value: &str) -> Result<String> {
     Ok(result)
 }
 
+fn copy_string_into(value: &str, target: &mut String) -> Result<()> {
+    if target == value {
+        return Ok(());
+    }
+    if value.len() > target.capacity() {
+        target.try_reserve_exact(value.len() - target.len())?;
+    }
+    target.clear();
+    target.push_str(value);
+    Ok(())
+}
+
 fn copy_state(states: &[LayerState]) -> Result<Vec<LayerState>> {
     let mut result = capacity(states.len())?;
     for state in states {
@@ -4944,6 +5112,151 @@ fn copy_state(states: &[LayerState]) -> Result<Vec<LayerState>> {
         });
     }
     Ok(result)
+}
+
+fn copy_state_into(states: &[LayerState], target: &mut Vec<LayerState>) -> Result<()> {
+    let compatible = states.len() == target.len()
+        && states
+            .iter()
+            .zip(target.iter())
+            .all(|(source, existing)| match (source, existing) {
+                (
+                    LayerState::Full { keys, values },
+                    LayerState::Full {
+                        keys: existing_keys,
+                        values: existing_values,
+                    },
+                ) => {
+                    keys.same_representation(existing_keys)
+                        && values.same_representation(existing_values)
+                }
+                (
+                    LayerState::Recurrent {
+                        convolution,
+                        matrix,
+                    },
+                    LayerState::Recurrent {
+                        convolution: existing_convolution,
+                        matrix: existing_matrix,
+                    },
+                ) => {
+                    convolution.len() == existing_convolution.len()
+                        && matrix.len() == existing_matrix.len()
+                }
+                _ => false,
+            });
+    if !compatible {
+        *target = copy_state(states)?;
+        return Ok(());
+    }
+    for (source, existing) in states.iter().zip(target.iter_mut()) {
+        if let (
+            LayerState::Full { keys, values },
+            LayerState::Full {
+                keys: existing_keys,
+                values: existing_values,
+            },
+        ) = (source, existing)
+        {
+            keys.copy_into(existing_keys)?;
+            values.copy_into(existing_values)?;
+        }
+    }
+    for (source, existing) in states.iter().zip(target.iter_mut()) {
+        if let (
+            LayerState::Recurrent {
+                convolution,
+                matrix,
+            },
+            LayerState::Recurrent {
+                convolution: existing_convolution,
+                matrix: existing_matrix,
+            },
+        ) = (source, existing)
+        {
+            existing_convolution.copy_from_slice(convolution);
+            existing_matrix.copy_from_slice(matrix);
+        }
+    }
+    Ok(())
+}
+
+fn restore_state_in_place(
+    states: &mut [LayerState],
+    checkpoint: &[LayerState],
+    expected_position: usize,
+) -> Result<()> {
+    if states.len() != checkpoint.len() {
+        return Err(invalid("checkpoint has incompatible layer state"));
+    }
+    for (state, saved) in states.iter().zip(checkpoint) {
+        match (state, saved) {
+            (
+                LayerState::Full { keys, values },
+                LayerState::Full {
+                    keys: saved_keys,
+                    values: saved_values,
+                },
+            ) => {
+                saved_keys.validate_restore(keys, Some(expected_position))?;
+                saved_values.validate_restore(values, Some(expected_position))?;
+            }
+            (
+                LayerState::Recurrent {
+                    convolution,
+                    matrix,
+                },
+                LayerState::Recurrent {
+                    convolution: saved_convolution,
+                    matrix: saved_matrix,
+                },
+            ) if convolution.len() == saved_convolution.len()
+                && matrix.len() == saved_matrix.len() => {}
+            _ => return Err(invalid("checkpoint has incompatible layer state")),
+        }
+    }
+    for (state, saved) in states.iter_mut().zip(checkpoint) {
+        if let (
+            LayerState::Full { keys, values },
+            LayerState::Full {
+                keys: saved_keys,
+                values: saved_values,
+            },
+        ) = (state, saved)
+        {
+            keys.reserve_restore(saved_keys, Some(expected_position))?;
+            values.reserve_restore(saved_values, Some(expected_position))?;
+        }
+    }
+    for (state, saved) in states.iter_mut().zip(checkpoint) {
+        match (state, saved) {
+            (
+                LayerState::Full { keys, values },
+                LayerState::Full {
+                    keys: saved_keys,
+                    values: saved_values,
+                },
+            ) => {
+                keys.apply_restore_in_place(saved_keys);
+                values.apply_restore_in_place(saved_values);
+            }
+            (
+                LayerState::Recurrent {
+                    convolution,
+                    matrix,
+                },
+                LayerState::Recurrent {
+                    convolution: saved_convolution,
+                    matrix: saved_matrix,
+                },
+            ) => {
+                convolution.copy_from_slice(saved_convolution);
+                matrix.copy_from_slice(saved_matrix);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Stage only the fallible KV copies before writing any live state. Recurrent
@@ -4982,12 +5295,19 @@ fn restore_state(
                     keys: saved_keys,
                     values: saved_values,
                 },
-            ) => Restore::Full {
-                keys,
-                values,
-                saved_keys: copy_cache(saved_keys)?,
-                saved_values: copy_cache(saved_values)?,
-            },
+            ) => {
+                saved_keys.validate_restore(keys, None)?;
+                saved_values.validate_restore(values, None)?;
+                if (saved_keys.len / saved_keys.width) != (saved_values.len / saved_values.width) {
+                    return Err(invalid("checkpoint key and value cache lengths disagree"));
+                }
+                Restore::Full {
+                    keys,
+                    values,
+                    saved_keys: copy_cache(saved_keys)?,
+                    saved_values: copy_cache(saved_values)?,
+                }
+            }
             (
                 LayerState::Recurrent {
                     convolution,
@@ -6557,6 +6877,158 @@ mod tests {
         assert!(KvCache::new(usize::MAX, 2).is_err());
         assert!(KvCache::new(1, MAX_STATE_BYTES).is_err());
         assert!(KvCache::new(0, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_state_rejects_malformed_partition_width_and_mismatched_key_value_lengths()
+    -> Result<()> {
+        let mut live = restore_fixture()?;
+        let baseline = copy_state(&live)?;
+
+        if let LayerState::Recurrent {
+            convolution,
+            matrix,
+        } = &mut live[0]
+        {
+            convolution.fill(9.0);
+            matrix.fill(-7.0);
+        }
+        if let LayerState::Full { keys, values } = &mut live[1] {
+            keys.clear();
+            values.clear();
+        }
+        let mutated = copy_state(&live)?;
+
+        assert!(super::restore_state_in_place(&mut live, &baseline, KV_PAGE_TOKENS + 2).is_err());
+        assert_state_bits_eq(&mutated, &live);
+
+        let mut malformed_tail = copy_state(&baseline)?;
+        if let LayerState::Full { keys, .. } = &mut malformed_tail[1] {
+            keys.tail.pop();
+        }
+        assert!(restore_state(&mut live, &malformed_tail, KvCache::copy).is_err());
+        assert!(
+            super::restore_state_in_place(&mut live, &malformed_tail, KV_PAGE_TOKENS + 1).is_err()
+        );
+        assert_state_bits_eq(&mutated, &live);
+
+        let mut mismatched_kv = copy_state(&baseline)?;
+        if let LayerState::Full { values, .. } = &mut mismatched_kv[1] {
+            values.clear();
+        }
+        assert!(restore_state(&mut live, &mismatched_kv, KvCache::copy).is_err());
+        assert!(
+            super::restore_state_in_place(&mut live, &mismatched_kv, KV_PAGE_TOKENS + 1).is_err()
+        );
+        assert_state_bits_eq(&mutated, &live);
+
+        let mut wrong_width = copy_state(&baseline)?;
+        if let LayerState::Full { keys, .. } = &mut wrong_width[1] {
+            keys.width += 1;
+        }
+        assert!(restore_state(&mut live, &wrong_width, KvCache::copy).is_err());
+        assert!(
+            super::restore_state_in_place(&mut live, &wrong_width, KV_PAGE_TOKENS + 1).is_err()
+        );
+        assert_state_bits_eq(&mutated, &live);
+
+        let full_context = KV_PAGE_TOKENS + 5;
+        let mut full_cache = KvCache::new(2, full_context)?;
+        for step in 0..full_context {
+            let value = f32::from(u8::try_from(step % 16)?);
+            full_cache.reserve_append()?;
+            full_cache.append(&[value, -value]);
+        }
+        let mut full_states = vec![LayerState::Full {
+            keys: full_cache.copy()?,
+            values: full_cache.copy()?,
+        }];
+        let mut live_full = vec![LayerState::Full {
+            keys: KvCache::new(2, full_context)?,
+            values: KvCache::new(2, full_context)?,
+        }];
+        super::restore_state_in_place(&mut live_full, &full_states, full_context)?;
+        assert_state_bits_eq(&full_states, &live_full);
+
+        if let LayerState::Full { keys, .. } = &mut full_states[0] {
+            keys.tail.push(0);
+        }
+        assert!(super::restore_state_in_place(&mut live_full, &full_states, full_context).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn kv_cache_copy_into_and_restore_in_place_reuse_capacities() -> Result<()> {
+        let mut source = KvCache::new(2, 3 * KV_PAGE_TOKENS)?;
+        for step in 0..(KV_PAGE_TOKENS + 3) {
+            let value = f32::from(u8::try_from(step % 64)?);
+            source.reserve_append()?;
+            source.append(&[value, value + 0.5]);
+        }
+        let mut recycled = source.copy()?;
+        for step in 0..5 {
+            let value = f32::from(u8::try_from(step + 10)?);
+            source.reserve_append()?;
+            source.append(&[value, -value]);
+        }
+        let prev_tail_cap = recycled.tail.capacity();
+        source.copy_into(&mut recycled)?;
+        assert_eq!(recycled.len, source.len);
+        assert!(recycled.tail.capacity() >= prev_tail_cap);
+        assert!(std::sync::Arc::ptr_eq(&source.pages[0], &recycled.pages[0]));
+        assert!(
+            source
+                .tokens()
+                .map(|row| row.to_vec())
+                .eq(recycled.tokens().map(|row| row.to_vec()))
+        );
+
+        let mut live = KvCache::new(2, 3 * KV_PAGE_TOKENS)?;
+        live.reserve_append()?;
+        live.append(&[-1.0, -2.0]);
+        live.restore_in_place(&recycled)?;
+        assert!(std::sync::Arc::ptr_eq(&live.pages[0], &recycled.pages[0]));
+        assert!(
+            live.tokens()
+                .map(|row| row.to_vec())
+                .eq(source.tokens().map(|row| row.to_vec()))
+        );
+
+        let live_states = restore_fixture()?;
+        let mut scratch_states = copy_state(&live_states)?;
+        let (conv_ptr, conv_cap, mat_ptr, mat_cap) = match &scratch_states[0] {
+            LayerState::Recurrent {
+                convolution,
+                matrix,
+            } => (
+                convolution.as_ptr(),
+                convolution.capacity(),
+                matrix.as_ptr(),
+                matrix.capacity(),
+            ),
+            LayerState::Full { .. } => return Err(crate::invalid("expected recurrent test state")),
+        };
+        if let LayerState::Recurrent {
+            convolution,
+            matrix,
+        } = &mut scratch_states[0]
+        {
+            convolution.fill(-4.0);
+            matrix.fill(5.0);
+        }
+        super::copy_state_into(&live_states, &mut scratch_states)?;
+        assert_state_bits_eq(&live_states, &scratch_states);
+        if let LayerState::Recurrent {
+            convolution,
+            matrix,
+        } = &scratch_states[0]
+        {
+            assert_eq!(convolution.as_ptr(), conv_ptr);
+            assert_eq!(convolution.capacity(), conv_cap);
+            assert_eq!(matrix.as_ptr(), mat_ptr);
+            assert_eq!(matrix.capacity(), mat_cap);
+        }
         Ok(())
     }
 }

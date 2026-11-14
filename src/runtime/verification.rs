@@ -14,7 +14,7 @@ impl<D: Decoder> Runtime<D> {
         let mut committed = Vec::new();
         committed.try_reserve_exact(draft.len() + 1)?;
         self.tokens.try_reserve(draft.len() + 1)?;
-        let mut rows = Vec::new();
+        let mut rows = self.take_batch_rows(draft.len())?;
         check()?;
         self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
         check()?;
@@ -28,6 +28,7 @@ impl<D: Decoder> Runtime<D> {
                     || !crate::kernels::is_finite_slice(row)
             })
         {
+            self.recycle_batch_rows(rows);
             return Err(invalid("batched decoder returned invalid logits"));
         }
         let mut stats = SpeculativeStats {
@@ -49,6 +50,7 @@ impl<D: Decoder> Runtime<D> {
                 // The batched graph contains the complete proposed suffix.
                 // Restore once, then replay only the accepted prefix before
                 // the correction. KV-only truncation cannot recover GDN/conv.
+                self.recycle_batch_rows(rows);
                 self.faulted = true;
                 self.decoder.restore(&rollback.state)?;
                 self.faulted = false;
@@ -69,10 +71,12 @@ impl<D: Decoder> Runtime<D> {
         // All proposed state is already present. Publish its final distribution
         // and advance precisely one bonus token from that distribution.
         self.tokens.extend_from_slice(draft);
-        self.logits = Arc::new(
-            rows.pop()
-                .ok_or_else(|| invalid("missing final batch logits"))?,
-        );
+        let final_row = rows
+            .pop()
+            .ok_or_else(|| invalid("missing final batch logits"))?;
+        self.recycle_batch_rows(rows);
+        let previous_logits = std::mem::replace(&mut self.logits, Arc::new(final_row));
+        self.recycle_logits(previous_logits);
         committed.extend_from_slice(draft);
         let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
         self.evaluate(bonus, check)?;

@@ -413,7 +413,6 @@ impl Qwen35 {
         output: &mut Vec<Vec<f32>>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        output.clear();
         if tokens.is_empty()
             || tokens.len() > self.verification_capacity()
             || self.projection_executor.is_some()
@@ -425,15 +424,27 @@ impl Qwen35 {
                 .checked_add(tokens.len())
                 .is_none_or(|end| end > self.context_limit)
         {
+            output.clear();
             return Err(invalid(
                 "invalid tiled verification bounds, tokens or context",
             ));
         }
-        // Allocate every output row before layer-major state can change. These
-        // are the caller-owned bytes charged by the explicit selection above.
+        // Reuse existing caller row capacities when available, allocating only
+        // missing rows before layer-major state can change.
         let allocation = (|| -> Result<()> {
-            output.try_reserve_exact(tokens.len())?;
-            for _ in tokens {
+            if output.len() > tokens.len() {
+                output.truncate(tokens.len());
+            }
+            for row in &mut *output {
+                row.clear();
+                if self.vocabulary > row.capacity() {
+                    row.try_reserve_exact(self.vocabulary)?;
+                }
+            }
+            if tokens.len() > output.capacity() {
+                output.try_reserve_exact(tokens.len() - output.len())?;
+            }
+            while output.len() < tokens.len() {
                 let mut row = Vec::new();
                 row.try_reserve_exact(self.vocabulary)?;
                 output.push(row);

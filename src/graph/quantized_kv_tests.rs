@@ -1055,3 +1055,89 @@ fn parallel_packed_attention_joins_failures_and_preserves_committed_cache() -> R
     }
     Ok(())
 }
+
+#[test]
+fn packed_cache_copy_into_and_restore_in_place_preserve_capacities_and_reject_mismatched_quantizer()
+-> Result<()> {
+    let context = super::super::KV_PAGE_TOKENS + 5;
+    let width = 2 * HEAD_DIM;
+    let mut live_keys = KvCache::with_policy(width, context, KvCachePolicy::Rotated4, true, false)?;
+    for position in 0..(super::super::KV_PAGE_TOKENS + 3) {
+        let key = input(width, u16::try_from(position)?)?;
+        live_keys.prepare_append(&key)?;
+        live_keys.append(&key);
+    }
+    let Some(live_packed) = live_keys.packed.as_ref() else {
+        return Err(crate::invalid("expected quantized packed cache"));
+    };
+    let mut scratch = live_packed.copy()?;
+    let extra_key = input(width, 99)?;
+    live_keys.prepare_append(&extra_key)?;
+    live_keys.append(&extra_key);
+    let Some(live_packed) = live_keys.packed.as_ref() else {
+        return Err(crate::invalid("expected quantized packed cache"));
+    };
+    let prev_tail_cap = scratch.tail.capacity();
+    live_packed.copy_into(&mut scratch)?;
+    assert_eq!(scratch.len, live_packed.len);
+    assert!(scratch.tail.capacity() >= prev_tail_cap);
+    assert!(Arc::ptr_eq(&scratch.pages[0], &live_packed.pages[0]));
+
+    let mut target_kv = KvCache::with_policy(width, context, KvCachePolicy::Rotated4, true, false)?;
+    for position in 0..2 {
+        let key = input(width, u16::try_from(position + 200)?)?;
+        target_kv.prepare_append(&key)?;
+        target_kv.append(&key);
+    }
+    target_kv.prepare_append(&extra_key)?;
+    let Some(target_packed) = target_kv.packed.as_mut() else {
+        return Err(crate::invalid("expected quantized packed cache"));
+    };
+    let preserved_prepared_cap = target_packed.prepared.capacity();
+    let preserved_tail_cap = target_packed.tail.capacity();
+    assert!(preserved_prepared_cap > 0);
+    target_packed.restore_in_place(&scratch)?;
+    assert!(target_packed.prepared.capacity() >= preserved_prepared_cap);
+    assert!(target_packed.tail.capacity() >= preserved_tail_cap);
+    assert!(!target_packed.prepared_ready);
+    assert_eq!(target_packed.len, scratch.len);
+    assert!(Arc::ptr_eq(&target_packed.pages[0], &scratch.pages[0]));
+
+    let before_len = target_packed.len;
+    let before_tail = target_packed.tail.clone();
+    let mut wrong_version = scratch.copy()?;
+    wrong_version.quantizer = wrong_version.quantizer.clone().with_fitted_scale();
+    assert!(target_packed.restore_in_place(&wrong_version).is_err());
+
+    let mut wrong_bits = scratch.copy()?;
+    wrong_bits.quantizer = Quantizer::new(Bits::Three, super::KEY_SEED);
+    assert!(target_packed.restore_in_place(&wrong_bits).is_err());
+
+    let mut wrong_seed = scratch.copy()?;
+    wrong_seed.quantizer = Quantizer::new(Bits::Four, super::KEY_SEED + 1);
+    assert!(target_packed.restore_in_place(&wrong_seed).is_err());
+
+    let mut bad_partition = scratch.copy()?;
+    bad_partition.tail.pop();
+    assert!(target_packed.restore_in_place(&bad_partition).is_err());
+    assert_eq!(target_packed.len, before_len);
+    assert_eq!(target_packed.tail, before_tail);
+
+    let full_key = input(width, 123)?;
+    live_keys.prepare_append(&full_key)?;
+    live_keys.append(&full_key);
+    let Some(full_packed) = live_keys.packed.as_ref() else {
+        return Err(crate::invalid("expected quantized packed cache"));
+    };
+    assert_eq!(full_packed.len, full_packed.maximum);
+    assert!(full_packed.tail.is_empty());
+    assert_eq!(full_packed.pages.len(), 2);
+    target_packed.restore_in_place(full_packed)?;
+    assert_eq!(target_packed.len, full_packed.maximum);
+    assert!(target_packed.tail.is_empty());
+
+    let mut unsealed_full = full_packed.copy()?;
+    unsealed_full.tail.push(0);
+    assert!(target_packed.restore_in_place(&unsealed_full).is_err());
+    Ok(())
+}

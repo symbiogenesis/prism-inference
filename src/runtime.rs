@@ -19,6 +19,9 @@ mod verification;
 use timing::measure;
 pub use timing::{GenerationPhase, GenerationTimings, PhaseTiming};
 
+const MAX_RECYCLED_CHECKPOINTS: usize = 2;
+const MAX_RECYCLED_BATCH_LOGITS: usize = MAX_SPECULATIVE_DRAFT_TOKENS;
+
 struct GenerationEffects<'a, S, E> {
     sampler: &'a mut S,
     emit: E,
@@ -152,6 +155,8 @@ pub struct Runtime<D: Decoder> {
     // Captures/restores share immutable output. Mutation detaches without copying.
     logits: Arc<Vec<f32>>,
     checkpoints: Vec<Snapshot<D::Checkpoint>>,
+    recycled_checkpoints: Vec<D::Checkpoint>,
+    batch_logits: Vec<Vec<f32>>,
     faulted: bool,
 }
 
@@ -229,6 +234,7 @@ impl Runtime<crate::graph::Qwen35> {
         self.faulted = true;
         self.decoder.reset_with_adapter_scale(scale)?;
         self.checkpoints.clear();
+        self.recycled_checkpoints.clear();
         self.tokens.clear();
         mutable_logits(&mut self.logits).clear();
         self.faulted = false;
@@ -260,12 +266,18 @@ impl<D: Decoder> Runtime<D> {
         tokens.try_reserve_exact(limits.context_tokens)?;
         let mut checkpoints = Vec::new();
         checkpoints.try_reserve_exact(limits.checkpoints)?;
+        let mut recycled_checkpoints = Vec::new();
+        recycled_checkpoints.try_reserve_exact(MAX_RECYCLED_CHECKPOINTS)?;
+        let mut batch_logits = Vec::new();
+        batch_logits.try_reserve_exact(MAX_RECYCLED_BATCH_LOGITS)?;
         Ok(Self {
             decoder,
             limits,
             tokens,
             logits: Arc::new(Vec::new()),
             checkpoints,
+            recycled_checkpoints,
+            batch_logits,
             faulted: false,
         })
     }
@@ -307,7 +319,9 @@ impl<D: Decoder> Runtime<D> {
     pub fn reset(&mut self) -> Result<()> {
         self.faulted = true;
         self.decoder.reset()?;
-        self.checkpoints.clear();
+        while let Some(snapshot) = self.checkpoints.pop() {
+            self.recycle_snapshot(snapshot);
+        }
         self.tokens.clear();
         mutable_logits(&mut self.logits).clear();
         self.faulted = false;
@@ -688,10 +702,12 @@ impl<D: Decoder> Runtime<D> {
                     // Count pressure alone must not discard a usable prefix
                     // when its optional replacement could not be captured.
                     if self.checkpoints.len() == self.limits.checkpoints {
-                        self.checkpoints.remove(0);
+                        let evicted = self.checkpoints.remove(0);
+                        self.recycle_snapshot(evicted);
                     }
                     self.checkpoints.push(snapshot);
                 }
+                self.recycle_snapshot(rollback);
                 Ok(completion)
             }
             Err(error) => {
@@ -701,12 +717,21 @@ impl<D: Decoder> Runtime<D> {
                     GenerationPhase::RollbackRestore,
                     0,
                     || {
-                        let restored = self.decoder.restore(&rollback.state);
+                        let Snapshot {
+                            state,
+                            tokens,
+                            logits,
+                            ..
+                        } = rollback;
+                        let restored = self.decoder.restore(&state);
                         // History describes the committed request even if backend
                         // recovery fails and admission remains closed.
-                        self.tokens = rollback.tokens;
-                        self.logits = rollback.logits;
-                        restored
+                        self.tokens = tokens;
+                        let previous_logits = std::mem::replace(&mut self.logits, logits);
+                        restored?;
+                        self.recycle_checkpoint(state);
+                        self.recycle_logits(previous_logits);
+                        Ok(())
                     },
                 )?;
                 self.faulted = false;
@@ -782,7 +807,8 @@ impl<D: Decoder> Runtime<D> {
             if self.checkpoints.is_empty() {
                 return Err(invalid("native checkpoint budget exhausted"));
             }
-            self.checkpoints.remove(0);
+            let evicted = self.checkpoints.remove(0);
+            self.recycle_snapshot(evicted);
         }
         let tokens = copy(&self.tokens)?;
         // Invalid/empty output needs no retained backing storage. Keep its
@@ -793,13 +819,57 @@ impl<D: Decoder> Runtime<D> {
             Arc::clone(&self.logits)
         };
         check()?;
-        let state = self.decoder.checkpoint()?;
+        let state = if let Some(mut recycled) = self.recycled_checkpoints.pop() {
+            self.decoder.checkpoint_into(&mut recycled)?;
+            recycled
+        } else {
+            self.decoder.checkpoint()?
+        };
         Ok(Snapshot {
             state,
             tokens,
             logits,
             bytes,
         })
+    }
+
+    fn recycle_checkpoint(&mut self, state: D::Checkpoint) {
+        if self.recycled_checkpoints.len() < MAX_RECYCLED_CHECKPOINTS {
+            self.recycled_checkpoints.push(state);
+        }
+    }
+
+    fn recycle_logits(&mut self, logits: Arc<Vec<f32>>) {
+        if let Ok(mut values) = Arc::try_unwrap(logits)
+            && values.capacity() > 0
+            && self.batch_logits.len() < MAX_RECYCLED_BATCH_LOGITS
+        {
+            values.clear();
+            self.batch_logits.push(values);
+        }
+    }
+
+    fn recycle_snapshot(&mut self, snapshot: Snapshot<D::Checkpoint>) {
+        self.recycle_checkpoint(snapshot.state);
+        self.recycle_logits(snapshot.logits);
+    }
+
+    fn take_batch_rows(&mut self, count: usize) -> Result<Vec<Vec<f32>>> {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count)?;
+        let available = self.batch_logits.len().min(count);
+        let start = self.batch_logits.len() - available;
+        rows.extend(self.batch_logits.drain(start..));
+        Ok(rows)
+    }
+
+    fn recycle_batch_rows(&mut self, rows: Vec<Vec<f32>>) {
+        for mut row in rows {
+            if row.capacity() > 0 && self.batch_logits.len() < MAX_RECYCLED_BATCH_LOGITS {
+                row.clear();
+                self.batch_logits.push(row);
+            }
+        }
     }
 
     fn prepare(&mut self, prompt: &[u32], check: &impl Fn() -> Result<()>) -> Result<usize> {
@@ -822,7 +892,8 @@ impl<D: Decoder> Runtime<D> {
             check()?;
             self.tokens.clear();
             self.tokens.extend_from_slice(&snapshot.tokens);
-            self.logits = Arc::clone(&snapshot.logits);
+            let previous_logits = std::mem::replace(&mut self.logits, Arc::clone(&snapshot.logits));
+            self.recycle_logits(previous_logits);
         } else {
             check()?;
             self.decoder.reset()?;
@@ -838,7 +909,7 @@ impl<D: Decoder> Runtime<D> {
         // Reserve before mutating decoder state; rollback is still available if
         // a decoder allocation or arithmetic operation subsequently fails.
         self.tokens.try_reserve(1)?;
-        let output = mutable_logits(&mut self.logits);
+        let output = mutable_logits_with_scratch(&mut self.logits, &mut self.batch_logits);
         output.clear();
         check()?;
         let result = self
@@ -1129,21 +1200,34 @@ impl<D: Decoder> Runtime<D> {
             committed.push(bonus);
             Ok((committed, stats))
         })();
-        if let Err(error) = result {
-            if self.faulted {
-                // A failed accepted-prefix restore already closed admission.
-                // Do not retry that restore or resume from provisional state.
-                return Err(error);
+        match result {
+            Ok((committed, stats)) => {
+                self.recycle_snapshot(rollback);
+                Ok((committed, stats))
             }
-            self.faulted = true;
-            let restored = self.decoder.restore(&rollback.state);
-            self.tokens = rollback.tokens;
-            self.logits = rollback.logits;
-            restored?;
-            self.faulted = false;
-            return Err(error);
+            Err(error) => {
+                if self.faulted {
+                    // A failed accepted-prefix restore already closed admission.
+                    // Do not retry that restore or resume from provisional state.
+                    return Err(error);
+                }
+                self.faulted = true;
+                let Snapshot {
+                    state,
+                    tokens,
+                    logits,
+                    ..
+                } = rollback;
+                let restored = self.decoder.restore(&state);
+                self.tokens = tokens;
+                let previous_logits = std::mem::replace(&mut self.logits, logits);
+                restored?;
+                self.faulted = false;
+                self.recycle_checkpoint(state);
+                self.recycle_logits(previous_logits);
+                Err(error)
+            }
         }
-        result
     }
 
     fn generate_speculative_checked(
@@ -1189,19 +1273,29 @@ impl<D: Decoder> Runtime<D> {
             Ok((completion, stats, snapshot)) => {
                 if let Some(snapshot) = snapshot {
                     if self.checkpoints.len() == self.limits.checkpoints {
-                        self.checkpoints.remove(0);
+                        let evicted = self.checkpoints.remove(0);
+                        self.recycle_snapshot(evicted);
                     }
                     self.checkpoints.push(snapshot);
                 }
+                self.recycle_snapshot(rollback);
                 Ok((completion, stats))
             }
             Err(error) => {
                 self.faulted = true;
-                let restored = self.decoder.restore(&rollback.state);
-                self.tokens = rollback.tokens;
-                self.logits = rollback.logits;
+                let Snapshot {
+                    state,
+                    tokens,
+                    logits,
+                    ..
+                } = rollback;
+                let restored = self.decoder.restore(&state);
+                self.tokens = tokens;
+                let previous_logits = std::mem::replace(&mut self.logits, logits);
                 restored?;
                 self.faulted = false;
+                self.recycle_checkpoint(state);
+                self.recycle_logits(previous_logits);
                 Err(error)
             }
         }
@@ -1324,6 +1418,18 @@ fn check_deadline(
 // A snapshot owns only an immutable Arc. Before writing a new distribution,
 // detach shared output without cloning values that will immediately be cleared.
 // The fresh allocation then remains unique and reusable across decoder steps.
+fn mutable_logits_with_scratch<'a>(
+    logits: &'a mut Arc<Vec<f32>>,
+    scratch: &mut Vec<Vec<f32>>,
+) -> &'a mut Vec<f32> {
+    if let Some(values) = Arc::get_mut(logits) {
+        return values;
+    }
+    let next = scratch.pop().unwrap_or_default();
+    *logits = Arc::new(next);
+    Arc::make_mut(logits)
+}
+
 fn mutable_logits(logits: &mut Arc<Vec<f32>>) -> &mut Vec<f32> {
     if let Some(values) = Arc::get_mut(logits) {
         return values;
@@ -2106,5 +2212,202 @@ mod optional_deadline_tests {
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
         }));
+    }
+}
+
+#[cfg(test)]
+mod recycling_tests {
+    use super::{
+        Arc, Cancellation, Decoder, Generation, Limits, MAX_RECYCLED_BATCH_LOGITS,
+        MAX_RECYCLED_CHECKPOINTS, Prefill, Result, Runtime, SuffixDraftConfig,
+    };
+    use std::cell::{Cell, RefCell};
+
+    struct RecycledDecoder {
+        tokens: Vec<u32>,
+        checkpoint_into_calls: Cell<usize>,
+        checkpoint_reused_count: Cell<usize>,
+        batch_row_initial_caps: RefCell<Vec<usize>>,
+        vocab: usize,
+    }
+
+    impl RecycledDecoder {
+        fn new() -> Self {
+            Self {
+                tokens: Vec::new(),
+                checkpoint_into_calls: Cell::new(0),
+                checkpoint_reused_count: Cell::new(0),
+                batch_row_initial_caps: RefCell::new(Vec::new()),
+                vocab: 8,
+            }
+        }
+
+        fn fill_logits(tokens: &[u32], vocab: usize, output: &mut Vec<f32>) -> Result<()> {
+            output.clear();
+            output.try_reserve_exact(vocab)?;
+            output.resize(vocab, 0.0);
+            let last = tokens.last().copied().unwrap_or(0);
+            let next = usize::try_from((last + 1) % u32::try_from(vocab)?)?;
+            output[next] = 10.0;
+            Ok(())
+        }
+    }
+
+    impl Decoder for RecycledDecoder {
+        type Checkpoint = Vec<u32>;
+
+        fn identity(&self) -> &'static str {
+            "recycled-checkpoint-test/v1"
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab
+        }
+
+        fn checkpoint_bytes(&self) -> usize {
+            self.tokens.len() * size_of::<u32>()
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.tokens.clear();
+            Ok(())
+        }
+
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            let mut output = Vec::new();
+            self.evaluate_into(token, &mut output)?;
+            Ok(output)
+        }
+
+        fn evaluate_into(&mut self, token: u32, output: &mut Vec<f32>) -> Result<()> {
+            self.tokens.push(token);
+            Self::fill_logits(&self.tokens, self.vocab, output)
+        }
+
+        fn evaluate_batch_into(
+            &mut self,
+            tokens: &[u32],
+            output: &mut Vec<Vec<f32>>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            output.truncate(tokens.len());
+            while output.len() < tokens.len() {
+                output.push(Vec::new());
+            }
+            for (index, &token) in tokens.iter().enumerate() {
+                check()?;
+                self.batch_row_initial_caps
+                    .borrow_mut()
+                    .push(output[index].capacity());
+                self.evaluate_into(token, &mut output[index])?;
+            }
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(self.tokens.len().max(16))?;
+            copy.extend_from_slice(&self.tokens);
+            Ok(copy)
+        }
+
+        fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> Result<()> {
+            self.checkpoint_into_calls
+                .set(self.checkpoint_into_calls.get() + 1);
+            let before_ptr = target.as_ptr();
+            let before_cap = target.capacity();
+            if self.tokens.len() > before_cap {
+                target.try_reserve_exact(self.tokens.len() - target.len())?;
+            }
+            target.clear();
+            target.extend_from_slice(&self.tokens);
+            if before_cap > 0 && std::ptr::eq(target.as_ptr(), before_ptr) {
+                self.checkpoint_reused_count
+                    .set(self.checkpoint_reused_count.get() + 1);
+            }
+            Ok(())
+        }
+
+        fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+            self.tokens.clear();
+            self.tokens.extend_from_slice(checkpoint);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recycled_checkpoints_capped_at_two_and_unique_logits_reused_without_mutating_shared_arcs()
+    -> Result<()> {
+        let mut runtime = Runtime::new(
+            RecycledDecoder::new(),
+            Limits {
+                context_tokens: 64,
+                checkpoints: 2,
+                checkpoint_bytes: 128 * 1_024,
+            },
+        )?;
+        let cancellation = Cancellation::default();
+        let options = Generation {
+            max_tokens: 2,
+            stop_tokens: vec![],
+        };
+
+        for seed in 0_u32..5 {
+            runtime.generate(&[seed, seed + 1], &options, &cancellation, |_| Ok(()))?;
+            assert!(runtime.recycled_checkpoints.len() <= MAX_RECYCLED_CHECKPOINTS);
+        }
+        assert!(runtime.decoder.checkpoint_into_calls.get() > 0);
+        assert!(runtime.decoder.checkpoint_reused_count.get() > 0);
+
+        let pre_cancel_tokens = runtime.tokens().to_vec();
+        let cancelled = Cancellation::default();
+        cancelled.cancel();
+        assert!(
+            runtime
+                .generate(&[9, 10], &options, &cancelled, |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(runtime.tokens(), pre_cancel_tokens);
+        assert!(runtime.recycled_checkpoints.len() <= MAX_RECYCLED_CHECKPOINTS);
+
+        runtime.reset()?;
+        let spec_options = Generation {
+            max_tokens: 3,
+            stop_tokens: vec![],
+        };
+        let suffix_config = SuffixDraftConfig::default();
+        runtime.generate_speculative(
+            &[1, 2, 3, 4, 1, 2],
+            &spec_options,
+            Prefill::default(),
+            suffix_config,
+            &cancellation,
+            |_| Ok(()),
+        )?;
+        let retained_shared = Arc::clone(&runtime.logits);
+        let retained_bits: Vec<u32> = retained_shared.iter().map(|v| v.to_bits()).collect();
+        assert!(!retained_bits.is_empty());
+
+        runtime.generate_speculative(
+            &[2, 3, 4, 5, 2, 3],
+            &spec_options,
+            Prefill::default(),
+            suffix_config,
+            &cancellation,
+            |_| Ok(()),
+        )?;
+        assert!(runtime.batch_logits.len() <= MAX_RECYCLED_BATCH_LOGITS);
+        let actual_retained_bits: Vec<u32> = retained_shared.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(actual_retained_bits, retained_bits);
+        assert!(
+            runtime
+                .decoder
+                .batch_row_initial_caps
+                .borrow()
+                .iter()
+                .any(|&cap| cap > 0),
+            "subsequent speculative verification must reuse recycled batch logit rows"
+        );
+        Ok(())
     }
 }

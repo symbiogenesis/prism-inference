@@ -83,6 +83,12 @@ impl KvCachePolicy {
 const KEY_SEED: u64 = 0x5357_4946_544b_5631;
 const VALUE_SEED: u64 = 0x5357_4946_5456_5631;
 
+fn same_quantizer(left: &Quantizer, right: &Quantizer) -> bool {
+    left.identity() == right.identity()
+        && left.uses_neon() == right.uses_neon()
+        && left.encoded_len() == right.encoded_len()
+}
+
 pub(super) struct PackedCache {
     pages: Vec<Arc<Vec<u8>>>,
     tail: Vec<u8>,
@@ -201,6 +207,71 @@ impl PackedCache {
         &row[head * width..(head + 1) * width]
     }
 
+    pub(super) fn same_representation(&self, other: &Self) -> bool {
+        self.heads == other.heads
+            && self.row_bytes == other.row_bytes
+            && self.page_bytes == other.page_bytes
+            && self.maximum == other.maximum
+            && same_quantizer(&self.quantizer, &other.quantizer)
+    }
+
+    pub(super) fn validate_restore(
+        &self,
+        live: &Self,
+        expected_tokens: Option<usize>,
+    ) -> Result<()> {
+        if !self.same_representation(live) {
+            return Err(invalid("packed KV cache representation mismatch"));
+        }
+        if self.heads == 0
+            || self.row_bytes == 0
+            || self.page_bytes == 0
+            || !self.maximum.is_multiple_of(self.row_bytes)
+            || !self.page_bytes.is_multiple_of(self.row_bytes)
+            || self.len > self.maximum
+            || !self.len.is_multiple_of(self.row_bytes)
+        {
+            return Err(invalid("malformed packed KV cache geometry"));
+        }
+        let tokens = self.len / self.row_bytes;
+        if expected_tokens.is_some_and(|expected| tokens != expected) {
+            return Err(invalid(
+                "packed KV cache token length does not match checkpoint position",
+            ));
+        }
+        let max_tokens = self.maximum / self.row_bytes;
+        let page_tokens = self.page_bytes / self.row_bytes;
+        if page_tokens != max_tokens.min(super::KV_PAGE_TOKENS) {
+            return Err(invalid("malformed packed KV page geometry"));
+        }
+        if tokens == max_tokens {
+            if !self.tail.is_empty() {
+                return Err(invalid("full packed KV cache must have an empty tail"));
+            }
+            let expected_pages = tokens.div_ceil(page_tokens);
+            if self.pages.len() != expected_pages {
+                return Err(invalid("malformed packed KV page count"));
+            }
+            for (index, page) in self.pages.iter().enumerate() {
+                let expected_bytes =
+                    if index + 1 < expected_pages || tokens.is_multiple_of(page_tokens) {
+                        self.page_bytes
+                    } else {
+                        (tokens % page_tokens) * self.row_bytes
+                    };
+                if page.len() != expected_bytes {
+                    return Err(invalid("malformed packed KV sealed page length"));
+                }
+            }
+        } else if self.pages.len() != tokens / super::KV_PAGE_TOKENS
+            || self.pages.iter().any(|page| page.len() != self.page_bytes)
+            || self.tail.len() != (tokens % super::KV_PAGE_TOKENS) * self.row_bytes
+        {
+            return Err(invalid("malformed packed KV page or tail partition"));
+        }
+        Ok(())
+    }
+
     pub(super) fn copy(&self) -> Result<Self> {
         let mut pages = super::capacity(self.pages.len())?;
         pages.extend(self.pages.iter().map(Arc::clone));
@@ -216,6 +287,68 @@ impl PackedCache {
             maximum: self.maximum,
             len: self.len,
         })
+    }
+
+    pub(super) fn copy_into(&self, target: &mut Self) -> Result<()> {
+        if !self.same_representation(target) {
+            *target = self.copy()?;
+            return Ok(());
+        }
+        if self.pages.len() > target.pages.capacity() {
+            target
+                .pages
+                .try_reserve_exact(self.pages.len() - target.pages.len())?;
+        }
+        if self.tail.len() > target.tail.capacity() {
+            target
+                .tail
+                .try_reserve_exact(self.tail.len() - target.tail.len())?;
+        }
+        target.pages.clear();
+        target.pages.extend(self.pages.iter().map(Arc::clone));
+        target.tail.resize(self.tail.len(), 0);
+        target.tail.copy_from_slice(&self.tail);
+        target.prepared.clear();
+        target.prepared_ready = false;
+        target.len = self.len;
+        Ok(())
+    }
+
+    pub(super) fn reserve_restore(
+        &mut self,
+        saved: &Self,
+        expected_tokens: Option<usize>,
+    ) -> Result<()> {
+        saved.validate_restore(self, expected_tokens)?;
+        if saved.pages.len() > self.pages.capacity() {
+            self.pages
+                .try_reserve_exact(saved.pages.len() - self.pages.len())?;
+        }
+        if saved.tail.len() > self.tail.capacity() {
+            self.tail
+                .try_reserve_exact(saved.tail.len() - self.tail.len())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_restore_in_place(&mut self, saved: &Self) {
+        self.pages.clear();
+        self.pages.extend(saved.pages.iter().map(Arc::clone));
+        self.tail.resize(saved.tail.len(), 0);
+        self.tail.copy_from_slice(&saved.tail);
+        self.prepared.clear();
+        self.prepared_ready = false;
+        self.len = saved.len;
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Direct in-place restoration contract tested and available alongside two-phase restore."
+    )]
+    pub(super) fn restore_in_place(&mut self, saved: &Self) -> Result<()> {
+        self.reserve_restore(saved, None)?;
+        self.apply_restore_in_place(saved);
+        Ok(())
     }
 
     pub(super) fn clear(&mut self) {

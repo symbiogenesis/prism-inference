@@ -828,7 +828,69 @@ fn step_in_place_inner<const SILU: bool, const PREPARED: bool>(
         use fearless_simd::{f32x4, prelude::*};
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
-        let mut finite_mask = zero.is_finite();
+        {
+            let mut finite_mask = zero.is_finite();
+            let (m_pairs, m_rem8) = mixed.as_chunks::<8>();
+            let (h_pairs, h_rem24) = history.as_chunks::<24>();
+            let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
+            for ((m_pair, h_pair), c_pair) in m_pairs.iter().zip(h_pairs).zip(c_pairs) {
+                let [tap0_0, tap0_1, tap0_2, tap0_3] =
+                    coefficient_taps::<PREPARED>(neon, &c_pair[0..16]);
+                let [tap1_0, tap1_1, tap1_2, tap1_3] =
+                    coefficient_taps::<PREPARED>(neon, &c_pair[16..32]);
+                let h0_t0 = f32x4::load_array(neon, [h_pair[0], h_pair[3], h_pair[6], h_pair[9]]);
+                let h0_t1 = f32x4::load_array(neon, [h_pair[1], h_pair[4], h_pair[7], h_pair[10]]);
+                let h0_t2 = f32x4::load_array(neon, [h_pair[2], h_pair[5], h_pair[8], h_pair[11]]);
+                let h1_t0 =
+                    f32x4::load_array(neon, [h_pair[12], h_pair[15], h_pair[18], h_pair[21]]);
+                let h1_t1 =
+                    f32x4::load_array(neon, [h_pair[13], h_pair[16], h_pair[19], h_pair[22]]);
+                let h1_t2 =
+                    f32x4::load_array(neon, [h_pair[14], h_pair[17], h_pair[20], h_pair[23]]);
+                let p0 = f32x4::from_slice(neon, &m_pair[0..4]);
+                let p1 = f32x4::from_slice(neon, &m_pair[4..8]);
+                let mut sum0 = zero;
+                let mut sum1 = zero;
+                sum0 = h0_t0.mul_add_precise(tap0_0, sum0);
+                sum1 = h1_t0.mul_add_precise(tap1_0, sum1);
+                sum0 = h0_t1.mul_add_precise(tap0_1, sum0);
+                sum1 = h1_t1.mul_add_precise(tap1_1, sum1);
+                sum0 = h0_t2.mul_add_precise(tap0_2, sum0);
+                sum1 = h1_t2.mul_add_precise(tap1_2, sum1);
+                let out0 = p0.mul_add_precise(tap0_3, sum0);
+                let out1 = p1.mul_add_precise(tap1_3, sum1);
+                finite_mask = finite_mask & out0.is_finite() & out1.is_finite();
+            }
+            let (m_chunks, m_rem) = m_rem8.as_chunks::<4>();
+            let (h_chunks, h_rem) = h_rem24.as_chunks::<12>();
+            let (c_chunks, c_rem) = c_rem32.as_chunks::<16>();
+            for ((m_chunk, h_chunk), c_chunk) in m_chunks.iter().zip(h_chunks).zip(c_chunks) {
+                let [tap0, tap1, tap2, tap3] = coefficient_taps::<PREPARED>(neon, &c_chunk[0..16]);
+                let h_t0 =
+                    f32x4::load_array(neon, [h_chunk[0], h_chunk[3], h_chunk[6], h_chunk[9]]);
+                let h_t1 =
+                    f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
+                let h_t2 =
+                    f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
+                let p = f32x4::from_slice(neon, m_chunk);
+                let mut sum = zero;
+                sum = h_t0.mul_add_precise(tap0, sum);
+                sum = h_t1.mul_add_precise(tap1, sum);
+                sum = h_t2.mul_add_precise(tap2, sum);
+                let out = p.mul_add_precise(tap3, sum);
+                finite_mask &= out.is_finite();
+            }
+            if !finite_mask.all_true() {
+                return Err(invalid("nonfinite kernel output"));
+            }
+            for ((&projected, h_slice), c_slice) in m_rem
+                .iter()
+                .zip(h_rem.as_chunks::<3>().0)
+                .zip(c_rem.as_chunks::<4>().0)
+            {
+                row(h_slice, projected, c_slice)?;
+            }
+        }
         let (m_pairs, m_rem8) = mixed.as_chunks_mut::<8>();
         let (h_pairs, h_rem24) = history.as_chunks_mut::<24>();
         let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
@@ -855,7 +917,6 @@ fn step_in_place_inner<const SILU: bool, const PREPARED: bool>(
             sum1 = h1_t2.mul_add_precise(tap1_2, sum1);
             let out0 = p0.mul_add_precise(tap0_3, sum0);
             let out1 = p1.mul_add_precise(tap1_3, sum1);
-            finite_mask = finite_mask & out0.is_finite() & out1.is_finite();
             let [p0_0, p0_1, p0_2, p0_3, p1_0, p1_1, p1_2, p1_3] = *m_pair;
             if SILU {
                 let s0 = out0 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out0));
@@ -886,7 +947,6 @@ fn step_in_place_inner<const SILU: bool, const PREPARED: bool>(
             sum = h_t1.mul_add_precise(tap1, sum);
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
-            finite_mask &= out.is_finite();
             let [p0, p1, p2, p3] = *m_chunk;
             if SILU {
                 (out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out)))
@@ -909,9 +969,6 @@ fn step_in_place_inner<const SILU: bool, const PREPARED: bool>(
                 p3,
             ];
         }
-        if !finite_mask.all_true() {
-            return Err(invalid("nonfinite kernel output"));
-        }
         for ((mixed_value, h_slice), c_slice) in m_rem
             .iter_mut()
             .zip(h_rem.as_chunks_mut::<3>().0)
@@ -927,6 +984,17 @@ fn step_in_place_inner<const SILU: bool, const PREPARED: bool>(
             super::pinned_activations::silu_in_place(m_rem);
         }
         return Ok(());
+    }
+    for (channel, &projected) in mixed.iter().enumerate() {
+        let start = channel * hist_width;
+        let prepared_row;
+        let coeff = if PREPARED {
+            prepared_row = prepared_coefficient_row(coefficients, channel);
+            &prepared_row[..]
+        } else {
+            &coefficients[channel * width..(channel + 1) * width]
+        };
+        row(&history[start..start + hist_width], projected, coeff)?;
     }
     for (channel, mixed_value) in mixed.iter_mut().enumerate() {
         let projected = *mixed_value;
@@ -1780,5 +1848,137 @@ mod tests {
         ).is_err());
         assert_eq!(history, [0.25; 24]);
         assert_eq!(output, [-999.0; 16]);
+    }
+
+    #[test]
+    fn overlapping_multi_step_shifts_and_verification_width_match_sequential_and_3_tap_history()
+    -> Result<()> {
+        for channels in [5, 8, 12, 13] {
+            let width = 4;
+            let taps = width - 1;
+            let history_init: Vec<f32> = (0..channels * taps)
+                .map(|index| Ok(f32::from(u8::try_from((index % 11) + 1)?) * 0.0625 - 0.375))
+                .collect::<Result<_>>()?;
+            let coefficients: Vec<f32> = (0..channels * width)
+                .map(|index| Ok(f32::from(u8::try_from((index % 7) + 1)?) * 0.125 - 0.5))
+                .collect::<Result<_>>()?;
+
+            for steps in [1, 2, 3, 5, 9] {
+                let raw_tokens: Vec<f32> = (0..steps * channels)
+                    .map(|index| Ok(f32::from(u8::try_from((index % 17) + 1)?) * 0.125 - 1.0))
+                    .collect::<Result<_>>()?;
+
+                let mut seq_history = history_init.clone();
+                let mut seq_tokens = raw_tokens.clone();
+                for step in 0..steps {
+                    let offset = step * channels;
+                    step_silu_in_place(
+                        &mut seq_history,
+                        &mut seq_tokens[offset..offset + channels],
+                        &coefficients,
+                        width,
+                    )?;
+                }
+
+                let mut batch_history = history_init.clone();
+                let mut batch_tokens = raw_tokens.clone();
+                step_silu_tokens_in_place(
+                    &mut batch_history,
+                    &mut batch_tokens,
+                    channels,
+                    &coefficients,
+                    width,
+                )?;
+
+                assert_eq!(bits(&batch_tokens), bits(&seq_tokens));
+                assert_eq!(bits(&batch_history), bits(&seq_history));
+                assert_eq!(batch_history.len(), taps * channels);
+
+                if steps >= taps {
+                    for channel in 0..channels {
+                        for tap in 0..taps {
+                            let step = steps - taps + tap;
+                            assert_eq!(
+                                batch_history[channel * taps + tap].to_bits(),
+                                raw_tokens[step * channels + channel].to_bits()
+                            );
+                        }
+                    }
+                } else {
+                    for channel in 0..channels {
+                        let base = channel * taps;
+                        for tap in 0..(taps - steps) {
+                            assert_eq!(
+                                batch_history[base + tap].to_bits(),
+                                history_init[base + tap + steps].to_bits()
+                            );
+                        }
+                        for step in 0..steps {
+                            assert_eq!(
+                                batch_history[base + (taps - steps) + step].to_bits(),
+                                raw_tokens[step * channels + channel].to_bits()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn step_in_place_nonfinite_late_channel_rolls_back_history_and_mixed_atomically() -> Result<()>
+    {
+        let width = 4;
+        for channels in [5, 8, 12, 13] {
+            for prepared in [false, true] {
+                let raw_coefficients: Vec<f32> = (0..channels * width)
+                    .map(|index| Ok(f32::from(u8::try_from((index % 5) + 1)?) * 0.125))
+                    .collect::<Result<_>>()?;
+                let packed = super::Coefficients::new(raw_coefficients.clone(), width, prepared);
+                for fault in [f32::NAN, f32::INFINITY, f32::MAX] {
+                    let mut history = vec![0.25; channels * (width - 1)];
+                    let mut mixed = vec![0.5; channels];
+                    let mut coefficients = raw_coefficients.clone();
+                    let is_overflow = fault.to_bits() == f32::MAX.to_bits();
+                    if is_overflow {
+                        coefficients[channels * width - 1] = f32::MAX;
+                        mixed[channels - 1] = 4.0;
+                    } else {
+                        mixed[channels - 1] = fault;
+                    }
+                    let expected_history = bits(&history);
+                    let expected_mixed = bits(&mixed);
+
+                    if !prepared {
+                        assert!(
+                            step_in_place(&mut history, &mut mixed, &coefficients, width).is_err()
+                        );
+                        assert_eq!(bits(&history), expected_history);
+                        assert_eq!(bits(&mixed), expected_mixed);
+                        assert!(
+                            step_silu_in_place(&mut history, &mut mixed, &coefficients, width)
+                                .is_err()
+                        );
+                        assert_eq!(bits(&history), expected_history);
+                        assert_eq!(bits(&mixed), expected_mixed);
+                    }
+                    if !is_overflow {
+                        assert!(
+                            super::step_silu_in_place_coefficients(
+                                &mut history,
+                                &mut mixed,
+                                packed.view(),
+                                width,
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(bits(&history), expected_history);
+                        assert_eq!(bits(&mixed), expected_mixed);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

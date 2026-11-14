@@ -141,28 +141,38 @@ impl<D: Decoder> Runtime<D> {
             Ok((completion, stats, snapshot)) => {
                 if let Some(snapshot) = snapshot {
                     if self.checkpoints.len() == self.limits.checkpoints {
-                        self.checkpoints.remove(0);
+                        let evicted = self.checkpoints.remove(0);
+                        self.recycle_snapshot(evicted);
                     }
                     self.checkpoints.push(snapshot);
                 }
+                self.recycle_snapshot(rollback);
                 Ok((completion, stats))
             }
             Err(error) => {
                 // A failed round restore is terminal. In particular, do not
                 // retry another restoration on the same provisional decoder.
+                let Snapshot {
+                    state,
+                    tokens,
+                    logits,
+                    ..
+                } = rollback;
                 let already_faulted = self.faulted;
                 let restored = if already_faulted {
                     Ok(())
                 } else {
                     self.faulted = true;
-                    self.decoder.restore(&rollback.state)
+                    self.decoder.restore(&state)
                 };
-                self.tokens = rollback.tokens;
-                self.logits = rollback.logits;
+                self.tokens = tokens;
+                let previous_logits = std::mem::replace(&mut self.logits, logits);
                 restored?;
                 if !already_faulted {
                     self.faulted = false;
                 }
+                self.recycle_checkpoint(state);
+                self.recycle_logits(previous_logits);
                 Err(error)
             }
         }
@@ -313,7 +323,7 @@ impl<D: Decoder> Runtime<D> {
             if draft.len() >= 2 && draft.len() <= self.decoder.batched_evaluation_capacity() {
                 self.tokens.try_reserve(draft.len())?;
                 let checkpoint = self.capture(reserved, check)?;
-                let mut rows = Vec::new();
+                let mut rows = self.take_batch_rows(draft.len())?;
                 check()?;
                 self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
                 check()?;
@@ -325,6 +335,8 @@ impl<D: Decoder> Runtime<D> {
                             || !crate::kernels::is_finite_slice(row)
                     })
                 {
+                    self.recycle_snapshot(checkpoint);
+                    self.recycle_batch_rows(rows);
                     return Err(invalid("batched decoder returned invalid logits"));
                 }
                 stats.target_evaluations += draft.len();
@@ -336,7 +348,8 @@ impl<D: Decoder> Runtime<D> {
             let target = self.sampled_suffix_token(check, effects.sampler)?;
             let stopped = options.stop_tokens.contains(&target);
             if stopped || target != candidate {
-                if let Some((checkpoint, _)) = batch {
+                if let Some((checkpoint, rows)) = batch {
+                    self.recycle_batch_rows(rows);
                     self.sampled_suffix_restore(checkpoint, &draft[..index], check, stats)?;
                 }
                 if !stopped {
@@ -351,13 +364,19 @@ impl<D: Decoder> Runtime<D> {
             }
             if let Some((_, rows)) = &mut batch {
                 self.tokens.push(candidate);
-                self.logits = Arc::new(std::mem::take(&mut rows[index]));
+                let previous_logits =
+                    std::mem::replace(&mut self.logits, Arc::new(std::mem::take(&mut rows[index])));
+                self.recycle_logits(previous_logits);
             } else {
                 self.evaluate(candidate, check)?;
                 stats.target_evaluations += 1;
             }
             stats.draft_tokens_accepted += 1;
             Self::sampled_suffix_emit(candidate, check, &mut effects.emit)?;
+        }
+        if let Some((checkpoint, rows)) = batch {
+            self.recycle_snapshot(checkpoint);
+            self.recycle_batch_rows(rows);
         }
         Ok(SampledRound {
             emitted: draft.len(),
@@ -372,12 +391,20 @@ impl<D: Decoder> Runtime<D> {
         check: &impl Fn() -> Result<()>,
         stats: &mut SpeculativeStats,
     ) -> Result<()> {
+        let Snapshot {
+            state,
+            tokens,
+            logits,
+            ..
+        } = checkpoint;
         self.faulted = true;
-        let restored = self.decoder.restore(&checkpoint.state);
-        self.tokens = checkpoint.tokens;
-        self.logits = checkpoint.logits;
+        let restored = self.decoder.restore(&state);
+        self.tokens = tokens;
+        let previous_logits = std::mem::replace(&mut self.logits, logits);
         restored?;
         self.faulted = false;
+        self.recycle_checkpoint(state);
+        self.recycle_logits(previous_logits);
         stats.rollback_restores += 1;
         check()?;
         for &token in accepted {

@@ -277,6 +277,15 @@ pub trait Decoder {
     /// # Errors
     /// Returns an error if the snapshot cannot be allocated.
     fn checkpoint(&self) -> Result<Self::Checkpoint>;
+    /// Capture every mutable component into an existing snapshot buffer,
+    /// reusing compatible allocations when possible.
+    ///
+    /// # Errors
+    /// Returns an error if the snapshot cannot be updated or allocated.
+    fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> Result<()> {
+        *target = self.checkpoint()?;
+        Ok(())
+    }
     /// Restore a snapshot from this exact model and cache contract.
     ///
     /// # Errors

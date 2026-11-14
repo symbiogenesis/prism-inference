@@ -306,7 +306,7 @@ fn projection_startup_waits_for_owner_and_binds_resident_observations() -> TestR
         json!({
             "schema_version": 1, "requested": "auto", "effective": "hexagon-native-q2",
             "identity": "hexagon-hvx-native-q2-resident-v1-experimental",
-            "resident_tensors": 168, "resident_weight_bytes": 2_888_663_040,
+        "resident_tensors": 168, "resident_weight_bytes": 2_888_663_040_u64,
             "host_metadata_bytes": 524_128,
         })
     );
@@ -357,8 +357,7 @@ fn projection_startup_preserves_external_identity_and_cpu_bypasses_failed_initia
         ))),
         ..Observation::default()
     };
-    let worker =
-        Worker::new(FakeEngine(observed.clone()), 42).map_err(|error| format!("{error:?}"))?;
+    let worker = Worker::new(FakeEngine(observed), 42).map_err(|error| format!("{error:?}"))?;
     let readiness = worker.profile.readiness(worker.seed);
     assert_eq!(
         readiness["data"][0]["startup_projection"]["effective"],
@@ -1762,7 +1761,7 @@ fn private_uncapped_generation_survives_ten_minutes_and_finite_deadlines_cancel(
             let bytes = bytes?;
             if finite {
                 assert_eq!(result, Err(NativeBackendError::Deadline));
-                assert!(bytes.is_empty());
+                assert_eq!(bytes.len(), 0);
                 assert!(observed.generation_cancelled.load(Ordering::Acquire));
                 assert_eq!(observed.state.load(Ordering::Relaxed), 0);
             } else {
@@ -1846,7 +1845,7 @@ fn private_expected_probe_and_context_rejections_are_not_failure_diagnostics() -
     ] {
         let mut bytes = Vec::new();
         write_request_failure(&mut bytes, error)?;
-        assert!(bytes.is_empty());
+        assert_eq!(bytes.len(), 0);
     }
     Ok(())
 }

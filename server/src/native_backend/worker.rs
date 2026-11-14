@@ -473,8 +473,10 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
     })
     .map(hexagon_native_rpc::NativeQ2ProjectionLimits::with_persistent_session)
     .ok()?;
-    let driver = hexagon_native_rpc::Driver::open_system().ok()?;
-    let q2_session = driver.open_native_q2_session(&package_dir, limits).ok()?;
+    let q2_session = hexagon_native_rpc::Driver::open_system()
+        .ok()?
+        .open_native_q2_session(&package_dir, limits)
+        .ok()?;
     let mut executor =
         bonsai_hexagon_runtime::NativeQ2Executor::new(q2_session, limits, 64 * 1024 * 1024)
             .with_row_parallelism(session.clone_row_parallelism())

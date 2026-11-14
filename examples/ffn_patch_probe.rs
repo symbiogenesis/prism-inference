@@ -105,7 +105,7 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
 fn hash_file(path: &Path, deadline: &Deadline) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hash = Hasher::new()?;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; 8 * 1024];
     loop {
         deadline.check()?;
         let count = file.read(&mut buffer)?;
@@ -371,8 +371,8 @@ fn factor_hash(values: &[f32]) -> Result<String> {
     hex(hash.finish()?)
 }
 
-fn read_patch(path: &Path, source: &Value, site: &Value) -> Result<FfnPatch> {
-    let patch: Value = serde_json::from_slice(&read_bounded(path, MAX_PATCH_BYTES)?)?;
+fn read_patch(artifact_path: &Path, source: &Value, site: &Value) -> Result<FfnPatch> {
+    let patch: Value = serde_json::from_slice(&read_bounded(artifact_path, MAX_PATCH_BYTES)?)?;
     if patch["schemaVersion"] != 1
         || patch["source"] != *source
         || patch["site"] != *site

@@ -133,8 +133,9 @@ deltas never alter committed state and valid retry replaces dirty scratch.
 Focused controls compare both arithmetic profiles with independent normalization,
 exercise scalar/NEON tails, signed zero/subnormals, invalid input/weights/epsilon,
 failure publication and stale admission. A direct recurrent-layer control uses
-defensive per-row/per-head kernels, one/four workers, malformed weights and late
-recurrence failure followed by recovery. Native/fallback compilation, complete
+defensive per-row/per-head kernels, serial execution and four workers when
+enabled, malformed weights and late recurrence failure followed by recovery.
+Native/fallback compilation, complete
 model state/logit/adapter/cancellation parity, codegen/resources and matched
 complete-request benefit remain independent qualification gates.
 

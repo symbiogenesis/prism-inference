@@ -113,6 +113,11 @@ fn recurrent_rms_weight_scope_integrates_worker_heads_and_recovers_failed_layer_
         .collect();
     let history = vec![0.25; input.len() * 3];
     let source_bits = bits(&previous);
+    let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
+        &[1, 4]
+    } else {
+        &[1]
+    };
     for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
         let mut layer = RecurrentAttention {
             qkv: placeholder(),
@@ -131,7 +136,7 @@ fn recurrent_rms_weight_scope_integrates_worker_heads_and_recovers_failed_layer_
         };
         let (expected_matrix, expected_output) =
             reference(arithmetic, &geometry, &layer, &input, &gate, &previous)?;
-        for workers in [1, 4] {
+        for &workers in worker_counts {
             let mut projection = ProjectionScratch::default();
             projection
                 .matvec

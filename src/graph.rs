@@ -2217,7 +2217,8 @@ impl Qwen35 {
             .rsplit_once(":rank-one-lora-v1:")
             .ok_or_else(|| invalid("rank-one graph identity is missing its adapter contract"))?;
         let mut identity = String::new();
-        identity.try_reserve_exact(base_identity.len() + adapter.execution_identity().len() + 32)?;
+        identity
+            .try_reserve_exact(base_identity.len() + adapter.execution_identity().len() + 32)?;
         write!(
             identity,
             "{base_identity}:rank-one-lora-v1:{}:{:08x}",

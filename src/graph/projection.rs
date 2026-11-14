@@ -197,9 +197,9 @@ impl ProjectedQwen35<'_> {
         // Refuse a complete token before any projection or state delta. This
         // refusal leaves the scope healthy; submitted failures remain terminal.
         self.admit_work(usize::from(logits.is_none()), usize::from(logits.is_some()))?;
-        let result = self
-            .decoder
-            .evaluate_token_with_executor(token, logits, Some(self.executor), None);
+        let result =
+            self.decoder
+                .evaluate_token_with_executor(token, logits, Some(self.executor), None);
         self.faulted = result.is_err();
         result
     }

@@ -628,15 +628,6 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
         }
         return Ok(());
     }
-    if count == 1 {
-        if DIRECT {
-            tokens.copy_from_slice(projections.chunk(0, 0, channels));
-        }
-        if let Some(previous) = projections.history {
-            history.copy_from_slice(previous);
-        }
-        return step_in_place_inner::<SILU, PREPARED>(history, tokens, coefficients, width);
-    }
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -795,6 +786,9 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
             token_slice.copy_from_slice(projections.chunk(token, 0, channels));
         }
     }
+    // The admitted native kernel also handles a singleton tile directly from
+    // its immutable projections and history. Keep copy-then-step only for
+    // unsupported geometry or targets, preserving their failure mutation.
     for token_slice in tokens.chunks_exact_mut(channels) {
         step_in_place_inner::<SILU, PREPARED>(history, token_slice, coefficients, width)?;
     }
@@ -1409,6 +1403,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn x1_singleton_convolution_retries_dirty_delta_with_scalar_bits() -> Result<()> {
+        let samples = [-0.0, 0.0, f32::from_bits(1), -0.375, 0.125, 0.75];
+        for channels in [4, 5, 8, 12, 128] {
+            for width in [2, 4] {
+                let previous: Vec<_> = samples
+                    .into_iter()
+                    .cycle()
+                    .take(channels * (width - 1))
+                    .collect();
+                let previous_bits = bits(&previous);
+                let raw: Vec<_> = [0.125, -0.25, 0.5, -0.0]
+                    .into_iter()
+                    .cycle()
+                    .take(channels * width)
+                    .collect();
+                let mut row = vec![f32::INFINITY; 2];
+                row.extend(samples.into_iter().cycle().take(channels));
+                row.push(f32::NAN);
+                let rows = [row];
+                let source_bits = bits(&rows[0]);
+                let mut oracle_history = previous.clone();
+                let oracle =
+                    scalar_projected_rows(&mut oracle_history, &rows, 2, channels, &raw, width);
+                for prepare in [false, true] {
+                    let coefficients = super::Coefficients::new(raw.clone(), width, prepare);
+                    let mut next = vec![f32::NAN; previous.len()];
+                    let mut output = vec![f32::NAN; channels];
+                    let mut bad_rows = rows.clone();
+                    bad_rows[0][channels + 1] = f32::NAN;
+                    assert!(
+                        super::step_silu_token_rows_from_coefficients(
+                            &previous,
+                            &mut next,
+                            &bad_rows,
+                            &(2..2 + channels),
+                            coefficients.view(),
+                            width,
+                            &mut output,
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(bits(&previous), previous_bits);
+                    super::step_silu_token_rows_from_coefficients(
+                        &previous,
+                        &mut next,
+                        &rows,
+                        &(2..2 + channels),
+                        coefficients.view(),
+                        width,
+                        &mut output,
+                    )?;
+                    assert_eq!(bits(&next), bits(&oracle_history));
+                    assert_eq!(bits(&output), bits(&oracle));
+                    assert_eq!(bits(&previous), previous_bits);
+                    assert_eq!(bits(&rows[0]), source_bits);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

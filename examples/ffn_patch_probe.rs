@@ -229,7 +229,7 @@ fn run() -> Result<Value> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.len() != 1 {
         return Err(reject(
-            "usage: ffn_patch_probe <absolute-request.json>; external Job/deadline/power supervision required",
+            "usage: ffn_probe <absolute-request.json>; external Job/deadline/power supervision required",
         ));
     }
     let request: Request =

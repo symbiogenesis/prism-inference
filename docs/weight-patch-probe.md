@@ -23,12 +23,12 @@ tokens is not implied by this API.
 
 ## Bounded native collector
 
-Build the explicit `ffn_patch_probe` example from reviewed source before any
+Build the explicit `ffn_probe` example from reviewed source before any
 owner-device allowance starts:
 
 ```text
-cargo +nightly-2026-11-09 build --locked --offline --release --example ffn_patch_probe --manifest-path <absolute-Cargo.toml> --target-dir <external-build>
-ffn_patch_probe <absolute-request.json>
+cargo +nightly-2026-11-09 build --locked --offline --release --example ffn_probe --manifest-path <absolute-Cargo.toml> --target-dir <external-build>
+ffn_probe <absolute-request.json>
 ```
 
 The request has `schemaVersion:1`, absolute `modelPath`, optional absolute

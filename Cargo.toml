@@ -76,7 +76,8 @@ test = true
 required-features = ["cli"]
 
 [[example]]
-name = "ffn_patch_probe"
+name = "ffn_probe"
+path = "examples/ffn_patch_probe.rs"
 test = true
 required-features = ["cli"]
 

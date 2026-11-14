@@ -190,6 +190,56 @@ does not substitute for them. Neither matrix loads the full model.
 See [runtime conformance](prism-upstream-tests.md) for complete reference coverage
 and [server acceptance](../server/README.md) for the private-service protocol.
 
+### Local source sanity
+
+The tracked [pre-push hook](../.githooks/pre-push) checks the immutable outgoing
+branch and tag commits supplied by Git, including non-HEAD refs. A private
+temporary index materializes each distinct commit; staged or unstaged repairs
+cannot conceal a broken outgoing commit. Annotated tags peel to commits,
+deletions introduce no source, and an absent remote base selects the full tree.
+Checks for a shared tip combine the paths selected by every ref that sends it.
+Git replacement refs cannot redirect bootstrap or outgoing-object inspection.
+
+Enable the hook once in this clone:
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+The [native checker](../tools/source-sanity/README.md) requires Windows ARM64,
+PowerShell 7.6+, Git, the pinned Rust toolchain and locked dependencies already
+cached. Prepare its source/digest-bound executable from committed `HEAD` under
+an externally supervised, predeclared source-build allowance:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .github/ci/Check-PushSanity.ps1 -Prepare
+```
+
+Preparation binds the helper to the committed manifest, lockfile, compiler pin,
+Cargo configuration and checker source, plus its executable SHA-256 digest.
+A missing, stale or corrupt helper blocks checking until preparation succeeds.
+The ordinary hook does not compile. Changes to checking-policy scripts come
+from committed `HEAD`; outgoing snapshots cannot replace those assertions.
+
+The screen parses changed PowerShell without executing it, checks workspace
+Rust formatting when Rust/build/formatter inputs change, and uses the existing
+workflow syntax, local-action-input and immutable-reference checks when workflow
+inputs change. A supplied `PRISM_ACTIONLINT_PATH` is a trusted, preprovisioned
+actionlint 1.7.12 executable; otherwise the existing workflow adapter verifies
+its pinned release archive. The screen invokes no Python or model workloads.
+Prism's existing language and hosted standards policies continue to apply.
+
+Commands run inside native Windows Jobs with bounded output and one aggregate
+allowance, including bootstrap and snapshot intake. New work stops at 270
+seconds to reserve time for cleanup inside five minutes. AC power and charge
+are observed before and after; unavailable battery-saver status stays unknown.
+These correctness checks make no performance-comparison claim.
+
+Foundation retains compilation, strict analyzers and complete correctness
+acceptance. The helper is registered in the ordinary Rust package checks.
+Do not bypass a failing hook; repair missing prerequisites or the outgoing
+commit. The owner retains push and CI authority.
+
 ### Focused checks before local delivery
 
 Before committing a workflow or composite action, run:

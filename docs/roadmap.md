@@ -38,3 +38,8 @@ and upstream source identities are recorded in [NOTICE](../NOTICE).
   bundle and Runner repin, explicit diagnostic deadlines, long-prefill Stop/retry
   and confirmed owner cleanup. Model-free virtual-time checks do not qualify
   actual-model long-prompt behavior or throughput.
+
+- [ ] Qualify the local immutable-source guard in Foundation: native and fallback
+  strict analysis, outgoing branch/tag and replacement-object isolation,
+  committed-policy controls, receipt invalidation, process/output bounds and
+  cleanup. Focused local checks supply no hosted acceptance verdict.

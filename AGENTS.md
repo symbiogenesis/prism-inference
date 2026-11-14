@@ -4,6 +4,11 @@ Never push anything, including `main`, branches or tags, directly or through
 scripts. The owner handles every push from the
 `C:\Users\symbi\source\repos\prism-inference` clone. Keep the primary checkout on
 local `main`, review and integrate completed changes there, and leave them local.
+The tracked local push guard must remain enabled with `core.hooksPath = .githooks`.
+Every outgoing branch/tag tip must pass its immutable-source checks; missing
+prerequisites or failed checks block the push. Do not bypass or disable the hook.
+See [local source sanity](docs/build-and-validation.md#local-source-sanity).
+A passing local screen does not authorize a push or establish a CI verdict.
 Do not create Prism pull requests as the routine delivery workflow. Parallel
 workers use individual Git worktrees and commit each logical change separately.
 

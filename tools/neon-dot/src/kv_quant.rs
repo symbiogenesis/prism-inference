@@ -189,14 +189,18 @@ pub fn hadamard(values: &mut [f32; DIMENSION]) -> bool {
     }
     let mut staged = *values;
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("neon") {
-        native::hadamard(&mut staged);
+    let finite = if std::arch::is_aarch64_feature_detected!("neon") {
+        native::hadamard(&mut staged)
     } else {
         portable_hadamard(&mut staged);
-    }
+        staged.iter().all(|value| value.is_finite())
+    };
     #[cfg(not(target_arch = "aarch64"))]
-    portable_hadamard(&mut staged);
-    if !staged.iter().all(|value| value.is_finite()) {
+    let finite = {
+        portable_hadamard(&mut staged);
+        staged.iter().all(|value| value.is_finite())
+    };
+    if !finite {
         return false;
     }
     *values = staged;
@@ -236,14 +240,18 @@ pub fn rotate(
             apply_signs(&mut staged, signs);
         }
         #[cfg(target_arch = "aarch64")]
-        if neon {
-            native::hadamard(&mut staged);
+        let finite = if neon {
+            native::hadamard(&mut staged)
         } else {
             portable_hadamard(&mut staged);
-        }
+            staged.iter().all(|value| value.is_finite())
+        };
         #[cfg(not(target_arch = "aarch64"))]
-        portable_hadamard(&mut staged);
-        if !staged.iter().all(|value| value.is_finite()) {
+        let finite = {
+            portable_hadamard(&mut staged);
+            staged.iter().all(|value| value.is_finite())
+        };
+        if !finite {
             return false;
         }
         if inverse {
@@ -361,11 +369,11 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
 )]
 mod native {
     use core::arch::aarch64::{
-        float32x4_t, uint8x16x4_t, vaddq_f32, vaddq_f64, vandq_u32, vcltq_u32, vcvt_f64_f32,
-        vcvt_high_f64_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u32, vget_low_f32, vld1q_f32,
-        vld1q_s32, vld1q_u8, vld1q_u8_x4, vminvq_u32, vmulq_f32, vmulq_f64, vmulq_u32, vorrq_u8,
-        vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u32, vreinterpretq_u32_f32, vshlq_u32,
-        vst1q_f32, vst1q_f64, vsubq_f32,
+        float32x4_t, float32x4x4_t, uint8x16x4_t, vaddq_f32, vaddq_f64, vandq_u32, vcltq_u32,
+        vcvt_f64_f32, vcvt_high_f64_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u32, vget_low_f32,
+        vld1q_f32, vld1q_s32, vld1q_u8, vld1q_u8_x4, vld4q_f32, vminvq_u32, vmulq_f32, vmulq_f64,
+        vmulq_u32, vorrq_u8, vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u32,
+        vreinterpretq_u32_f32, vshlq_u32, vst1q_f32, vst1q_f64, vst4q_f32, vsubq_f32,
     };
 
     use super::DIMENSION;
@@ -507,18 +515,37 @@ mod native {
         vreinterpretq_f32_u8(vqtbl4q_u8(table, vorrq_u8(bases, offsets)))
     }
 
-    pub(super) fn hadamard(values: &mut [f32; DIMENSION]) {
+    pub(super) fn hadamard(values: &mut [f32; DIMENSION]) -> bool {
         // SAFETY: caller detects baseline NEON and supplies one unique fixed
         // 256-coordinate staging array, retained entirely within this call.
-        unsafe { hadamard_neon(values) };
+        unsafe { hadamard_neon(values) }
     }
 
     #[target_feature(enable = "neon")]
-    fn hadamard_neon(values: &mut [f32; DIMENSION]) {
-        super::butterfly(values, 1);
-        super::butterfly(values, 2);
+    fn hadamard_neon(values: &mut [f32; DIMENSION]) -> bool {
+        // Deinterleaving places the same coordinate from four independent
+        // four-value blocks in each vector. Preserve the first two butterfly
+        // stages in registers, with exactly their original add/subtract order.
+        for chunk in values.as_chunks_mut::<16>().0 {
+            // SAFETY: the unique chunk contains sixteen initialized values;
+            // the four-way unaligned load reads exactly those coordinates.
+            let input = unsafe { vld4q_f32(chunk.as_ptr()) };
+            let first_sum = vaddq_f32(input.0, input.1);
+            let first_difference = vsubq_f32(input.0, input.1);
+            let second_sum = vaddq_f32(input.2, input.3);
+            let second_difference = vsubq_f32(input.2, input.3);
+            let output = float32x4x4_t(
+                vaddq_f32(first_sum, second_sum),
+                vaddq_f32(first_difference, second_difference),
+                vsubq_f32(first_sum, second_sum),
+                vsubq_f32(first_difference, second_difference),
+            );
+            // SAFETY: the same unique sixteen-value chunk admits all four
+            // interleaved result vectors, restoring the original row order.
+            unsafe { vst4q_f32(chunk.as_mut_ptr(), output) };
+        }
         let mut half = 4;
-        while half < DIMENSION {
+        while half < DIMENSION / 2 {
             for block in values.chunks_exact_mut(half * 2) {
                 let (left, right) = block.split_at_mut(half);
                 for (left, right) in left
@@ -542,14 +569,37 @@ mod native {
             }
             half *= 2;
         }
+        // The final half-width-128 butterfly already visits every output.
+        // Normalize and check each result before its only store, retaining the
+        // separate binary32 addition/subtraction and multiplication boundary.
         let normalization = vdupq_n_f32(0.0625);
-        for chunk in values.as_chunks_mut::<4>().0 {
-            // SAFETY: the fixed chunk contains four initialized coordinates.
-            let value = unsafe { vld1q_f32(chunk.as_ptr()) };
-            let scaled = vmulq_f32(value, normalization);
-            // SAFETY: chunk is unique and has room for all four result values.
-            unsafe { vst1q_f32(chunk.as_mut_ptr(), scaled) };
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        let mut finite = vdupq_n_u32(u32::MAX);
+        let (left, right) = values.split_at_mut(DIMENSION / 2);
+        for (left, right) in left
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(right.as_chunks_mut::<4>().0)
+        {
+            // SAFETY: left and right are disjoint initialized four-value
+            // chunks of the unique row and stay valid through both stores.
+            let a = unsafe { vld1q_f32(left.as_ptr()) };
+            // SAFETY: right supplies its own disjoint initialized vector.
+            let b = unsafe { vld1q_f32(right.as_ptr()) };
+            let sum = vmulq_f32(vaddq_f32(a, b), normalization);
+            let difference = vmulq_f32(vsubq_f32(a, b), normalization);
+            let sum_magnitude = vandq_u32(vreinterpretq_u32_f32(sum), magnitude);
+            let difference_magnitude = vandq_u32(vreinterpretq_u32_f32(difference), magnitude);
+            finite = vandq_u32(finite, vcltq_u32(sum_magnitude, infinity));
+            finite = vandq_u32(finite, vcltq_u32(difference_magnitude, infinity));
+            // SAFETY: left remains a unique four-value output chunk.
+            unsafe { vst1q_f32(left.as_mut_ptr(), sum) };
+            // SAFETY: right is disjoint and has room for its four outputs.
+            unsafe { vst1q_f32(right.as_mut_ptr(), difference) };
         }
+        vminvq_u32(finite) != 0
     }
 
     #[cfg(test)]
@@ -680,6 +730,56 @@ mod tests {
                         .map(|values| values.map(f32::to_bits)),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn x1_hadamard_fused_stages_match_ordered_arithmetic_and_atomic_failure() {
+        for case in 0..32_u32 {
+            let mut word = 0x9328_17af_u32.wrapping_add(case);
+            let input: [f32; DIMENSION] = std::array::from_fn(|index| {
+                word = word.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                match case % 4 {
+                    // Both signs of zero and subnormal coordinates.
+                    0 => f32::from_bits(word & 0x807f_ffff),
+                    // Exclude the all-ones exponent while retaining wide
+                    // cancellation, intermediate overflow and rounding cases.
+                    1 => f32::from_bits(word & 0xfeff_ffff),
+                    2 => (f32::from(index.to_le_bytes()[0]) - 127.5) * 0.03125,
+                    _ => {
+                        if index.is_multiple_of(2) {
+                            f32::MAX * 0.25
+                        } else {
+                            -f32::MAX * 0.25
+                        }
+                    }
+                }
+            });
+            // Independent scalar indexing retains every original butterfly
+            // stage and the later normalization, with no native tile helper.
+            let mut expected = input;
+            for stage in 0..8 {
+                let width = 1 << stage;
+                for base in (0..DIMENSION).step_by(2 * width) {
+                    for lane in 0..width {
+                        let a = expected[base + lane];
+                        let b = expected[base + width + lane];
+                        expected[base + lane] = a + b;
+                        expected[base + width + lane] = a - b;
+                    }
+                }
+            }
+            for value in &mut expected {
+                *value *= 0.0625;
+            }
+            let finite = expected.iter().all(|value| value.is_finite());
+            let mut actual = input;
+            assert_eq!(hadamard(&mut actual), finite, "case {case}");
+            assert_eq!(
+                actual.map(f32::to_bits),
+                if finite { expected } else { input }.map(f32::to_bits),
+                "case {case}",
+            );
         }
     }
 

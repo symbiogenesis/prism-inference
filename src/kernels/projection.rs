@@ -347,6 +347,7 @@ impl PreparedMatvec<'_> {
                 || !gate_cols.is_multiple_of(128)
                 || !down_cols.is_multiple_of(128)
                 || residual.is_some_and(|res| res.len() != down_rows || !is_finite_slice(res))
+                || !executor.supports_f32_ffn_chain(tensors)
             {
                 return Err(invalid(
                     "incompatible prepared projection executor activation",
@@ -395,6 +396,7 @@ impl PreparedMatvec<'_> {
                 || gate_cols != up_cols
                 || gate_rows != up_rows
                 || !gate_cols.is_multiple_of(128)
+                || !executor.supports_f32_ffn_swiglu(gate, up)
             {
                 return Err(invalid(
                     "incompatible prepared projection executor activation",
@@ -435,6 +437,11 @@ impl PreparedMatvec<'_> {
             return Err(invalid("mismatched projection group outputs"));
         }
         let result = (|| {
+            if !executor.supports_f32_group(tensors) {
+                return Err(invalid(
+                    "projection executor does not support this F32 group",
+                ));
+            }
             for &tensor in tensors {
                 let (columns, _, _) = dimensions(tensor)?;
                 if !self.is_compatible(tensor)?
@@ -547,3 +554,6 @@ impl PreparedMatvec<'_> {
         result
     }
 }
+
+#[cfg(test)]
+mod tests;

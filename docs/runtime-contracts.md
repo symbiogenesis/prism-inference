@@ -244,5 +244,14 @@ The methodology follows ggml's [fusion testing][fusion-tests] and
 [boundary-dependent rounding regression][fusion-boundaries]; no upstream
 implementation is imported.
 
+Prepared external FFN-chain, FFN-SwiGLU and sibling-group calls validate their
+specific F32 capability before submission, including direct library calls.
+Unsupported capabilities reject and clear provisional outputs without calling
+the executor. This does not substitute F32 arithmetic for the pinned F16/BF16
+activation-rounding contracts. `projection_precision_` controls distinguish
+F32 activation bits, BF16 range beyond F16, intentional BF16 rounding and F16
+range rejection, following the [operand-precision regression approach][precision-tests].
+
 [fusion-tests]: https://github.com/ggml-org/llama.cpp/pull/30769
 [fusion-boundaries]: https://github.com/ggml-org/llama.cpp/pull/31688
+[precision-tests]: https://github.com/ggml-org/llama.cpp/pull/31896

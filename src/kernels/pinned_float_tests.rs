@@ -45,6 +45,43 @@ fn tensor(kind: u32, count: usize, bytes: Vec<u8>) -> Tensor {
 }
 
 #[test]
+fn projection_precision_preserves_bf16_range_and_declared_activation_rounding() -> Result<()> {
+    for count in [1, 16, 17, 32] {
+        for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+            for pinned in [false, true] {
+                let mut scratch = if pinned {
+                    MatvecScratch::with_pinned_backend(backend)
+                } else {
+                    MatvecScratch::with_backend(backend)
+                };
+                let mut input = vec![0.0; count];
+                input[0] = 131_072.0;
+                let bf16 = tensor(BF16, count, super::quantize_row(BF16, &vec![1.0; count])?);
+                let mut output = vec![f32::NAN];
+                matvec_into(&bf16, &input, &mut output, &mut scratch)?;
+                assert_eq!(output[0].to_bits(), 131_072.0_f32.to_bits());
+
+                // The pinned F16 contract explicitly rounds activations to
+                // F16; it must reject this range instead of returning infinity.
+                let f16 = tensor(F16, count, super::quantize_row(F16, &vec![1.0; count])?);
+                assert!(matvec_into(&f16, &input, &mut output, &mut scratch).is_err());
+                assert!(output.is_empty());
+
+                // F32 source activations retain distinctions below one F16 or
+                // BF16 ULP. The declared BF16 preparation still rounds them.
+                input[0] = f32::from_bits(0x3f80_0001);
+                let f32 = tensor(F32, count, super::quantize_row(F32, &vec![1.0; count])?);
+                matvec_into(&f32, &input, &mut output, &mut scratch)?;
+                assert_eq!(output[0].to_bits(), 0x3f80_0001);
+                matvec_into(&bf16, &input, &mut output, &mut scratch)?;
+                assert_eq!(output[0].to_bits(), 1.0_f32.to_bits());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn aligned_pinned_float_projections_match_native_without_changing_generic_or_bf16() -> Result<()> {
     let capture: Capture = serde_json::from_str(include_str!(
         "../../tests/fixtures/swift-float-projection-parity.json"

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! One fixed factual smoke arm, externally supervised with an original deadline.
 //!
-//! Standard versus absent adapter is an ablation ceiling, not a quality verdict.
+//! An edited arm retains the adapter at the same scale and pins its new weights.
 
 use std::{
     fmt::Write as _,
@@ -17,7 +17,10 @@ use bonsai_prism_runtime::{
     Result,
     graph::KvCachePolicy,
     kernels::{MatvecBackend, RowParallelism},
-    model::{lora::SWIFT_ADAPTER_SHA256, swift::Representation},
+    model::{
+        lora::{EditedAdapter, SWIFT_ADAPTER_BYTES, SWIFT_ADAPTER_SHA256},
+        swift::Representation,
+    },
     runtime::{Cancellation, Finish, GenerationPhase, GenerationTimings, PromptReuse},
     swift_session::{SwiftSession, TextEvent},
 };
@@ -53,6 +56,8 @@ const CASES: [(&str, &str, &str); 4] = [
 struct Request {
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
+    edited_adapter_sha256: Option<String>,
+    edited_adapter_bytes: Option<u64>,
     condition: String,
     source_commit: String,
     deadline_unix_milliseconds: u64,
@@ -87,6 +92,44 @@ fn normalized(text: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+impl Request {
+    fn adapter_sha256(&self) -> Option<&str> {
+        if self.condition == "edited" {
+            self.edited_adapter_sha256.as_deref()
+        } else {
+            self.adapter_path.as_ref().map(|_| SWIFT_ADAPTER_SHA256)
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let edited = self.condition == "edited";
+        if !self.model_path.is_absolute()
+            || !self.output_path.is_absolute()
+            || self.adapter_path.as_ref().is_some_and(|path| !path.is_absolute())
+            || !matches!(self.condition.as_str(), "standard" | "none" | "edited")
+            || (self.condition != "none") != self.adapter_path.is_some()
+            || !lowercase_hex(&self.source_commit, 40)
+            || self.edited_adapter_sha256.is_some() != edited
+            || self.edited_adapter_bytes.is_some() != edited
+            || (edited
+                && (self.edited_adapter_bytes != Some(SWIFT_ADAPTER_BYTES)
+                    || self.edited_adapter_sha256.as_deref().is_none_or(|hash| {
+                        !lowercase_hex(hash, 64) || hash == SWIFT_ADAPTER_SHA256
+                    })))
+        {
+            return Err(reject("Invalid fixed factual smoke profile or source declaration."));
+        }
+        Ok(())
+    }
+}
+
 fn check(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         return Err(reject("The original factual-smoke deadline expired."));
@@ -113,7 +156,22 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
     check(deadline)?;
     record["stage"] = json!("model-load");
     let started = Instant::now();
-    let session = SwiftSession::load_profile_with_context(
+    let session = if request.condition == "edited" {
+        SwiftSession::load_edited_profile_with_context(
+            &request.model_path,
+            Representation::Pq2,
+            EditedAdapter {
+                path: request.adapter_path.as_deref().ok_or_else(|| reject("Missing edited adapter."))?,
+                bytes: request.edited_adapter_bytes.ok_or_else(|| reject("Missing edited adapter length."))?,
+                sha256: request.edited_adapter_sha256.as_deref().ok_or_else(|| reject("Missing edited adapter digest."))?,
+            },
+            MatvecBackend::ExperimentalNeon,
+            42,
+            RowParallelism::new(4)?,
+            KvCachePolicy::Rotated4,
+            256,
+        )
+    } else { SwiftSession::load_profile_with_context(
         &request.model_path,
         Representation::Pq2,
         request.adapter_path.as_deref(),
@@ -122,19 +180,28 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
         RowParallelism::new(4)?,
         KvCachePolicy::Rotated4,
         256,
-    );
+    ) };
     record["loadMilliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
     let mut session = session?;
     session.set_projection_executor(None);
     if session.row_workers() != 4
         || session.prompt_reuse() != PromptReuse::Disabled
-        || session.adapter_identity() != request.adapter_path.as_ref().map(|_| SWIFT_ADAPTER_SHA256)
+        || session.adapter_identity() != request.adapter_sha256()
     {
         return Err(reject(
             "The factual smoke session disagrees with its fixed profile.",
         ));
     }
     record["modelLoaded"] = json!(true);
+    record["adapterStorage"] = session.adapter_storage().map_or(Value::Null, |storage| json!({
+        "linearABytes":storage.linear_a_bytes, "embeddingABytes":storage.embedding_a_bytes,
+        "uniqueBBytes":storage.unique_b_bytes, "indexBytes":storage.index_bytes,
+        "totalPayloadBytes":storage.total_payload_bytes,
+        "linearACoefficients":storage.linear_a_coefficients,
+        "storedLinearACoefficients":storage.stored_linear_a_coefficients,
+        "sparseSites":storage.sparse_sites,
+        "scope":"Retained coefficient/index allocation capacity, excluding allocator/container overhead and scratch."
+    }));
     record["graphIdentity"] = json!(session.decoder_identity());
     for (id, prompt, expected) in CASES {
         check(deadline)?;
@@ -230,24 +297,7 @@ fn run() -> Result<()> {
         return Err(reject("Request exceeds 64 KiB."));
     }
     let request: Request = serde_json::from_slice(&bytes)?;
-    if !request.model_path.is_absolute()
-        || !request.output_path.is_absolute()
-        || request
-            .adapter_path
-            .as_ref()
-            .is_some_and(|path| !path.is_absolute())
-        || !matches!(request.condition.as_str(), "standard" | "none")
-        || (request.condition == "standard") != request.adapter_path.is_some()
-        || request.source_commit.len() != 40
-        || !request
-            .source_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(reject(
-            "Invalid fixed factual smoke profile or source declaration.",
-        ));
-    }
+    request.validate()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let remaining = Duration::from_millis(request.deadline_unix_milliseconds)
         .checked_sub(now)
@@ -265,10 +315,12 @@ fn run() -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&request.output_path)?;
-    let mut record = json!({"schemaVersion":1, "kind":"swift-fixed-factual-smoke",
+    let mut record = json!({"schemaVersion":2, "kind":"swift-fixed-factual-smoke",
         "sourceCommitDeclaration":request.source_commit, "condition":request.condition,
         "modelSha256":Representation::Pq2.model_sha256(), "weightRepresentation":"PQ2_0",
-        "adapterSha256":request.adapter_path.as_ref().map(|_| SWIFT_ADAPTER_SHA256),
+        "adapterSha256":request.adapter_sha256(),
+        "adapterSourceSha256":if request.condition == "edited" {Some(SWIFT_ADAPTER_SHA256)} else {None},
+        "adapterArithmetic":if request.condition == "edited" {"edited-sparse-a-u16-f64-v1"} else {"native-dense"},
         "adapterScaleBits":if request.adapter_path.is_some() {"3fa66666"} else {"00000000"},
         "rowWorkers":4, "backend":"experimental-neon-cpu", "kvCache":"rsq4",
         "contextTokens":256, "outputTokensPerCase":OUTPUT_TOKENS, "seed":42,
@@ -298,7 +350,29 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::normalized;
+    use super::{Request, SWIFT_ADAPTER_BYTES, normalized};
+    use serde_json::json;
+
+    #[test]
+    fn edited_arm_requires_new_digest_length_and_adapter() -> bonsai_prism_runtime::Result<()> {
+        let root = std::env::current_dir()?;
+        let value = json!({"modelPath":root.join("model.gguf"),
+            "adapterPath":root.join("edited.gguf"), "outputPath":root.join("facts.json"),
+            "condition":"edited", "editedAdapterSha256":"a".repeat(64),
+            "editedAdapterBytes":SWIFT_ADAPTER_BYTES,
+            "sourceCommit":"b".repeat(40), "deadlineUnixMilliseconds":1});
+        let request: Request = serde_json::from_value(value.clone())?;
+        request.validate()?;
+        for (field, bad) in [("adapterPath", serde_json::Value::Null),
+            ("editedAdapterBytes", json!(1)), ("editedAdapterSha256", json!("A".repeat(64))),
+            ("condition", json!("standard"))] {
+            let mut invalid = value.clone();
+            invalid[field] = bad;
+            let request: Request = serde_json::from_value(invalid)?;
+            assert!(request.validate().is_err(), "{field}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn factual_gate_rejects_explanations_and_wrong_answers() {

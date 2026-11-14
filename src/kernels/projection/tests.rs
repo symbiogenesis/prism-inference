@@ -116,14 +116,14 @@ fn projection_precision_capabilities_gate_fused_and_group_callbacks() -> Result<
             )
             .is_err()
     );
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     output.push(17.0);
     assert!(
         prepared
             .matvec_ffn_swiglu_with_executor(&gate, &up, &mut output, &mut executor)
             .is_err()
     );
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
     let mut other = vec![23.0];
     output.push(17.0);
     assert!(
@@ -135,8 +135,8 @@ fn projection_precision_capabilities_gate_fused_and_group_callbacks() -> Result<
             )
             .is_err()
     );
-    assert!(output.is_empty());
-    assert!(other.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
+    assert_eq!(other, Vec::<f32>::new());
     assert_eq!(executor.calls, 0);
     assert_eq!(executor.capability_queries.get(), 1);
     Ok(())
@@ -164,8 +164,8 @@ fn projection_precision_validates_group_geometry_before_capability_callback() ->
             )
             .is_err()
     );
-    assert!(output.is_empty());
-    assert!(other.is_empty());
+    assert_eq!(output, Vec::<f32>::new());
+    assert_eq!(other, Vec::<f32>::new());
     assert_eq!(executor.capability_queries.get(), 0);
     assert_eq!(executor.calls, 0);
     Ok(())

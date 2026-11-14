@@ -576,7 +576,7 @@ mod tests {
             }
         }
         let mut transformed = hidden.clone();
-        for (group, block) in transformed.chunks_exact_mut(1024).enumerate() {
+        for (group, block) in transformed.as_chunks_mut::<1024>().0.iter_mut().enumerate() {
             // Retained signs use each original group's slice. Whole-block
             // omission must commute with this independent signed transform.
             let sign = if group % 2 == 0 { -1.0 } else { 1.0 };

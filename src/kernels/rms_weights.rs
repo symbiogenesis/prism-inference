@@ -8,6 +8,10 @@ use crate::{Result, invalid};
 /// has joined. Input, epsilon, geometry and output checks remain per operation.
 /// No transformed weights, cached pointers or persistent storage are retained.
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "The private module reexports this internal type crate-wide through kernels."
+)]
 pub(crate) struct RmsNormWeights<'a> {
     values: &'a [f32],
 }

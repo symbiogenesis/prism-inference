@@ -38,9 +38,9 @@ pub struct FusionStatistics {
     pub norm_hadamard: FusionCount,
     /// Residual addition, RMS normalization and Hadamard preparation.
     pub add_norm_hadamard: FusionCount,
-    /// Read-only SwiGLU and Hadamard preparation without an adapter.
+    /// Read-only `SwiGLU` and Hadamard preparation without an adapter.
     pub swiglu_hadamard: FusionCount,
-    /// SwiGLU and Hadamard preparation preserving original-basis adapter input.
+    /// `SwiGLU` and Hadamard preparation preserving original-basis adapter input.
     pub adapter_swiglu_hadamard: FusionCount,
     /// Scoped external gate/up/SwiGLU submission.
     pub external_ffn_swiglu: FusionCount,

@@ -31,6 +31,10 @@ fn prefix(graph: &str, tokens: &[u32]) -> Result<String> {
     clippy::too_many_lines,
     reason = "Keep original replay, reset, changed-graph replay and publication ordering auditable."
 )]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "The parent binary owns this capture entry point; it is not a public API."
+)]
 pub(super) fn capture(
     request: &Request,
     representation: Representation,

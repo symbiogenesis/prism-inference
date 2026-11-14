@@ -74,7 +74,12 @@ fn reference(
                 gate,
             )?,
             Arithmetic::PinnedSwift => {
-                kernels::rms_norm_swiglu_in_place::<true>(out, &layer.norm, geometry.epsilon, gate)?
+                kernels::rms_norm_swiglu_in_place::<true>(
+                    out,
+                    &layer.norm,
+                    geometry.epsilon,
+                    gate,
+                )?;
             }
         }
     }

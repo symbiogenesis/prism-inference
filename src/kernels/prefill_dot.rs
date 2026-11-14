@@ -356,7 +356,7 @@ impl Block {
 )]
 pub(super) fn dot_eight_rows<const TOKENS: usize>(
     rows: [&[u8]; 8],
-    preparations: &[super::super::MatvecScratch],
+    preparations: &[MatvecScratch],
     kind: u32,
     columns: usize,
     pinned: bool,
@@ -400,7 +400,7 @@ pub(super) fn dot_eight_rows<const TOKENS: usize>(
 )]
 pub(super) fn dot_four_rows<const TOKENS: usize>(
     rows: [&[u8]; 4],
-    preparations: &[super::super::MatvecScratch],
+    preparations: &[MatvecScratch],
     kind: u32,
     columns: usize,
     pinned: bool,
@@ -444,7 +444,7 @@ pub(super) fn dot_four_rows<const TOKENS: usize>(
 )]
 pub(super) fn dot_bf16_eight_rows<const TOKENS: usize>(
     rows: [&[u8]; 8],
-    preparations: &[super::super::MatvecScratch],
+    preparations: &[MatvecScratch],
     backend: MatvecBackend,
 ) -> Option<Result<[[f32; TOKENS]; 8]>> {
     #[cfg(all(
@@ -467,7 +467,7 @@ pub(super) fn dot_bf16_eight_rows<const TOKENS: usize>(
 )]
 pub(super) fn dot_bf16_four_rows<const TOKENS: usize>(
     rows: [&[u8]; 4],
-    preparations: &[super::super::MatvecScratch],
+    preparations: &[MatvecScratch],
     backend: MatvecBackend,
 ) -> Option<Result<[[f32; TOKENS]; 4]>> {
     #[cfg(all(
@@ -491,7 +491,7 @@ pub(super) fn dot_bf16_four_rows<const TOKENS: usize>(
 pub(super) fn dot_quantized_eight_rows<const TOKENS: usize>(
     kind: u32,
     rows: [&[u8]; 8],
-    preparations: &[super::super::MatvecScratch],
+    preparations: &[MatvecScratch],
     backend: MatvecBackend,
 ) -> Option<Result<[[f32; TOKENS]; 8]>> {
     #[cfg(all(
@@ -502,10 +502,10 @@ pub(super) fn dot_quantized_eight_rows<const TOKENS: usize>(
         target_feature = "neon"
     ))]
     if backend != MatvecBackend::Scalar {
-        if kind == super::super::Q8_0 {
+        if kind == Q8_0 {
             return super::super::neon::dot_q8_0_eight_rows_tile(rows, preparations);
         }
-        if kind == super::super::Q4_0 {
+        if kind == Q4_0 {
             return super::super::neon::dot_q4_0_eight_rows_tile(rows, preparations);
         }
     }
@@ -520,7 +520,7 @@ pub(super) fn dot_quantized_eight_rows<const TOKENS: usize>(
 pub(super) fn dot_quantized_four_rows<const TOKENS: usize>(
     kind: u32,
     rows: [&[u8]; 4],
-    preparations: &[super::super::MatvecScratch],
+    preparations: &[MatvecScratch],
     backend: MatvecBackend,
 ) -> Option<Result<[[f32; TOKENS]; 4]>> {
     #[cfg(all(
@@ -531,10 +531,10 @@ pub(super) fn dot_quantized_four_rows<const TOKENS: usize>(
         target_feature = "neon"
     ))]
     if backend != MatvecBackend::Scalar {
-        if kind == super::super::Q8_0 {
+        if kind == Q8_0 {
             return super::super::neon::dot_q8_0_four_rows_tile(rows, preparations);
         }
-        if kind == super::super::Q4_0 {
+        if kind == Q4_0 {
             return super::super::neon::dot_q4_0_four_rows_tile(rows, preparations);
         }
     }

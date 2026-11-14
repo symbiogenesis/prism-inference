@@ -264,7 +264,7 @@ fn ffn_surrogate_discards_late_failure_and_rejects_independent_patches() -> Resu
     let mut logits = vec![1.0];
     // FFN observation staging succeeds before the final projection overflows.
     assert!(probe.evaluate_surrogate_into(0, &mut logits).is_err());
-    assert!(logits.is_empty());
+    assert_eq!(logits, Vec::<f32>::new());
     let row = probe.evaluate_surrogate_into(1, &mut logits)?;
     assert_eq!(row.token_index, 0);
     let mut fresh = FfnProbe::new(graph()?, 0, None)?;
@@ -276,6 +276,6 @@ fn ffn_surrogate_discards_late_failure_and_rejects_independent_patches() -> Resu
     let patch = FfnPatch::new(vec![0.0; 2], vec![0.0; 2], 0.0)?;
     let mut patched = FfnProbe::new(graph()?, 0, Some(patch))?;
     assert!(patched.evaluate_surrogate_into(1, &mut logits).is_err());
-    assert!(logits.is_empty());
+    assert_eq!(logits, Vec::<f32>::new());
     Ok(())
 }

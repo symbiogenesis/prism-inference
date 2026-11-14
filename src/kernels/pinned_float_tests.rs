@@ -65,7 +65,7 @@ fn projection_precision_preserves_bf16_range_and_declared_activation_rounding() 
                 // F16; it must reject this range instead of returning infinity.
                 let f16 = tensor(F16, count, super::quantize_row(F16, &vec![1.0; count])?);
                 assert!(matvec_into(&f16, &input, &mut output, &mut scratch).is_err());
-                assert!(output.is_empty());
+                assert_eq!(output, Vec::<f32>::new());
 
                 // F32 source activations retain distinctions below one F16 or
                 // BF16 ULP. The declared BF16 preparation still rounds them.

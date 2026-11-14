@@ -3,6 +3,7 @@
 use super::{
     Decoder, MatvecBackend, Qwen35, Result, fixture, rank_one_factors, rank_one_graph, weight,
 };
+use bonsai_gguf::MetadataValue;
 use bonsai_prism_runtime::graph::weight_patch::{FfnPatch, FfnProbe};
 
 fn active_ffn() -> super::Model {

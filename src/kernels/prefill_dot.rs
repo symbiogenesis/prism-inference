@@ -1,7 +1,59 @@
 //! Exact integer reductions over one decoded block shared by a prompt tile.
 
-use super::super::{MatvecBackend, pq2_values, ptq1_values, q8_native_lanes};
-use crate::Result;
+use super::super::{
+    MatvecBackend, MatvecScratch, Q4_0, Q8_0, dot_integer, finite, pq2_values, ptq1_values,
+    q8_native_lanes, scale,
+};
+use crate::{Result, invalid};
+
+/// Portable legacy tiles decode one stack-scoped weight block for every token.
+/// The counter follows successful block decoding, independently of token count.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Retain dot_legacy's per-block scale multiplication and separate binary32 addition."
+)]
+pub(super) fn dot_legacy_tile_row<const TOKENS: usize>(
+    kind: u32,
+    row: &[u8],
+    preparations: &[MatvecScratch],
+    decoded_blocks: &mut u64,
+) -> Result<[f32; TOKENS]> {
+    let bytes = match kind {
+        Q4_0 => 18,
+        Q8_0 => 34,
+        _ => return Err(invalid("unsupported shared legacy tile format")),
+    };
+    if preparations.is_empty()
+        || preparations.len() > TOKENS
+        || row.is_empty()
+        || !row.len().is_multiple_of(bytes)
+        || preparations
+            .iter()
+            .any(|scratch| scratch.q8.len() != row.len() / bytes)
+    {
+        return Err(invalid("invalid shared legacy tile geometry"));
+    }
+    let mut sums = [0.0_f32; TOKENS];
+    for (index, block) in row.chunks_exact(bytes).enumerate() {
+        let weight_scale = scale(block)?;
+        let weights: [i16; 32] = std::array::from_fn(|column| {
+            if kind == Q4_0 {
+                i16::from((block[2 + column % 16] >> (4 * (column / 16))) & 15) - 8
+            } else {
+                i16::from(i8::from_ne_bytes([block[2 + column]]))
+            }
+        });
+        *decoded_blocks = decoded_blocks.saturating_add(1);
+        for (sum, scratch) in sums.iter_mut().zip(preparations) {
+            let activation = &scratch.q8[index];
+            *sum += (weight_scale * activation.scale) * dot_integer(&weights, &activation.values);
+        }
+    }
+    for sum in sums.iter_mut().take(preparations.len()) {
+        *sum = finite(*sum)?;
+    }
+    Ok(sums)
+}
 
 #[cfg(all(
     feature = "experimental-neon",

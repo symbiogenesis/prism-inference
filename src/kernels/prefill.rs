@@ -47,6 +47,7 @@ fn dot_quantized_tile_row(
     row: &[u8],
     preparations: &[MatvecScratch],
     backend: MatvecBackend,
+    decoded_blocks: &mut u64,
 ) -> Result<[f32; MAX_TILE_TOKENS]> {
     #[cfg(all(
         feature = "experimental-neon",
@@ -68,6 +69,9 @@ fn dot_quantized_tile_row(
         }
     }
     let _ = backend;
+    if matches!(kind, Q4_0 | Q8_0) {
+        return dot::dot_legacy_tile_row(kind, row, preparations, decoded_blocks);
+    }
     let mut sums = [0.0_f32; MAX_TILE_TOKENS];
     for (sum, scratch) in sums.iter_mut().zip(preparations) {
         *sum = match kind {
@@ -388,8 +392,8 @@ impl ProjectionTile {
                 let mut unused_blocks = 0_u64;
                 if matches!(tensor.kind, Q4_0 | Q8_0) {
                     let dot_quant_one =
-                        |row: &[u8], _: &mut u64| -> Result<[f32; MAX_TILE_TOKENS]> {
-                            dot_quantized_tile_row(tensor.kind, row, preparations, backend)
+                        |row: &[u8], decoded: &mut u64| -> Result<[f32; MAX_TILE_TOKENS]> {
+                            dot_quantized_tile_row(tensor.kind, row, preparations, backend, decoded)
                         };
                     return self.row_parallelism.fill_tile_four_rows(
                         &tensor.data,
@@ -442,7 +446,9 @@ impl ProjectionTile {
                     outputs,
                     &mut unused_blocks,
                     check,
-                    |row, _| dot_quantized_tile_row(tensor.kind, row, preparations, backend),
+                    |row, decoded| {
+                        dot_quantized_tile_row(tensor.kind, row, preparations, backend, decoded)
+                    },
                 );
             }
             if !matches!(tensor.kind, PQ2 | PTQ1) {
@@ -673,6 +679,10 @@ impl ProjectionTile {
 #[cfg(test)]
 #[path = "prefill_sibling_tests.rs"]
 mod sibling_tests;
+
+#[cfg(test)]
+#[path = "prefill_few_token_tests.rs"]
+mod few_token_tests;
 
 #[cfg(test)]
 mod tests {

@@ -118,6 +118,18 @@ four-row admission minimum. Transform, targeted-adapter and external-executor
 guards, joined error ordering and complete output clearing remain unchanged.
 This extends prompt tiles only and adds no scratch, helper API or precision mode.
 
+Portable Q4_0/Q8_0 prompt rows also decode each 32-weight block once for all
+tokens, with one stack-scoped 64-byte integer block. Each token retains its
+Q8_0 preparation, block-scale multiplication and separate binary32 addition;
+eligible native row/tile kernels keep their existing dispatch. No expanded
+matrix or additional retained scratch is introduced. Model-free few-token
+controls cover 2/3/7/9/17/24-token batches, row tails, odd-group PQ2, PTQ1,
+independent integer equations, late rejection and same-owner recovery. The
+existing PQ2/PTQ1 block sharing already covers these small batches; this adds
+no new prefill selection or measured throughput claim. Native/fallback Release
+analysis, actual-model state/adapter parity and complete-request benefit remain
+required before release selection.
+
 Full attention borrows immutable interleaved gate heads and normalizes queries
 into separate scratch. [Attention locality](inference-efficiency.md#attention-locality)
 defines grouped/paired cache traversal. Ordinary recurrent arithmetic remains

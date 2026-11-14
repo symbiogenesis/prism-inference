@@ -159,13 +159,13 @@ fn recurrent_rms_weight_scope_rejects_nonfinite_weights_and_never_reuses_stale_a
 -> Result<()> {
     for index in [0, 63, 127] {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let mut weights = vec![1.0; 128];
+            let mut weights = [1.0; 128];
             weights[index] = bad;
             assert!(RmsNormWeights::new(&weights).is_err());
             weights[index] = -0.0;
             let scope = RmsNormWeights::new(&weights)?;
-            let mut output = vec![0.5; 128];
-            scope.swiglu_in_place::<true>(&mut output, 0.000_001, &vec![0.75; 128])?;
+            let mut output = [0.5; 128];
+            scope.swiglu_in_place::<true>(&mut output, 0.000_001, &[0.75; 128])?;
             assert!(output.iter().all(|value| value.is_finite()));
             // The immutable borrow has ended; a newly mutated owner requires
             // fresh admission rather than inheriting a pointer-keyed verdict.

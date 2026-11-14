@@ -117,26 +117,31 @@ The result is limited to 4,096 symbols, 4,096 rules and 65,536 total rule elemen
 
 ## Generic reasoning-budget and UTF-8 operations
 
+This source route is retired from the native bridge. The Rust harness owns the
+bounded protocol below for both production Rust and a separately implemented
+reference. The legacy `cpp` reference-arm selector dispatches these operations
+to `reference_reasoning.rs`; sending them to the C++ executable rejects as unknown.
+No native execution or captured native output is claimed for this family.
+
 `utf8-is-complete` takes exact fields `Kind`, `Bytes` (0 through 65,536 integer
-bytes) and returns `{"Complete":boolean}` directly from
-`common_utf8_is_complete`. Raw bytes permit incomplete and invalid UTF-8 inputs.
+bytes) and returns `{"Complete":boolean}` under the pinned trailing-boundary
+contract. Raw bytes permit incomplete and invalid UTF-8 inputs.
 
 `reasoning-budget-trace` takes exact fields `Kind`, `Actions`, with 1 through
 4,096 actions. Every action has a `Kind` and a `Sampler` handle (0 through 31),
-or `null` for native APIs that accept a null sampler. Handles are owned only for
+or `null` for the pinned null-sampler behavior. Handles are owned only for
 that operation and freed on all exit paths. Handle lifetimes are checked before
-any native action executes. Additional fields and production calls are:
+an observable result is published. Additional fields and observations are:
 
 | Action Kind | Additional fields | Trace event |
 | --- | --- | --- |
 | `init` | `Vocabulary`: null; `StartSequences`, `EndSequences`: token sequence arrays; `ForcedTokens`: token array; `Budget`: i32; `InitialState`: enum 0 through 4 | `{}` |
-| `apply` | `Candidates`: objects with `Id` i32, `LogitBits` u32, `ProbabilityBits` u32; `Selected`: valid index or -1; `Sorted`: boolean | `Candidates`, `Selected`, `Sorted` after `llama_sampler_apply` |
+| `apply` | `Candidates`: objects with `Id` i32, `LogitBits` u32, `ProbabilityBits` u32; `Selected`: valid index or -1; `Sorted`: boolean | `Candidates`, `Selected`, `Sorted` after forcing |
 | `accept` | `Token`: i32 | `{}` |
 | `clone` | `Target`: unused handle | `{}` |
 | `state` | none | `{"State":enum}` |
 | `force` | none | `{"Forced":boolean}` |
 | `end-match` | none | `{"EndMatch":null}` or `{"EndMatch":[tokens]}` |
-| `reset` | none | `{}` |
 | `free` | none | `{}` |
 
 The response is `{"Trace":[events in action order]}`. Start and end sequence
@@ -145,7 +150,8 @@ forced sequence at most 1,024 tokens. Token IDs and budgets are signed 32-bit
 integers. Each apply has at most 4,096 candidates, with at most 65,536 candidates
 combined across the trace. Floats use their raw IEEE binary32 bits, preserving
 infinities and NaNs without JSON number conversions. The complete backing
-candidate vector is returned from the production sampler API.
+candidate vector is returned. The original source has no reset calls; this
+transport rejects reset rather than claiming additional source coverage.
 
 ## Generic tensor graphs
 

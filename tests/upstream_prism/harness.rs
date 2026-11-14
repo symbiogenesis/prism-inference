@@ -91,6 +91,7 @@ mod quantize_stats;
 mod reasoning_budget;
 mod recurrent_rollback;
 mod reference_provider;
+mod reference_reasoning;
 mod schema_python;
 mod tokenizer_roundtrip;
 mod validator;
@@ -497,7 +498,7 @@ const CASES: &[Case] = &[
     register(
         "test-reasoning-budget",
         "tests/test-reasoning-budget.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         reasoning_budget::run,
     ),
     register(
@@ -701,14 +702,16 @@ fn options() -> Result<Options> {
 impl Options {
     fn validate(&self) -> Result<()> {
         if matches!(self.target, Target::RustReference)
-            && (self.case.is_none_or(|case| case.id != MTP_ID)
+            && (self
+                .case
+                .is_none_or(|case| !reference_provider::supports(case.id))
                 || self.benchmark.is_some()
                 || self.diagnostic.is_some()
                 || self.bridge.is_some()
                 || self.common_bridge.is_some())
         {
             return Err(invalid(
-                "rust-reference supports only the explicit MTP source case without native bridges, benchmarks or diagnostics",
+                "rust-reference supports only explicit migrated source cases without native bridges, benchmarks or diagnostics",
             ));
         }
         if self.case.is_none()
@@ -950,6 +953,16 @@ fn main() -> Result<()> {
     });
     if matches!(options.target, Target::RustReference) {
         report["ObservationProvider"] = reference_provider::identity();
+    }
+    if matches!(options.target, Target::Cpp)
+        && options.benchmark.is_none()
+        && options.diagnostic.is_none()
+        && selected(options.case).any(|case| case.id == reference_reasoning::ID)
+    {
+        // `cpp` remains the historic reference-arm selector. This migrated
+        // source executes the independent provider even in complete owning CI.
+        // Its per-case Detail survives existing baseline/fan-in serialization.
+        report["MigratedReferenceProviders"] = json!([reference_reasoning::identity()]);
     }
     fs::write(options.output, serde_json::to_vec_pretty(&report)?)?;
     // Measured failures belong in the report. Nonzero exits indicate an

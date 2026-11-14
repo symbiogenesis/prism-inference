@@ -1,8 +1,9 @@
 # Safe Rust assertions against pinned Prism
 
 The `upstream_prism` example owns inputs, references and assertions in safe Rust.
-The same tests target production Prism through a native process bridge and this
-repository's Rust runtime. Both results are retained; native reference failure
+The same tests target an independent reference and this repository's Rust runtime.
+References use pinned native Prism except explicitly migrated model-free families.
+Both results are retained; reference failure
 fails the final gate. The source pin is
 `PrismML-Eng/llama.cpp@b87ca7225456b06b0975b8239c66b5aecf07e37c`.
 
@@ -52,7 +53,7 @@ cargo run -p prism-inference --example upstream_prism -- \
 Use `--target rust` without bridge options for the runtime arm. PTQ1's selector is
 `test-ptq1_0-element-map`; Unicode/MTP use `--common-bridge`. The supervising
 `tests/Test-PrismUpstream.ps1` retains required requests/responses and checks all
-native results in the final gate. GGML adapter use also requires
+reference results in the final gate. GGML adapter use also requires
 `tests/Test-PrismGgmlBridge.ps1` protocol/resource rejection checks; optional
 `-ReferenceBridge` compares adapters independently.
 
@@ -83,9 +84,36 @@ Retain the upstream MIT terms in [LICENSE](LICENSE). Source identities are revie
 source observations, not captured native output. Reports identify target
 `rust-reference` and `ObservationProvider.Kind: independent-rust-mathematical`,
 with `NativeReferenceReplay`, `CompleteSourceGate` and `NativeRetirementQualified`
-false. The selector rejects other sources, full catalogs, benchmarks, diagnostics
-and native bridge options. Existing `cpp` and `rust` routes and their native
+false. The selector also admits the explicitly migrated reasoning-budget source
+below; it rejects other sources, full catalogs, benchmarks, diagnostics
+and native bridge options. The MTP `cpp` and `rust` routes and their native
 acceptance remain unchanged; this provider does not replace the complete owning
 reference gate or authorize deleting the common dispatcher. Backend geometries,
 source inventories, approved green IDs and separate performance schedules remain
 required.
+
+## Retired reasoning-budget native provider
+
+`--target rust-reference --case test-reasoning-budget` runs all 71 original
+semantic conditions through the unchanged source adapter against
+`tests/upstream_prism/reference_reasoning.rs`. Its delimiter recognizer tracks
+active prefix positions and its countdown derives from accepted-event ordinals.
+It calls neither the production sampler nor native libraries and reads no
+expected-answer fixtures. The assertions retain their original test source
+identity, eight basic sequences, mid-count/mid-force clone, manual force/null,
+end match/rearm/overlap/null and fifteen UTF-8 boundaries. Candidate and probability
+bits, selected index and sorted flag survive unchanged except the specified
+negative-infinity forcing mask.
+
+The ordinary owning reference arm's historic `--target cpp` selector now uses
+this independent provider for that same source ID. Its case `Detail` records the
+provider and `nativeReferenceReplay=false`, so existing baseline/fan-in records
+retain that distinction; the top-level report also identifies the migrated
+provider. All required reference green IDs remain protected, including this ID.
+The inventory's `LegacyReferenceRequired` field continues to mean the protected
+reference-result obligation, without requiring the retired implementation.
+
+`common/reasoning_budget.hpp`, its operative include/dispatch and its CMake edge
+are removed. Direct native requests for these operations reject. Complete owning
+hosted acceptance and the remaining 39 C++ files are separate gates; this removal
+does not claim complete native retirement, model/codec parity or device behavior.

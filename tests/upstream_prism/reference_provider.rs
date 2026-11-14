@@ -46,6 +46,9 @@ fn first_decode_fits(batch: i32, catchup: i32, anchors: i32) -> bool {
 }
 
 pub(super) fn execute(value: &Value) -> Result<Value> {
+    if super::reference_reasoning::handles(value) {
+        return super::reference_reasoning::execute(value);
+    }
     if !value["Operations"]
         .as_array()
         .is_some_and(|operations| (1..=128).contains(&operations.len()))
@@ -72,12 +75,17 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
     Ok(json!({"SchemaVersion": 1, "Results": results}))
 }
 
+pub(super) fn supports(id: &str) -> bool {
+    id == MTP_ID || id == super::reference_reasoning::ID
+}
+
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-mathematical", "SupportedSourceIds": [MTP_ID],
+    json!({"Kind": "independent-rust-mathematical", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID],
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
+        "AdditionalProviders": [super::reference_reasoning::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }
@@ -162,7 +170,7 @@ mod tests {
         options.validate()?;
         options.case = None;
         assert!(options.validate().is_err());
-        options.case = crate::CASES.iter().find(|case| case.id != MTP_ID);
+        options.case = crate::CASES.iter().find(|case| !supports(case.id));
         assert!(options.validate().is_err());
         options.case = crate::CASES.iter().find(|case| case.id == MTP_ID);
         options.common_bridge = Some(std::env::temp_dir().join("unused-native-bridge"));

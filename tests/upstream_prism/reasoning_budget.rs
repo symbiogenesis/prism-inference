@@ -798,7 +798,8 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
         ID,
         assertions.failures.is_empty(),
         format!(
-            "8 basic sequences; clone counting/forcing; manual force/null; end-match/rearm/overlap/null; 15 UTF-8 boundaries; 71 required semantic conditions; assertions={}; failed={}; {}",
+            "provider={}; 8 basic sequences; clone counting/forcing; manual force/null; end-match/rearm/overlap/null; 15 UTF-8 boundaries; 71 required semantic conditions; assertions={}; failed={}; {}",
+            engine.reasoning_provider(),
             assertions.count,
             assertions.failures.len(),
             assertions.failures.join("; ")

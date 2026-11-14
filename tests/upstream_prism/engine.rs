@@ -64,6 +64,14 @@ impl Engine {
         matches!(self.target, Target::Rust)
     }
 
+    pub(super) const fn reasoning_provider(&self) -> &'static str {
+        if matches!(self.target, Target::Rust) {
+            "production-rust"
+        } else {
+            "independent-rust-state-machine; nativeReferenceReplay=false"
+        }
+    }
+
     pub(super) fn new(
         target: Target,
         bridge: Option<PathBuf>,
@@ -278,6 +286,9 @@ impl Engine {
             return Err(invalid(
                 "extended graph-controller deadlines require the main CI backend lane",
             ));
+        }
+        if matches!(self.target, Target::Cpp) && super::reference_reasoning::handles(request) {
+            return super::reference_reasoning::execute(request).map(Some);
         }
         if matches!(self.target, Target::RustReference) {
             return super::reference_provider::execute(request).map(Some);

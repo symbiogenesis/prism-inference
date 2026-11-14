@@ -672,7 +672,7 @@
       "SourceSha256": "1499e08757ff9e6f52ddd84134a1454346e92cd78a3dc5a9141f8ba775f57979",
       "Category": "model-free",
       "Needs": [
-        "reasoning-budget sampler and synthetic vocab production API"
+        "production Rust reasoning-budget sampler; complete independent null-vocabulary active-prefix/event-ordinal Rust reference"
       ],
       "AssertionsToPort": "All counting/forcing/end-match/manual-force/boundary tests; clone mid-count and mid-force; exact UTF-8 boundary predicate cases and state transitions.",
       "LegacyReferenceRequired": true,

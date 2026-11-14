@@ -23,8 +23,12 @@ All 70 Windows-applicable sources have safe Rust adapters; Apple-only wired
 memory remains unsupported and never counts as a pass.
 
 Safe Rust owns inputs, reference calculations, assertions and tolerances.
-Each adapter runs the same assertions against pinned native Prism and the Rust
-runtime. Native bridges provide bounded serialization and production calls;
+Each adapter runs the same assertions against an independent reference and the Rust
+runtime. References use pinned native Prism except for explicitly migrated
+model-free families. Reasoning-budget's complete 71-condition source contract
+uses a separate Rust active-prefix/event-ordinal state machine; its former native
+header and dispatch are retired. Reports and retained case details identify the
+provider without claiming native replay. Native bridges provide bounded serialization and production calls;
 they contain no expected outputs, random generators or acceptance policy.
 Upstream test executables and fixture exporters are not built.
 
@@ -111,11 +115,12 @@ Interpret source results according to the inventory:
 
 [baseline.json](../tools/prism/upstream/baseline.json) binds the catalog digest,
 upstream revision, minimum green count and required passing IDs.
-`RequiredReferencePassedIds` protects native controls independently of Rust
+`RequiredReferencePassedIds` protects reference controls independently of Rust
 progress. For each complete run:
 
 1. Verify the unchanged source inventory and catalog binding.
-2. Require one Rust and one reference result for every implemented adapter.
+2. Require one Rust and one reference result for every implemented adapter,
+   preserving the named provider for migrated source families.
 3. Expand remaining sources to `unsupported` for Rust.
 4. Count only `pass` as green; `fail`, `skip` and `unsupported` stay red.
 5. Require every protected ID and the minimum integer ratio. New passes cannot

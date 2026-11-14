@@ -5,7 +5,6 @@
 #include "jinja.hpp"
 #include "mtmd.hpp"
 #include "grammar_parser.hpp"
-#include "reasoning_budget.hpp"
 #include "tensor_graph.hpp"
 #include "grammar.hpp"
 #include "codec.hpp"
@@ -150,8 +149,6 @@ void validate_operation(const wire_json & operation) {
         prism_mtmd::validate(operation);
     } else if (prism_grammar_parser::handles(kind)) {
         prism_grammar_parser::validate(operation);
-    } else if (prism_reasoning_budget::handles(kind)) {
-        prism_reasoning_budget::validate(operation);
     } else if (prism_tensor_graph::handles(kind)) {
         prism_tensor_graph::validate(operation);
     } else if (prism_grammar::handles(kind)) {
@@ -227,9 +224,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_grammar_parser::handles(kind)) {
         return prism_grammar_parser::execute(operation);
-    }
-    if (prism_reasoning_budget::handles(kind)) {
-        return prism_reasoning_budget::execute(operation);
     }
     if (prism_tensor_graph::handles(kind)) {
         return prism_tensor_graph::execute(operation);

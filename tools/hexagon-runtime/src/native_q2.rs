@@ -686,7 +686,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             }
             selected.push(tensor.clone());
         }
-        selected.sort_by_key(|tensor| tensor.data.as_ptr().addr());
+        selected.sort_by(|left, right| selected_tensor_key(left).cmp(&selected_tensor_key(right)));
         let min_addr = selected
             .first()
             .map_or(0, |tensor| tensor.data.as_ptr().addr());
@@ -2708,9 +2708,9 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
             if addr < min_addr || addr > max_addr {
                 return false;
             }
-            let Ok(idx) =
-                allowed.binary_search_by_key(&addr, |candidate| candidate.data.as_ptr().addr())
-            else {
+            let Ok(idx) = allowed.binary_search_by(|candidate| {
+                selected_tensor_key(candidate).cmp(&selected_tensor_key(tensor))
+            }) else {
                 return false;
             };
             let candidate = &allowed[idx];
@@ -2915,6 +2915,15 @@ fn resize_packed_scratch(weights: &mut Vec<u8>, required_bytes: usize) -> Result
         weights.resize(required_bytes, 0_u8);
     }
     Ok(())
+}
+
+fn selected_tensor_key(tensor: &Tensor) -> (usize, u32, &[usize], &str) {
+    (
+        tensor.data.as_ptr().addr(),
+        tensor.kind,
+        &tensor.dimensions,
+        &tensor.name,
+    )
 }
 
 fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
@@ -3497,6 +3506,47 @@ mod tests {
         assert_eq!(executor.statistics().operations_attempted, 4);
         assert_eq!(executor.statistics().operations_completed, 4);
         assert_eq!(executor.operation_capacity(), Some(6));
+        Ok(())
+    }
+
+    #[test]
+    fn resident_cache_index_selected_aliases_admit_each_exact_name_and_geometry() -> Result<()> {
+        let source = lazy_tensor("wide", 512, 32);
+        let mut tensors = vec![source.clone()];
+        for (name, dimensions) in [
+            ("middle", [256, 64]),
+            ("narrow", [128, 128]),
+            ("alias", [512, 32]),
+        ] {
+            let mut tensor = source.clone();
+            tensor.name = name.into();
+            tensor.dimensions = dimensions.into();
+            tensors.push(tensor);
+        }
+        let limits = NativeQ2ProjectionLimits::new(512, 128, 10, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(32_768)
+            .map_err(|_| invalid("residency"))?;
+        let mut executor = NativeQ2Executor::new(
+            arena_submitter_at_capacity(true, 32_768)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        executor.select_and_prewarm_tensors(&tensors)?;
+        for tensor in &tensors {
+            assert!(executor.supports_f32(tensor));
+            assert!(executor.prewarm_tensor(tensor)?);
+            let mut unselected = tensor.clone();
+            unselected.name.push_str("-unselected");
+            assert!(!executor.supports_f32(&unselected));
+            unselected = tensor.clone();
+            unselected.data = Arc::from(tensor.data.to_vec());
+            assert!(!executor.supports_f32(&unselected));
+        }
+        assert_eq!(executor.residency_statistics().tensors_prepared, 3);
+        assert_eq!(executor.submitter.registry.used_bytes(), 3 * 4608);
+        assert_eq!(executor.statistics().operations_attempted, 0);
         Ok(())
     }
 

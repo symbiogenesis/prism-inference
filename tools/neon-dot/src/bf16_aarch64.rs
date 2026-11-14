@@ -8,10 +8,6 @@ use core::arch::aarch64::{
 };
 
 #[inline]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Keep the checked native implementation visible only to its safe parent boundary."
-)]
 pub(super) fn dot_rows<const ROWS: usize>(
     rows: [&[u8]; ROWS],
     input: &[f32],
@@ -66,18 +62,20 @@ fn paired<const ROWS: usize>(rows: [&[u8]; ROWS], input: &[f32]) -> Option<[f32;
             let second_row = &rows[pair * 2 + 1][offset..offset + 16];
             // SAFETY: checked geometry and the eight-column loop supply both
             // sixteen-byte immutable ranges. NEON allows unaligned loads.
-            let first_raw = unsafe { vreinterpretq_u16_u8(vld1q_u8(first_row.as_ptr())) };
+            let first_bytes = unsafe { vld1q_u8(first_row.as_ptr()) };
             // SAFETY: the second range has the same checked complete extent.
-            let second_raw = unsafe { vreinterpretq_u16_u8(vld1q_u8(second_row.as_ptr())) };
+            let second_bytes = unsafe { vld1q_u8(second_row.as_ptr()) };
+            let first_payload = vreinterpretq_u16_u8(first_bytes);
+            let second_payload = vreinterpretq_u16_u8(second_bytes);
             weight_magnitude = vmaxq_u16(
                 weight_magnitude,
                 vmaxq_u16(
-                    vandq_u16(first_raw, magnitude_mask),
-                    vandq_u16(second_raw, magnitude_mask),
+                    vandq_u16(first_payload, magnitude_mask),
+                    vandq_u16(second_payload, magnitude_mask),
                 ),
             );
-            let a = products(first_raw, first, second);
-            let b = products(second_raw, first, second);
+            let a = products(first_payload, first, second);
+            let b = products(second_payload, first, second);
             *sum = add_columns(*sum, a[0], b[0]);
             *sum = add_columns(*sum, a[1], b[1]);
         }

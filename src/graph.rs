@@ -3131,6 +3131,9 @@ impl Qwen35 {
                     if let Some(patch) = probe.patch {
                         patch.apply(up, attention)?;
                     }
+                    if let Some(observer) = &mut probe.surrogate_observer {
+                        observer(normalized, attention)?;
+                    }
                     add_finite(hidden, attention, "decoder layer output")?;
                     (probe.observer)(weight_patch::FfnObservation {
                         layer: layer_idx,

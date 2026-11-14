@@ -16,6 +16,26 @@ use crate::{Decoder, Result, invalid};
 pub const EXECUTION_PROFILE: &str = "experimental-ffn-cpu-scalar-unfused-v1";
 /// Basis of the post-SwiGLU FFN activation supplied to a patch.
 pub const INPUT_BASIS: &str = "original-ffn-hidden";
+/// Original normalized residual basis used by an entire-FFN surrogate.
+pub const SURROGATE_INPUT_BASIS: &str = "original-ffn-normalized-input";
+/// Complete FFN branch, including the frozen existing adapter, before residual add.
+pub const SURROGATE_TARGET_BASIS: &str = "complete-ffn-branch-delta";
+
+/// Owned teacher observation returned only after the complete token succeeds.
+///
+/// Unlike [`FfnObservation`], these vectors describe the input and output of
+/// the entire FFN branch. The target is captured before residual addition;
+/// subtracting rounded residual streams cannot reconstruct it exactly.
+pub struct FfnSurrogateObservation {
+    /// Zero-based decoder block index.
+    pub layer: usize,
+    /// Zero-based input token position in the current sequence.
+    pub token_index: usize,
+    /// Original normalized pre-FFN residual, before Hadamard rotation.
+    pub input: Vec<f32>,
+    /// Complete FFN delta, including the existing adapter at its frozen scale.
+    pub target: Vec<f32>,
+}
 
 /// Borrowed values at one selected FFN site during a provisional token.
 ///
@@ -127,10 +147,13 @@ impl FfnPatch {
     }
 }
 
+type SurrogateObserver<'a> = &'a mut dyn FnMut(&[f32], &[f32]) -> Result<()>;
+
 pub(super) struct Intervention<'a> {
     pub(super) layer: usize,
     pub(super) patch: Option<&'a FfnPatch>,
     pub(super) observer: &'a mut dyn FnMut(FfnObservation<'_>) -> Result<()>,
+    pub(super) surrogate_observer: Option<SurrogateObserver<'a>>,
 }
 
 /// A sealed experimental graph with one observed and optionally patched FFN.
@@ -214,6 +237,7 @@ impl FfnProbe {
             layer: self.layer,
             patch: self.patch.as_ref(),
             observer,
+            surrogate_observer: None,
         };
         let result = self.graph.evaluate_token_with_executor(
             token,
@@ -225,6 +249,56 @@ impl FfnProbe {
             logits.clear();
         }
         result
+    }
+
+    /// Evaluates one token and returns an entire-FFN teacher pair on success.
+    ///
+    /// Original normalized input and the complete adapter-inclusive FFN delta
+    /// are copied before residual addition. Copies remain provisional and are
+    /// dropped if any later layer, output projection or state staging fails.
+    /// Existing adapter factors and scale remain fixed by this probe.
+    ///
+    /// # Errors
+    /// Rejects independently patched probes and graph/allocation failures.
+    /// Errors clear `logits`, return no observation and commit no token state.
+    pub fn evaluate_surrogate_into(
+        &mut self,
+        token: u32,
+        logits: &mut Vec<f32>,
+    ) -> Result<FfnSurrogateObservation> {
+        logits.clear();
+        if self.patch.is_some() {
+            return Err(invalid("FFN surrogate teacher rejects independent patches"));
+        }
+        let layer = self.layer;
+        let token_index = self.graph.position;
+        let mut observation = None;
+        let mut capture = |input: &[f32], target: &[f32]| {
+            observation = Some(FfnSurrogateObservation {
+                layer,
+                token_index,
+                input: super::copy_values(input)?,
+                target: super::copy_values(target)?,
+            });
+            Ok(())
+        };
+        let mut intervention = Intervention {
+            layer,
+            patch: None,
+            observer: &mut |_| Ok(()),
+            surrogate_observer: Some(&mut capture),
+        };
+        let result = self.graph.evaluate_token_with_executor(
+            token,
+            Some(logits),
+            None,
+            Some(&mut intervention),
+        );
+        if let Err(error) = result {
+            logits.clear();
+            return Err(error);
+        }
+        observation.ok_or_else(|| invalid("selected FFN surrogate observation is absent"))
     }
 }
 
@@ -262,6 +336,7 @@ impl Decoder for FfnProbe {
             layer: self.layer,
             patch: self.patch.as_ref(),
             observer: &mut |_| Ok(()),
+            surrogate_observer: None,
         };
         self.graph
             .evaluate_token_with_executor(token, None, None, Some(&mut intervention))

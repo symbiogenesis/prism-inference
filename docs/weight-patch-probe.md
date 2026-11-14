@@ -75,3 +75,50 @@ Teacher-forced captures establish neither spontaneous repetition nor improved
 correctness, creativity, performance, memory use or daily-service qualification.
 Diagnose a real failure, separate fitting/tuning/held-out material, and compare
 complete answers and simpler controls before applying a fitted correction.
+
+## Entire-FFN surrogate teacher pairs
+
+Set `captureKind:"ffn-surrogate"` to prepare the separate Runner
+`bonsai-tools ffn-surrogate` fitting input. Omitting `captureKind`, or selecting
+`hidden-patch`, preserves the existing post-SwiGLU capture format above.
+Surrogate capture rejects `patchPath`; its teacher includes only the packed
+base and the approved adapter at the declared frozen scale. An absent adapter
+requires positive-zero scale bits `00000000`.
+
+Each surrogate sequence uses `split:"fit"` or `"development"`; `label` can be
+omitted. At least two fitting rows and one development row are required, with
+the same 64-row aggregate bound. Final held-out answer material is rejected
+from this fitting capture. Distinct group names do not prove content independence.
+
+`FfnProbe::evaluate_surrogate_into` returns an owned teacher pair only after
+the complete token succeeds. Its input is the original normalized pre-FFN
+residual, before Hadamard rotation. Its target is the complete FFN output,
+including the approved FFN-down adapter, captured **before residual addition**.
+It never reconstructs the target by subtracting rounded residual streams.
+Input/target copies are provisional until output projection and state staging
+succeed; an error drops both, clears logits and commits no token state.
+
+The surrogate JSON contains exactly `schemaVersion:1`, `source`, `site` and
+`rows`. `source` retains the executable/source/base/adapter/scale/profile/graph
+identities described above. `site` is:
+
+```json
+{
+  "layer": 0,
+  "inputBasis": "original-ffn-normalized-input",
+  "targetBasis": "complete-ffn-branch-delta",
+  "inputWidth": 5120,
+  "outputWidth": 5120
+}
+```
+
+Rows contain only `sampleId`, `groupId`, `tokenIndex`, `split`, `input` and
+`target`. The numerical profile remains
+`experimental-ffn-cpu-scalar-unfused-v1`; this is no production NEON capture.
+Before fitting, add the fitter's bounded `controls` and new `outputPath` if
+needed. In particular, select `controls.rank` no greater than the number of
+fitting rows; the fitter's default rank eight needs at least eight fitting rows.
+
+This operation still executes and loads the complete FFN. It supplies no skip,
+unloading, latency, process-memory or cognitive-quality result. Whole-FFN
+replacement/loading and independent complete-answer acceptance remain separate.

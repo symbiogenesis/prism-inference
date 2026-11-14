@@ -187,3 +187,95 @@ fn ffn_probe_captures_original_gated_values_before_hadamard() -> Result<()> {
     })?;
     Ok(())
 }
+
+#[test]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "The oracle preserves separate base product, adapter product, scaling and addition rounding."
+)]
+fn ffn_surrogate_captures_exact_normalized_input_and_adapter_delta_before_add() -> Result<()> {
+    let graph = || {
+        let mut base = active_ffn();
+        base.tensors.insert(
+            "blk.0.attn_output.weight".into(),
+            weight("blk.0.attn_output.weight", &[2, 2], &[0.0; 4]),
+        );
+        base.tensors.insert(
+            "blk.0.ffn_down.weight".into(),
+            weight("blk.0.ffn_down.weight", &[2, 2], &[0.0, 0.0, 0.5, 0.0]),
+        );
+        let mut factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+        factors.tensors.insert(
+            "blk.0.ffn_down.weight.lora_b".into(),
+            weight("blk.0.ffn_down.weight.lora_b", &[1, 2], &[1e-10; 2]),
+        );
+        rank_one_graph(base, factors, 1.3)
+    };
+    let mut teacher = FfnProbe::new(graph()?, 0, None)?;
+    let mut hidden_teacher = FfnProbe::new(graph()?, 0, None)?;
+    let mut gated = Vec::new();
+    let mut residual = Vec::new();
+    let mut old_logits = Vec::new();
+    hidden_teacher.evaluate_observed_into(0, &mut old_logits, &mut |row| {
+        gated.extend_from_slice(row.activation);
+        residual.extend_from_slice(row.residual);
+        Ok(())
+    })?;
+    let mut logits = Vec::new();
+    let row = teacher.evaluate_surrogate_into(0, &mut logits)?;
+    assert_eq!((row.layer, row.token_index), (0, 0));
+    let normalized = 1.0_f32 / (0.5_f32 + 0.000_001).sqrt();
+    assert_eq!(row.input, [normalized, 0.0]);
+    assert_ne!(row.input, gated);
+    let expected = ((0.25 * gated[0]) * 1e-10) * 1.3;
+    assert!(expected > 0.0);
+    assert_eq!(
+        row.target
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [expected.to_bits(), (0.5 * gated[0] + expected).to_bits()]
+    );
+    // The first branch delta is rounded away by residual addition. Capturing
+    // this nonzero value proves the teacher did not subtract two residuals.
+    assert_eq!(residual[0], 1.0);
+    assert_eq!(residual[0] - 1.0, 0.0);
+    assert_eq!(logits, old_logits);
+    let next = teacher.evaluate_surrogate_into(1, &mut logits)?;
+    assert_eq!(next.token_index, 1);
+    Ok(())
+}
+
+#[test]
+fn ffn_surrogate_discards_late_failure_and_rejects_independent_patches() -> Result<()> {
+    let graph = || {
+        let mut model = active_ffn();
+        model.tensors.insert(
+            "blk.0.attn_output.weight".into(),
+            weight("blk.0.attn_output.weight", &[2, 2], &[0.0; 4]),
+        );
+        model.tensors.insert(
+            "output.weight".into(),
+            weight("output.weight", &[2, 2], &[f32::MAX, 0.0, 0.0, 1.0]),
+        );
+        Qwen35::with_backend(model, 8, MatvecBackend::Scalar)
+    };
+    let mut probe = FfnProbe::new(graph()?, 0, None)?;
+    let mut logits = vec![1.0];
+    // FFN observation staging succeeds before the final projection overflows.
+    assert!(probe.evaluate_surrogate_into(0, &mut logits).is_err());
+    assert!(logits.is_empty());
+    let row = probe.evaluate_surrogate_into(1, &mut logits)?;
+    assert_eq!(row.token_index, 0);
+    let mut fresh = FfnProbe::new(graph()?, 0, None)?;
+    let mut expected_logits = Vec::new();
+    let expected = fresh.evaluate_surrogate_into(1, &mut expected_logits)?;
+    assert_eq!(row.input, expected.input);
+    assert_eq!(row.target, expected.target);
+    assert_eq!(logits, expected_logits);
+    let patch = FfnPatch::new(vec![0.0; 2], vec![0.0; 2], 0.0)?;
+    let mut patched = FfnProbe::new(graph()?, 0, Some(patch))?;
+    assert!(patched.evaluate_surrogate_into(1, &mut logits).is_err());
+    assert!(logits.is_empty());
+    Ok(())
+}

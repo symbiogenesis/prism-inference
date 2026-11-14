@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::graph::weight_patch::{
-    EXECUTION_PROFILE, FfnPatch, FfnProbe, INPUT_BASIS,
+    EXECUTION_PROFILE, FfnPatch, FfnProbe, INPUT_BASIS, SURROGATE_INPUT_BASIS,
+    SURROGATE_TARGET_BASIS,
 };
 use bonsai_prism_runtime::graph::{MAX_STATE_BYTES, Qwen35};
 use bonsai_prism_runtime::kernels::MatvecBackend;
@@ -27,10 +28,20 @@ const MAX_CAPTURE_ROWS: usize = 64;
 const MAX_TOKENS: usize = 256;
 const MODEL_BUDGET: usize = 8 * 1024 * 1024 * 1024;
 
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum CaptureKind {
+    #[default]
+    HiddenPatch,
+    FfnSurrogate,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {
     schema_version: u32,
+    #[serde(default)]
+    capture_kind: CaptureKind,
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
     adapter_scale_bits: String,
@@ -49,7 +60,8 @@ struct Sequence {
     sample_id: String,
     group_id: String,
     split: String,
-    label: String,
+    #[serde(default)]
+    label: Option<String>,
     token_ids: Vec<u32>,
     capture_token_indices: Vec<usize>,
 }
@@ -162,6 +174,7 @@ fn validate(request: &Request) -> Result<Representation> {
         || request.layer >= 64
         || request.sequences.is_empty()
         || request.sequences.len() > 16
+        || (request.capture_kind == CaptureKind::FfnSurrogate && request.patch_path.is_some())
     {
         return Err(reject(
             "invalid FFN probe version, paths, source, site or sequences",
@@ -176,6 +189,8 @@ fn validate(request: &Request) -> Result<Representation> {
     let mut rows = 0_usize;
     let mut samples = BTreeSet::new();
     let mut groups = std::collections::BTreeMap::new();
+    let mut fit_rows = 0;
+    let mut development_rows = 0;
     for sequence in &request.sequences {
         tokens = tokens
             .checked_add(sequence.token_ids.len())
@@ -191,8 +206,15 @@ fn validate(request: &Request) -> Result<Representation> {
         if !identifier(&sequence.sample_id)
             || !identifier(&sequence.group_id)
             || !samples.insert(&sequence.sample_id)
-            || !matches!(sequence.split.as_str(), "fit" | "holdout")
-            || !matches!(sequence.label.as_str(), "target" | "preserve")
+            || match request.capture_kind {
+                CaptureKind::HiddenPatch => {
+                    !matches!(sequence.split.as_str(), "fit" | "holdout")
+                        || !matches!(sequence.label.as_deref(), Some("target" | "preserve"))
+                }
+                CaptureKind::FfnSurrogate => {
+                    !matches!(sequence.split.as_str(), "fit" | "development")
+                }
+            }
             || sequence.token_ids.is_empty()
             || sequence.capture_token_indices.is_empty()
             || indices.len() != sequence.capture_token_indices.len()
@@ -210,8 +232,17 @@ fn validate(request: &Request) -> Result<Representation> {
                 "invalid FFN probe sequence identity, split, label or token bounds",
             ));
         }
+        if sequence.split == "fit" {
+            fit_rows += sequence.capture_token_indices.len();
+        } else if sequence.split == "development" {
+            development_rows += sequence.capture_token_indices.len();
+        }
     }
-    if tokens > MAX_TOKENS || rows > MAX_CAPTURE_ROWS {
+    if tokens > MAX_TOKENS
+        || rows > MAX_CAPTURE_ROWS
+        || (request.capture_kind == CaptureKind::FfnSurrogate
+            && (fit_rows < 2 || development_rows == 0))
+    {
         return Err(reject(
             "FFN probe exceeds aggregate token or capture bounds",
         ));
@@ -244,7 +275,10 @@ fn run() -> Result<Value> {
     deadline.check()?;
     let representation = validate(&request)?;
     let scale = parse_scale(&request.adapter_scale_bits)?;
-    if request.adapter_path.is_none() && scale != 0.0 {
+    if request.adapter_path.is_none()
+        && (scale != 0.0
+            || (request.capture_kind == CaptureKind::FfnSurrogate && scale.to_bits() != 0))
+    {
         return Err(reject("absent adapter requires zero scale"));
     }
     let executable_sha256 = hash_file(&std::env::current_exe()?, &deadline)?;
@@ -288,10 +322,16 @@ fn run() -> Result<Value> {
         "runtimeSourceCommit":request.runtime_source_commit,
         "graphIdentity":base_probe_identity,
     });
-    let site = json!({
-        "tensor":format!("blk.{}.ffn_down.weight", request.layer),
-        "inputBasis":INPUT_BASIS,"inputWidth":17408,"outputWidth":5120,
-    });
+    let site = match request.capture_kind {
+        CaptureKind::HiddenPatch => json!({
+            "tensor":format!("blk.{}.ffn_down.weight", request.layer),
+            "inputBasis":INPUT_BASIS,"inputWidth":17408,"outputWidth":5120,
+        }),
+        CaptureKind::FfnSurrogate => json!({
+            "layer":request.layer,"inputBasis":SURROGATE_INPUT_BASIS,
+            "targetBasis":SURROGATE_TARGET_BASIS,"inputWidth":5120,"outputWidth":5120,
+        }),
+    };
     let patch = request
         .patch_path
         .as_ref()
@@ -307,6 +347,25 @@ fn run() -> Result<Value> {
         graph.reset()?;
         for (index, &token) in sequence.token_ids.iter().enumerate() {
             deadline.check()?;
+            if request.capture_kind == CaptureKind::FfnSurrogate {
+                if sequence.capture_token_indices.contains(&index) {
+                    let observation = graph.evaluate_surrogate_into(token, &mut logits)?;
+                    if observation.input.len() != 5120 || observation.target.len() != 5120 {
+                        return Err(reject(
+                            "actual surrogate observation dimensions differ from Swift contract",
+                        ));
+                    }
+                    deadline.check()?;
+                    rows.push(json!({
+                        "sampleId":sequence.sample_id,"groupId":sequence.group_id,
+                        "tokenIndex":index,"split":sequence.split,
+                        "input":observation.input,"target":observation.target,
+                    }));
+                } else {
+                    graph.evaluate_into(token, &mut logits)?;
+                }
+                continue;
+            }
             let mut row = None;
             graph.evaluate_observed_into(token, &mut logits, &mut |observation| {
                 if sequence.capture_token_indices.contains(&index) {
@@ -330,11 +389,16 @@ fn run() -> Result<Value> {
         }
     }
     let row_count = rows.len();
-    let artifact = json!({
-        "schemaVersion":1,"source":source,"site":site,"rows":rows,
-        "observationGraphIdentity":graph.identity(),
-        "qualification":"teacher-forced observations only; labels are supplied, not independently diagnosed; no behavioral or performance acceptance",
-    });
+    let artifact = match request.capture_kind {
+        CaptureKind::HiddenPatch => json!({
+            "schemaVersion":1,"source":source,"site":site,"rows":rows,
+            "observationGraphIdentity":graph.identity(),
+            "qualification":"teacher-forced observations only; labels are supplied, not independently diagnosed; no behavioral or performance acceptance",
+        }),
+        CaptureKind::FfnSurrogate => json!({
+            "schemaVersion":1,"source":source,"site":site,"rows":rows,
+        }),
+    };
     let bytes = serde_json::to_vec(&artifact)?;
     if bytes.len() > MAX_CAPTURE_BYTES {
         return Err(reject("serialized FFN capture exceeds its byte bound"));
@@ -437,7 +501,7 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, parse_scale, validate};
+    use super::{CaptureKind, Request, parse_scale, validate};
     use bonsai_prism_runtime::Result;
     use serde_json::json;
 
@@ -475,6 +539,27 @@ mod tests {
         for bits in ["3FA66666", "7f800000", "7fc00000", "40000001", "bf800000"] {
             assert!(parse_scale(bits).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ffn_surrogate_capture_keeps_development_separate_and_rejects_patches() -> Result<()> {
+        let mut request = request()?;
+        request.capture_kind = CaptureKind::FfnSurrogate;
+        request.sequences[0].capture_token_indices = vec![0, 1];
+        request.sequences[1].split = "development".into();
+        for sequence in &mut request.sequences {
+            sequence.label = None;
+        }
+        assert!(validate(&request).is_ok());
+        request.sequences[1].split = "holdout".into();
+        assert!(validate(&request).is_err());
+        request.sequences[1].split = "development".into();
+        request.patch_path = Some(std::env::temp_dir().join("independent-patch.json"));
+        assert!(validate(&request).is_err());
+        request.patch_path = None;
+        request.sequences[0].capture_token_indices = vec![1];
+        assert!(validate(&request).is_err());
         Ok(())
     }
 }

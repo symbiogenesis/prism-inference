@@ -1075,8 +1075,8 @@ mod tests {
 
     #[test]
     fn x1_temporal_gdn_prefill_consumer_matches_defensive_rows() -> Result<()> {
-        let width = 128;
-        let previous: Vec<_> = (0..width * width)
+        let width = 128_usize;
+        let previous: Vec<f32> = (0..width * width)
             .map(|i| {
                 if i.is_multiple_of(3) {
                     -0.015_625
@@ -1113,8 +1113,8 @@ mod tests {
             &mut actual,
             &mut output,
         )?;
-        let mut expected = vec![0.0; previous.len()];
-        let mut expected_output = vec![0.0; output.len()];
+        let mut expected = vec![0.0_f32; previous.len()];
+        let mut expected_output = vec![0.0_f32; output.len()];
         let scale = 1.0 / small_float(width)?.sqrt();
         for (row, (previous, expected)) in previous
             .chunks_exact(width)

@@ -199,7 +199,7 @@ impl ProjectedQwen35<'_> {
         self.admit_work(usize::from(logits.is_none()), usize::from(logits.is_some()))?;
         let result = self
             .decoder
-            .evaluate_token_with_executor(token, logits, Some(self.executor));
+            .evaluate_token_with_executor(token, logits, Some(self.executor), None);
         self.faulted = result.is_err();
         result
     }

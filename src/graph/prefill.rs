@@ -502,7 +502,12 @@ impl Qwen35 {
         let Some(mut tile) = self.tiled_prefill.take() else {
             for &token in tokens {
                 check()?;
-                self.evaluate_token_with_executor(token, None, reborrow_executor(&mut executor))?;
+                self.evaluate_token_with_executor(
+                    token,
+                    None,
+                    reborrow_executor(&mut executor),
+                    None,
+                )?;
                 check()?;
             }
             return Ok(());

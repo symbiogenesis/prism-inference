@@ -335,10 +335,18 @@ impl Quantizer {
         if out.len() != self.encoded_len() {
             return Err(invalid("KV codec record length mismatch"));
         }
-        let mut row = finite_row(input)?;
-        let squared_norm = row.iter().fold(0.0_f64, |sum, &value| {
-            f64::from(value).mul_add(f64::from(value), sum)
-        });
+        let mut row: [f32; HEAD_DIM] = input
+            .try_into()
+            .map_err(|_| invalid("KV codec requires exactly 256 channels"))?;
+        // The norm already visits every coordinate before normalization or
+        // publication. Validate there without a separate finite-input scan,
+        // retaining the original ordered binary64 FMA accumulation.
+        let squared_norm = row.iter().try_fold(0.0_f64, |sum, &value| {
+            if !value.is_finite() {
+                return Err(invalid("KV codec row must contain only finite values"));
+            }
+            Ok(f64::from(value).mul_add(f64::from(value), sum))
+        })?;
         let mut record = [0_u8; MAX_RECORD_BYTES];
         if squared_norm == 0.0 {
             out.copy_from_slice(&record[..self.encoded_len()]);

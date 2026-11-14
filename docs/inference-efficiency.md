@@ -41,6 +41,20 @@ and complete-dot absolute bound 32,768. Derived payload for `C` columns is
 `C + 4 * C / 128` bytes: 5,280 bytes at width 5,120, additional to Q8_K scratch.
 Capacity remains at its high water; weights are neither repacked nor expanded.
 
+## Packed KV validation
+
+Packed-row encoding checks each input coordinate during the existing ordered
+binary64 norm accumulation, before normalization or record publication. Portable
+value accumulation checks each binary32 result during its update traversal,
+omitting a separate read of the complete output row. Neither changes arithmetic
+order, record bytes, cache precision, scratch admission or native ISA selection.
+The public single-row helper still stages its complete result; scan-owned sums
+remain private and permanently reject publication after a failed append.
+
+These source reductions require exact record/arithmetic and failure controls,
+complete-model state/adapters/cancellation acceptance and matched whole-request
+measurement before claiming X1 or X2 benefit.
+
 ## Finite logits and sampling
 
 Complete decoder-output validation creates an immutable `FiniteLogits` view.

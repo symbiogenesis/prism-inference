@@ -167,9 +167,14 @@ pub(super) fn accumulate_in_place(
     scale: f32,
     out: &mut [f32; HEAD_DIM],
 ) -> Result<()> {
+    let mut finite = true;
     for (index, value) in out.iter_mut().enumerate() {
         let increment = scale * centroids[read_code(codes, bits, index)];
         *value += increment;
+        finite &= value.is_finite();
     }
-    finite_values(out)
+    if !finite {
+        return Err(invalid("KV codec row must contain only finite values"));
+    }
+    Ok(())
 }

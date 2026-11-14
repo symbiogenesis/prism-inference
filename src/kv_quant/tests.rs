@@ -180,6 +180,58 @@ fn x1_value_scan_preserves_record_rounding_and_rejects_late_failure() -> Result<
 }
 
 #[test]
+fn scan_value_overflow_rejects_finite_products_and_preserves_public_output() -> Result<()> {
+    for bits in [Bits::Three, Bits::Four] {
+        for quantizer in [Quantizer::scalar(bits, 91), Quantizer::new(bits, 91)] {
+            let scale = f32::MAX / 4.0;
+            let mut packed = vec![0xff; quantizer.encoded_len()];
+            packed[..4].copy_from_slice(&scale.to_le_bytes());
+            let mut scan = quantizer.value_accumulator()?;
+            // The largest centroid lies between two and four: each product
+            // is finite, but adding a second identical product overflows.
+            let largest = quantizer.centroids()[usize::from(bits.levels() - 1)];
+            assert!(largest > 2.0 && largest < 4.0);
+            assert!((scale * largest).is_finite());
+            scan.accumulate(&packed, 1.0)?;
+            assert!(scan.accumulate(&packed, 1.0).is_err());
+            assert!(scan.accumulate(&record(bits, 1.0), 0.0).is_err());
+            assert!(scan.finish().is_err());
+
+            // Only the final coordinate fails, after all earlier updates;
+            // the defensive public helper still publishes none of them.
+            let mut output = [0.0; HEAD_DIM];
+            output[HEAD_DIM - 1] = f32::MAX;
+            let original = output.map(f32::to_bits);
+            assert!(quantizer.accumulate(&packed, 1.0, &mut output).is_err());
+            assert_eq!(output.map(f32::to_bits), original);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn fused_encode_validation_preserves_exact_norm_and_rejects_nonfinite_tail() -> Result<()> {
+    let mut input = [0.0; HEAD_DIM];
+    input[0] = 3.0;
+    input[HEAD_DIM - 1] = -4.0;
+    for bits in [Bits::Three, Bits::Four] {
+        for quantizer in [Quantizer::scalar(bits, 91), Quantizer::new(bits, 91)] {
+            let mut packed = vec![0xff; quantizer.encoded_len()];
+            quantizer.encode(&input, &mut packed)?;
+            assert_eq!(&packed[..4], &(5.0_f32 / 16.0).to_le_bytes());
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut malformed = input;
+                malformed[HEAD_DIM - 1] = invalid;
+                let original = packed.clone();
+                assert!(quantizer.encode(&malformed, &mut packed).is_err());
+                assert_eq!(packed, original);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn x1_prepared_kv_scores_preserve_order_records_and_failure_precedence() -> Result<()> {
     let query = input_row();
     for bits in [Bits::Three, Bits::Four] {

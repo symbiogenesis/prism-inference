@@ -79,7 +79,7 @@ impl CpuBackend {
     }
 
     pub(super) fn relative_positions(&mut self, tensor: TensorId) -> Result<()> {
-        let info = self.info(tensor)?.clone();
+        let info = self.info(tensor)?;
         let source = *info
             .sources
             .first()

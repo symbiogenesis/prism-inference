@@ -428,15 +428,15 @@ impl BatchAllocator {
         let Some(start) = self.used.iter().position(|used| !used) else {
             return Ok(MicroBatch::default());
         };
-        let mut current = self.sequence_sets[start].clone();
+        let mut current = &self.sequence_sets[start];
         let mut indices = Vec::new();
         for index in start..self.used.len() {
-            if self.used[index] || !self.sequence_sets[index].is_subset(&current) {
+            if self.used[index] || !self.sequence_sets[index].is_subset(current) {
                 continue;
             }
             indices.push(index);
             self.used[index] = true;
-            current.clone_from(&self.sequence_sets[index]);
+            current = &self.sequence_sets[index];
             if indices.len() == capacity {
                 break;
             }

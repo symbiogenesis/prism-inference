@@ -180,6 +180,96 @@ fn x1_value_scan_preserves_record_rounding_and_rejects_late_failure() -> Result<
 }
 
 #[test]
+fn zero_weight_value_scan_preserves_signed_zero_cancellation_and_underflow() -> Result<()> {
+    for bits in [Bits::Three, Bits::Four] {
+        for quantizer in [Quantizer::scalar(bits, 91), Quantizer::new(bits, 91)] {
+            let mut scan = quantizer.value_accumulator()?;
+            let mut defensive = [0.0; HEAD_DIM];
+            let minimum = f32::from_bits(1);
+            for (scale, weight) in [
+                (f32::MAX, 0.0),
+                (f32::MAX, -0.0),
+                (0.25, minimum),
+                (0.25, -minimum),
+                (minimum, 1.0),
+                (minimum, -1.0),
+                (1.0, -0.5),
+                (1.0, -0.0),
+                (0.25, minimum),
+                (1.0, 0.5),
+                (1.0, -0.0),
+            ] {
+                let packed = record(bits, scale);
+                scan.accumulate(&packed, weight)?;
+                quantizer.accumulate(&packed, weight, &mut defensive)?;
+                // The independent public operation visits every coordinate,
+                // including zero increments; cancellation must still yield +0.
+                assert!(
+                    defensive
+                        .iter()
+                        .all(|value| value.to_bits() != (-0.0_f32).to_bits())
+                );
+            }
+            assert_eq!(
+                scan.finish()?.map(f32::to_bits),
+                defensive.map(f32::to_bits)
+            );
+            assert_eq!(defensive.map(f32::to_bits), [0.0_f32.to_bits(); HEAD_DIM]);
+
+            // A caller-owned -0 row violates the private scan's invariant.
+            // Public accumulation must still perform its signed additions.
+            let mut negative_zero = [-0.0; HEAD_DIM];
+            quantizer.accumulate(&record(bits, 1.0), -0.0, &mut negative_zero)?;
+            for (index, value) in negative_zero.iter().enumerate() {
+                let centroid = quantizer.centroids()[index % usize::from(bits.levels())];
+                let expected = if centroid.is_sign_negative() {
+                    0.0_f32
+                } else {
+                    -0.0_f32
+                };
+                assert_eq!(value.to_bits(), expected.to_bits());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn zero_weight_value_scan_still_validates_records_and_retains_poison() -> Result<()> {
+    for bits in [Bits::Three, Bits::Four] {
+        for quantizer in [Quantizer::scalar(bits, 91), Quantizer::new(bits, 91)] {
+            let mut malformed_zero = vec![0; quantizer.encoded_len()];
+            malformed_zero[4] = 1;
+            for invalid in [
+                Vec::new(),
+                malformed_zero,
+                record(bits, -0.0),
+                record(bits, -1.0),
+                record(bits, f32::NAN),
+                record(bits, f32::INFINITY),
+            ] {
+                for weight in [0.0, -0.0, f32::from_bits(1)] {
+                    let mut scan = quantizer.value_accumulator()?;
+                    assert!(scan.accumulate(&invalid, weight).is_err());
+                    assert!(scan.accumulate(&record(bits, 1.0), 0.0).is_err());
+                    assert!(scan.finish().is_err());
+                }
+            }
+            for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut scan = quantizer.value_accumulator()?;
+                assert!(
+                    scan.accumulate(&vec![0; quantizer.encoded_len()], weight)
+                        .is_err()
+                );
+                assert!(scan.accumulate(&record(bits, 1.0), 0.0).is_err());
+                assert!(scan.finish().is_err());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn scan_value_overflow_rejects_finite_products_and_preserves_public_output() -> Result<()> {
     for bits in [Bits::Three, Bits::Four] {
         for quantizer in [Quantizer::scalar(bits, 91), Quantizer::new(bits, 91)] {

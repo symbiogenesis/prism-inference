@@ -448,6 +448,109 @@ fn x1_value_scan_late_record_failure_never_publishes_attended_head() -> Result<(
 }
 
 #[test]
+fn zero_probability_history_matches_defensive_values_and_rejects_hidden_corruption() -> Result<()> {
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
+        for scalar in [true, false] {
+            for arithmetic in [
+                super::super::Arithmetic::Source,
+                super::super::Arithmetic::PinnedSwift,
+            ] {
+                let mut keys = KvCache::with_policy(HEAD_DIM, 4, policy, true, scalar)?;
+                let mut values = KvCache::with_policy(HEAD_DIM, 4, policy, false, scalar)?;
+                for position in 0..3 {
+                    let key = [-1.0; HEAD_DIM];
+                    let value = input(HEAD_DIM, position)?;
+                    keys.prepare_append(&key)?;
+                    values.prepare_append(&value)?;
+                    keys.append(&key);
+                    values.append(&value);
+                }
+                let current_key = [1.0; HEAD_DIM];
+                let current_value = input(HEAD_DIM, 41)?;
+                let queries = [100.0; HEAD_DIM];
+                let projected = [0.0; 2 * HEAD_DIM];
+                let packed_keys = keys.packed.as_ref().ok_or_else(|| invalid("keys"))?;
+                let mut encoded = vec![0; packed_keys.row_bytes];
+                packed_keys.quantizer.encode(&current_key, &mut encoded)?;
+                let probabilities =
+                    defensive_probabilities(packed_keys, &encoded, &queries, 0, 1, arithmetic)?;
+                assert_eq!(
+                    probabilities
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        0.0_f32.to_bits(),
+                        0.0_f32.to_bits(),
+                        0.0_f32.to_bits(),
+                        1.0_f32.to_bits()
+                    ]
+                );
+                let expected = defensive_value_result(
+                    &values,
+                    &current_value,
+                    &projected,
+                    0,
+                    0,
+                    &probabilities,
+                )?;
+                let run = |keys: &mut KvCache, values: &mut KvCache, output: &mut [f32]| {
+                    attend(
+                        keys,
+                        values,
+                        &queries,
+                        &projected,
+                        &current_key,
+                        &current_value,
+                        output,
+                        &mut [0.0; 4],
+                        1,
+                        1.0 / 16.0,
+                        arithmetic,
+                        &RowParallelism::default(),
+                    )
+                };
+                let mut actual = [13.0; HEAD_DIM];
+                run(&mut keys, &mut values, &mut actual)?;
+                assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+
+                // Even a zero-probability history row must validate its record.
+                // The third value fails after two skipped but valid records.
+                let cache = values.packed.as_mut().ok_or_else(|| invalid("values"))?;
+                let offset = 2 * cache.row_bytes;
+                cache.tail[offset..offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+                let frozen_values = packed_bytes(&values);
+                let frozen_keys = packed_bytes(&keys);
+                actual.fill(13.0);
+                assert!(run(&mut keys, &mut values, &mut actual).is_err());
+                assert_eq!(actual.map(f32::to_bits), [13.0_f32.to_bits(); HEAD_DIM]);
+                assert_eq!(packed_bytes(&values), frozen_values);
+                assert_eq!(packed_bytes(&keys), frozen_keys);
+                assert!(
+                    !values
+                        .packed
+                        .as_ref()
+                        .ok_or_else(|| invalid("values"))?
+                        .prepared_ready
+                );
+                assert!(
+                    !keys
+                        .packed
+                        .as_ref()
+                        .ok_or_else(|| invalid("keys"))?
+                        .prepared_ready
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn packed_pages_and_partial_tail_snapshots_are_independent() -> Result<()> {
     for policy in [
         KvCachePolicy::Rotated4,

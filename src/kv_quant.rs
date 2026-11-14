@@ -172,7 +172,15 @@ impl ValueAccumulator<'_> {
         if !weighted_scale.is_finite() {
             return Err(invalid("KV codec weighted scale overflow"));
         }
-        if scale == 0.0 {
+        // This private sum starts at +0 and uses separate binary32 products
+        // and additions. Adding finite binary32 operands cannot underflow an
+        // exact nonzero sum below the smallest subnormal; exact cancellation
+        // produces +0. Thus no successful append can leave a -0 coordinate.
+        // Adding either signed zero is consequently bit-preserving, including
+        // when weight * scale underflows. Keep all record/weight/scale checks
+        // above this shortcut; a zero probability cannot hide malformed rows.
+        // Public accumulate accepts caller-owned -0 and retains its full path.
+        if weighted_scale == 0.0 {
             return Ok(());
         }
         match &mut self.state {

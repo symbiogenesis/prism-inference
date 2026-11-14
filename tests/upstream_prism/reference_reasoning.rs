@@ -422,7 +422,8 @@ mod tests {
         assert!(
             report["Detail"]
                 .as_str()
-                .is_some_and(|detail| detail.contains("assertions=71; failed=0"))
+                .is_some_and(|detail| detail.contains("71 required semantic conditions;")
+                    && detail.contains("failed=0;"))
         );
         let reference_arm = Engine::new(Target::Cpp, None, None, None, None, None)?;
         assert_eq!(crate::reasoning_budget::run(&reference_arm)?, report);

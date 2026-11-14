@@ -92,6 +92,10 @@ impl FfnPatch {
         &self.identity
     }
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "The declared source-order F32 contract rounds each product before reduction, scale and base addition; FMA changes patch arithmetic."
+    )]
     pub(super) fn apply(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
         if input.len() != self.a.len() || output.len() != self.b.len() {
             return Err(invalid(

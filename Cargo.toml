@@ -76,6 +76,11 @@ test = true
 required-features = ["cli"]
 
 [[example]]
+name = "ffn_patch_probe"
+test = true
+required-features = ["cli"]
+
+[[example]]
 name = "cpu_bundle_check"
 test = true
 required-features = ["cli", "parallel-rows"]

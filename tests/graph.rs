@@ -13,6 +13,8 @@ mod quantized_kv;
 mod sampled_suffix;
 #[path = "graph/verification.rs"]
 mod verification;
+#[path = "graph/weight_patch.rs"]
+mod weight_patch;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

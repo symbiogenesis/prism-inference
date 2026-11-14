@@ -42,6 +42,7 @@ mod ffn_preparation;
 #[cfg(all(test, feature = "parallel-rows"))]
 #[path = "graph/sibling_projection_tests.rs"]
 mod sibling_projection_tests;
+pub mod weight_patch;
 
 /// Maximum generic live KV/recurrent element payload, also the default budget.
 ///
@@ -2923,6 +2924,7 @@ impl Qwen35 {
             token,
             logits,
             executor.as_mut().map(coerce_executor),
+            None,
         );
         self.projection_executor = executor;
         result
@@ -2937,6 +2939,7 @@ impl Qwen35 {
         token: u32,
         logits: Option<&mut Vec<f32>>,
         executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        mut probe: Option<&mut weight_patch::Intervention<'_>>,
     ) -> Result<()> {
         let token = usize::try_from(token)?;
         if token >= self.vocabulary || self.position >= self.context_limit {
@@ -3069,26 +3072,55 @@ impl Qwen35 {
             // exact FFN operations while reusing their high-water allocations.
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
-            if evaluation.try_project_ffn_chain_into(
-                &layer.gate,
-                &layer.up,
-                &layer.down,
-                normalized,
-                Some(hidden.as_slice()),
-                attention,
-            )? {
-                std::mem::swap(hidden, attention);
-                finite(hidden, "decoder layer output")?;
-            } else {
-                evaluation.project_ffn_swiglu_into(
+            let selected_probe = probe.as_mut().filter(|probe| probe.layer == layer_idx);
+            if selected_probe.is_none()
+                && evaluation.try_project_ffn_chain_into(
                     &layer.gate,
                     &layer.up,
                     &layer.down,
                     normalized,
-                    gate,
-                    up,
-                )?;
+                    Some(hidden.as_slice()),
+                    attention,
+                )?
+            {
+                std::mem::swap(hidden, attention);
+                finite(hidden, "decoder layer output")?;
+            } else {
+                if selected_probe.is_some() {
+                    evaluation.project_group_into(
+                        [&layer.up, &layer.gate],
+                        normalized,
+                        [&mut *up, &mut *gate],
+                    )?;
+                    evaluation.arithmetic.swiglu_in_place_with_parallelism(
+                        gate,
+                        up,
+                        evaluation.projection.matvec.row_parallelism(),
+                    )?;
+                } else {
+                    evaluation.project_ffn_swiglu_into(
+                        &layer.gate,
+                        &layer.up,
+                        &layer.down,
+                        normalized,
+                        gate,
+                        up,
+                    )?;
+                }
                 evaluation.project_into(&layer.down, up, attention)?;
+                if let Some(probe) = selected_probe {
+                    if let Some(patch) = probe.patch {
+                        patch.apply(up, attention)?;
+                    }
+                    add_finite(hidden, attention, "decoder layer output")?;
+                    (probe.observer)(weight_patch::FfnObservation {
+                        layer: layer_idx,
+                        token_index: self.position,
+                        activation: up,
+                        residual: hidden,
+                    })?;
+                    continue;
+                }
                 add_finite(hidden, attention, "decoder layer output")?;
             }
         }

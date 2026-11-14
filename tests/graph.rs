@@ -39,6 +39,8 @@ macro_rules! metadata {
     ($value:expr) => { MetadataValue::from($value) };
 }
 
+#[path = "graph/timing.rs"]
+mod timing;
 #[path = "graph/weight_patch.rs"]
 mod weight_patch;
 

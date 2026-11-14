@@ -50,7 +50,15 @@ struct Observation {
     completion: Option<Completion>,
 }
 
-fn bounded_deadline(value: &str, started: Instant, now: SystemTime) -> Result<(u64, Instant)> {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Shared only by this example's two timing commands."
+)]
+pub(super) fn bounded_deadline(
+    value: &str,
+    started: Instant,
+    now: SystemTime,
+) -> Result<(u64, Instant)> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(reject(
             "an absolute deadline in Unix milliseconds is required",
@@ -71,7 +79,11 @@ fn bounded_deadline(value: &str, started: Instant, now: SystemTime) -> Result<(u
     Ok((milliseconds, started + remaining))
 }
 
-fn check(deadline: Instant) -> Result<()> {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Shared only by this example's two timing commands."
+)]
+pub(super) fn check(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -90,7 +102,11 @@ fn hex(digest: impl IntoIterator<Item = u8>) -> String {
         .collect()
 }
 
-fn read_input(path: &Path, deadline: Instant) -> Result<(Vec<u8>, String)> {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Shared only by this example's two timing commands."
+)]
+pub(super) fn read_input(path: &Path, deadline: Instant) -> Result<(Vec<u8>, String)> {
     check(deadline)?;
     let input = File::open(path)?;
     if !input.metadata()?.is_file() {
@@ -107,7 +123,11 @@ fn read_input(path: &Path, deadline: Instant) -> Result<(Vec<u8>, String)> {
     Ok((bytes, digest))
 }
 
-fn executable_hash(deadline: Instant) -> Result<String> {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Shared only by this example's two timing commands."
+)]
+pub(super) fn executable_hash(deadline: Instant) -> Result<String> {
     let mut file = File::open(std::env::current_exe()?)?;
     if file.metadata()?.len() > MAX_EXECUTABLE_BYTES {
         return Err(reject("diagnostic executable exceeds its byte bound"));

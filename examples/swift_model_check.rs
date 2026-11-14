@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Bounded, explicit actual-model load, forward and rollback correctness evidence.
 
+#[path = "swift_model_check/ffn_timing.rs"]
+mod ffn_timing;
 #[path = "swift_model_check/request_timing.rs"]
 mod request_timing;
 #[path = "swift_model_check/rollback.rs"]
@@ -29,9 +31,10 @@ const USAGE: &str = concat!(
     "       swift_model_check trajectory <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-prompt-ids.json> <greedy-steps>\n",
     "       swift_model_check rollback <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check request-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-messages.json> <output-1..16> <absolute-deadline-unix-ms> <source-commit>\n",
+    "       swift_model_check ffn-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-token-ids.json> <absolute-deadline-unix-ms> <source-commit>\n",
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
-    "For load/forward/trajectory/rollback/request-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
-    "For selected current-weight load/forward/trajectory/rollback/request-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
+    "For load/forward/trajectory/rollback/request-timing/ffn-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
+    "For selected current-weight load/forward/trajectory/rollback/request-timing/ffn-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -42,6 +45,7 @@ const USAGE: &str = concat!(
     "request-timing uses production Swift sampling/stops with seed 42, thinking disabled, at most 128 rendered prompt tokens and a no-op text consumer.\n",
     "Its original absolute deadline must leave 1..240 seconds at entry, covering intake, loading and generation; the external owner must separately reserve cleanup and enforce the aggregate limit.\n",
     "request-timing writes create-new started/final receipts, including returned failures, with input/executable hashes and a declared source commit requiring external build-receipt verification. It retains no prompt/output text or token IDs.\n",
+    "ffn-timing attributes attention/FFN at each layer for 1..16 fixed full-token evaluations with logits, not narrowed/tiled prefill or sampled answers. Same worker/adapter prefixes and original deadline rules apply. It writes value-free started/final receipts; external containment, power observations and source-bound prebuilt helpers remain required.\n",
 );
 
 fn reject(message: &str) -> bonsai_prism_runtime::Error {
@@ -83,7 +87,13 @@ fn run() -> Result<()> {
     if !path.is_absolute()
         || !matches!(
             mode.as_str(),
-            "inspect" | "load" | "forward" | "trajectory" | "rollback" | "request-timing"
+            "inspect"
+                | "load"
+                | "forward"
+                | "trajectory"
+                | "rollback"
+                | "request-timing"
+                | "ffn-timing"
         )
     {
         return Err(reject(
@@ -138,6 +148,13 @@ fn run() -> Result<()> {
             row_workers.unwrap_or(1),
         ),
         "request-timing" => request_timing::run(
+            &path,
+            &arguments[2..],
+            representation,
+            adapter.as_ref(),
+            row_workers.unwrap_or(1),
+        ),
+        "ffn-timing" => ffn_timing::run(
             &path,
             &arguments[2..],
             representation,

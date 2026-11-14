@@ -50,7 +50,9 @@ mod rms_weight_scope_tests;
 #[cfg(all(test, feature = "parallel-rows"))]
 #[path = "graph/sibling_projection_tests.rs"]
 mod sibling_projection_tests;
+mod timing;
 pub mod weight_patch;
+pub use timing::{LayerTimings, MAX_TIMED_LAYERS, OperationTiming, TokenTimings};
 
 /// Maximum generic live KV/recurrent element payload, also the default budget.
 ///
@@ -2949,32 +2951,53 @@ impl Qwen35 {
     }
 
     fn evaluate_token_into(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
+        self.evaluate_token_recorded_into(token, logits, None)
+    }
+
+    fn evaluate_token_recorded_into(
+        &mut self,
+        token: u32,
+        logits: Option<&mut Vec<f32>>,
+        timings: Option<&mut TokenTimings>,
+    ) -> Result<()> {
         const fn coerce_executor<'a>(
             executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
         ) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
             &mut **executor
         }
         let mut executor = self.projection_executor.take();
-        let result = self.evaluate_token_with_executor(
+        let result = self.evaluate_token_recorded_with_executor(
             token,
             logits,
             executor.as_mut().map(coerce_executor),
             None,
+            timings,
         );
         self.projection_executor = executor;
         result
+    }
+
+    fn evaluate_token_with_executor(
+        &mut self,
+        token: u32,
+        logits: Option<&mut Vec<f32>>,
+        executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        probe: Option<&mut weight_patch::Intervention<'_>>,
+    ) -> Result<()> {
+        self.evaluate_token_recorded_with_executor(token, logits, executor, probe, None)
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and transactional graph operation order auditable together."
     )]
-    fn evaluate_token_with_executor(
+    fn evaluate_token_recorded_with_executor(
         &mut self,
         token: u32,
         logits: Option<&mut Vec<f32>>,
         executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
         mut probe: Option<&mut weight_patch::Intervention<'_>>,
+        mut timings: Option<&mut TokenTimings>,
     ) -> Result<()> {
         let token = usize::try_from(token)?;
         if token >= self.vocabulary || self.position >= self.context_limit {
@@ -3036,6 +3059,9 @@ impl Qwen35 {
                 Attention::Full(weights) => &weights.query,
                 Attention::Recurrent(weights) => &weights.qkv,
             };
+            let attention_timer = timings
+                .as_deref_mut()
+                .map(|record| record.attention(layer_idx));
             evaluation.normalize_for_into(hidden, &layer.norm, normalized, first_attn_target)?;
             if is_narrow_final {
                 match (&layer.attention, state) {
@@ -3065,6 +3091,7 @@ impl Qwen35 {
                     }
                     _ => return Err(invalid("decoder layer/cache kind mismatch")),
                 }
+                timing::complete(attention_timer);
                 continue;
             }
             match (&layer.attention, state) {
@@ -3096,6 +3123,8 @@ impl Qwen35 {
                 )?,
                 _ => return Err(invalid("decoder layer/cache kind mismatch")),
             }
+            timing::complete(attention_timer);
+            let ffn_timer = timings.as_deref_mut().map(|record| record.ffn(layer_idx));
             evaluation.add_normalize_for_into(
                 hidden,
                 attention,
@@ -3171,10 +3200,12 @@ impl Qwen35 {
                         activation: up,
                         residual: hidden,
                     })?;
+                    timing::complete(ffn_timer);
                     continue;
                 }
                 add_finite(hidden, attention, "decoder layer output")?;
             }
+            timing::complete(ffn_timer);
         }
         if let Some(logits) = logits {
             evaluation.normalize_for_into(hidden, &self.output_norm, normalized, &self.output)?;

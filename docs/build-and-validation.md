@@ -296,6 +296,47 @@ timings attribute session work; they do not qualify app throughput, model parity
 or service lifecycle. For a controlled multi-arm experiment, use the
 [CPU bundle comparison protocol](cpu-bundle-comparison.md).
 
+### FFN layer attribution
+
+The source-only checker also accepts `ffn-timing` with the same representation,
+worker and approved-adapter prefixes:
+
+```text
+swift_model_check --row-workers 4 --rank-one-adapter <absolute-approved-adapter> 1.3 ffn-timing <absolute-original-PQ2> <new-existing-evidence-dir> auto <absolute-token-ids.json> <original-work-deadline-unix-ms> <exact-source-commit>
+```
+
+Supply a JSON array of 1–16 fixed public token IDs. Every token computes full
+logits; this is neither narrowed/tiled prompt ingestion nor sampled generation.
+The original deadline leaves 1–240 seconds and includes intake, executable
+hashing, loading, evaluation and model destruction. Prebuild the source-bound
+checker; use native process supervision and reserve receipt/descendant cleanup
+within the original owner allowance. The helper cannot preempt blocking loads
+or projections. Retain aggregate and per-arm power externally.
+
+Create-new `ffn-timing-started.json` and `ffn-timing.json` retain the exact input
+and executable hashes, declared source commit, selected model/adapter/scale,
+graph, workers and every layer observation, including returned failures.
+Bind the executable to its separately reviewed build identity; a declared commit
+alone authenticates no build. Missing or empty final output means incomplete
+evidence. Receipts omit token IDs, tensor values, logits and output text. Preserve
+the original token input separately for replay; after reviewing a successful
+final receipt, the redundant started receipt need not be retained.
+
+Attention brackets include input normalization and attention. FFN brackets
+include attention residual addition, post-attention normalization, the selected
+FFN/fusion/standard adapter and FFN residual addition. Embedding, vocabulary
+projection and state commit remain outside these disjoint layer brackets.
+Attempted/completed brackets describe provisional work; only a successful token
+establishes graph-state commit. Unentered brackets have unknown time, not measured
+zero. The fixed record supports at most 64 layers. Untimed entry points read no
+timing clocks and retain their numerical and checkpoint identities.
+
+Predeclare one useful bounded workload and retain all sites. Report the first
+token separately from later tokens. These observations may nominate an FFN
+capacity screen; they establish no statistical site ranking, long-context,
+tiled/accelerator, useful-answer latency, unloaded-weight memory or quality gain.
+The helper intentionally reports performance comparison as ineligible.
+
 ## Binary bundles
 
 A bundle contains `prism-inference`, `bonsai-token-worker`,

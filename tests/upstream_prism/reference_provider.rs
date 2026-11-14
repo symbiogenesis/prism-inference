@@ -79,6 +79,16 @@ pub(super) fn supports(id: &str) -> bool {
     id == MTP_ID || id == super::reference_reasoning::ID
 }
 
+pub(super) fn handles(value: &Value) -> bool {
+    super::reference_reasoning::handles(value)
+        || value["Operations"].as_array().is_some_and(|operations| {
+            !operations.is_empty()
+                && operations
+                    .iter()
+                    .all(|operation| operation["Kind"] == "mtp-first-decode-fits")
+        })
+}
+
 pub(super) fn identity() -> Value {
     json!({"Kind": "independent-rust-mathematical", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID],
         "UpstreamCommit": super::UPSTREAM,
@@ -102,6 +112,8 @@ mod tests {
         let report = crate::common::run_mtp(&engine)?;
         assert_eq!(report["Id"], MTP_ID);
         assert_eq!(report["Status"], "pass", "{report}");
+        let reference_arm = Engine::new(Target::Cpp, None, None, None, None, None)?;
+        assert_eq!(crate::common::run_mtp(&reference_arm)?, report);
         for (batch, demand, anchors, expected) in [
             (1, 0, 0, true),
             (1, 0, 1, true),

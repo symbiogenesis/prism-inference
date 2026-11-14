@@ -25,7 +25,8 @@ memory remains unsupported and never counts as a pass.
 Safe Rust owns inputs, reference calculations, assertions and tolerances.
 Each adapter runs the same assertions against an independent reference and the Rust
 runtime. References use pinned native Prism except for explicitly migrated
-model-free families. Reasoning-budget's complete 71-condition source contract
+model-free families. MTP's six exact bounds predicates use an independent
+capacity-minus-reserved-anchors calculation. Reasoning-budget's complete 71-condition source contract
 uses a separate Rust active-prefix/event-ordinal state machine; its former native
 header and dispatch are retired. Reports and retained case details identify the
 provider without claiming native replay. Native bridges provide bounded serialization and production calls;

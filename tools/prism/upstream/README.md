@@ -51,7 +51,7 @@ cargo run -p prism-inference --example upstream_prism -- \
 ```
 
 Use `--target rust` without bridge options for the runtime arm. PTQ1's selector is
-`test-ptq1_0-element-map`; Unicode/MTP use `--common-bridge`. The supervising
+`test-ptq1_0-element-map`; Unicode uses `--common-bridge`. The supervising
 `tests/Test-PrismUpstream.ps1` retains required requests/responses and checks all
 reference results in the final gate. GGML adapter use also requires
 `tests/Test-PrismGgmlBridge.ps1` protocol/resource rejection checks; optional
@@ -86,9 +86,13 @@ source observations, not captured native output. Reports identify target
 with `NativeReferenceReplay`, `CompleteSourceGate` and `NativeRetirementQualified`
 false. The selector also admits the explicitly migrated reasoning-budget source
 below; it rejects other sources, full catalogs, benchmarks, diagnostics
-and native bridge options. The MTP `cpp` and `rust` routes and their native
-acceptance remain unchanged; this provider does not replace the complete owning
-reference gate or authorize deleting the common dispatcher. Backend geometries,
+and native bridge options. The ordinary owning `cpp` reference arm also uses
+this provider for the MTP source, preserving all six source predicates and the
+protected green ID. Its native include and dispatch are retired; the Rust
+production arm remains unchanged. Reports and per-case details identify the
+independent provider without claiming native replay. This provider does not
+replace the complete owning reference gate or authorize deleting the common
+dispatcher. Backend geometries,
 source inventories, approved green IDs and separate performance schedules remain
 required.
 

@@ -287,8 +287,8 @@ impl Engine {
                 "extended graph-controller deadlines require the main CI backend lane",
             ));
         }
-        if matches!(self.target, Target::Cpp) && super::reference_reasoning::handles(request) {
-            return super::reference_reasoning::execute(request).map(Some);
+        if matches!(self.target, Target::Cpp) && super::reference_provider::handles(request) {
+            return super::reference_provider::execute(request).map(Some);
         }
         if matches!(self.target, Target::RustReference) {
             return super::reference_provider::execute(request).map(Some);

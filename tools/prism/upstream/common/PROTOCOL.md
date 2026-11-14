@@ -13,30 +13,34 @@ Input and output are bounded UTF-8 JSON files with this schema:
 
 ```json
 {"SchemaVersion":1,"Operations":[
-  {"Kind":"unicode-regex-split","Text":"text","Expressions":["expression"],"ByteEncoding":false},
-  {"Kind":"mtp-first-decode-fits","Batch":32,"Catchup":31,"Sequences":1}
+  {"Kind":"unicode-regex-split","Text":"text","Expressions":["expression"],"ByteEncoding":false}
 ]}
 ```
 
 Every operation is validated before any production API executes. Operation fields are exact; unknown
-fields, duplicate object keys, unknown kinds and incorrect types are rejected. `Batch`, `Catchup`
-and `Sequences` are signed 32-bit integers. JSON nesting is limited to 160 levels for declarative
+fields, duplicate object keys, unknown kinds and incorrect types are rejected.
+JSON nesting is limited to 160 levels for declarative
 graph transport. Request and response files are at most 16 MiB, and operations number 1 through 128.
 Text is at most 65,536 UTF-8 bytes; there are 1 through 16 expressions, each at most 8,192 UTF-8
 bytes. Paths must be absolute and distinct.
 
-The adapter forwards inputs directly to `unicode_regex_split` and
-`common_speculative_mtp_first_decode_fits`. Results preserve input order:
+The adapter forwards Unicode inputs directly to `unicode_regex_split`.
+Results preserve input order:
 
 ```json
-{"SchemaVersion":1,"Results":[{"Pieces":["piece"]},{"Fits":true}]}
+{"SchemaVersion":1,"Results":[{"Pieces":["piece"]}]}
 ```
 
 `Pieces` contains the production split result without further encoding changes;
-the production function receives `ByteEncoding` exactly as supplied. `Fits` is
-the production boolean result. A zero process exit means completion and a written
+the production function receives `ByteEncoding` exactly as supplied.
+A zero process exit means completion and a written
 response. Errors return a nonzero exit and a message on stderr. Discard any
 response from a failing process. The caller owns the timeout and file lifecycle.
+
+The former `mtp-first-decode-fits` native operation is retired. Its exact
+`Batch`, `Catchup`, `Sequences` i32 protocol and `{"Fits":boolean}` result now
+belong to the independent Rust reference selected by the source harness. The
+native executable rejects this operation as unknown.
 
 ## Generic Jinja operations
 

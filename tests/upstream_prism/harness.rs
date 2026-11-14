@@ -474,7 +474,7 @@ const CASES: &[Case] = &[
     register(
         "test-mtp-catchup-batch",
         "tests/test-mtp-catchup-batch.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         common::run_mtp,
     ),
     register(
@@ -957,12 +957,12 @@ fn main() -> Result<()> {
     if matches!(options.target, Target::Cpp)
         && options.benchmark.is_none()
         && options.diagnostic.is_none()
-        && selected(options.case).any(|case| case.id == reference_reasoning::ID)
+        && selected(options.case).any(|case| reference_provider::supports(case.id))
     {
         // `cpp` remains the historic reference-arm selector. This migrated
-        // source executes the independent provider even in complete owning CI.
+        // sources execute independent providers even in complete owning CI.
         // Its per-case Detail survives existing baseline/fan-in serialization.
-        report["MigratedReferenceProviders"] = json!([reference_reasoning::identity()]);
+        report["MigratedReferenceProviders"] = json!([reference_provider::identity()]);
     }
     fs::write(options.output, serde_json::to_vec_pretty(&report)?)?;
     // Measured failures belong in the report. Nonzero exits indicate an

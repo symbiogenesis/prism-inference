@@ -1,6 +1,5 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
-#include "speculative.h"
 #include "unicode.h"
 #include "jinja.hpp"
 #include "mtmd.hpp"
@@ -138,11 +137,6 @@ void validate_operation(const wire_json & operation) {
             require(expression.is_string() && expression.get_ref<const std::string &>().size() <= max_expression_bytes,
                     "expression must be a string of at most 8192 UTF-8 bytes");
         }
-    } else if (kind == "mtp-first-decode-fits") {
-        require_keys(operation, {"Kind", "Batch", "Catchup", "Sequences"});
-        integer(operation.at("Batch"));
-        integer(operation.at("Catchup"));
-        integer(operation.at("Sequences"));
     } else if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
     } else if (prism_mtmd::handles(kind)) {
@@ -303,9 +297,7 @@ wire_json execute(const wire_json & operation) {
                 operation.at("ByteEncoding").get<bool>());
         return wire_json{{"Pieces", pieces}};
     }
-    return wire_json{{"Fits", common_speculative_mtp_first_decode_fits(
-            integer(operation.at("Batch")), integer(operation.at("Catchup")),
-            integer(operation.at("Sequences")))}};
+    throw std::runtime_error("unknown operation Kind");
 }
 } // namespace
 

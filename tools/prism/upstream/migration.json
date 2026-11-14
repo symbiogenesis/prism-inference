@@ -551,7 +551,7 @@
       "SourceSha256": "48d136ab03706c888eb393a771a6e1c7ec0c4ac0be1d7581d58a35bb57f1aae0",
       "Category": "model-free",
       "Needs": [
-        "common_speculative_mtp_first_decode_fits production function"
+        "production Rust speculative bounds; independent nonnegative-capacity-minus-reserved-anchors Rust reference"
       ],
       "AssertionsToPort": "Six exact boundary predicates (32/31/1 true;32/32/1 false;32/30/2 true;32/32/2 false;0/0/0 false;32/-1/1 false).",
       "LegacyReferenceRequired": true,

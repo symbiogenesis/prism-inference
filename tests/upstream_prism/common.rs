@@ -126,7 +126,12 @@ pub(super) fn run_mtp(engine: &Engine) -> Result<Value> {
         MTP_ID,
         failures.is_empty(),
         format!(
-            "6 original first-decode bounds assertions; failed={}; {}",
+            "provider={}; 6 original first-decode bounds assertions; failed={}; {}",
+            if engine.is_rust() {
+                "production-rust"
+            } else {
+                "independent-rust-mathematical; nativeReferenceReplay=false"
+            },
             failures.len(),
             failures.join("; ")
         ),

@@ -8,6 +8,10 @@ use core::arch::aarch64::{
 };
 
 #[inline]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Keep the checked native implementation visible only to its safe parent boundary."
+)]
 pub(super) fn dot_rows<const ROWS: usize>(
     rows: [&[u8]; ROWS],
     input: &[f32],

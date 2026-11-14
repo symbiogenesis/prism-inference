@@ -135,6 +135,7 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
         ));
     }
     record["modelLoaded"] = json!(true);
+    record["graphIdentity"] = json!(session.decoder_identity());
     for (id, prompt, expected) in CASES {
         check(deadline)?;
         record["stage"] = json!(id);

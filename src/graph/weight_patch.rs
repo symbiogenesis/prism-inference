@@ -12,6 +12,11 @@ use bonsai_native_hash::Hasher;
 use super::{MatvecBackend, Qwen35, Qwen35Checkpoint};
 use crate::{Decoder, Result, invalid};
 
+mod compensation;
+pub use compensation::{
+    FACTOR_APPLICATION_ARITHMETIC, FfnCompensation, GROUP_COMPENSATION_PROFILE,
+};
+
 /// Numerical profile for the experimental original-basis FFN observation path.
 pub const EXECUTION_PROFILE: &str = "experimental-ffn-cpu-scalar-unfused-v1";
 /// Basis of the post-SwiGLU FFN activation supplied to a patch.
@@ -33,8 +38,10 @@ pub struct FfnGroupObservation {
     pub input: Vec<f32>,
     /// Complete FFN delta on this same student input, before residual addition.
     pub teacher_target: Vec<f32>,
-    /// Group-omitted FFN delta actually propagated through the student graph.
+    /// Group-omitted FFN delta before any new recovery correction.
     pub retained_branch: Vec<f32>,
+    /// Source-order corrected branch when the probe has frozen recovery factors.
+    pub compensated_branch: Option<Vec<f32>>,
 }
 
 pub(super) struct GroupOmission {
@@ -192,6 +199,7 @@ pub(super) struct Intervention<'a> {
     pub(super) surrogate_observer: Option<SurrogateObserver<'a>>,
     pub(super) omission: Option<&'a GroupOmission>,
     pub(super) group_observer: Option<GroupObserver<'a>>,
+    pub(super) compensation: Option<&'a FfnCompensation>,
 }
 
 /// A sealed experimental graph with one observed and optionally patched FFN.
@@ -206,6 +214,7 @@ pub struct FfnProbe {
     layer: usize,
     patch: Option<FfnPatch>,
     omission: Option<GroupOmission>,
+    compensation: Option<FfnCompensation>,
 }
 
 impl FfnProbe {
@@ -256,6 +265,7 @@ impl FfnProbe {
             layer,
             patch,
             omission: None,
+            compensation: None,
         })
     }
 
@@ -341,6 +351,45 @@ impl FfnProbe {
             .map(|omission| omission.full_signs_sha256.as_str())
     }
 
+    /// Consumes an omitted graph into a reset profile with frozen recovery.
+    ///
+    /// Recovery uses the original normalized pre-FFN input and adds to the
+    /// retained adapter-inclusive branch before residual addition. It changes
+    /// subsequent layers and tokens; old checkpoints become foreign. This
+    /// still loads all weights and executes the complete teacher FFN.
+    ///
+    /// # Errors
+    /// Rejects a non-omitted/already-compensated profile, mismatched factor
+    /// dimensions, and reset or identity-allocation failures.
+    pub fn with_group_compensation(self, compensation: FfnCompensation) -> Result<Self> {
+        if self.omission.is_none() {
+            return Err(invalid(
+                "FFN recovery requires a frozen group-omission profile",
+            ));
+        }
+        self.install_compensation(compensation)
+    }
+
+    fn install_compensation(mut self, compensation: FfnCompensation) -> Result<Self> {
+        let layer = &self.graph.layers[self.layer];
+        if self.compensation.is_some()
+            || compensation.dimensions() != (layer.up.dimensions[0], layer.down.dimensions[1])
+        {
+            return Err(invalid(
+                "FFN recovery requires matching frozen omitted-site factors",
+            ));
+        }
+        self.graph.reset()?;
+        write!(
+            self.graph.identity,
+            ":{GROUP_COMPENSATION_PROFILE}:recovery={}",
+            compensation.identity()
+        )?;
+        self.graph.provenance = Arc::new(());
+        self.compensation = Some(compensation);
+        Ok(self)
+    }
+
     /// Evaluates one token and borrows the selected activation and residual.
     ///
     /// The callback may inspect or copy bounded selected values. It cannot alter
@@ -362,6 +411,7 @@ impl FfnProbe {
             surrogate_observer: None,
             omission: self.omission.as_ref(),
             group_observer: None,
+            compensation: self.compensation.as_ref(),
         };
         let result = self.graph.evaluate_token_with_executor(
             token,
@@ -413,6 +463,7 @@ impl FfnProbe {
             surrogate_observer: Some(&mut capture),
             omission: None,
             group_observer: None,
+            compensation: None,
         };
         let result = self.graph.evaluate_token_with_executor(
             token,
@@ -443,11 +494,20 @@ impl FfnProbe {
             .as_ref()
             .ok_or_else(|| invalid("paired branches require a group-omission probe"))?;
         let mut observation = None;
+        let compensation = self.compensation.as_ref();
         let mut capture = |input: &[f32], teacher: &[f32], retained: &[f32]| {
+            let compensated_branch = compensation
+                .map(|factors| {
+                    let mut branch = super::copy_values(retained)?;
+                    factors.apply(input, &mut branch)?;
+                    Ok::<_, crate::Error>(branch)
+                })
+                .transpose()?;
             observation = Some(FfnGroupObservation {
                 input: super::copy_values(input)?,
                 teacher_target: super::copy_values(teacher)?,
                 retained_branch: super::copy_values(retained)?,
+                compensated_branch,
             });
             Ok(())
         };
@@ -458,6 +518,7 @@ impl FfnProbe {
             surrogate_observer: None,
             omission: Some(omission),
             group_observer: Some(&mut capture),
+            compensation: self.compensation.as_ref(),
         };
         let result = self.graph.evaluate_token_with_executor(
             token,
@@ -510,6 +571,7 @@ impl Decoder for FfnProbe {
             surrogate_observer: None,
             omission: self.omission.as_ref(),
             group_observer: None,
+            compensation: self.compensation.as_ref(),
         };
         self.graph
             .evaluate_token_with_executor(token, None, None, Some(&mut intervention))

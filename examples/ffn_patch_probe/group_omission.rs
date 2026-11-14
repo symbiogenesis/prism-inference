@@ -1,5 +1,8 @@
 //! Two-pass, one-site structured FFN capture with matched original teacher rows.
 
+use bonsai_prism_runtime::graph::weight_patch::{
+    FACTOR_APPLICATION_ARITHMETIC, GROUP_COMPENSATION_PROFILE,
+};
 use std::collections::BTreeMap;
 
 use super::{
@@ -69,7 +72,7 @@ pub(super) fn capture(
     }
     deadline.check()?;
     let mut probe = probe.with_group_omission(groups.clone())?;
-    let student_graph = probe.identity().to_owned();
+    let omitted_graph = probe.identity().to_owned();
     let full_signs = probe
         .omission_signs_sha256()
         .ok_or_else(|| reject("missing actual omission sign identity"))?
@@ -82,8 +85,28 @@ pub(super) fn capture(
         "weightRepresentation":representation.name(),"executionProfile":EXECUTION_PROFILE,
         "graphIdentity":original_graph,
     });
+    let site = json!({"layer":request.layer,"inputBasis":SURROGATE_INPUT_BASIS,
+        "targetBasis":"teacher-minus-retained-ffn-branch","inputWidth":5120,"outputWidth":5120});
+    let omission = json!({"groupWidth":1024,"originalHiddenWidth":17408,"omittedGroups":groups,
+        "transform":"independent-contiguous-1024-signed-hadamard-v1",
+        "retainedAdapterPolicy":"zero-omitted-original-hidden-before-standard-adapter",
+        "signIdentity":{"fullSignsSha256":full_signs,"downSignOffset":11264,"downSignCount":17408}});
+    let recovery_sha256 = if let Some(path) = &request.patch_path {
+        let (factors, digest) =
+            super::group_compensation::read(path, &source, &site, &omission, &omitted_graph)?;
+        probe = probe.with_group_compensation(factors)?;
+        Some(digest)
+    } else {
+        None
+    };
+    let student_graph = probe.identity().to_owned();
+    let execution_profile = if recovery_sha256.is_some() {
+        GROUP_COMPENSATION_PROFILE
+    } else {
+        GROUP_OMISSION_PROFILE
+    };
     let policy = json!({"graphIdentity":student_graph,"omittedGroups":groups,
-        "executionProfile":GROUP_OMISSION_PROFILE,"recovery":"none",
+        "executionProfile":execution_profile,"recovery":recovery_sha256.as_ref().map_or_else(||json!("none"),|digest|json!(digest)),
         "rollout":"fixed-token-ids-teacher-forced","reset":"before-each-sequence",
         "sequences":request.sequences.iter().map(|sequence|json!({
             "sampleId":sequence.sample_id,"groupId":sequence.group_id,
@@ -105,7 +128,7 @@ pub(super) fn capture(
                 let baseline = original
                     .remove(&(sequence.sample_id.as_str(), index))
                     .ok_or_else(|| reject("missing matched original teacher row"))?;
-                rows.push(json!({
+                let mut row = json!({
                     "sampleId":sequence.sample_id,"groupId":sequence.group_id,
                     "tokenIndex":index,"split":sequence.split,
                     "sharedInputSha256":factor_hash(&observation.input)?,
@@ -113,7 +136,11 @@ pub(super) fn capture(
                     "originalPrefixSha256":prefix(&original_graph,&sequence.token_ids[..=index])?,
                     "input":observation.input,"teacherTarget":observation.teacher_target,
                     "retainedBranch":observation.retained_branch,"originalPrefixTeacherTarget":baseline,
-                }));
+                });
+                if let Some(compensated) = observation.compensated_branch {
+                    row["compensatedBranch"] = json!(compensated);
+                }
+                rows.push(row);
             } else {
                 probe.evaluate_into(token, &mut logits)?;
             }
@@ -124,16 +151,19 @@ pub(super) fn capture(
     }
     let row_count = rows.len();
     let mut packet = json!({"schemaVersion":2,"source":source,
-        "studentExecution":{"executionProfile":GROUP_OMISSION_PROFILE,
+        "studentExecution":{"executionProfile":execution_profile,
             "graphIdentity":student_graph,"prefixPolicySha256":prefix_policy_sha256},
-        "site":{"layer":request.layer,"inputBasis":SURROGATE_INPUT_BASIS,
-            "targetBasis":"teacher-minus-retained-ffn-branch","inputWidth":5120,"outputWidth":5120},
-        "omission":{"groupWidth":1024,"originalHiddenWidth":17408,"omittedGroups":groups,
-            "transform":"independent-contiguous-1024-signed-hadamard-v1",
-            "retainedAdapterPolicy":"zero-omitted-original-hidden-before-standard-adapter",
-            "signIdentity":{"fullSignsSha256":full_signs,"downSignOffset":11264,"downSignCount":17408}},
+        "site":site,"omission":omission,
         "rows":rows,
     });
+    if let Some(digest) = &recovery_sha256 {
+        // This is an observation of a frozen edited graph, never an uncorrected
+        // fitting packet. Runner's schema-2 fitter must reject this schema.
+        packet["schemaVersion"] = json!(3);
+        packet["kind"] = json!("experimental-structured-ffn-compensated-replay-v1");
+        packet["recoveryArtifactSha256"] = json!(digest);
+        packet["factorApplicationArithmetic"] = json!(FACTOR_APPLICATION_ARITHMETIC);
+    }
     let capture_sha256 = digest(
         b"prism-ffn-structured-capture-packet-v1\0",
         &serde_json::to_vec(&packet)?,
@@ -148,11 +178,12 @@ pub(super) fn capture(
     deadline.check()?;
     publish(&request.capture_path, &bytes)?;
     Ok(json!({"event":"ffn-probe-captured","rows":row_count,
-        "capturePath":request.capture_path,"executionProfile":GROUP_OMISSION_PROFILE,
-        "originalReplayPasses":1,"studentReplayPasses":1,"recoveryApplied":false,
+        "capturePath":request.capture_path,"executionProfile":execution_profile,
+        "originalReplayPasses":1,"studentReplayPasses":1,"recoveryApplied":recovery_sha256.is_some(),
+        "recoveryArtifactSha256":recovery_sha256,"sourceResearchReplayImplemented":true,
         "allWeightsLoaded":true,"fullTeacherFfnExecuted":true,
         "teacherForcedOnly":true,"performanceQualified":false,"processMemoryQualified":false,
-        "qualification":"unqualified one-site research capture; no compensated rollout or free generation"}))
+        "qualification":"unqualified one-site fixed-token research replay; no free generation, selective loading or serving qualification"}))
 }
 
 #[cfg(test)]

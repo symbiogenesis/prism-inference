@@ -28,6 +28,8 @@ const MAX_CAPTURE_ROWS: usize = 64;
 const MAX_TOKENS: usize = 256;
 const MODEL_BUDGET: usize = 8 * 1024 * 1024 * 1024;
 
+#[path = "ffn_patch_probe/group_compensation.rs"]
+mod group_compensation;
 #[path = "ffn_patch_probe/group_omission.rs"]
 mod group_omission;
 
@@ -180,7 +182,7 @@ fn validate(request: &Request) -> Result<Representation> {
         || request.layer >= 64
         || request.sequences.is_empty()
         || request.sequences.len() > 16
-        || (request.capture_kind != CaptureKind::HiddenPatch && request.patch_path.is_some())
+        || (request.capture_kind == CaptureKind::FfnSurrogate && request.patch_path.is_some())
         || match (&request.omitted_groups, request.capture_kind) {
             (Some(groups), CaptureKind::FfnGroupOmission) => {
                 groups.is_empty()
@@ -625,7 +627,7 @@ mod tests {
         assert!(validate(&request).is_err());
         let _ = request.sequences[0].token_ids.pop();
         request.patch_path = Some(std::env::temp_dir().join("unsupported-recovery.json"));
-        assert!(validate(&request).is_err());
+        assert!(validate(&request).is_ok());
         request.patch_path = None;
         request.capture_kind = CaptureKind::FfnSurrogate;
         assert!(validate(&request).is_err());

@@ -3155,6 +3155,9 @@ impl Qwen35 {
                             observer(normalized, &teacher, attention)?;
                         }
                     }
+                    if let Some(compensation) = probe.compensation {
+                        compensation.apply(normalized, attention)?;
+                    }
                     if let Some(patch) = probe.patch {
                         patch.apply(up, attention)?;
                     }

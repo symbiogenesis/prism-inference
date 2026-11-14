@@ -128,7 +128,7 @@ replacement/loading and independent complete-answer acceptance remain separate.
 Set `captureKind:"ffn-group-omission"` and supply `omittedGroups`, a strictly
 increasing nonempty list of original 1,024-coordinate group indices from 0 to 16.
 At least one group must remain. The request version remains 1; the resulting
-fitting packet uses schema 2. This mode rejects `patchPath` and uses the same
+fitting packet uses schema 2. Without `patchPath`, this uses the same
 fit/development-only split rules as the surrogate collector. Other modes reject
 `omittedGroups`, preserving the existing schema-1 capture formats.
 
@@ -194,5 +194,52 @@ Add bounded fitting `controls` and optional new `outputPath` before using the
 packet with `bonsai-tools ffn-surrogate`. Rank must not exceed fit rows. This
 collector runs **without compensation**, computes the complete gate/up branch
 and loads every base weight. It provides neither selective loading nor saved
-computation, actual RAM or latency. Compensated-prefix capture, multiple edited
-sites, freely generated answers and production arithmetic remain separate work.
+computation, actual RAM or latency. Frozen compensated replay is separately
+available below; multiple edited sites, freely generated answers and production
+arithmetic remain separate work.
+
+## Frozen structured-compensation replay
+
+For source-only recovery replay, use `captureKind:"ffn-group-omission"` with
+the same `omittedGroups` and `patchPath` pointing to a Runner schema-2
+`experimental-structured-ffn-compensation-v2` artifact. Entire-FFN surrogate
+capture continues to reject patches; hidden-basis patches remain a separate
+schema and cannot substitute for normalized-input recovery.
+
+The 8 MiB bounded importer requires the exact current teacher source, executable,
+base, adapter/scale, selected site, omission groups, original omitted graph and
+model-bound sign digest; rank 1..16, width-5,120 F32 factor shapes, layout and
+factor hashes; and both the exported-factor F64 and source-order F32 development
+screens. It rejects changed/absent arithmetic markers, relaxed screening
+thresholds and promoted qualification flags. The stored fitting prefix-policy
+digest remains derivation evidence; replay may use different development tokens.
+Declared fitting vectors and screening claims remain unauthenticated.
+
+`FfnCompensation::new` binds factor shapes/bits and
+`rank-major-source-order-f32-dot-add-v1` arithmetic into an immutable identity.
+`FfnProbe::with_group_compensation` consumes and resets an omitted probe, gives it the
+separate `experimental-ffn-group-compensation-cpu-scalar-unfused-v1` profile and
+invalidates prior checkpoints. Every rank computes a left-to-right binary32 dot
+on the original normalized input, then adds `dot * B[k][j]` directly to the
+retained branch in rank order, with separately rounded products and additions.
+All output is staged and checked finite before replacing the branch. The frozen
+standard adapter is already included and is not reapplied. This arithmetic does
+not promise signed-zero identity for zero factors; the older patch scale-zero
+bypass retains its separate contract.
+
+The existing two-pass/token/deadline limits still apply. The original teacher is
+replayed first; the second pass propagates the retained branch plus correction
+through later layers/tokens. Rows preserve `teacherTarget`, `retainedBranch` and
+`originalPrefixTeacherTarget`, and add `compensatedBranch`. Copies remain
+provisional until the entire token commits. Recovery observations use
+`schemaVersion:3`, `kind:experimental-structured-ffn-compensated-replay-v1`, a fresh
+student graph/prefix identity, `recoveryArtifactSha256` and the arithmetic marker.
+They cannot be consumed by the schema-2 fitter as uncorrected fitting data.
+
+This establishes `sourceResearchReplayImplemented:true`; artifact
+`runtimeImplemented:false` explicitly scopes released serving and selective
+loading. All weights and the complete teacher FFN still execute. The one-site
+fixed-token replay does not test drift from earlier edited sites or model-chosen
+continuations, and supplies no speed, process-memory or cognitive-quality claim.
+Native Swift-width composition, free generation, selective loading, production
+arithmetic and independent held-out answer acceptance remain pending.

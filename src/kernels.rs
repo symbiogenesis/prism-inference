@@ -80,7 +80,7 @@ const Q8_1: u32 = 9;
 const Q8_K: u32 = 15;
 pub(crate) const BF16: u32 = 30;
 pub(crate) const PQ2: u32 = 142;
-const PTQ1: u32 = 143;
+pub(crate) const PTQ1: u32 = 143;
 
 fn layout(kind: u32) -> Result<(usize, usize)> {
     if let Some(layout) = fp4::layout(kind)

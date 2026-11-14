@@ -74,6 +74,17 @@ struct Parser<'a> {
     subrules: HashMap<String, String>,
 }
 impl Parser<'_> {
+    // Lend a cached name before allocating a rule key; only misses own a key.
+    fn subrule(&mut self, rule: &str) -> &str {
+        if let Some(name) = self.subrules.get(rule) {
+            return name;
+        }
+        let name = self
+            .converter
+            .add(&format!("{}-{}", self.name, self.subrules.len() + 1), rule);
+        self.subrules.entry(rule.to_owned()).or_insert(name)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Preserve the source regex transform's ordered token/quantifier behavior"
@@ -182,17 +193,7 @@ impl Parser<'_> {
                     };
                     let piece = sequence.last_mut().ok_or(PatternError::Invalid)?;
                     if !piece.1 {
-                        let rule = piece.0.clone();
-                        let name = if let Some(name) = self.subrules.get(&rule) {
-                            name.clone()
-                        } else {
-                            let name = self
-                                .converter
-                                .add(&format!("{}-{}", self.name, self.subrules.len() + 1), &rule);
-                            self.subrules.insert(rule, name.clone());
-                            name
-                        };
-                        piece.0 = name;
+                        self.subrule(&piece.0).clone_into(&mut piece.0);
                     }
                     piece.0 = repetition(&to_rule(piece), minimum, maximum, "");
                     piece.1 = false;
@@ -290,5 +291,31 @@ impl Converter {
                 Err(invalid(format!("invalid schema pattern {pattern}")))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Converter, Result};
+
+    #[test]
+    fn repeated_subrules_preserve_numbering_and_failed_pattern_rolls_back() -> Result<()> {
+        let mut converter = Converter::new();
+        assert_eq!(
+            converter.pattern("^[a-z]{2}[a-z]{3}[0-9]{1,2}[a-z]{4}$", "token")?,
+            "token"
+        );
+        assert_eq!(converter.rules.len(), 4);
+        assert_eq!(converter.rules["token-1"], "[a-z]");
+        assert_eq!(converter.rules["token-2"], "[0-9]");
+        assert_eq!(
+            converter.rules["token"],
+            r#""\"" (token-1{2,2} token-1{3,3} token-2{1,2} token-1{4,4}) "\"""#
+        );
+
+        let before = converter.rules.clone();
+        assert!(converter.pattern("^[A-Z]{2}($", "broken").is_err());
+        assert_eq!(converter.rules, before);
+        Ok(())
     }
 }

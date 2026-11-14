@@ -21,6 +21,18 @@ cargo +nightly-2026-11-09 install --path <absolute-repo> --locked
 prism-inference --help
 ```
 
+The pinned nightly enables Polonius Alpha and the next trait solver by default.
+[Compiler gates](../tools/rust-trial/tests/compiler.rs) require their behavior
+under ordinary Cargo compilation. Keep those defaults for production builds;
+disabled-component and stable invocations belong to the isolated
+[compiler controls](../tools/rust-trial/README.md).
+
+Prefer borrowing cached output before a miss refills or inserts, including
+borrowed-key lookups before allocating owned keys. Avoid copies or interior
+mutability used only to satisfy the borrow checker. Retain ownership required by
+snapshots, rollback, shared model storage and asynchronous work; compiler adoption
+alone establishes no performance improvement.
+
 The private server and GGUF tool are separate workspace packages. To build all
 five executables, use [Build a checkout](#build-a-checkout). Prebuilt consumers
 should verify source, target and file hashes from the bundle receipt.

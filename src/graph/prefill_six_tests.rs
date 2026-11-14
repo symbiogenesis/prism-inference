@@ -243,10 +243,10 @@ fn packed_production_prefill_matches_serial_causal_state_and_reserved_scores() -
                 )?;
                 assert_eq!(reservation, count * 128 * size_of::<f32>());
                 assert!(reservation >= actual.attention_scratch.scores.len() * size_of::<f32>());
-                assert!(actual.keys.tail.is_empty());
-                assert!(actual.values.tail.is_empty());
-                assert!(actual.keys.pages.is_empty());
-                assert!(actual.values.pages.is_empty());
+                assert_eq!(actual.keys.tail.len(), 0);
+                assert_eq!(actual.values.tail.len(), 0);
+                assert_eq!(actual.keys.pages.len(), 0);
+                assert_eq!(actual.values.pages.len(), 0);
             }
         }
     }

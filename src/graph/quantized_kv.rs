@@ -575,7 +575,9 @@ pub(super) fn attend_tile(
                         scale,
                         arithmetic,
                     };
-                    for (head, output) in output.chunks_exact_mut(HEAD_DIM).enumerate() {
+                    for (head, output) in
+                        output.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate()
+                    {
                         input.attend_head(head, output, &mut scores[..=position])?;
                     }
                 }

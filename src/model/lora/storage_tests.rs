@@ -182,7 +182,10 @@ fn rank_one_edited_sparse_storage_releases_dense_a_and_binds_arithmetic() -> Res
     assert_eq!(adapter.identity(), adapter.execution_identity());
     adapter.enable_sparse_a()?;
     assert_eq!(adapter.identity(), "adapter");
-    assert_eq!(adapter.execution_identity(), "adapter:edited-sparse-a-u16-f64-v1");
+    assert_eq!(
+        adapter.execution_identity(),
+        "adapter:edited-sparse-a-u16-f64-v1"
+    );
     let sparse = adapter.storage();
     assert_eq!(dense.linear_a_coefficients, 4);
     assert_eq!(sparse.linear_a_coefficients, 4);
@@ -196,7 +199,7 @@ fn rank_one_edited_sparse_storage_releases_dense_a_and_binds_arithmetic() -> Res
     assert_eq!(dense.total_payload_bytes - sparse.total_payload_bytes, 4);
     for target in LINEAR {
         let factors = adapter.factors.get(target).ok_or("missing sparse factor")?;
-        assert!(factors.a_values.is_empty());
+        assert_eq!(factors.a_values, [] as [f32; 0]);
         assert_eq!(factors.a_values.capacity(), 0);
         let compact = factors.sparse_a.as_ref().ok_or("missing compact A")?;
         assert_eq!(compact.indices, [0]);
@@ -217,9 +220,13 @@ fn rank_one_edited_sparse_dots_round_and_reject_nonfinite_omitted_inputs() -> Re
     assert_eq!(scratch.rank, [16_785_408.0]);
     for invalid in [vec![1.0], vec![1.0, f32::NAN], vec![1.0, f32::INFINITY]] {
         let mut output = [3.0, 4.0];
-        assert!(adapter.linear(LINEAR[0], &invalid, 1.0, &mut output, &mut scratch).is_err());
+        assert!(
+            adapter
+                .linear(LINEAR[0], &invalid, 1.0, &mut output, &mut scratch)
+                .is_err()
+        );
         assert_eq!(output, [3.0, 4.0]);
-        assert!(scratch.rank.is_empty());
+        assert_eq!(scratch.rank, [] as [f32; 0]);
     }
     let mut output = [-0.0, -0.0];
     adapter.linear(LINEAR[0], &[f32::NAN], 0.0, &mut output, &mut scratch)?;
@@ -232,7 +239,13 @@ fn rank_one_edited_sparse_batch_matches_single_and_keeps_every_site() -> Result<
     let (base, source) = fixture();
     let mut adapter = RankOneAdapter::from_model(source, &base)?;
     adapter.enable_sparse_a()?;
-    let inputs = vec![vec![1.0, 1.0], vec![2.0, 0.0], vec![-2.0, 3.0], vec![0.0, 4.0], vec![3.0, 5.0]];
+    let inputs = vec![
+        vec![1.0, 1.0],
+        vec![2.0, 0.0],
+        vec![-2.0, 3.0],
+        vec![0.0, 4.0],
+        vec![3.0, 5.0],
+    ];
     let mut single = vec![vec![0.0, 0.0]; inputs.len()];
     let mut batched = single.clone();
     let mut scratch = Scratch::default();
@@ -245,7 +258,9 @@ fn rank_one_edited_sparse_batch_matches_single_and_keeps_every_site() -> Result<
 
     let (_, mut source) = fixture();
     let name = format!("{}.lora_a", LINEAR[0]);
-    source.tensors.insert(name.clone(), tensor(&name, &[2, 1], &[0.0, -0.0]));
+    source
+        .tensors
+        .insert(name.clone(), tensor(&name, &[2, 1], &[0.0, -0.0]));
     let mut empty = RankOneAdapter::from_model(source, &base)?;
     assert!(empty.enable_sparse_a().is_err());
     Ok(())
@@ -255,18 +270,31 @@ fn rank_one_edited_sparse_batch_matches_single_and_keeps_every_site() -> Result<
 fn rank_one_edited_sparse_dot_uses_nonzero_input_indices_in_order() -> Result<()> {
     let (mut base, mut source) = fixture();
     for target in LINEAR {
-        base.tensors.insert(target.into(), tensor(target, &[6, 2], &[0.0; 12]));
+        base.tensors
+            .insert(target.into(), tensor(target, &[6, 2], &[0.0; 12]));
         let name = format!("{target}.lora_a");
-        source.tensors.insert(name.clone(), tensor(&name, &[6, 1], &[0.0, 2.0, -0.0, 0.0, -3.0, 0.0]));
+        source.tensors.insert(
+            name.clone(),
+            tensor(&name, &[6, 1], &[0.0, 2.0, -0.0, 0.0, -3.0, 0.0]),
+        );
     }
     let mut adapter = RankOneAdapter::from_model(source, &base)?;
     adapter.enable_sparse_a()?;
-    let compact = adapter.factors.get(LINEAR[0]).and_then(|factors| factors.sparse_a.as_ref())
+    let compact = adapter
+        .factors
+        .get(LINEAR[0])
+        .and_then(|factors| factors.sparse_a.as_ref())
         .ok_or("missing indexed sparse A")?;
     assert_eq!(compact.indices, [1, 4]);
     let mut output = [0.0, 0.0];
     let mut scratch = Scratch::default();
-    adapter.linear(LINEAR[0], &[100.0, 4.0, 30.0, 0.0, 5.0, 0.0], 1.0, &mut output, &mut scratch)?;
+    adapter.linear(
+        LINEAR[0],
+        &[100.0, 4.0, 30.0, 0.0, 5.0, 0.0],
+        1.0,
+        &mut output,
+        &mut scratch,
+    )?;
     assert_eq!(scratch.rank, [-7.0]);
     assert_eq!(output[0], -7.0);
     Ok(())

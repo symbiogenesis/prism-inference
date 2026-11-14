@@ -425,6 +425,7 @@ pub struct SwiftSession {
     receipt: LoadReceipt,
 }
 
+#[derive(Clone, Copy)]
 enum AdapterSelection<'a> {
     Approved(Option<&'a Path>),
     Edited(EditedAdapter<'a>),
@@ -634,8 +635,16 @@ impl SwiftSession {
         cpu_speculation: Option<CpuSpeculation>,
     ) -> Result<Self> {
         Self::load_selected_profile(
-            path, representation, AdapterSelection::Approved(adapter_path), backend,
-            seed, parallelism, kv_cache, context_tokens, cpu_prefill, cpu_speculation,
+            path,
+            representation,
+            AdapterSelection::Approved(adapter_path),
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            context_tokens,
+            cpu_prefill,
+            cpu_speculation,
         )
     }
 
@@ -665,8 +674,16 @@ impl SwiftSession {
         context_tokens: usize,
     ) -> Result<Self> {
         Self::load_selected_profile(
-            path, representation, AdapterSelection::Edited(adapter), backend,
-            seed, parallelism, kv_cache, context_tokens, None, None,
+            path,
+            representation,
+            AdapterSelection::Edited(adapter),
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            context_tokens,
+            None,
+            None,
         )
     }
 
@@ -711,9 +728,11 @@ impl SwiftSession {
             AdapterSelection::Approved(path) => path
                 .map(|path| RankOneAdapter::load_swift_representation(path, &model, representation))
                 .transpose()?,
-            AdapterSelection::Edited(candidate) => Some(
-                RankOneAdapter::load_edited_swift(candidate, &model, representation)?
-            ),
+            AdapterSelection::Edited(candidate) => Some(RankOneAdapter::load_edited_swift(
+                candidate,
+                &model,
+                representation,
+            )?),
         };
         let adapter_identity = adapter
             .as_ref()

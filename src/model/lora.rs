@@ -46,7 +46,10 @@ impl EditedAdapter<'_> {
             || self.bytes != SWIFT_ADAPTER_BYTES
             || self.sha256 == SWIFT_ADAPTER_SHA256
             || self.sha256.len() != 64
-            || !self.sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(invalid("edited Swift adapter identity rejected"));
         }
@@ -102,9 +105,14 @@ impl Factors {
         };
         scratch.rank.clear();
         if input.len() != sparse.width || input.iter().any(|value| !value.is_finite()) {
-            return Err(invalid("sparse A dot requires a matching finite activation vector"));
+            return Err(invalid(
+                "sparse A dot requires a matching finite activation vector",
+            ));
         }
-        let sum: f64 = sparse.indices.iter().zip(&sparse.values)
+        let sum: f64 = sparse
+            .indices
+            .iter()
+            .zip(&sparse.values)
             .map(|(&index, &value)| f64::from(value) * f64::from(input[usize::from(index)]))
             .sum();
         let rank = sum as f32;
@@ -188,9 +196,16 @@ impl RankOneAdapter {
         for layer in 0..64 {
             for family in [
                 "ffn_down",
-                if layer % 4 == 3 { "attn_output" } else { "ssm_out" },
+                if layer % 4 == 3 {
+                    "attn_output"
+                } else {
+                    "ssm_out"
+                },
             ] {
-                if !adapter.factors.contains_key(&format!("blk.{layer}.{family}.weight")) {
+                if !adapter
+                    .factors
+                    .contains_key(&format!("blk.{layer}.{family}.weight"))
+                {
                     return Err(invalid("edited Swift adapter lacks a required linear site"));
                 }
             }
@@ -330,7 +345,14 @@ impl RankOneAdapter {
                     // already shared B nearby to avoid another target lookup.
                     embedding = Some((a.clone(), Arc::clone(&b_values)));
                 }
-                factors.insert(target.to_owned(), Factors { a_values, sparse_a: None, b_values });
+                factors.insert(
+                    target.to_owned(),
+                    Factors {
+                        a_values,
+                        sparse_a: None,
+                        b_values,
+                    },
+                );
             } else if let Some(target) = name.strip_suffix(".lora_b") {
                 if !model.tensors.contains_key(&format!("{target}.lora_a")) {
                     return Err(invalid("rank-one adapter A factor missing"));
@@ -381,14 +403,19 @@ impl RankOneAdapter {
                 storage.linear_a_coefficients += factors.a_values.len();
                 storage.stored_linear_a_coefficients += factors.a_values.len();
             }
-            if !seen_b.iter().any(|other| Arc::ptr_eq(other, &factors.b_values)) {
+            if !seen_b
+                .iter()
+                .any(|other| Arc::ptr_eq(other, &factors.b_values))
+            {
                 storage.unique_b_bytes += factors.b_values.capacity() * size_of::<f32>();
                 seen_b.push(Arc::clone(&factors.b_values));
             }
         }
         storage.embedding_a_bytes = self.embedding.as_ref().map_or(0, |(a, _)| a.data.len());
-        storage.total_payload_bytes = storage.linear_a_bytes + storage.index_bytes
-            + storage.embedding_a_bytes + storage.unique_b_bytes;
+        storage.total_payload_bytes = storage.linear_a_bytes
+            + storage.index_bytes
+            + storage.embedding_a_bytes
+            + storage.unique_b_bytes;
         storage
     }
 
@@ -398,9 +425,15 @@ impl RankOneAdapter {
             if target == "token_embd.weight" {
                 continue;
             }
-            let nonzero = factors.a_values.iter().filter(|value| **value != 0.0).count();
+            let nonzero = factors
+                .a_values
+                .iter()
+                .filter(|value| **value != 0.0)
+                .count();
             if nonzero == 0 {
-                return Err(invalid("edited adapter must retain every linear correction"));
+                return Err(invalid(
+                    "edited adapter must retain every linear correction",
+                ));
             }
             if factors.a_values.len() > usize::from(u16::MAX) + 1
                 || nonzero * (size_of::<f32>() + size_of::<u16>())
@@ -415,7 +448,12 @@ impl RankOneAdapter {
             };
             sparse.indices.try_reserve_exact(nonzero)?;
             sparse.values.try_reserve_exact(nonzero)?;
-            for (index, &value) in factors.a_values.iter().enumerate().filter(|(_, value)| **value != 0.0) {
+            for (index, &value) in factors
+                .a_values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| **value != 0.0)
+            {
                 sparse.indices.push(u16::try_from(index)?);
                 sparse.values.push(value);
             }
@@ -424,9 +462,12 @@ impl RankOneAdapter {
             sparse_count += 1;
         }
         if sparse_count == 0 {
-            return Err(invalid("edited adapter has no profitable sparse linear A vectors"));
+            return Err(invalid(
+                "edited adapter has no profitable sparse linear A vectors",
+            ));
         }
-        self.execution_identity.push_str(":edited-sparse-a-u16-f64-v1");
+        self.execution_identity
+            .push_str(":edited-sparse-a-u16-f64-v1");
         Ok(())
     }
 
@@ -476,6 +517,10 @@ impl RankOneAdapter {
         self.scale_and_finish(&factors.b_values, scale, output, scratch)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Sparse execution precedes the existing four-, two- and single-token dense paths without changing their arithmetic."
+    )]
     pub(crate) fn linear_tokens(
         &self,
         target: &str,

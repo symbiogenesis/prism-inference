@@ -112,7 +112,10 @@ impl Request {
         let edited = self.condition == "edited";
         if !self.model_path.is_absolute()
             || !self.output_path.is_absolute()
-            || self.adapter_path.as_ref().is_some_and(|path| !path.is_absolute())
+            || self
+                .adapter_path
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
             || !matches!(self.condition.as_str(), "standard" | "none" | "edited")
             || (self.condition != "none") != self.adapter_path.is_some()
             || !lowercase_hex(&self.source_commit, 40)
@@ -124,7 +127,9 @@ impl Request {
                         !lowercase_hex(hash, 64) || hash == SWIFT_ADAPTER_SHA256
                     })))
         {
-            return Err(reject("Invalid fixed factual smoke profile or source declaration."));
+            return Err(reject(
+                "Invalid fixed factual smoke profile or source declaration.",
+            ));
         }
         Ok(())
     }
@@ -161,9 +166,17 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
             &request.model_path,
             Representation::Pq2,
             EditedAdapter {
-                path: request.adapter_path.as_deref().ok_or_else(|| reject("Missing edited adapter."))?,
-                bytes: request.edited_adapter_bytes.ok_or_else(|| reject("Missing edited adapter length."))?,
-                sha256: request.edited_adapter_sha256.as_deref().ok_or_else(|| reject("Missing edited adapter digest."))?,
+                path: request
+                    .adapter_path
+                    .as_deref()
+                    .ok_or_else(|| reject("Missing edited adapter."))?,
+                bytes: request
+                    .edited_adapter_bytes
+                    .ok_or_else(|| reject("Missing edited adapter length."))?,
+                sha256: request
+                    .edited_adapter_sha256
+                    .as_deref()
+                    .ok_or_else(|| reject("Missing edited adapter digest."))?,
             },
             MatvecBackend::ExperimentalNeon,
             42,
@@ -171,16 +184,18 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
             KvCachePolicy::Rotated4,
             256,
         )
-    } else { SwiftSession::load_profile_with_context(
-        &request.model_path,
-        Representation::Pq2,
-        request.adapter_path.as_deref(),
-        MatvecBackend::ExperimentalNeon,
-        42,
-        RowParallelism::new(4)?,
-        KvCachePolicy::Rotated4,
-        256,
-    ) };
+    } else {
+        SwiftSession::load_profile_with_context(
+            &request.model_path,
+            Representation::Pq2,
+            request.adapter_path.as_deref(),
+            MatvecBackend::ExperimentalNeon,
+            42,
+            RowParallelism::new(4)?,
+            KvCachePolicy::Rotated4,
+            256,
+        )
+    };
     record["loadMilliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
     let mut session = session?;
     session.set_projection_executor(None);
@@ -363,9 +378,12 @@ mod tests {
             "sourceCommit":"b".repeat(40), "deadlineUnixMilliseconds":1});
         let request: Request = serde_json::from_value(value.clone())?;
         request.validate()?;
-        for (field, bad) in [("adapterPath", serde_json::Value::Null),
-            ("editedAdapterBytes", json!(1)), ("editedAdapterSha256", json!("A".repeat(64))),
-            ("condition", json!("standard"))] {
+        for (field, bad) in [
+            ("adapterPath", serde_json::Value::Null),
+            ("editedAdapterBytes", json!(1)),
+            ("editedAdapterSha256", json!("A".repeat(64))),
+            ("condition", json!("standard")),
+        ] {
             let mut invalid = value.clone();
             invalid[field] = bad;
             let request: Request = serde_json::from_value(invalid)?;

@@ -98,11 +98,15 @@ fn timing_record(timings: &GenerationTimings) -> Value {
     json!({"entered":timings.entered, "succeeded":timings.succeeded,
         "totalMilliseconds":timings.total.as_secs_f64() * 1000.0,
         "decodeMilliseconds":timings.phase(GenerationPhase::DecodeEvaluation).elapsed.as_secs_f64() * 1000.0,
-        "prefillMilliseconds":timings.phase(GenerationPhase::PrefillIngestion).elapsed.as_secs_f64() * 1000.0
-            + timings.phase(GenerationPhase::PrefillEvaluation).elapsed.as_secs_f64() * 1000.0,
+        "prefillMilliseconds":(timings.phase(GenerationPhase::PrefillIngestion).elapsed.as_secs_f64()
+            + timings.phase(GenerationPhase::PrefillEvaluation).elapsed.as_secs_f64()) * 1000.0,
         "committedGeneratedTokens":timings.committed_generated_tokens})
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "One fixed arm retains loading, all four answers and cleanup in one transaction."
+)]
 fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<()> {
     record["stage"] = json!("executable-identity");
     record["executableSha256"] = json!(hash_file(&std::env::current_exe()?)?);
@@ -159,7 +163,7 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
             |event| {
                 match event {
                     TextEvent::Delta(delta) if text.len() + delta.len() <= 4096 => {
-                        text.push_str(delta)
+                        text.push_str(delta);
                     }
                     TextEvent::Delta(_) => {
                         return Err(reject("Factual answer exceeded its text bound."));
@@ -252,7 +256,10 @@ fn run() -> Result<()> {
             "Original arm deadline must leave 5 through 120 seconds.",
         ));
     }
-    let deadline = Instant::now() + remaining - Duration::from_secs(2);
+    let deadline = Instant::now()
+        .checked_add(remaining)
+        .and_then(|deadline| deadline.checked_sub(Duration::from_secs(2)))
+        .ok_or_else(|| reject("The factual-smoke deadline overflowed."))?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)

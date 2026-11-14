@@ -28,11 +28,22 @@ impl CpuBackend {
         let tokens = shapes[1][2];
         let sequences = shapes[1][3];
         let groups = shapes[4][1];
-        let snapshots = integer(&info.parameters, 0) as usize;
+        let snapshots = usize::try_from(integer(&info.parameters, 0))?;
+        if snapshots == 0 {
+            return Err(invalid("CPU state scan snapshots must be positive"));
+        }
         let ids = self.integer_values(info.sources[6])?;
-        let state_elements = state_width * head_width * heads;
+        let state_elements = state_width
+            .checked_mul(head_width)
+            .and_then(|value| value.checked_mul(heads))
+            .ok_or_else(|| invalid("CPU state scan state extent overflow"))?;
         let output_elements = inputs[1].len();
-        if output.len() != output_elements + snapshots * state_elements * sequences {
+        let total_states = snapshots
+            .checked_mul(state_elements)
+            .and_then(|value| value.checked_mul(sequences))
+            .and_then(|value| output_elements.checked_add(value))
+            .ok_or_else(|| invalid("CPU state scan output extent overflow"))?;
+        if output.len() != total_states {
             return Err(invalid("CPU state scan output extent differs"));
         }
         for sequence in 0..sequences {
@@ -185,7 +196,7 @@ impl CpuBackend {
                 let scale = self.values(info.sources[1])?;
                 let base = self.values(info.sources[2])?;
                 let epsilon = float(&info.parameters, 0);
-                let iterations = integer(&info.parameters, 1);
+                let iterations = usize::try_from(integer(&info.parameters, 1))?;
                 for token in 0..first_shape[1] {
                     let mut matrix = [0.0_f32; 16];
                     for source in 0..4 {

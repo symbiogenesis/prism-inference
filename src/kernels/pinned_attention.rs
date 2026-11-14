@@ -18,6 +18,8 @@ pub(crate) const VALUE_TILE: usize = 32;
 pub(crate) const VALUE_TILE_FOUR: usize = 128;
 /// Multi-head value tile width for 4-query-head two-token GQA reduction (32 KiB stack accumulator).
 pub(crate) const VALUE_TILE_FOUR_TWO_TOKENS: usize = 64;
+/// Maximum supported attention head dimension for key/query dot reductions.
+pub(crate) const MAX_ATTENTION_HEAD_DIM: usize = 1_024;
 
 #[cfg(test)]
 #[path = "pinned_attention_padding_tests.rs"]
@@ -538,7 +540,7 @@ fn value_tile_four_two_tokens_scalar<'a>(
 /// # Errors
 /// Rejects empty, unequal or oversized rows and nonfinite results.
 pub(crate) fn dot_f16(key: &[u16], query: &[f32]) -> Result<f32> {
-    if query.is_empty() || query.len() > crate::model::swift::CONTEXT_TOKENS {
+    if query.is_empty() || query.len() > MAX_ATTENTION_HEAD_DIM {
         return Err(invalid("invalid pinned attention dot width"));
     }
     if key.len() < query.len() {
@@ -568,7 +570,7 @@ pub(crate) fn dot_f16(key: &[u16], query: &[f32]) -> Result<f32> {
 /// # Errors
 /// Rejects empty, unequal or oversized rows and nonfinite results.
 pub(crate) fn dot_f32(key: &[f32], query: &[f32]) -> Result<f32> {
-    if query.is_empty() || query.len() > crate::model::swift::CONTEXT_TOKENS {
+    if query.is_empty() || query.len() > MAX_ATTENTION_HEAD_DIM {
         return Err(invalid("invalid pinned attention dot width"));
     }
     if key.len() < query.len() {
@@ -596,10 +598,7 @@ pub(crate) fn dot_f32(key: &[f32], query: &[f32]) -> Result<f32> {
 /// Rejects empty, unequal or oversized rows and nonfinite results.
 pub(crate) fn dot_f16_four(key: &[u16], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
     let len = queries[0].len();
-    if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
-        || queries.iter().any(|q| q.len() != len)
-    {
+    if len == 0 || len > MAX_ATTENTION_HEAD_DIM || queries.iter().any(|q| q.len() != len) {
         return Err(invalid("invalid pinned attention dot width"));
     }
     if key.len() < len {
@@ -650,10 +649,7 @@ pub(crate) fn dot_f16_two_keys_four_queries(
     queries: [&[f32]; 4],
 ) -> Result<TwoKeyFourQueryScores> {
     let len = queries[0].len();
-    if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
-        || queries.iter().any(|q| q.len() != len)
-    {
+    if len == 0 || len > MAX_ATTENTION_HEAD_DIM || queries.iter().any(|q| q.len() != len) {
         return Err(invalid("invalid pinned attention dot width"));
     }
     for key in keys {
@@ -691,7 +687,7 @@ pub(crate) fn dot_f16_two_keys_two_token_four_queries(
 ) -> Result<(TwoKeyFourQueryScores, TwoKeyFourQueryScores)> {
     let len = queries0[0].len();
     if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
+        || len > MAX_ATTENTION_HEAD_DIM
         || queries0.iter().any(|q| q.len() != len)
         || queries1.iter().any(|q| q.len() != len)
     {
@@ -730,10 +726,7 @@ pub(crate) fn dot_f16_four_keys_four_queries(
     queries: [&[f32]; 4],
 ) -> Result<[[f32; 4]; 4]> {
     let len = queries[0].len();
-    if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
-        || queries.iter().any(|q| q.len() != len)
-    {
+    if len == 0 || len > MAX_ATTENTION_HEAD_DIM || queries.iter().any(|q| q.len() != len) {
         return Err(invalid("invalid pinned attention dot width"));
     }
     for key in keys {
@@ -773,7 +766,7 @@ pub(crate) fn dot_f16_two_token_four_queries(
 ) -> Result<([f32; 4], [f32; 4])> {
     let len = queries0[0].len();
     if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
+        || len > MAX_ATTENTION_HEAD_DIM
         || queries0.iter().any(|q| q.len() != len)
         || queries1.iter().any(|q| q.len() != len)
     {
@@ -812,7 +805,7 @@ pub(crate) fn dot_f16_four_keys_two_token_four_queries(
 ) -> Result<(FourKeyFourQueryScores, FourKeyFourQueryScores)> {
     let len = queries0[0].len();
     if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
+        || len > MAX_ATTENTION_HEAD_DIM
         || queries0.iter().any(|q| q.len() != len)
         || queries1.iter().any(|q| q.len() != len)
     {
@@ -848,10 +841,7 @@ pub(crate) fn dot_f16_four_keys_two_token_four_queries(
 /// Rejects empty, unequal or oversized rows and nonfinite results.
 pub(crate) fn dot_f32_four(key: &[f32], queries: [&[f32]; 4]) -> Result<[f32; 4]> {
     let len = queries[0].len();
-    if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
-        || queries.iter().any(|q| q.len() != len)
-    {
+    if len == 0 || len > MAX_ATTENTION_HEAD_DIM || queries.iter().any(|q| q.len() != len) {
         return Err(invalid("invalid pinned attention dot width"));
     }
     if key.len() < len {
@@ -1056,7 +1046,7 @@ pub(crate) fn softmax_round_f16(scores: &mut [f32]) -> Result<()> {
 
 /// Same pinned arithmetic with the separate rotated-KV profile's context bound.
 pub(crate) fn softmax_rotated_kv(scores: &mut [f32]) -> Result<()> {
-    softmax_with_rounding::<true>(scores, 262_144)
+    softmax_with_rounding::<true>(scores, crate::model::swift::TRAINING_CONTEXT_TOKENS)
 }
 
 /// Retains the pinned out-of-place operator oracle for focused comparisons.
@@ -1730,6 +1720,43 @@ mod tests {
                 exp1.map(|r| r.map(f32::to_bits))
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn head_dim_dot_bounds_reject_above_max_head_dim() -> crate::Result<()> {
+        let valid_len = super::MAX_ATTENTION_HEAD_DIM;
+        let over_len = valid_len + 1;
+        let key_f16 = vec![0x3c00_u16; over_len];
+        let key_f32 = vec![1.0_f32; over_len];
+        let query = vec![0.25_f32; over_len];
+
+        assert!((dot_f16(&key_f16[..valid_len], &query[..valid_len])? - 256.0).abs() <= 1e-4);
+        assert!((dot_f32(&key_f32[..valid_len], &query[..valid_len])? - 256.0).abs() <= 1e-4);
+        assert!(dot_f16(&key_f16, &query).is_err());
+        assert!(dot_f32(&key_f32, &query).is_err());
+        assert!(dot_f16_four(&key_f16[..valid_len], [&query[..valid_len]; 4]).is_ok());
+        assert!(dot_f16_four(&key_f16, [&query; 4]).is_err());
+        assert!(dot_f32_four(&key_f32[..valid_len], [&query[..valid_len]; 4]).is_ok());
+        assert!(dot_f32_four(&key_f32, [&query; 4]).is_err());
+        assert!(super::six::dot(&key_f16[..valid_len], [&query[..valid_len]; 6]).is_ok());
+        assert!(super::six::dot(&key_f16, [&query; 6]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn softmax_rotated_kv_supports_above_8192_tokens() -> crate::Result<()> {
+        let mut scores = vec![0.0_f32; 8_256];
+        scores[8_255] = 2.0;
+        super::softmax_rotated_kv(&mut scores)?;
+        let sum: f64 = scores.iter().map(|&value| f64::from(value)).sum();
+        assert!((sum - 1.0).abs() <= 1e-3);
+        assert!(
+            scores
+                .iter()
+                .all(|&value| value.is_finite() && value >= 0.0)
+        );
+        assert!(scores[8_255] > scores[0]);
         Ok(())
     }
 }

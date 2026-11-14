@@ -199,21 +199,36 @@ impl Planner<'_> {
             for &parent in &info.sources {
                 let parent_info = self.backend.info(parent)?;
                 let parent_state = self.states[parent.0].clone();
-                let root = parent_info.view.unwrap_or(parent);
+                let (root, total_offset) = self.backend.view_root(parent)?;
                 let root_info = self.backend.info(root)?;
+                let mut chain_output_flag = root_info.flags & 2 != 0;
+                let mut cursor = parent;
+                while cursor != root {
+                    let hop = self.backend.info(cursor)?;
+                    if hop.flags & 2 != 0 {
+                        chain_output_flag = true;
+                        break;
+                    }
+                    let Some(next) = hop.view else {
+                        break;
+                    };
+                    cursor = next;
+                }
+                let unmarked_leaf = root_info.operation == 0 && root_info.flags & 1 == 0;
+                let occurrences = info.sources.iter().filter(|&&src| src == parent).count();
                 if !self.states[root.0].owned
-                    || parent_info.flags & 2 != 0
-                    || root_info.flags & 2 != 0
+                    || chain_output_flag
+                    || unmarked_leaf
                     || !same_layout(info, parent_info)
-                    || parent_state.children != 1
+                    || parent_state.children != occurrences
                     || parent_state.views != 0
                 {
                     continue;
                 }
-                if parent_info.view.is_some()
+                if parent != root
                     && (self.states[root.0].views != 1
                         || self.states[root.0].children != 0
-                        || parent_info.offset != 0)
+                        || total_offset != 0)
                 {
                     continue;
                 }
@@ -361,11 +376,16 @@ impl GraphAllocator {
             }
         }
         for &leaf in leaves {
+            if backend.info(leaf)?.view.is_some() {
+                let (root, _) = backend.view_root(leaf)?;
+                planner.states[root.0].views += 1;
+            }
             planner.allocate(leaf, kind_for(leaf)?)?;
         }
         for &node in nodes {
             let info = backend.info(node)?;
-            if let Some(root) = info.view {
+            if info.view.is_some() {
+                let (root, _) = backend.view_root(node)?;
                 planner.states[root.0].views += 1;
             }
             if info.flags & 1 != 0 {
@@ -394,7 +414,8 @@ impl GraphAllocator {
                 if state.children != 0 || state.views != 0 {
                     continue;
                 }
-                if let Some(root) = backend.info(source)?.view {
+                if backend.info(source)?.view.is_some() {
+                    let (root, _) = backend.view_root(source)?;
                     planner.states[root.0].views = planner.states[root.0]
                         .views
                         .checked_sub(1)
@@ -484,6 +505,214 @@ impl GraphAllocator {
                 .collect::<Vec<_>>();
             backend.allocate_arena(description.bytes, &placements)?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Argument, GraphId, Observation};
+    use super::{BufferType, CpuBackend, GraphAllocator, TensorId};
+    use crate::{Result, invalid};
+
+    fn tensor(value: &Observation) -> Result<TensorId> {
+        match value {
+            Observation::Tensor(Some(id)) => Ok(*id),
+            _ => Err(invalid("expected tensor")),
+        }
+    }
+
+    fn new_graph(backend: &mut CpuBackend) -> Result<GraphId> {
+        match backend.call("ggml_new_graph", &[Argument::Context(0)])? {
+            Observation::Graph(graph) => Ok(graph),
+            _ => Err(invalid("expected graph")),
+        }
+    }
+
+    fn manual_view(
+        backend: &mut CpuBackend,
+        target: TensorId,
+        shape: [usize; 4],
+        offset: usize,
+    ) -> Result<TensorId> {
+        let id = backend.tensor(0, 0, shape)?;
+        let info = backend.info_mut(id)?;
+        info.operation = 30;
+        info.view = Some(target);
+        info.offset = offset;
+        info.sources = vec![target];
+        info.source_slots[0] = Some(target);
+        Ok(id)
+    }
+
+    #[test]
+    fn multi_hop_views_keep_root_live_and_check_total_offset_and_intermediate_flags() -> Result<()>
+    {
+        let mut backend = CpuBackend::new();
+        let root_in = backend.tensor(0, 0, [8, 1, 1, 1])?;
+        backend.info_mut(root_in)?.flags |= 1;
+        // Intermediate computed node so `root` is internal owned storage.
+        let root = tensor(&backend.call(
+            "ggml_scale",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(root_in),
+                Argument::Float(2.0),
+            ],
+        )?)?;
+        // Two-hop view chain with non-zero offset in the first hop and 0 in the second.
+        let v1 = manual_view(&mut backend, root, [4, 1, 1, 1], 16)?;
+        let v2 = manual_view(&mut backend, v1, [4, 1, 1, 1], 0)?;
+        // Sibling unrelated tensor allocated during live V2 must not reuse `root`'s memory.
+        let bystander = backend.tensor(0, 0, [8, 1, 1, 1])?;
+        let scaled_bystander = tensor(&backend.call(
+            "ggml_scale",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(bystander),
+                Argument::Float(3.0),
+            ],
+        )?)?;
+        let bystander_slice = manual_view(&mut backend, scaled_bystander, [4, 1, 1, 1], 0)?;
+        let out = tensor(&backend.call(
+            "ggml_add",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(v2),
+                Argument::Tensor(bystander_slice),
+            ],
+        )?)?;
+        backend.info_mut(out)?.flags |= 2;
+
+        let graph = new_graph(&mut backend)?;
+        backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(graph), Argument::Tensor(out)],
+        )?;
+        let mut allocator = GraphAllocator::new(vec![BufferType {
+            alignment: 16,
+            maximum: None,
+        }])?;
+        let allocation = allocator.reserve(&backend, graph, &[], &[])?;
+        let root_place =
+            allocation.tensors[root.0].ok_or_else(|| invalid("missing root placement"))?;
+        let bystander_place = allocation.tensors[scaled_bystander.0]
+            .ok_or_else(|| invalid("missing bystander placement"))?;
+        assert_ne!(root_place, bystander_place);
+        let out_place =
+            allocation.tensors[out.0].ok_or_else(|| invalid("missing output placement"))?;
+        // Because V2 inherits non-zero cumulative offset (16), `out` must not reuse `root` via `v2`.
+        assert_ne!(out_place, root_place);
+
+        // Also check intermediate output flag on a zero-offset two-hop view chain blocks reuse.
+        let mut flagged_backend = CpuBackend::new();
+        let src = flagged_backend.tensor(0, 0, [4, 1, 1, 1])?;
+        flagged_backend.info_mut(src)?.flags |= 1;
+        let mid_v1 = manual_view(&mut flagged_backend, src, [4, 1, 1, 1], 0)?;
+        flagged_backend.info_mut(mid_v1)?.flags |= 2;
+        let mid_v2 = manual_view(&mut flagged_backend, mid_v1, [4, 1, 1, 1], 0)?;
+        let final_out = tensor(&flagged_backend.call(
+            "ggml_scale",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(mid_v2),
+                Argument::Float(5.0),
+            ],
+        )?)?;
+        flagged_backend.info_mut(final_out)?.flags |= 2;
+        let flagged_graph = new_graph(&mut flagged_backend)?;
+        flagged_backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(flagged_graph), Argument::Tensor(final_out)],
+        )?;
+        let flagged_alloc = allocator.reserve(&flagged_backend, flagged_graph, &[], &[])?;
+        assert_ne!(
+            flagged_alloc.tensors[src.0],
+            flagged_alloc.tensors[final_out.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unmarked_leaf_and_output_nodes_block_can_inplace() -> Result<()> {
+        let mut backend = CpuBackend::new();
+        let unmarked = backend.tensor(0, 0, [4, 1, 1, 1])?;
+        let from_unmarked = tensor(&backend.call(
+            "ggml_scale",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(unmarked),
+                Argument::Float(2.0),
+            ],
+        )?)?;
+        // Intermediate node marked as output (flags |= 2) cannot be overwritten in-place.
+        backend.info_mut(from_unmarked)?.flags |= 2;
+        let tail = tensor(&backend.call(
+            "ggml_scale",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(from_unmarked),
+                Argument::Float(3.0),
+            ],
+        )?)?;
+        backend.info_mut(tail)?.flags |= 2;
+
+        let graph = new_graph(&mut backend)?;
+        backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(graph), Argument::Tensor(tail)],
+        )?;
+        let mut allocator = GraphAllocator::new(vec![BufferType {
+            alignment: 16,
+            maximum: None,
+        }])?;
+        let allocation = allocator.reserve(&backend, graph, &[], &[])?;
+        assert_ne!(
+            allocation.tensors[unmarked.0],
+            allocation.tensors[from_unmarked.0]
+        );
+        assert_ne!(
+            allocation.tensors[from_unmarked.0],
+            allocation.tensors[tail.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_source_occurrences_reuse_dead_input_without_early_release() -> Result<()> {
+        let mut backend = CpuBackend::new();
+        let input = backend.tensor(0, 0, [4, 1, 1, 1])?;
+        backend.info_mut(input)?.flags |= 1;
+        let doubled = tensor(&backend.call(
+            "ggml_add",
+            &[
+                Argument::Context(0),
+                Argument::Tensor(input),
+                Argument::Tensor(input),
+            ],
+        )?)?;
+        backend.info_mut(doubled)?.flags |= 2;
+        let graph = new_graph(&mut backend)?;
+        backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(graph), Argument::Tensor(doubled)],
+        )?;
+        let mut allocator = GraphAllocator::new(vec![BufferType {
+            alignment: 16,
+            maximum: None,
+        }])?;
+        let allocation = allocator.reserve(&backend, graph, &[], &[])?;
+        assert_eq!(allocation.tensors[doubled.0], allocation.tensors[input.0]);
+        GraphAllocator::allocate(&mut backend, &allocation)?;
+        backend.set_values(input, &[1.5, -2.0, 3.25, 4.0])?;
+        backend.compute(graph)?;
+        let actual: Vec<u32> = backend
+            .values(doubled)?
+            .iter()
+            .copied()
+            .map(f32::to_bits)
+            .collect();
+        assert_eq!(actual, [3.0_f32, -4.0, 6.5, 8.0].map(f32::to_bits));
         Ok(())
     }
 }

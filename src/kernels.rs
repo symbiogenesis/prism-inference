@@ -3260,6 +3260,69 @@ pub(crate) fn gdn_wy_update_eight_rows(
     }
 }
 
+/// Normalization mode for GDN query/key `L2` normalization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GdnQkNormMode {
+    /// Clamped inverse norm `x / max(sqrt(sum(x^2)), eps)` matching pinned Swift/Prism.
+    #[default]
+    ClampedL2,
+    /// Inverse square root with additive epsilon `x / sqrt(sum(x^2) + eps)`.
+    AdditiveRsqrt,
+}
+
+/// Normalizes a nonempty slice in place under an explicit GDN `L2` mode.
+///
+/// # Errors
+/// Rejects empty slices, negative or nonfinite `epsilon`, nonfinite inputs, and
+/// nonfinite or nonpositive scales before mutating `values`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "The pinned scalar L2 normalization contract rounds sum of squares to binary32."
+)]
+pub fn l2_normalize_in_place_mode(
+    values: &mut [f32],
+    epsilon: f32,
+    mode: GdnQkNormMode,
+) -> Result<()> {
+    if values.is_empty() || !epsilon.is_finite() || epsilon < 0.0 {
+        return Err(invalid(
+            "L2 normalization requires nonempty vector and nonnegative finite epsilon",
+        ));
+    }
+    let mut squares = 0.0_f64;
+    for &value in &*values {
+        finite(value)?;
+        squares += f64::from(value * value);
+    }
+    let sum_f32 = squares as f32;
+    let scale = match mode {
+        GdnQkNormMode::ClampedL2 => 1.0 / sum_f32.sqrt().max(epsilon),
+        GdnQkNormMode::AdditiveRsqrt => 1.0 / (sum_f32 + epsilon).sqrt(),
+    };
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(invalid("L2 normalization produced an invalid scale"));
+    }
+    match mode {
+        GdnQkNormMode::ClampedL2 => l2_norm_in_place(values, epsilon),
+        GdnQkNormMode::AdditiveRsqrt => {
+            for value in values {
+                *value *= scale;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes a nonempty slice in place using [`GdnQkNormMode::ClampedL2`].
+///
+/// # Errors
+/// Rejects empty slices, negative or nonfinite `epsilon`, nonfinite inputs, and
+/// nonfinite or nonpositive scales before mutating `values`.
+pub fn l2_normalize_in_place(values: &mut [f32], epsilon: f32) -> Result<()> {
+    l2_normalize_in_place_mode(values, epsilon, GdnQkNormMode::ClampedL2)
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
@@ -3812,6 +3875,25 @@ fn rms_norm_scale_inner<const WEIGHTS_VALIDATED: bool>(
     Ok(scale)
 }
 
+fn validate_add_rms_norm_inputs(
+    values: &[f32],
+    delta: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+) -> Result<u32> {
+    if values.is_empty()
+        || values.len() != delta.len()
+        || values.len() != weight.len()
+        || !epsilon.is_finite()
+        || epsilon < 0.0
+    {
+        return Err(invalid(
+            "RMS normalization requires equal nonempty vectors and nonnegative epsilon",
+        ));
+    }
+    u32::try_from(values.len()).map_err(|_| invalid("RMS normalization vector length overflow"))
+}
+
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -3823,21 +3905,7 @@ fn add_rms_norm_scale(
     weight: &[f32],
     epsilon: f32,
 ) -> Result<f32> {
-    if values.is_empty()
-        || values.len() != delta.len()
-        || values.len() != weight.len()
-        || !epsilon.is_finite()
-        || epsilon < 0.0
-    {
-        add_slice_in_place(values, delta);
-        return Err(invalid(
-            "RMS normalization requires equal nonempty vectors and nonnegative epsilon",
-        ));
-    }
-    let Ok(count) = u32::try_from(values.len()) else {
-        add_slice_in_place(values, delta);
-        return Err(invalid("RMS normalization vector length overflow"));
-    };
+    let count = validate_add_rms_norm_inputs(values, delta, weight, epsilon)?;
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -3845,47 +3913,32 @@ fn add_rms_norm_scale(
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    let sum = if let Some(sum) = neon::add_rms_norm_squares(values, delta, weight) {
-        sum?
-    } else {
-        let mut sum = 0.0_f64;
-        let mut all_finite = true;
-        for ((value, &d), &w) in values.iter_mut().zip(delta).zip(weight) {
-            let v = *value + d;
-            *value = v;
-            all_finite &= v.is_finite() && w.is_finite();
-            sum += f64::from(v * v);
+    if let Some(sum) = neon::add_rms_norm_squares(values, delta, weight) {
+        let sum = sum?;
+        let mean = (sum / f64::from(count)) as f32;
+        let scale = 1.0 / (mean + epsilon).sqrt();
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("RMS normalization produced an invalid scale"));
         }
-        if !all_finite {
-            return Err(invalid("nonfinite tensor or activation value"));
-        }
-        sum
-    };
-    #[cfg(not(all(
-        feature = "experimental-neon",
-        target_arch = "aarch64",
-        target_os = "windows",
-        target_env = "msvc",
-        target_feature = "neon"
-    )))]
-    let sum = {
-        let mut sum = 0.0_f64;
-        let mut all_finite = true;
-        for ((value, &d), &w) in values.iter_mut().zip(delta).zip(weight) {
-            let v = *value + d;
-            *value = v;
-            all_finite &= v.is_finite() && w.is_finite();
-            sum += f64::from(v * v);
-        }
-        if !all_finite {
-            return Err(invalid("nonfinite tensor or activation value"));
-        }
-        sum
-    };
+        return Ok(scale);
+    }
+    let mut sum = 0.0_f64;
+    let mut all_finite = true;
+    for ((&value, &d), &w) in values.iter().zip(delta).zip(weight) {
+        let v = value + d;
+        all_finite &= v.is_finite() && w.is_finite();
+        sum += f64::from(v * v);
+    }
+    if !all_finite {
+        return Err(invalid("nonfinite tensor or activation value"));
+    }
     let mean = (sum / f64::from(count)) as f32;
     let scale = 1.0 / (mean + epsilon).sqrt();
     if !scale.is_finite() || scale <= 0.0 {
         return Err(invalid("RMS normalization produced an invalid scale"));
+    }
+    for (value, &d) in values.iter_mut().zip(delta) {
+        *value += d;
     }
     Ok(scale)
 }
@@ -4261,6 +4314,7 @@ pub(crate) fn add_rms_norm_hadamard_into<const PINNED: bool>(
     rotated_out: &mut Vec<f32>,
 ) -> Result<()> {
     let result = (|| {
+        validate_add_rms_norm_inputs(values, delta, weight, epsilon)?;
         if !block.is_power_of_two()
             || !values.len().is_multiple_of(block)
             || signs.is_some_and(|s| s.len() < values.len())
@@ -5118,6 +5172,438 @@ mod tests {
         assert!((actual - expected).abs() <= 1e-5);
         assert!(super::dot_ptq1_q8k(&ptq1_bytes[..27], &q8k).is_err());
         assert!(super::dot_ptq1_q8k(&ptq1_bytes, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn l2_normalize_in_place_modes_and_near_zero_divergence() -> crate::Result<()> {
+        let mut clamped = [3.0_f32, 4.0];
+        let mut legacy = clamped;
+        super::l2_normalize_in_place(&mut clamped, 1e-6)?;
+        super::l2_norm_in_place(&mut legacy, 1e-6);
+        assert_eq!(clamped.map(f32::to_bits), legacy.map(f32::to_bits));
+
+        let mut additive = [3.0_f32, 4.0];
+        super::l2_normalize_in_place_mode(
+            &mut additive,
+            1e-6,
+            super::GdnQkNormMode::AdditiveRsqrt,
+        )?;
+        let expected_add_scale = 1.0_f32 / (25.0_f32 + 1e-6_f32).sqrt();
+        assert!(3.0_f32.mul_add(-expected_add_scale, additive[0]).abs() <= 1e-7);
+        assert!(4.0_f32.mul_add(-expected_add_scale, additive[1]).abs() <= 1e-7);
+
+        let epsilon = 1e-6_f32;
+        let mut near_zero_clamped = [1e-9_f32, 0.0];
+        let mut near_zero_additive = near_zero_clamped;
+        super::l2_normalize_in_place_mode(
+            &mut near_zero_clamped,
+            epsilon,
+            super::GdnQkNormMode::ClampedL2,
+        )?;
+        super::l2_normalize_in_place_mode(
+            &mut near_zero_additive,
+            epsilon,
+            super::GdnQkNormMode::AdditiveRsqrt,
+        )?;
+        assert!((near_zero_clamped[0] - 1e-3).abs() <= 1e-7);
+        assert!((near_zero_additive[0] - 1e-6).abs() <= 1e-10);
+        let ratio = near_zero_clamped[0] / near_zero_additive[0];
+        assert!((ratio - (1.0 / epsilon.sqrt())).abs() <= 1e-2);
+
+        for bad_epsilon in [-1.0_f32, f32::NAN, f32::INFINITY] {
+            let mut unchanged = [1.5_f32, -2.5];
+            let original = unchanged.map(f32::to_bits);
+            assert!(
+                super::l2_normalize_in_place_mode(
+                    &mut unchanged,
+                    bad_epsilon,
+                    super::GdnQkNormMode::ClampedL2
+                )
+                .is_err()
+            );
+            assert_eq!(unchanged.map(f32::to_bits), original);
+        }
+        let mut nonfinite = [1.0_f32, f32::NAN];
+        let original_nonfinite = nonfinite.map(f32::to_bits);
+        assert!(super::l2_normalize_in_place(&mut nonfinite, 1e-6).is_err());
+        assert_eq!(nonfinite.map(f32::to_bits), original_nonfinite);
+        let mut zeros = [0.0_f32, 0.0];
+        assert!(super::l2_normalize_in_place(&mut zeros, 0.0).is_err());
+        assert_eq!(zeros.map(f32::to_bits), [0.0_f32, 0.0].map(f32::to_bits));
+        assert!(super::l2_normalize_in_place(&mut [], 1e-6).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn add_rms_norm_and_hadamard_preserve_inputs_on_invalid_geometry_or_epsilon() {
+        let parallelism = super::RowParallelism::default();
+        let initial = [1.0_f32, -2.0, 3.5, 4.25];
+        let initial_bits = initial.map(f32::to_bits);
+
+        let mut values = initial;
+        let mut out = vec![99.0_f32; 4];
+        assert!(
+            super::add_rms_norm_into(&mut values, &[0.5, 0.5], &[1.0; 4], 1e-5, &mut out).is_err()
+        );
+        assert_eq!(out, Vec::<f32>::new());
+        assert_eq!(values.map(f32::to_bits), initial_bits);
+
+        let mut values = initial;
+        assert!(
+            super::add_rms_norm_pinned_into(&mut values, &[0.5; 4], &[1.0; 2], 1e-5, &mut out)
+                .is_err()
+        );
+        assert_eq!(out, Vec::<f32>::new());
+        assert_eq!(values.map(f32::to_bits), initial_bits);
+
+        for bad_epsilon in [-0.1_f32, f32::NAN, f32::INFINITY] {
+            let mut values = initial;
+            assert!(
+                super::add_rms_norm_into(&mut values, &[0.5; 4], &[1.0; 4], bad_epsilon, &mut out)
+                    .is_err()
+            );
+            assert_eq!(out, Vec::<f32>::new());
+            assert_eq!(values.map(f32::to_bits), initial_bits);
+
+            let mut values = initial;
+            let mut norm_out = vec![1.0_f32; 4];
+            let mut rot_out = vec![2.0_f32; 4];
+            assert!(
+                super::add_rms_norm_hadamard_into::<false>(
+                    &mut values,
+                    &[0.5; 4],
+                    &[1.0; 4],
+                    bad_epsilon,
+                    3,
+                    Some(&[1.0]),
+                    &parallelism,
+                    &mut norm_out,
+                    &mut rot_out,
+                )
+                .is_err()
+            );
+            assert_eq!(norm_out, Vec::<f32>::new());
+            assert_eq!(rot_out, Vec::<f32>::new());
+            assert_eq!(values.map(f32::to_bits), initial_bits);
+        }
+
+        // Mismatched lengths with invalid Hadamard block must still leave `values` untouched.
+        let mut values = initial;
+        let mut norm_out = vec![1.0_f32; 4];
+        let mut rot_out = vec![2.0_f32; 4];
+        assert!(
+            super::add_rms_norm_hadamard_into::<true>(
+                &mut values,
+                &[0.5; 2],
+                &[1.0; 4],
+                1e-5,
+                3,
+                None,
+                &parallelism,
+                &mut norm_out,
+                &mut rot_out,
+            )
+            .is_err()
+        );
+        assert_eq!(values.map(f32::to_bits), initial_bits);
+
+        // Valid geometry/epsilon + Hadamard failure retains `values += delta` for unfused fallback.
+        assert_eq!(values.map(f32::to_bits), initial_bits);
+    }
+
+    #[test]
+    fn add_rms_norm_hadamard_retains_sum_only_when_fallback_applies() {
+        let parallelism = super::RowParallelism::default();
+        let initial = [1.0_f32, -2.0, 3.5, 4.25];
+        let delta = [0.25_f32, 0.5, -0.5, 0.75];
+        let mut values = initial;
+        let mut norm_out = vec![1.0_f32; 4];
+        let mut rot_out = vec![2.0_f32; 4];
+        assert!(
+            super::add_rms_norm_hadamard_into::<true>(
+                &mut values,
+                &delta,
+                &[1.0; 4],
+                1e-5,
+                3,
+                None,
+                &parallelism,
+                &mut norm_out,
+                &mut rot_out,
+            )
+            .is_err()
+        );
+        assert_eq!(norm_out, Vec::<f32>::new());
+        assert_eq!(rot_out, Vec::<f32>::new());
+        let expected_sum: Vec<u32> = initial
+            .iter()
+            .zip(delta)
+            .map(|(&a, d)| (a + d).to_bits())
+            .collect();
+        assert_eq!(values.map(f32::to_bits).to_vec(), expected_sum);
+    }
+
+    #[test]
+    fn pq2_256_multi_row_i8_min_and_weight_two_preserve_distinct_rows() -> crate::Result<()> {
+        let backends = [
+            super::MatvecBackend::Scalar,
+            super::MatvecBackend::Auto,
+            super::MatvecBackend::ExperimentalNeon,
+        ];
+        let mut output = Vec::new();
+        for rows in 2_usize..=8 {
+            let mut pq2_256 = Vec::with_capacity(rows * 68);
+            for row in 0..rows {
+                let row_u8 = u8::try_from(row)?;
+                let row_scale = super::half_bits(0.125_f32.mul_add(f32::from(row_u8), 1.0));
+                for block_index in 0..2 {
+                    let mut block = [0x55_u8; 34];
+                    block[..2].copy_from_slice(&row_scale.to_le_bytes());
+                    for (byte_index, slot) in block[2..].iter_mut().enumerate() {
+                        *slot = match (byte_index + row + block_index * 3) % 5 {
+                            0 => 0xff, // all four weights = +2 (PQ2_0 code 3)
+                            1 => 0xaa, // +1
+                            2 => 0x00, // -1
+                            3 => 0xf3, // mixed +2 and -1
+                            _ => 0x55, // 0
+                        };
+                    }
+                    pq2_256.extend_from_slice(&block);
+                }
+            }
+            let pq2_tensor = Tensor {
+                name: "pq2_256".to_owned(),
+                dimensions: vec![256, rows],
+                kind: super::PQ2,
+                data: Arc::from(pq2_256),
+            };
+            let q8k_block = super::Q8KBlock {
+                scale: 0.25,
+                values: [i8::MIN; 256],
+                sums: [-2048_i16; 16],
+            };
+            let expected_pq2_256: Vec<f32> = pq2_tensor
+                .data
+                .as_chunks::<68>()
+                .0
+                .iter()
+                .map(|row_bytes| {
+                    let mut total = 0.0_f32;
+                    for (block, chunk) in row_bytes
+                        .as_chunks::<34>()
+                        .0
+                        .iter()
+                        .zip(q8k_block.values.as_chunks::<128>().0)
+                    {
+                        let d = super::scale(block)? * q8k_block.scale;
+                        let sum = super::dot_integer(&super::pq2_values(block), chunk);
+                        total = d.mul_add(sum, total);
+                    }
+                    Ok(total)
+                })
+                .collect::<crate::Result<_>>()?;
+            for idx in 0..rows {
+                for other in (idx + 1)..rows {
+                    assert_ne!(
+                        expected_pq2_256[idx].to_bits(),
+                        expected_pq2_256[other].to_bits()
+                    );
+                }
+            }
+            let dummy = vec![0.0_f32; 256];
+            for backend in backends {
+                for pinned in [false, true] {
+                    let mut scratch = if pinned {
+                        MatvecScratch::with_pinned_backend(backend)
+                    } else {
+                        MatvecScratch::with_backend(backend)
+                    };
+                    let mut prepared = scratch.prepare(&pq2_tensor, &dummy)?;
+                    prepared.scratch.q8k = vec![q8k_block.clone()];
+                    prepared.scratch.pq2_consumption.clear();
+                    prepared.matvec_into(&pq2_tensor, &mut output)?;
+                    assert_eq!(output.len(), rows);
+                    for (&actual, &expected) in output.iter().zip(&expected_pq2_256) {
+                        assert!((actual - expected).abs() <= 1e-4);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pq2_128_multi_row_i8_min_and_weight_two_preserve_distinct_rows() -> crate::Result<()> {
+        let backends = [
+            super::MatvecBackend::Scalar,
+            super::MatvecBackend::Auto,
+            super::MatvecBackend::ExperimentalNeon,
+        ];
+        let make_q8 = || -> Vec<super::Q8Block> {
+            (0..4)
+                .map(|_| super::Q8Block {
+                    scale: 0.25,
+                    sum: 0.0,
+                    values: [i8::MIN; 32],
+                })
+                .collect()
+        };
+        let q8_ref = make_q8();
+        let dummy_128 = vec![0.0_f32; 128];
+        let mut output = Vec::new();
+        for rows in 2_usize..=8 {
+            let mut pq2_128 = Vec::with_capacity(rows * 34);
+            for row in 0..rows {
+                let row_u8 = u8::try_from(row)?;
+                let mut block = [0xff_u8; 34];
+                block[..2].copy_from_slice(
+                    &super::half_bits(0.125_f32.mul_add(f32::from(row_u8), 1.0)).to_le_bytes(),
+                );
+                block[2 + row] = 0x00;
+                block[18 + row] = 0xaa;
+                pq2_128.extend_from_slice(&block);
+            }
+            let pq2_128_tensor = Tensor {
+                name: "pq2_128".to_owned(),
+                dimensions: vec![128, rows],
+                kind: super::PQ2,
+                data: Arc::from(pq2_128),
+            };
+            let expected_pq2_128: Vec<f32> = pq2_128_tensor
+                .data
+                .as_chunks::<34>()
+                .0
+                .iter()
+                .map(|block| {
+                    let d = super::scale(block)?;
+                    let weights = super::pq2_values(block);
+                    let mut total = 0.0_f32;
+                    for (group_w, group_a) in weights.as_chunks::<32>().0.iter().zip(&q8_ref) {
+                        total = (d * group_a.scale)
+                            .mul_add(super::dot_integer(group_w, &group_a.values), total);
+                    }
+                    Ok(total)
+                })
+                .collect::<crate::Result<_>>()?;
+            for idx in 0..rows {
+                for other in (idx + 1)..rows {
+                    assert_ne!(
+                        expected_pq2_128[idx].to_bits(),
+                        expected_pq2_128[other].to_bits()
+                    );
+                }
+            }
+            for backend in backends {
+                for pinned in [false, true] {
+                    let mut scratch = if pinned {
+                        MatvecScratch::with_pinned_backend(backend)
+                    } else {
+                        MatvecScratch::with_backend(backend)
+                    };
+                    let mut prepared = scratch.prepare(&pq2_128_tensor, &dummy_128)?;
+                    prepared.scratch.q8 = make_q8();
+                    prepared.matvec_into(&pq2_128_tensor, &mut output)?;
+                    assert_eq!(output.len(), rows);
+                    for (&actual, &expected) in output.iter().zip(&expected_pq2_128) {
+                        assert!((actual - expected).abs() <= 1e-4);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ptq1_multi_row_i8_min_preserve_distinct_rows() -> crate::Result<()> {
+        let backends = [
+            super::MatvecBackend::Scalar,
+            super::MatvecBackend::Auto,
+            super::MatvecBackend::ExperimentalNeon,
+        ];
+        let make_q8 = || -> Vec<super::Q8Block> {
+            (0..8_usize)
+                .map(|block_idx| {
+                    let mut values = [i8::MIN; 32];
+                    values[block_idx % 32] = 127;
+                    super::Q8Block {
+                        scale: 0.25,
+                        sum: 0.0,
+                        values,
+                    }
+                })
+                .collect()
+        };
+        let ptq1_ref = make_q8();
+        let dummy = vec![0.0_f32; 256];
+        let mut output = Vec::new();
+        for rows in 2_usize..=8 {
+            let mut ptq1_256 = Vec::with_capacity(rows * 56);
+            for row in 0..rows {
+                let row_u8 = u8::try_from(row)?;
+                let scale = 0.125_f32.mul_add(f32::from(row_u8), 1.0);
+                let mut row_weights = [0.0_f32; 256];
+                for (col, slot) in row_weights.iter_mut().enumerate() {
+                    *slot = match (col + row) % 5 {
+                        0 | 2 => scale,
+                        1 | 4 => -scale,
+                        _ => 0.0,
+                    };
+                }
+                ptq1_256.extend_from_slice(&super::quantize_row(super::PTQ1, &row_weights)?);
+            }
+            let ptq1_tensor = Tensor {
+                name: "ptq1_256".to_owned(),
+                dimensions: vec![256, rows],
+                kind: super::PTQ1,
+                data: Arc::from(ptq1_256),
+            };
+            let expected_ptq1: Vec<f32> = ptq1_tensor
+                .data
+                .as_chunks::<56>()
+                .0
+                .iter()
+                .map(|row_bytes| {
+                    let mut total = 0.0_f32;
+                    for (block, act_group) in row_bytes
+                        .as_chunks::<28>()
+                        .0
+                        .iter()
+                        .zip(ptq1_ref.as_chunks::<4>().0)
+                    {
+                        let d = super::scale(&block[26..])?;
+                        let weights = super::ptq1_values(block)?;
+                        for (w_chunk, a_block) in weights.as_chunks::<32>().0.iter().zip(act_group)
+                        {
+                            total = (d * a_block.scale)
+                                .mul_add(super::dot_integer(w_chunk, &a_block.values), total);
+                        }
+                    }
+                    Ok(total)
+                })
+                .collect::<crate::Result<_>>()?;
+            for idx in 0..rows {
+                for other in (idx + 1)..rows {
+                    assert_ne!(expected_ptq1[idx].to_bits(), expected_ptq1[other].to_bits());
+                }
+            }
+            for backend in backends {
+                for pinned in [false, true] {
+                    let mut scratch = if pinned {
+                        MatvecScratch::with_pinned_backend(backend)
+                    } else {
+                        MatvecScratch::with_backend(backend)
+                    };
+                    let mut prepared = scratch.prepare(&ptq1_tensor, &dummy)?;
+                    prepared.scratch.q8 = make_q8();
+                    prepared.matvec_into(&ptq1_tensor, &mut output)?;
+                    assert_eq!(output.len(), rows);
+                    for (&actual, &expected) in output.iter().zip(&expected_ptq1) {
+                        assert!((actual - expected).abs() <= 1e-4);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

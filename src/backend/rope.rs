@@ -44,7 +44,12 @@ impl CpuBackend {
         let extension = float(p, 7);
         let mut magnitude = float(p, 8);
         let theta_scale = freq_base.powf(-2.0 / dims as f32);
-        let sections: [usize; 4] = std::array::from_fn(|axis| integer(p, 11 + axis) as usize);
+        let sections = [
+            usize::try_from(integer(p, 11))?,
+            usize::try_from(integer(p, 12))?,
+            usize::try_from(integer(p, 13))?,
+            usize::try_from(integer(p, 14))?,
+        ];
         let section_count: usize = sections.iter().sum();
         let multi = mode & 8 != 0;
         let vision = mode == 24;

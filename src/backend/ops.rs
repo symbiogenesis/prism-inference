@@ -510,20 +510,29 @@ impl CpuBackend {
                 let b_id = source(1)?;
                 let b_shape = self.info(b_id)?.shape;
                 let b = self.values(b_id)?;
+                let unsigned_param = |index: usize| -> Result<usize> {
+                    let bytes = std::array::from_fn(|offset| p[index * 4 + offset]);
+                    usize::try_from(u32::from_le_bytes(bytes))
+                        .map_err(|_| invalid("CPU set stride or offset exceeds pointer width"))
+                };
                 let strides = [
                     4,
-                    integer(p, 0) as usize,
-                    integer(p, 1) as usize,
-                    integer(p, 2) as usize,
+                    unsigned_param(0)?,
+                    unsigned_param(1)?,
+                    unsigned_param(2)?,
                 ];
+                let base_offset = unsigned_param(3)?;
                 for (index, &x) in b.iter().enumerate() {
                     let coord = coordinates(index, b_shape);
-                    let offset = integer(p, 3) as usize
-                        + coord
-                            .iter()
-                            .zip(strides)
-                            .map(|(&x, stride)| x * stride)
-                            .sum::<usize>();
+                    let mut offset = base_offset;
+                    for (&axis_coord, stride) in coord.iter().zip(strides) {
+                        let step = axis_coord
+                            .checked_mul(stride)
+                            .ok_or_else(|| invalid("CPU set stride multiplication overflow"))?;
+                        offset = offset
+                            .checked_add(step)
+                            .ok_or_else(|| invalid("CPU set offset addition overflow"))?;
+                    }
                     let destination = out
                         .get_mut(offset / 4)
                         .ok_or_else(|| invalid("CPU set destination exceeds extent"))?;
@@ -707,7 +716,7 @@ impl CpuBackend {
                 let b_id = source(1)?;
                 let b_shape = self.info(b_id)?.shape;
                 let b = self.values(b_id)?;
-                let stride = integer(p, 0) as usize;
+                let stride = usize::try_from(integer(p, 0))?;
                 for channel in 0..a_shape[1] {
                     for input_time in 0..b_shape[0] {
                         for kernel in 0..a_shape[0] {
@@ -726,7 +735,10 @@ impl CpuBackend {
             }
             55 => {
                 let stride = i64::from(integer(p, 0));
-                let channels = integer(p, 1) as usize;
+                let channels = usize::try_from(integer(p, 1))?;
+                if channels == 0 {
+                    return Err(invalid("CPU conv1d requires positive channel count"));
+                }
                 let padding = i64::from(integer(p, 2));
                 let kernel_width = a_shape[0] / channels;
                 for channel in 0..channels {
@@ -738,9 +750,11 @@ impl CpuBackend {
                         for input in first..=last {
                             let kernel = absolute - input * stride;
                             if kernel >= 0 && kernel < kernel_width as i64 {
+                                let kernel_index = usize::try_from(kernel)?;
+                                let input_index = usize::try_from(input)?;
                                 sum += a[channel * kernel_width
-                                    + kernel as usize
-                                    + input as usize * a_shape[0]];
+                                    + kernel_index
+                                    + input_index * a_shape[0]];
                             }
                         }
                         out[time + channel * shape[0]] = sum;
@@ -758,11 +772,11 @@ impl CpuBackend {
                     for axis in 0..4 {
                         let shifted = coordinate[axis] as i64 - i64::from(integer(p, 2 * axis));
                         if circular {
-                            src[axis] = shifted.rem_euclid(a_shape[axis] as i64) as usize;
+                            src[axis] = usize::try_from(shifted.rem_euclid(a_shape[axis] as i64))?;
                         } else if shifted < 0 || shifted >= a_shape[axis] as i64 {
                             valid = false;
                         } else {
-                            src[axis] = shifted as usize;
+                            src[axis] = usize::try_from(shifted)?;
                         }
                     }
                     if valid {
@@ -773,10 +787,13 @@ impl CpuBackend {
             66 => {
                 for (index, value) in out.iter_mut().enumerate() {
                     let coordinate = coordinates(index, shape);
-                    let src = std::array::from_fn(|axis| {
-                        (coordinate[axis] as i64 - i64::from(integer(p, axis)))
-                            .rem_euclid(shape[axis] as i64) as usize
-                    });
+                    let mut src = [0; 4];
+                    for axis in 0..4 {
+                        src[axis] = usize::try_from(
+                            (coordinate[axis] as i64 - i64::from(integer(p, axis)))
+                                .rem_euclid(shape[axis] as i64),
+                        )?;
+                    }
                     *value = a[linear(src, shape)];
                 }
             }
@@ -786,7 +803,7 @@ impl CpuBackend {
                 }
             }
             68 => {
-                let dim = integer(p, 0) as usize;
+                let dim = usize::try_from(integer(p, 0))?;
                 let half = dim / 2;
                 for (row, &time) in a.iter().enumerate() {
                     for index in 0..half {
@@ -970,5 +987,99 @@ impl CpuBackend {
             _ => return Err(invalid(format!("unsupported CPU numerical operation {op}"))),
         }
         self.set_values(tensor, &out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Argument, CpuBackend, GraphId, Observation};
+    use crate::{Result, invalid};
+
+    fn new_graph(backend: &mut CpuBackend) -> Result<GraphId> {
+        match backend.call("ggml_new_graph", &[Argument::Context(0)])? {
+            Observation::Graph(graph) => Ok(graph),
+            _ => Err(invalid("expected graph")),
+        }
+    }
+
+    #[test]
+    fn set_op_262144_token_stride_widening_avoids_sign_extension_and_wrap() -> Result<()> {
+        // Synthetic 262,144-token stride = 262,144 * 2,048 * 4 bytes = 0x8000_0000 (bit 31 set).
+        // With coord[1] = 0, unsigned widening to usize works without sign extension;
+        // with coord[1] > 0 or stride = 0xffff_fffc, checked arithmetic rejects out-of-extent without wrap.
+        let stride_262k: u32 = 262_144_u32 * 2_048 * 4;
+        let mut backend = CpuBackend::new();
+        let a = backend.tensor(0, 0, [4, 1, 1, 1])?;
+        let b = backend.tensor(0, 0, [1, 1, 1, 1])?;
+        let out = backend.tensor(0, 0, [4, 1, 1, 1])?;
+        backend.allocate(0)?;
+        backend.set_values(a, &[1.0, 2.0, 3.0, 4.0])?;
+        backend.set_values(b, &[9.0])?;
+        {
+            let info = backend.info_mut(out)?;
+            info.operation = 33;
+            info.sources = vec![a, b];
+            info.source_slots[0] = Some(a);
+            info.source_slots[1] = Some(b);
+            info.parameters[..4].copy_from_slice(&stride_262k.to_le_bytes());
+            info.parameters[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        }
+        let graph = new_graph(&mut backend)?;
+        backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(graph), Argument::Tensor(out)],
+        )?;
+        backend.compute(graph)?;
+        assert_eq!(backend.values(out)?, [1.0, 9.0, 3.0, 4.0]);
+
+        // Test wraparound immunity: coord[1] = 4 with 0xffff_fffc (-4_i32) + offset 16 previously
+        // wrapped mod 2^64 back to index 0; checked unsigned widening rejects it cleanly.
+        let mut wrap_backend = CpuBackend::new();
+        let wa = wrap_backend.tensor(0, 0, [4, 1, 1, 1])?;
+        let wb = wrap_backend.tensor(0, 0, [1, 5, 1, 1])?;
+        let wout = wrap_backend.tensor(0, 0, [4, 1, 1, 1])?;
+        wrap_backend.allocate(0)?;
+        wrap_backend.set_values(wa, &[1.0, 2.0, 3.0, 4.0])?;
+        wrap_backend.set_values(wb, &[5.0; 5])?;
+        {
+            let info = wrap_backend.info_mut(wout)?;
+            info.operation = 33;
+            info.sources = vec![wa, wb];
+            info.source_slots[0] = Some(wa);
+            info.source_slots[1] = Some(wb);
+            info.parameters[..4].copy_from_slice(&0xffff_fffc_u32.to_le_bytes());
+            info.parameters[12..16].copy_from_slice(&16_u32.to_le_bytes());
+        }
+        let wrap_graph = new_graph(&mut wrap_backend)?;
+        wrap_backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(wrap_graph), Argument::Tensor(wout)],
+        )?;
+        assert!(wrap_backend.compute(wrap_graph).is_err());
+
+        // Test 262,144-element tensor stride multiplication overflow/extent guard.
+        let mut long_backend = CpuBackend::new();
+        let la = long_backend.tensor(0, 0, [4, 1, 1, 1])?;
+        let lb = long_backend.tensor(0, 0, [1, 262_144, 1, 1])?;
+        let lout = long_backend.tensor(0, 0, [4, 1, 1, 1])?;
+        long_backend.allocate(0)?;
+        long_backend.set_values(la, &[0.0; 4])?;
+        let long_values: Vec<f32> = std::iter::repeat_n(1.0, 262_144).collect();
+        long_backend.set_values(lb, &long_values)?;
+        {
+            let info = long_backend.info_mut(lout)?;
+            info.operation = 33;
+            info.sources = vec![la, lb];
+            info.source_slots[0] = Some(la);
+            info.source_slots[1] = Some(lb);
+            info.parameters[..4].copy_from_slice(&stride_262k.to_le_bytes());
+        }
+        let long_graph = new_graph(&mut long_backend)?;
+        long_backend.call(
+            "ggml_build_forward_expand",
+            &[Argument::Graph(long_graph), Argument::Tensor(lout)],
+        )?;
+        assert!(long_backend.compute(long_graph).is_err());
+        Ok(())
     }
 }

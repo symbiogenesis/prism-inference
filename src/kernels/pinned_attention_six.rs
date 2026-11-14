@@ -46,7 +46,7 @@ pub(crate) fn dot_pair(key: &[u16], queries: [[&[f32]; 6]; 2]) -> Result<[[f32; 
 fn dot_many<const HEADS: usize>(key: &[u16], queries: [&[f32]; HEADS]) -> Result<[f32; HEADS]> {
     let len = key.len();
     if len == 0
-        || len > crate::model::swift::CONTEXT_TOKENS
+        || len > super::MAX_ATTENTION_HEAD_DIM
         || queries.iter().any(|query| query.len() != len)
     {
         return Err(invalid("invalid pinned six-head attention dot width"));

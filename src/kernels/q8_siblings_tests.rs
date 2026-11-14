@@ -157,7 +157,7 @@ fn q8_siblings_accept_native_ptq1_aliases_and_signed_zero_scales() -> Result<()>
     for scale in [0_u16, 0x8000, 0x3c00, 0xbc00] {
         for tensor in &mut tensors {
             let mut data = tensor.data.to_vec();
-            for block in data.chunks_exact_mut(28) {
+            for block in data.as_chunks_mut::<28>().0 {
                 // Every fractional trit byte is valid for native execution,
                 // independently of the stricter canonical wire-codec boundary.
                 block[0] = 1;

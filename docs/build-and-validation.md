@@ -5,6 +5,15 @@
 ## Install from source
 
 Use the compiler pinned in [rust-toolchain.toml](../rust-toolchain.toml).
+Its next-generation trait solver is enabled globally by default: there is no
+per-trait opt-in. Workspace crates, dependencies, build scripts, procedural macros
+and rustdoc use the selected compiler's solver without extra flags. Keep external
+builds and consumers on the pinned compiler; `--manifest-path` alone does not
+select a toolchain. The [compiler gates](../tools/rust-trial/tests/compiler.rs)
+and `SupportsLogitsView` doctest check the default behavior. Stable and
+coherence-only solver selections belong to the isolated
+[compiler comparison controls](../tools/rust-trial/README.md).
+
 Install the CLI and two JSONL workers from a checkout:
 
 ```powershell

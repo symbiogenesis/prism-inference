@@ -75,6 +75,22 @@ impl LogitsSource for LogitsCache {
 }
 
 /// Higher-ranked associated-view projection supported by the next trait solver.
+///
+/// Rustdoc compiles this example with the selected compiler's default solver,
+/// exercising the same projection as the ordinary Cargo compiler gate.
+///
+/// ```
+/// use bonsai_rust_trial::{LogitsCache, SupportsLogitsView};
+///
+/// fn first(values: &[f32]) -> Option<f32> {
+///     values.first().copied()
+/// }
+///
+/// let read: for<'a> fn(&'a [f32]) -> Option<f32> = first;
+/// let mut source = (LogitsCache::new(4), read);
+/// assert_eq!(source.apply(5), Some(5.0));
+/// assert_eq!(source.apply(7), Some(7.0));
+/// ```
 pub trait SupportsLogitsView {
     /// Evaluate a token through a higher-ranked borrowed-output function pointer.
     fn apply(&mut self, token: u16) -> Option<f32>;

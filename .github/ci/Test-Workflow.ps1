@@ -13,7 +13,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 function Test-CiActionReference {
     [CmdletBinding()]
-    [OutputType([string[]])]
+    [OutputType([string])]
     param([Parameter(Mandatory)][string]$RepositoryRoot)
     $errors = [Collections.Generic.List[string]]::new()
     $sources = @(Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot '.github/workflows') -File |
@@ -61,7 +61,7 @@ function Test-CiActionReference {
             }
         }
     }
-    return ,$errors.ToArray()
+    return $errors.ToArray()
 }
 
 function Invoke-CiWorkflowLint {
@@ -71,7 +71,7 @@ function Invoke-CiWorkflowLint {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$Linter
     )
-    $errors = Test-CiActionReference $RepositoryRoot
+    $errors = @(Test-CiActionReference $RepositoryRoot)
     if ($errors.Count) { throw ($errors -join "`n") }
     $workflows = @(Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot '.github/workflows') -File |
         Where-Object Extension -cin @('.yml', '.yaml') | Sort-Object Name | ForEach-Object FullName)

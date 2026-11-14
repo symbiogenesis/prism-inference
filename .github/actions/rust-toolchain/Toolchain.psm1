@@ -4,6 +4,30 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
 function Install-VerifiedRustToolchain {
+    <#
+    .SYNOPSIS
+    Installs or verifies an exact Rust toolchain and returns its compiler digest.
+    .DESCRIPTION
+    Checks the compiler host, exact rustup sysroot and required components.
+    An invalid restored cache may be replaced once on a hosted runner; owner
+    installations and failed fresh installations are never removed or retried.
+    .PARAMETER Toolchain
+    Exact dated or versioned toolchain including the expected host triple.
+    .PARAMETER ExpectedHost
+    Required native compiler host triple.
+    .PARAMETER ToolchainPath
+    Absolute path to the selected toolchain below rustup's toolchains directory.
+    .PARAMETER Components
+    Required rustup components to install and verify.
+    .PARAMETER CacheRestored
+    Indicates that the exact toolchain directory came from an optional cache.
+    .PARAMETER HostedRunner
+    Permits one replacement of an invalid restored cache on an ephemeral runner.
+    .PARAMETER RunRustup
+    Command adapter for rustup; focused controls may provide a deterministic fixture.
+    .OUTPUTS
+    System.String. SHA-256 of the verified rustc verbose version lines.
+    #>
     [CmdletBinding()]
     [OutputType([string])]
     param(

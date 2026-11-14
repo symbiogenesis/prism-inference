@@ -746,9 +746,8 @@ fn malformed_scales_and_overflow_do_not_partially_mutate_outputs() {
 
 #[test]
 fn x1_compact_rotation_preserves_scalar_bits_and_failure_publication() -> Result<()> {
-    let subnormal = std::array::from_fn(|index: usize| {
-        f32::from_bits(u32::from(index.to_le_bytes()[0]))
-    });
+    let subnormal =
+        std::array::from_fn(|index: usize| f32::from_bits(u32::from(index.to_le_bytes()[0])));
     for seed in [0, 42, 91, u64::MAX] {
         let automatic = Quantizer::new(Bits::Four, seed);
         let scalar = Quantizer::scalar(Bits::Four, seed);

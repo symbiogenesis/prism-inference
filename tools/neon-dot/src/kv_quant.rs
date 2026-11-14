@@ -668,9 +668,8 @@ mod tests {
             let value = f32::from(index.to_le_bytes()[0]) - 127.5;
             value / 32.0
         });
-        let subnormal = std::array::from_fn(|index: usize| {
-            f32::from_bits(u32::from(index.to_le_bytes()[0]))
-        });
+        let subnormal =
+            std::array::from_fn(|index: usize| f32::from_bits(u32::from(index.to_le_bytes()[0])));
         for input in [mixed, subnormal, [0.0; DIMENSION], [-0.0; DIMENSION]] {
             for inverse in [false, true] {
                 let mut actual = input;

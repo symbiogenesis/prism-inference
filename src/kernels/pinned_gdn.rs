@@ -658,6 +658,19 @@ pub(crate) fn step_eight_rows_provisional(
 /// # Errors
 /// An eligible head with mismatched extents rejects before any mutation. Native
 /// failures replay the failing group against its immutable committed source.
+#[cfg_attr(
+    not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Native execution mutates both destinations; the unsupported-target stub keeps that signature while checking only their extents."
+    )
+)]
 pub(crate) fn try_step_head_provisional(
     previous: &[f32],
     state: &mut [f32],

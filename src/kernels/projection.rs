@@ -437,11 +437,6 @@ impl PreparedMatvec<'_> {
             return Err(invalid("mismatched projection group outputs"));
         }
         let result = (|| {
-            if !executor.supports_f32_group(tensors) {
-                return Err(invalid(
-                    "projection executor does not support this F32 group",
-                ));
-            }
             for &tensor in tensors {
                 let (columns, _, _) = dimensions(tensor)?;
                 if !self.is_compatible(tensor)?
@@ -452,6 +447,11 @@ impl PreparedMatvec<'_> {
                         "incompatible prepared projection executor activation",
                     ));
                 }
+            }
+            if !executor.supports_f32_group(tensors) {
+                return Err(invalid(
+                    "projection executor does not support this F32 group",
+                ));
             }
             executor.project_f32_group(
                 tensors,

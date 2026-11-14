@@ -1,6 +1,6 @@
 //! Capability rejection before any fused/group submission or output publication.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use super::{Pq2ProjectionExecutor, Q8KBlock};
 use crate::{Result, invalid, kernels::MatvecScratch, model::Tensor};
@@ -8,6 +8,7 @@ use crate::{Result, invalid, kernels::MatvecScratch, model::Tensor};
 #[derive(Default)]
 struct RefusingExecutor {
     calls: usize,
+    capability_queries: Cell<usize>,
 }
 
 impl Pq2ProjectionExecutor for RefusingExecutor {
@@ -16,6 +17,12 @@ impl Pq2ProjectionExecutor for RefusingExecutor {
     }
 
     fn supports(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn supports_f32_group(&self, _tensors: &[&Tensor]) -> bool {
+        self.capability_queries
+            .set(self.capability_queries.get() + 1);
         false
     }
 
@@ -130,6 +137,36 @@ fn projection_precision_capabilities_gate_fused_and_group_callbacks() -> Result<
     );
     assert!(output.is_empty());
     assert!(other.is_empty());
+    assert_eq!(executor.calls, 0);
+    assert_eq!(executor.capability_queries.get(), 1);
+    Ok(())
+}
+
+#[test]
+fn projection_precision_validates_group_geometry_before_capability_callback() -> Result<()> {
+    let valid = weight("valid");
+    let malformed = Tensor {
+        dimensions: Vec::new(),
+        ..weight("malformed")
+    };
+    let mut scratch = MatvecScratch::default();
+    let input = vec![0.0; 128];
+    let mut prepared = scratch.prepare_f32_executor(&valid, &input)?;
+    let mut executor = RefusingExecutor::default();
+    let mut output = vec![17.0];
+    let mut other = vec![23.0];
+    assert!(
+        prepared
+            .matvec_group_with_executor(
+                &[&valid, &malformed],
+                &mut [&mut output, &mut other],
+                &mut executor
+            )
+            .is_err()
+    );
+    assert!(output.is_empty());
+    assert!(other.is_empty());
+    assert_eq!(executor.capability_queries.get(), 0);
     assert_eq!(executor.calls, 0);
     Ok(())
 }

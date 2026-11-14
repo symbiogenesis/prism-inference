@@ -199,7 +199,7 @@ fn rank_one_edited_sparse_storage_releases_dense_a_and_binds_arithmetic() -> Res
     assert_eq!(dense.total_payload_bytes - sparse.total_payload_bytes, 4);
     for target in LINEAR {
         let factors = adapter.factors.get(target).ok_or("missing sparse factor")?;
-        assert_eq!(factors.a_values, [] as [f32; 0]);
+        assert_eq!(factors.a_values, Vec::<f32>::new());
         assert_eq!(factors.a_values.capacity(), 0);
         let compact = factors.sparse_a.as_ref().ok_or("missing compact A")?;
         assert_eq!(compact.indices, [0]);
@@ -226,7 +226,7 @@ fn rank_one_edited_sparse_dots_round_and_reject_nonfinite_omitted_inputs() -> Re
                 .is_err()
         );
         assert_eq!(output, [3.0, 4.0]);
-        assert_eq!(scratch.rank, [] as [f32; 0]);
+        assert_eq!(scratch.rank, Vec::<f32>::new());
     }
     let mut output = [-0.0, -0.0];
     adapter.linear(LINEAR[0], &[f32::NAN], 0.0, &mut output, &mut scratch)?;

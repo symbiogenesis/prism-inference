@@ -111,6 +111,33 @@ final store, retaining their ordered partial-error publication. Scalar atomic
 fallback retains its own failure boundary. These destinations are private graph
 scratch; complete-request rollback governs committed state.
 
+## Recurrent RMS weight admission
+
+Each recurrent layer borrows its immutable RMS weights through one finite-weight
+scope before traversing its value heads. Ordinary decode shares this borrow
+across all heads; tiled prefill shares it across all heads and tokens in the
+tile, including existing worker partitions. The square-accumulation pass omits
+repeated weight loads and finite predicates. At Swift's 48 value heads and
+128-channel normalization, ordinary decode replaces 6,144 such checks with 128
+per recurrent layer. This source count establishes no device timing benefit.
+
+The scope owns no allocation and keeps no pointer-keyed cache. Its immutable
+borrow prevents weight mutation until all consumers join. Geometry, epsilon,
+activation and result checks remain per operation; binary32 products, ordered
+binary64 square sums, scale rounding, source/pinned multiply order and SwiGLU
+remain unchanged. Public normalization retains defensive validation. Graph
+loading already rejects nonfinite normalization vectors; private malformed
+weight injection now rejects before recurrent matrix work. Failed disposable
+deltas never alter committed state and valid retry replaces dirty scratch.
+
+Focused controls compare both arithmetic profiles with independent normalization,
+exercise scalar/NEON tails, signed zero/subnormals, invalid input/weights/epsilon,
+failure publication and stale admission. A direct recurrent-layer control uses
+defensive per-row/per-head kernels, one/four workers, malformed weights and late
+recurrence failure followed by recovery. Native/fallback compilation, complete
+model state/logit/adapter/cancellation parity, codegen/resources and matched
+complete-request benefit remain independent qualification gates.
+
 ## Provisional GDN decode state
 
 Pinned Swift CPU decode writes eight recurrent rows into unpublished

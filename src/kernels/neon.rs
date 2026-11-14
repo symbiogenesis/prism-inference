@@ -2202,7 +2202,10 @@ pub(super) fn l2_norm_in_place(input: &mut [f32], epsilon: f32) -> bool {
 }
 
 #[inline]
-pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f64>> {
+pub(super) fn rms_norm_squares<const WEIGHTS_VALIDATED: bool>(
+    input: &[f32],
+    weight: &[f32],
+) -> Option<Result<f64>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut sum = 0.0_f64;
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
@@ -2213,19 +2216,16 @@ pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f
         let v1 = f32x4::from_slice(neon, &in_b[4..8]);
         let v2 = f32x4::from_slice(neon, &in_b[8..12]);
         let v3 = f32x4::from_slice(neon, &in_b[12..16]);
-        let w0 = f32x4::from_slice(neon, &w_b[0..4]);
-        let w1 = f32x4::from_slice(neon, &w_b[4..8]);
-        let w2 = f32x4::from_slice(neon, &w_b[8..12]);
-        let w3 = f32x4::from_slice(neon, &w_b[12..16]);
-        finite_mask = finite_mask
-            & v0.is_finite()
-            & w0.is_finite()
-            & v1.is_finite()
-            & w1.is_finite()
-            & v2.is_finite()
-            & w2.is_finite()
-            & v3.is_finite()
-            & w3.is_finite();
+        finite_mask =
+            finite_mask & v0.is_finite() & v1.is_finite() & v2.is_finite() & v3.is_finite();
+        if !WEIGHTS_VALIDATED {
+            let w0 = f32x4::from_slice(neon, &w_b[0..4]);
+            let w1 = f32x4::from_slice(neon, &w_b[4..8]);
+            let w2 = f32x4::from_slice(neon, &w_b[8..12]);
+            let w3 = f32x4::from_slice(neon, &w_b[12..16]);
+            finite_mask =
+                finite_mask & w0.is_finite() & w1.is_finite() & w2.is_finite() & w3.is_finite();
+        }
         for sq in [
             (v0 * v0).to_array(),
             (v1 * v1).to_array(),
@@ -2242,8 +2242,10 @@ pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f
     let (w_chunks, w_tail) = w_rem16.as_chunks::<4>();
     for (in_chunk, w_chunk) in in_chunks.iter().zip(w_chunks) {
         let v = f32x4::from_slice(neon, in_chunk);
-        let w = f32x4::from_slice(neon, w_chunk);
-        finite_mask = finite_mask & v.is_finite() & w.is_finite();
+        finite_mask &= v.is_finite();
+        if !WEIGHTS_VALIDATED {
+            finite_mask &= f32x4::from_slice(neon, w_chunk).is_finite();
+        }
         let sq_lanes = (v * v).to_array();
         sum += f64::from(sq_lanes[0]);
         sum += f64::from(sq_lanes[1]);
@@ -2254,7 +2256,7 @@ pub(super) fn rms_norm_squares(input: &[f32], weight: &[f32]) -> Option<Result<f
         return Some(Err(crate::invalid("nonfinite tensor or activation value")));
     }
     for (&value, &w) in in_tail.iter().zip(w_tail) {
-        if !value.is_finite() || !w.is_finite() {
+        if !value.is_finite() || (!WEIGHTS_VALIDATED && !w.is_finite()) {
             return Some(Err(crate::invalid("nonfinite tensor or activation value")));
         }
         sum += f64::from(value * value);

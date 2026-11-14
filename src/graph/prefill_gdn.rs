@@ -7,7 +7,8 @@ use crate::graph::{
 };
 use crate::kernels::pinned_gdn::ChunkInput as Input;
 use crate::kernels::{
-    add_scaled_slice_in_place, gdn_wy_update_eight_rows, gdn_wy_update_four_rows, scale_slice_into,
+    RmsNormWeights, add_scaled_slice_in_place, gdn_wy_update_eight_rows, gdn_wy_update_four_rows,
+    scale_slice_into,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::{Result, invalid};
@@ -790,6 +791,7 @@ pub(super) fn recurrent_tile<'a>(
             },
         )?;
     }
+    let norm = RmsNormWeights::new(&layer.norm)?;
     let mut output_reuse = TileReuse::default();
     if tile.projector.row_parallelism().workers() > 1 && geometry.ssm_values > 1 {
         if chunkwise {
@@ -890,7 +892,7 @@ pub(super) fn recurrent_tile<'a>(
                         let token_out = &mut head_out[token * width..(token + 1) * width];
                         arithmetic.normalize_swiglu_in_place(
                             token_out,
-                            &layer.norm,
+                            norm,
                             geometry.epsilon,
                             &gate_ref[token][head_index * width..(head_index + 1) * width],
                         )?;
@@ -1037,7 +1039,7 @@ pub(super) fn recurrent_tile<'a>(
                 let token_out = &tile.gdn_head_outputs[token * width..(token + 1) * width];
                 arithmetic.normalize_swiglu_into(
                     token_out,
-                    &layer.norm,
+                    norm,
                     geometry.epsilon,
                     &tile.recurrent_gate[token][head_index * width..(head_index + 1) * width],
                     &mut tile.attended[token][head_index * width..(head_index + 1) * width],

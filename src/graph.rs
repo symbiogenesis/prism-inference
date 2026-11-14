@@ -14,12 +14,12 @@ use bonsai_ternary::half_to_float;
 
 use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place};
 use crate::kernels::{
-    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RowParallelism,
-    add_rms_norm_into, add_rms_norm_pinned_into, add_scaled_slice_in_place, add_slice_in_place,
-    add_slice_in_place_all_finite, append_half_bits, f16_dot, float_dot, is_finite_slice,
-    l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into, rms_norm_into,
-    rms_norm_pinned_into, rms_norm_swiglu_in_place, rms_norm_swiglu_into, round_f16_slice, row,
-    row_into, scale_slice_into, silu, softmax_round_f16,
+    MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RmsNormWeights,
+    RowParallelism, add_rms_norm_into, add_rms_norm_pinned_into, add_scaled_slice_in_place,
+    add_slice_in_place, add_slice_in_place_all_finite, append_half_bits, f16_dot, float_dot,
+    is_finite_slice, l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into,
+    rms_norm_into, rms_norm_pinned_into, round_f16_slice, row, row_into, scale_slice_into, silu,
+    softmax_round_f16,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -39,6 +39,9 @@ mod attention_six;
 mod quantized_kv;
 pub use quantized_kv::KvCachePolicy;
 mod ffn_preparation;
+#[cfg(test)]
+#[path = "graph/rms_weight_scope_tests.rs"]
+mod rms_weight_scope_tests;
 #[cfg(all(test, feature = "parallel-rows"))]
 #[path = "graph/sibling_projection_tests.rs"]
 mod sibling_projection_tests;
@@ -139,27 +142,27 @@ impl Arithmetic {
     fn normalize_swiglu_in_place(
         self,
         values: &mut [f32],
-        weight: &[f32],
+        weight: RmsNormWeights<'_>,
         epsilon: f32,
         gate: &[f32],
     ) -> Result<()> {
         match self {
-            Self::Source => rms_norm_swiglu_in_place::<false>(values, weight, epsilon, gate),
-            Self::PinnedSwift => rms_norm_swiglu_in_place::<true>(values, weight, epsilon, gate),
+            Self::Source => weight.swiglu_in_place::<false>(values, epsilon, gate),
+            Self::PinnedSwift => weight.swiglu_in_place::<true>(values, epsilon, gate),
         }
     }
 
     fn normalize_swiglu_into(
         self,
         input: &[f32],
-        weight: &[f32],
+        weight: RmsNormWeights<'_>,
         epsilon: f32,
         gate: &[f32],
         output: &mut [f32],
     ) -> Result<()> {
         match self {
-            Self::Source => rms_norm_swiglu_into::<false>(input, weight, epsilon, gate, output),
-            Self::PinnedSwift => rms_norm_swiglu_into::<true>(input, weight, epsilon, gate, output),
+            Self::Source => weight.swiglu_into::<false>(input, epsilon, gate, output),
+            Self::PinnedSwift => weight.swiglu_into::<true>(input, epsilon, gate, output),
         }
     }
 
@@ -4139,6 +4142,7 @@ impl Evaluation<'_, '_> {
         let head_state_len = g.ssm_head * g.ssm_head;
         let arithmetic = self.arithmetic;
         let mixed_ref: &[f32] = mixed;
+        let norm = RmsNormWeights::new(&layer.norm)?;
         self.projection
             .matvec
             .row_parallelism()
@@ -4267,7 +4271,7 @@ impl Evaluation<'_, '_> {
                         // ggml_swiglu_split(gate, normalized), not separate SiLU/MUL nodes.
                         arithmetic.normalize_swiglu_in_place(
                             output,
-                            &layer.norm,
+                            norm,
                             g.epsilon,
                             &gate_ref[head * g.ssm_head..(head + 1) * g.ssm_head],
                         )?;

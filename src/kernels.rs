@@ -60,6 +60,9 @@ mod pinned_q8_tests;
 #[cfg(test)]
 mod finite_activation_tests;
 
+mod rms_weights;
+pub(crate) use rms_weights::RmsNormWeights;
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -3508,13 +3511,23 @@ pub(crate) fn rms_norm_pinned_in_place(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn rms_norm_swiglu_in_place<const PINNED: bool>(
     values: &mut [f32],
     weight: &[f32],
     epsilon: f32,
     gate: &[f32],
 ) -> Result<()> {
-    let scale = rms_norm_scale(values, weight, epsilon)?;
+    rms_norm_swiglu_in_place_inner::<PINNED, false>(values, weight, epsilon, gate)
+}
+
+fn rms_norm_swiglu_in_place_inner<const PINNED: bool, const WEIGHTS_VALIDATED: bool>(
+    values: &mut [f32],
+    weight: &[f32],
+    epsilon: f32,
+    gate: &[f32],
+) -> Result<()> {
+    let scale = rms_norm_scale_inner::<WEIGHTS_VALIDATED>(values, weight, epsilon)?;
     if gate.len() != values.len() {
         return Err(invalid("SwiGLU requires equal gate and up vector lengths"));
     }
@@ -3546,6 +3559,7 @@ pub(crate) fn rms_norm_swiglu_in_place<const PINNED: bool>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn rms_norm_swiglu_into<const PINNED: bool>(
     input: &[f32],
     weight: &[f32],
@@ -3553,7 +3567,17 @@ pub(crate) fn rms_norm_swiglu_into<const PINNED: bool>(
     gate: &[f32],
     output: &mut [f32],
 ) -> Result<()> {
-    let scale = rms_norm_scale(input, weight, epsilon)?;
+    rms_norm_swiglu_into_inner::<PINNED, false>(input, weight, epsilon, gate, output)
+}
+
+fn rms_norm_swiglu_into_inner<const PINNED: bool, const WEIGHTS_VALIDATED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    gate: &[f32],
+    output: &mut [f32],
+) -> Result<()> {
+    let scale = rms_norm_scale_inner::<WEIGHTS_VALIDATED>(input, weight, epsilon)?;
     if gate.len() != input.len() || output.len() != input.len() {
         return Err(invalid("SwiGLU requires equal gate and up vector lengths"));
     }
@@ -3722,12 +3746,20 @@ pub(crate) fn rms_norm_rope_round_f16_in_place<const PINNED: bool>(
     Ok(round_f16_slice(values))
 }
 
+fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
+    rms_norm_scale_inner::<false>(input, weight, epsilon)
+}
+
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "The scalar normalization contract rounds the binary64 mean to binary32."
 )]
-fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
+fn rms_norm_scale_inner<const WEIGHTS_VALIDATED: bool>(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+) -> Result<f32> {
     if input.is_empty() || input.len() != weight.len() || !epsilon.is_finite() || epsilon < 0.0 {
         return Err(invalid(
             "RMS normalization requires equal nonempty vectors and nonnegative epsilon",
@@ -3741,13 +3773,15 @@ fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
         target_env = "msvc",
         target_feature = "neon"
     ))]
-    let sum = if let Some(sum) = neon::rms_norm_squares(input, weight) {
+    let sum = if let Some(sum) = neon::rms_norm_squares::<WEIGHTS_VALIDATED>(input, weight) {
         sum?
     } else {
         let mut sum = 0.0_f64;
         for (&value, &w) in input.iter().zip(weight) {
             finite(value)?;
-            finite(w)?;
+            if !WEIGHTS_VALIDATED {
+                finite(w)?;
+            }
             sum += f64::from(value * value);
         }
         sum
@@ -3763,7 +3797,9 @@ fn rms_norm_scale(input: &[f32], weight: &[f32], epsilon: f32) -> Result<f32> {
         let mut sum = 0.0_f64;
         for (&value, &w) in input.iter().zip(weight) {
             finite(value)?;
-            finite(w)?;
+            if !WEIGHTS_VALIDATED {
+                finite(w)?;
+            }
             sum += f64::from(value * value);
         }
         sum

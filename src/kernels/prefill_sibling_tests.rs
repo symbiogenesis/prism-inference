@@ -277,11 +277,18 @@ fn tiled_q8_siblings_preserve_pinned_lanes_reuse_and_failure_atomicity() -> Resu
     } else {
         1
     };
-    for (kind, columns) in [(PQ2, 128), (PQ2, 384), (PTQ1, 256), (PTQ1, 384)] {
+    for (kind, columns) in [
+        (PQ2, 128),
+        (PQ2, 256),
+        (PQ2, 384),
+        (PQ2, 512),
+        (PTQ1, 256),
+        (PTQ1, 384),
+    ] {
         let tensors = [
-            q8_tensor(kind, columns, 13, 0x66)?,
+            q8_tensor(kind, columns, 3, 0x66)?,
             q8_tensor(kind, columns, 9, 0x19)?,
-            q8_tensor(kind, columns, 3, 0x44)?,
+            q8_tensor(kind, columns, 13, 0x44)?,
         ];
         assert!(ProjectionTile::supports_siblings(&tensors.each_ref()));
         for count in [1, 9, 32] {

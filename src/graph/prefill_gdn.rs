@@ -1077,7 +1077,13 @@ mod tests {
     fn x1_temporal_gdn_prefill_consumer_matches_defensive_rows() -> Result<()> {
         let width = 128;
         let previous: Vec<_> = (0..width * width)
-            .map(|i| if i % 3 == 0 { -0.015_625 } else { 0.03125 })
+            .map(|i| {
+                if i.is_multiple_of(3) {
+                    -0.015_625
+                } else {
+                    0.03125
+                }
+            })
             .collect();
         let key = vec![0.25; width];
         let query = vec![-0.125; width];

@@ -1700,6 +1700,10 @@ fn step_eight_rows_tokens_from_blocks<const BLOCKS: usize>(
 /// Geometry, tile bound and baseline selection are established by either
 /// the defensive block entry point or the borrowed complete-head entry point.
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep admitted baseline, immutable source and temporal output placement explicit."
+)]
 fn step_eight_rows_tokens_from_selected<const BLOCKS: usize>(
     neon: Neon,
     previous: [&[f32]; 8],

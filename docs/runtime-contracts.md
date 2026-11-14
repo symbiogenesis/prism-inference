@@ -225,3 +225,24 @@ Cumulative counters include preparations/failures, matrix attempts/successes,
 pre-dispatch rejection, dispatches and fallback reasons. Siblings share one
 preparation but count separate matrices. Counts survive reset/restore, saturate
 at `u64::MAX`, retain no inputs and do not count committed tokens.
+
+`Qwen35::fusion_statistics` separately witnesses the existing decode
+RMSNorm/Hadamard, residual/RMSNorm/Hadamard, SwiGLU/Hadamard, adapter-preserving
+SwiGLU/Hadamard and external FFN branches. Each path counts attempts, complete
+successful returns and explicit fallback. A successful separate fallback never
+counts as a completed fusion. Counts survive reset/restore and describe
+provisional execution; they establish neither hardware execution, tiled-prefill
+coverage nor numerical or performance qualification.
+
+The model-free `fusion_verification_` controls compare real graph preparation
+branches with separate operations, checking output bits and reporting maximum
+absolute error on failure alongside the executed counts. They cover source and
+pinned arithmetic, changed unrelated transform entries, explicit worker budgets
+and a failing fused preparation followed by successful ordinary normalization.
+The existing adapter FFN controls additionally require a completed fusion witness.
+The methodology follows ggml's [fusion testing][fusion-tests] and
+[boundary-dependent rounding regression][fusion-boundaries]; no upstream
+implementation is imported.
+
+[fusion-tests]: https://github.com/ggml-org/llama.cpp/pull/30769
+[fusion-boundaries]: https://github.com/ggml-org/llama.cpp/pull/31688

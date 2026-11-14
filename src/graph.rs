@@ -39,6 +39,11 @@ mod attention_six;
 mod quantized_kv;
 pub use quantized_kv::KvCachePolicy;
 mod ffn_preparation;
+mod fusion;
+pub use fusion::{FusionCount, FusionStatistics};
+#[cfg(test)]
+#[path = "graph/fusion_tests.rs"]
+mod fusion_tests;
 #[cfg(test)]
 #[path = "graph/rms_weight_scope_tests.rs"]
 mod rms_weight_scope_tests;
@@ -1275,6 +1280,7 @@ struct ProjectionScratch {
     transformed: Vec<f32>,
     pre_transformed_len: Option<usize>,
     matvec: MatvecScratch,
+    fusions: FusionStatistics,
     #[cfg(test)]
     transforms: usize,
 }
@@ -2932,6 +2938,16 @@ impl Qwen35 {
         self.workspace.projection.matvec.statistics()
     }
 
+    /// Successful and attempted decode fusion paths over this decoder's lifetime.
+    ///
+    /// These counts include provisional work and survive reset and restoration.
+    /// They identify executed preparation paths, not ISA use, committed tokens,
+    /// tiled-prefill coverage or numerical/performance qualification.
+    #[must_use]
+    pub const fn fusion_statistics(&self) -> FusionStatistics {
+        self.workspace.projection.fusions
+    }
+
     fn evaluate_token_into(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
         const fn coerce_executor<'a>(
             executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
@@ -3249,6 +3265,7 @@ impl Evaluation<'_, '_> {
         {
             let signs = self.transforms.signs.get(&input.len()).map(Vec::as_slice);
             let parallelism = self.projection.matvec.clone_row_parallelism();
+            self.projection.fusions.norm_hadamard.attempt();
             if self
                 .arithmetic
                 .normalize_hadamard_into(
@@ -3263,9 +3280,11 @@ impl Evaluation<'_, '_> {
                 )
                 .is_ok()
             {
+                self.projection.fusions.norm_hadamard.complete();
                 self.projection.pre_transformed_len = Some(input.len());
                 return Ok(());
             }
+            self.projection.fusions.norm_hadamard.fallback();
         }
         self.arithmetic
             .normalize(input, weight, self.geometry.epsilon, output)
@@ -3286,6 +3305,7 @@ impl Evaluation<'_, '_> {
         {
             let signs = self.transforms.signs.get(&values.len()).map(Vec::as_slice);
             let parallelism = self.projection.matvec.clone_row_parallelism();
+            self.projection.fusions.add_norm_hadamard.attempt();
             if self
                 .arithmetic
                 .add_normalize_hadamard_into(
@@ -3301,9 +3321,11 @@ impl Evaluation<'_, '_> {
                 )
                 .is_ok()
             {
+                self.projection.fusions.add_norm_hadamard.complete();
                 self.projection.pre_transformed_len = Some(values.len());
                 return Ok(());
             }
+            self.projection.fusions.add_norm_hadamard.fallback();
             return self
                 .arithmetic
                 .normalize(values, weight, self.geometry.epsilon, output);
@@ -3362,6 +3384,7 @@ impl Evaluation<'_, '_> {
             .matvec
             .prepare_f32_executor(gate_weight, activation)?;
         if let Some(executor) = self.executor.as_deref_mut() {
+            self.projection.fusions.external_ffn_chain.attempt();
             prepared.matvec_ffn_chain_with_executor(
                 tensors,
                 residual,
@@ -3369,6 +3392,7 @@ impl Evaluation<'_, '_> {
                 output,
                 executor,
             )?;
+            self.projection.fusions.external_ffn_chain.complete();
             return Ok(true);
         }
         Ok(false)
@@ -3418,12 +3442,10 @@ impl Evaluation<'_, '_> {
                 .matvec
                 .prepare_f32_executor(gate_weight, activation)?;
             if let Some(executor) = self.executor.as_deref_mut() {
-                return prepared.matvec_ffn_swiglu_with_executor(
-                    gate_weight,
-                    up_weight,
-                    up,
-                    executor,
-                );
+                self.projection.fusions.external_ffn_swiglu.attempt();
+                prepared.matvec_ffn_swiglu_with_executor(gate_weight, up_weight, up, executor)?;
+                self.projection.fusions.external_ffn_swiglu.complete();
+                return Ok(());
             }
         }
         self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
@@ -3433,6 +3455,7 @@ impl Evaluation<'_, '_> {
             && down_weight.dimensions.first().copied() == Some(up.len())
         {
             let signs = self.transforms.signs.get(&up.len()).map(Vec::as_slice);
+            self.projection.fusions.adapter_swiglu_hadamard.attempt();
             self.arithmetic.swiglu_hadamard_preserving_up_into(
                 gate,
                 up,
@@ -3441,6 +3464,7 @@ impl Evaluation<'_, '_> {
                 self.projection.matvec.row_parallelism(),
                 &mut self.projection.transformed,
             )?;
+            self.projection.fusions.adapter_swiglu_hadamard.complete();
             self.projection.pre_transformed_len = Some(up.len());
             return Ok(());
         }
@@ -3450,6 +3474,7 @@ impl Evaluation<'_, '_> {
             && down_weight.dimensions.first().copied() == Some(up.len())
         {
             let signs = self.transforms.signs.get(&up.len()).map(Vec::as_slice);
+            self.projection.fusions.swiglu_hadamard.attempt();
             if self
                 .arithmetic
                 .swiglu_hadamard_read_into_with_parallelism(
@@ -3462,9 +3487,11 @@ impl Evaluation<'_, '_> {
                 )
                 .is_ok()
             {
+                self.projection.fusions.swiglu_hadamard.complete();
                 self.projection.pre_transformed_len = Some(up.len());
                 return Ok(());
             }
+            self.projection.fusions.swiglu_hadamard.fallback();
         }
         self.arithmetic.swiglu_in_place_with_parallelism(
             gate,

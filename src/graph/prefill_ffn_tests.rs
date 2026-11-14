@@ -160,6 +160,15 @@ impl Fixture {
                 self.geometry.feed_forward,
                 self.transforms.block,
             );
+            assert_eq!(
+                evaluation
+                    .projection
+                    .fusions
+                    .adapter_swiglu_hadamard
+                    .completed,
+                u64::from(self.transforms.can_block_hadamard(up.len())),
+                "adapter fusion must identify the branch actually completed"
+            );
         } else {
             evaluation.project_group_into([&self.up, &self.gate], input, [&mut up, &mut gate])?;
             arithmetic.swiglu_in_place_with_parallelism(

@@ -10,6 +10,7 @@ fn bounded_selection() -> Selection {
         messages: PathBuf::from("messages"),
         output_tokens: 16,
         source_commit: "0".repeat(40),
+        profile: Profile,
         deadline_unix_milliseconds: 1,
         deadline,
         generation_deadline,
@@ -84,6 +85,18 @@ fn selection_rejects_relative_paths_bad_commit_and_output_overflow() {
         arguments[6] = "1".repeat(40);
         assert!(selection(&arguments, started, now).is_err());
     }
+}
+
+#[test]
+fn frozen_selection_rejects_candidate_suffix_and_preserves_schema_one() -> Result<()> {
+    assert!(parse_profile(&["k4-v4".into(), "1".into(), "0".into()]).is_err());
+    let identity = identity_record(&bounded_selection(), &Observation::default());
+    assert_eq!(identity["schema_version"], 1);
+    assert_eq!(identity["kind"], "swift-cpu-bundle-arm");
+    assert_eq!(identity["kv_cache"], "f16");
+    assert!(identity.get("cpu_prefill_tokens").is_none());
+    assert_eq!(receipt_names(), ("cpu-bundle-started.json", "cpu-bundle.json"));
+    Ok(())
 }
 
 #[test]

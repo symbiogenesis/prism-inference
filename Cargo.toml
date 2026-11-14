@@ -87,6 +87,11 @@ test = true
 required-features = ["cli", "parallel-rows"]
 
 [[example]]
+name = "cpu_candidate_check"
+test = true
+required-features = ["cli", "parallel-rows"]
+
+[[example]]
 name = "swift_sanity_check"
 test = true
 required-features = ["cli", "parallel-rows"]

@@ -179,7 +179,8 @@ pub(super) fn evaluate(
             continue;
         }
         let mut bytes = metadata.bytes;
-        for source in metadata.sources.into_iter().flatten() {
+        let sources = metadata.sources.clone();
+        for source in sources.into_iter().flatten() {
             bytes = bytes.wrapping_add(host.graph.tensor(source)?.bytes);
         }
         memory = memory.wrapping_add(bytes);

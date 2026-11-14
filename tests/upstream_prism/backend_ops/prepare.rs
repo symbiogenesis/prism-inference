@@ -258,6 +258,7 @@ fn gradients(host: &mut Production<'_, '_>, prepared: &mut Prepared, class: &str
         prepared.supported = false;
         return Ok(());
     }
+    let output_elements = metadata.elements;
     let order = host
         .graph
         .contexts
@@ -281,7 +282,7 @@ fn gradients(host: &mut Production<'_, '_>, prepared: &mut Prepared, class: &str
                 prepared.skip = Some(format!("{}->type != FP32", tensor.name));
                 return Ok(());
             }
-            parameters.push(tensor);
+            parameters.push(tensor.clone());
         }
     }
     if parameters.is_empty() {
@@ -294,7 +295,7 @@ fn gradients(host: &mut Production<'_, '_>, prepared: &mut Prepared, class: &str
         prepared.skip = Some("original large-gradient tensor skip".into());
         return Ok(());
     }
-    let output = if metadata.elements == 1 {
+    let output = if output_elements == 1 {
         output
     } else {
         let output = tensor(&host.graph.call(
@@ -382,9 +383,8 @@ fn gradients(host: &mut Production<'_, '_>, prepared: &mut Prepared, class: &str
         .ok_or_else(|| invalid("post-backward context missing"))?;
     for id in order {
         let tensor = host.graph.tensor(id)?;
-        if !supports(host, prepared.backend, &[id], true)?
-            || (tensor.flags & param_flag != 0 && tensor.kind != f32_kind)
-        {
+        let unsupported_parameter = tensor.flags & param_flag != 0 && tensor.kind != f32_kind;
+        if !supports(host, prepared.backend, &[id], true)? || unsupported_parameter {
             prepared.supported = false;
             prepared.skip = Some("post-backward operation/type not supported".into());
             return Ok(());

@@ -134,7 +134,7 @@ pub(super) fn capture(
     id: u32,
     purpose: &str,
 ) -> Result<(Tensor, PathBuf)> {
-    let tensor = host.graph.tensor(id)?;
+    let tensor = host.graph.tensor(id)?.clone();
     let path = host.inputs.name(&host.graph, purpose)?;
     host.graph.push(json!({"Op":"tensor-get","Tensor":id,"File":path,"FileOffset":0,"TensorOffset":0,"Bytes":tensor.bytes}));
     let _ = host.graph.flush()?;
@@ -167,8 +167,8 @@ fn metric(
             if truth(&prepared.fields, "ties")? {
                 host.assertions += 1;
                 let input = prepare::tensor(&field(&prepared.fields, "input")?)?;
-                let metadata = host.graph.tensor(input)?;
-                let (_, source_path) = capture(host, input, &format!("top-k-source-{ordinal}"))?;
+                let (metadata, source_path) =
+                    capture(host, input, &format!("top-k-source-{ordinal}"))?;
                 let mut source_bytes = vec![0_u8; usize::try_from(metadata.elements)? * 4];
                 let raw = fs::read(source_path)?;
                 let copied = usize::try_from(metadata.elements)?

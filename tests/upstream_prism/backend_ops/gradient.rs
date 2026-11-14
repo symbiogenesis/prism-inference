@@ -74,6 +74,7 @@ pub(super) fn evaluate(
         if metadata.flags & parameter_flag == 0 {
             continue;
         }
+        let metadata = metadata.clone();
         let count = usize::try_from(metadata.elements)?;
         let gradient = gradients
             .iter()

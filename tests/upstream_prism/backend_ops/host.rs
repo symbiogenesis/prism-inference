@@ -417,7 +417,8 @@ impl Host for Production<'_, '_> {
             "op_size" => {
                 let value = self.graph.tensor(tensor(at(arguments, 0)?)?)?;
                 let mut bytes = value.bytes;
-                for id in value.sources.into_iter().flatten() {
+                let sources = value.sources.clone();
+                for id in sources.into_iter().flatten() {
                     bytes += self.graph.tensor(id)?.bytes;
                 }
                 Value::Number(Number::U64(bytes))
@@ -465,13 +466,14 @@ impl Host for Production<'_, '_> {
             "src" => Value::array(
                 tensor
                     .sources
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|id| id.map_or(Value::Null, |id| Value::Handle(Handle::Tensor(id))))
                     .collect(),
             ),
             "type" => Value::Number(Number::I32(tensor.kind)),
             "op" => Value::Number(Number::I32(tensor.op)),
-            "name" => Value::Bytes(tensor.name.into_bytes()),
+            "name" => Value::Bytes(tensor.name.as_bytes().to_vec()),
             "op_params" => Value::TensorBytes {
                 tensor: *id,
                 field: name.into(),
@@ -501,7 +503,7 @@ impl Host for Production<'_, '_> {
                 json!({"NB":strides})
             }
             ("src", Some(index)) => {
-                let mut sources = tensor.sources;
+                let mut sources = tensor.sources.clone();
                 *sources
                     .get_mut(index)
                     .ok_or_else(|| invalid("source tensor source index exceeds slots"))? =

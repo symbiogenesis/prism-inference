@@ -232,7 +232,7 @@ impl Inputs {
         minimum: f32,
         maximum: f32,
     ) -> Result<()> {
-        let tensor = plan.tensor(id)?;
+        let tensor = plan.tensor(id)?.clone();
         let count = usize::try_from(tensor.elements)?;
         let values = self.fill_uniform(count, minimum, maximum)?;
         let kind = |name: &str| {
@@ -300,7 +300,7 @@ impl Inputs {
         minimum: f32,
         maximum: f32,
     ) -> Result<()> {
-        let tensor = plan.tensor(id)?;
+        let tensor = plan.tensor(id)?.clone();
         if program.constants["GGML_TYPE_F16"].as_i64() != Some(i64::from(tensor.kind)) {
             return Err(invalid("original KQ mask F16 assertion failed"));
         }
@@ -377,8 +377,9 @@ impl Inputs {
                 }
             }
         }
+        let bytes = tensor.bytes;
         let path = self.stage_floats(plan, &values, "lower-triangular")?;
-        Self::set_file(plan, id, &path, 0, tensor.bytes)
+        Self::set_file(plan, id, &path, 0, bytes)
     }
 }
 

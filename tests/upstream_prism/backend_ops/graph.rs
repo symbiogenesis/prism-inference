@@ -460,14 +460,16 @@ impl<'a> Plan<'a> {
         self.contexts_current = false;
     }
 
-    pub(super) fn tensor(&mut self, id: u32) -> Result<Tensor> {
-        if !self.tensors.contains_key(&id) {
-            self.push(json!({"Op":"tensor-snapshot","Tensor":id}));
-            let _ = self.flush()?;
+    // Lend cached metadata before the miss path mutates the plan. Callers keep
+    // an owned snapshot only when a later graph operation needs the same data.
+    pub(super) fn tensor(&mut self, id: u32) -> Result<&Tensor> {
+        if let Some(tensor) = self.tensors.get(&id) {
+            return Ok(tensor);
         }
+        self.push(json!({"Op":"tensor-snapshot","Tensor":id}));
+        let _ = self.flush()?;
         self.tensors
             .get(&id)
-            .cloned()
             .ok_or_else(|| invalid("source tensor handle is absent from production contexts"))
     }
 

@@ -6,6 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     path::PathBuf,
     process::ExitCode,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -141,73 +142,83 @@ fn write_readiness(session: &SwiftSession, output: &mut impl Write) -> Result<()
     Ok(())
 }
 
-fn serve(
+fn serve_request(
     session: &mut SwiftSession,
-    input: &mut impl BufRead,
+    output: &mut impl Write,
+    bytes: &[u8],
+    cancellation: &Cancellation,
+) -> Result<()> {
+    let Ok(request) = request::parse(bytes) else {
+        write_record(
+            output,
+            &json!({"type":"error","id":null,"error":"invalid_request"}),
+        )?;
+        return Ok(());
+    };
+    match request {
+        Request::Reset { id } => {
+            let success = session.reset().is_ok();
+            write_record(output, &json!({"type":"reset","id":id,"ready":success}))?;
+        }
+        Request::Count {
+            id,
+            messages,
+            max_tokens,
+        } => match session.prepare(&messages, max_tokens) {
+            Ok(prompt) => write_record(
+                output,
+                &json!({"type":"count","id":id,
+                    "prompt_tokens":prompt.prompt_tokens(),"reserved_output_tokens":max_tokens}),
+            )?,
+            Err(_) => write_record(
+                output,
+                &json!({"type":"error","id":id,"error":"rejected_input"}),
+            )?,
+        },
+        Request::Complete {
+            id,
+            messages,
+            max_tokens,
+            timeout_seconds,
+        } => {
+            let Some(deadline) = (1..=600)
+                .contains(&timeout_seconds)
+                .then(|| Instant::now().checked_add(Duration::from_secs(timeout_seconds)))
+                .flatten()
+            else {
+                write_record(
+                    output,
+                    &json!({"type":"error","id":id,"error":"invalid_request"}),
+                )?;
+                return Ok(());
+            };
+            let Ok(prompt) = session.prepare(&messages, max_tokens) else {
+                write_record(
+                    output,
+                    &json!({"type":"error","id":id,"error":"rejected_input"}),
+                )?;
+                return Ok(());
+            };
+            let mut delivery = Delivery::new(output, id);
+            let result = session.complete(&prompt, cancellation, deadline, |event| {
+                delivery.emit(&event)
+            });
+            delivery.finish(result.is_ok(), session.is_faulted())?;
+        }
+    }
+    Ok(())
+}
+
+fn serve_with_cancellation(
+    session: &mut SwiftSession,
+    rx: &mpsc::Receiver<Result<Vec<u8>>>,
+    cancellation: &Cancellation,
     output: &mut impl Write,
 ) -> Result<()> {
     write_readiness(session, output)?;
-    let mut bytes = Vec::new();
-    while frame(input, &mut bytes)? {
-        let Ok(request) = request::parse(&bytes) else {
-            write_record(
-                output,
-                &json!({"type":"error","id":null,"error":"invalid_request"}),
-            )?;
-            continue;
-        };
-        match request {
-            Request::Reset { id } => {
-                let success = session.reset().is_ok();
-                write_record(output, &json!({"type":"reset","id":id,"ready":success}))?;
-            }
-            Request::Count {
-                id,
-                messages,
-                max_tokens,
-            } => match session.prepare(&messages, max_tokens) {
-                Ok(prompt) => write_record(
-                    output,
-                    &json!({"type":"count","id":id,
-                        "prompt_tokens":prompt.prompt_tokens(),"reserved_output_tokens":max_tokens}),
-                )?,
-                Err(_) => write_record(
-                    output,
-                    &json!({"type":"error","id":id,"error":"rejected_input"}),
-                )?,
-            },
-            Request::Complete {
-                id,
-                messages,
-                max_tokens,
-                timeout_seconds,
-            } => {
-                let Some(deadline) = (1..=600)
-                    .contains(&timeout_seconds)
-                    .then(|| Instant::now().checked_add(Duration::from_secs(timeout_seconds)))
-                    .flatten()
-                else {
-                    write_record(
-                        output,
-                        &json!({"type":"error","id":id,"error":"invalid_request"}),
-                    )?;
-                    continue;
-                };
-                let Ok(prompt) = session.prepare(&messages, max_tokens) else {
-                    write_record(
-                        output,
-                        &json!({"type":"error","id":id,"error":"rejected_input"}),
-                    )?;
-                    continue;
-                };
-                let mut delivery = Delivery::new(output, id);
-                let result =
-                    session.complete(&prompt, &Cancellation::default(), deadline, |event| {
-                        delivery.emit(&event)
-                    });
-                delivery.finish(result.is_ok(), session.is_faulted())?;
-            }
-        }
+    while let Ok(frame_result) = rx.recv() {
+        let bytes = frame_result?;
+        serve_request(session, output, &bytes, cancellation)?;
     }
     Ok(())
 }
@@ -221,11 +232,41 @@ fn main() -> ExitCode {
         };
     }
     let result = load().and_then(|mut session| {
-        serve(
-            &mut session,
-            &mut BufReader::with_capacity(8192, io::stdin().lock()),
-            &mut io::stdout().lock(),
-        )
+        let cancellation = Cancellation::default();
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(1);
+        let reader_cancel = cancellation.clone();
+        let handle = std::thread::Builder::new()
+            .name("swift-stdin".to_owned())
+            .spawn(move || {
+                let mut input = BufReader::with_capacity(8192, io::stdin().lock());
+                let mut bytes = Vec::new();
+                loop {
+                    match frame(&mut input, &mut bytes) {
+                        Ok(true) => {
+                            let frame_bytes = std::mem::take(&mut bytes);
+                            if tx.send(Ok(frame_bytes)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(false) => {
+                            reader_cancel.cancel();
+                            break;
+                        }
+                        Err(err) => {
+                            reader_cancel.cancel();
+                            let _ = tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            })?;
+        let outcome =
+            serve_with_cancellation(&mut session, &rx, &cancellation, &mut io::stdout().lock());
+        drop(rx);
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        outcome
     });
     if result.is_ok() {
         ExitCode::SUCCESS

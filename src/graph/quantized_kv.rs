@@ -359,6 +359,55 @@ impl PackedCache {
         self.len = 0;
     }
 
+    pub(super) fn truncate_to(&mut self, position: usize) -> Result<()> {
+        if self.heads == 0
+            || self.row_bytes == 0
+            || self.page_bytes == 0
+            || !self.page_bytes.is_multiple_of(self.row_bytes)
+            || self.len > self.maximum
+            || !self.len.is_multiple_of(self.row_bytes)
+        {
+            return Err(invalid("malformed packed KV cache geometry"));
+        }
+        let tokens = self.len / self.row_bytes;
+        if position > tokens {
+            return Err(invalid(
+                "packed KV truncation position exceeds cached length",
+            ));
+        }
+        if position == tokens {
+            self.prepared.clear();
+            self.prepared_ready = false;
+            return Ok(());
+        }
+        let page_tokens = self.page_bytes / self.row_bytes;
+        let keep_pages = position / page_tokens;
+        let tail_tokens = position % page_tokens;
+        let tail_bytes = checked_product(&[tail_tokens, self.row_bytes])?;
+        if keep_pages < self.pages.len() {
+            if self.pages[keep_pages].len() < tail_bytes {
+                return Err(invalid("malformed packed KV page extent during truncation"));
+            }
+            if tail_bytes > self.tail.capacity() {
+                self.tail.try_reserve_exact(tail_bytes - self.tail.len())?;
+            }
+            if tail_bytes == 0 {
+                self.tail.clear();
+            } else {
+                self.tail.resize(tail_bytes, 0);
+                self.tail
+                    .copy_from_slice(&self.pages[keep_pages][..tail_bytes]);
+            }
+            self.pages.truncate(keep_pages);
+        } else {
+            self.tail.truncate(tail_bytes);
+        }
+        self.prepared.clear();
+        self.prepared_ready = false;
+        self.len = checked_product(&[position, self.row_bytes])?;
+        Ok(())
+    }
+
     pub(super) fn bytes(&self) -> usize {
         size_of::<Self>()
             + self.pages.capacity() * size_of::<Arc<Vec<u8>>>()

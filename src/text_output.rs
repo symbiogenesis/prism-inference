@@ -165,6 +165,15 @@ impl Utf8Output {
         if truncated { "\u{fffd}" } else { "" }
     }
 
+    /// Flushes any incomplete `UTF-8` suffix before a token or control boundary.
+    ///
+    /// Emits one Unicode replacement character when truncated lead bytes are
+    /// pending, resets the pending buffer, and otherwise returns an empty string.
+    #[must_use]
+    pub const fn flush_incomplete(&mut self) -> Cow<'static, str> {
+        Cow::Borrowed(self.finish())
+    }
+
     /// Discards provisional suffix bytes without producing display output.
     ///
     /// Use this when cancelling a request so its incomplete character cannot
@@ -286,6 +295,20 @@ mod tests {
         assert_eq!(bridged, "雨!");
         assert_eq!(decoder.pending_bytes(), b"");
         assert_eq!(decoder.finish(), "");
+        Ok(())
+    }
+
+    #[test]
+    fn flush_incomplete_emits_replacement_before_boundary() -> Result<()> {
+        let mut decoder = Utf8Output::new();
+        let lead = &"\u{1f980}".as_bytes()[..2];
+        assert_eq!(decoder.push_borrowed(lead)?.as_ref(), "");
+        assert_eq!(decoder.pending_bytes(), lead);
+
+        assert_eq!(decoder.flush_incomplete().as_ref(), "\u{fffd}");
+        assert_eq!(decoder.pending_bytes(), b"");
+        assert_eq!(decoder.flush_incomplete().as_ref(), "");
+        assert_eq!(decoder.push_borrowed(b"ok")?.as_ref(), "ok");
         Ok(())
     }
 }

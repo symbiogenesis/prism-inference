@@ -1,22 +1,38 @@
 //! Opt-in weight-sharing target verification with complete-prefix replay.
 
 use super::{
-    Arc, Decoder, FiniteLogits, Result, Runtime, Snapshot, SpeculativeStats, greedy_finite, invalid,
+    Arc, Decoder, FiniteLogits, Result, Runtime, Snapshot, SpeculativeStats, VerificationLimits,
+    VerifiedRound, greedy_finite, invalid,
 };
 
 impl<D: Decoder> Runtime<D> {
     pub(super) fn verify_batched_draft(
         &mut self,
         draft: &[u32],
+        limits: VerificationLimits<'_>,
         rollback: &Snapshot<D::Checkpoint>,
         check: &impl Fn() -> Result<()>,
     ) -> Result<(Vec<u32>, SpeculativeStats)> {
+        let allow_bonus = draft.len() < limits.max_new_tokens;
+        let max_advance = draft.len() + usize::from(allow_bonus);
         let mut committed = Vec::new();
-        committed.try_reserve_exact(draft.len() + 1)?;
-        self.tokens.try_reserve(draft.len() + 1)?;
+        committed.try_reserve_exact(max_advance)?;
+        let cap_before = self.tokens.capacity();
+        self.tokens.try_reserve(max_advance)?;
+        if self.tokens.capacity() > cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
         let mut rows = self.take_batch_rows(draft.len())?;
+        let mut row_caps_before = [0_usize; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
+        for (dst, row) in row_caps_before.iter_mut().zip(&rows) {
+            *dst = row.capacity();
+        }
         check()?;
         self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
+        self.record_batch_row_witness(&row_caps_before, &rows);
         check()?;
         // Decoder is public: independently validate every output before using
         // any row to accept tokens, including rows beyond a rejected prefix.
@@ -31,13 +47,7 @@ impl<D: Decoder> Runtime<D> {
             self.recycle_batch_rows(rows);
             return Err(invalid("batched decoder returned invalid logits"));
         }
-        let mut stats = SpeculativeStats {
-            draft_rounds: 1,
-            draft_tokens_proposed: draft.len(),
-            draft_tokens_accepted: 0,
-            target_evaluations: draft.len(),
-            rollback_restores: 0,
-        };
+        let mut stats = SpeculativeStats::default();
         for (index, &candidate) in draft.iter().enumerate() {
             check()?;
             let logits = if index == 0 {
@@ -46,7 +56,8 @@ impl<D: Decoder> Runtime<D> {
                 &rows[index - 1]
             };
             let expected = greedy_finite(FiniteLogits::from_validated(logits)?)?;
-            if candidate != expected {
+            let stopped = limits.stop_tokens.contains(&expected);
+            if stopped || candidate != expected {
                 // The batched graph contains the complete proposed suffix.
                 // Restore once, then replay only the accepted prefix before
                 // the correction. KV-only truncation cannot recover GDN/conv.
@@ -54,22 +65,32 @@ impl<D: Decoder> Runtime<D> {
                 self.faulted = true;
                 self.decoder.restore(&rollback.state)?;
                 self.faulted = false;
-                stats.rollback_restores = 1;
                 check()?;
                 for &accepted in &draft[..index] {
                     self.evaluate(accepted, check)?;
-                    stats.target_evaluations += 1;
                     committed.push(accepted);
                 }
-                self.evaluate(expected, check)?;
-                stats.target_evaluations += 1;
-                committed.push(expected);
+                if !stopped {
+                    self.evaluate(expected, check)?;
+                    committed.push(expected);
+                }
+                let replay_tokens = index + usize::from(!stopped);
+                stats.record_verified_round(VerifiedRound {
+                    proposed: draft.len(),
+                    accepted: index,
+                    verified: draft.len(),
+                    target_evaluations: draft.len() + replay_tokens,
+                    rolled_back: true,
+                    bonus_tokens: 0,
+                    correction_tokens: u64::from(!stopped),
+                    fallback_tokens: 0,
+                    replay_tokens,
+                });
                 return Ok((committed, stats));
             }
-            stats.draft_tokens_accepted += 1;
         }
         // All proposed state is already present. Publish its final distribution
-        // and advance precisely one bonus token from that distribution.
+        // and advance at most one bonus token when limits allow.
         self.tokens.extend_from_slice(draft);
         let final_row = rows
             .pop()
@@ -78,10 +99,26 @@ impl<D: Decoder> Runtime<D> {
         let previous_logits = std::mem::replace(&mut self.logits, Arc::new(final_row));
         self.recycle_logits(previous_logits);
         committed.extend_from_slice(draft);
-        let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
-        self.evaluate(bonus, check)?;
-        stats.target_evaluations += 1;
-        committed.push(bonus);
+        let mut bonus_emitted = 0_u64;
+        if allow_bonus {
+            let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
+            if !limits.stop_tokens.contains(&bonus) {
+                self.evaluate(bonus, check)?;
+                committed.push(bonus);
+                bonus_emitted = 1;
+            }
+        }
+        stats.record_verified_round(VerifiedRound {
+            proposed: draft.len(),
+            accepted: draft.len(),
+            verified: draft.len(),
+            target_evaluations: draft.len() + usize::from(bonus_emitted > 0),
+            rolled_back: false,
+            bonus_tokens: bonus_emitted,
+            correction_tokens: 0,
+            fallback_tokens: 0,
+            replay_tokens: 0,
+        });
         Ok((committed, stats))
     }
 }

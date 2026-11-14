@@ -239,7 +239,11 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
         cancellation.cancel();
     }
     // A following request cannot run until recovery has left the model thread.
-    worker.settled().await;
+    let settle_timeout = std::time::Duration::from_secs(10);
+    if !worker.settled_within(settle_timeout).await {
+        cancellation.cancel();
+        return Err(NativeBackendError::Deadline);
+    }
     result
 }
 

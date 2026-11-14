@@ -353,6 +353,145 @@ pub fn validate_prefill_capacity_with_kv(
     validate_context_capacity_with_kv(context_tokens, available, kv_cache)
 }
 
+/// Explicit breakdown of host process commit and external accelerator memory.
+///
+/// Windows Job-object commit covers pinned host weights, live and checkpointed
+/// state, logits/replay/tile scratch, and fixed runtime headroom; external
+/// accelerator allocations (`accelerator_external_bytes`) are separated so
+/// callers never equate host commit limits with total device footprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwiftExecutionMemoryLedger {
+    /// Pinned host model weights allowance.
+    pub host_weights_bytes: u64,
+    /// Live `F32` recurrent/convolution state across all layers.
+    pub live_recurrent_bytes: u64,
+    /// Live attention `KV` cache bytes for the configured context length.
+    pub live_kv_bytes: u64,
+    /// Retained and rollback checkpoint `F32` recurrent/convolution bytes.
+    pub checkpoint_recurrent_bytes: u64,
+    /// Retained and rollback checkpoint `KV` cache bytes.
+    pub checkpoint_kv_bytes: u64,
+    /// Bounded speculative-verification or step logits scratch bytes.
+    pub verification_logits_bytes: u64,
+    /// Context bookkeeping, attention score, and replay history scratch bytes.
+    pub replay_scratch_bytes: u64,
+    /// Explicit `CPU` tiled-prefill scratch allowance.
+    pub tile_scratch_bytes: u64,
+    /// External accelerator/GPU memory outside the host Job commit limit.
+    pub accelerator_external_bytes: u64,
+    /// Fixed codec/transform/allocator fragmentation and runtime headroom.
+    pub fragmentation_margin_bytes: u64,
+}
+
+impl SwiftExecutionMemoryLedger {
+    /// Constructs an itemized memory ledger for an immutable Swift profile.
+    ///
+    /// # Errors
+    /// Rejects invalid context/KV geometry and `u64` arithmetic overflow.
+    pub fn for_swift_profile(
+        context_tokens: usize,
+        kv_cache: KvCachePolicy,
+        cpu_prefill: Option<CpuPrefill>,
+        cpu_speculation: Option<CpuSpeculation>,
+        checkpoint_slots: usize,
+        accelerator_external_bytes: u64,
+    ) -> Result<Self> {
+        validate_context_capacity_with_kv(context_tokens, u64::MAX, kv_cache)?;
+        let context_u64 = u64::try_from(context_tokens)?;
+        let slots_u64 = u64::try_from(checkpoint_slots)?;
+        let host_weights_bytes = u64::try_from(MODEL_MEMORY_BYTES)?;
+        let live_recurrent_bytes = u64::try_from(RECURRENT_MEMORY_BYTES)?;
+        let live_kv_bytes = context_u64
+            .checked_mul(u64::try_from(kv_token_memory_bytes(kv_cache))?)
+            .ok_or_else(|| invalid("Swift ledger live KV overflow"))?;
+        let spec_checkpoint_bytes =
+            u64::try_from(cpu_speculation.map_or(0, CpuSpeculation::checkpoint_bytes))?;
+        let spec_recurrent_bytes = spec_checkpoint_bytes.min(live_recurrent_bytes);
+        let spec_kv_bytes = spec_checkpoint_bytes.saturating_sub(spec_recurrent_bytes);
+        let checkpoint_recurrent_bytes = slots_u64
+            .checked_mul(live_recurrent_bytes)
+            .and_then(|bytes| bytes.checked_add(spec_recurrent_bytes))
+            .ok_or_else(|| invalid("Swift ledger checkpoint recurrent overflow"))?;
+        let checkpoint_kv_bytes = slots_u64
+            .checked_mul(live_kv_bytes)
+            .and_then(|bytes| bytes.checked_add(spec_kv_bytes))
+            .ok_or_else(|| invalid("Swift ledger checkpoint KV overflow"))?;
+        let verification_logits_bytes = if let Some(speculation) = cpu_speculation {
+            u64::try_from(speculation.verification_scratch_bytes())?
+        } else {
+            u64::try_from(
+                swift::VOCAB_SIZE
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("Swift ledger logits scratch overflow"))?,
+            )?
+        };
+        let replay_scratch_bytes = context_u64
+            .checked_mul(96 + 128)
+            .ok_or_else(|| invalid("Swift ledger replay scratch overflow"))?;
+        let tile_scratch_bytes = u64::try_from(cpu_prefill.map_or(0, CpuPrefill::scratch_bytes))?;
+        let fixed_host_baseline = u64::try_from(MODEL_MEMORY_BYTES)?
+            .checked_add(u64::try_from(CHECKPOINT_MEMORY_BYTES)?)
+            .ok_or_else(|| invalid("Swift ledger baseline overflow"))?;
+        let fragmentation_margin_bytes =
+            NON_CONTEXT_MEMORY_BYTES.saturating_sub(fixed_host_baseline);
+        Ok(Self {
+            host_weights_bytes,
+            live_recurrent_bytes,
+            live_kv_bytes,
+            checkpoint_recurrent_bytes,
+            checkpoint_kv_bytes,
+            verification_logits_bytes,
+            replay_scratch_bytes,
+            tile_scratch_bytes,
+            accelerator_external_bytes,
+            fragmentation_margin_bytes,
+        })
+    }
+
+    /// Host commit total excluding `accelerator_external_bytes`.
+    ///
+    /// Returns `None` on `u64` overflow.
+    #[must_use]
+    pub const fn job_commit_total_bytes(&self) -> Option<u64> {
+        let Some(total) = self
+            .host_weights_bytes
+            .checked_add(self.live_recurrent_bytes)
+        else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.live_kv_bytes) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.checkpoint_recurrent_bytes) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.checkpoint_kv_bytes) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.verification_logits_bytes) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.replay_scratch_bytes) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.tile_scratch_bytes) else {
+            return None;
+        };
+        total.checked_add(self.fragmentation_margin_bytes)
+    }
+
+    /// Total estimated footprint including `accelerator_external_bytes`.
+    ///
+    /// Returns `None` on `u64` overflow.
+    #[must_use]
+    pub const fn total_with_external_bytes(&self) -> Option<u64> {
+        let Some(host_commit) = self.job_commit_total_bytes() else {
+            return None;
+        };
+        host_commit.checked_add(self.accelerator_external_bytes)
+    }
+}
+
 /// Largest complete displayed output retained or delivered by one request.
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -422,6 +561,7 @@ pub struct SwiftSession {
     seed: u32,
     delivery_fault: bool,
     prompt_reuse: PromptReuse,
+    last_speculative_stats: Option<SpeculativeStats>,
     receipt: LoadReceipt,
 }
 
@@ -776,6 +916,7 @@ impl SwiftSession {
             seed,
             delivery_fault: false,
             prompt_reuse: PromptReuse::Disabled,
+            last_speculative_stats: None,
             receipt,
         })
     }
@@ -915,6 +1056,7 @@ impl SwiftSession {
         if self.prompt_reuse != reuse {
             self.runtime.reset()?;
             self.prompt_reuse = reuse;
+            self.last_speculative_stats = None;
             self.runtime
                 .set_retain_prompt_end(reuse == PromptReuse::PromptEndAndLatest);
         }
@@ -925,6 +1067,37 @@ impl SwiftSession {
     #[must_use]
     pub const fn is_faulted(&self) -> bool {
         self.delivery_fault || self.runtime.is_faulted()
+    }
+
+    /// Speculative decoding counters recorded by the most recent speculative completion.
+    ///
+    /// Returns `None` after session load, reset, or non-speculative completion.
+    #[must_use]
+    pub const fn last_speculative_stats(&self) -> Option<&SpeculativeStats> {
+        self.last_speculative_stats.as_ref()
+    }
+
+    /// Itemized host process commit and external accelerator memory ledger.
+    ///
+    /// # Errors
+    /// Rejects invalid or overflowing capacity calculations.
+    pub fn execution_memory_ledger(
+        &self,
+        accelerator_external_bytes: u64,
+    ) -> Result<SwiftExecutionMemoryLedger> {
+        let checkpoint_slots = match self.prompt_reuse {
+            PromptReuse::Disabled => 1,
+            PromptReuse::Latest => 2,
+            PromptReuse::PromptEndAndLatest => 3,
+        };
+        SwiftExecutionMemoryLedger::for_swift_profile(
+            self.context_tokens(),
+            self.kv_cache,
+            self.cpu_prefill,
+            self.cpu_speculation,
+            checkpoint_slots,
+            accelerator_external_bytes,
+        )
     }
 
     /// Render and encode once, reserving the entire output allowance.
@@ -992,6 +1165,7 @@ impl SwiftSession {
     /// Failed reset keeps admission closed until a subsequent reset succeeds.
     pub fn reset(&mut self) -> Result<()> {
         self.delivery_fault = true;
+        self.last_speculative_stats = None;
         self.runtime.reset()?;
         self.sampler = SwiftSampler::new(self.seed)?;
         self.delivery_fault = false;
@@ -1058,6 +1232,7 @@ impl SwiftSession {
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<(Completion, SpeculativeStats)> {
         let deadline = deadline.into();
+        self.last_speculative_stats = None;
         suffix_config.validate()?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
@@ -1071,14 +1246,13 @@ impl SwiftSession {
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
         let consume = |token| {
-            crate::text_output::push_with(&mut display, self.vocabulary.piece(token)?, |piece| {
-                let text = piece.as_ref();
-                charge_output(&mut output_bytes, text.len())?;
-                if !text.is_empty() {
-                    emit(TextEvent::Delta(text))?;
-                }
-                Ok(())
-            })
+            emit_decoded_token(
+                &self.vocabulary,
+                &mut display,
+                &mut output_bytes,
+                token,
+                &mut emit,
+            )
         };
         let (completion, stats) = self.runtime.generate_speculative_until(
             &prompt.tokens,
@@ -1099,6 +1273,7 @@ impl SwiftSession {
         emit(TextEvent::Complete(completion))?;
         check_request(cancellation, deadline)?;
         self.delivery_fault = false;
+        self.last_speculative_stats = Some(stats);
         Ok((completion, stats))
     }
 
@@ -1115,6 +1290,7 @@ impl SwiftSession {
                 "runtime phase timings are unavailable for CPU speculation",
             ));
         }
+        self.last_speculative_stats = None;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
@@ -1129,28 +1305,28 @@ impl SwiftSession {
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
         let consume = |token| {
-            crate::text_output::push_with(&mut display, self.vocabulary.piece(token)?, |piece| {
-                let text = piece.as_ref();
-                charge_output(&mut output_bytes, text.len())?;
-                if !text.is_empty() {
-                    emit(TextEvent::Delta(text))?;
-                }
-                Ok(())
-            })
+            emit_decoded_token(
+                &self.vocabulary,
+                &mut display,
+                &mut output_bytes,
+                token,
+                &mut emit,
+            )
         };
+        let mut recorded_stats = None;
         let completion = if let Some(speculation) = self.cpu_speculation {
-            self.runtime
-                .generate_sampled_speculative_until(
-                    &prompt.tokens,
-                    &options,
-                    Prefill { block_tokens: 64 },
-                    speculation.suffix_config()?,
-                    cancellation,
-                    deadline,
-                    &mut self.sampler,
-                    consume,
-                )?
-                .0
+            let (completion, stats) = self.runtime.generate_sampled_speculative_until(
+                &prompt.tokens,
+                &options,
+                Prefill { block_tokens: 64 },
+                speculation.suffix_config()?,
+                cancellation,
+                deadline,
+                &mut self.sampler,
+                consume,
+            )?;
+            recorded_stats = Some(stats);
+            completion
         } else if self.prompt_reuse == PromptReuse::Disabled {
             self.runtime.generate_sampled_until_for_reset(
                 &prompt.tokens,
@@ -1194,8 +1370,33 @@ impl SwiftSession {
         emit(TextEvent::Complete(completion))?;
         check_request(cancellation, deadline)?;
         self.delivery_fault = false;
+        self.last_speculative_stats = recorded_stats;
         Ok(completion)
     }
+}
+
+fn emit_decoded_token(
+    vocabulary: &Vocabulary,
+    display: &mut Utf8Output,
+    output_bytes: &mut usize,
+    token: u32,
+    emit: &mut impl FnMut(TextEvent<'_>) -> Result<()>,
+) -> Result<()> {
+    if vocabulary.is_control(token)? {
+        let pending = display.flush_incomplete();
+        if !pending.is_empty() {
+            charge_output(output_bytes, pending.len())?;
+            emit(TextEvent::Delta(pending.as_ref()))?;
+        }
+    }
+    crate::text_output::push_with(display, vocabulary.piece(token)?, |piece| {
+        let text = piece.as_ref();
+        charge_output(output_bytes, text.len())?;
+        if !text.is_empty() {
+            emit(TextEvent::Delta(text))?;
+        }
+        Ok(())
+    })
 }
 
 fn validate_prompt_owner(owner: &Arc<()>, prompt: &PreparedChat) -> Result<()> {
@@ -1244,18 +1445,22 @@ fn check_request(cancellation: &Cancellation, deadline: Option<Instant>) -> Resu
 mod tests {
     use super::{
         CONTEXT_TOKEN_MEMORY_BYTES, CpuPrefill, CpuSpeculation, MAX_CONTEXT_TOKENS,
-        NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftSession,
-        context_token_memory_bytes, kv_token_memory_bytes, max_context_tokens,
-        selected_state_budget, state_limit_bytes, validate_adapter_scale,
-        validate_context_capacity, validate_context_capacity_with_kv, validate_execution_capacity,
-        validate_execution_capacity_with_kv, validate_prefill_capacity, validate_prompt_owner,
+        NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftExecutionMemoryLedger,
+        SwiftSession, TextEvent, context_token_memory_bytes, emit_decoded_token,
+        kv_token_memory_bytes, max_context_tokens, selected_state_budget, state_limit_bytes,
+        validate_adapter_scale, validate_context_capacity, validate_context_capacity_with_kv,
+        validate_execution_capacity, validate_execution_capacity_with_kv,
+        validate_prefill_capacity, validate_prompt_owner,
     };
     use crate::{
         Result,
-        graph::KvCachePolicy,
+        graph::{KvCachePolicy, MAX_STATE_BYTES},
         kernels::{MatvecBackend, RowParallelism},
         model::swift::Representation,
+        text_output::Utf8Output,
+        vocabulary::Vocabulary,
     };
+    use bonsai_gguf::Metadata;
     use std::{path::Path, sync::Arc};
 
     #[test]
@@ -1482,6 +1687,124 @@ mod tests {
         for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 2.01] {
             assert!(validate_adapter_scale(true, Some(scale)).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn execution_memory_ledger_separates_job_commit_from_external_bytes() -> Result<()> {
+        assert_eq!(
+            state_limit_bytes(KvCachePolicy::Rotated4FittedValues),
+            MAX_STATE_BYTES
+        );
+        let base = SwiftExecutionMemoryLedger::for_swift_profile(
+            8_192,
+            KvCachePolicy::Rotated4,
+            None,
+            None,
+            1,
+            0,
+        )?;
+        let external = 2_u64 * 1024 * 1024 * 1024;
+        let with_external = SwiftExecutionMemoryLedger::for_swift_profile(
+            8_192,
+            KvCachePolicy::Rotated4,
+            None,
+            None,
+            1,
+            external,
+        )?;
+        assert_eq!(
+            base.job_commit_total_bytes(),
+            with_external.job_commit_total_bytes()
+        );
+        assert_eq!(
+            with_external.total_with_external_bytes(),
+            base.job_commit_total_bytes()
+                .and_then(|bytes| bytes.checked_add(external))
+        );
+
+        let tile = CpuPrefill::new(16, 64 * 1024 * 1024)?;
+        let spec = CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES + 4096)?;
+        let expanded = SwiftExecutionMemoryLedger::for_swift_profile(
+            8_192,
+            KvCachePolicy::Rotated4,
+            Some(tile),
+            Some(spec),
+            3,
+            external,
+        )?;
+        assert_eq!(expanded.tile_scratch_bytes, 64 * 1024 * 1024);
+        assert_eq!(expanded.verification_logits_bytes, 16 * 1024 * 1024);
+        assert!(expanded.checkpoint_recurrent_bytes > base.checkpoint_recurrent_bytes);
+        assert!(expanded.checkpoint_kv_bytes > base.checkpoint_kv_bytes);
+        assert!(expanded.job_commit_total_bytes() > base.job_commit_total_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn control_token_boundary_flushes_incomplete_utf8_sequence() -> Result<()> {
+        let metadata = Metadata::from([
+            ("tokenizer.ggml.model".to_owned(), "gpt2".into()),
+            ("tokenizer.ggml.pre".to_owned(), "qwen35".into()),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                vec![
+                    "<0xF0>",
+                    "<0x9F>",
+                    "<|im_end|>",
+                    "<0xE9>",
+                    "<0x9B>",
+                    "<0xA8>",
+                ]
+                .into(),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_owned(),
+                vec![6_i32, 6, 3, 6, 6, 6].into(),
+            ),
+        ]);
+        let vocabulary = Vocabulary::from_metadata(&metadata, 6)?;
+
+        let mut bridged = Utf8Output::new();
+        let mut bridged_bytes = 0usize;
+        let mut bridged_chunks = Vec::new();
+        for token in [3_u32, 4, 5] {
+            emit_decoded_token(
+                &vocabulary,
+                &mut bridged,
+                &mut bridged_bytes,
+                token,
+                &mut |event| {
+                    if let TextEvent::Delta(chunk) = event {
+                        bridged_chunks.push(chunk.to_owned());
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        assert_eq!(bridged_chunks.concat(), "雨");
+        assert_eq!(bridged.pending_bytes(), b"");
+
+        let mut interrupted = Utf8Output::new();
+        let mut interrupted_bytes = 0usize;
+        let mut chunks = Vec::new();
+        for token in [0_u32, 1, 2] {
+            emit_decoded_token(
+                &vocabulary,
+                &mut interrupted,
+                &mut interrupted_bytes,
+                token,
+                &mut |event| {
+                    if let TextEvent::Delta(chunk) = event {
+                        chunks.push(chunk.to_owned());
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        assert_eq!(chunks, vec!["\u{fffd}".to_owned(), "<|im_end|>".to_owned()]);
+        assert_eq!(interrupted.pending_bytes(), b"");
+        assert_eq!(interrupted_bytes, "\u{fffd}<|im_end|>".len());
         Ok(())
     }
 }

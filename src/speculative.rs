@@ -98,6 +98,47 @@ pub struct SpeculativeStats {
     pub target_evaluations: usize,
     /// Number of transactional decoder checkpoint restores triggered by rejected block steps.
     pub rollback_restores: usize,
+    /// Total candidate draft positions verified across speculative rounds.
+    pub draft_tokens_verified: u64,
+    /// Count of rounds proposing a draft token at each block offset `0..MAX_SPECULATIVE_DRAFT_TOKENS`.
+    pub position_proposed: [u64; MAX_SPECULATIVE_DRAFT_TOKENS],
+    /// Count of rounds accepting the draft token at each block offset `0..MAX_SPECULATIVE_DRAFT_TOKENS`.
+    pub position_accepted: [u64; MAX_SPECULATIVE_DRAFT_TOKENS],
+    /// Histogram of accepted draft prefix lengths (`0..=MAX_SPECULATIVE_DRAFT_TOKENS`).
+    pub accepted_len_histogram: [u64; MAX_SPECULATIVE_DRAFT_TOKENS + 1],
+    /// Bonus tokens emitted after full-block draft acceptance.
+    pub bonus_tokens: u64,
+    /// Correction tokens emitted upon draft divergence.
+    pub correction_tokens: u64,
+    /// Single-token target evaluations emitted directly when no draft was proposed.
+    pub fallback_tokens: u64,
+    /// Number of accepted-prefix replay passes executed after batched rejection.
+    pub replay_steps: u64,
+    /// Total tokens replayed sequentially (`accepted_prefix + correction`) after batched rejection.
+    pub replay_tokens: u64,
+}
+
+/// Outcome recorded for one verified speculative round or unspeculated fallback step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerifiedRound {
+    /// Number of proposed draft tokens in this round (`0` for unspeculated fallback).
+    pub proposed: usize,
+    /// Number of proposed draft tokens accepted from index `0`.
+    pub accepted: usize,
+    /// Number of proposed draft positions inspected or batched-verified.
+    pub verified: usize,
+    /// Target forward evaluations executed during this round.
+    pub target_evaluations: usize,
+    /// Whether this round triggered rollback / divergence recovery.
+    pub rolled_back: bool,
+    /// Bonus tokens emitted after full acceptance (`0` or `1`).
+    pub bonus_tokens: u64,
+    /// Correction tokens emitted on divergence (`0` or `1`).
+    pub correction_tokens: u64,
+    /// Direct fallback tokens emitted when no draft proposal existed (`0` or `1`).
+    pub fallback_tokens: u64,
+    /// Total tokens replayed sequentially after batched rejection (`accepted + correction`).
+    pub replay_tokens: usize,
 }
 
 impl SpeculativeStats {
@@ -115,6 +156,152 @@ impl SpeculativeStats {
             (self.draft_tokens_accepted as f64) / (self.draft_tokens_proposed as f64)
         }
     }
+
+    /// Mean accepted draft tokens per non-empty speculative round (`0.0` when none entered).
+    #[must_use]
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "Diagnostic mean accepted length converts bounded token counts to f64."
+    )]
+    pub const fn mean_accepted_length(&self) -> f64 {
+        if self.draft_rounds == 0 {
+            0.0
+        } else {
+            (self.draft_tokens_accepted as f64) / (self.draft_rounds as f64)
+        }
+    }
+
+    /// Fraction of proposed tokens accepted at zero-based draft offset `position`,
+    /// or `None` when out of bounds or never proposed.
+    #[must_use]
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "Diagnostic per-position acceptance ratio converts bounded u64 counts to f64."
+    )]
+    pub const fn position_acceptance_rate(&self, position: usize) -> Option<f64> {
+        if position >= MAX_SPECULATIVE_DRAFT_TOKENS {
+            return None;
+        }
+        let proposed = self.position_proposed[position];
+        if proposed == 0 {
+            None
+        } else {
+            Some((self.position_accepted[position] as f64) / (proposed as f64))
+        }
+    }
+
+    /// Record one speculative verification round using core round counters.
+    pub fn record_round(
+        &mut self,
+        proposed: usize,
+        accepted: usize,
+        target_evaluations: usize,
+        rolled_back: bool,
+    ) {
+        self.record_verified_round(VerifiedRound {
+            proposed,
+            accepted,
+            verified: proposed,
+            target_evaluations,
+            rolled_back,
+            bonus_tokens: 0,
+            correction_tokens: 0,
+            fallback_tokens: 0,
+            replay_tokens: 0,
+        });
+    }
+
+    /// Record full per-position, bonus/correction/fallback, and replay telemetry for one round.
+    pub fn record_verified_round(&mut self, round: VerifiedRound) {
+        if round.proposed > 0 {
+            self.draft_rounds = self.draft_rounds.saturating_add(1);
+            self.draft_tokens_proposed = self.draft_tokens_proposed.saturating_add(round.proposed);
+            self.draft_tokens_accepted = self.draft_tokens_accepted.saturating_add(round.accepted);
+            let proposed_positions = round.proposed.min(MAX_SPECULATIVE_DRAFT_TOKENS);
+            let accepted_positions = round
+                .accepted
+                .min(proposed_positions)
+                .min(MAX_SPECULATIVE_DRAFT_TOKENS);
+            for slot in self.position_proposed.iter_mut().take(proposed_positions) {
+                *slot = slot.saturating_add(1);
+            }
+            for slot in self.position_accepted.iter_mut().take(accepted_positions) {
+                *slot = slot.saturating_add(1);
+            }
+            self.accepted_len_histogram[accepted_positions] =
+                self.accepted_len_histogram[accepted_positions].saturating_add(1);
+        }
+        self.target_evaluations = self
+            .target_evaluations
+            .saturating_add(round.target_evaluations);
+        if round.rolled_back {
+            self.rollback_restores = self.rollback_restores.saturating_add(1);
+        }
+        self.draft_tokens_verified = self
+            .draft_tokens_verified
+            .saturating_add(u64::try_from(round.verified).unwrap_or(u64::MAX));
+        self.bonus_tokens = self.bonus_tokens.saturating_add(round.bonus_tokens);
+        self.correction_tokens = self
+            .correction_tokens
+            .saturating_add(round.correction_tokens);
+        self.fallback_tokens = self.fallback_tokens.saturating_add(round.fallback_tokens);
+        if round.replay_tokens > 0 {
+            self.replay_steps = self.replay_steps.saturating_add(1);
+            self.replay_tokens = self
+                .replay_tokens
+                .saturating_add(u64::try_from(round.replay_tokens).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+/// Compute cumulative rejection complement `1.0 - prod_i (1.0 - r_i)` stably
+/// via `-sum_i(ln_1p(-r_i)).exp_m1()`.
+///
+/// # Errors
+/// Rejects any non-finite rejection probability or value outside `[0.0, 1.0]`.
+pub fn cumulative_rejection_complement(rejection_probs: &[f64]) -> Result<f64> {
+    let mut log_survival_sum = 0.0_f64;
+    for &prob in rejection_probs {
+        if !prob.is_finite() || !(0.0..=1.0).contains(&prob) {
+            return Err(invalid(
+                "cumulative rejection probabilities must be finite and within [0.0, 1.0]",
+            ));
+        }
+        log_survival_sum += (-prob).ln_1p();
+    }
+    Ok((-log_survival_sum.exp_m1()).clamp(0.0, 1.0))
+}
+
+/// Propose continuation tokens from prompt/history suffix lookup first,
+/// invoking the fallback drafter only when lookup finds no continuation.
+///
+/// # Errors
+/// Rejects invalid [`SuffixDraftConfig`] or errors from lookup or fallback drafting.
+pub fn propose_lookup_then_fallback<F>(
+    history: &[u32],
+    lookup_config: SuffixDraftConfig,
+    remaining_tokens: usize,
+    fallback: F,
+) -> Result<Vec<u32>>
+where
+    F: FnOnce(&[u32], usize) -> Result<Vec<u32>>,
+{
+    lookup_config.validate()?;
+    let limit = lookup_config.max_draft_tokens.min(remaining_tokens);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let lookup = SuffixDrafter::propose(history, lookup_config, limit)?;
+    if !lookup.is_empty() {
+        return Ok(lookup);
+    }
+    let mut secondary = fallback(history, limit)?;
+    if secondary.len() > limit {
+        secondary.truncate(limit);
+    }
+    Ok(secondary)
 }
 
 /// Zero-weight prompt and token-history suffix drafter (`SuffixDecoding`).
@@ -587,6 +774,9 @@ impl GdnVerifyTape {
         }
         let group = self.value_heads / self.key_heads;
         let head_stride = self.value_dim * self.key_dim;
+        let mut staged = Vec::new();
+        staged.try_reserve_exact(base_state.len())?;
+        staged.extend_from_slice(base_state);
         for v_head in 0..self.value_heads {
             let k_head = v_head / group;
             let mut inputs = [crate::kernels::pinned_gdn::ChunkInput {
@@ -605,14 +795,18 @@ impl GdnVerifyTape {
                     beta: step.betas[v_head],
                 };
             }
-            let state_head = &mut base_state[v_head * head_stride..(v_head + 1) * head_stride];
+            let state_head = &mut staged[v_head * head_stride..(v_head + 1) * head_stride];
             crate::kernels::pinned_gdn::step_head_tokens_in_place(
                 state_head,
                 self.value_dim,
                 self.key_dim,
                 &inputs[..accepted_steps],
             )?;
+            if !crate::kernels::is_finite_slice(state_head) {
+                return Err(invalid("nonfinite GDN verification tape replay state"));
+            }
         }
+        base_state.copy_from_slice(&staged);
         Ok(())
     }
 }
@@ -622,7 +816,8 @@ mod tests {
     use super::{
         DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, GdnVerifyTape,
         MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS, SpeculativeStats, SuffixDraftConfig,
-        SuffixDrafter, mtp_first_decode_fits, suffix_match_start, verify_stochastic_step,
+        SuffixDrafter, VerifiedRound, cumulative_rejection_complement, mtp_first_decode_fits,
+        propose_lookup_then_fallback, suffix_match_start, verify_stochastic_step,
     };
     use crate::Result;
 
@@ -910,9 +1105,146 @@ mod tests {
             draft_tokens_accepted: 3,
             target_evaluations: 5,
             rollback_restores: 1,
+            ..SpeculativeStats::default()
         };
         assert!((stats.acceptance_rate() - 0.75).abs() <= 1e-12);
+        assert!((stats.mean_accepted_length() - 1.5).abs() <= 1e-12);
         assert_eq!(SpeculativeStats::default().acceptance_rate(), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_stats_tracks_positions_histogram_and_outcomes() {
+        let mut stats = SpeculativeStats::default();
+        stats.record_round(3, 2, 4, true);
+        stats.record_verified_round(VerifiedRound {
+            proposed: 4,
+            accepted: 4,
+            verified: 4,
+            target_evaluations: 5,
+            rolled_back: false,
+            bonus_tokens: 1,
+            correction_tokens: 0,
+            fallback_tokens: 0,
+            replay_tokens: 0,
+        });
+        stats.record_verified_round(VerifiedRound {
+            proposed: 0,
+            accepted: 0,
+            verified: 0,
+            target_evaluations: 1,
+            rolled_back: false,
+            bonus_tokens: 0,
+            correction_tokens: 0,
+            fallback_tokens: 1,
+            replay_tokens: 0,
+        });
+        stats.record_verified_round(VerifiedRound {
+            proposed: 3,
+            accepted: 1,
+            verified: 3,
+            target_evaluations: 5,
+            rolled_back: true,
+            bonus_tokens: 0,
+            correction_tokens: 1,
+            fallback_tokens: 0,
+            replay_tokens: 2,
+        });
+        assert_eq!(stats.draft_rounds, 3);
+        assert_eq!(stats.draft_tokens_proposed, 10);
+        assert_eq!(stats.draft_tokens_accepted, 7);
+        assert_eq!(stats.draft_tokens_verified, 10);
+        assert_eq!(stats.target_evaluations, 15);
+        assert_eq!(stats.rollback_restores, 2);
+        assert_eq!(stats.bonus_tokens, 1);
+        assert_eq!(stats.correction_tokens, 1);
+        assert_eq!(stats.fallback_tokens, 1);
+        assert_eq!(stats.replay_steps, 1);
+        assert_eq!(stats.replay_tokens, 2);
+        assert_eq!(stats.position_proposed, [3, 3, 3, 1, 0, 0, 0, 0]);
+        assert_eq!(stats.position_accepted, [3, 2, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(stats.accepted_len_histogram, [0, 1, 1, 0, 1, 0, 0, 0, 0]);
+        assert!((stats.mean_accepted_length() - (7.0 / 3.0)).abs() <= 1e-12);
+        assert_eq!(
+            stats
+                .position_acceptance_rate(0)
+                .map(|rate| (rate - 1.0).abs() <= 1e-12),
+            Some(true)
+        );
+        assert_eq!(
+            stats
+                .position_acceptance_rate(1)
+                .map(|rate| (rate - (2.0 / 3.0)).abs() <= 1e-12),
+            Some(true)
+        );
+        assert_eq!(stats.position_acceptance_rate(4), None);
+        assert_eq!(stats.position_acceptance_rate(8), None);
+    }
+
+    #[test]
+    fn cumulative_rejection_complement_preserves_small_tail_precision() -> Result<()> {
+        assert_eq!(
+            cumulative_rejection_complement(&[])?.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            cumulative_rejection_complement(&[1.0])?.to_bits(),
+            1.0_f64.to_bits()
+        );
+        let two = cumulative_rejection_complement(&[0.5, 0.5])?;
+        assert!((two - 0.75).abs() <= 1e-12);
+
+        let tiny = 1e-12_f64;
+        let tiny_res = cumulative_rejection_complement(&[tiny, tiny])?;
+        assert!(2.0_f64.mul_add(-tiny, tiny_res).abs() <= 1e-22);
+
+        for invalid_prob in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(cumulative_rejection_complement(&[invalid_prob]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn propose_lookup_then_fallback_runs_lookup_before_secondary_drafter() -> Result<()> {
+        let config = SuffixDraftConfig::new(2, 8, 3)?;
+        let history_with_match = vec![10, 20, 30, 40, 10, 20];
+        let mut fallback_called = false;
+        let lookup = propose_lookup_then_fallback(&history_with_match, config, 3, |_, _| {
+            fallback_called = true;
+            Ok(vec![99, 98, 97])
+        })?;
+        assert!(!fallback_called);
+        assert_eq!(lookup, vec![30, 40, 10]);
+
+        let history_without_match = vec![1, 2, 3, 4];
+        let secondary =
+            propose_lookup_then_fallback(&history_without_match, config, 2, |_, limit| {
+                fallback_called = true;
+                assert_eq!(limit, 2);
+                Ok(vec![77, 88, 99])
+            })?;
+        assert!(fallback_called);
+        assert_eq!(secondary, vec![77, 88]);
+        Ok(())
+    }
+
+    #[test]
+    fn gdn_verify_tape_atomic_rollback_on_late_head_failure() -> Result<()> {
+        let key_heads = 1;
+        let value_heads = 2;
+        let key_dim = 4;
+        let value_dim = 4;
+        let head_stride = value_dim * key_dim;
+        let mut tape = GdnVerifyTape::new(key_heads, value_heads, key_dim, value_dim, 2)?;
+        tape.record_step(&[0.1; 4], &[0.2; 4], &[0.3; 8], &[0.9, 0.9], &[0.5, 0.5])?;
+        let mut state = vec![0.25_f32; value_heads * head_stride];
+        // Corrupt head 1 so head 0 computes finitely while head 1 fails finiteness.
+        state[head_stride] = f32::NAN;
+        let original = state.clone();
+        assert!(tape.replay_accepted_prefix(&mut state, 1).is_err());
+        for (actual, expected) in state.iter().zip(&original) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
         Ok(())
     }
 

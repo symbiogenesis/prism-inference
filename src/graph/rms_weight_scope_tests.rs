@@ -176,13 +176,13 @@ fn recurrent_rms_weight_scope_integrates_worker_heads_and_recovers_failed_layer_
                 let result = evaluation.recurrent_attention_state(
                     &layer,
                     &mut mixed,
-                    &gate,
+                    Some(&gate),
                     &beta,
                     &vec![0.0; geometry.ssm_values],
                     &history,
                     &previous,
                     &mut delta,
-                    &mut attended,
+                    Some(&mut attended),
                 );
                 if failure < 2 {
                     assert!(result.is_err());

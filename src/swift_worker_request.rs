@@ -103,8 +103,9 @@ fn messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Erro
         }
         fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<Self::Value, S::Error> {
             let mut messages = Vec::new();
+            let initial_cap = sequence.size_hint().unwrap_or(32).min(64).min(MAX_MESSAGES);
             messages
-                .try_reserve_exact(MAX_MESSAGES)
+                .try_reserve_exact(initial_cap)
                 .map_err(|_| de::Error::custom("Swift message allocation failed"))?;
             let mut supplied_bytes = 0usize;
             while let Some(message) = sequence.next_element::<TextMessage>()? {
@@ -131,4 +132,40 @@ fn messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Erro
         }
     }
     Ok(Value::Array(deserializer.deserialize_seq(MessagesVisitor)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_MESSAGES, Request, parse};
+
+    #[test]
+    fn parses_complete_request_with_bounded_reserve() -> Result<(), serde_json::Error> {
+        let mut framed = br#"{"op":"complete","id":7,"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"timeout_seconds":5}"#.to_vec();
+        framed.push(b'\n');
+        let parsed = parse(&framed)?;
+        assert!(matches!(
+            parsed,
+            Request::Complete {
+                id: 7,
+                max_tokens: 16,
+                timeout_seconds: 5,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_messages_exceeding_max_messages_bound() {
+        let mut frame = String::from(r#"{"op":"count","id":1,"messages":["#);
+        for index in 0..=MAX_MESSAGES {
+            if index != 0 {
+                frame.push(',');
+            }
+            frame.push_str(r#"{"role":"user","content":"m"}"#);
+        }
+        frame.push_str(r#"],"max_tokens":4}"#);
+        frame.push('\n');
+        assert!(parse(frame.as_bytes()).is_err());
+    }
 }

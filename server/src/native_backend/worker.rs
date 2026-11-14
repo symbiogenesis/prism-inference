@@ -26,6 +26,17 @@ pub(super) trait Engine: Send + 'static {
         Ok(ModelProfile::default())
     }
     fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError>;
+    fn prepare_until(
+        &self,
+        pending: PendingChat,
+        cancel: &Cancellation,
+        deadline: Option<Instant>,
+    ) -> Result<Self::Prepared, NativeBackendError> {
+        check_deadline_or_cancel(cancel, deadline)?;
+        let prepared = self.prepare(pending)?;
+        check_deadline_or_cancel(cancel, deadline)?;
+        Ok(prepared)
+    }
     fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]);
     fn complete(
         &mut self,
@@ -745,6 +756,17 @@ impl Worker {
         }
         self.cancellation = None;
     }
+
+    pub(super) async fn settled_within(&mut self, timeout: Duration) -> bool {
+        if tokio::time::timeout(timeout, self.settled()).await.is_ok() {
+            true
+        } else {
+            if let Some(cancel) = &self.cancellation {
+                cancel.cancel();
+            }
+            false
+        }
+    }
 }
 
 impl Drop for Worker {
@@ -795,7 +817,9 @@ impl<E: Engine> State<E> {
         pending: PendingChat,
     ) -> Result<(), NativeBackendError> {
         self.counted = None;
-        let prepared = self.engine.prepare(pending)?;
+        let prepared = self
+            .engine
+            .prepare_until(pending, &context.cancel, context.deadline)?;
         check(context)?;
         acknowledge(context, Output::Count(E::properties(&prepared).0))?;
         self.counted = Some(prepared);
@@ -846,17 +870,21 @@ impl<E: Engine> State<E> {
     }
 }
 
-fn check(context: &CommandContext) -> Result<(), NativeBackendError> {
-    if context.cancel.is_cancelled() {
+fn check_deadline_or_cancel(
+    cancel: &Cancellation,
+    deadline: Option<Instant>,
+) -> Result<(), NativeBackendError> {
+    if cancel.is_cancelled() {
         return Err(NativeBackendError::ClientAbandoned);
     }
-    if context
-        .deadline
-        .is_some_and(|deadline| Instant::now() >= deadline)
-    {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(NativeBackendError::Deadline);
     }
     Ok(())
+}
+
+fn check(context: &CommandContext) -> Result<(), NativeBackendError> {
+    check_deadline_or_cancel(&context.cancel, context.deadline)
 }
 
 fn acknowledge(context: &CommandContext, output: Output) -> Result<(), NativeBackendError> {
@@ -887,4 +915,149 @@ fn acknowledge(context: &CommandContext, output: Output) -> Result<(), NativeBac
         }
     }
     check(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Engine, Input, Worker};
+    use crate::{AuthorizedHead, PendingChat, native_backend::NativeBackendError};
+    use bonsai_prism_runtime::{
+        runtime::{Cancellation, Completion, Finish},
+        swift_session::TextEvent,
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    struct StubEngine {
+        release: Arc<AtomicBool>,
+        cancel_during_prepare: Option<Cancellation>,
+    }
+
+    impl Engine for StubEngine {
+        type Prepared = PendingChat;
+
+        fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
+            if let Some(cancel) = &self.cancel_during_prepare {
+                cancel.cancel();
+            }
+            Ok(pending)
+        }
+
+        fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]) {
+            (1, false, false, &prepared.body)
+        }
+
+        fn complete(
+            &mut self,
+            _prepared: &Self::Prepared,
+            _cancel: &Cancellation,
+            _deadline: Option<Instant>,
+            _emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+        ) -> bonsai_prism_runtime::Result<Completion> {
+            Ok(Completion {
+                prompt_tokens: 0,
+                reused_tokens: 0,
+                generated_tokens: 0,
+                finish: Finish::Length,
+            })
+        }
+
+        fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
+            while !self.release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(())
+        }
+    }
+
+    fn sample_pending() -> Result<PendingChat, String> {
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        AuthorizedHead { length: body.len() }
+            .prepare(body)
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    #[test]
+    fn prepare_until_enforces_cancellation_and_deadline() -> Result<(), String> {
+        let engine = StubEngine {
+            release: Arc::new(AtomicBool::new(true)),
+            cancel_during_prepare: None,
+        };
+        let cancel = Cancellation::default();
+        assert!(
+            engine
+                .prepare_until(sample_pending()?, &cancel, None)
+                .is_ok()
+        );
+
+        let expired = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        );
+        assert_eq!(
+            engine
+                .prepare_until(sample_pending()?, &cancel, expired)
+                .err(),
+            Some(NativeBackendError::Deadline)
+        );
+
+        cancel.cancel();
+        assert_eq!(
+            engine.prepare_until(sample_pending()?, &cancel, None).err(),
+            Some(NativeBackendError::ClientAbandoned)
+        );
+
+        let mid_cancel = Cancellation::default();
+        let cancelling_engine = StubEngine {
+            release: Arc::new(AtomicBool::new(true)),
+            cancel_during_prepare: Some(mid_cancel.clone()),
+        };
+        assert_eq!(
+            cancelling_engine
+                .prepare_until(sample_pending()?, &mid_cancel, None)
+                .err(),
+            Some(NativeBackendError::ClientAbandoned)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_settled_within_times_out_when_busy_and_completes_after_release() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let release = Arc::new(AtomicBool::new(false));
+            let mut worker = Worker::new(
+                StubEngine {
+                    release: release.clone(),
+                    cancel_during_prepare: None,
+                },
+                42,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+            assert!(worker.settled_within(Duration::from_millis(20)).await);
+
+            let cancel = Cancellation::default();
+            let _events = worker
+                .start(Input::Reset, cancel.clone(), None)
+                .map_err(|error| format!("{error:?}"))?;
+            assert!(!worker.settled_within(Duration::from_millis(15)).await);
+            assert!(cancel.is_cancelled());
+
+            release.store(true, Ordering::Release);
+            assert!(worker.settled_within(Duration::from_secs(2)).await);
+            Ok(())
+        })
+    }
 }

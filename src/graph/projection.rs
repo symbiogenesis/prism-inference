@@ -499,7 +499,7 @@ mod tests {
             position: 0,
             state_consistent: true,
             vocabulary: 2,
-            kv_cache_policy: super::KvCachePolicy::F16,
+            kv_cache_policy: super::super::KvCachePolicy::F16,
             narrow_last_layer: false,
             tiled_prefill: None,
             projection_executor: None,

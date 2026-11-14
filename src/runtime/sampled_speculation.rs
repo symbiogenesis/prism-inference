@@ -3,7 +3,7 @@
 use super::{
     Arc, Cancellation, Completion, Decoder, Finish, FiniteLogits, Generation, Instant,
     MAX_SPECULATIVE_DRAFT_TOKENS, Prefill, PromptEndCapture, Result, Runtime, Sampler, Snapshot,
-    SpeculativeStats, SuffixDraftConfig, SuffixDrafter, check_deadline, invalid,
+    SpeculativeStats, SuffixDraftConfig, SuffixDrafter, VerifiedRound, check_deadline, invalid,
 };
 
 struct SampledSuffixEffects<'a, S, E> {
@@ -15,6 +15,8 @@ struct SampledRound {
     emitted: usize,
     stopped: bool,
 }
+
+type PreparedSuffixBatch<C> = Option<(Snapshot<C>, Vec<Vec<f32>>)>;
 
 impl<D: Decoder> Runtime<D> {
     /// Generate sampled tokens with deterministic prompt/history suffix proposals.
@@ -311,9 +313,61 @@ impl<D: Decoder> Runtime<D> {
             return Ok(true);
         }
         self.evaluate(token, check)?;
-        stats.target_evaluations += 1;
+        stats.record_verified_round(VerifiedRound {
+            proposed: 0,
+            accepted: 0,
+            verified: 0,
+            target_evaluations: 1,
+            rolled_back: false,
+            bonus_tokens: 0,
+            correction_tokens: 0,
+            fallback_tokens: 1,
+            replay_tokens: 0,
+        });
         Self::sampled_suffix_emit(token, check, &mut effects.emit)?;
         Ok(false)
+    }
+
+    fn prepare_sampled_suffix_batch(
+        &mut self,
+        draft: &[u32],
+        check: &impl Fn() -> Result<()>,
+        reserved: usize,
+    ) -> Result<(usize, PreparedSuffixBatch<D::Checkpoint>)> {
+        if draft.len() < 2 || draft.len() > self.decoder.batched_evaluation_capacity() {
+            return Ok((0, None));
+        }
+        let cap_before = self.tokens.capacity();
+        self.tokens.try_reserve(draft.len())?;
+        if self.tokens.capacity() > cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
+        let checkpoint = self.capture_transient(reserved, check)?;
+        let mut rows = self.take_batch_rows(draft.len())?;
+        let mut row_caps_before = [0_usize; MAX_SPECULATIVE_DRAFT_TOKENS];
+        for (dst, row) in row_caps_before.iter_mut().zip(&rows) {
+            *dst = row.capacity();
+        }
+        check()?;
+        self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
+        self.record_batch_row_witness(&row_caps_before, &rows);
+        check()?;
+        if rows.len() != draft.len()
+            || rows.iter().any(|row| {
+                row.len() != self.decoder.vocab_size()
+                    || row.is_empty()
+                    || row.len() > 1_048_576
+                    || !crate::kernels::is_finite_slice(row)
+            })
+        {
+            self.recycle_snapshot(checkpoint);
+            self.recycle_batch_rows(rows);
+            return Err(invalid("batched decoder returned invalid logits"));
+        }
+        Ok((draft.len(), Some((checkpoint, rows))))
     }
 
     fn sampled_suffix_round(
@@ -325,46 +379,44 @@ impl<D: Decoder> Runtime<D> {
         stats: &mut SpeculativeStats,
         reserved: usize,
     ) -> Result<SampledRound> {
-        stats.draft_rounds += 1;
-        stats.draft_tokens_proposed += draft.len();
-        let mut batch =
-            if draft.len() >= 2 && draft.len() <= self.decoder.batched_evaluation_capacity() {
-                self.tokens.try_reserve(draft.len())?;
-                let checkpoint = self.capture_transient(reserved, check)?;
-                let mut rows = self.take_batch_rows(draft.len())?;
-                check()?;
-                self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
-                check()?;
-                if rows.len() != draft.len()
-                    || rows.iter().any(|row| {
-                        row.len() != self.decoder.vocab_size()
-                            || row.is_empty()
-                            || row.len() > 1_048_576
-                            || !crate::kernels::is_finite_slice(row)
-                    })
-                {
-                    self.recycle_snapshot(checkpoint);
-                    self.recycle_batch_rows(rows);
-                    return Err(invalid("batched decoder returned invalid logits"));
-                }
-                stats.target_evaluations += draft.len();
-                Some((checkpoint, rows))
-            } else {
-                None
-            };
+        let (batch_evals, mut batch) = self.prepare_sampled_suffix_batch(draft, check, reserved)?;
+        let mut sequential_evals = 0_usize;
+        let mut accepted = 0_usize;
+        let mut verified = usize::from(batch.is_some()) * draft.len();
         for (index, &candidate) in draft.iter().enumerate() {
+            if batch.is_none() {
+                verified += 1;
+            }
             let target = self.sampled_suffix_token(check, effects.sampler)?;
             let stopped = options.stop_tokens.contains(&target);
             if stopped || target != candidate {
-                if let Some((checkpoint, rows)) = batch {
+                let (rolled_back, mut replay_tokens) = if let Some((checkpoint, rows)) = batch {
                     self.recycle_batch_rows(rows);
-                    self.sampled_suffix_restore(checkpoint, &draft[..index], check, stats)?;
-                }
+                    self.sampled_suffix_restore(checkpoint, &draft[..index], check)?;
+                    sequential_evals += index;
+                    (true, index)
+                } else {
+                    (false, 0_usize)
+                };
                 if !stopped {
                     self.evaluate(target, check)?;
-                    stats.target_evaluations += 1;
+                    sequential_evals += 1;
+                    if rolled_back {
+                        replay_tokens += 1;
+                    }
                     Self::sampled_suffix_emit(target, check, &mut effects.emit)?;
                 }
+                stats.record_verified_round(VerifiedRound {
+                    proposed: draft.len(),
+                    accepted,
+                    verified,
+                    target_evaluations: batch_evals + sequential_evals,
+                    rolled_back,
+                    bonus_tokens: 0,
+                    correction_tokens: u64::from(!stopped),
+                    fallback_tokens: 0,
+                    replay_tokens,
+                });
                 return Ok(SampledRound {
                     emitted: index + usize::from(!stopped),
                     stopped,
@@ -377,15 +429,26 @@ impl<D: Decoder> Runtime<D> {
                 self.recycle_logits(previous_logits);
             } else {
                 self.evaluate(candidate, check)?;
-                stats.target_evaluations += 1;
+                sequential_evals += 1;
             }
-            stats.draft_tokens_accepted += 1;
+            accepted += 1;
             Self::sampled_suffix_emit(candidate, check, &mut effects.emit)?;
         }
         if let Some((checkpoint, rows)) = batch {
             self.recycle_snapshot(checkpoint);
             self.recycle_batch_rows(rows);
         }
+        stats.record_verified_round(VerifiedRound {
+            proposed: draft.len(),
+            accepted,
+            verified,
+            target_evaluations: batch_evals + sequential_evals,
+            rolled_back: false,
+            bonus_tokens: 0,
+            correction_tokens: 0,
+            fallback_tokens: 0,
+            replay_tokens: 0,
+        });
         Ok(SampledRound {
             emitted: draft.len(),
             stopped: false,
@@ -397,7 +460,6 @@ impl<D: Decoder> Runtime<D> {
         checkpoint: Snapshot<D::Checkpoint>,
         accepted: &[u32],
         check: &impl Fn() -> Result<()>,
-        stats: &mut SpeculativeStats,
     ) -> Result<()> {
         let Snapshot {
             state,
@@ -413,11 +475,9 @@ impl<D: Decoder> Runtime<D> {
         self.faulted = false;
         self.recycle_checkpoint(state);
         self.recycle_logits(previous_logits);
-        stats.rollback_restores += 1;
         check()?;
         for &token in accepted {
             self.evaluate(token, check)?;
-            stats.target_evaluations += 1;
         }
         Ok(())
     }

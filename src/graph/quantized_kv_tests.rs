@@ -1068,14 +1068,14 @@ fn packed_cache_copy_into_and_restore_in_place_preserve_capacities_and_reject_mi
         live_keys.append(&key);
     }
     let Some(live_packed) = live_keys.packed.as_ref() else {
-        return Err(crate::invalid("expected quantized packed cache"));
+        return Err(invalid("expected quantized packed cache"));
     };
     let mut scratch = live_packed.copy()?;
     let extra_key = input(width, 99)?;
     live_keys.prepare_append(&extra_key)?;
     live_keys.append(&extra_key);
     let Some(live_packed) = live_keys.packed.as_ref() else {
-        return Err(crate::invalid("expected quantized packed cache"));
+        return Err(invalid("expected quantized packed cache"));
     };
     let prev_tail_cap = scratch.tail.capacity();
     live_packed.copy_into(&mut scratch)?;
@@ -1091,7 +1091,7 @@ fn packed_cache_copy_into_and_restore_in_place_preserve_capacities_and_reject_mi
     }
     target_kv.prepare_append(&extra_key)?;
     let Some(target_packed) = target_kv.packed.as_mut() else {
-        return Err(crate::invalid("expected quantized packed cache"));
+        return Err(invalid("expected quantized packed cache"));
     };
     let preserved_prepared_cap = target_packed.prepared.capacity();
     let preserved_tail_cap = target_packed.tail.capacity();
@@ -1110,11 +1110,11 @@ fn packed_cache_copy_into_and_restore_in_place_preserve_capacities_and_reject_mi
     assert!(target_packed.restore_in_place(&wrong_version).is_err());
 
     let mut wrong_bits = scratch.copy()?;
-    wrong_bits.quantizer = Quantizer::new(Bits::Three, super::KEY_SEED);
+    wrong_bits.quantizer = Quantizer::new(Bits::Three, KEY_SEED);
     assert!(target_packed.restore_in_place(&wrong_bits).is_err());
 
     let mut wrong_seed = scratch.copy()?;
-    wrong_seed.quantizer = Quantizer::new(Bits::Four, super::KEY_SEED + 1);
+    wrong_seed.quantizer = Quantizer::new(Bits::Four, KEY_SEED + 1);
     assert!(target_packed.restore_in_place(&wrong_seed).is_err());
 
     let mut bad_partition = scratch.copy()?;
@@ -1127,14 +1127,14 @@ fn packed_cache_copy_into_and_restore_in_place_preserve_capacities_and_reject_mi
     live_keys.prepare_append(&full_key)?;
     live_keys.append(&full_key);
     let Some(full_packed) = live_keys.packed.as_ref() else {
-        return Err(crate::invalid("expected quantized packed cache"));
+        return Err(invalid("expected quantized packed cache"));
     };
     assert_eq!(full_packed.len, full_packed.maximum);
-    assert!(full_packed.tail.is_empty());
+    assert_eq!(full_packed.tail, Vec::<u8>::new());
     assert_eq!(full_packed.pages.len(), 2);
     target_packed.restore_in_place(full_packed)?;
     assert_eq!(target_packed.len, full_packed.maximum);
-    assert!(target_packed.tail.is_empty());
+    assert_eq!(target_packed.tail, Vec::<u8>::new());
 
     let mut unsealed_full = full_packed.copy()?;
     unsealed_full.tail.push(0);

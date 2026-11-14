@@ -3,9 +3,10 @@
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc;
 
 use bonsai_prism_runtime::special_input::SpecialInputPolicy;
 use bonsai_prism_runtime::token_worker::{WorkerConfig, serve};
@@ -131,6 +132,75 @@ fn load(
     Ok((session, startup.worker))
 }
 
+struct ChannelReader {
+    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    offset: usize,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChannelReader {
+    fn spawn_stdin() -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+        let handle = std::thread::Builder::new()
+            .name("token-stdin".to_owned())
+            .spawn(move || {
+                let mut stdin = io::stdin().lock();
+                let mut buf = [0_u8; 8192];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            if tx.send(Ok(buf[..read].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            rx,
+            current: Vec::new(),
+            offset: 0,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        while self.offset >= self.current.len() {
+            let Ok(chunk) = self.rx.recv() else {
+                return Ok(0);
+            };
+            self.current = chunk?;
+            self.offset = 0;
+        }
+        let available = &self.current[self.offset..];
+        let count = available.len().min(out.len());
+        out[..count].copy_from_slice(&available[..count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+impl Drop for ChannelReader {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.is_finished()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && arguments[0] == "--help" {
@@ -146,8 +216,14 @@ fn main() -> ExitCode {
             .write_all(b"token worker startup failed\n");
         return ExitCode::FAILURE;
     };
+    let Ok(stdin_reader) = ChannelReader::spawn_stdin() else {
+        let _ = io::stderr()
+            .lock()
+            .write_all(b"token worker transport failed\n");
+        return ExitCode::FAILURE;
+    };
     // An explicit small read buffer is independent of the admitted frame bound.
-    let mut input = BufReader::with_capacity(8192, io::stdin().lock());
+    let mut input = BufReader::with_capacity(8192, stdin_reader);
     let mut output = io::stdout().lock();
     if serve(&session, config, &mut input, &mut output).is_ok() {
         ExitCode::SUCCESS

@@ -171,6 +171,18 @@ impl TiledPrefill {
             statistics: TiledPrefillStatistics::default(),
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn poison_gate_and_attended(&mut self, width: usize) {
+        for slot in &mut self.attended {
+            slot.resize(width, f32::NAN);
+            slot.fill(f32::NAN);
+        }
+        for slot in &mut self.recurrent_gate {
+            slot.resize(width, f32::NAN);
+            slot.fill(f32::NAN);
+        }
+    }
 }
 
 impl Qwen35 {

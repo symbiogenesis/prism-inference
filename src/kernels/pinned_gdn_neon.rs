@@ -374,7 +374,6 @@ pub(super) fn decay_and_dot_from(
 /// The parent checks lengths; every safe load/store receives exactly four lanes.
 /// A nonfinite vector is replayed in scalar lane order before any vector store,
 /// preserving the original finite-prefix mutation and untouched failing lane.
-#[cfg(test)]
 #[inline]
 pub(super) fn add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Option<Result<()>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
@@ -393,7 +392,6 @@ pub(super) fn update_and_dot(
     Some(update_and_dot_with_neon(neon, target, key, scale, query))
 }
 
-#[cfg(test)]
 #[inline]
 #[expect(
     clippy::suboptimal_flops,

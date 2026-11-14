@@ -1293,6 +1293,64 @@ impl KvCache {
         self.len = 0;
     }
 
+    #[allow(
+        dead_code,
+        reason = "Pure-KV truncation helper for attention-only rollback and boundary tests."
+    )]
+    fn truncate_to(&mut self, position: usize) -> Result<()> {
+        if self.width == 0
+            || self.page_elements == 0
+            || !self.page_elements.is_multiple_of(self.width)
+            || self.len > self.maximum
+            || !self.len.is_multiple_of(self.width)
+        {
+            return Err(invalid("malformed KV cache geometry"));
+        }
+        let tokens = self.len / self.width;
+        if position > tokens {
+            return Err(invalid(
+                "KV cache truncation position exceeds cached length",
+            ));
+        }
+        let next_len = checked_product(&[position, self.width])?;
+        if let Some(packed) = &mut self.packed {
+            if !self.pages.is_empty() || !self.tail.is_empty() {
+                return Err(invalid("quantized KV cache must not store F16 buffers"));
+            }
+            packed.truncate_to(position)?;
+            self.len = next_len;
+            return Ok(());
+        }
+        if position == tokens {
+            return Ok(());
+        }
+        let page_tokens = self.page_elements / self.width;
+        let keep_pages = position / page_tokens;
+        let tail_tokens = position % page_tokens;
+        let tail_elements = checked_product(&[tail_tokens, self.width])?;
+        if keep_pages < self.pages.len() {
+            if self.pages[keep_pages].len() < tail_elements {
+                return Err(invalid("malformed KV page extent during truncation"));
+            }
+            if tail_elements > self.tail.capacity() {
+                self.tail
+                    .try_reserve_exact(tail_elements - self.tail.len())?;
+            }
+            if tail_elements == 0 {
+                self.tail.clear();
+            } else {
+                self.tail.resize(tail_elements, 0);
+                self.tail
+                    .copy_from_slice(&self.pages[keep_pages][..tail_elements]);
+            }
+            self.pages.truncate(keep_pages);
+        } else {
+            self.tail.truncate(tail_elements);
+        }
+        self.len = next_len;
+        Ok(())
+    }
+
     fn bytes(&self) -> usize {
         self.pages.capacity() * size_of::<Arc<Vec<u16>>>()
             + self.tail.capacity() * size_of::<u16>()
@@ -5363,6 +5421,7 @@ fn restore_state_in_place(
 /// payloads have fixed geometry and restore into their existing allocations;
 /// copying a complete replacement would transiently retain another full set of
 /// convolution and GDN buffers while live state and checkpoints coexist.
+#[cfg(test)]
 fn restore_state(
     states: &mut [LayerState],
     checkpoint: &[LayerState],
@@ -5486,7 +5545,6 @@ fn sigmoid(value: f32) -> f32 {
 }
 
 #[expect(
-    clippy::float_cmp,
     clippy::imprecise_flops,
     reason = "Guard exact zero ssm_a before log1p/exp product to avoid 0.0 * inf = NaN while matching pinned scalar binary32 softplus."
 )]
@@ -7106,23 +7164,23 @@ mod tests {
         source.copy_into(&mut recycled)?;
         assert_eq!(recycled.len, source.len);
         assert!(recycled.tail.capacity() >= prev_tail_cap);
-        assert!(std::sync::Arc::ptr_eq(&source.pages[0], &recycled.pages[0]));
+        assert!(Arc::ptr_eq(&source.pages[0], &recycled.pages[0]));
         assert!(
             source
                 .tokens()
-                .map(|row| row.to_vec())
-                .eq(recycled.tokens().map(|row| row.to_vec()))
+                .map(<[u16]>::to_vec)
+                .eq(recycled.tokens().map(<[u16]>::to_vec))
         );
 
         let mut live = KvCache::new(2, 3 * KV_PAGE_TOKENS)?;
         live.reserve_append()?;
         live.append(&[-1.0, -2.0]);
         live.restore_in_place(&recycled)?;
-        assert!(std::sync::Arc::ptr_eq(&live.pages[0], &recycled.pages[0]));
+        assert!(Arc::ptr_eq(&live.pages[0], &recycled.pages[0]));
         assert!(
             live.tokens()
-                .map(|row| row.to_vec())
-                .eq(source.tokens().map(|row| row.to_vec()))
+                .map(<[u16]>::to_vec)
+                .eq(source.tokens().map(<[u16]>::to_vec))
         );
 
         let live_states = restore_fixture()?;
@@ -7169,7 +7227,10 @@ mod tests {
 
         use bonsai_gguf::MetadataValue;
 
-        use super::super::{LayerState, Qwen35, recurrent_decay};
+        use super::super::{
+            KV_PAGE_TOKENS, KvCache, KvCachePolicy, LayerState, Qwen35, recurrent_decay,
+        };
+        use crate::kv_quant::HEAD_DIM;
         use crate::model::{Model, Tensor};
         use crate::{Decoder, Result, invalid};
 
@@ -7187,8 +7248,8 @@ mod tests {
             }
         }
 
-        fn recurrent_fixture(ssm_a: f32) -> Model {
-            let metadata = BTreeMap::from([
+        fn recurrent_metadata() -> BTreeMap<String, MetadataValue> {
+            BTreeMap::from([
                 (
                     "general.architecture".to_owned(),
                     MetadataValue::from("qwen35"),
@@ -7266,7 +7327,11 @@ mod tests {
                     "qwen35.attention.recurrent_layers".to_owned(),
                     MetadataValue::from(vec![true]),
                 ),
-            ]);
+            ])
+        }
+
+        fn recurrent_fixture(ssm_a: f32) -> Model {
+            let metadata = recurrent_metadata();
             let mut tensors = BTreeMap::new();
             let mut insert = |name: &str, dimensions: &[usize], values: &[f32]| {
                 tensors.insert(name.to_owned(), weight(name, dimensions, values));
@@ -7359,9 +7424,8 @@ mod tests {
             let scratch = base.tiled_prefill_scratch_bytes(8)?;
             let mut decoder = base.with_tiled_prefill(8, scratch)?;
             let clean_base = Qwen35::new(recurrent_fixture(-0.5), 8)?;
-            let mut clean =
-                clean_base.with_tiled_prefill(8, clean_base.tiled_prefill_scratch_bytes(8)?)?;
-            let checkpoint0 = clean.checkpoint()?;
+            let clean_scratch = clean_base.tiled_prefill_scratch_bytes(8)?;
+            let mut clean = clean_base.with_tiled_prefill(8, clean_scratch)?;
 
             // 1. Fail mid-tile on the very first tile (`position == 0`).
             let checks = Cell::new(0_usize);
@@ -7379,7 +7443,7 @@ mod tests {
             assert!(decoder.evaluate(0).is_err());
             assert!(decoder.ingest_block(&[0], &|| Ok(())).is_err());
             assert!(decoder.checkpoint().is_err());
-            let mut recycled = checkpoint0.clone();
+            let mut recycled = clean.checkpoint()?;
             assert!(decoder.checkpoint_into(&mut recycled).is_err());
 
             // Explicit reset must clear layer state even though position remained 0.
@@ -7423,17 +7487,69 @@ mod tests {
             let mut tiled_narrow = tiled_base.with_tiled_prefill(8, scratch)?;
             tiled_narrow.narrow_last_layer = true;
             if let Some(tile) = tiled_narrow.tiled_prefill.as_mut() {
-                for slot in &mut tile.attended {
-                    slot.resize(2, f32::NAN);
-                    slot.fill(f32::NAN);
-                }
-                for slot in &mut tile.recurrent_gate {
-                    slot.resize(2, f32::NAN);
-                    slot.fill(f32::NAN);
-                }
+                tile.poison_gate_and_attended(2);
             }
             tiled_narrow.ingest_block(&[0, 1], &|| Ok(()))?;
             assert_recurrent_states_bit_eq(&full.state, &tiled_narrow.state)?;
+            Ok(())
+        }
+
+        #[test]
+        fn kv_cache_truncate_to_restores_exact_page_and_tail_boundaries() -> Result<()> {
+            let width = HEAD_DIM;
+            let context = KV_PAGE_TOKENS * 2 + 5;
+            let mut f16_cache = KvCache::new(width, context)?;
+            let mut packed_cache =
+                KvCache::with_policy(width, context, KvCachePolicy::Rotated4, true, true)?;
+            let total_tokens = KV_PAGE_TOKENS + 3;
+            let mut expected_rows = Vec::new();
+            for step in 0..total_tokens {
+                let row: Vec<f32> = (0..width)
+                    .map(|idx| {
+                        #[expect(
+                            clippy::as_conversions,
+                            clippy::cast_precision_loss,
+                            reason = "Bounded test fixture indices convert cleanly to f32."
+                        )]
+                        let value = ((step * 17 + idx) as f32) * 0.01;
+                        value
+                    })
+                    .collect();
+                f16_cache.prepare_append(&row)?;
+                f16_cache.append(&row);
+                let encoded = f16_cache
+                    .tokens()
+                    .last()
+                    .ok_or_else(|| invalid("missing appended KV row"))?
+                    .to_vec();
+                expected_rows.push(encoded);
+                packed_cache.prepare_append(&row)?;
+                packed_cache.append(&row);
+            }
+
+            // Out-of-bounds truncation rejects without mutating cached length.
+            assert!(f16_cache.truncate_to(total_tokens + 1).is_err());
+            assert!(packed_cache.truncate_to(total_tokens + 1).is_err());
+            assert_eq!(f16_cache.len / width, total_tokens);
+            assert_eq!(packed_cache.len / width, total_tokens);
+
+            // Truncating across the page boundary (67 -> 64 -> 63 -> 0) restores valid partitions.
+            for target in [KV_PAGE_TOKENS, KV_PAGE_TOKENS - 1, 0] {
+                f16_cache.truncate_to(target)?;
+                packed_cache.truncate_to(target)?;
+                assert_eq!(f16_cache.len / width, target);
+                assert_eq!(packed_cache.len / width, target);
+                assert_eq!(f16_cache.tokens().count(), target);
+                for (actual, expected) in f16_cache.tokens().zip(&expected_rows[..target]) {
+                    assert_eq!(actual, expected.as_slice());
+                }
+                assert!(f16_cache.validate_restore(&f16_cache, Some(target)).is_ok());
+                assert!(
+                    packed_cache
+                        .validate_restore(&packed_cache, Some(target))
+                        .is_ok()
+                );
+            }
             Ok(())
         }
     }

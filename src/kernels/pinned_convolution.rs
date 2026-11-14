@@ -1857,15 +1857,24 @@ mod tests {
             let width = 4;
             let taps = width - 1;
             let history_init: Vec<f32> = (0..channels * taps)
-                .map(|index| Ok(f32::from(u8::try_from((index % 11) + 1)?) * 0.0625 - 0.375))
+                .map(|index| {
+                    let sample = f32::from(u8::try_from((index % 11) + 1)?);
+                    Ok(sample.mul_add(0.0625, -0.375))
+                })
                 .collect::<Result<_>>()?;
             let coefficients: Vec<f32> = (0..channels * width)
-                .map(|index| Ok(f32::from(u8::try_from((index % 7) + 1)?) * 0.125 - 0.5))
+                .map(|index| {
+                    let sample = f32::from(u8::try_from((index % 7) + 1)?);
+                    Ok(sample.mul_add(0.125, -0.5))
+                })
                 .collect::<Result<_>>()?;
 
             for steps in [1, 2, 3, 5, 9] {
                 let raw_tokens: Vec<f32> = (0..steps * channels)
-                    .map(|index| Ok(f32::from(u8::try_from((index % 17) + 1)?) * 0.125 - 1.0))
+                    .map(|index| {
+                        let sample = f32::from(u8::try_from((index % 17) + 1)?);
+                        Ok(sample.mul_add(0.125, -1.0))
+                    })
                     .collect::<Result<_>>()?;
 
                 let mut seq_history = history_init.clone();

@@ -5,6 +5,7 @@ use crate::{
     sampling::{FiniteLogits, Greedy, Sampler},
     speculative::{
         MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixDrafter,
+        VerifiedRound,
     },
 };
 use std::sync::{
@@ -243,6 +244,26 @@ impl HybridCheckpointBoundary {
     }
 }
 
+/// Hard output bounds for one bounded speculative draft verification call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerificationLimits<'a> {
+    /// Maximum new tokens that may be committed during this verification call.
+    pub max_new_tokens: usize,
+    /// Exact stop tokens (such as `EOS` or turn-end tokens) that halt emission immediately.
+    pub stop_tokens: &'a [u32],
+}
+
+/// Witness counters for buffer reallocations and reused scratch preparations in [`Runtime`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReallocationWitness {
+    /// Reservations or buffer allocations that increased element capacity (`new_cap > old_cap`).
+    pub growth_reallocations: u64,
+    /// Detached buffer rebuilds matching prior capacity when no recycled slot was free.
+    pub same_size_reallocations: u64,
+    /// Decode steps, batch rows, or checkpoints that reused an existing buffer capacity.
+    pub reused_preparations: u64,
+}
+
 /// Single-owner native conversation with rollback on cancellation or failure.
 ///
 /// Edited prompts reuse only an exact saved token prefix. Recurrent state is
@@ -264,6 +285,7 @@ pub struct Runtime<D: Decoder> {
     retain_prompt_end: bool,
     recycled_checkpoints: Vec<D::Checkpoint>,
     batch_logits: Vec<Vec<f32>>,
+    reallocation_witness: ReallocationWitness,
     faulted: bool,
 }
 
@@ -396,8 +418,15 @@ impl<D: Decoder> Runtime<D> {
             retain_prompt_end: false,
             recycled_checkpoints,
             batch_logits,
+            reallocation_witness: ReallocationWitness::default(),
             faulted: false,
         })
+    }
+
+    /// Runtime reallocation and recycled-scratch preparation witnesses.
+    #[must_use]
+    pub const fn reallocation_witness(&self) -> ReallocationWitness {
+        self.reallocation_witness
     }
 
     /// Committed prompt plus generated tokens; excludes sampled stop tokens.
@@ -434,7 +463,8 @@ impl<D: Decoder> Runtime<D> {
     pub fn set_retain_prompt_end(&mut self, retain: bool) {
         self.retain_prompt_end = retain;
         if !retain {
-            self.recycle_optional_snapshot(self.prompt_end_checkpoint.take());
+            let previous = self.prompt_end_checkpoint.take();
+            self.recycle_optional_snapshot(previous);
         }
     }
 
@@ -1023,9 +1053,18 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         let state = if let Some(mut recycled) = self.recycled_checkpoints.pop() {
             self.decoder.checkpoint_into(&mut recycled)?;
+            self.reallocation_witness.reused_preparations = self
+                .reallocation_witness
+                .reused_preparations
+                .saturating_add(1);
             recycled
         } else {
-            self.decoder.checkpoint()?
+            let state = self.decoder.checkpoint()?;
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+            state
         };
         Ok(Snapshot {
             state,
@@ -1178,6 +1217,24 @@ impl<D: Decoder> Runtime<D> {
         }
     }
 
+    fn record_batch_row_witness(&mut self, before_caps: &[usize], rows: &[Vec<f32>]) {
+        for (idx, row) in rows.iter().enumerate() {
+            let before = before_caps.get(idx).copied().unwrap_or(0);
+            let after = row.capacity();
+            if after > before {
+                self.reallocation_witness.growth_reallocations = self
+                    .reallocation_witness
+                    .growth_reallocations
+                    .saturating_add(1);
+            } else if after > 0 {
+                self.reallocation_witness.reused_preparations = self
+                    .reallocation_witness
+                    .reused_preparations
+                    .saturating_add(1);
+            }
+        }
+    }
+
     fn prepare(&mut self, prompt: &[u32], check: &impl Fn() -> Result<()>) -> Result<usize> {
         enum CandidateSlot {
             Prefix(usize),
@@ -1215,8 +1272,15 @@ impl<D: Decoder> Runtime<D> {
             None => None,
         };
         if let Some(snapshot) = snapshot {
+            let tokens_cap_before = self.tokens.capacity();
             self.tokens
                 .try_reserve_exact(snapshot.tokens.len().saturating_sub(self.tokens.len()))?;
+            if self.tokens.capacity() > tokens_cap_before {
+                self.reallocation_witness.growth_reallocations = self
+                    .reallocation_witness
+                    .growth_reallocations
+                    .saturating_add(1);
+            }
             check()?;
             self.decoder.restore(&snapshot.state)?;
             check()?;
@@ -1238,8 +1302,19 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         // Reserve before mutating decoder state; rollback is still available if
         // a decoder allocation or arithmetic operation subsequently fails.
+        let tokens_cap_before = self.tokens.capacity();
         self.tokens.try_reserve(1)?;
+        if self.tokens.capacity() > tokens_cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
+        let shared = Arc::strong_count(&self.logits) > 1;
+        let reused_from_pool = shared && !self.batch_logits.is_empty();
+        let prev_logits_cap = self.logits.capacity();
         let output = mutable_logits_with_scratch(&mut self.logits, &mut self.batch_logits);
+        let output_cap_before = output.capacity();
         output.clear();
         check()?;
         let result = self
@@ -1257,6 +1332,24 @@ impl<D: Decoder> Runtime<D> {
                 }
                 check()
             });
+        let output_cap_after = output.capacity();
+        if shared && !reused_from_pool && prev_logits_cap > 0 && output_cap_after == prev_logits_cap
+        {
+            self.reallocation_witness.same_size_reallocations = self
+                .reallocation_witness
+                .same_size_reallocations
+                .saturating_add(1);
+        } else if output_cap_after > output_cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        } else if output_cap_after > 0 {
+            self.reallocation_witness.reused_preparations = self
+                .reallocation_witness
+                .reused_preparations
+                .saturating_add(1);
+        }
         if let Err(error) = result {
             output.clear();
             return Err(error);
@@ -1267,7 +1360,14 @@ impl<D: Decoder> Runtime<D> {
 
     fn ingest_block(&mut self, tokens: &[u32], check: &impl Fn() -> Result<()>) -> Result<()> {
         check()?;
+        let tokens_cap_before = self.tokens.capacity();
         self.tokens.try_reserve(tokens.len())?;
+        if self.tokens.capacity() > tokens_cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
         // Preserve the reusable allocation, but invalidate logits for the old
         // prefix before advancing state without producing a new distribution.
         mutable_logits(&mut self.logits).clear();
@@ -1431,6 +1531,24 @@ impl<D: Decoder> Runtime<D> {
         )
     }
 
+    /// Verify one bounded block of draft continuation tokens against the target decoder.
+    ///
+    /// Preserves [`Self::verify_draft_block`] transactionally while enforcing
+    /// `limits.max_new_tokens` and `limits.stop_tokens` so verification never
+    /// emits or commits surplus bonus/correction tokens beyond the stop or length limit.
+    ///
+    /// # Errors
+    /// Rejects invalid runtime state, invalid draft/limit bounds, context overflow,
+    /// cancellation, or decoder checkpoint/restore failures.
+    pub fn verify_draft_block_bounded(
+        &mut self,
+        draft: &[u32],
+        limits: VerificationLimits<'_>,
+        cancellation: &Cancellation,
+    ) -> Result<(Vec<u32>, SpeculativeStats)> {
+        self.verify_draft_block_inner(draft, limits, cancellation)
+    }
+
     /// Speculatively advance and verify a short draft chain (`1..=8` tokens) against
     /// the current committed state, rolling back the decoder checkpoint on the first
     /// rejected draft token and committing all accepted tokens plus one bonus/correction token.
@@ -1441,6 +1559,22 @@ impl<D: Decoder> Runtime<D> {
     pub fn verify_draft_block(
         &mut self,
         draft: &[u32],
+        cancellation: &Cancellation,
+    ) -> Result<(Vec<u32>, SpeculativeStats)> {
+        self.verify_draft_block_inner(
+            draft,
+            VerificationLimits {
+                max_new_tokens: usize::MAX,
+                stop_tokens: &[],
+            },
+            cancellation,
+        )
+    }
+
+    fn verify_draft_block_inner(
+        &mut self,
+        draft: &[u32],
+        limits: VerificationLimits<'_>,
         cancellation: &Cancellation,
     ) -> Result<(Vec<u32>, SpeculativeStats)> {
         if self.faulted {
@@ -1456,15 +1590,21 @@ impl<D: Decoder> Runtime<D> {
         }
         if draft.is_empty()
             || draft.len() > MAX_SPECULATIVE_DRAFT_TOKENS
+            || limits.stop_tokens.len() > 256
             || draft.iter().any(|&token| {
                 !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size())
             })
         {
             return Err(invalid("invalid speculative draft block bounds or tokens"));
         }
-        let max_advance = draft
+        if limits.max_new_tokens == 0 {
+            return Ok((Vec::new(), SpeculativeStats::default()));
+        }
+        let effective_draft = &draft[..draft.len().min(limits.max_new_tokens)];
+        let allow_bonus = effective_draft.len() < limits.max_new_tokens;
+        let max_advance = effective_draft
             .len()
-            .checked_add(1)
+            .checked_add(usize::from(allow_bonus))
             .ok_or_else(|| invalid("speculative context length overflow"))?;
         if self
             .tokens
@@ -1476,14 +1616,15 @@ impl<D: Decoder> Runtime<D> {
                 "speculative draft block exceeds context token limit",
             ));
         }
-        let batched = draft.len() > 1 && draft.len() <= self.decoder.batched_evaluation_capacity();
+        let batched = effective_draft.len() > 1
+            && effective_draft.len() <= self.decoder.batched_evaluation_capacity();
         // A rejection pays for every proposed token plus replay of the accepted
         // prefix and its correction. Device work is never refunded by restore.
         let evaluations = if batched {
-            draft
+            effective_draft
                 .len()
                 .checked_mul(2)
-                .and_then(|tokens| tokens.checked_add(1))
+                .and_then(|tokens| tokens.checked_add(usize::from(allow_bonus)))
                 .ok_or_else(|| invalid("speculative verification work overflow"))?
         } else {
             max_advance
@@ -1491,47 +1632,11 @@ impl<D: Decoder> Runtime<D> {
         self.decoder.admit_work(0, evaluations)?;
         let check = || cancellation.check();
         let rollback = self.capture_transient(0, &check)?;
-        let result = (|| {
-            if batched {
-                return self.verify_batched_draft(draft, &rollback, &check);
-            }
-            let mut stats = SpeculativeStats {
-                draft_rounds: 1,
-                draft_tokens_proposed: draft.len(),
-                draft_tokens_accepted: 0,
-                target_evaluations: 0,
-                rollback_restores: 0,
-            };
-            let mut committed = Vec::new();
-            committed.try_reserve_exact(max_advance)?;
-            for &candidate in draft {
-                check()?;
-                let expected = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
-                if candidate == expected {
-                    self.evaluate(candidate, &check)?;
-                    stats.target_evaluations += 1;
-                    stats.draft_tokens_accepted += 1;
-                    committed.push(candidate);
-                } else {
-                    // Candidate diverged from greedy target verification before mutating
-                    // the committed GDN + KV state: skip the rejected forward pass and
-                    // per-step GDN checkpoint clone, and advance directly with the exact
-                    // target correction token.
-                    stats.rollback_restores += 1;
-                    self.evaluate(expected, &check)?;
-                    stats.target_evaluations += 1;
-                    committed.push(expected);
-                    return Ok((committed, stats));
-                }
-            }
-            // All draft tokens were accepted; emit one bonus token from the final distribution.
-            check()?;
-            let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
-            self.evaluate(bonus, &check)?;
-            stats.target_evaluations += 1;
-            committed.push(bonus);
-            Ok((committed, stats))
-        })();
+        let result = if batched {
+            self.verify_batched_draft(effective_draft, limits, &rollback, &check)
+        } else {
+            self.verify_sequential_draft(effective_draft, limits, allow_bonus, max_advance, &check)
+        };
         match result {
             Ok((committed, stats)) => {
                 self.recycle_snapshot(rollback);
@@ -1560,6 +1665,76 @@ impl<D: Decoder> Runtime<D> {
                 Err(error)
             }
         }
+    }
+
+    fn verify_sequential_draft(
+        &mut self,
+        effective_draft: &[u32],
+        limits: VerificationLimits<'_>,
+        allow_bonus: bool,
+        max_advance: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<(Vec<u32>, SpeculativeStats)> {
+        let mut stats = SpeculativeStats::default();
+        let mut committed = Vec::new();
+        committed.try_reserve_exact(max_advance)?;
+        let mut accepted = 0_usize;
+        let mut verified = 0_usize;
+        let mut target_evals = 0_usize;
+        let mut finished_early = false;
+        let mut rolled_back = false;
+        let mut correction = 0_u64;
+        let mut bonus_emitted = 0_u64;
+        for &candidate in effective_draft {
+            check()?;
+            let expected = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
+            verified += 1;
+            if limits.stop_tokens.contains(&expected) {
+                finished_early = true;
+                break;
+            }
+            if candidate == expected {
+                self.evaluate(candidate, check)?;
+                target_evals += 1;
+                accepted += 1;
+                committed.push(candidate);
+            } else {
+                // Candidate diverged from greedy target verification before mutating
+                // the committed GDN + KV state: skip the rejected forward pass and
+                // per-step GDN checkpoint clone, and advance directly with the exact
+                // target correction token.
+                rolled_back = true;
+                correction = 1;
+                self.evaluate(expected, check)?;
+                target_evals += 1;
+                committed.push(expected);
+                finished_early = true;
+                break;
+            }
+        }
+        if !finished_early && allow_bonus {
+            // All draft tokens were accepted and token budget permits one bonus token.
+            check()?;
+            let bonus = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
+            if !limits.stop_tokens.contains(&bonus) {
+                self.evaluate(bonus, check)?;
+                target_evals += 1;
+                bonus_emitted = 1;
+                committed.push(bonus);
+            }
+        }
+        stats.record_verified_round(VerifiedRound {
+            proposed: effective_draft.len(),
+            accepted,
+            verified,
+            target_evaluations: target_evals,
+            rolled_back,
+            bonus_tokens: bonus_emitted,
+            correction_tokens: correction,
+            fallback_tokens: 0,
+            replay_tokens: 0,
+        });
+        Ok((committed, stats))
     }
 
     fn generate_speculative_checked(
@@ -1688,57 +1863,121 @@ impl<D: Decoder> Runtime<D> {
                 &mut draft_storage,
             )?;
             let draft = &draft_storage[..draft_len];
-            let mut stopped = false;
-            let mut correction = None;
-            if !draft.is_empty() {
-                stats.draft_rounds += 1;
-                stats.draft_tokens_proposed += draft.len();
-                for &candidate in draft {
-                    check()?;
-                    let target_token = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
-                    check()?;
-                    if target_token != candidate {
-                        // No evaluation or callback occurs before correction,
-                        // so these same validated logits still select this token.
-                        // Avoid scanning the complete vocabulary a second time.
-                        correction = Some(target_token);
-                        break;
-                    }
-                    stats.draft_tokens_accepted += 1;
-                    if options.stop_tokens.contains(&target_token) {
-                        completion.finish = Finish::Stop;
-                        stopped = true;
-                        break;
-                    }
-                    self.evaluate(target_token, check)?;
-                    stats.target_evaluations += 1;
-                    check()?;
-                    emit(target_token)?;
-                    check()?;
-                    completion.generated_tokens += 1;
-                }
-            }
-            if stopped || completion.generated_tokens >= options.max_tokens {
+            if self.verify_greedy_draft_round(
+                draft,
+                options,
+                check,
+                emit,
+                &mut completion,
+                &mut stats,
+            )? {
                 break;
             }
+        }
+        Ok((completion, stats))
+    }
+
+    fn verify_greedy_draft_round(
+        &mut self,
+        draft: &[u32],
+        options: &Generation,
+        check: &impl Fn() -> Result<()>,
+        emit: &mut impl FnMut(u32) -> Result<()>,
+        completion: &mut Completion,
+        stats: &mut SpeculativeStats,
+    ) -> Result<bool> {
+        let mut stopped = false;
+        let mut correction = None;
+        let mut accepted = 0_usize;
+        let mut verified = 0_usize;
+        let mut evals = 0_usize;
+        for &candidate in draft {
             check()?;
-            let token = correction.map_or_else(
-                || greedy_finite(FiniteLogits::from_validated(&self.logits)?),
-                Ok,
-            )?;
+            let target_token = greedy_finite(FiniteLogits::from_validated(&self.logits)?)?;
             check()?;
-            if options.stop_tokens.contains(&token) {
+            verified += 1;
+            if target_token != candidate {
+                // No evaluation or callback occurs before correction,
+                // so these same validated logits still select this token.
+                // Avoid scanning the complete vocabulary a second time.
+                correction = Some(target_token);
+                break;
+            }
+            accepted += 1;
+            if options.stop_tokens.contains(&target_token) {
                 completion.finish = Finish::Stop;
+                stopped = true;
                 break;
             }
-            self.evaluate(token, check)?;
-            stats.target_evaluations += 1;
+            self.evaluate(target_token, check)?;
+            evals += 1;
             check()?;
-            emit(token)?;
+            emit(target_token)?;
             check()?;
             completion.generated_tokens += 1;
         }
-        Ok((completion, stats))
+        let record_terminal = |stats: &mut SpeculativeStats| {
+            if !draft.is_empty() {
+                stats.record_verified_round(VerifiedRound {
+                    proposed: draft.len(),
+                    accepted,
+                    verified,
+                    target_evaluations: evals,
+                    rolled_back: false,
+                    bonus_tokens: 0,
+                    correction_tokens: 0,
+                    fallback_tokens: 0,
+                    replay_tokens: 0,
+                });
+            }
+        };
+        if stopped || completion.generated_tokens >= options.max_tokens {
+            record_terminal(stats);
+            return Ok(true);
+        }
+        check()?;
+        let token = correction.map_or_else(
+            || greedy_finite(FiniteLogits::from_validated(&self.logits)?),
+            Ok,
+        )?;
+        check()?;
+        if options.stop_tokens.contains(&token) {
+            record_terminal(stats);
+            completion.finish = Finish::Stop;
+            return Ok(true);
+        }
+        self.evaluate(token, check)?;
+        evals += 1;
+        if draft.is_empty() {
+            stats.record_verified_round(VerifiedRound {
+                proposed: 0,
+                accepted: 0,
+                verified: 0,
+                target_evaluations: 1,
+                rolled_back: false,
+                bonus_tokens: 0,
+                correction_tokens: 0,
+                fallback_tokens: 1,
+                replay_tokens: 0,
+            });
+        } else {
+            stats.record_verified_round(VerifiedRound {
+                proposed: draft.len(),
+                accepted,
+                verified,
+                target_evaluations: evals,
+                rolled_back: false,
+                bonus_tokens: u64::from(correction.is_none()),
+                correction_tokens: u64::from(correction.is_some()),
+                fallback_tokens: 0,
+                replay_tokens: 0,
+            });
+        }
+        check()?;
+        emit(token)?;
+        check()?;
+        completion.generated_tokens += 1;
+        Ok(false)
     }
 }
 
@@ -2729,7 +2968,7 @@ mod recycling_tests {
         )?;
         let retained_shared = Arc::clone(&runtime.logits);
         let retained_bits: Vec<u32> = retained_shared.iter().map(|v| v.to_bits()).collect();
-        assert!(!retained_bits.is_empty());
+        assert_ne!(retained_bits, Vec::<u32>::new());
 
         runtime.generate_speculative(
             &[2, 3, 4, 5, 2, 3],
@@ -2758,9 +2997,10 @@ mod recycling_tests {
 #[cfg(test)]
 mod boundary_and_checkpoint_tests {
     use super::{
-        Cancellation, Decoder, Generation, HybridCheckpointBoundary, Limits, Prefill, Result,
-        Runtime,
+        Cancellation, Decoder, Generation, HybridCheckpointBoundary, Limits, Result, Runtime,
+        VerificationLimits,
     };
+    use crate::speculative::SpeculativeStats;
     use std::cell::Cell;
 
     struct BoundaryDecoder {
@@ -2936,7 +3176,7 @@ mod boundary_and_checkpoint_tests {
     }
 
     #[test]
-    fn hybrid_checkpoint_boundary_reconciles_page_and_recurrent_limits() -> Result<()> {
+    fn hybrid_checkpoint_boundary_reconciles_page_and_recurrent_limits() {
         let prompt: Vec<u32> = (0..130).collect();
         let history: Vec<u32> = (0..130).collect();
         let identity = "qwen35-hybrid-f16/v1";
@@ -3032,8 +3272,10 @@ mod boundary_and_checkpoint_tests {
         );
         assert_eq!(pure_kv.position, 128);
         assert!(!pure_kv.clamped_by_recurrent);
+    }
 
-        // 6. Live runtime helper reconciles saved page-aligned vs unaligned state.
+    #[test]
+    fn runtime_hybrid_boundary_reconciles_live_checkpoint() -> Result<()> {
         let mut runtime = Runtime::new(
             BoundaryDecoder::new(),
             Limits {
@@ -3056,6 +3298,184 @@ mod boundary_and_checkpoint_tests {
         )?;
         let extra = runtime.hybrid_boundary(&tail_prompt, true, Some(64));
         assert_eq!(extra.position, 64);
+        Ok(())
+    }
+
+    struct BatchedGreedyControl {
+        tokens: Vec<u32>,
+        next_stop_on_one: bool,
+    }
+
+    impl Decoder for BatchedGreedyControl {
+        type Checkpoint = Vec<u32>;
+
+        fn identity(&self) -> &'static str {
+            "bounded-verify-control"
+        }
+        fn vocab_size(&self) -> usize {
+            3
+        }
+        fn checkpoint_bytes(&self) -> usize {
+            128
+        }
+        fn reset(&mut self) -> Result<()> {
+            self.tokens.clear();
+            Ok(())
+        }
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            self.tokens.push(token);
+            if self.next_stop_on_one {
+                if token == 1 {
+                    // Next greedy token after 1 is stop token 2.
+                    Ok(vec![0.0, 0.0, 5.0])
+                } else if self.tokens.len() >= 2 {
+                    // Prompt+1 generation done; next greedy token is 1.
+                    Ok(vec![0.0, 5.0, 0.0])
+                } else {
+                    Ok(vec![5.0, 0.0, 0.0])
+                }
+            } else {
+                Ok(vec![5.0, 0.0, 0.0])
+            }
+        }
+        fn batched_evaluation_capacity(&self) -> usize {
+            8
+        }
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            Ok(self.tokens.clone())
+        }
+        fn restore(&mut self, state: &Self::Checkpoint) -> Result<()> {
+            self.tokens.clone_from(state);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn verify_draft_block_bounded_stops_cleanly_at_stop_token_and_limit() -> Result<()> {
+        let limits = Limits {
+            context_tokens: 32,
+            checkpoints: 0,
+            checkpoint_bytes: 4096,
+        };
+        let cancel = Cancellation::default();
+
+        // 1. max_new_tokens == 0 returns empty without touching decoder state.
+        let mut runtime = Runtime::new(
+            BatchedGreedyControl {
+                tokens: Vec::new(),
+                next_stop_on_one: false,
+            },
+            limits,
+        )?;
+        runtime.generate(
+            &[0],
+            &Generation {
+                max_tokens: 1,
+                stop_tokens: Vec::new(),
+            },
+            &cancel,
+            |_| Ok(()),
+        )?;
+        let before_zero = runtime.tokens.clone();
+        let (zero_tokens, zero_stats) = runtime.verify_draft_block_bounded(
+            &[0, 0],
+            VerificationLimits {
+                max_new_tokens: 0,
+                stop_tokens: &[2],
+            },
+            &cancel,
+        )?;
+        assert_eq!(zero_tokens, Vec::<u32>::new());
+        assert_eq!(zero_stats, SpeculativeStats::default());
+        assert_eq!(runtime.tokens, before_zero);
+        assert_eq!(runtime.decoder.tokens, before_zero);
+
+        // 2. max_new_tokens == draft.len() caps emission without adding a surplus bonus token.
+        let (capped, capped_stats) = runtime.verify_draft_block_bounded(
+            &[0, 0],
+            VerificationLimits {
+                max_new_tokens: 2,
+                stop_tokens: &[2],
+            },
+            &cancel,
+        )?;
+        assert_eq!(capped, [0, 0]);
+        assert_eq!(capped_stats.draft_tokens_accepted, 2);
+        assert_eq!(capped_stats.bonus_tokens, 0);
+        assert_eq!(runtime.decoder.tokens, runtime.tokens);
+
+        // 3. Stop token encountered inside a batched draft rolls back surplus draft tokens.
+        let mut stop_runtime = Runtime::new(
+            BatchedGreedyControl {
+                tokens: Vec::new(),
+                next_stop_on_one: true,
+            },
+            limits,
+        )?;
+        stop_runtime.generate(
+            &[0],
+            &Generation {
+                max_tokens: 1,
+                stop_tokens: Vec::new(),
+            },
+            &cancel,
+            |_| Ok(()),
+        )?;
+        // State is [0, 0]; draft [1, 2] accepts 1, then stops at 2 without evaluating/emitting 2.
+        let (stopped, stop_stats) = stop_runtime.verify_draft_block_bounded(
+            &[1, 2],
+            VerificationLimits {
+                max_new_tokens: 4,
+                stop_tokens: &[2],
+            },
+            &cancel,
+        )?;
+        assert_eq!(stopped, [1]);
+        assert_eq!(stop_stats.draft_tokens_accepted, 1);
+        assert_eq!(stop_stats.rollback_restores, 1);
+        assert_eq!(stop_stats.correction_tokens, 0);
+        assert_eq!(stop_stats.replay_steps, 1);
+        assert_eq!(stop_stats.replay_tokens, 1);
+        assert_eq!(stop_runtime.decoder.tokens, stop_runtime.tokens);
+        assert_eq!(stop_runtime.tokens, [0, 0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn reallocation_witness_stops_growing_and_counts_reuse_after_warmup() -> Result<()> {
+        let mut runtime = Runtime::new(
+            BoundaryDecoder::new(),
+            Limits {
+                context_tokens: 32,
+                checkpoints: 2,
+                checkpoint_bytes: 8192,
+            },
+        )?;
+        let cancel = Cancellation::default();
+        runtime.generate(
+            &[1, 2],
+            &Generation {
+                max_tokens: 1,
+                stop_tokens: Vec::new(),
+            },
+            &cancel,
+            |_| Ok(()),
+        )?;
+        // Warm up checkpoint & batch logits pools on first transient verification block.
+        let _ = runtime.verify_draft_block(&[0, 1], &cancel)?;
+        let warmup = runtime.reallocation_witness();
+        assert!(warmup.growth_reallocations > 0);
+
+        for _ in 0..3 {
+            let _ = runtime.verify_draft_block(&[0, 1], &cancel)?;
+        }
+        let steady = runtime.reallocation_witness();
+        assert_eq!(steady.growth_reallocations, warmup.growth_reallocations);
+        assert_eq!(
+            steady.same_size_reallocations,
+            warmup.same_size_reallocations
+        );
+        assert!(steady.reused_preparations > warmup.reused_preparations);
         Ok(())
     }
 }

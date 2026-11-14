@@ -286,7 +286,6 @@ pub(crate) fn decay_and_dot_from(
 ///
 /// # Errors
 /// Rejects unequal lengths before mutation, or a nonfinite updated element.
-#[cfg(test)]
 pub(crate) fn add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
     if target.len() != input.len() {
         return Err(invalid("pinned GDN update requires matching vectors"));

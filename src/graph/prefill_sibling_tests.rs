@@ -113,6 +113,22 @@ impl Fixture {
         })
     }
 
+    fn with_bf16(mut self) -> Self {
+        for tensor in self.tensors.iter_mut().chain([&mut self.prior]) {
+            let elements = tensor.dimensions.iter().product::<usize>();
+            tensor.kind = 30;
+            tensor.data = Arc::from(
+                [0x3f80_u16, 0xc000, 0x8000, 0x0080, 0x3eaa, 0x0001]
+                    .into_iter()
+                    .cycle()
+                    .take(elements)
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        self
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Keep production pair/triple invocation, scoped reuse and independent sequential oracle together."
@@ -270,7 +286,7 @@ impl Fixture {
 }
 
 #[test]
-fn x1_production_cpu_siblings_preserve_adapter_and_prepared_reuse() -> Result<()> {
+fn production_cpu_siblings_preserve_adapter_and_prepared_reuse() -> Result<()> {
     let inputs: Vec<Vec<f32>> = (0..3)
         .map(|token| {
             (0..256)
@@ -278,8 +294,12 @@ fn x1_production_cpu_siblings_preserve_adapter_and_prepared_reuse() -> Result<()
                 .collect()
         })
         .collect();
-    for targeted in [false, true] {
-        let fixture = Fixture::new(targeted)?;
+    for (targeted, bf16) in [(false, false), (true, false), (false, true), (true, true)] {
+        let fixture = if bf16 {
+            Fixture::new(targeted)?.with_bf16()
+        } else {
+            Fixture::new(targeted)?
+        };
         assert!(ProjectionTile::supports_siblings(
             &fixture.tensors.each_ref()
         ));

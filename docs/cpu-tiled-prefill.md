@@ -99,6 +99,18 @@ DOTPROD/I8MM are not selected. Packed tasks share the existing
 [row-worker pool](parallel-rows.md), borrowing activations and writing disjoint
 rows. Floating fallback remains sequential.
 
+Compatible BF16 prompt siblings, including recurrent beta/alpha projections,
+share rounded activation preparation and one joined row-pool submission. Each
+matrix retains its existing eight/four/one-row tile dots and output extent;
+all geometry and fallible output growth precede submission. Sibling-major
+failure selection follows joined completion, and every output clears on error
+or cancellation. Targeted adapters keep sequential base/adapter ordering;
+single matrices and unsupported groups retain their existing paths. This adds
+no weight copy, pool, scratch reserve or ISA requirement. Final-source Release
+analysis, native/fallback arithmetic controls, complete-model state/adapter/
+cancellation parity and matched complete-request benefit remain qualification
+gates; source work counts establish no X1 speedup or application selection.
+
 Full attention borrows immutable interleaved gate heads and normalizes queries
 into separate scratch. [Attention locality](inference-efficiency.md#attention-locality)
 defines grouped/paired cache traversal. Ordinary recurrent arithmetic remains

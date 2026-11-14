@@ -143,11 +143,10 @@ impl ProjectionTile {
             return false;
         };
         (2..=3).contains(&tensors.len())
-            && first.kind == PQ2
-            && rows >= 4
-            && columns.is_multiple_of(256)
+            && (first.kind == BF16
+                || (first.kind == PQ2 && rows >= 4 && columns.is_multiple_of(256)))
             && tensors.iter().all(|tensor| {
-                tensor.kind == PQ2
+                tensor.kind == first.kind
                     && dimensions(tensor).is_ok_and(|(cols, rows, bytes)| {
                         cols == columns && rows > 0 && bytes == row_bytes
                     })
@@ -321,44 +320,60 @@ impl ProjectionTile {
                     }
                     Ok(sums)
                 };
-                return self.row_parallelism.fill_tile_four_rows(
-                    &tensor.data,
+                let dot_eight = |rows8: [&[u8]; 8], decoded: &mut u64| {
+                    if let Some(res) =
+                        dot::dot_bf16_eight_rows::<MAX_TILE_TOKENS>(rows8, preparations, backend)
+                    {
+                        return res;
+                    }
+                    Ok([
+                        dot_bf16_one(rows8[0], decoded)?,
+                        dot_bf16_one(rows8[1], decoded)?,
+                        dot_bf16_one(rows8[2], decoded)?,
+                        dot_bf16_one(rows8[3], decoded)?,
+                        dot_bf16_one(rows8[4], decoded)?,
+                        dot_bf16_one(rows8[5], decoded)?,
+                        dot_bf16_one(rows8[6], decoded)?,
+                        dot_bf16_one(rows8[7], decoded)?,
+                    ])
+                };
+                let dot_four = |rows4: [&[u8]; 4], decoded: &mut u64| {
+                    if let Some(res) =
+                        dot::dot_bf16_four_rows::<MAX_TILE_TOKENS>(rows4, preparations, backend)
+                    {
+                        return res;
+                    }
+                    Ok([
+                        dot_bf16_one(rows4[0], decoded)?,
+                        dot_bf16_one(rows4[1], decoded)?,
+                        dot_bf16_one(rows4[2], decoded)?,
+                        dot_bf16_one(rows4[3], decoded)?,
+                    ])
+                };
+                if tensors.len() == 1 {
+                    return self.row_parallelism.fill_tile_four_rows(
+                        &tensor.data,
+                        block_bytes,
+                        all_outputs[0],
+                        &mut unused_blocks,
+                        check,
+                        dot_eight,
+                        dot_four,
+                        dot_bf16_one,
+                    );
+                }
+                let mut data = [&[][..]; 3];
+                for (slot, tensor) in data.iter_mut().zip(tensors) {
+                    *slot = &tensor.data;
+                }
+                return self.row_parallelism.fill_tile_siblings_four_rows(
+                    &data[..tensors.len()],
                     block_bytes,
-                    outputs,
+                    all_outputs,
                     &mut unused_blocks,
                     check,
-                    |rows8, decoded| {
-                        if let Some(res) = dot::dot_bf16_eight_rows::<MAX_TILE_TOKENS>(
-                            rows8,
-                            preparations,
-                            backend,
-                        ) {
-                            return res;
-                        }
-                        Ok([
-                            dot_bf16_one(rows8[0], decoded)?,
-                            dot_bf16_one(rows8[1], decoded)?,
-                            dot_bf16_one(rows8[2], decoded)?,
-                            dot_bf16_one(rows8[3], decoded)?,
-                            dot_bf16_one(rows8[4], decoded)?,
-                            dot_bf16_one(rows8[5], decoded)?,
-                            dot_bf16_one(rows8[6], decoded)?,
-                            dot_bf16_one(rows8[7], decoded)?,
-                        ])
-                    },
-                    |rows4, decoded| {
-                        if let Some(res) =
-                            dot::dot_bf16_four_rows::<MAX_TILE_TOKENS>(rows4, preparations, backend)
-                        {
-                            return res;
-                        }
-                        Ok([
-                            dot_bf16_one(rows4[0], decoded)?,
-                            dot_bf16_one(rows4[1], decoded)?,
-                            dot_bf16_one(rows4[2], decoded)?,
-                            dot_bf16_one(rows4[3], decoded)?,
-                        ])
-                    },
+                    dot_eight,
+                    dot_four,
                     dot_bf16_one,
                 );
             }

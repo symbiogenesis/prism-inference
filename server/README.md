@@ -131,3 +131,16 @@ Request failures retain one value-free `private-inference-request-failed error=D
 line (or another fixed error category) in private stderr; no prompt, generated text
 or credential is included. The uncapped HTTP change needs a published source-bound
 bundle, Runner repin and actual-model owner acceptance before installed use changes.
+
+Native generation also retains one fixed metadata line on completion or returned
+failure: prompt/reuse/committed-output counts, total and active-phase elapsed time,
+phase call/token attempts and completed lower bounds, and unknown partial progress.
+Missing counts remain `unknown`. `firstTextMicros` observes the first nonempty text
+delta before its HTTP write; it is not first sampled-token or delivered-text latency.
+The line excludes prompt text, generated text, token IDs, paths and credentials.
+Runtime timing includes instrumentation and rollback, excludes loading/rendering,
+and does not qualify performance. Session elapsed time includes profile setup and
+callback acknowledgements; phase sums omit other runtime overhead. CPU speculation
+uses its unchanged path and reports attribution unavailable. Abrupt process exits
+cannot publish a completed summary. Matched actual-model measurements and owning
+hosted checks remain required before selecting an optimization.

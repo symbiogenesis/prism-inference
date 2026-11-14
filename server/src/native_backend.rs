@@ -7,6 +7,7 @@
 //! time. Output has one event slot and requires a write acknowledgement before
 //! the next decoder step. Failed generation closes model admission until reset.
 
+mod diagnostics;
 mod profile;
 mod worker;
 

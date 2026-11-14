@@ -92,7 +92,7 @@ fn classify_preparation_error(
 /// Stream one admitted request on its original verified native session.
 ///
 /// The owner propagates disconnects through `cancellation` or callback errors,
-/// and supplies the same absolute deadline used during HTTP intake and admission.
+/// and supplies the same optional deadline used during HTTP intake and admission.
 /// Deltas remain provisional until terminal completion succeeds. Failed terminal
 /// delivery requires a successful session reset before another request.
 ///
@@ -106,6 +106,24 @@ pub fn complete(
     emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
 ) -> bonsai_prism_runtime::Result<Completion> {
     session.complete(&chat.prompt, cancellation, deadline, emit)
+}
+
+/// Complete with value-free phase attribution retained on returned failures.
+///
+/// Uses the same ownership, cancellation and delivery contract as [`complete`].
+/// Loading, request rendering and outer HTTP delivery remain outside this record.
+///
+/// # Errors
+/// Returns the errors of [`complete`]; CPU speculation does not support attribution.
+pub fn complete_with_timings(
+    session: &mut SwiftSession,
+    chat: &NativeChat,
+    cancellation: &Cancellation,
+    deadline: impl Into<Option<Instant>>,
+    timings: &mut bonsai_prism_runtime::runtime::GenerationTimings,
+    emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+) -> bonsai_prism_runtime::Result<Completion> {
+    session.complete_with_timings(&chat.prompt, cancellation, deadline, timings, emit)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 use super::{NativeBackendError, PendingChat, Placement, profile::ModelProfile};
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
-    runtime::{Cancellation, Completion},
+    runtime::{Cancellation, Completion, GenerationTimings},
     swift_session::{SwiftSession, TextEvent},
 };
 use std::{
@@ -80,9 +80,39 @@ impl Engine for SwiftSession {
         prepared: &Self::Prepared,
         cancel: &Cancellation,
         deadline: Option<Instant>,
-        emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+        mut emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion> {
-        crate::native_swift::complete(self, prepared, cancel, deadline, emit)
+        let started = Instant::now();
+        let mut first_text = None;
+        let mut observe = |event: TextEvent<'_>| {
+            if matches!(event, TextEvent::Delta(text) if !text.is_empty()) && first_text.is_none() {
+                first_text = Some(started.elapsed());
+            }
+            emit(event)
+        };
+        let mut timings = GenerationTimings::default();
+        let measured = self.cpu_speculation().is_none();
+        let result = if measured {
+            crate::native_swift::complete_with_timings(
+                self,
+                prepared,
+                cancel,
+                deadline,
+                &mut timings,
+                &mut observe,
+            )
+        } else {
+            crate::native_swift::complete(self, prepared, cancel, deadline, &mut observe)
+        };
+        let _ = super::diagnostics::write_generation(
+            &mut std::io::stderr().lock(),
+            result.is_ok(),
+            started.elapsed(),
+            prepared.prompt_tokens(),
+            first_text,
+            measured.then_some(&timings),
+        );
+        result
     }
     fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
         Self::reset(self)

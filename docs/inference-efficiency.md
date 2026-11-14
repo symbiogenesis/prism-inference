@@ -51,6 +51,13 @@ order, record bytes, cache precision, scratch admission or native ISA selection.
 The public single-row helper still stages its complete result; scan-owned sums
 remain private and permanently reject publication after a failed append.
 
+After weight, complete record and weighted-scale validation, a scan-owned value
+sum skips code decoding and channel updates when the weighted scale rounds to
+either signed zero, including product underflow. Its initial positive-zero sum
+and separate finite binary32 additions cannot create a negative-zero accumulator.
+Public accumulation retains its ordinary arithmetic for caller-owned negative
+zero. Corrupt zero-probability rows still reject and poison the private scan.
+
 These source reductions require exact record/arithmetic and failure controls,
 complete-model state/adapters/cancellation acceptance and matched whole-request
 measurement before claiming X1 or X2 benefit.
@@ -124,6 +131,13 @@ update and combine finite masks before grouped publication. Floating pass/order
 and scalar partial-failure replay remain intact. Direct convolution tiles read
 immutable projection rows and write convolved SiLU values; unsupported shapes
 retain complete raw staging. Conservative stack/scratch charges are unchanged.
+
+Exact pinned tiled prefill admits each complete square 128/256-row head once,
+including every immutable token's Q/K/V extent, and selects baseline NEON once.
+Eight-row groups reuse the unchanged temporal kernel and private staging. A
+failed group replays the existing defensive row-major path from committed source;
+prior successful groups retain their ordinary publication. Source arithmetic,
+unsupported geometry and feature-disabled targets retain their existing grouping.
 
 ## Suffix proposals
 

@@ -111,6 +111,13 @@ analysis, native/fallback arithmetic controls, complete-model state/adapter/
 cancellation parity and matched complete-request benefit remain qualification
 gates; source work counts establish no X1 speedup or application selection.
 
+Joined packed siblings also admit PTQ1, odd-group PQ2 and short row tails. They
+reuse the existing Q8_0 activation contracts and per-format 8/4/1-row kernels;
+even-group PQ2 retains its Q8_K preparation. A short first sibling needs no
+four-row admission minimum. Transform, targeted-adapter and external-executor
+guards, joined error ordering and complete output clearing remain unchanged.
+This extends prompt tiles only and adds no scratch, helper API or precision mode.
+
 Full attention borrows immutable interleaved gate heads and normalizes queries
 into separate scratch. [Attention locality](inference-efficiency.md#attention-locality)
 defines grouped/paired cache traversal. Ordinary recurrent arithmetic remains

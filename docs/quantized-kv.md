@@ -31,6 +31,23 @@ Current-token K/V use the same codec. No context-sized expanded cache is allocat
 Existing RMS, RoPE and FP16 preparation remain; pinned rotated softmax admits up
 to 262,144 tokens, while ordinary FP16 softmax retains its 8K bound.
 
+Rotation signs retain the same seeded sequence in three 256-byte boolean masks,
+replacing three binary32 sign tables (768 versus 3,072 payload bytes per codec).
+The native rotation helper selects baseline NEON once and stages all three
+forward or inverse passes in one row. Every pass still checks finite results
+after normalization; failure leaves the public row unchanged. Sign-bit toggles
+match multiplication by `-1` for finite values, including signed zeros and
+subnormals. The scalar codec retains independent sign multiplication and
+Hadamard arithmetic. Record and graph identities remain unchanged.
+
+The `x1_rotation_` helper controls and `x1_compact_rotation_` codec control cover
+ordered scalar bits, signs, subnormals, late-pass overflow and atomic failure.
+These source work/storage reductions establish no X1 performance result.
+Final-source native/fallback Release analysis, codegen/stack review, complete
+model state/logit/adapter/cancellation parity and matched complete-request benefit
+remain independent gates. Publish the changed helper before its runtime consumer;
+Runner's existing release pin remains the rollback until qualification and repin.
+
 Independent query heads can share the [row-worker pool](parallel-rows.md).
 Tasks borrow packed records, own disjoint score/output slices and join before
 returning the earliest head-chunk error. No additional pool is created;

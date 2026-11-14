@@ -73,7 +73,7 @@ pub struct Identity {
 #[derive(Clone)]
 pub struct Quantizer {
     identity: Identity,
-    signs: [[f32; HEAD_DIM]; ROTATION_PASSES],
+    negative_signs: [[bool; HEAD_DIM]; ROTATION_PASSES],
     scalar_only: bool,
 }
 
@@ -232,14 +232,10 @@ impl Quantizer {
     #[must_use]
     pub fn new(bits: Bits, seed: u64) -> Self {
         let mut stream = seed;
-        let mut signs = [[1.0; HEAD_DIM]; ROTATION_PASSES];
-        for pass in &mut signs {
+        let mut negative_signs = [[false; HEAD_DIM]; ROTATION_PASSES];
+        for pass in &mut negative_signs {
             for sign in pass {
-                *sign = if scalar::splitmix64(&mut stream) & 1 == 0 {
-                    1.0
-                } else {
-                    -1.0
-                };
+                *sign = scalar::splitmix64(&mut stream) & 1 != 0;
             }
         }
         Self {
@@ -248,7 +244,7 @@ impl Quantizer {
                 bits,
                 seed,
             },
-            signs,
+            negative_signs,
             scalar_only: false,
         }
     }
@@ -317,13 +313,27 @@ impl Quantizer {
     /// Rejects nonfinite input or arithmetic; the row is unchanged on failure.
     pub fn inverse(&self, inout: &mut [f32; HEAD_DIM]) -> Result<()> {
         let mut row = finite_row(inout)?;
-        for signs in self.signs.iter().rev() {
-            self.hadamard(&mut row)?;
+        self.inverse_row(&mut row)?;
+        *inout = row;
+        Ok(())
+    }
+
+    fn inverse_row(&self, row: &mut [f32; HEAD_DIM]) -> Result<()> {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        if !self.scalar_only {
+            return native_rotation(row, &self.negative_signs, true);
+        }
+        for signs in self.negative_signs.iter().rev() {
+            scalar::hadamard(row)?;
             for (value, sign) in row.iter_mut().zip(signs) {
-                *value *= sign;
+                *value *= if *sign { -1.0 } else { 1.0 };
             }
         }
-        *inout = row;
         Ok(())
     }
 
@@ -546,11 +556,20 @@ impl Quantizer {
     }
 
     fn forward(&self, row: &mut [f32; HEAD_DIM]) -> Result<()> {
-        for signs in &self.signs {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        if !self.scalar_only {
+            return native_rotation(row, &self.negative_signs, false);
+        }
+        for signs in &self.negative_signs {
             for (value, sign) in row.iter_mut().zip(signs) {
-                *value *= sign;
+                *value *= if *sign { -1.0 } else { 1.0 };
             }
-            self.hadamard(row)?;
+            scalar::hadamard(row)?;
         }
         Ok(())
     }
@@ -571,35 +590,6 @@ impl Quantizer {
             return Err(invalid("KV codec zero row must be canonical"));
         }
         Ok((scale, codes))
-    }
-
-    #[cfg_attr(
-        not(all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc"
-        )),
-        expect(
-            clippy::unused_self,
-            reason = "The native target reads the instance backend policy; portable targets share this method with the scalar path."
-        )
-    )]
-    fn hadamard(&self, row: &mut [f32; HEAD_DIM]) -> Result<()> {
-        #[cfg(all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc"
-        ))]
-        if !self.scalar_only {
-            return if bonsai_neon_dot::kv_quant::hadamard(row) {
-                Ok(())
-            } else {
-                Err(invalid("KV codec native transform rejected arithmetic"))
-            };
-        }
-        scalar::hadamard(row)
     }
 
     fn add_codes(&self, codes: &[u8], scale: f32, out: &mut [f32; HEAD_DIM]) -> Result<()> {
@@ -629,6 +619,24 @@ impl Quantizer {
             scale,
             out,
         )
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc"
+))]
+fn native_rotation(
+    row: &mut [f32; HEAD_DIM],
+    negative_signs: &[[bool; HEAD_DIM]; ROTATION_PASSES],
+    inverse: bool,
+) -> Result<()> {
+    if bonsai_neon_dot::kv_quant::rotate(row, negative_signs, inverse) {
+        Ok(())
+    } else {
+        Err(invalid("KV codec native transform rejected arithmetic"))
     }
 }
 

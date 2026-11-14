@@ -203,6 +203,63 @@ pub fn hadamard(values: &mut [f32; DIMENSION]) -> bool {
     true
 }
 
+/// Applies three signed, normalized Hadamard passes in one transaction.
+///
+/// Each boolean selects a negative diagonal sign before its forward pass.
+/// Inverse execution reverses the passes and applies each sign after its
+/// Hadamard. Sign-bit toggles preserve finite multiplication by `-1` exactly,
+/// including signed zero and subnormals. Every pass retains increasing-width
+/// butterflies, normalization by `1/16` and its finite-result boundary.
+///
+/// Native dispatch is selected once. The input is checked once and one staging
+/// row serves all passes; there are no per-pass row copies. Nonfinite input or
+/// arithmetic returns false without changing any caller-owned coordinate.
+#[must_use]
+pub fn rotate(
+    values: &mut [f32; DIMENSION],
+    negative_signs: &[[bool; DIMENSION]; 3],
+    inverse: bool,
+) -> bool {
+    if !values.iter().all(|value| value.is_finite()) {
+        return false;
+    }
+    let mut staged = *values;
+    #[cfg(target_arch = "aarch64")]
+    let neon = std::arch::is_aarch64_feature_detected!("neon");
+    for pass in 0..negative_signs.len() {
+        let signs = &negative_signs[if inverse {
+            negative_signs.len() - 1 - pass
+        } else {
+            pass
+        }];
+        if !inverse {
+            apply_signs(&mut staged, signs);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if neon {
+            native::hadamard(&mut staged);
+        } else {
+            portable_hadamard(&mut staged);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        portable_hadamard(&mut staged);
+        if !staged.iter().all(|value| value.is_finite()) {
+            return false;
+        }
+        if inverse {
+            apply_signs(&mut staged, signs);
+        }
+    }
+    *values = staged;
+    true
+}
+
+fn apply_signs(values: &mut [f32; DIMENSION], negative_signs: &[bool; DIMENSION]) {
+    for (value, &negative) in values.iter_mut().zip(negative_signs) {
+        *value = f32::from_bits(value.to_bits() ^ (u32::from(negative) << 31));
+    }
+}
+
 fn valid(packed: &[u8], bits: u8, centroids: &[f32; 16]) -> bool {
     matches!((bits, packed.len()), (3, 96) | (4, 128))
         && centroids.iter().all(|value| value.is_finite())
@@ -558,6 +615,102 @@ mod native {
 )]
 mod tests {
     use super::{DIMENSION, accumulate, dot, hadamard};
+
+    // Keep this oracle independent of the production butterfly and sign helpers.
+    // Match binary32 stage boundaries rather than using a reassociated dense dot.
+    fn reference_rotation(
+        mut values: [f32; DIMENSION],
+        negative_signs: &[[bool; DIMENSION]; 3],
+        inverse: bool,
+    ) -> Option<[f32; DIMENSION]> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        for pass in 0..3 {
+            let signs = &negative_signs[if inverse { 2 - pass } else { pass }];
+            if !inverse {
+                for (value, &negative) in values.iter_mut().zip(signs) {
+                    *value *= if negative { -1.0 } else { 1.0 };
+                }
+            }
+            for stage in 0..8 {
+                let width = 1 << stage;
+                for base in (0..DIMENSION).step_by(2 * width) {
+                    for lane in 0..width {
+                        let left = values[base + lane];
+                        let right = values[base + width + lane];
+                        values[base + lane] = left + right;
+                        values[base + width + lane] = left - right;
+                    }
+                }
+            }
+            for value in &mut values {
+                *value *= 0.0625;
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return None;
+            }
+            if inverse {
+                for (value, &negative) in values.iter_mut().zip(signs) {
+                    *value *= if negative { -1.0 } else { 1.0 };
+                }
+            }
+        }
+        Some(values)
+    }
+
+    #[test]
+    fn x1_rotation_preserves_ordered_passes_signed_zero_and_subnormals() {
+        let signs = std::array::from_fn(|pass: usize| {
+            std::array::from_fn(|index: usize| (index * (2 * pass + 1) + pass) % 11 < 5)
+        });
+        let mixed = std::array::from_fn(|index: usize| {
+            let value = f32::from(index.to_le_bytes()[0]) - 127.5;
+            value / 32.0
+        });
+        let subnormal = std::array::from_fn(|index: usize| {
+            f32::from_bits(u32::from(index.to_le_bytes()[0]))
+        });
+        for input in [mixed, subnormal, [0.0; DIMENSION], [-0.0; DIMENSION]] {
+            for inverse in [false, true] {
+                let mut actual = input;
+                assert!(super::rotate(&mut actual, &signs, inverse));
+                assert_eq!(
+                    Some(actual.map(f32::to_bits)),
+                    reference_rotation(input, &signs, inverse)
+                        .map(|values| values.map(f32::to_bits)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x1_rotation_rejects_late_pass_overflow_without_publication() {
+        let signs = [[false; DIMENSION]; 3];
+        let mut late_overflow = [0.0; DIMENSION];
+        late_overflow[0] = f32::MAX * 0.5;
+        // The impulse's first Hadamard is finite; its second pass over the
+        // resulting constant row overflows before normalization.
+        let mut first = late_overflow;
+        assert!(hadamard(&mut first));
+        assert!(!hadamard(&mut first));
+        for input in [
+            late_overflow,
+            [f32::MAX; DIMENSION],
+            [f32::NAN; DIMENSION],
+            [f32::INFINITY; DIMENSION],
+            [f32::NEG_INFINITY; DIMENSION],
+        ] {
+            for inverse in [false, true] {
+                let mut actual = input;
+                assert!(!super::rotate(&mut actual, &signs, inverse));
+                assert_eq!(actual.map(f32::to_bits), input.map(f32::to_bits));
+                assert!(reference_rotation(input, &signs, inverse).is_none());
+            }
+        }
+        let mut recovery = [0.25; DIMENSION];
+        assert!(super::rotate(&mut recovery, &signs, false));
+    }
 
     // Independent bit-at-a-time encoder: no production decode/packing helpers.
     fn packed(codes: &[u8; DIMENSION], bits: u8) -> Vec<u8> {

@@ -427,17 +427,18 @@ fn transform_matches_an_independent_dense_signed_hadamard() -> Result<()> {
     let mut actual = [0.0; HEAD_DIM];
     quantizer.rotate(&input, &mut actual)?;
     let mut expected = input;
-    for signs in &quantizer.signs {
+    for signs in &quantizer.negative_signs {
         let mut next = [0.0; HEAD_DIM];
         for (index, value) in next.iter_mut().enumerate() {
             let mut sum = 0.0_f64;
-            for (channel, (&input, &sign)) in expected.iter().zip(signs).enumerate() {
+            for (channel, (&input, &negative)) in expected.iter().zip(signs).enumerate() {
                 let parity = if (index & channel).count_ones() % 2 == 0 {
                     1.0
                 } else {
                     -1.0
                 };
-                sum += f64::from(input) * f64::from(sign) * parity;
+                let sign = if negative { -1.0 } else { 1.0 };
+                sum += f64::from(input) * sign * parity;
             }
             *value = scalar::checked_f32(sum / 16.0)?;
         }
@@ -741,6 +742,41 @@ fn malformed_scales_and_overflow_do_not_partially_mutate_outputs() {
     let mut output = [9.0; HEAD_DIM];
     assert!(quantizer.rotate(&original, &mut output).is_err());
     assert_eq!(output, [9.0; HEAD_DIM]);
+}
+
+#[test]
+fn x1_compact_rotation_preserves_scalar_bits_and_failure_publication() -> Result<()> {
+    let subnormal = std::array::from_fn(|index: usize| {
+        f32::from_bits(u32::from(index.to_le_bytes()[0]))
+    });
+    for seed in [0, 42, 91, u64::MAX] {
+        let automatic = Quantizer::new(Bits::Four, seed);
+        let scalar = Quantizer::scalar(Bits::Four, seed);
+        for input in [input_row(), subnormal, [0.0; HEAD_DIM], [-0.0; HEAD_DIM]] {
+            let mut actual = [9.0; HEAD_DIM];
+            let mut expected = actual;
+            automatic.rotate(&input, &mut actual)?;
+            scalar.rotate(&input, &mut expected)?;
+            assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+            automatic.inverse(&mut actual)?;
+            scalar.inverse(&mut expected)?;
+            assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+        }
+        for input in [
+            [f32::MAX; HEAD_DIM],
+            [f32::NAN; HEAD_DIM],
+            [f32::INFINITY; HEAD_DIM],
+            [f32::NEG_INFINITY; HEAD_DIM],
+        ] {
+            let mut forward = [9.0; HEAD_DIM];
+            assert!(automatic.rotate(&input, &mut forward).is_err());
+            assert_eq!(forward, [9.0; HEAD_DIM]);
+            let mut inverse = input;
+            assert!(automatic.inverse(&mut inverse).is_err());
+            assert_eq!(inverse.map(f32::to_bits), input.map(f32::to_bits));
+        }
+    }
+    Ok(())
 }
 
 #[test]

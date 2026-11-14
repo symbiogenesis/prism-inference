@@ -78,6 +78,17 @@ limits. Statistics report preparations, cache hits, copied bytes and metadata
 separately from kernel operations. Host caching proves neither DSP residency nor
 reduced DMA/cache work.
 
+Resident metadata uses a capacity-reserved sorted storage/geometry index and
+append-only projection records. Native Q2 and HMX lookups check retained strong
+`Arc` ownership and exact geometry, including different matrix views sharing one
+immutable byte allocation; names do not determine cache identity. The index's
+retained capacity is charged inside the existing metadata reservation, reducing
+the number of entries that fit a given reservation. Native Q2 sibling preparation
+reuses one extent for repeated identical tensors without changing operation
+charges. HMX lookups use binary search instead of a linear metadata scan. These
+are source work reductions; device timing, resources and complete-model parity
+still require independent qualification.
+
 `NativeQ2Executor` can pack a fresh resident extent directly through the submitter's
 exact-length callback into its admitted mapped arena. Registry growth and handles
 remain private until packing, scale checks and deadline checks pass. Error or

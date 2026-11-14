@@ -221,6 +221,10 @@ struct ResidentProjection {
 
 struct ResidentCache {
     projections: Vec<ResidentProjection>,
+    // Sorted indirection keeps projection indices stable while new sources are
+    // prepared. Geometry is part of the key: one immutable byte allocation may
+    // legitimately be viewed as differently shaped matrices.
+    by_storage: Vec<usize>,
     handles: Vec<NativeQ2WeightHandle>,
     reservation: usize,
     statistics: NativeQ2ResidencyStatistics,
@@ -228,14 +232,17 @@ struct ResidentCache {
 
 impl ResidentCache {
     fn new(reservation: usize) -> Result<Self> {
-        let slots =
-            reservation / (size_of::<ResidentProjection>() + size_of::<NativeQ2WeightHandle>());
+        let slots = reservation
+            / (size_of::<ResidentProjection>()
+                + size_of::<NativeQ2WeightHandle>()
+                + size_of::<usize>());
         if slots == 0 {
             return Err(invalid(
                 "native Q2 resident metadata reservation is too small",
             ));
         }
         let mut projections = Vec::new();
+        let mut by_storage = Vec::new();
         let mut handles = Vec::new();
         projections
             .try_reserve_exact(slots)
@@ -243,6 +250,9 @@ impl ResidentCache {
         handles
             .try_reserve_exact(slots)
             .map_err(|_| invalid("native Q2 resident handle metadata allocation failed"))?;
+        by_storage
+            .try_reserve_exact(slots)
+            .map_err(|_| invalid("native Q2 resident index metadata allocation failed"))?;
         let metadata_payload_bytes = projections
             .capacity()
             .checked_mul(size_of::<ResidentProjection>())
@@ -252,10 +262,17 @@ impl ResidentCache {
                     .checked_mul(size_of::<NativeQ2WeightHandle>())
                     .and_then(|handle_bytes| bytes.checked_add(handle_bytes))
             })
+            .and_then(|bytes| {
+                by_storage
+                    .capacity()
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|index_bytes| bytes.checked_add(index_bytes))
+            })
             .filter(|&bytes| bytes <= reservation)
             .ok_or_else(|| invalid("native Q2 resident metadata allocation exceeds reservation"))?;
         Ok(Self {
             projections,
+            by_storage,
             handles,
             reservation,
             statistics: NativeQ2ResidencyStatistics {
@@ -266,11 +283,22 @@ impl ResidentCache {
     }
 
     fn find(&self, tensor: &Tensor) -> Option<usize> {
-        let addr = tensor.data.as_ptr().addr();
-        let index = self
-            .projections
-            .binary_search_by_key(&addr, |projection| projection.source.as_ptr().addr())
+        let &[columns, rows] = tensor.dimensions.as_slice() else {
+            return None;
+        };
+        let key = (tensor.data.as_ptr().addr(), columns, rows);
+        let position = self
+            .by_storage
+            .binary_search_by_key(&key, |&index| {
+                let projection = &self.projections[index];
+                (
+                    projection.source.as_ptr().addr(),
+                    projection.columns,
+                    projection.rows,
+                )
+            })
             .ok()?;
+        let index = self.by_storage[position];
         let projection = &self.projections[index];
         (Arc::ptr_eq(&projection.source, &tensor.data)
             && tensor.kind == 142
@@ -280,25 +308,36 @@ impl ResidentCache {
 
     const fn has_metadata_capacity(&self, operations: usize) -> bool {
         self.projections.len() < self.projections.capacity()
+            && self.by_storage.len() < self.by_storage.capacity()
             && operations <= self.handles.capacity() - self.handles.len()
     }
 
     fn commit(&mut self, tensor: &Tensor, first_handle: usize, evaluated: bool) -> usize {
-        let addr = tensor.data.as_ptr().addr();
-        let index = self
-            .projections
-            .binary_search_by_key(&addr, |projection| projection.source.as_ptr().addr())
-            .unwrap_or_else(|pos| pos);
-        self.projections.insert(
-            index,
-            ResidentProjection {
-                source: Arc::clone(&tensor.data),
-                columns: tensor.dimensions[0],
-                rows: tensor.dimensions[1],
-                first_handle,
-                evaluated,
-            },
+        let key = (
+            tensor.data.as_ptr().addr(),
+            tensor.dimensions[0],
+            tensor.dimensions[1],
         );
+        let position = self
+            .by_storage
+            .binary_search_by_key(&key, |&index| {
+                let projection = &self.projections[index];
+                (
+                    projection.source.as_ptr().addr(),
+                    projection.columns,
+                    projection.rows,
+                )
+            })
+            .unwrap_or_else(|pos| pos);
+        let index = self.projections.len();
+        self.projections.push(ResidentProjection {
+            source: Arc::clone(&tensor.data),
+            columns: tensor.dimensions[0],
+            rows: tensor.dimensions[1],
+            first_handle,
+            evaluated,
+        });
+        self.by_storage.insert(position, index);
         self.statistics.tensors_prepared = self.statistics.tensors_prepared.saturating_add(1);
         index
     }
@@ -492,6 +531,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let Some(cache) = &mut self.residency else {
             return Ok(None);
         };
+        if let Some(index) = cache.find(tensor) {
+            return Ok(Some(index));
+        }
         let (columns, rows) = native_dimensions(tensor)?;
         let col_tiles = columns.div_ceil(self.maximum_columns);
         let row_tiles = rows.div_ceil(self.maximum_rows);
@@ -932,7 +974,6 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         finite_slice(activation)?;
         let mut weights = Vec::new();
         let mut indices = [0_usize; 3];
-        let mut any_prepared = false;
         for (member, &tensor) in tensors.iter().enumerate() {
             let index = if let Some(idx) = cached_indices[member] {
                 if let Some(cache) = &mut self.residency {
@@ -944,18 +985,10 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 }
                 idx
             } else {
-                any_prepared = true;
                 self.prepare_resident(tensor, &mut weights, true)?
                     .ok_or_else(|| invalid("native Q2 resident preparation failed"))?
             };
             indices[member] = index;
-        }
-        if any_prepared && let Some(cache) = &self.residency {
-            for (member, &tensor) in tensors.iter().enumerate() {
-                indices[member] = cache
-                    .find(tensor)
-                    .ok_or_else(|| invalid("native Q2 resident preparation failed"))?;
-            }
         }
         for (member, output) in outputs.iter_mut().enumerate() {
             let rows = rows_per_member[member];
@@ -3047,6 +3080,10 @@ fn pack_native_chunk(
 mod multitile_tests;
 
 #[cfg(test)]
+#[path = "native_q2/residency_tests.rs"]
+mod residency_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -3415,6 +3452,52 @@ mod tests {
         resident_calls: u64,
         remaining: u64,
         residency_bytes: usize,
+    }
+
+    #[test]
+    fn resident_cache_index_duplicate_siblings_prepare_one_extent() -> Result<()> {
+        let tensor = lazy_tensor("duplicate-sibling", 128, 32);
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 10, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(8192)
+            .map_err(|_| invalid("residency"))?;
+        let submitter = MockNativeSubmitter {
+            batch_ffn: false,
+            ffn_pair_calls: 0,
+            calls: 0,
+            resident_calls: 0,
+            remaining: 10,
+            residency_bytes: 8192,
+        };
+        let mut executor =
+            NativeQ2Executor::new(submitter, limits, 1024 * 1024).with_resident_weights(4096)?;
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for _ in 0..2 {
+            executor.project_f32_group(
+                &[&tensor, &tensor],
+                &[1.0; 128],
+                true,
+                &mut [&mut first, &mut second],
+            )?;
+            assert_eq!(first.len(), 32);
+            assert_eq!(second.len(), 32);
+            assert_eq!(first[0], 128.0);
+            assert_eq!(second[0], 129.0);
+            assert!(first[1..].iter().all(|value| value.to_bits() == 0));
+            assert!(second[1..].iter().all(|value| value.to_bits() == 0));
+            assert_eq!(executor.residency_statistics().tensors_prepared, 1);
+            assert_eq!(
+                executor
+                    .residency_statistics()
+                    .weight_payload_bytes_prepared,
+                1152
+            );
+        }
+        assert_eq!(executor.statistics().operations_attempted, 4);
+        assert_eq!(executor.statistics().operations_completed, 4);
+        assert_eq!(executor.operation_capacity(), Some(6));
+        Ok(())
     }
 
     #[expect(

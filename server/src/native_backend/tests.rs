@@ -717,7 +717,9 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
         legacy,
         json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0", "object":"model",
         "model_sha256":swift::MODEL_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
-        "runtime":"prism-inference", "context_tokens":8192, "seed":42, "row_workers":1}]})
+        "runtime":"prism-inference", "context_tokens":8192, "seed":42, "row_workers":1,
+        "startup_projection":{"schema_version":1,"requested":"auto","effective":"cpu",
+            "identity":null,"resident_tensors":0,"resident_weight_bytes":0,"host_metadata_bytes":0}}]})
     );
     let reused = ModelProfile {
         prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse::Latest,

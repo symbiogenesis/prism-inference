@@ -106,7 +106,7 @@ impl BatchAllocator {
             embedding_width: 0,
             sequence_limit: 0,
             batch: None,
-            sequence_positions: vec![BTreeSet::new(); MAX_SEQUENCES],
+            sequence_positions: Vec::new(),
             sequence_sets: Vec::new(),
             set_indices: BTreeMap::new(),
             coupled: false,
@@ -124,12 +124,19 @@ impl BatchAllocator {
     /// Returns native minimum/maximum positions, or `(-1, -1)` for an unused ID.
     #[must_use]
     pub fn sequence_position(&self, id: usize) -> Option<(i32, i32)> {
-        self.sequence_positions.get(id).map(|positions| {
-            (
-                positions.first().copied().unwrap_or(-1),
-                positions.last().copied().unwrap_or(-1),
-            )
-        })
+        if id >= MAX_SEQUENCES {
+            return None;
+        }
+        Some(
+            self.sequence_positions
+                .get(id)
+                .map_or((-1, -1), |positions| {
+                    (
+                        positions.first().copied().unwrap_or(-1),
+                        positions.last().copied().unwrap_or(-1),
+                    )
+                }),
+        )
     }
 
     /// Number of rows already consumed by splits.
@@ -146,6 +153,7 @@ impl BatchAllocator {
 
     fn clear(&mut self) {
         self.batch = None;
+        self.sequence_limit = 0;
         self.sequence_sets.clear();
         self.set_indices.clear();
         for positions in &mut self.sequence_positions {
@@ -267,6 +275,10 @@ impl BatchAllocator {
         }
         self.embedding_width = input.embedding_width;
         self.sequence_limit = sequence_limit;
+        if self.sequence_positions.len() < sequence_limit {
+            self.sequence_positions
+                .resize_with(sequence_limit, BTreeSet::new);
+        }
         for (index, ids) in sequence_ids.iter().enumerate() {
             let set: BTreeSet<_> = ids
                 .iter()
@@ -305,13 +317,13 @@ impl BatchAllocator {
                 return Ok(false);
             }
         }
-        let mut intersections: Vec<BTreeSet<usize>> =
-            vec![(0..sequence_limit).collect(); sequence_limit];
+        let mut intersections: Vec<Option<BTreeSet<usize>>> = vec![None; sequence_limit];
         let mut last = vec![-1; sequence_limit];
         for (index, set) in self.sequence_sets.iter().enumerate() {
             for &id in set {
-                intersections[id].retain(|member| set.contains(member));
-                if intersections[id].is_empty() || positions[index] < last[id] {
+                let entry = intersections[id].get_or_insert_with(|| set.clone());
+                entry.retain(|member| set.contains(member));
+                if entry.is_empty() || positions[index] < last[id] {
                     return Ok(false);
                 }
                 last[id] = positions[index];
@@ -591,5 +603,41 @@ impl BatchAllocator {
             unique_sequence_ids: (0..sequences).collect(),
             sequence_indices,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_positions_grow_lazily_and_preserve_bounds_contract() -> Result<()> {
+        let mut allocator = BatchAllocator::new(1)?;
+        assert_eq!(allocator.sequence_positions, Vec::new());
+        assert_eq!(allocator.sequence_position(0), Some((-1, -1)));
+        assert_eq!(allocator.sequence_position(255), Some((-1, -1)));
+        assert_eq!(allocator.sequence_position(MAX_SEQUENCES), None);
+
+        assert!(allocator.init(
+            Input {
+                tokens: Some(vec![1, 2]),
+                sequence_ids: Some(vec![vec![1], vec![1]]),
+                ..Input::default()
+            },
+            4,
+            2,
+            false,
+            None,
+        )?);
+        assert_eq!(allocator.sequence_positions.len(), 2);
+        assert_eq!(allocator.sequence_position(0), Some((-1, -1)));
+        assert_eq!(allocator.sequence_position(1), Some((0, 1)));
+        assert_eq!(allocator.sequence_position(200), Some((-1, -1)));
+        assert_eq!(allocator.sequence_position(MAX_SEQUENCES), None);
+
+        allocator.clear();
+        assert_eq!(allocator.sequence_positions.len(), 2);
+        assert_eq!(allocator.sequence_position(1), Some((-1, -1)));
+        Ok(())
     }
 }

@@ -2,6 +2,24 @@
 use super::{Kind, Part, Runtime, Val, value};
 use crate::{Result, invalid};
 use std::collections::BTreeMap;
+
+const MAX_DIAGNOSTIC_PREVIEW_BYTES: usize = 256;
+
+fn bounded_utf8_preview(bytes: &[u8]) -> String {
+    let sample = &bytes[..bytes.len().min(MAX_DIAGNOSTIC_PREVIEW_BYTES)];
+    let preview = String::from_utf8_lossy(sample);
+    if bytes.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES && preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES
+    {
+        return preview.into_owned();
+    }
+    let mut end = preview
+        .len()
+        .min(MAX_DIAGNOSTIC_PREVIEW_BYTES.saturating_sub(3));
+    while end > 0 && !preview.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &preview[..end])
+}
 pub(super) fn is_global(name: &str) -> bool {
     matches!(
         name,
@@ -166,7 +184,7 @@ impl Runtime {
         match name {
             "raise_exception" => Err(invalid(format!(
                 "Jinja Exception: {}",
-                String::from_utf8_lossy(&value.text())
+                bounded_utf8_preview(&value.text())
             ))),
             "namespace" => {
                 if !pos.is_empty() {
@@ -1093,4 +1111,32 @@ fn json_bytes(value: &Val, options: &JsonOptions, depth: usize) -> Result<Vec<u8
         return Err(invalid("Jinja JSON output bound exceeded"));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raise_exception_caps_message_preview_on_utf8_boundary() -> Result<()> {
+        let mut runtime = Runtime {
+            scopes: Vec::new(),
+            steps: 0,
+            depth: 0,
+            expression_depth: 0,
+            output_bytes: 0,
+        };
+        let long = "€".repeat(200);
+        let err = runtime
+            .builtin("raise_exception", vec![Val::string(long)], BTreeMap::new())
+            .err()
+            .ok_or_else(|| invalid("expected raise_exception error"))?;
+        let message = err.to_string();
+        let preview = message
+            .strip_prefix("Jinja Exception: ")
+            .ok_or_else(|| invalid("unexpected Jinja Exception prefix"))?;
+        assert!(preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(preview.ends_with("..."));
+        Ok(())
+    }
 }

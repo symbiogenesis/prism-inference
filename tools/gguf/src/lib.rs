@@ -56,6 +56,14 @@ fn open_read(path: &Path) -> Result<File> {
 }
 
 #[cfg(feature = "report")]
+fn path_basename(path: &Path, fallback: &str) -> String {
+    path.file_name().map_or_else(
+        || fallback.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+#[cfg(feature = "report")]
 pub(crate) fn digest_hex(hash: bonsai_native_hash::Hasher) -> Result<String> {
     Ok(bytes_hex(hash.finish()?))
 }
@@ -293,23 +301,29 @@ pub fn export_ptq1(
         {
             return Err(bad("GGUF: export metadata identity differs."));
         }
+        let output_artifact = serde_json::json!({
+            "role": "ptq1-export",
+            "name": path_basename(output, "export.gguf"),
+            "bytes": output_bytes,
+            "sha256": output_hash,
+        });
         report["SourceSha256"] = expected_sha256.to_ascii_lowercase().into();
         report["TokenizerMetadataSha256"] = checked.report["TokenizerMetadataSha256"].clone();
-        report["OutputPath"] = output.to_string_lossy().into_owned().into();
+        report["OutputArtifact"] = output_artifact;
         fs::hard_link(&partial, output)?;
         drop(exported);
         if let Err(error) = fs::remove_file(&partial) {
             // Publication already succeeded. Report a retained alias instead of
             // claiming that the validated final output failed to publish.
-            report["RetainedPartialPath"] = partial.to_string_lossy().into_owned().into();
+            report["RetainedPartialName"] = path_basename(&partial, "export.partial").into();
             report["PartialCleanupError"] = error.to_string().into();
         }
         Ok(report)
     })();
     result.map_err(|error: Error| {
         bad(format!(
-            "{error} Partial path (retained if created): {}",
-            partial.display()
+            "{error} Partial artifact (retained if created): {}",
+            path_basename(&partial, "export.partial")
         ))
     })
 }

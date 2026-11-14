@@ -10,6 +10,8 @@
     reason = "Keep graph-consumed tile types crate scoped inside the private kernel module."
 )]
 
+use std::sync::{Arc, Weak};
+
 use super::{
     ActivationContract, BF16, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0, Q5_1,
     Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite, integer_float,
@@ -83,10 +85,20 @@ fn dot_quantized_tile_row(
     Ok(sums)
 }
 
+#[derive(Clone)]
+struct PreparedBatch {
+    tokens: usize,
+    columns: usize,
+    pinned: bool,
+    contract: ActivationContract,
+    tensors: [Option<Weak<[u8]>>; 4],
+}
+
 #[derive(Default)]
 pub(crate) struct ProjectionTile {
     backend: MatvecBackend,
     preparations: Vec<MatvecScratch>,
+    last_preparation: Option<PreparedBatch>,
     row_parallelism: RowParallelism,
     pub(crate) packed_projections: u64,
     pub(crate) decoded_blocks: u64,
@@ -199,6 +211,8 @@ impl ProjectionTile {
                 output.clear();
             }
         }
+        let previous_preparation = self.last_preparation.take();
+        let mut reused_batch = false;
         let result = (|| {
             let (columns, rows, block_bytes) = dimensions(tensor)?;
             for (sibling, outputs) in tensors.iter().zip(all_outputs.iter_mut()).skip(1) {
@@ -215,16 +229,28 @@ impl ProjectionTile {
             {
                 return Err(invalid("invalid bounded projection tile"));
             }
+            let current_contract = ActivationContract::for_tensor(tensor, columns, pinned);
             let reuse_prepared = supports_tiled_rows(tensor.kind)
                 && self.preparations.len() >= inputs.len()
-                && previous.is_some_and(|prev| {
-                    supports_tiled_rows(prev.kind)
-                        && dimensions(prev).is_ok_and(|(prev_cols, _, _)| {
-                            prev_cols == columns
-                                && ActivationContract::for_tensor(prev, prev_cols, pinned)
-                                    == ActivationContract::for_tensor(tensor, columns, pinned)
+                && previous_preparation.as_ref().is_some_and(|prepared| {
+                    prepared.tokens == inputs.len()
+                        && prepared.columns == columns
+                        && prepared.pinned == pinned
+                        && prepared.contract == current_contract
+                        && previous.is_some_and(|prev| {
+                            supports_tiled_rows(prev.kind)
+                                && dimensions(prev).is_ok_and(|(prev_cols, _, _)| {
+                                    prev_cols == columns
+                                        && ActivationContract::for_tensor(prev, prev_cols, pinned)
+                                            == current_contract
+                                })
+                                && prepared.tensors.iter().flatten().any(|weak| {
+                                    weak.upgrade()
+                                        .is_some_and(|data| Arc::ptr_eq(&data, &prev.data))
+                                })
                         })
                 });
+            reused_batch = reuse_prepared;
             while self.preparations.len() < inputs.len() {
                 self.preparations.try_reserve_exact(1)?;
                 self.preparations.push(if pinned {
@@ -671,6 +697,26 @@ impl ProjectionTile {
                     output.clear();
                 }
             }
+        } else if supports_tiled_rows(tensor.kind)
+            && let Ok((columns, _, _)) = dimensions(tensor)
+        {
+            let mut prepared_tensors = [None, None, None, None];
+            for (slot, sibling) in prepared_tensors.iter_mut().zip(tensors) {
+                *slot = Some(Arc::downgrade(&sibling.data));
+            }
+            if reused_batch
+                && tensors.len() < prepared_tensors.len()
+                && let Some(prev) = previous
+            {
+                prepared_tensors[tensors.len()] = Some(Arc::downgrade(&prev.data));
+            }
+            self.last_preparation = Some(PreparedBatch {
+                tokens: inputs.len(),
+                columns,
+                pinned,
+                contract: ActivationContract::for_tensor(tensor, columns, pinned),
+                tensors: prepared_tensors,
+            });
         }
         result
     }
@@ -687,7 +733,6 @@ mod few_token_tests;
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::sync::Arc;
 
     use super::*;
 
@@ -1200,6 +1245,148 @@ mod tests {
                 assert_eq!(preps_after, preps_before, "prep not reused for kind={kind}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Regression verifies 32->4->8 stale-slot, pinned, tensor-id, and error invalidation together."
+    )]
+    fn projection_tile_invalidates_stale_tokens_pinned_tensor_and_errors() -> Result<()> {
+        let columns = 256_usize;
+        let rows = 8_usize;
+        let make_pq2 = |name: &str, seed: u8| -> Tensor {
+            let mut data = Vec::with_capacity(rows * (columns / 128) * 34);
+            for row in 0..rows {
+                for block_idx in 0..(columns / 128) {
+                    let mut block = [0_u8; 34];
+                    block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                    for byte in &mut block[2..] {
+                        *byte = seed.wrapping_add(u8::try_from(row + block_idx).unwrap_or(0));
+                    }
+                    data.extend_from_slice(&block);
+                }
+            }
+            Tensor {
+                name: name.to_owned(),
+                dimensions: vec![columns, rows],
+                kind: PQ2,
+                data: Arc::from(data),
+            }
+        };
+        let t0 = make_pq2("t0", 0x1b);
+        let t1 = make_pq2("t1", 0x72);
+        let t2 = make_pq2("t2", 0xe4);
+        let make_inputs = |count: usize, offset: usize| -> Vec<Vec<f32>> {
+            (0..count)
+                .map(|token| {
+                    (0..columns)
+                        .map(|idx| {
+                            [1.25, -3.5, 0.5, -2.25, 7.125, -0.375][(idx + token + offset) % 6]
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let scalar_bits =
+            |tensor: &Tensor, inputs: &[Vec<f32>], pinned: bool| -> Result<Vec<Vec<u32>>> {
+                inputs
+                    .iter()
+                    .map(|input| {
+                        let mut scratch = if pinned {
+                            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                        } else {
+                            MatvecScratch::with_backend(MatvecBackend::Scalar)
+                        };
+                        let mut out = Vec::new();
+                        matvec_into(tensor, input, &mut out, &mut scratch)?;
+                        Ok(out.into_iter().map(f32::to_bits).collect())
+                    })
+                    .collect()
+            };
+        let inputs_32 = make_inputs(32, 0);
+        let inputs_4 = make_inputs(4, 100);
+        let inputs_8 = make_inputs(8, 200);
+        let inputs_8_alt = make_inputs(8, 300);
+
+        let mut tile = ProjectionTile::with_backend(MatvecBackend::Scalar);
+        let mut out32 = vec![Vec::new(); 32];
+        tile.project(&t0, &inputs_32, &mut out32, true, &|| Ok(()))?;
+        assert_eq!(tile.preparations.len(), 32);
+
+        let mut out4 = vec![Vec::new(); 4];
+        tile.project(&t1, &inputs_4, &mut out4, true, &|| Ok(()))?;
+        let out4_bits: Vec<Vec<u32>> = out4
+            .iter()
+            .map(|r| r.iter().copied().map(f32::to_bits).collect())
+            .collect();
+        assert_eq!(out4_bits, scalar_bits(&t1, &inputs_4, true)?);
+
+        // 32 -> 4 -> 8 regression: must NOT reuse stale entries in slots 4..8.
+        let mut out8 = vec![Vec::new(); 8];
+        tile.project_with_previous(Some(&t1), &t2, &inputs_8, &mut out8, true, &|| Ok(()))?;
+        let out8_bits: Vec<Vec<u32>> = out8
+            .iter()
+            .map(|r| r.iter().copied().map(f32::to_bits).collect())
+            .collect();
+        assert_eq!(out8_bits, scalar_bits(&t2, &inputs_8, true)?);
+
+        // Pinning mode mismatch must invalidate cached preparations.
+        let mut out8_unpinned = vec![Vec::new(); 8];
+        let preps_before: Vec<usize> = tile
+            .preparations
+            .iter()
+            .take(8)
+            .map(MatvecScratch::preparation_count)
+            .collect();
+        tile.project_with_previous(
+            Some(&t2),
+            &t0,
+            &inputs_8_alt,
+            &mut out8_unpinned,
+            false,
+            &|| Ok(()),
+        )?;
+        let preps_after: Vec<usize> = tile
+            .preparations
+            .iter()
+            .take(8)
+            .map(MatvecScratch::preparation_count)
+            .collect();
+        assert!(
+            preps_before
+                .iter()
+                .zip(&preps_after)
+                .all(|(before, after)| *after > *before)
+        );
+        let unpinned_bits: Vec<Vec<u32>> = out8_unpinned
+            .iter()
+            .map(|r| r.iter().copied().map(f32::to_bits).collect())
+            .collect();
+        assert_eq!(unpinned_bits, scalar_bits(&t0, &inputs_8_alt, false)?);
+
+        // Tensor identity mismatch (`t1` was not last prepared; `t0` was) must invalidate.
+        tile.project_with_previous(Some(&t1), &t2, &inputs_8, &mut out8, false, &|| Ok(()))?;
+        let mismatched_bits: Vec<Vec<u32>> = out8
+            .iter()
+            .map(|r| r.iter().copied().map(f32::to_bits).collect())
+            .collect();
+        assert_eq!(mismatched_bits, scalar_bits(&t2, &inputs_8, false)?);
+
+        // Failure invalidation: failed call must clear valid_tokens so subsequent call re-prepares.
+        assert!(
+            tile.project_with_previous(Some(&t2), &t0, &inputs_8, &mut out8, false, &|| Err(
+                invalid("cancel")
+            ))
+            .is_err()
+        );
+        tile.project_with_previous(Some(&t2), &t0, &inputs_8_alt, &mut out8, false, &|| Ok(()))?;
+        let recovered_bits: Vec<Vec<u32>> = out8
+            .iter()
+            .map(|r| r.iter().copied().map(f32::to_bits).collect())
+            .collect();
+        assert_eq!(recovered_bits, scalar_bits(&t0, &inputs_8_alt, false)?);
         Ok(())
     }
 }

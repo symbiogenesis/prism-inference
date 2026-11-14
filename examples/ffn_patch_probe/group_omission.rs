@@ -178,7 +178,8 @@ pub(super) fn capture(
     deadline.check()?;
     publish(&request.capture_path, &bytes)?;
     Ok(json!({"event":"ffn-probe-captured","rows":row_count,
-        "capturePath":request.capture_path,"executionProfile":execution_profile,
+        "captureArtifact":super::capture_artifact_summary("structured-ffn-capture", &request.capture_path, &bytes)?,
+        "executionProfile":execution_profile,
         "originalReplayPasses":1,"studentReplayPasses":1,"recoveryApplied":recovery_sha256.is_some(),
         "recoveryArtifactSha256":recovery_sha256,"sourceResearchReplayImplemented":true,
         "allWeightsLoaded":true,"fullTeacherFfnExecuted":true,

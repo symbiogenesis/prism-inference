@@ -810,28 +810,99 @@ impl Arena {
         self.validate()
     }
     fn validate(&self) -> Result<()> {
+        const MAX_CHILDREN: usize = 16_384;
+        const MAX_TOTAL_EDGES: usize = 262_144;
         if self.parsers.len() > 16384
             || self.root >= self.parsers.len()
             || self.rules.values().any(|&id| id >= self.parsers.len())
         {
             return Err(invalid("PEG arena IDs/count outside bound"));
         }
+        let mut total_edges = 0_usize;
         for parser in &self.parsers {
-            let children: Vec<_> = match parser {
-                Parser::Sequence { children } | Parser::Choice { children } => children.clone(),
-                Parser::Repetition { child, .. }
-                | Parser::And { child }
+            let children: &[usize] = match parser {
+                Parser::Sequence { children } | Parser::Choice { children } => {
+                    if children.len() > MAX_CHILDREN {
+                        return Err(invalid("PEG child count exceeds bound"));
+                    }
+                    children
+                }
+                Parser::Repetition {
+                    child,
+                    min_count,
+                    max_count,
+                } => {
+                    if !(0..=65536).contains(min_count) || !(-1..=65536).contains(max_count) {
+                        return Err(invalid("PEG repetition extent exceeds bound"));
+                    }
+                    std::slice::from_ref(child)
+                }
+                Parser::Chars {
+                    min_count,
+                    max_count,
+                    ..
+                } => {
+                    if !(0..=65536).contains(min_count) || !(-1..=65536).contains(max_count) {
+                        return Err(invalid("PEG class extent exceeds bound"));
+                    }
+                    &[]
+                }
+                Parser::And { child }
                 | Parser::Not { child }
                 | Parser::Rule { child, .. }
                 | Parser::Atomic { child }
                 | Parser::Tag { child, .. }
                 | Parser::Gbnf { child, .. }
                 | Parser::Ac { child, .. }
-                | Parser::Schema { child, .. } => vec![*child],
-                _ => Vec::new(),
+                | Parser::Schema { child, .. } => std::slice::from_ref(child),
+                _ => &[],
             };
+            total_edges = total_edges
+                .checked_add(children.len())
+                .filter(|&count| count <= MAX_TOTAL_EDGES)
+                .ok_or_else(|| invalid("PEG arena edge count exceeds bound"))?;
             if children.iter().any(|&id| id >= self.parsers.len()) {
                 return Err(invalid("PEG child ID outside arena"));
+            }
+        }
+        let mut color = vec![0_u8; self.parsers.len()];
+        let mut stack = Vec::new();
+        for start in 0..self.parsers.len() {
+            if color[start] != 0 {
+                continue;
+            }
+            stack.push((start, false));
+            while let Some((node, exiting)) = stack.pop() {
+                if exiting {
+                    color[node] = 2;
+                    continue;
+                }
+                match color[node] {
+                    1 => return Err(invalid("PEG parser graph contains non-rule cycle")),
+                    2 => continue,
+                    _ => {}
+                }
+                color[node] = 1;
+                stack.push((node, true));
+                let edges: &[usize] = match &self.parsers[node] {
+                    Parser::Sequence { children } | Parser::Choice { children } => children,
+                    Parser::Repetition { child, .. }
+                    | Parser::And { child }
+                    | Parser::Not { child }
+                    | Parser::Atomic { child }
+                    | Parser::Tag { child, .. }
+                    | Parser::Gbnf { child, .. }
+                    | Parser::Ac { child, .. }
+                    | Parser::Schema { child, .. } => std::slice::from_ref(child),
+                    _ => &[],
+                };
+                for &next in edges {
+                    match color[next] {
+                        1 => return Err(invalid("PEG parser graph contains non-rule cycle")),
+                        0 => stack.push((next, false)),
+                        _ => {}
+                    }
+                }
             }
         }
         Ok(())
@@ -872,6 +943,41 @@ mod tests {
             r#"{"parsers":[{"type":"rule","name":"cycle","child":0,"trigger":false}],"rules":{"cycle":0},"root":0}"#,
         )?;
         assert!(recursive.parse(b"x", 0).is_err());
+        Ok(())
+    }
+    #[test]
+    fn validate_rejects_excessive_children_bad_repetition_and_non_rule_cycles() -> Result<()> {
+        assert!(
+            Arena::load(r#"{"parsers":[{"type":"sequence","children":[0]}],"rules":{},"root":0}"#)
+                .is_err()
+        );
+        assert!(
+            Arena::load(
+                r#"{"parsers":[{"type":"tag","child":1,"tag":"a"},{"type":"atomic","child":0}],"rules":{},"root":0}"#
+            )
+            .is_err()
+        );
+        assert!(
+            Arena::load(
+                r#"{"parsers":[{"type":"literal","literal":"x"},{"type":"repetition","child":0,"min_count":0,"max_count":-2}],"rules":{},"root":1}"#
+            )
+            .is_err()
+        );
+        let too_many_children = format!(
+            r#"{{"parsers":[{{"type":"literal","literal":"x"}},{{"type":"sequence","children":[{}]}}] ,"rules":{{}},"root":1}}"#,
+            std::iter::repeat_n("0", 16_385)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(Arena::load(&too_many_children).is_err());
+
+        let mut parsers = vec![serde_json::json!({"type": "literal", "literal": "x"})];
+        for id in 0..200_usize {
+            parsers.push(serde_json::json!({"type": "sequence", "children": [id]}));
+        }
+        let dag = serde_json::json!({"parsers": parsers, "rules": {}, "root": 200}).to_string();
+        let loaded = Arena::load(&dag)?;
+        assert_eq!(loaded.root(), 200);
         Ok(())
     }
 }

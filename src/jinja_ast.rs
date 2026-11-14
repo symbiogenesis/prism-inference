@@ -279,8 +279,18 @@ impl Expression {
         Ok(value)
     }
     fn test(&mut self) -> Result<Expr> {
+        let mut depth_steps = 1_usize;
+        self.depth += 1;
+        if self.depth > 128 {
+            return Err(invalid("Jinja test nesting bound exceeded"));
+        }
         let mut value = self.filter()?;
         while self.eat("is") {
+            self.depth += 1;
+            depth_steps += 1;
+            if self.depth > 128 {
+                return Err(invalid("Jinja test nesting bound exceeded"));
+            }
             let negative = self.eat("not");
             let name = self.identifier()?;
             let args = if self.word("(") {
@@ -290,11 +300,22 @@ impl Expression {
             };
             value = Expr::Test(Box::new(value), name, args, negative);
         }
+        self.depth -= depth_steps;
         Ok(value)
     }
     fn filter(&mut self) -> Result<Expr> {
+        let mut depth_steps = 1_usize;
+        self.depth += 1;
+        if self.depth > 128 {
+            return Err(invalid("Jinja filter nesting bound exceeded"));
+        }
         let mut value = self.postfix()?;
         while self.eat("|") {
+            self.depth += 1;
+            depth_steps += 1;
+            if self.depth > 128 {
+                return Err(invalid("Jinja filter nesting bound exceeded"));
+            }
             let name = self.identifier()?;
             let args = if self.word("(") {
                 self.args()?
@@ -303,6 +324,7 @@ impl Expression {
             };
             value = Expr::Filter(Box::new(value), name, args);
         }
+        self.depth -= depth_steps;
         Ok(value)
     }
     fn args(&mut self) -> Result<Vec<Arg>> {
@@ -736,4 +758,16 @@ pub(super) fn parse(source: &str) -> Result<Vec<Stmt>> {
         depth: 0,
     };
     parser.body(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_and_filter_chains_enforce_depth_bound() {
+        assert!(parse("{{ x | lower is defined }}").is_ok());
+        assert!(parse(&format!("{{{{ x{} }}}}", " | lower".repeat(130))).is_err());
+        assert!(parse(&format!("{{{{ x{} }}}}", " is defined".repeat(130))).is_err());
+    }
 }

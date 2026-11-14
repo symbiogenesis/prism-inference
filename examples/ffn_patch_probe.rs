@@ -147,6 +147,202 @@ fn hex(bytes: [u8; 32]) -> Result<String> {
     Ok(result)
 }
 
+fn path_basename(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || String::from("capture.json"),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn bytes_sha256(bytes: &[u8]) -> Result<String> {
+    let mut hash = Hasher::new()?;
+    hash.update(bytes)?;
+    hex(hash.finish()?)
+}
+
+fn capture_artifact_summary(role: &str, path: &Path, bytes: &[u8]) -> Result<Value> {
+    Ok(json!({
+        "role": role,
+        "name": path_basename(path),
+        "bytes": bytes.len(),
+        "sha256": bytes_sha256(bytes)?,
+    }))
+}
+
+fn ensure_finite(values: &[f32]) -> Result<()> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(reject("FFN probe vector contains non-finite values"));
+    }
+    Ok(())
+}
+
+fn sum_of_squares(values: &[f32]) -> Result<f64> {
+    ensure_finite(values)?;
+    let mut sum_sq = 0.0_f64;
+    for &value in values {
+        let wide = f64::from(value);
+        sum_sq = wide.mul_add(wide, sum_sq);
+    }
+    if !sum_sq.is_finite() {
+        return Err(reject("FFN probe vector energy overflowed"));
+    }
+    Ok(sum_sq)
+}
+
+fn l2_norm(values: &[f32]) -> Result<f64> {
+    let norm = sum_of_squares(values)?.sqrt();
+    if !norm.is_finite() {
+        return Err(reject("FFN probe vector norm overflowed"));
+    }
+    Ok(norm)
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<Option<f64>> {
+    ensure_finite(left)?;
+    ensure_finite(right)?;
+    if left.len() != right.len() {
+        return Err(reject("cosine similarity requires equal vector lengths"));
+    }
+    let left_norm = l2_norm(left)?;
+    let right_norm = l2_norm(right)?;
+    if left_norm <= 0.0 || right_norm <= 0.0 {
+        return Ok(None);
+    }
+    let mut dot = 0.0_f64;
+    for (&lhs, &rhs) in left.iter().zip(right.iter()) {
+        dot = f64::from(lhs).mul_add(f64::from(rhs), dot);
+    }
+    let ratio = (dot / (left_norm * right_norm)).clamp(-1.0, 1.0);
+    if !ratio.is_finite() {
+        return Err(reject("cosine similarity produced non-finite value"));
+    }
+    Ok(Some(ratio))
+}
+
+fn energy_entropy(values: &[f32]) -> Result<f64> {
+    let total_energy = sum_of_squares(values)?;
+    if total_energy <= 0.0 {
+        return Ok(0.0);
+    }
+    let mut entropy = 0.0_f64;
+    for &value in values {
+        let wide = f64::from(value);
+        let energy = wide * wide;
+        if energy > 0.0 {
+            let probability = energy / total_energy;
+            entropy = (-probability).mul_add(probability.ln(), entropy);
+        }
+    }
+    if !entropy.is_finite() {
+        return Err(reject("FFN probe vector entropy overflowed"));
+    }
+    Ok(if entropy <= 0.0 { 0.0 } else { entropy })
+}
+
+fn coordinate_coverage(values: &[f32]) -> Result<f64> {
+    ensure_finite(values)?;
+    if values.is_empty() {
+        return Ok(0.0);
+    }
+    let nonzero = values.iter().filter(|&&value| value.abs() > 0.0).count();
+    let numerator = f64::from(u32::try_from(nonzero)?);
+    let denominator = f64::from(u32::try_from(values.len())?);
+    Ok(numerator / denominator)
+}
+
+struct VectorStats {
+    l2_norm: f64,
+    energy_entropy: f64,
+    coordinate_coverage: f64,
+}
+
+impl VectorStats {
+    fn from_slice(values: &[f32]) -> Result<Self> {
+        Ok(Self {
+            l2_norm: l2_norm(values)?,
+            energy_entropy: energy_entropy(values)?,
+            coordinate_coverage: coordinate_coverage(values)?,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "l2Norm": self.l2_norm,
+            "energyEntropy": self.energy_entropy,
+            "coordinateCoverage": self.coordinate_coverage,
+        })
+    }
+}
+
+#[derive(Default)]
+struct StatsAccumulator {
+    count: u32,
+    l2_norm_sum: f64,
+    energy_entropy_sum: f64,
+    coordinate_coverage_sum: f64,
+}
+
+impl StatsAccumulator {
+    fn push(&mut self, stats: &VectorStats) -> Result<()> {
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| reject("FFN probe row count overflow"))?;
+        self.l2_norm_sum += stats.l2_norm;
+        self.energy_entropy_sum += stats.energy_entropy;
+        self.coordinate_coverage_sum += stats.coordinate_coverage;
+        if !self.l2_norm_sum.is_finite()
+            || !self.energy_entropy_sum.is_finite()
+            || !self.coordinate_coverage_sum.is_finite()
+        {
+            return Err(reject("FFN probe aggregate vector statistics overflowed"));
+        }
+        Ok(())
+    }
+
+    fn summary(&self) -> Value {
+        if self.count == 0 {
+            return json!({
+                "count": 0,
+                "meanL2Norm": Value::Null,
+                "meanEnergyEntropy": Value::Null,
+                "meanCoordinateCoverage": Value::Null,
+            });
+        }
+        let denom = f64::from(self.count);
+        json!({
+            "count": self.count,
+            "meanL2Norm": self.l2_norm_sum / denom,
+            "meanEnergyEntropy": self.energy_entropy_sum / denom,
+            "meanCoordinateCoverage": self.coordinate_coverage_sum / denom,
+        })
+    }
+}
+
+fn row_pair_stats(
+    first_name: &str,
+    first: &[f32],
+    second_name: &str,
+    second: &[f32],
+    include_cosine: bool,
+) -> Result<(VectorStats, VectorStats, Option<f64>, Value)> {
+    let first_stats = VectorStats::from_slice(first)?;
+    let second_stats = VectorStats::from_slice(second)?;
+    let cosine = if include_cosine {
+        cosine_similarity(first, second)?
+    } else {
+        None
+    };
+    let mut value = json!({
+        first_name: first_stats.to_json(),
+        second_name: second_stats.to_json(),
+    });
+    if include_cosine {
+        value["inputTargetCosine"] = json!(cosine);
+    }
+    Ok((first_stats, second_stats, cosine, value))
+}
+
 fn parse_scale(bits: &str) -> Result<f32> {
     if bits.len() != 8 || !bits.bytes().all(lower_hex) {
         return Err(reject(
@@ -375,6 +571,10 @@ fn run() -> Result<Value> {
     source["graphIdentity"] = graph.identity().into();
     let mut rows = Vec::new();
     let mut logits = Vec::new();
+    let mut first_accumulator = StatsAccumulator::default();
+    let mut second_accumulator = StatsAccumulator::default();
+    let mut cosine_count = 0_u32;
+    let mut cosine_sum = 0.0_f64;
     for sequence in &request.sequences {
         graph.reset()?;
         for (index, &token) in sequence.token_ids.iter().enumerate() {
@@ -388,10 +588,26 @@ fn run() -> Result<Value> {
                         ));
                     }
                     deadline.check()?;
+                    let (input_stats, target_stats, cosine, pair_json) = row_pair_stats(
+                        "input",
+                        &observation.input,
+                        "target",
+                        &observation.target,
+                        true,
+                    )?;
+                    first_accumulator.push(&input_stats)?;
+                    second_accumulator.push(&target_stats)?;
+                    if let Some(cosine) = cosine {
+                        cosine_count = cosine_count
+                            .checked_add(1)
+                            .ok_or_else(|| reject("FFN probe cosine count overflow"))?;
+                        cosine_sum += cosine;
+                    }
                     rows.push(json!({
                         "sampleId":sequence.sample_id,"groupId":sequence.group_id,
                         "tokenIndex":index,"split":sequence.split,
                         "input":observation.input,"target":observation.target,
+                        "vectorStats":pair_json,
                     }));
                 } else {
                     graph.evaluate_into(token, &mut logits)?;
@@ -406,16 +622,30 @@ fn run() -> Result<Value> {
                             "actual FFN observation dimensions differ from Swift contract",
                         ));
                     }
-                    row = Some(json!({
-                        "sampleId":sequence.sample_id,"groupId":sequence.group_id,
-                        "tokenIndex":index,"split":sequence.split,"label":sequence.label,
-                        "activation":observation.activation,"residual":observation.residual,
-                    }));
+                    let (act_stats, res_stats, _, pair_json) = row_pair_stats(
+                        "activation",
+                        observation.activation,
+                        "residual",
+                        observation.residual,
+                        false,
+                    )?;
+                    row = Some((
+                        json!({
+                            "sampleId":sequence.sample_id,"groupId":sequence.group_id,
+                            "tokenIndex":index,"split":sequence.split,"label":sequence.label,
+                            "activation":observation.activation,"residual":observation.residual,
+                            "vectorStats":pair_json,
+                        }),
+                        act_stats,
+                        res_stats,
+                    ));
                 }
                 Ok(())
             })?;
             deadline.check()?;
-            if let Some(row) = row {
+            if let Some((row, act_stats, res_stats)) = row {
+                first_accumulator.push(&act_stats)?;
+                second_accumulator.push(&res_stats)?;
                 rows.push(row);
             }
         }
@@ -424,12 +654,29 @@ fn run() -> Result<Value> {
     let artifact = match request.capture_kind {
         CaptureKind::HiddenPatch => json!({
             "schemaVersion":1,"source":source,"site":site,"rows":rows,
+            "vectorStats":{
+                "activation":first_accumulator.summary(),
+                "residual":second_accumulator.summary(),
+            },
             "observationGraphIdentity":graph.identity(),
             "qualification":"teacher-forced observations only; labels are supplied, not independently diagnosed; no behavioral or performance acceptance",
         }),
-        CaptureKind::FfnSurrogate => json!({
-            "schemaVersion":1,"source":source,"site":site,"rows":rows,
-        }),
+        CaptureKind::FfnSurrogate => {
+            let mean_cosine = if cosine_count == 0 {
+                Value::Null
+            } else {
+                json!(cosine_sum / f64::from(cosine_count))
+            };
+            json!({
+                "schemaVersion":1,"source":source,"site":site,"rows":rows,
+                "vectorStats":{
+                    "input":first_accumulator.summary(),
+                    "target":second_accumulator.summary(),
+                    "cosineSampleCount":cosine_count,
+                    "meanInputTargetCosine":mean_cosine,
+                },
+            })
+        }
         CaptureKind::FfnGroupOmission => {
             return Err(reject("structured capture must use its two-pass path"));
         }
@@ -440,9 +687,13 @@ fn run() -> Result<Value> {
     }
     deadline.check()?;
     publish(&request.capture_path, &bytes)?;
-    Ok(
-        json!({"event":"ffn-probe-captured","rows":row_count,"capturePath":request.capture_path,"executionProfile":EXECUTION_PROFILE,"qualification":"unqualified research capture"}),
-    )
+    Ok(json!({
+        "event": "ffn-probe-captured",
+        "rows": row_count,
+        "captureArtifact": capture_artifact_summary("ffn-capture", &request.capture_path, &bytes)?,
+        "executionProfile": EXECUTION_PROFILE,
+        "qualification": "unqualified research capture",
+    }))
 }
 
 fn factor(value: &Value, expected: usize) -> Result<Vec<f32>> {
@@ -631,6 +882,66 @@ mod tests {
         request.patch_path = None;
         request.capture_kind = CaptureKind::FfnSurrogate;
         assert!(validate(&request).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vector_telemetry_rejects_non_finite_and_mismatched_and_matches_exact_identities()
+    -> Result<()> {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(super::l2_norm(&[1.0, bad]).is_err());
+            assert!(super::energy_entropy(&[1.0, bad]).is_err());
+            assert!(super::coordinate_coverage(&[1.0, bad]).is_err());
+            assert!(super::cosine_similarity(&[1.0, 2.0], &[1.0, bad]).is_err());
+        }
+        assert!(super::cosine_similarity(&[1.0, 2.0], &[1.0]).is_err());
+
+        assert!(super::l2_norm(&[0.0, -0.0, 0.0])?.abs() < 1e-12);
+        assert!(super::energy_entropy(&[0.0, -0.0])?.abs() < 1e-12);
+        assert!(super::coordinate_coverage(&[0.0, -0.0, 0.0])?.abs() < 1e-12);
+        assert!(super::cosine_similarity(&[0.0, 0.0], &[1.0, 0.0])?.is_none());
+
+        assert!((super::l2_norm(&[3.0, -4.0])? - 5.0).abs() < 1e-12);
+        assert!(super::energy_entropy(&[0.0, 5.0, 0.0])?.abs() < 1e-12);
+        assert!((super::energy_entropy(&[2.0, -2.0, 2.0, -2.0])? - 4.0_f64.ln()).abs() < 1e-12);
+        assert!((super::coordinate_coverage(&[0.0, 1.5, -0.0, -2.0])? - 0.5).abs() < 1e-12);
+
+        let same = super::cosine_similarity(&[1.0, -2.0], &[3.0, -6.0])?.ok_or("missing cosine")?;
+        assert!((same - 1.0).abs() < 1e-12);
+        let opposite =
+            super::cosine_similarity(&[1.0, 2.0], &[-1.0, -2.0])?.ok_or("missing cosine")?;
+        assert!((opposite + 1.0).abs() < 1e-12);
+        let orthogonal =
+            super::cosine_similarity(&[1.0, 0.0], &[0.0, 2.0])?.ok_or("missing cosine")?;
+        assert!(orthogonal.abs() < 1e-12);
+
+        let (_, _, cosine, stats_json) =
+            super::row_pair_stats("input", &[3.0, 0.0], "target", &[0.0, 4.0], true)?;
+        assert!(cosine.ok_or("missing pair cosine")?.abs() < 1e-12);
+        assert!(
+            (stats_json["input"]["l2Norm"]
+                .as_f64()
+                .ok_or("missing norm")?
+                - 3.0)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (stats_json["target"]["coordinateCoverage"]
+                .as_f64()
+                .ok_or("missing coverage")?
+                - 0.5)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            super::path_basename(std::path::Path::new("C:\\private\\dir\\capture.json")),
+            "capture.json"
+        );
+        assert_eq!(
+            super::bytes_sha256(b"")?,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
         Ok(())
     }
 }

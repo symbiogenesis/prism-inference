@@ -15,6 +15,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Result, invalid};
 
+const MAX_DIAGNOSTIC_PREVIEW_BYTES: usize = 256;
+
+fn bounded_preview(text: &str) -> String {
+    if text.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_DIAGNOSTIC_PREVIEW_BYTES.saturating_sub(3);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
 #[path = "schema_integer.rs"]
 mod integer;
 #[path = "schema_pattern.rs"]
@@ -857,7 +870,7 @@ impl Converter {
             .ok_or_else(|| {
                 invalid(format!(
                     "unrecognized schema {}",
-                    schema.dump().unwrap_or_default()
+                    bounded_preview(&schema.dump().unwrap_or_default())
                 ))
             })?;
         self.primitive(if rule_name == "root" { "root" } else { kind }, kind)
@@ -1046,5 +1059,25 @@ impl SchemaInfo {
             })
         }
         check(&self.schema, &self.converter.refs, &mut HashSet::new(), 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrecognized_schema_diagnostic_caps_long_preview_on_utf8_boundary() -> Result<()> {
+        let huge = serde_json::json!({ "type": "€".repeat(200) }).to_string();
+        let err = to_grammar(&huge, false)
+            .err()
+            .ok_or_else(|| invalid("expected unrecognized schema error"))?;
+        let message = err.to_string();
+        let preview = message
+            .strip_prefix("unrecognized schema ")
+            .ok_or_else(|| invalid("unexpected schema error prefix"))?;
+        assert!(preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(preview.ends_with("..."));
+        Ok(())
     }
 }

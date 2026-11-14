@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism};
 use bonsai_prism_runtime::model::lora::RankOneAdapter;
@@ -20,7 +21,7 @@ use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::runtime::greedy;
 use bonsai_prism_runtime::token_input::read_tokens;
 use bonsai_prism_runtime::{Decoder, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const MODEL_BUDGET: usize = 8 * 1024 * 1024 * 1024;
 const MAX_GREEDY_STEPS: usize = 16;
@@ -52,7 +53,7 @@ fn reject(message: &str) -> bonsai_prism_runtime::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into()
 }
 
-fn emit(record: &serde_json::Value) -> Result<()> {
+fn emit(record: &Value) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, record)?;
     stdout.write_all(b"\n")?;
@@ -393,19 +394,47 @@ fn trajectory(
     )
 }
 
+fn hash_f32_le(values: &[f32]) -> Result<(usize, String)> {
+    let bytes = values
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| reject("logit snapshot byte size overflow"))?;
+    let mut hash = Hasher::new()?;
+    for value in values {
+        hash.update(&value.to_le_bytes())?;
+    }
+    let sha256: String = hash
+        .finish()?
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+        .collect();
+    Ok((bytes, sha256))
+}
+
+fn snapshot_artifact_metadata(position: usize, logits: &[f32]) -> Result<Value> {
+    let (bytes, sha256) = hash_f32_le(logits)?;
+    Ok(json!({
+        "role": "logits-snapshot",
+        "name": format!("logits-{position}.f32le"),
+        "bytes": bytes,
+        "sha256": sha256,
+    }))
+}
+
 fn snapshot(
     graph: &Qwen35,
     logits: &[f32],
     evidence: &Path,
     position: usize,
     remaining: &mut usize,
-) -> Result<PathBuf> {
+) -> Result<Value> {
     let output = evidence.join(format!("logits-{position}.f32le"));
     write_values(&output, logits, remaining)?;
     let states = evidence.join(format!("state-{position}"));
     std::fs::create_dir(&states)?;
     dump_state(graph, &states, remaining)?;
-    Ok(output)
+    snapshot_artifact_metadata(position, logits)
 }
 
 fn write_values(path: &Path, values: &[f32], remaining: &mut usize) -> Result<()> {
@@ -635,6 +664,27 @@ mod tests {
         assert_eq!(std::fs::read(&output)?, expected);
         std::fs::remove_file(output)?;
         std::fs::remove_dir(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_artifact_metadata_omits_paths_and_records_sha256() -> Result<()> {
+        let values = [1.0_f32, -0.5_f32];
+        let metadata = super::snapshot_artifact_metadata(7, &values)?;
+        assert_eq!(metadata["role"], "logits-snapshot");
+        assert_eq!(metadata["name"], "logits-7.f32le");
+        assert_eq!(metadata["bytes"], 8);
+        let expected_bytes = [0_u8, 0, 128, 63, 0, 0, 0, 191];
+        let expected_sha256: String = bonsai_native_hash::hash_bytes(&expected_bytes)?
+            .iter()
+            .flat_map(|byte| [byte >> 4, byte & 15])
+            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
+            .collect();
+        assert_eq!(metadata["sha256"], expected_sha256);
+        let serialized = serde_json::to_string(&metadata)?;
+        assert!(!serialized.contains('\\'));
+        assert!(!serialized.contains('/'));
+        assert!(!serialized.contains("C:"));
         Ok(())
     }
 }

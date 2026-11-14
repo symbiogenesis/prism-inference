@@ -4,7 +4,7 @@
 //! They do not establish that its authoring basis matches a particular model,
 //! and do not enable adapters in the private Swift HTTP service.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, fmt::Write as _, path::Path, sync::Arc};
 
 use bonsai_gguf::MetadataValue;
 
@@ -364,8 +364,15 @@ impl RankOneAdapter {
         if factors.len() * 2 != model.tensors.len() {
             return Err(invalid("incomplete rank-one adapter inventory"));
         }
+        let execution_identity = adapter_execution_identity(
+            &model.identity,
+            &base.identity,
+            *alpha,
+            embedding.as_ref().map(|(tensor, _)| tensor),
+            &factors,
+        )?;
         Ok(Self {
-            execution_identity: model.identity.clone(),
+            execution_identity,
             identity: model.identity,
             base_identity: base.identity.clone(),
             alpha: *alpha,
@@ -744,6 +751,56 @@ fn decode_shared_factor<'a>(
     Ok(values)
 }
 
+fn hash_len_bytes(hasher: &mut bonsai_native_hash::Hasher, bytes: &[u8]) -> Result<()> {
+    hasher.update(&u64::try_from(bytes.len())?.to_le_bytes())?;
+    hasher.update(bytes)?;
+    Ok(())
+}
+
+fn adapter_execution_identity(
+    model_identity: &str,
+    base_identity: &str,
+    alpha: f32,
+    embedding: Option<&Tensor>,
+    factors: &BTreeMap<String, Factors>,
+) -> Result<String> {
+    let mut hasher = bonsai_native_hash::Hasher::new()?;
+    hasher.update(b"prism-rank-one-adapter-v1\0")?;
+    hash_len_bytes(&mut hasher, base_identity.as_bytes())?;
+    hasher.update(&alpha.to_bits().to_le_bytes())?;
+    if let Some(embed) = embedding {
+        hasher.update(&[1_u8])?;
+        hash_len_bytes(&mut hasher, embed.name.as_bytes())?;
+        hasher.update(&embed.kind.to_le_bytes())?;
+        hasher.update(&u64::try_from(embed.dimensions.len())?.to_le_bytes())?;
+        for &dim in &embed.dimensions {
+            hasher.update(&u64::try_from(dim)?.to_le_bytes())?;
+        }
+        hash_len_bytes(&mut hasher, &embed.data)?;
+    } else {
+        hasher.update(&[0_u8])?;
+    }
+    hasher.update(&u64::try_from(factors.len())?.to_le_bytes())?;
+    for (target, factor) in factors {
+        hash_len_bytes(&mut hasher, target.as_bytes())?;
+        hasher.update(&u64::try_from(factor.a_values.len())?.to_le_bytes())?;
+        for value in &factor.a_values {
+            hasher.update(&value.to_bits().to_le_bytes())?;
+        }
+        hasher.update(&u64::try_from(factor.b_values.len())?.to_le_bytes())?;
+        for value in factor.b_values.as_slice() {
+            hasher.update(&value.to_bits().to_le_bytes())?;
+        }
+    }
+    let digest = hasher.finish()?;
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hex, "{byte:02x}")
+            .map_err(|_| invalid("rank-one adapter execution digest format error"))?;
+    }
+    Ok(format!("{model_identity}:sha256={hex}"))
+}
+
 #[cfg(test)]
 mod storage_tests;
 
@@ -1018,6 +1075,97 @@ mod tests {
                     to_bits(&scratch_single.correction)
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rank_one_execution_identity_binds_weights_alpha_signed_zero_embedding_and_base() -> Result<()>
+    {
+        let build = |base_id: &str,
+                     alpha: f32,
+                     a_val: f32,
+                     b_val: f32,
+                     emb_a_val: Option<f32>|
+         -> Result<RankOneAdapter> {
+            let linear = "blk.0.ffn_down.weight";
+            let emb = "token_embd.weight";
+            let mut base = Model {
+                identity: base_id.into(),
+                metadata: BTreeMap::from([(
+                    "general.architecture".into(),
+                    MetadataValue::from("qwen35"),
+                )]),
+                tensors: BTreeMap::from([(
+                    linear.into(),
+                    Tensor {
+                        name: linear.into(),
+                        dimensions: vec![1, 1],
+                        kind: 0,
+                        data: Arc::from(vec![0_u8; 4]),
+                    },
+                )]),
+            };
+            let mut tensors = BTreeMap::from([
+                (
+                    format!("{linear}.lora_a"),
+                    tensor(&format!("{linear}.lora_a"), &[a_val]),
+                ),
+                (
+                    format!("{linear}.lora_b"),
+                    tensor(&format!("{linear}.lora_b"), &[b_val]),
+                ),
+            ]);
+            if let Some(ev) = emb_a_val {
+                base.tensors.insert(
+                    emb.into(),
+                    Tensor {
+                        name: emb.into(),
+                        dimensions: vec![1, 1],
+                        kind: 0,
+                        data: Arc::from(vec![0_u8; 4]),
+                    },
+                );
+                tensors.insert(
+                    format!("{emb}.lora_a"),
+                    tensor(&format!("{emb}.lora_a"), &[ev]),
+                );
+                tensors.insert(
+                    format!("{emb}.lora_b"),
+                    tensor(&format!("{emb}.lora_b"), &[1.0]),
+                );
+            }
+            let model = Model {
+                identity: "reused-general-name".into(),
+                metadata: BTreeMap::from([
+                    ("general.architecture".into(), MetadataValue::from("qwen35")),
+                    ("general.type".into(), MetadataValue::from("adapter")),
+                    ("adapter.type".into(), MetadataValue::from("lora")),
+                    ("adapter.lora_alpha".into(), MetadataValue::from(alpha)),
+                ]),
+                tensors,
+            };
+            RankOneAdapter::from_model(model, &base)
+        };
+        let baseline = build("base-a", 1.0, 0.0, 2.0, Some(0.5))?;
+        let repeated = build("base-a", 1.0, 0.0, 2.0, Some(0.5))?;
+        assert_eq!(baseline.identity(), "reused-general-name");
+        assert_eq!(baseline.execution_identity(), repeated.execution_identity());
+
+        let diff_signed_zero = build("base-a", 1.0, -0.0, 2.0, Some(0.5))?;
+        let diff_weights = build("base-a", 1.0, 0.0, 3.0, Some(0.5))?;
+        let diff_alpha = build("base-a", 2.0, 0.0, 2.0, Some(0.5))?;
+        let diff_embed = build("base-a", 1.0, 0.0, 2.0, Some(-0.5))?;
+        let diff_base = build("base-b", 1.0, 0.0, 2.0, Some(0.5))?;
+        for other in [
+            diff_signed_zero,
+            diff_weights,
+            diff_alpha,
+            diff_embed,
+            diff_base,
+        ] {
+            assert_eq!(other.identity(), "reused-general-name");
+            assert_ne!(other.execution_identity(), baseline.execution_identity());
         }
         Ok(())
     }

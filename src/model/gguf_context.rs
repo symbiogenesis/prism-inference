@@ -13,6 +13,7 @@ use crate::{Result, invalid};
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 65536;
+const MAX_ALIGNMENT: u32 = 1_048_576;
 
 /// Exact ordered GGUF metadata value, retaining its scalar/array wire type.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,7 +56,9 @@ pub struct Context {
     alignment: usize,
     data_offset: u64,
     entries: Vec<Entry>,
+    entry_keys: BTreeSet<String>,
     tensors: Vec<Tensor>,
+    tensor_names: BTreeSet<String>,
     loaded: bool,
     blob: Option<Vec<u8>>,
 }
@@ -192,8 +195,10 @@ impl Entry {
                 return Err(invalid("GGUF alignment must be UINT32"));
             }
             let value = u32::from_le_bytes(self.data[..4].try_into()?);
-            if !value.is_power_of_two() {
-                return Err(invalid("GGUF alignment must be a positive power of two"));
+            if !value.is_power_of_two() || value > MAX_ALIGNMENT {
+                return Err(invalid(
+                    "GGUF alignment must be a positive power of two up to 1 MiB",
+                ));
             }
         }
         Ok(())
@@ -215,7 +220,9 @@ impl Context {
             alignment: 32,
             data_offset: 0,
             entries: Vec::new(),
+            entry_keys: BTreeSet::new(),
             tensors: Vec::new(),
+            tensor_names: BTreeSet::new(),
             loaded: false,
             blob: None,
         }
@@ -263,12 +270,14 @@ impl Context {
     /// reserved alignment metadata, collection bounds or allocation failures.
     pub fn set_entry(&mut self, entry: Entry) -> Result<()> {
         entry.validate(true)?;
-        if self.entries.len() >= MAX_ITEMS
-            && !self.entries.iter().any(|value| value.key == entry.key)
-        {
-            return Err(invalid("GGUF metadata entry count exceeds bound"));
+        if self.entry_keys.contains(&entry.key) {
+            self.entries.retain(|value| value.key != entry.key);
+        } else {
+            if self.entries.len() >= MAX_ITEMS {
+                return Err(invalid("GGUF metadata entry count exceeds bound"));
+            }
+            self.entry_keys.insert(entry.key.clone());
         }
-        self.entries.retain(|value| value.key != entry.key);
         self.entries.push(entry);
         Ok(())
     }
@@ -287,7 +296,7 @@ impl Context {
                     }
                 }
             }
-            if entry.kind == 7 {
+            if entry.kind == 7 || entry.array_kind == Some(7) {
                 entry
                     .data
                     .iter_mut()
@@ -313,7 +322,7 @@ impl Context {
         let bytes = tensor_bytes(kind, dimensions)?;
         if name.len() >= 64
             || name.contains('\0')
-            || self.tensors.iter().any(|tensor| tensor.name == name)
+            || self.tensor_names.contains(&name)
             || self.tensors.len() >= MAX_ITEMS
             || usize::try_from(bytes)? != data.len()
             || data.len() > MAX_BYTES
@@ -328,6 +337,7 @@ impl Context {
         } else {
             0
         };
+        self.tensor_names.insert(name.clone());
         self.tensors.push(Tensor {
             name,
             kind,
@@ -551,10 +561,9 @@ fn parse<F: FnMut(u64, &mut [u8]) -> Result<usize>>(
         version,
         ..Context::new()
     };
-    let mut keys = BTreeSet::new();
     for _ in 0..key_count {
         let key = String::from_utf8(reader.string()?)?;
-        if !keys.insert(key.clone()) {
+        if !context.entry_keys.insert(key.clone()) {
             return Err(invalid("duplicate GGUF metadata key"));
         }
         let kind = reader.u32()?;
@@ -603,24 +612,21 @@ fn parse<F: FnMut(u64, &mut [u8]) -> Result<usize>>(
         }
         context.entries.push(entry);
     }
-    let mut names = BTreeSet::new();
     let mut total = 0_u64;
     for _ in 0..tensor_count {
         let raw_name = reader.string()?;
-        if raw_name.len() >= 64 {
-            return Err(invalid("GGUF tensor name is too long"));
+        if raw_name.len() >= 64 || raw_name.contains(&0) {
+            return Err(invalid(
+                "GGUF tensor name is overlong or contains null byte",
+            ));
         }
-        let end = raw_name
-            .iter()
-            .position(|&byte| byte == 0)
-            .unwrap_or(raw_name.len());
-        let name = String::from_utf8(raw_name[..end].to_vec())?;
-        if !names.insert(name.clone()) {
+        let name = String::from_utf8(raw_name)?;
+        if !context.tensor_names.insert(name.clone()) {
             return Err(invalid("duplicate GGUF tensor name"));
         }
         let rank = usize::try_from(reader.u32()?)?;
-        if rank > 4 {
-            return Err(invalid("GGUF tensor rank exceeds four"));
+        if !(1..=4).contains(&rank) {
+            return Err(invalid("GGUF tensor rank must be in 1..=4"));
         }
         let mut dimensions = [1; 4];
         for dimension in &mut dimensions[..rank] {
@@ -671,4 +677,123 @@ fn parse<F: FnMut(u64, &mut [u8]) -> Result<usize>>(
         context.blob = Some(blob);
     }
     Ok(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_header(tensor_count: u64, key_count: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&tensor_count.to_le_bytes());
+        bytes.extend_from_slice(&key_count.to_le_bytes());
+        bytes
+    }
+
+    fn push_str(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+        out.extend_from_slice(&u64::try_from(value.len())?.to_le_bytes());
+        out.extend_from_slice(value);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rejects_zero_rank_and_excess_alignment_and_interior_nul() -> Result<()> {
+        let mut zero_rank = minimal_header(1, 0);
+        push_str(&mut zero_rank, b"t0")?;
+        zero_rank.extend_from_slice(&0_u32.to_le_bytes());
+        zero_rank.extend_from_slice(&0_u32.to_le_bytes());
+        zero_rank.extend_from_slice(&0_u64.to_le_bytes());
+        assert!(Context::read_buffer(&zero_rank, false).is_err());
+
+        let mut nul_tensor = minimal_header(1, 0);
+        push_str(&mut nul_tensor, b"bad\0name")?;
+        nul_tensor.extend_from_slice(&1_u32.to_le_bytes());
+        nul_tensor.extend_from_slice(&1_u64.to_le_bytes());
+        nul_tensor.extend_from_slice(&0_u32.to_le_bytes());
+        nul_tensor.extend_from_slice(&0_u64.to_le_bytes());
+        assert!(Context::read_buffer(&nul_tensor, false).is_err());
+
+        let mut big_align = minimal_header(0, 1);
+        push_str(&mut big_align, b"general.alignment")?;
+        big_align.extend_from_slice(&4_u32.to_le_bytes());
+        big_align.extend_from_slice(&(MAX_ALIGNMENT * 2).to_le_bytes());
+        assert!(Context::read_buffer(&big_align, false).is_err());
+
+        let mut max_align = minimal_header(0, 1);
+        push_str(&mut max_align, b"general.alignment")?;
+        max_align.extend_from_slice(&4_u32.to_le_bytes());
+        max_align.extend_from_slice(&MAX_ALIGNMENT.to_le_bytes());
+        let parsed = Context::read_buffer(&max_align, false)?;
+        assert_eq!(parsed.alignment(), usize::try_from(MAX_ALIGNMENT)?);
+        Ok(())
+    }
+
+    #[test]
+    fn entry_sets_enforce_bounds_and_copy_normalizes_array_bools() -> Result<()> {
+        let mut ctx = Context::new();
+        assert!(
+            ctx.set_entry(Entry {
+                key: "bad\0key".to_owned(),
+                kind: 4,
+                array_kind: None,
+                count: 1,
+                data: 1_u32.to_le_bytes().to_vec(),
+                strings: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            ctx.set_entry(Entry {
+                key: "bad_bool".to_owned(),
+                kind: 7,
+                array_kind: None,
+                count: 1,
+                data: vec![2],
+                strings: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            ctx.set_entry(Entry {
+                key: "bad_bool_arr".to_owned(),
+                kind: 9,
+                array_kind: Some(7),
+                count: 2,
+                data: vec![0, 2],
+                strings: Vec::new(),
+            })
+            .is_err()
+        );
+
+        let mut parsed_bool_arr = minimal_header(0, 1);
+        push_str(&mut parsed_bool_arr, b"flags")?;
+        parsed_bool_arr.extend_from_slice(&9_u32.to_le_bytes());
+        parsed_bool_arr.extend_from_slice(&7_u32.to_le_bytes());
+        parsed_bool_arr.extend_from_slice(&2_u64.to_le_bytes());
+        parsed_bool_arr.extend_from_slice(&[0, 255]);
+        let src = Context::read_buffer(&parsed_bool_arr, false)?;
+        ctx.copy_metadata(&src)?;
+        assert_eq!(ctx.entries()[0].data, vec![0, 1]);
+
+        for index in 0..2000_usize {
+            ctx.set_entry(Entry {
+                key: format!("k.{index}"),
+                kind: 4,
+                array_kind: None,
+                count: 1,
+                data: u32::try_from(index)?.to_le_bytes().to_vec(),
+                strings: Vec::new(),
+            })?;
+            ctx.add_tensor(format!("t.{index}"), 0, [1, 1, 1, 1], vec![0; 4])?;
+        }
+        assert!(
+            ctx.add_tensor("t.0".to_owned(), 0, [1, 1, 1, 1], vec![0; 4])
+                .is_err()
+        );
+        assert_eq!(ctx.entries().len(), 2001);
+        assert_eq!(ctx.tensors().len(), 2000);
+        Ok(())
+    }
 }

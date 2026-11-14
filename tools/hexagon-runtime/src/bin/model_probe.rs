@@ -474,6 +474,32 @@ fn logits_digest(logits: &[f32]) -> Result<String> {
     hex_digest(hash)
 }
 
+fn driver_artifact_summary(path: &Path) -> Result<Value> {
+    let mut file = File::open(path)?;
+    require(file.metadata()?.is_file())?;
+    let mut hash = Hasher::new()?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.checked_add(u64::try_from(read)?).ok_or_else(reject)?;
+        hash.update(&buffer[..read])?;
+    }
+    let name = path.file_name().map_or_else(
+        || String::from("libcdsprpc.dll"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    Ok(json!({
+        "role": "hexagon-driver",
+        "name": name,
+        "bytes": bytes,
+        "sha256": hex_digest(hash)?,
+    }))
+}
+
 fn shared_model(model: &Model) -> Model {
     Model {
         metadata: model.metadata.clone(),
@@ -1419,6 +1445,7 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
                           compared: u64| {
             parent.ensure_alive()?;
             value["driverDll"] = json!(driver_dll);
+            value["driverArtifact"] = driver_artifact_summary(&driver_dll)?;
             value["projectionsCompleted"] = json!(statistics.projections_completed);
             value["integerValuesCompared"] = json!(compared);
             result = Some(value);
@@ -1803,7 +1830,7 @@ fn main_work() -> Result<()> {
         let location = DriverLocation::inspect_system()?;
         return emit(
             &json!({"event":"inspection","kind":"native-fastrpc-inspection",
-            "driverDll":location.path(),"driverLoaded":false,"dspCodeLoaded":false,"profileEligible":false}),
+            "driverDll":location.path(),"driverArtifact":driver_artifact_summary(location.path())?,"driverLoaded":false,"dspCodeLoaded":false,"profileEligible":false}),
         );
     }
     require(arguments.len() == 2 && arguments[0] == "--request")?;
@@ -2826,5 +2853,35 @@ mod tests {
         let (div_pass, _) = compute_logits_tolerance(&diverged, &expected)?;
         assert!(!div_pass);
         Ok(())
+    }
+
+    #[test]
+    fn driver_artifact_summary_records_basename_and_digest_without_host_paths() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory =
+            env::temp_dir().join(format!("PrismDriverSummary-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let driver_path = directory.join("driver_fixture.dll");
+        let payload = b"hexagon-driver-fixture-v1";
+        let expected_sha256 = digest(payload)?;
+        let result = (|| -> Result<()> {
+            fs::write(&driver_path, payload)?;
+            let summary = driver_artifact_summary(&driver_path)?;
+            assert_eq!(summary["role"], json!("hexagon-driver"));
+            assert_eq!(summary["name"], json!("driver_fixture.dll"));
+            assert_eq!(summary["bytes"], json!(payload.len()));
+            assert_eq!(summary["sha256"], json!(expected_sha256));
+            let serialized = serde_json::to_string(&summary)?;
+            assert!(!serialized.contains('\\'));
+            assert!(!serialized.contains('/'));
+            assert!(!serialized.contains("PrismDriverSummary"));
+            assert!(!serialized.contains("C:"));
+            Ok(())
+        })();
+        let _ = fs::remove_file(&driver_path);
+        let _ = fs::remove_dir(&directory);
+        result
     }
 }

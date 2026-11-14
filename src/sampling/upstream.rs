@@ -104,8 +104,9 @@ impl Candidates {
     }
 
     fn sort(&mut self) {
-        self.data_mut()
-            .sort_unstable_by(|left, right| descending(left.logit, right.logit));
+        self.data_mut().sort_unstable_by(|left, right| {
+            descending(left.logit, right.logit).then_with(|| left.id.cmp(&right.id))
+        });
         self.sorted = true;
     }
 
@@ -120,6 +121,21 @@ impl Candidates {
                     maximum = entry.logit;
                 }
             }
+        }
+        if !maximum.is_finite() {
+            let mut sum = 0.0_f32;
+            for entry in self.data_mut() {
+                entry.probability = if entry.logit.to_bits() == maximum.to_bits() {
+                    1.0
+                } else {
+                    0.0
+                };
+                sum += entry.probability;
+            }
+            for entry in self.data_mut() {
+                entry.probability /= sum;
+            }
+            return;
         }
         let mut sum = 0.0_f32;
         for entry in self.data_mut() {
@@ -236,13 +252,27 @@ impl Config {
             | Self::Typical {
                 probability,
                 min_keep,
-            } => (vec![*probability], *min_keep),
+            } => {
+                if !(0.0..=1.0).contains(probability) {
+                    return Err(invalid(
+                        "sampler probability must be finite and within [0.0, 1.0]",
+                    ));
+                }
+                (vec![*probability], *min_keep)
+            }
             Self::Xtc {
                 probability,
                 threshold,
                 min_keep,
                 ..
-            } => (vec![*probability, *threshold], *min_keep),
+            } => {
+                if !(0.0..=1.0).contains(probability) {
+                    return Err(invalid(
+                        "sampler XTC probability must be finite and within [0.0, 1.0]",
+                    ));
+                }
+                (vec![*probability, *threshold], *min_keep)
+            }
             Self::Penalties {
                 vocabulary_size,
                 last_n,
@@ -674,6 +704,11 @@ fn adjust_heap(data: &mut [Candidate], mut hole: usize, length: usize, value: Ca
     data[hole] = value;
 }
 
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Overflow-guarded extreme-logit temperature division narrows finite double differences into binary32."
+)]
 fn temperature_filter(candidates: &mut Candidates, temperature: f32) {
     if temperature <= 0.0 {
         let mut maximum = 0;
@@ -683,6 +718,33 @@ fn temperature_filter(candidates: &mut Candidates, temperature: f32) {
                 maximum = index;
             } else {
                 candidates.data_mut()[index].logit = f32::NEG_INFINITY;
+            }
+        }
+        return;
+    }
+    if temperature.to_bits() == 1.0_f32.to_bits() {
+        return;
+    }
+    let mut maximum = f32::NEG_INFINITY;
+    let mut overflows_f32 = false;
+    let max_f32 = f64::from(f32::MAX);
+    let temp_f64 = f64::from(temperature);
+    for entry in candidates.data() {
+        if entry.logit > maximum {
+            maximum = entry.logit;
+        }
+        if entry.logit.is_finite() {
+            let scaled = f64::from(entry.logit) / temp_f64;
+            if !scaled.is_finite() || scaled.abs() > max_f32 {
+                overflows_f32 = true;
+            }
+        }
+    }
+    if overflows_f32 && maximum.is_finite() {
+        let max_f64 = f64::from(maximum);
+        for entry in candidates.data_mut() {
+            if entry.logit.is_finite() {
+                entry.logit = ((f64::from(entry.logit) - max_f64) / temp_f64) as f32;
             }
         }
     } else {
@@ -718,10 +780,27 @@ fn extended_temperature(candidates: &mut Candidates, temperature: f32, delta: f3
     }
     let dynamic = minimum + (maximum - minimum) * (entropy / maximum_entropy).powf(exponent);
     temperature_filter(candidates, dynamic);
-    let maximum = f64::from(candidates.data()[0].logit);
+    let max_logit = candidates.data()[0].logit;
+    if !max_logit.is_finite() {
+        let mut sum = 0.0_f64;
+        for entry in candidates.data_mut() {
+            let weight = if entry.logit.to_bits() == max_logit.to_bits() {
+                1.0
+            } else {
+                0.0
+            };
+            entry.probability = weight as f32;
+            sum += weight;
+        }
+        for entry in candidates.data_mut() {
+            entry.probability = (f64::from(entry.probability) / sum) as f32;
+        }
+        return;
+    }
+    let max_logit_f64 = f64::from(max_logit);
     let mut sum = 0.0_f64;
     for entry in candidates.data_mut() {
-        let probability = (f64::from(entry.logit) - maximum).exp();
+        let probability = (f64::from(entry.logit) - max_logit_f64).exp();
         entry.probability = probability as f32;
         sum += probability;
     }
@@ -751,9 +830,21 @@ fn distribution(candidates: &mut Candidates, random: &mut Random) {
         }
     }
     let mut sum = 0.0_f64;
-    for entry in candidates.data_mut() {
-        entry.probability = (entry.logit - maximum).exp();
-        sum += f64::from(entry.probability);
+    if maximum.is_finite() {
+        for entry in candidates.data_mut() {
+            entry.probability = (entry.logit - maximum).exp();
+            sum += f64::from(entry.probability);
+        }
+    } else {
+        for entry in candidates.data_mut() {
+            let weight = if entry.logit.to_bits() == maximum.to_bits() {
+                1.0
+            } else {
+                0.0
+            };
+            entry.probability = weight as f32;
+            sum += weight;
+        }
     }
     let target = sum * draw;
     let mut cumulative = 0.0_f64;
@@ -794,6 +885,7 @@ fn min_p(candidates: &mut Candidates, probability: f32, min_keep: usize) {
     if probability <= 0.0 {
         return;
     }
+    let threshold = f64::from(probability).ln();
     if !candidates.sorted {
         let mut maximum = -f32::MAX;
         for entry in candidates.data() {
@@ -801,11 +893,14 @@ fn min_p(candidates: &mut Candidates, probability: f32, min_keep: usize) {
                 maximum = entry.logit;
             }
         }
-        let minimum = maximum + probability.ln();
+        let max_f64 = f64::from(maximum);
         let filtered = candidates
             .data()
             .iter()
-            .filter(|entry| entry.logit >= minimum)
+            .filter(|entry| {
+                entry.logit.to_bits() == maximum.to_bits()
+                    || f64::from(entry.logit) - max_f64 >= threshold
+            })
             .copied()
             .collect::<Vec<_>>();
         if !filtered.is_empty() && filtered.len() >= min_keep {
@@ -815,10 +910,15 @@ fn min_p(candidates: &mut Candidates, probability: f32, min_keep: usize) {
         }
         candidates.sort();
     }
-    let minimum = candidates.data()[0].logit + probability.ln();
+    let maximum = candidates.data()[0].logit;
+    let max_f64 = f64::from(maximum);
     let mut size = 1;
     while size < candidates.size {
-        if candidates.data()[size].logit < minimum && size >= min_keep {
+        let logit = candidates.data()[size].logit;
+        if logit.to_bits() != maximum.to_bits()
+            && f64::from(logit) - max_f64 < threshold
+            && size >= min_keep
+        {
             break;
         }
         size += 1;
@@ -919,42 +1019,39 @@ fn penalties(
     candidates.sorted = false;
 }
 
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    reason = "Preserve native float mean/stddev and double pow compound-assignment rounding."
-)]
 fn top_n_sigma(candidates: &mut Candidates, n: f32) {
     if n <= 0.0 || candidates.size <= 1 {
         return;
     }
     let mut maximum = candidates.data()[0].logit;
-    let mut sum = 0.0_f32;
-    let mut count = 0;
+    let mut sum = 0.0_f64;
+    let mut count = 0_u32;
     for entry in candidates.data() {
         if entry.logit != f32::NEG_INFINITY {
             if maximum < entry.logit {
                 maximum = entry.logit;
             }
-            sum += entry.logit;
+            sum += f64::from(entry.logit);
             count += 1;
         }
     }
-    let mean = if count > 0 { sum / count as f32 } else { 0.0 };
-    let mut accumulator = 0.0_f32;
+    let count_f64 = f64::from(count);
+    let mean = if count > 0 { sum / count_f64 } else { 0.0 };
+    let mut accumulator = 0.0_f64;
     for entry in candidates.data() {
         if entry.logit != f32::NEG_INFINITY {
-            accumulator = (f64::from(accumulator) + f64::from(entry.logit - mean).powi(2)) as f32;
+            let delta = f64::from(entry.logit) - mean;
+            accumulator = delta.mul_add(delta, accumulator);
         }
     }
     let deviation = if count > 0 {
-        (accumulator / count as f32).sqrt()
+        (accumulator / count_f64).sqrt()
     } else {
         0.0
     };
+    let threshold = (-f64::from(n)).mul_add(deviation, f64::from(maximum));
     for entry in candidates.data_mut() {
-        if entry.logit < maximum - n * deviation {
+        if f64::from(entry.logit) < threshold {
             entry.logit = f32::NEG_INFINITY;
         }
     }
@@ -1148,5 +1245,173 @@ impl Random {
     fn double(&mut self) -> f64 {
         let bits = u64::from(self.next() >> 11) + (u64::from(self.next()) << 21);
         bits as f64 * (1.0 / 9_007_199_254_740_992.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_rejects_out_of_range_probabilities() {
+        for invalid_prob in [-0.1_f32, 1.000_1, f32::NAN, f32::INFINITY] {
+            assert!(
+                State::new(Config::TopP {
+                    probability: invalid_prob,
+                    min_keep: 1,
+                })
+                .is_err()
+            );
+            assert!(
+                State::new(Config::MinP {
+                    probability: invalid_prob,
+                    min_keep: 1,
+                })
+                .is_err()
+            );
+            assert!(
+                State::new(Config::Typical {
+                    probability: invalid_prob,
+                    min_keep: 1,
+                })
+                .is_err()
+            );
+            assert!(
+                State::new(Config::Xtc {
+                    probability: invalid_prob,
+                    threshold: 0.1,
+                    min_keep: 1,
+                    seed: 0,
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            State::new(Config::TopP {
+                probability: 1.0,
+                min_keep: 1,
+            })
+            .is_ok()
+        );
+        assert!(
+            State::new(Config::MinP {
+                probability: 0.0,
+                min_keep: 1,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn candidates_sort_breaks_equal_logit_ties_by_ascending_id() -> Result<()> {
+        let mut candidates = Candidates::new(
+            vec![
+                Candidate {
+                    id: 9,
+                    logit: 2.0,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 2,
+                    logit: 2.0,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 5,
+                    logit: 3.0,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 4,
+                    logit: 2.0,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        candidates.sort();
+        let ids: Vec<i32> = candidates.data().iter().map(|entry| entry.id).collect();
+        assert_eq!(ids, [5, 2, 4, 9]);
+        Ok(())
+    }
+
+    #[test]
+    fn extreme_logits_temperature_top_n_sigma_and_min_p_avoid_f32_overflow() -> Result<()> {
+        let mut extreme = Candidates::new(
+            vec![
+                Candidate {
+                    id: 0,
+                    logit: 3.0e38,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 1,
+                    logit: 2.0e38,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        State::new(Config::Temperature(0.1))?.apply(&mut extreme)?;
+        State::new(Config::Distribution(7))?.apply(&mut extreme)?;
+        assert!(
+            extreme
+                .data()
+                .iter()
+                .all(|entry| entry.probability.is_finite())
+        );
+        assert!((extreme.data()[0].probability - 1.0).abs() <= 1e-6);
+
+        let mut sigma = Candidates::new(
+            vec![
+                Candidate {
+                    id: 0,
+                    logit: -2.0e20,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 1,
+                    logit: 2.0e20,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 2,
+                    logit: 2.0e20,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        State::new(Config::TopNSigma(1.0))?.apply(&mut sigma)?;
+        assert_eq!(sigma.data()[0].logit, f32::NEG_INFINITY);
+        assert_eq!(sigma.data()[1].logit, 2.0e20);
+        assert_eq!(sigma.data()[2].logit, 2.0e20);
+
+        let mut min_p = Candidates::new(
+            vec![
+                Candidate {
+                    id: 0,
+                    logit: -3.4e38,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 1,
+                    logit: -3.4e38,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        State::new(Config::MinP {
+            probability: 0.5,
+            min_keep: 1,
+        })?
+        .apply(&mut min_p)?;
+        assert_eq!(min_p.data().len(), 2);
+        Ok(())
     }
 }

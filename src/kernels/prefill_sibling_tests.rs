@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use super::*;
 
 fn tensor(columns: usize, rows: usize, symbol: u8) -> Tensor {

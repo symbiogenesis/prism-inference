@@ -84,6 +84,8 @@ pub(super) fn normalize_quotes(input: &str) -> String {
     }
     String::from_utf8_lossy(&output).into_owned()
 }
+const MAX_CAPTURE_DEPTH: usize = 64;
+
 fn brace_depth(text: &str) -> usize {
     let mut depth = 0_usize;
     let mut string = false;
@@ -133,7 +135,10 @@ impl Mapper {
         clippy::too_many_lines,
         reason = "Preserve source semantic tag order and tool/argument streaming transitions together"
     )]
-    fn visit(&mut self, node: &Capture, input: &[u8]) -> Result<()> {
+    fn visit(&mut self, node: &Capture, input: &[u8], depth: usize) -> Result<()> {
+        if depth > MAX_CAPTURE_DEPTH {
+            return Err(invalid("chat capture nesting depth exceeded"));
+        }
         let text = std::str::from_utf8(
             input
                 .get(node.start..node.end)
@@ -247,7 +252,7 @@ impl Mapper {
             self.message.tool_calls[index] = call.clone();
         }
         for child in &node.children {
-            self.visit(child, input)?;
+            self.visit(child, input, depth + 1)?;
         }
         Ok(())
     }
@@ -255,7 +260,8 @@ impl Mapper {
 /// Map streaming semantic captures into a structured assistant message.
 ///
 /// # Errors
-/// Returns an error for invalid capture offsets or non-UTF-8 semantic text.
+/// Returns an error for invalid capture offsets, non-UTF-8 semantic text or
+/// capture nesting beyond 64 levels.
 pub fn map_captures(nodes: &[Capture], input: &[u8]) -> Result<ChatMessage> {
     let mut mapper = Mapper {
         message: ChatMessage::default(),
@@ -266,7 +272,7 @@ pub fn map_captures(nodes: &[Capture], input: &[u8]) -> Result<ChatMessage> {
         quote: false,
     };
     for node in nodes {
-        mapper.visit(node, input)?;
+        mapper.visit(node, input, 0)?;
     }
     if mapper.index.is_none()
         && let Some(mut call) = mapper.current
@@ -289,4 +295,42 @@ pub fn map_captures(nodes: &[Capture], input: &[u8]) -> Result<ChatMessage> {
         mapper.message.reasoning_content.clear();
     }
     Ok(mapper.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nested_capture(levels: usize) -> Capture {
+        let mut node = Capture {
+            name: String::new(),
+            tag: "content".into(),
+            start: 0,
+            end: 2,
+            incomplete: false,
+            children: Vec::new(),
+        };
+        for _ in 0..levels {
+            node = Capture {
+                name: "wrap".into(),
+                tag: String::new(),
+                start: 0,
+                end: 2,
+                incomplete: false,
+                children: vec![node],
+            };
+        }
+        node
+    }
+
+    #[test]
+    fn map_captures_enforces_nesting_depth_limit() -> Result<()> {
+        let at_limit = nested_capture(MAX_CAPTURE_DEPTH);
+        let mapped = map_captures(&[at_limit], b"ok")?;
+        assert_eq!(mapped.content, "ok");
+
+        let too_deep = nested_capture(MAX_CAPTURE_DEPTH + 1);
+        assert!(map_captures(&[too_deep], b"ok").is_err());
+        Ok(())
+    }
 }

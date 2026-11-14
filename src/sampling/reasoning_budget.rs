@@ -166,7 +166,9 @@ impl ReasoningBudget {
         if tokens.len() != logits.len() {
             return Err(invalid("reasoning candidate token/logit extent mismatch"));
         }
-        if let Some(forced) = self.forced_token() {
+        if let Some(forced) = self.forced_token()
+            && tokens.contains(&forced)
+        {
             for (&token, logit) in tokens.iter().zip(logits) {
                 if token != forced {
                     *logit = f32::NEG_INFINITY;
@@ -280,4 +282,39 @@ pub fn utf8_is_complete(bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_leaves_logits_untouched_when_forced_token_is_absent() -> Result<()> {
+        let budget = ReasoningBudget::new(vec![], vec![], vec![99], 0, State::Counting)?;
+        assert_eq!(budget.forced_token(), Some(99));
+        let tokens = [1, 2, 3];
+        let mut logits = [1.5, -0.5, 2.25];
+        budget.apply(&tokens, &mut logits)?;
+        assert_eq!(
+            logits.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+            [1.5_f32.to_bits(), (-0.5_f32).to_bits(), 2.25_f32.to_bits()]
+        );
+
+        let present_tokens = [1, 99, 3];
+        let mut masked_logits = [1.5, -0.5, 2.25];
+        budget.apply(&present_tokens, &mut masked_logits)?;
+        assert_eq!(
+            masked_logits
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            [
+                f32::NEG_INFINITY.to_bits(),
+                (-0.5_f32).to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+            ]
+        );
+        Ok(())
+    }
 }

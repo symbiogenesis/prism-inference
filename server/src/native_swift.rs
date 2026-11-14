@@ -61,13 +61,7 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(Rejection::CompletionLimit)?;
-        let adapter_scale = value
-            .get("lora")
-            .map(|lora| {
-                serde_json::from_value::<f32>(lora[0]["scale"].clone())
-                    .map_err(|_| Rejection::ChatSchema)
-            })
-            .transpose()?;
+        let adapter_scale = parse_adapter_scale(&value)?;
         let prompt = session
             .prepare_with_settings(messages, output, enable_thinking, adapter_scale)
             .map_err(|error| classify_preparation_error(error.as_ref()))?;
@@ -77,6 +71,27 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
     })?;
     let prompt = prepared.ok_or(Rejection::TokenCountUnavailable)?;
     Ok(NativeChat { admitted, prompt })
+}
+
+fn parse_adapter_scale(value: &serde_json::Value) -> Result<Option<f32>, Rejection> {
+    let Some(lora) = value.get("lora") else {
+        return Ok(None);
+    };
+    let raw = serde_json::from_value::<f64>(lora[0]["scale"].clone())
+        .map_err(|_| Rejection::ChatSchema)?;
+    if !raw.is_finite() || !(0.0..=f64::from(f32::MAX)).contains(&raw) {
+        return Err(Rejection::ChatSchema);
+    }
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "Scale is validated finite and within [0.0, f32::MAX] before narrowing to binary32."
+    )]
+    let scale = raw as f32;
+    if !scale.is_finite() || scale < 0.0 {
+        return Err(Rejection::ChatSchema);
+    }
+    Ok(Some(scale))
 }
 
 fn classify_preparation_error(
@@ -128,8 +143,39 @@ pub fn complete_with_timings(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_preparation_error;
+    use super::{classify_preparation_error, parse_adapter_scale};
     use crate::Rejection;
+    use serde_json::json;
+
+    #[test]
+    fn parse_adapter_scale_validates_f64_before_binary32_narrowing() {
+        assert_eq!(parse_adapter_scale(&json!({})), Ok(None));
+        assert_eq!(
+            parse_adapter_scale(&json!({"lora": [{"scale": 0.0}]})),
+            Ok(Some(0.0))
+        );
+        assert_eq!(
+            parse_adapter_scale(&json!({"lora": [{"scale": 1.25}]})),
+            Ok(Some(1.25))
+        );
+        for invalid in [
+            json!({"lora": null}),
+            json!({"lora": []}),
+            json!({"lora": [{}]}),
+            json!({"lora": [{"scale": null}]}),
+            json!({"lora": [{"scale": "1.0"}]}),
+            json!({"lora": [{"scale": -0.001}]}),
+            json!({"lora": [{"scale": -1.0}]}),
+            json!({"lora": [{"scale": 1e39}]}),
+            json!({"lora": [{"scale": 3.402_823_6e38_f64}]}),
+        ] {
+            assert_eq!(
+                parse_adapter_scale(&invalid),
+                Err(Rejection::ChatSchema),
+                "unexpected acceptance for {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn native_swift_context_classification_requires_concrete_token_limit_error() {

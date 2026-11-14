@@ -26,6 +26,32 @@ use crate::vocabulary::{
 use crate::{Result, invalid};
 
 const LIMIT: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_PREVIEW_BYTES: usize = 256;
+
+fn bounded_preview(text: &str) -> String {
+    if text.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_DIAGNOSTIC_PREVIEW_BYTES.saturating_sub(3);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+fn validate_bpe_merge(merge: &str) -> Result<()> {
+    let Some((left, right)) = merge.split_once(' ') else {
+        return Err(invalid(
+            "BPE merge must contain two non-empty space-separated pieces",
+        ));
+    };
+    if left.is_empty() || right.is_empty() || right.contains(' ') {
+        return Err(invalid(
+            "BPE merge must contain two non-empty space-separated pieces",
+        ));
+    }
+    Ok(())
+}
 
 // Search all eligible special spellings together instead of scanning the full
 // remaining input once per spelling. IDs stay ordered so duplicate spellings
@@ -270,7 +296,12 @@ impl GgufTokenizer {
             "t5" => Family::Unigram,
             "rwkv" => Family::Rwkv,
             "plamo2" => Family::Plamo,
-            _ => return Err(invalid(format!("unsupported tokenizer model {model}"))),
+            _ => {
+                return Err(invalid(format!(
+                    "unsupported tokenizer model {}",
+                    bounded_preview(model)
+                )));
+            }
         };
         let pre = if model == "gemma4" {
             "gemma4"
@@ -378,6 +409,7 @@ impl GgufTokenizer {
             }
             ranks.try_reserve(merges.len())?;
             for (rank, merge) in merges.iter().enumerate() {
+                validate_bpe_merge(merge)?;
                 ranks.entry(merge.clone()).or_insert(rank);
             }
         }
@@ -603,23 +635,45 @@ impl GgufTokenizer {
 
     fn merge_spm_bytes(&self, bytes: &[u8], output: &mut Vec<u32>) -> Result<()> {
         let mut nodes: Vec<Symbol> = Vec::new();
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let length = match bytes[offset] {
-                0..=0xbf => 1,
-                0xc0..=0xdf => 2,
-                0xe0..=0xef => 3,
-                _ => 4,
-            };
+        let mut push_node = |start: usize, end: usize| {
             let index = nodes.len();
-            let end = (offset + length).min(bytes.len());
+            if let Some(previous) = index.checked_sub(1) {
+                nodes[previous].next = Some(index);
+            }
             nodes.push(Symbol {
-                start: offset,
+                start,
                 end,
                 previous: index.checked_sub(1),
-                next: (end < bytes.len()).then_some(index + 1),
+                next: None,
             });
-            offset = end;
+        };
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match std::str::from_utf8(&bytes[offset..]) {
+                Ok(valid) => {
+                    for ch in valid.chars() {
+                        let end = offset + ch.len_utf8();
+                        push_node(offset, end);
+                        offset = end;
+                    }
+                }
+                Err(error) => {
+                    let valid_end = offset + error.valid_up_to();
+                    if let Ok(valid) = std::str::from_utf8(&bytes[offset..valid_end]) {
+                        for ch in valid.chars() {
+                            let end = offset + ch.len_utf8();
+                            push_node(offset, end);
+                            offset = end;
+                        }
+                    }
+                    let invalid_len = error.error_len().unwrap_or(bytes.len() - offset);
+                    let invalid_end = (offset + invalid_len).min(bytes.len());
+                    if invalid_end > offset {
+                        push_node(offset, invalid_end);
+                        offset = invalid_end;
+                    }
+                }
+            }
         }
         let mut queue = BinaryHeap::new();
         let candidate =
@@ -1311,7 +1365,12 @@ fn patterns(pre: &str) -> Result<Vec<&'static str>> {
         "gemma4" => vec![r"[^\n]+|[\n]+"],
         "whitespace" => vec![r"\S+"],
         "default" => vec![r"[\p{P}\$\+<=>\^~\|]+", gpt, r"\p{N}+", r"[0-9][0-9][0-9]"],
-        other => return Err(invalid(format!("unsupported BPE pretokenizer {other}"))),
+        other => {
+            return Err(invalid(format!(
+                "unsupported BPE pretokenizer {}",
+                bounded_preview(other)
+            )));
+        }
     })
 }
 
@@ -1512,6 +1571,80 @@ mod tests {
             assert_eq!(tokenizer.encode(b"b", false, false)?, [2]);
             assert!(tokenizer.encode(b"a", false, false).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bpe_merges_require_two_non_empty_space_separated_pieces() {
+        let make = |merges: Vec<&str>| {
+            let metadata = Metadata::from([
+                ("tokenizer.ggml.model".into(), "gpt2".into()),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    vec!["?", "a", "b", "ab"].into(),
+                ),
+                ("tokenizer.ggml.merges".into(), merges.into()),
+                ("tokenizer.ggml.unknown_token_id".into(), 0_u32.into()),
+                ("tokenizer.ggml.add_space_prefix".into(), false.into()),
+                ("tokenizer.ggml.add_bos_token".into(), false.into()),
+                ("tokenizer.ggml.add_eos_token".into(), false.into()),
+                ("tokenizer.ggml.normalizer.lowercase".into(), false.into()),
+                (
+                    "tokenizer.ggml.normalizer.strip_accents".into(),
+                    false.into(),
+                ),
+            ]);
+            GgufTokenizer::from_metadata(&metadata, 4)
+        };
+        assert!(make(vec!["a b"]).is_ok());
+        for bad in ["", "ab", " a", "a ", "a  b", "a b c"] {
+            assert!(make(vec![bad]).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn spm_invalid_utf8_lead_preserves_following_ascii_and_merges() -> Result<()> {
+        let spm = tokenizer(
+            "llama",
+            &["<unk>", "a", "b", "ab", "<0xC2>", "<0xE1>", "<0x80>"],
+            &[0.0, -1.0, -1.0, 1.0, 0.0, 0.0, 0.0],
+        )?;
+        assert_eq!(spm.encode(&[0xc2, b'a', b'b'], false, false)?, [4, 3]);
+        assert_eq!(
+            spm.encode(&[0xe1, 0x80, b'a', b'b'], false, false)?,
+            [5, 6, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_previews_cap_long_model_and_pretokenizer_names() -> Result<()> {
+        let long = "€".repeat(200);
+        let bad_model = Metadata::from([
+            ("tokenizer.ggml.model".into(), long.as_str().into()),
+            ("tokenizer.ggml.tokens".into(), vec!["?"].into()),
+        ]);
+        let err = GgufTokenizer::from_metadata(&bad_model, 1)
+            .err()
+            .ok_or_else(|| invalid("expected unsupported model error"))?;
+        let preview = err
+            .to_string()
+            .strip_prefix("unsupported tokenizer model ")
+            .ok_or_else(|| invalid("unexpected model error format"))?
+            .to_owned();
+        assert!(preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(preview.ends_with("..."));
+
+        let err_pre = patterns(&long)
+            .err()
+            .ok_or_else(|| invalid("expected unsupported pretokenizer error"))?;
+        let pre_preview = err_pre
+            .to_string()
+            .strip_prefix("unsupported BPE pretokenizer ")
+            .ok_or_else(|| invalid("unexpected pretokenizer error format"))?
+            .to_owned();
+        assert!(pre_preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(pre_preview.ends_with("..."));
         Ok(())
     }
 }

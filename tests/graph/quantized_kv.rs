@@ -652,7 +652,8 @@ fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Resul
         assert!(
             adapted
                 .identity()
-                .contains(":rank-one-lora-v1:rank-one-fixture:3fa66666")
+                .contains(":rank-one-lora-v1:rank-one-fixture:sha256=")
+                && adapted.identity().contains(":3fa66666")
         );
         adapted.evaluate(0)?;
         let previous = adapted.checkpoint()?;

@@ -31,7 +31,7 @@ Export preserves raw scales, ternary symbols, other tensor payloads and metadata
 then verifies byte-identical PQ2 reconstruction. It writes a unique partial,
 validates it and publishes by exclusive hard link, requiring a hard-link-capable
 filesystem. Failures retain partials. A post-publication partial cleanup failure
-adds `RetainedPartialPath` and `PartialCleanupError` to the report.
+adds `RetainedPartialName` and `PartialCleanupError` to the report.
 
 `--timeout-seconds` accepts 1..3600 (default 1800), covering conversion, copying,
 padding and initial output hashing. Source verification and final validation are

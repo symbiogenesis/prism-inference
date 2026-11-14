@@ -179,12 +179,21 @@ fn rank_one_edited_sparse_storage_releases_dense_a_and_binds_arithmetic() -> Res
     let (base, source) = fixture();
     let mut adapter = RankOneAdapter::from_model(source, &base)?;
     let dense = adapter.storage();
-    assert_eq!(adapter.identity(), adapter.execution_identity());
+    assert_eq!(adapter.identity(), "adapter");
+    let dense_exec = adapter.execution_identity().to_owned();
+    let hex = dense_exec
+        .strip_prefix("adapter:sha256=")
+        .ok_or("missing sha256 execution identity prefix")?;
+    assert_eq!(hex.len(), 64);
+    assert!(
+        hex.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     adapter.enable_sparse_a()?;
     assert_eq!(adapter.identity(), "adapter");
     assert_eq!(
         adapter.execution_identity(),
-        "adapter:edited-sparse-a-u16-f64-v1"
+        format!("{dense_exec}:edited-sparse-a-u16-f64-v1")
     );
     let sparse = adapter.storage();
     assert_eq!(dense.linear_a_coefficients, 4);

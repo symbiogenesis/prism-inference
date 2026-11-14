@@ -3,7 +3,11 @@ use super::ast::{Expr, Stmt};
 use crate::{Result, invalid};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use std::{cell::RefCell, fmt, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, fmt, rc::Rc};
+
+const MAX_DAG_STEPS: usize = 65_536;
+const MAX_TRAVERSAL_DEPTH: usize = 64;
+const MAX_TEXT_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct Part {
@@ -47,7 +51,7 @@ impl Val {
         while let Some((value, depth)) = pending.pop() {
             visited += 1;
             bytes += 32;
-            if visited > 65536 || depth > 64 || bytes > 4 * 1024 * 1024 {
+            if visited > MAX_DAG_STEPS || depth > MAX_TRAVERSAL_DEPTH || bytes > 4 * 1024 * 1024 {
                 return Err(invalid("Jinja value graph bound exceeded"));
             }
             match value.kind() {
@@ -73,17 +77,28 @@ impl Val {
     }
     pub(super) fn ensure_insert(&self, value: &Self) -> Result<()> {
         value.check_graph()?;
-        let mut pending = vec![value.clone()];
-        while let Some(value) = pending.pop() {
-            if Rc::ptr_eq(&self.0, &value.0) {
+        let mut seen = HashSet::new();
+        let mut pending = vec![(value.clone(), 0_usize)];
+        let mut steps = 0_usize;
+        while let Some((node, depth)) = pending.pop() {
+            steps += 1;
+            if depth > MAX_TRAVERSAL_DEPTH || steps > MAX_DAG_STEPS {
+                return Err(invalid("Jinja insertion traversal bound exceeded"));
+            }
+            if Rc::ptr_eq(&self.0, &node.0) {
                 return Err(invalid("cyclic Jinja container assignment"));
             }
-            match value.kind() {
-                Kind::Array(values) | Kind::Tuple(values) => pending.extend(values),
+            if !seen.insert(Rc::as_ptr(&node.0)) {
+                continue;
+            }
+            match node.kind() {
+                Kind::Array(values) | Kind::Tuple(values) => {
+                    pending.extend(values.into_iter().map(|child| (child, depth + 1)));
+                }
                 Kind::Object(values) => {
                     for (key, value) in values {
-                        pending.push(key);
-                        pending.push(value);
+                        pending.push((key, depth + 1));
+                        pending.push((value, depth + 1));
                     }
                 }
                 _ => {}
@@ -139,20 +154,30 @@ impl Val {
         self.0.borrow_mut().used = true;
     }
     pub(super) fn recursive_mark(&self) {
-        self.mark();
-        match self.kind() {
-            Kind::Array(values) | Kind::Tuple(values) => {
-                for value in values {
-                    value.recursive_mark();
-                }
+        let mut seen = HashSet::new();
+        let mut pending = vec![(self.clone(), 0_usize)];
+        let mut steps = 0_usize;
+        while let Some((value, depth)) = pending.pop() {
+            if depth > MAX_TRAVERSAL_DEPTH || steps >= MAX_DAG_STEPS {
+                break;
             }
-            Kind::Object(values) => {
-                for (key, value) in values {
-                    key.recursive_mark();
-                    value.recursive_mark();
-                }
+            if !seen.insert(Rc::as_ptr(&value.0)) {
+                continue;
             }
-            _ => {}
+            steps += 1;
+            value.mark();
+            match value.kind() {
+                Kind::Array(values) | Kind::Tuple(values) => {
+                    pending.extend(values.into_iter().map(|child| (child, depth + 1)));
+                }
+                Kind::Object(values) => {
+                    for (key, value) in values {
+                        pending.push((key, depth + 1));
+                        pending.push((value, depth + 1));
+                    }
+                }
+                _ => {}
+            }
         }
     }
     pub(super) fn truth(&self) -> bool {
@@ -203,60 +228,103 @@ impl Val {
     }
     pub(super) fn text(&self) -> Vec<u8> {
         self.recursive_mark();
+        let mut out = Vec::new();
+        let mut steps = 0_usize;
+        let _ = self.append_text(&mut out, 0, &mut steps);
+        out
+    }
+    #[cfg(test)]
+    pub(super) fn repr(&self) -> Vec<u8> {
+        self.recursive_mark();
+        let mut out = Vec::new();
+        let mut steps = 0_usize;
+        let _ = self.append_repr(&mut out, 0, &mut steps);
+        out
+    }
+    fn append_text(&self, out: &mut Vec<u8>, depth: usize, steps: &mut usize) -> bool {
+        *steps += 1;
+        if depth > MAX_TRAVERSAL_DEPTH
+            || *steps > MAX_DAG_STEPS
+            || out.len() >= MAX_TEXT_OUTPUT_BYTES
+        {
+            return false;
+        }
         match self.kind() {
-            Kind::Undefined => Vec::new(),
-            Kind::None => b"None".to_vec(),
-            Kind::Bool(value) => {
-                if value {
-                    b"True".to_vec()
-                } else {
-                    b"False".to_vec()
-                }
-            }
-            Kind::Int(value) => value.to_string().into_bytes(),
+            Kind::Undefined => true,
+            Kind::None => push_bounded(out, b"None"),
+            Kind::Bool(value) => push_bounded(out, if value { b"True" } else { b"False" }),
+            Kind::Int(value) => push_bounded(out, value.to_string().as_bytes()),
             Kind::Float(value) => {
                 let mut text = value.to_string();
                 if !text.contains(['.', 'e', 'E']) {
                     text.push_str(".0");
                 }
-                text.into_bytes()
+                push_bounded(out, text.as_bytes())
             }
-            Kind::String(parts) => parts.into_iter().flat_map(|part| part.bytes).collect(),
-            Kind::Array(values) => repr_sequence(&values, b"[", b"]", false),
-            Kind::Tuple(values) => repr_sequence(&values, b"(", b")", true),
-            Kind::Object(values) => {
-                let mut result = b"{".to_vec();
-                for (index, (key, value)) in values.iter().enumerate() {
-                    if index != 0 {
-                        result.extend(b", ");
+            Kind::String(parts) => {
+                for part in parts {
+                    if !push_bounded(out, &part.bytes) {
+                        return false;
                     }
-                    result.extend(key.repr());
-                    result.extend(b": ");
-                    result.extend(value.repr());
                 }
-                result.push(b'}');
-                result
+                true
             }
-            _ => b"<function>".to_vec(),
+            Kind::Array(values) => {
+                append_sequence(&values, b"[", b"]", false, out, depth + 1, steps)
+            }
+            Kind::Tuple(values) => {
+                append_sequence(&values, b"(", b")", true, out, depth + 1, steps)
+            }
+            Kind::Object(values) => {
+                if !push_bounded(out, b"{") {
+                    return false;
+                }
+                for (index, (key, value)) in values.iter().enumerate() {
+                    if index != 0 && !push_bounded(out, b", ") {
+                        return false;
+                    }
+                    if !key.append_repr(out, depth + 1, steps)
+                        || !push_bounded(out, b": ")
+                        || !value.append_repr(out, depth + 1, steps)
+                    {
+                        return false;
+                    }
+                }
+                push_bounded(out, b"}")
+            }
+            _ => push_bounded(out, b"<function>"),
         }
     }
-    pub(super) fn repr(&self) -> Vec<u8> {
-        if self.is_string() {
-            let mut result = b"'".to_vec();
-            for byte in self.text() {
-                match byte {
-                    b'\'' => result.extend(b"\\'"),
-                    b'\\' => result.extend(b"\\\\"),
-                    b'\n' => result.extend(b"\\n"),
-                    b'\r' => result.extend(b"\\r"),
-                    b'\t' => result.extend(b"\\t"),
-                    _ => result.push(byte),
+    fn append_repr(&self, out: &mut Vec<u8>, depth: usize, steps: &mut usize) -> bool {
+        *steps += 1;
+        if depth > MAX_TRAVERSAL_DEPTH
+            || *steps > MAX_DAG_STEPS
+            || out.len() >= MAX_TEXT_OUTPUT_BYTES
+        {
+            return false;
+        }
+        if let Kind::String(parts) = self.kind() {
+            if !push_bounded(out, b"'") {
+                return false;
+            }
+            for part in parts {
+                for byte in part.bytes {
+                    let ok = match byte {
+                        b'\'' => push_bounded(out, b"\\'"),
+                        b'\\' => push_bounded(out, b"\\\\"),
+                        b'\n' => push_bounded(out, b"\\n"),
+                        b'\r' => push_bounded(out, b"\\r"),
+                        b'\t' => push_bounded(out, b"\\t"),
+                        _ => push_bounded(out, &[byte]),
+                    };
+                    if !ok {
+                        return false;
+                    }
                 }
             }
-            result.push(b'\'');
-            result
+            push_bounded(out, b"'")
         } else {
-            self.text()
+            self.append_text(out, depth, steps)
         }
     }
     pub(super) fn parts(&self) -> Vec<Part> {
@@ -354,19 +422,40 @@ impl Val {
         }
     }
 }
-fn repr_sequence(values: &[Val], begin: &[u8], end: &[u8], tuple: bool) -> Vec<u8> {
-    let mut result = begin.to_vec();
+fn push_bounded(out: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    let remaining = MAX_TEXT_OUTPUT_BYTES.saturating_sub(out.len());
+    if remaining == 0 {
+        return false;
+    }
+    let take = bytes.len().min(remaining);
+    out.extend_from_slice(&bytes[..take]);
+    take == bytes.len()
+}
+
+fn append_sequence(
+    values: &[Val],
+    begin: &[u8],
+    end: &[u8],
+    tuple: bool,
+    out: &mut Vec<u8>,
+    depth: usize,
+    steps: &mut usize,
+) -> bool {
+    if !push_bounded(out, begin) {
+        return false;
+    }
     for (index, value) in values.iter().enumerate() {
-        if index != 0 {
-            result.extend(b", ");
+        if index != 0 && !push_bounded(out, b", ") {
+            return false;
         }
-        result.extend(value.repr());
+        if !value.append_repr(out, depth, steps) {
+            return false;
+        }
     }
-    if tuple && values.len() == 1 {
-        result.push(b',');
+    if tuple && values.len() == 1 && !push_bounded(out, b",") {
+        return false;
     }
-    result.extend(end);
-    result
+    push_bounded(out, end)
 }
 pub(super) fn index_at(index: i64, len: usize) -> Option<usize> {
     let index = if index < 0 {
@@ -377,21 +466,40 @@ pub(super) fn index_at(index: i64, len: usize) -> Option<usize> {
     usize::try_from(index).ok().filter(|&index| index < len)
 }
 pub(super) fn equal(left: &Val, right: &Val) -> bool {
+    let mut steps = 0_usize;
+    equal_bounded(left, right, 0, &mut steps)
+}
+
+fn equal_bounded(left: &Val, right: &Val, depth: usize, steps: &mut usize) -> bool {
+    *steps += 1;
+    if depth > MAX_TRAVERSAL_DEPTH || *steps > MAX_DAG_STEPS {
+        return false;
+    }
     match (left.kind(), right.kind()) {
         (Kind::Undefined, Kind::Undefined) | (Kind::None, Kind::None) => true,
         (
             Kind::Bool(_) | Kind::Int(_) | Kind::Float(_),
             Kind::Bool(_) | Kind::Int(_) | Kind::Float(_),
         ) => left.number().ok() == right.number().ok(),
-        (Kind::String(_), Kind::String(_)) => left.text() == right.text(),
+        (Kind::String(a), Kind::String(b)) => {
+            left.mark();
+            right.mark();
+            a.iter()
+                .flat_map(|part| part.bytes.iter().copied())
+                .eq(b.iter().flat_map(|part| part.bytes.iter().copied()))
+        }
         (Kind::Array(a), Kind::Array(b)) | (Kind::Tuple(a), Kind::Tuple(b)) => {
-            a.len() == b.len() && a.iter().zip(&b).all(|(a, b)| equal(a, b))
+            a.len() == b.len()
+                && a.iter()
+                    .zip(&b)
+                    .all(|(a, b)| equal_bounded(a, b, depth + 1, steps))
         }
         (Kind::Object(a), Kind::Object(b)) => {
             a.len() == b.len()
                 && a.iter().all(|(key, value)| {
                     b.iter().any(|(other_key, other_value)| {
-                        equal(key, other_key) && equal(value, other_value)
+                        equal_bounded(key, other_key, depth + 1, steps)
+                            && equal_bounded(value, other_value, depth + 1, steps)
                     })
                 })
         }
@@ -399,8 +507,12 @@ pub(super) fn equal(left: &Val, right: &Val) -> bool {
     }
 }
 pub(super) fn compare(left: &Val, right: &Val) -> Result<std::cmp::Ordering> {
-    if matches!(left.kind(), Kind::String(_)) && matches!(right.kind(), Kind::String(_)) {
-        Ok(left.text().cmp(&right.text()))
+    if let (Kind::String(a), Kind::String(b)) = (left.kind(), right.kind()) {
+        left.mark();
+        right.mark();
+        Ok(a.iter()
+            .flat_map(|part| part.bytes.iter().copied())
+            .cmp(b.iter().flat_map(|part| part.bytes.iter().copied())))
     } else {
         left.number()?
             .partial_cmp(&right.number()?)
@@ -522,4 +634,34 @@ pub(super) fn variables(json: &str) -> Result<Val> {
     }
     depth(&value, 0)?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_and_repr_cap_output_to_one_mib_and_bound_shared_dag_steps() {
+        let mut node = Val::string("x".repeat(1024));
+        for _ in 0..18 {
+            node = Val::new(Kind::Array(vec![node.clone(), node]));
+        }
+        let text = node.text();
+        let repr = node.repr();
+        assert!(text.len() <= MAX_TEXT_OUTPUT_BYTES);
+        assert!(repr.len() <= MAX_TEXT_OUTPUT_BYTES);
+        assert!(node.check_graph().is_err());
+    }
+
+    #[test]
+    fn deep_dag_equal_and_recursive_mark_terminate_cleanly() {
+        let mut left = Val::int(1);
+        let mut right = Val::int(1);
+        for _ in 0..70 {
+            left = Val::new(Kind::Array(vec![left]));
+            right = Val::new(Kind::Array(vec![right]));
+        }
+        left.recursive_mark();
+        assert!(!equal(&left, &right));
+    }
 }

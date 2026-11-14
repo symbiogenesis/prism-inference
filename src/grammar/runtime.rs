@@ -306,62 +306,95 @@ fn accept_character(
     Ok(())
 }
 
+const MAX_DIAGNOSTIC_PREVIEW_BYTES: usize = 256;
+
+fn bounded_utf8_preview(bytes: &[u8]) -> String {
+    let sample = &bytes[..bytes.len().min(MAX_DIAGNOSTIC_PREVIEW_BYTES)];
+    let preview = String::from_utf8_lossy(sample);
+    if bytes.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES && preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES
+    {
+        return preview.into_owned();
+    }
+    let mut end = preview
+        .len()
+        .min(MAX_DIAGNOSTIC_PREVIEW_BYTES.saturating_sub(3));
+    while end > 0 && !preview.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &preview[..end])
+}
+
+const fn is_valid_utf8_continuation(partial: PartialUtf8, byte: u8) -> bool {
+    if (byte & 0xc0) != 0x80 {
+        return false;
+    }
+    match (partial.remaining, partial.value) {
+        (1, 0..=1) => false,
+        (2, 0) => byte >= 0xa0,
+        (2, 0x0d) => byte <= 0x9f,
+        (3, 0) => byte >= 0x90,
+        (3, 4) => byte <= 0x8f,
+        (1..=3, _) => true,
+        _ => false,
+    }
+}
+
 fn decode_utf8(bytes: &[u8], mut partial: PartialUtf8) -> (Vec<u32>, PartialUtf8) {
     let mut points = Vec::new();
     let mut position = 0;
-    let previous = partial.remaining;
-    while position < bytes.len() && bytes[position] != 0 && partial.remaining > 0 {
-        let byte = bytes[position];
-        if byte >> 6 != 2 {
-            return (
-                Vec::new(),
-                PartialUtf8 {
-                    value: 0,
-                    remaining: -1,
-                },
-            );
-        }
-        partial.value = (partial.value << 6) + u32::from(byte & 63);
-        position += 1;
-        partial.remaining -= 1;
-    }
-    if previous > 0 && partial.remaining == 0 {
-        points.push(partial.value);
+    if !(0..=3).contains(&partial.remaining) {
+        points.push(0xfffd);
+        partial = PartialUtf8::default();
     }
     while position < bytes.len() && bytes[position] != 0 {
-        let first = bytes[position];
-        partial.remaining = match first >> 4 {
-            0..=7 => 0,
-            8..=11 => -1,
-            12 | 13 => 1,
-            14 => 2,
-            _ => 3,
-        };
-        if partial.remaining < 0 {
-            return (
-                Vec::new(),
-                PartialUtf8 {
-                    value: 0,
-                    remaining: partial.remaining,
-                },
-            );
+        let byte = bytes[position];
+        if partial.remaining > 0 {
+            if is_valid_utf8_continuation(partial, byte) {
+                partial.value = (partial.value << 6) | u32::from(byte & 0x3f);
+                partial.remaining -= 1;
+                position += 1;
+                if partial.remaining == 0 {
+                    if partial.value <= 0x10_ffff && !(0xd800..=0xdfff).contains(&partial.value) {
+                        points.push(partial.value);
+                    } else {
+                        points.push(0xfffd);
+                    }
+                    partial.value = 0;
+                }
+            } else {
+                points.push(0xfffd);
+                partial = PartialUtf8::default();
+            }
+            continue;
         }
-        let mask = match partial.remaining {
-            0 => 0x7f,
-            1 => 0x1f,
-            2 => 0x0f,
-            _ => 0x07,
-        };
-        partial.value = u32::from(first & mask);
+        match byte {
+            0x01..=0x7f => {
+                points.push(u32::from(byte));
+            }
+            0xc2..=0xdf => {
+                partial = PartialUtf8 {
+                    value: u32::from(byte & 0x1f),
+                    remaining: 1,
+                };
+            }
+            0xe0..=0xef => {
+                partial = PartialUtf8 {
+                    value: u32::from(byte & 0x0f),
+                    remaining: 2,
+                };
+            }
+            0xf0..=0xf4 => {
+                partial = PartialUtf8 {
+                    value: u32::from(byte & 0x07),
+                    remaining: 3,
+                };
+            }
+            _ => {
+                points.push(0xfffd);
+                partial = PartialUtf8::default();
+            }
+        }
         position += 1;
-        while position < bytes.len() && bytes[position] != 0 && partial.remaining > 0 {
-            partial.value = (partial.value << 6) + u32::from(bytes[position] & 63);
-            position += 1;
-            partial.remaining -= 1;
-        }
-        if partial.remaining == 0 {
-            points.push(partial.value);
-        }
     }
     (points, partial)
 }
@@ -535,7 +568,7 @@ impl GrammarState {
         if self.stacks.is_empty() {
             return Err(invalid(format!(
                 "Unexpected empty grammar stack after accepting piece: {} ({token})",
-                String::from_utf8_lossy(piece)
+                bounded_utf8_preview(piece)
             )));
         }
         Ok(())
@@ -661,4 +694,70 @@ fn reject_for_stack(
         }
     }
     Ok(rejected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_utf8_enforces_rfc3629_and_reprocesses_interrupting_ascii() {
+        let (points, partial) = decode_utf8(&[0xc2, b'a'], PartialUtf8::default());
+        assert_eq!(points, vec![0xfffd, u32::from(b'a')]);
+        assert_eq!(partial, PartialUtf8::default());
+
+        let (points, partial) = decode_utf8(&[0xc0, 0xaf, b'x'], PartialUtf8::default());
+        assert_eq!(points, vec![0xfffd, 0xfffd, u32::from(b'x')]);
+        assert_eq!(partial, PartialUtf8::default());
+
+        let (points, partial) = decode_utf8(&[0xed, 0xa0, 0x80, b'y'], PartialUtf8::default());
+        assert_eq!(points, vec![0xfffd, 0xfffd, 0xfffd, u32::from(b'y')]);
+        assert_eq!(partial, PartialUtf8::default());
+
+        let (points, partial) = decode_utf8(&[0xe0, 0x80, 0x80], PartialUtf8::default());
+        assert_eq!(points, vec![0xfffd, 0xfffd, 0xfffd]);
+        assert_eq!(partial, PartialUtf8::default());
+
+        let (points, partial) = decode_utf8(&[0xf4, 0x90, 0x80, 0x80], PartialUtf8::default());
+        assert_eq!(points, vec![0xfffd, 0xfffd, 0xfffd, 0xfffd]);
+        assert_eq!(partial, PartialUtf8::default());
+
+        let (points_first, partial_mid) = decode_utf8(&[0xe2, 0x82], PartialUtf8::default());
+        assert_eq!(points_first, Vec::<u32>::new());
+        let (points_second, partial_done) = decode_utf8(&[0xac], partial_mid);
+        assert_eq!(points_second, vec![0x20ac]);
+        assert_eq!(partial_done, PartialUtf8::default());
+
+        let (_, pending) = decode_utf8(&[0xe1, 0x80], PartialUtf8::default());
+        let (interrupted, reset) = decode_utf8(b"z", pending);
+        assert_eq!(interrupted, vec![0xfffd, u32::from(b'z')]);
+        assert_eq!(reset, PartialUtf8::default());
+    }
+
+    #[test]
+    fn accept_token_error_caps_piece_preview_on_utf8_boundary() -> Result<()> {
+        let rules = vec![vec![
+            Element {
+                kind: 3,
+                value: u32::from(b'a'),
+            },
+            Element { kind: 0, value: 0 },
+        ]];
+        let mut state = GrammarState::from_rules(rules, 0)?;
+        let long_piece = "€".repeat(200);
+        let err = state
+            .accept_token(1, long_piece.as_bytes())
+            .err()
+            .ok_or_else(|| invalid("expected stack error"))?;
+        let message = err.to_string();
+        let rest = message
+            .strip_prefix("Unexpected empty grammar stack after accepting piece: ")
+            .ok_or_else(|| invalid("unexpected error prefix"))?;
+        let preview = rest
+            .strip_suffix(" (1)")
+            .ok_or_else(|| invalid("unexpected error suffix"))?;
+        assert!(preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(preview.ends_with("..."));
+        Ok(())
+    }
 }

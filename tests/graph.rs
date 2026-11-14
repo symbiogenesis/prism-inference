@@ -417,7 +417,8 @@ fn rank_one_checkpoint_and_failed_generation_preserve_complete_state() -> Result
     assert!(
         graph
             .identity()
-            .contains(":rank-one-lora-v1:rank-one-fixture:3fa66666")
+            .contains(":rank-one-lora-v1:rank-one-fixture:sha256=")
+            && graph.identity().contains(":3fa66666")
     );
     graph.evaluate(0)?;
     let checkpoint = graph.checkpoint()?;

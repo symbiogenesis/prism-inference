@@ -878,7 +878,9 @@ fn inspect_with_vocabulary_version(
             .map(|tensor| tensor.name.clone())
             .collect();
         json!({
-                "SchemaVersion": 1, "Format": "GGUF", "Version": 3, "ByteOrder": "little", "ModelPath": path.to_string_lossy(),
+                "SchemaVersion": 1, "Format": "GGUF", "Version": 3, "ByteOrder": "little",
+                "ModelRole": "input-gguf",
+                "ModelName": path.file_name().map_or_else(|| String::from("model.gguf"), |name| name.to_string_lossy().into_owned()),
                 "FileBytes": file_bytes, "Architecture": architecture, "Alignment": alignment, "MetadataCount": metadata_count,
                 "MetadataEndOffset": metadata_end, "TensorDescriptorsEndOffset": descriptors_end, "TensorDataOffset": data_offset,
                 "TensorCount": tensor_count, "TensorTypeHistogram": histogram, "Scalars": scalar_report, "Arrays": arrays,

@@ -5371,62 +5371,16 @@ pub(super) fn bf16_dot(bytes: &[u8], input: &[f32]) -> Option<Result<f32>> {
     Some(super::finite(sum as f32))
 }
 
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
-)]
 #[inline]
 fn bf16_dot_rows<const ROWS: usize>(
     rows: [&[u8]; ROWS],
     input: &[f32],
 ) -> Option<Result<[f32; ROWS]>> {
-    let neon = fearless_simd::Level::baseline().as_neon()?;
-    let zero = u16x8::splat(neon, 0);
-    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    let b_chunks = rows.map(|row| row.as_chunks::<16>().0);
-    let b_rems = rows.map(|row| row.as_chunks::<16>().1);
-    let (in_chunks, in_rem) = input.as_chunks::<8>();
-    let mut sums = [-0.0_f64; ROWS];
-    for (idx, in_chunk) in in_chunks.iter().enumerate() {
-        let a0 = f32x4::from_slice(neon, &in_chunk[..4]);
-        let a1 = f32x4::from_slice(neon, &in_chunk[4..]);
-        for r in 0..ROWS {
-            let raw = u8x16::from_slice(neon, &b_chunks[r][idx]).bitcast::<u16x8<Neon>>();
-            let w0 = zero.zip_low(raw).bitcast::<f32x4<Neon>>();
-            let w1 = zero.zip_high(raw).bitcast::<f32x4<Neon>>();
-            finite_mask = finite_mask & w0.is_finite() & w1.is_finite();
-            let prod0 = (w0 * a0).to_array();
-            let prod1 = (w1 * a1).to_array();
-            sums[r] += f64::from(prod0[0]);
-            sums[r] += f64::from(prod0[1]);
-            sums[r] += f64::from(prod0[2]);
-            sums[r] += f64::from(prod0[3]);
-            sums[r] += f64::from(prod1[0]);
-            sums[r] += f64::from(prod1[1]);
-            sums[r] += f64::from(prod1[2]);
-            sums[r] += f64::from(prod1[3]);
-        }
-    }
-    if !finite_mask.all_true() {
-        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-    }
-    for r in 0..ROWS {
-        for (b, &act) in b_rems[r].as_chunks::<2>().0.iter().zip(in_rem) {
-            match super::finite(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16)) {
-                Ok(w) => sums[r] += f64::from(w * act),
-                Err(err) => return Some(Err(err)),
-            }
-        }
-    }
-    let mut out = [0.0_f32; ROWS];
-    for r in 0..ROWS {
-        match super::finite(sums[r] as f32) {
-            Ok(val) => out[r] = val,
-            Err(err) => return Some(Err(err)),
-        }
-    }
-    Some(Ok(out))
+    let _neon = fearless_simd::Level::baseline().as_neon()?;
+    Some(
+        bonsai_neon_dot::dot_bf16_rows(rows, input)
+            .ok_or_else(|| crate::invalid("nonfinite tensor or activation value")),
+    )
 }
 
 #[inline]

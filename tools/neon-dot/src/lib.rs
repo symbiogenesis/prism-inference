@@ -1,8 +1,9 @@
 //! Audited ARMv8.2-A `dotprod` (`vdotq_s32`) and `i8mm` (`vmmlaq_s32`) SIMD
-//! dot-product, exact binary16 widening and non-widening `PTQ1_0` unpacking.
+//! dot-product, exact binary16 widening, ordered BF16 row reductions and
+//! non-widening `PTQ1_0` unpacking.
 //!
-//! All public entry points accept fixed-size array references and fall back
-//! cleanly to exact portable arithmetic when their target features are absent.
+//! Public entry points use fixed-array or checked borrowed-slice boundaries
+//! and retain exact portable arithmetic when their target features are absent.
 //! Binary16 widening preserves every bit pattern through a baseline-NEON
 //! finite fast path and exact exceptional decoding.
 
@@ -13,6 +14,9 @@ pub use scaled::Pq2Activation;
 
 mod half;
 pub use half::{widen_f16_eight, widen_f16_four};
+
+mod bf16;
+pub use bf16::dot_bf16_rows;
 
 /// Packed rotated scalar KV consumption with portable and baseline-NEON paths.
 pub mod kv_quant;

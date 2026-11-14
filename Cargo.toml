@@ -86,6 +86,11 @@ test = true
 required-features = ["cli", "parallel-rows"]
 
 [[example]]
+name = "swift_sanity_check"
+test = true
+required-features = ["cli", "parallel-rows"]
+
+[[example]]
 name = "upstream_prism"
 # Conformance code lives with tests; the explicit example target preserves
 # its command-line runner and embedded unit tests.

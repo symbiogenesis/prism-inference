@@ -65,10 +65,6 @@ fn compare(actual: &[f32], expected: &[f32], count: FusionCount) {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep the real fused and separate arithmetic, worker and unrelated-node controls together."
-)]
 fn fusion_verification_counts_real_norm_paths_and_separate_arithmetic() -> Result<()> {
     for width in [16, 32, 1024] {
         let geometry = geometry(width);

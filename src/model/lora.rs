@@ -26,9 +26,95 @@ pub const SWIFT_ADAPTER_SHA256: &str =
 pub const SWIFT_ADAPTER_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAIRS: usize = 513;
 
+/// Explicit identity of one edited, source-only experimental adapter artifact.
+///
+/// The caller selects the candidate; these fields authenticate its bytes, not
+/// its authoring history or quality. Released loaders still admit only Orca.
+#[derive(Clone, Copy)]
+pub struct EditedAdapter<'a> {
+    /// Absolute path of the candidate GGUF, separate from the approved file.
+    pub path: &'a Path,
+    /// Exact candidate length; the fixed Orca factor inventory is required.
+    pub bytes: u64,
+    /// Exact lowercase candidate SHA-256.
+    pub sha256: &'a str,
+}
+
+impl EditedAdapter<'_> {
+    pub(crate) fn validate_identity(self) -> Result<()> {
+        if !self.path.is_absolute()
+            || self.bytes != SWIFT_ADAPTER_BYTES
+            || self.sha256 == SWIFT_ADAPTER_SHA256
+            || self.sha256.len() != 64
+            || !self.sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid("edited Swift adapter identity rejected"));
+        }
+        Ok(())
+    }
+}
+
+/// Retained factor payload and coefficient counts, excluding allocator overhead.
+///
+/// B vectors are counted once per shared allocation. Dense serialized linear A
+/// tensors are released; embedding lookup retains its original serialized A.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterStorage {
+    /// Retained dense or sparse F32 linear A coefficients, excluding indices.
+    pub linear_a_bytes: usize,
+    /// Retained serialized embedding A bytes.
+    pub embedding_a_bytes: usize,
+    /// Retained decoded B bytes, counting shared allocations once.
+    pub unique_b_bytes: usize,
+    /// Retained U16 sparse input indices.
+    pub index_bytes: usize,
+    /// Sum of the four retained payload byte counts.
+    pub total_payload_bytes: usize,
+    /// Dense linear A extent before sparse storage conversion.
+    pub linear_a_coefficients: usize,
+    /// Linear A coefficients retained in dense or sparse storage.
+    pub stored_linear_a_coefficients: usize,
+    /// Linear sites using the explicitly selected sparse arithmetic profile.
+    pub sparse_sites: usize,
+}
+
+struct SparseA {
+    width: usize,
+    indices: Vec<u16>,
+    values: Vec<f32>,
+}
+
 struct Factors {
     a_values: Vec<f32>,
+    sparse_a: Option<SparseA>,
     b_values: Arc<Vec<f32>>,
+}
+
+impl Factors {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "The experimental profile explicitly rounds its finite F64 dot to F32 before B multiplication."
+    )]
+    fn dot(&self, input: &[f32], scratch: &mut Scratch) -> Result<()> {
+        let Some(sparse) = &self.sparse_a else {
+            return lora_a_dot(&self.a_values, input, &mut scratch.rank, &scratch.matvec);
+        };
+        scratch.rank.clear();
+        if input.len() != sparse.width || input.iter().any(|value| !value.is_finite()) {
+            return Err(invalid("sparse A dot requires a matching finite activation vector"));
+        }
+        let sum: f64 = sparse.indices.iter().zip(&sparse.values)
+            .map(|(&index, &value)| f64::from(value) * f64::from(input[usize::from(index)]))
+            .sum();
+        let rank = sum as f32;
+        if !rank.is_finite() {
+            return Err(invalid("nonfinite sparse rank-one A product"));
+        }
+        scratch.rank.try_reserve_exact(1)?;
+        scratch.rank.push(rank);
+        Ok(())
+    }
 }
 
 /// An immutable, explicitly admitted rank-one adapter for one base model.
@@ -38,6 +124,7 @@ struct Factors {
 /// stages separately. Structural admission is not full-model qualification.
 pub struct RankOneAdapter {
     identity: String,
+    execution_identity: String,
     base_identity: String,
     alpha: f32,
     embedding: Option<(Tensor, Arc<Vec<f32>>)>,
@@ -67,6 +154,54 @@ impl Scratch {
 }
 
 impl RankOneAdapter {
+    /// Load a bounded edited Orca candidate with explicit sparse A execution.
+    ///
+    /// The selected base remains strictly pinned. The full 129-site F32 rank-one
+    /// inventory and alpha one are required. Only profitable sparse linear A
+    /// vectors use U16 indices; their ascending-index F64 dot rounds once to
+    /// F32. This experimental numerical profile differs from the dense kernels
+    /// and is bound into graph identity. No production loader calls this method.
+    ///
+    /// # Errors
+    /// Rejects invalid identity, changed length, unpinned base, malformed factors,
+    /// missing sites, zero linear corrections or no useful sparse representation.
+    pub fn load_edited_swift(
+        candidate: EditedAdapter<'_>,
+        base: &Model,
+        representation: super::swift::Representation,
+    ) -> Result<Self> {
+        candidate.validate_identity()?;
+        if base.identity != representation.model_sha256() {
+            return Err(invalid("edited Swift adapter base rejected"));
+        }
+        let mut model = Model::load(
+            candidate.path,
+            candidate.bytes,
+            candidate.sha256,
+            SWIFT_ADAPTER_MEMORY_BYTES,
+        )?;
+        model.share_lora_b();
+        let mut adapter = Self::from_model(model, base)?;
+        if adapter.factors.len() != 129 || adapter.alpha.to_bits() != 1.0_f32.to_bits() {
+            return Err(invalid("edited Swift adapter inventory or alpha mismatch"));
+        }
+        for layer in 0..64 {
+            for family in [
+                "ffn_down",
+                if layer % 4 == 3 { "attn_output" } else { "ssm_out" },
+            ] {
+                if !adapter.factors.contains_key(&format!("blk.{layer}.{family}.weight")) {
+                    return Err(invalid("edited Swift adapter lacks a required linear site"));
+                }
+            }
+        }
+        if adapter.embedding.is_none() {
+            return Err(invalid("edited Swift adapter lacks its embedding site"));
+        }
+        adapter.enable_sparse_a()?;
+        Ok(adapter)
+    }
+
     /// Loads the exact approved artifact for the exact original Swift PQ2 model.
     ///
     /// File verification precedes payload publication. Identical immutable B
@@ -195,7 +330,7 @@ impl RankOneAdapter {
                     // already shared B nearby to avoid another target lookup.
                     embedding = Some((a.clone(), Arc::clone(&b_values)));
                 }
-                factors.insert(target.to_owned(), Factors { a_values, b_values });
+                factors.insert(target.to_owned(), Factors { a_values, sparse_a: None, b_values });
             } else if let Some(target) = name.strip_suffix(".lora_b") {
                 if !model.tensors.contains_key(&format!("{target}.lora_a")) {
                     return Err(invalid("rank-one adapter A factor missing"));
@@ -208,6 +343,7 @@ impl RankOneAdapter {
             return Err(invalid("incomplete rank-one adapter inventory"));
         }
         Ok(Self {
+            execution_identity: model.identity.clone(),
             identity: model.identity,
             base_identity: base.identity.clone(),
             alpha: *alpha,
@@ -222,6 +358,76 @@ impl RankOneAdapter {
     #[must_use]
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+
+    pub(crate) fn execution_identity(&self) -> &str {
+        &self.execution_identity
+    }
+
+    /// Count retained factor payload, without process or peak-memory claims.
+    #[must_use]
+    pub fn storage(&self) -> AdapterStorage {
+        let mut storage = AdapterStorage::default();
+        let mut seen_b = Vec::new();
+        for factors in self.factors.values() {
+            if let Some(sparse) = &factors.sparse_a {
+                storage.linear_a_bytes += sparse.values.capacity() * size_of::<f32>();
+                storage.index_bytes += sparse.indices.capacity() * size_of::<u16>();
+                storage.linear_a_coefficients += sparse.width;
+                storage.stored_linear_a_coefficients += sparse.values.len();
+                storage.sparse_sites += 1;
+            } else {
+                storage.linear_a_bytes += factors.a_values.capacity() * size_of::<f32>();
+                storage.linear_a_coefficients += factors.a_values.len();
+                storage.stored_linear_a_coefficients += factors.a_values.len();
+            }
+            if !seen_b.iter().any(|other| Arc::ptr_eq(other, &factors.b_values)) {
+                storage.unique_b_bytes += factors.b_values.capacity() * size_of::<f32>();
+                seen_b.push(Arc::clone(&factors.b_values));
+            }
+        }
+        storage.embedding_a_bytes = self.embedding.as_ref().map_or(0, |(a, _)| a.data.len());
+        storage.total_payload_bytes = storage.linear_a_bytes + storage.index_bytes
+            + storage.embedding_a_bytes + storage.unique_b_bytes;
+        storage
+    }
+
+    fn enable_sparse_a(&mut self) -> Result<()> {
+        let mut sparse_count = 0;
+        for (target, factors) in &mut self.factors {
+            if target == "token_embd.weight" {
+                continue;
+            }
+            let nonzero = factors.a_values.iter().filter(|value| **value != 0.0).count();
+            if nonzero == 0 {
+                return Err(invalid("edited adapter must retain every linear correction"));
+            }
+            if factors.a_values.len() > usize::from(u16::MAX) + 1
+                || nonzero * (size_of::<f32>() + size_of::<u16>())
+                    >= factors.a_values.len() * size_of::<f32>()
+            {
+                continue;
+            }
+            let mut sparse = SparseA {
+                width: factors.a_values.len(),
+                indices: Vec::new(),
+                values: Vec::new(),
+            };
+            sparse.indices.try_reserve_exact(nonzero)?;
+            sparse.values.try_reserve_exact(nonzero)?;
+            for (index, &value) in factors.a_values.iter().enumerate().filter(|(_, value)| **value != 0.0) {
+                sparse.indices.push(u16::try_from(index)?);
+                sparse.values.push(value);
+            }
+            factors.a_values = Vec::new();
+            factors.sparse_a = Some(sparse);
+            sparse_count += 1;
+        }
+        if sparse_count == 0 {
+            return Err(invalid("edited adapter has no profitable sparse linear A vectors"));
+        }
+        self.execution_identity.push_str(":edited-sparse-a-u16-f64-v1");
+        Ok(())
     }
 
     /// Number of complete admitted factor pairs.
@@ -266,7 +472,7 @@ impl RankOneAdapter {
         let Some(factors) = self.factors.get(target) else {
             return Ok(());
         };
-        lora_a_dot(&factors.a_values, input, &mut scratch.rank, &scratch.matvec)?;
+        factors.dot(input, scratch)?;
         self.scale_and_finish(&factors.b_values, scale, output, scratch)
     }
 
@@ -285,6 +491,13 @@ impl RankOneAdapter {
             return Ok(());
         };
         let count = inputs.len().min(outputs.len());
+        if factors.sparse_a.is_some() {
+            for (input, output) in inputs[..count].iter().zip(&mut outputs[..count]) {
+                factors.dot(input, scratch)?;
+                self.scale_and_finish(&factors.b_values, scale, output, scratch)?;
+            }
+            return Ok(());
+        }
         let mut idx = 0;
         while idx + 4 <= count {
             if let Some(ranks) = lora_a_dot_four(

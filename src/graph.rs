@@ -2178,7 +2178,7 @@ impl Qwen35 {
         write!(
             graph.identity,
             ":rank-one-lora-v1:{}:{:08x}",
-            adapter.identity(),
+            adapter.execution_identity(),
             scale.to_bits()
         )?;
         graph.adapter = Some(adapter);
@@ -2217,11 +2217,11 @@ impl Qwen35 {
             .rsplit_once(":rank-one-lora-v1:")
             .ok_or_else(|| invalid("rank-one graph identity is missing its adapter contract"))?;
         let mut identity = String::new();
-        identity.try_reserve_exact(base_identity.len() + adapter.identity().len() + 32)?;
+        identity.try_reserve_exact(base_identity.len() + adapter.execution_identity().len() + 32)?;
         write!(
             identity,
             "{base_identity}:rank-one-lora-v1:{}:{:08x}",
-            adapter.identity(),
+            adapter.execution_identity(),
             scale.to_bits()
         )?;
         self.append_tiled_prefill_identity(&mut identity)?;

@@ -13,7 +13,7 @@ use crate::{
     invalid,
     kernels::{MatvecBackend, RowParallelism},
     model::{
-        lora::RankOneAdapter,
+        lora::{AdapterStorage, EditedAdapter, RankOneAdapter},
         swift::{self, LoadReceipt, Representation},
     },
     runtime::{Cancellation, Completion, GenerationTimings, Limits, Prefill, PromptReuse, Runtime},
@@ -414,6 +414,7 @@ pub struct SwiftSession {
     cpu_prefill: Option<CpuPrefill>,
     cpu_speculation: Option<CpuSpeculation>,
     adapter_identity: Option<String>,
+    adapter_storage: Option<AdapterStorage>,
     runtime: Runtime<Qwen35>,
     chat: SwiftChatSession,
     vocabulary: Vocabulary,
@@ -422,6 +423,11 @@ pub struct SwiftSession {
     delivery_fault: bool,
     prompt_reuse: PromptReuse,
     receipt: LoadReceipt,
+}
+
+enum AdapterSelection<'a> {
+    Approved(Option<&'a Path>),
+    Edited(EditedAdapter<'a>),
 }
 
 impl SwiftSession {
@@ -627,6 +633,62 @@ impl SwiftSession {
         cpu_prefill: Option<CpuPrefill>,
         cpu_speculation: Option<CpuSpeculation>,
     ) -> Result<Self> {
+        Self::load_selected_profile(
+            path, representation, AdapterSelection::Approved(adapter_path), backend,
+            seed, parallelism, kv_cache, context_tokens, cpu_prefill, cpu_speculation,
+        )
+    }
+
+    /// Load one explicitly bound edited adapter with experimental sparse A dots.
+    ///
+    /// The model, tokenizer, context, KV cache and transaction contracts remain
+    /// those of the exact selected Swift artifact. Adapter authenticity is the
+    /// caller's candidate hash, not the released Orca approval. Sparse arithmetic
+    /// has its own graph identity. No HTTP or ordinary loading path calls this
+    /// research entry point; it selects no tiled prefill or speculation.
+    ///
+    /// # Errors
+    /// Rejects candidate identity/inventory, unprofitable sparse factors and the
+    /// model, context, allocation and execution errors of ordinary loading.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The explicit candidate replaces the approved adapter in the established immutable context loader."
+    )]
+    pub fn load_edited_profile_with_context(
+        path: &Path,
+        representation: Representation,
+        adapter: EditedAdapter<'_>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+        context_tokens: usize,
+    ) -> Result<Self> {
+        Self::load_selected_profile(
+            path, representation, AdapterSelection::Edited(adapter), backend,
+            seed, parallelism, kv_cache, context_tokens, None, None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Both explicit adapter selections share one immutable execution loader."
+    )]
+    fn load_selected_profile(
+        path: &Path,
+        representation: Representation,
+        adapter_selection: AdapterSelection<'_>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+        context_tokens: usize,
+        cpu_prefill: Option<CpuPrefill>,
+        cpu_speculation: Option<CpuSpeculation>,
+    ) -> Result<Self> {
+        if let AdapterSelection::Edited(candidate) = &adapter_selection {
+            candidate.validate_identity()?;
+        }
         validate_execution_capacity_with_kv(
             context_tokens,
             u64::MAX,
@@ -645,12 +707,18 @@ impl SwiftSession {
         let chat = SwiftChatSession::from_model_representation(&model, representation)?
             .with_context_tokens(context_tokens)?;
         let vocabulary = Vocabulary::from_metadata(&model.metadata, swift::VOCAB_SIZE)?;
-        let adapter = adapter_path
-            .map(|path| RankOneAdapter::load_swift_representation(path, &model, representation))
-            .transpose()?;
+        let adapter = match adapter_selection {
+            AdapterSelection::Approved(path) => path
+                .map(|path| RankOneAdapter::load_swift_representation(path, &model, representation))
+                .transpose()?,
+            AdapterSelection::Edited(candidate) => Some(
+                RankOneAdapter::load_edited_swift(candidate, &model, representation)?
+            ),
+        };
         let adapter_identity = adapter
             .as_ref()
-            .map(|_| crate::model::lora::SWIFT_ADAPTER_SHA256.to_owned());
+            .map(|adapter| adapter.identity().to_owned());
+        let adapter_storage = adapter.as_ref().map(RankOneAdapter::storage);
         let mut decoder = Qwen35::with_swift_state_budget_and_kv(
             model,
             context_tokens,
@@ -681,6 +749,7 @@ impl SwiftSession {
             cpu_prefill,
             cpu_speculation,
             adapter_identity,
+            adapter_storage,
             runtime,
             chat,
             vocabulary,
@@ -739,10 +808,16 @@ impl SwiftSession {
         self.runtime.decoder().identity()
     }
 
-    /// Exact approved adapter artifact SHA-256, when one was explicitly loaded.
+    /// Exact verified adapter artifact SHA-256, when one was explicitly loaded.
     #[must_use]
     pub fn adapter_identity(&self) -> Option<&str> {
         self.adapter_identity.as_deref()
+    }
+
+    /// Retained adapter factor payload; excludes process memory and overhead.
+    #[must_use]
+    pub const fn adapter_storage(&self) -> Option<AdapterStorage> {
+        self.adapter_storage
     }
 
     /// Verified loading and bounded storage accounting for this model.

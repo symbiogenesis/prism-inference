@@ -111,7 +111,7 @@ fn ffn_probe_callback_failure_commits_no_token_and_bounds_reject() -> Result<()>
             })
             .is_err()
     );
-    assert_eq!(output, [] as [f32; 0]);
+    assert_eq!(output, Vec::<f32>::new());
     probe.restore(&before)?;
     let mut fresh = FfnProbe::new(graph()?, 0, None)?;
     assert_eq!(probe.evaluate(0)?, fresh.evaluate(0)?);

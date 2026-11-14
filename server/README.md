@@ -49,6 +49,21 @@ startup policies. Worker count is a budget, not measured parallel utilization.
 Requests cannot override it. Strict owning brokers must validate the complete
 selected profile before forwarding work.
 
+Readiness waits for the joined model thread to complete optional accelerator
+initialization and resident-weight preparation. A failure or malformed startup
+observation closes startup and joins that owner before returning. The
+`startup_projection` object has `schema_version: 1`, `requested: "auto" | "cpu"`
+and `effective: "cpu" | "hexagon-native-q2" | "external"`. CPU has null `identity`
+and zero `resident_tensors`, `resident_weight_bytes` and `host_metadata_bytes`.
+The fixed resident Hexagon route reports
+`identity: "hexagon-hvx-native-q2-resident-v1-experimental"`, 168 prepared tensors,
+2,888,663,040 packed resident bytes and the observed positive host metadata
+payload, bounded by its 524,288-byte reservation. An external executor reports
+its bounded identity and zero residency observations, which do not establish
+absence of external allocations. Explicit CPU placement bypasses initialization.
+These startup facts establish installation and preparation, not completed DSP
+execution, qualified arithmetic, full resource accounting or performance.
+
 Adapter requests require exactly `lora: [{"id": 0, "scale": 1.3}]`, with a finite
 JSON scale in 0..2 before binary32 conversion. Missing/null/extra slots, other IDs
 and overrides reject. No-adapter requests reject `lora`. Public

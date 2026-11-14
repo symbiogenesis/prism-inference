@@ -14,9 +14,81 @@ use std::sync::Arc;
 
 use super::Placement;
 
+/// Model-thread observations frozen after accelerator initialization completes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) enum ProjectionStartup {
+    #[default]
+    Cpu,
+    External(Arc<str>),
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")),
+        allow(
+            dead_code,
+            reason = "Only Windows ARM64 initializes a native Hexagon executor; other targets retain the wire-validation controls."
+        )
+    )]
+    NativeQ2 {
+        resident_tensors: u64,
+        resident_weight_bytes: u64,
+        host_metadata_bytes: usize,
+    },
+}
+
+impl ProjectionStartup {
+    pub(super) fn valid(&self, placement: Placement) -> bool {
+        match self {
+            Self::Cpu => true,
+            Self::External(identity) => {
+                placement == Placement::Auto
+                    && !identity.is_empty()
+                    && identity.len() <= 256
+                    && identity.bytes().all(|byte| byte.is_ascii_graphic())
+            }
+            Self::NativeQ2 {
+                resident_tensors,
+                resident_weight_bytes,
+                host_metadata_bytes,
+            } => {
+                placement == Placement::Auto
+                    && *resident_tensors == 168
+                    && *resident_weight_bytes == 2_888_663_040
+                    && (1..=524_288).contains(host_metadata_bytes)
+            }
+        }
+    }
+
+    fn readiness(&self, placement: Placement) -> Value {
+        let (effective, identity, tensors, weights, metadata) = match self {
+            Self::Cpu => ("cpu", None, 0, 0, 0),
+            Self::External(identity) => ("external", Some(identity.as_ref()), 0, 0, 0),
+            Self::NativeQ2 {
+                resident_tensors,
+                resident_weight_bytes,
+                host_metadata_bytes,
+            } => (
+                "hexagon-native-q2",
+                Some("hexagon-hvx-native-q2-resident-v1-experimental"),
+                *resident_tensors,
+                *resident_weight_bytes,
+                *host_metadata_bytes,
+            ),
+        };
+        json!({
+            "schema_version": 1,
+            "requested": if placement == Placement::Cpu { "cpu" } else { "auto" },
+            "effective": effective,
+            "identity": identity,
+            "resident_tensors": tensors,
+            "resident_weight_bytes": weights,
+            "host_metadata_bytes": metadata,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ModelProfile {
     pub placement: Placement,
+    pub projection_startup: ProjectionStartup,
     pub representation: Representation,
     pub adapter: bool,
     pub prompt_reuse: PromptReuse,
@@ -32,6 +104,7 @@ impl Default for ModelProfile {
     fn default() -> Self {
         Self {
             placement: Placement::Auto,
+            projection_startup: ProjectionStartup::default(),
             representation: Representation::default(),
             adapter: false,
             prompt_reuse: PromptReuse::default(),
@@ -56,6 +129,7 @@ impl ModelProfile {
             "template_sha256": swift::TEMPLATE_SHA256, "runtime": "prism-inference",
             "context_tokens": self.context_tokens, "seed": seed,
             "row_workers": self.row_workers,
+            "startup_projection": self.projection_startup.readiness(self.placement),
         });
         if self.placement == Placement::Cpu {
             model["placement"] = json!("cpu");

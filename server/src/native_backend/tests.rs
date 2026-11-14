@@ -103,6 +103,9 @@ struct Observation {
     generation_gate: Option<Arc<AtomicBool>>,
     finite_deadlines: Arc<AtomicUsize>,
     generation_cancelled: Arc<AtomicBool>,
+    initialization_gate: Option<Arc<AtomicBool>>,
+    initialization_failure: Option<NativeBackendError>,
+    startup_projection: Option<profile::ProjectionStartup>,
 }
 struct FakeEngine(Observation);
 
@@ -114,10 +117,24 @@ impl Drop for FakeEngine {
 
 impl worker::Engine for FakeEngine {
     type Prepared = FakePrepared;
-    fn initialize_worker_thread(&mut self) {
+    fn initialize_worker_thread(
+        &mut self,
+    ) -> Result<profile::ProjectionStartup, NativeBackendError> {
         self.0
             .worker_initializations
             .fetch_add(1, Ordering::Relaxed);
+        while self
+            .0
+            .initialization_gate
+            .as_ref()
+            .is_some_and(|gate| !gate.load(Ordering::Acquire))
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(error) = self.0.initialization_failure {
+            return Err(error);
+        }
+        Ok(self.0.startup_projection.clone().unwrap_or_default())
     }
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
         Ok(ModelProfile {
@@ -227,6 +244,15 @@ fn cpu_placement_skips_accelerator_initializer_and_binds_readiness() -> TestResu
             assert!(model.get("placement").is_none());
             assert!(model.get("projection_backend").is_none());
         }
+        assert_eq!(
+            model["startup_projection"],
+            json!({
+                "schema_version": 1,
+                "requested": if placement == Placement::Cpu { "cpu" } else { "auto" },
+                "effective": "cpu", "identity": null,
+                "resident_tensors": 0, "resident_weight_bytes": 0, "host_metadata_bytes": 0,
+            })
+        );
         drop(worker);
         assert!(observed.terminated.load(Ordering::Acquire));
         assert_eq!(
@@ -234,6 +260,128 @@ fn cpu_placement_skips_accelerator_initializer_and_binds_readiness() -> TestResu
             usize::from(placement == Placement::Auto)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn projection_startup_waits_for_owner_and_binds_resident_observations() -> TestResult {
+    use profile::ProjectionStartup;
+    let gate = Arc::new(AtomicBool::new(false));
+    let observed = Observation {
+        initialization_gate: Some(gate.clone()),
+        startup_projection: Some(ProjectionStartup::NativeQ2 {
+            resident_tensors: 168,
+            resident_weight_bytes: 2_888_663_040,
+            host_metadata_bytes: 524_128,
+        }),
+        ..Observation::default()
+    };
+    let engine = FakeEngine(observed.clone());
+    let (completed, receive) = std::sync::mpsc::channel();
+    let constructor = std::thread::spawn(move || {
+        let result = Worker::with_placement(engine, 42, Placement::Auto);
+        let _ = completed.send(result);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while observed.worker_initializations.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let initialized = observed.worker_initializations.load(Ordering::Acquire);
+    let premature = receive.try_recv();
+    gate.store(true, Ordering::Release);
+    assert_eq!(initialized, 1);
+    assert!(matches!(
+        premature,
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    let worker = receive
+        .recv_timeout(Duration::from_secs(2))?
+        .map_err(|error| format!("{error:?}"))?;
+    constructor.join().map_err(|_| "constructor panicked")?;
+    let readiness = worker.profile.readiness(worker.seed);
+    assert_eq!(
+        readiness["data"][0]["startup_projection"],
+        json!({
+            "schema_version": 1, "requested": "auto", "effective": "hexagon-native-q2",
+            "identity": "hexagon-hvx-native-q2-resident-v1-experimental",
+            "resident_tensors": 168, "resident_weight_bytes": 2_888_663_040,
+            "host_metadata_bytes": 524_128,
+        })
+    );
+    drop(worker);
+    assert!(observed.terminated.load(Ordering::Acquire));
+    Ok(())
+}
+
+#[test]
+fn projection_startup_rejects_failure_or_inconsistent_observations_and_joins_owner() {
+    use profile::ProjectionStartup;
+    for observation in [
+        Observation {
+            initialization_failure: Some(NativeBackendError::Engine),
+            ..Observation::default()
+        },
+        Observation {
+            startup_projection: Some(ProjectionStartup::NativeQ2 {
+                resident_tensors: 167,
+                resident_weight_bytes: 2_888_663_040,
+                host_metadata_bytes: 1,
+            }),
+            ..Observation::default()
+        },
+        Observation {
+            startup_projection: Some(ProjectionStartup::External(Arc::from(""))),
+            ..Observation::default()
+        },
+        Observation {
+            startup_projection: Some(ProjectionStartup::External(Arc::from("bad identity"))),
+            ..Observation::default()
+        },
+    ] {
+        assert!(
+            Worker::with_placement(FakeEngine(observation.clone()), 42, Placement::Auto).is_err()
+        );
+        assert!(observation.terminated.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn projection_startup_preserves_external_identity_and_cpu_bypasses_failed_initializer() -> TestResult
+{
+    use profile::ProjectionStartup;
+    let observed = Observation {
+        startup_projection: Some(ProjectionStartup::External(Arc::from(
+            "caller-projection-v1",
+        ))),
+        ..Observation::default()
+    };
+    let worker =
+        Worker::new(FakeEngine(observed.clone()), 42).map_err(|error| format!("{error:?}"))?;
+    let readiness = worker.profile.readiness(worker.seed);
+    assert_eq!(
+        readiness["data"][0]["startup_projection"]["effective"],
+        "external"
+    );
+    assert_eq!(
+        readiness["data"][0]["startup_projection"]["identity"],
+        "caller-projection-v1"
+    );
+    assert_eq!(
+        readiness["data"][0]["startup_projection"]["resident_weight_bytes"],
+        0
+    );
+    drop(worker);
+    let observed = Observation {
+        initialization_failure: Some(NativeBackendError::Engine),
+        ..Observation::default()
+    };
+    let worker = Worker::with_placement(FakeEngine(observed.clone()), 42, Placement::Cpu)
+        .map_err(|error| format!("{error:?}"))?;
+    assert_eq!(worker.profile.projection_startup, ProjectionStartup::Cpu);
+    assert_eq!(observed.worker_initializations.load(Ordering::Acquire), 0);
+    drop(worker);
     Ok(())
 }
 

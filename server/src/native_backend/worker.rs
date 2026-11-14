@@ -1,6 +1,9 @@
 //! A single joined model owner and acknowledged one-event output lane.
 
-use super::{NativeBackendError, PendingChat, Placement, profile::ModelProfile};
+use super::{
+    NativeBackendError, PendingChat, Placement,
+    profile::{ModelProfile, ProjectionStartup},
+};
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
     runtime::{Cancellation, Completion, GenerationTimings},
@@ -32,12 +35,19 @@ pub(super) trait Engine: Send + 'static {
         emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion>;
     fn reset(&mut self) -> bonsai_prism_runtime::Result<()>;
-    fn initialize_worker_thread(&mut self) {}
+    fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
+        Ok(ProjectionStartup::Cpu)
+    }
 }
 
-fn initialize_for_placement(engine: &mut impl Engine, placement: Placement) {
+fn initialize_for_placement(
+    engine: &mut impl Engine,
+    placement: Placement,
+) -> Result<ProjectionStartup, NativeBackendError> {
     if placement == Placement::Auto {
-        engine.initialize_worker_thread();
+        engine.initialize_worker_thread()
+    } else {
+        Ok(ProjectionStartup::Cpu)
     }
 }
 
@@ -51,6 +61,7 @@ impl Engine for SwiftSession {
         }
         Ok(ModelProfile {
             placement: Placement::Auto,
+            projection_startup: ProjectionStartup::default(),
             representation: self.representation(),
             adapter: self.adapter_identity().is_some(),
             prompt_reuse: self.prompt_reuse(),
@@ -117,9 +128,21 @@ impl Engine for SwiftSession {
     fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
         Self::reset(self)
     }
-    fn initialize_worker_thread(&mut self) {
+    fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
         #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-        install_default_hexagon_executor(self);
+        if let Some(startup) = install_default_hexagon_executor(self) {
+            return Ok(startup);
+        }
+        let Some(identity) = self.projection_executor_identity() else {
+            return Ok(ProjectionStartup::Cpu);
+        };
+        if identity.is_empty()
+            || identity.len() > 256
+            || !identity.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(NativeBackendError::Configuration);
+        }
+        Ok(ProjectionStartup::External(Arc::from(identity)))
     }
 }
 
@@ -431,16 +454,14 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-fn install_default_hexagon_executor(session: &mut SwiftSession) {
+fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<ProjectionStartup> {
     if session.representation() != bonsai_prism_runtime::model::swift::Representation::Pq2
         || session.cpu_prefill().is_some()
     {
-        return;
+        return None;
     }
-    let Some(package_dir) = discover_hexagon_package_directory() else {
-        return;
-    };
-    let Ok(limits) = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+    let package_dir = discover_hexagon_package_directory()?;
+    let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
         hexagon_native_rpc::NATIVE_Q2_MAX_COLUMNS,
         hexagon_native_rpc::NATIVE_Q2_MAX_ROWS,
         24_000,
@@ -450,16 +471,11 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) {
         limits
             .with_resident_weights(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES)
     })
-    .map(hexagon_native_rpc::NativeQ2ProjectionLimits::with_persistent_session) else {
-        return;
-    };
-    let Ok(driver) = hexagon_native_rpc::Driver::open_system() else {
-        return;
-    };
-    let Ok(q2_session) = driver.open_native_q2_session(&package_dir, limits) else {
-        return;
-    };
-    let Ok(mut executor) =
+    .map(hexagon_native_rpc::NativeQ2ProjectionLimits::with_persistent_session)
+    .ok()?;
+    let driver = hexagon_native_rpc::Driver::open_system().ok()?;
+    let q2_session = driver.open_native_q2_session(&package_dir, limits).ok()?;
+    let mut executor =
         bonsai_hexagon_runtime::NativeQ2Executor::new(q2_session, limits, 64 * 1024 * 1024)
             .with_row_parallelism(session.clone_row_parallelism())
             .and_then(|executor| {
@@ -467,23 +483,30 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) {
                     bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES,
                 )
             })
-    else {
-        return;
-    };
-    let mut tensors =
-        Vec::with_capacity(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS.len());
+            .ok()?;
+    let mut tensors = Vec::new();
+    tensors
+        .try_reserve_exact(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS.len())
+        .ok()?;
     for &name in &bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS {
-        let Some(tensor) = session.projection_tensor(name) else {
-            return;
-        };
+        let tensor = session.projection_tensor(name)?;
         tensors.push(tensor.clone());
     }
-    if executor.select_and_prewarm_tensors(&tensors).is_ok() {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            *slot = Some(executor);
-        });
-        session.set_projection_executor(Some(Box::new(WorkerThreadHexagonExecutor)));
+    executor.select_and_prewarm_tensors(&tensors).ok()?;
+    let residency = executor.residency_statistics();
+    let startup = ProjectionStartup::NativeQ2 {
+        resident_tensors: residency.tensors_prepared,
+        resident_weight_bytes: residency.weight_payload_bytes_prepared,
+        host_metadata_bytes: residency.metadata_payload_bytes,
+    };
+    if !startup.valid(Placement::Auto) {
+        return None;
     }
+    WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+        *slot = Some(executor);
+    });
+    session.set_projection_executor(Some(Box::new(WorkerThreadHexagonExecutor)));
+    Some(startup)
 }
 
 pub(super) enum Input {
@@ -611,6 +634,7 @@ impl Worker {
             return Err(NativeBackendError::Configuration);
         }
         let (commands, receive) = mpsc::sync_channel::<Command>(1);
+        let (initialized, startup) = mpsc::sync_channel(1);
         let busy = Arc::new(AtomicBool::new(false));
         let idle = Arc::new(Notify::new());
         let active = busy.clone();
@@ -623,7 +647,21 @@ impl Worker {
                     counted: None,
                     faulted: false,
                 };
-                initialize_for_placement(&mut state.engine, placement);
+                // Publish no readiness until the model owner finishes native
+                // setup and verifies its complete immutable placement facts.
+                let observation = initialize_for_placement(&mut state.engine, placement).and_then(
+                    |observation| {
+                        if observation.valid(placement) {
+                            Ok(observation)
+                        } else {
+                            Err(NativeBackendError::Configuration)
+                        }
+                    },
+                );
+                let succeeded = observation.is_ok();
+                if initialized.send(observation).is_err() || !succeeded {
+                    return;
+                }
                 while let Ok(command) = receive.recv() {
                     let _settlement = Settlement {
                         busy: &active,
@@ -638,6 +676,19 @@ impl Worker {
                 }
             })
             .map_err(|_| NativeBackendError::Engine)?;
+        profile.projection_startup = match startup.recv() {
+            Ok(Ok(observation)) => observation,
+            result => {
+                // Closing the command lane precedes joining, including an
+                // initializer panic or an explicit failed startup observation.
+                drop(commands);
+                let _ = thread.join();
+                return Err(result
+                    .ok()
+                    .and_then(Result::err)
+                    .unwrap_or(NativeBackendError::Engine));
+            }
+        };
         Ok(Self {
             seed,
             profile,

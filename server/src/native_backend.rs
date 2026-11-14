@@ -106,7 +106,8 @@ pub async fn serve(
 /// CPU placement clears any supplied projection executor before worker creation
 /// and bypasses accelerator initialization on the model thread. Its readiness
 /// declares both the requested placement and CPU projection backend. Automatic
-/// placement preserves the existing readiness schema and initialization policy.
+/// placement retains the optional resident initialization policy. Both report
+/// startup projection facts only after model-thread initialization completes.
 /// Process, context and state memory allowances remain unchanged.
 ///
 /// # Errors

@@ -2836,6 +2836,16 @@ impl Qwen35 {
         self.projection_executor = executor;
     }
 
+    /// Installed projection executor identity, absent for ordinary CPU execution.
+    ///
+    /// Installation does not establish successful device execution or qualification.
+    #[must_use]
+    pub fn projection_executor_identity(&self) -> Option<&str> {
+        self.projection_executor
+            .as_ref()
+            .map(|executor| executor.identity())
+    }
+
     /// Enable or disable last-layer (lk.N-1) state-only prefill row narrowing.
     ///
     /// Enabled by default for graphs with at least 4 layers (such as the 64-layer

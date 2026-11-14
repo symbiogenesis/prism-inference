@@ -886,6 +886,14 @@ impl SwiftSession {
         self.runtime.set_projection_executor(executor);
     }
 
+    /// Installed projection executor identity, absent for ordinary CPU execution.
+    ///
+    /// This describes installation, not device execution or qualification.
+    #[must_use]
+    pub fn projection_executor_identity(&self) -> Option<&str> {
+        self.runtime.decoder().projection_executor_identity()
+    }
+
     /// Explicit request-boundary policy; fresh recomputation remains the default.
     #[must_use]
     pub const fn prompt_reuse(&self) -> PromptReuse {

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::graph::weight_patch::{
-    EXECUTION_PROFILE, FfnPatch, FfnProbe, INPUT_BASIS, SURROGATE_INPUT_BASIS,
-    SURROGATE_TARGET_BASIS,
+    EXECUTION_PROFILE, FfnPatch, FfnProbe, GROUP_OMISSION_PROFILE, INPUT_BASIS,
+    SURROGATE_INPUT_BASIS, SURROGATE_TARGET_BASIS,
 };
 use bonsai_prism_runtime::graph::{MAX_STATE_BYTES, Qwen35};
 use bonsai_prism_runtime::kernels::MatvecBackend;
@@ -28,12 +28,16 @@ const MAX_CAPTURE_ROWS: usize = 64;
 const MAX_TOKENS: usize = 256;
 const MODEL_BUDGET: usize = 8 * 1024 * 1024 * 1024;
 
+#[path = "ffn_patch_probe/group_omission.rs"]
+mod group_omission;
+
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 enum CaptureKind {
     #[default]
     HiddenPatch,
     FfnSurrogate,
+    FfnGroupOmission,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +55,8 @@ struct Request {
     absolute_deadline_unix_ms: u64,
     capture_path: PathBuf,
     patch_path: Option<PathBuf>,
+    #[serde(default)]
+    omitted_groups: Option<Vec<usize>>,
     sequences: Vec<Sequence>,
 }
 
@@ -174,7 +180,17 @@ fn validate(request: &Request) -> Result<Representation> {
         || request.layer >= 64
         || request.sequences.is_empty()
         || request.sequences.len() > 16
-        || (request.capture_kind == CaptureKind::FfnSurrogate && request.patch_path.is_some())
+        || (request.capture_kind != CaptureKind::HiddenPatch && request.patch_path.is_some())
+        || match (&request.omitted_groups, request.capture_kind) {
+            (Some(groups), CaptureKind::FfnGroupOmission) => {
+                groups.is_empty()
+                    || groups.len() >= 17
+                    || groups.iter().any(|&group| group >= 17)
+                    || groups.windows(2).any(|pair| pair[0] >= pair[1])
+            }
+            (None, CaptureKind::FfnGroupOmission) | (Some(_), _) => true,
+            (None, _) => false,
+        }
     {
         return Err(reject(
             "invalid FFN probe version, paths, source, site or sequences",
@@ -211,7 +227,7 @@ fn validate(request: &Request) -> Result<Representation> {
                     !matches!(sequence.split.as_str(), "fit" | "holdout")
                         || !matches!(sequence.label.as_deref(), Some("target" | "preserve"))
                 }
-                CaptureKind::FfnSurrogate => {
+                CaptureKind::FfnSurrogate | CaptureKind::FfnGroupOmission => {
                     !matches!(sequence.split.as_str(), "fit" | "development")
                 }
             }
@@ -240,7 +256,8 @@ fn validate(request: &Request) -> Result<Representation> {
     }
     if tokens > MAX_TOKENS
         || rows > MAX_CAPTURE_ROWS
-        || (request.capture_kind == CaptureKind::FfnSurrogate
+        || (request.capture_kind == CaptureKind::FfnGroupOmission && tokens > MAX_TOKENS / 2)
+        || (request.capture_kind != CaptureKind::HiddenPatch
             && (fit_rows < 2 || development_rows == 0))
     {
         return Err(reject(
@@ -277,7 +294,7 @@ fn run() -> Result<Value> {
     let scale = parse_scale(&request.adapter_scale_bits)?;
     if request.adapter_path.is_none()
         && (scale != 0.0
-            || (request.capture_kind == CaptureKind::FfnSurrogate && scale.to_bits() != 0))
+            || (request.capture_kind != CaptureKind::HiddenPatch && scale.to_bits() != 0))
     {
         return Err(reject("absent adapter requires zero scale"));
     }
@@ -307,6 +324,16 @@ fn run() -> Result<Value> {
     } else {
         Qwen35::with_backend(model, context, MatvecBackend::Scalar)?
     };
+    if request.capture_kind == CaptureKind::FfnGroupOmission {
+        return group_omission::capture(
+            &request,
+            representation,
+            scale,
+            &executable_sha256,
+            graph,
+            &deadline,
+        );
+    }
     let base_probe_identity = format!(
         "{}:{EXECUTION_PROFILE}:layer={}:patch=none",
         graph.identity(),
@@ -331,6 +358,9 @@ fn run() -> Result<Value> {
             "layer":request.layer,"inputBasis":SURROGATE_INPUT_BASIS,
             "targetBasis":SURROGATE_TARGET_BASIS,"inputWidth":5120,"outputWidth":5120,
         }),
+        CaptureKind::FfnGroupOmission => {
+            return Err(reject("structured capture must use its two-pass path"));
+        }
     };
     let patch = request
         .patch_path
@@ -398,6 +428,9 @@ fn run() -> Result<Value> {
         CaptureKind::FfnSurrogate => json!({
             "schemaVersion":1,"source":source,"site":site,"rows":rows,
         }),
+        CaptureKind::FfnGroupOmission => {
+            return Err(reject("structured capture must use its two-pass path"));
+        }
     };
     let bytes = serde_json::to_vec(&artifact)?;
     if bytes.len() > MAX_CAPTURE_BYTES {
@@ -559,6 +592,42 @@ mod tests {
         assert!(validate(&request).is_err());
         request.patch_path = None;
         request.sequences[0].capture_token_indices = vec![1];
+        assert!(validate(&request).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn structured_capture_rejects_group_errors_and_charges_both_replays() -> Result<()> {
+        let mut request = request()?;
+        request.capture_kind = CaptureKind::FfnGroupOmission;
+        request.omitted_groups = Some(vec![0, 16]);
+        request.sequences[0].capture_token_indices = vec![0, 1];
+        request.sequences[1].split = "development".into();
+        for sequence in &mut request.sequences {
+            sequence.label = None;
+        }
+        assert!(validate(&request).is_ok());
+        for groups in [
+            None,
+            Some(vec![]),
+            Some(vec![1, 1]),
+            Some(vec![16, 0]),
+            Some(vec![17]),
+            Some((0..17).collect()),
+        ] {
+            request.omitted_groups = groups;
+            assert!(validate(&request).is_err());
+        }
+        request.omitted_groups = Some(vec![0, 16]);
+        request.sequences[0].token_ids = vec![1; 127];
+        assert!(validate(&request).is_ok());
+        request.sequences[0].token_ids.push(1);
+        assert!(validate(&request).is_err());
+        let _ = request.sequences[0].token_ids.pop();
+        request.patch_path = Some(std::env::temp_dir().join("unsupported-recovery.json"));
+        assert!(validate(&request).is_err());
+        request.patch_path = None;
+        request.capture_kind = CaptureKind::FfnSurrogate;
         assert!(validate(&request).is_err());
         Ok(())
     }

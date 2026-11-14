@@ -3144,6 +3144,17 @@ impl Qwen35 {
                 }
                 evaluation.project_into(&layer.down, up, attention)?;
                 if let Some(probe) = selected_probe {
+                    if let Some(omission) = probe.omission {
+                        // Keep the full teacher delta before changing the
+                        // original-basis hidden input. Both base and standard
+                        // adapter then see identical zeroed omitted groups.
+                        let teacher = copy_values(attention)?;
+                        omission.mask_hidden(up)?;
+                        evaluation.project_into(&layer.down, up, attention)?;
+                        if let Some(observer) = &mut probe.group_observer {
+                            observer(normalized, &teacher, attention)?;
+                        }
+                    }
                     if let Some(patch) = probe.patch {
                         patch.apply(up, attention)?;
                     }

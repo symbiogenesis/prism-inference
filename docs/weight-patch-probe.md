@@ -122,3 +122,77 @@ fitting rows; the fitter's default rank eight needs at least eight fitting rows.
 This operation still executes and loads the complete FFN. It supplies no skip,
 unloading, latency, process-memory or cognitive-quality result. Whole-FFN
 replacement/loading and independent complete-answer acceptance remain separate.
+
+## One-site structured omission pairs
+
+Set `captureKind:"ffn-group-omission"` and supply `omittedGroups`, a strictly
+increasing nonempty list of original 1,024-coordinate group indices from 0 to 16.
+At least one group must remain. The request version remains 1; the resulting
+fitting packet uses schema 2. This mode rejects `patchPath` and uses the same
+fit/development-only split rules as the surrogate collector. Other modes reject
+`omittedGroups`, preserving the existing schema-1 capture formats.
+
+The collector first replays the supplied fixed token IDs through the original
+teacher and retains the requested complete pre-add FFN targets. It then consumes
+and resets that same graph into one immutable omission profile, resets before
+each sequence, and replays exactly the same tokens. Both passes share the
+original absolute deadline and the 256-token aggregate ceiling, so the input
+sequences may contain at most 128 tokens in total. There is one model load and
+no second model payload copy. Both passes, reset, hashes, retention and cleanup
+belong in the predeclared owner allowance.
+
+At the selected site, the omission graph computes the complete FFN branch on
+its current normalized original-basis input. It then zeroes each omitted
+**original hidden group**, evaluates down projection and standard LoRA on that
+same zeroed hidden vector, and propagates the retained branch through later
+layers. The teacher and retained branch are copied before residual addition and
+returned only after the whole token succeeds. Failed-token rows are discarded.
+The scalar profile is
+`experimental-ffn-group-omission-cpu-scalar-unfused-v1`; its group/sign recipe
+enters a fresh checkpoint identity, invalidating original teacher checkpoints.
+
+The schema-2 packet matches Runner's structured `ffn-surrogate` input:
+
+- `source` identifies the original teacher profile, model, executable, source,
+  approved adapter and exact scale bits.
+- `studentExecution` identifies the changed graph/profile and `prefixPolicySha256`.
+- `site.targetBasis` is `teacher-minus-retained-ffn-branch`; the input basis remains
+  `original-ffn-normalized-input` and both vector widths are 5,120.
+- `omission` records original groups, width 1,024, original hidden width 17,408,
+  `transform:independent-contiguous-1024-signed-hadamard-v1` and
+  `retainedAdapterPolicy:zero-omitted-original-hidden-before-standard-adapter`.
+- `omission.signIdentity.fullSignsSha256` hashes the actual complete explicit
+  metadata sign values, in Swift's width order `[5120,6144,17408]`, as canonical
+  I32-LE values +1/-1. The down slice starts at element 11,264 and contains
+  17,408 values. Signs precede independent block transforms; omission never
+  compacts or reindexes their original slices or the down-projection columns.
+- Each row contains `sampleId`, `groupId`, `tokenIndex`, `split`, `input`,
+  `teacherTarget`, `retainedBranch`, `originalPrefixTeacherTarget`,
+  `sharedInputSha256`, `studentPrefixSha256` and `originalPrefixSha256`.
+
+`teacherTarget` and `retainedBranch` use exactly the same changed-graph input.
+`originalPrefixTeacherTarget` comes from the matched first-pass sample/token;
+its separate error diagnostic exposes local input drift rather than silently
+substituting an original-graph target for a changed-graph target. An unchanged
+input at this sole edited site during fixed-token replay does not establish
+multi-site composition or freely generated continuation quality.
+
+`sharedInputSha256` hashes the exact F32-LE normalized input. Prefix hashes use
+domain `prism-ffn-capture-token-prefix-v1\0`, then graph-identity UTF-8 length as
+U64-LE, graph bytes, token count as U64-LE, and ordered U32-LE token IDs through
+the current token. They identify graph and token history, not a cryptographic
+digest of all numerical state. The prefix policy hashes domain
+`prism-ffn-student-prefix-policy-v1\0` plus canonical serialized JSON describing
+the graph, group selection, no-recovery policy, teacher-forced rollout, reset
+policy and exact sequence identities/token IDs. `captureSha256` hashes domain
+`prism-ffn-structured-capture-packet-v1\0` plus the serialized packet before
+inserting that field; it is not the final capture file's SHA-256. Retain the
+exact request and final file digest with any required independent replay inputs.
+The fitter still treats supplied vectors and identities as unauthenticated.
+
+Add bounded fitting `controls` and optional new `outputPath` before using the
+packet with `bonsai-tools ffn-surrogate`. Rank must not exceed fit rows. This
+collector runs **without compensation**, computes the complete gate/up branch
+and loads every base weight. It provides neither selective loading nor saved
+computation, actual RAM or latency. Compensated-prefix capture, multiple edited
+sites, freely generated answers and production arithmetic remain separate work.

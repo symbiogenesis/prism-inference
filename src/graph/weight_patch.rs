@@ -20,6 +20,41 @@ pub const INPUT_BASIS: &str = "original-ffn-hidden";
 pub const SURROGATE_INPUT_BASIS: &str = "original-ffn-normalized-input";
 /// Complete FFN branch, including the frozen existing adapter, before residual add.
 pub const SURROGATE_TARGET_BASIS: &str = "complete-ffn-branch-delta";
+/// Separate scalar graph identity for complete-group FFN omission research.
+pub const GROUP_OMISSION_PROFILE: &str = "experimental-ffn-group-omission-cpu-scalar-unfused-v1";
+
+/// Paired complete and retained branches evaluated on the same student input.
+///
+/// Both branches include the frozen standard adapter. The retained branch uses
+/// zero for omitted original hidden groups before both the base down projection
+/// and the adapter. The returned input is before any Hadamard rotation.
+pub struct FfnGroupObservation {
+    /// Original normalized pre-FFN residual.
+    pub input: Vec<f32>,
+    /// Complete FFN delta on this same student input, before residual addition.
+    pub teacher_target: Vec<f32>,
+    /// Group-omitted FFN delta actually propagated through the student graph.
+    pub retained_branch: Vec<f32>,
+}
+
+pub(super) struct GroupOmission {
+    groups: Vec<usize>,
+    full_signs_sha256: String,
+}
+
+impl GroupOmission {
+    pub(super) fn mask_hidden(&self, hidden: &mut [f32]) -> Result<()> {
+        if hidden.len() != 17_408 {
+            return Err(invalid(
+                "group omission requires Swift original FFN hidden width",
+            ));
+        }
+        for &group in &self.groups {
+            hidden[group * 1024..(group + 1) * 1024].fill(0.0);
+        }
+        Ok(())
+    }
+}
 
 /// Owned teacher observation returned only after the complete token succeeds.
 ///
@@ -148,12 +183,15 @@ impl FfnPatch {
 }
 
 type SurrogateObserver<'a> = &'a mut dyn FnMut(&[f32], &[f32]) -> Result<()>;
+type GroupObserver<'a> = &'a mut dyn FnMut(&[f32], &[f32], &[f32]) -> Result<()>;
 
 pub(super) struct Intervention<'a> {
     pub(super) layer: usize,
     pub(super) patch: Option<&'a FfnPatch>,
     pub(super) observer: &'a mut dyn FnMut(FfnObservation<'_>) -> Result<()>,
     pub(super) surrogate_observer: Option<SurrogateObserver<'a>>,
+    pub(super) omission: Option<&'a GroupOmission>,
+    pub(super) group_observer: Option<GroupObserver<'a>>,
 }
 
 /// A sealed experimental graph with one observed and optionally patched FFN.
@@ -167,6 +205,7 @@ pub struct FfnProbe {
     graph: Qwen35,
     layer: usize,
     patch: Option<FfnPatch>,
+    omission: Option<GroupOmission>,
 }
 
 impl FfnProbe {
@@ -216,7 +255,90 @@ impl FfnProbe {
             graph,
             layer,
             patch,
+            omission: None,
         })
+    }
+
+    /// Consumes an unpatched teacher into a reset, fixed one-site omission graph.
+    ///
+    /// Complete original hidden groups are zeroed only after computing the full
+    /// teacher branch. The retained base down projection and standard adapter
+    /// receive the same zeroed original hidden input. All weights remain loaded
+    /// and the full gate/up computation still executes; this is capture, not an
+    /// accelerated or memory-saving serving implementation.
+    ///
+    /// # Errors
+    /// Rejects patched/already-omitted graphs, noncanonical group selection,
+    /// unsupported Swift dimensions/transforms/signs, hashing and reset failures.
+    pub fn with_group_omission(mut self, groups: Vec<usize>) -> Result<Self> {
+        if self.patch.is_some()
+            || self.omission.is_some()
+            || groups.is_empty()
+            || groups.len() >= 17
+            || groups.iter().any(|&group| group >= 17)
+            || groups.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid(
+                "group omission needs sorted distinct groups 0..17 and an unpatched teacher",
+            ));
+        }
+        let selected = &self.graph.layers[self.layer];
+        if selected.down.dimensions != [17_408, 5_120]
+            || selected.up.dimensions != [5_120, 17_408]
+            || selected.gate.dimensions != [5_120, 17_408]
+            || self.graph.transforms.block != 1024
+            || self.graph.transforms.basis(&selected.down) != (true, false)
+        {
+            return Err(invalid(
+                "group omission requires the pinned Swift block-1024 FFN transform",
+            ));
+        }
+        let mut hash = Hasher::new()?;
+        // Swift's metadata order is [5120,6144,17408]. Hash canonical I32-LE
+        // +/-1 values, matching the complete sign_values evidence contract.
+        for width in [5_120, 6_144, 17_408] {
+            let signs = self
+                .graph
+                .transforms
+                .signs
+                .get(&width)
+                .filter(|signs| signs.len() == width)
+                .ok_or_else(|| invalid("group omission requires complete explicit Swift signs"))?;
+            for &sign in signs {
+                let value: i32 = if sign.to_bits() == 1.0_f32.to_bits() {
+                    1
+                } else if sign.to_bits() == (-1.0_f32).to_bits() {
+                    -1
+                } else {
+                    return Err(invalid("group omission signs must be exact +/-1"));
+                };
+                hash.update(&value.to_le_bytes())?;
+            }
+        }
+        let mut full_signs_sha256 = String::new();
+        full_signs_sha256.try_reserve_exact(64)?;
+        for byte in hash.finish()? {
+            write!(full_signs_sha256, "{byte:02x}")?;
+        }
+        self.graph.reset()?;
+        write!(
+            self.graph.identity,
+            ":{GROUP_OMISSION_PROFILE}:groups={groups:?}:signs={full_signs_sha256}"
+        )?;
+        self.graph.provenance = Arc::new(());
+        self.omission = Some(GroupOmission {
+            groups,
+            full_signs_sha256,
+        });
+        Ok(self)
+    }
+
+    /// Canonical complete I32-LE metadata sign digest for an omission probe.
+    #[must_use]
+    pub fn omission_signs_sha256(&self) -> Option<&str> {
+        self.omission
+            .as_ref()
+            .map(|omission| omission.full_signs_sha256.as_str())
     }
 
     /// Evaluates one token and borrows the selected activation and residual.
@@ -238,6 +360,8 @@ impl FfnProbe {
             patch: self.patch.as_ref(),
             observer,
             surrogate_observer: None,
+            omission: self.omission.as_ref(),
+            group_observer: None,
         };
         let result = self.graph.evaluate_token_with_executor(
             token,
@@ -267,7 +391,7 @@ impl FfnProbe {
         logits: &mut Vec<f32>,
     ) -> Result<FfnSurrogateObservation> {
         logits.clear();
-        if self.patch.is_some() {
+        if self.patch.is_some() || self.omission.is_some() {
             return Err(invalid("FFN surrogate teacher rejects independent patches"));
         }
         let layer = self.layer;
@@ -287,6 +411,8 @@ impl FfnProbe {
             patch: None,
             observer: &mut |_| Ok(()),
             surrogate_observer: Some(&mut capture),
+            omission: None,
+            group_observer: None,
         };
         let result = self.graph.evaluate_token_with_executor(
             token,
@@ -299,6 +425,51 @@ impl FfnProbe {
             return Err(error);
         }
         observation.ok_or_else(|| invalid("selected FFN surrogate observation is absent"))
+    }
+
+    /// Evaluates and returns paired branches only after the entire token commits.
+    ///
+    /// # Errors
+    /// Rejects a teacher-only probe or later graph/copy failures. On failure no
+    /// observation is returned, logits are cleared and no token state commits.
+    pub fn evaluate_group_omission_into(
+        &mut self,
+        token: u32,
+        logits: &mut Vec<f32>,
+    ) -> Result<FfnGroupObservation> {
+        logits.clear();
+        let omission = self
+            .omission
+            .as_ref()
+            .ok_or_else(|| invalid("paired branches require a group-omission probe"))?;
+        let mut observation = None;
+        let mut capture = |input: &[f32], teacher: &[f32], retained: &[f32]| {
+            observation = Some(FfnGroupObservation {
+                input: super::copy_values(input)?,
+                teacher_target: super::copy_values(teacher)?,
+                retained_branch: super::copy_values(retained)?,
+            });
+            Ok(())
+        };
+        let mut intervention = Intervention {
+            layer: self.layer,
+            patch: None,
+            observer: &mut |_| Ok(()),
+            surrogate_observer: None,
+            omission: Some(omission),
+            group_observer: Some(&mut capture),
+        };
+        let result = self.graph.evaluate_token_with_executor(
+            token,
+            Some(logits),
+            None,
+            Some(&mut intervention),
+        );
+        if let Err(error) = result {
+            logits.clear();
+            return Err(error);
+        }
+        observation.ok_or_else(|| invalid("selected group-omission observation is absent"))
     }
 }
 
@@ -337,6 +508,8 @@ impl Decoder for FfnProbe {
             patch: self.patch.as_ref(),
             observer: &mut |_| Ok(()),
             surrogate_observer: None,
+            omission: self.omission.as_ref(),
+            group_observer: None,
         };
         self.graph
             .evaluate_token_with_executor(token, None, None, Some(&mut intervention))
@@ -353,7 +526,7 @@ impl Decoder for FfnProbe {
 
 #[cfg(test)]
 mod tests {
-    use super::FfnPatch;
+    use super::{FfnPatch, GroupOmission};
     use crate::Result;
 
     #[test]
@@ -376,6 +549,57 @@ mod tests {
         assert_eq!(output[0].to_bits(), (-0.0_f32).to_bits());
         assert!(FfnPatch::new(vec![f32::NAN], vec![1.0], 1.0).is_err());
         assert!(FfnPatch::new(vec![1.0], vec![f32::INFINITY], 0.0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn group_omission_preserves_transform_blocks_and_original_adapter_coordinates() -> Result<()> {
+        let omission = GroupOmission {
+            groups: vec![0, 8, 16],
+            full_signs_sha256: String::new(),
+        };
+        let mut hidden = vec![1.0_f32; 17_408];
+        // Distinct original positions make an accidental compact/reindexed
+        // standard-adapter input observably wrong at group boundaries.
+        for group in 0..17 {
+            hidden[group * 1024] = 2.0;
+            hidden[(group + 1) * 1024 - 1] = -1.0;
+        }
+        let original = hidden.clone();
+        omission.mask_hidden(&mut hidden)?;
+        for group in 0..17 {
+            let range = group * 1024..(group + 1) * 1024;
+            if [0, 8, 16].contains(&group) {
+                assert!(hidden[range].iter().all(|value| value.to_bits() == 0));
+            } else {
+                assert_eq!(hidden[range.clone()], original[range]);
+            }
+        }
+        let mut transformed = hidden.clone();
+        for (group, block) in transformed.chunks_exact_mut(1024).enumerate() {
+            // Retained signs use each original group's slice. Whole-block
+            // omission must commute with this independent signed transform.
+            let sign = if group % 2 == 0 { -1.0 } else { 1.0 };
+            for value in block.iter_mut() {
+                *value *= sign;
+            }
+            crate::kernels::hadamard(block)?;
+            if [0, 8, 16].contains(&group) {
+                assert!(block.iter().all(|value| *value == 0.0));
+            } else {
+                let mut expected = original[group * 1024..(group + 1) * 1024].to_vec();
+                for value in &mut expected {
+                    *value *= sign;
+                }
+                crate::kernels::hadamard(&mut expected)?;
+                assert_eq!(&*block, expected.as_slice());
+            }
+        }
+        // A standard adapter reading the final original coordinate must see
+        // zero, while the last retained coordinate retains its original value.
+        assert_eq!(hidden[17_407], 0.0);
+        assert_eq!(hidden[16_383], -1.0);
+        assert!(omission.mask_hidden(&mut [1.0; 1024]).is_err());
         Ok(())
     }
 }

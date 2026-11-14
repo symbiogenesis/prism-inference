@@ -26,7 +26,7 @@ for performance by its availability alone.
 | Tokenization and chat | Broaden template-byte, tokenizer-ID and turn-boundary coverage |
 | Sampling | Broaden production sampler and RNG comparisons |
 | Adapters | Qualify native residual writers, scale-zero/nonzero behavior, grouped SSM basis, scale changes and service lifecycle under the [adapter contract](rank-one-adapter.md) |
-| CPU execution | Qualify packed prefill tiles, attention scoring, parallel transforms and [work/storage reductions](inference-efficiency.md) with full-model parity and matched whole-request measurements |
+| CPU execution | Qualify packed prefill tiles, attention scoring, bounded score-scratch growth, parallel transforms and [work/storage reductions](inference-efficiency.md) with full-model parity and matched whole-request measurements |
 | Accelerators | Qualify the explicit Hexagon FFN chain and investigate Adreno after defining execution and ownership contracts |
 | Service ownership | Complete process/OS, cancellation, recovery, daily-service and device lifecycle acceptance |
 | Devices | Establish correctness, quality, throughput, memory and security on each intended target |

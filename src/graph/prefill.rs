@@ -4,8 +4,8 @@ use std::fmt::Write as _;
 
 use super::{
     Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
-    Transforms, add, add_finite, attention_gate, checked_product, finite, resize_into,
-    rope_frequencies, row_into, small_float,
+    Transforms, add, add_finite, attention_gate, checked_product, finite, resize_attention_scores,
+    resize_into, rope_frequencies, row_into, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -1164,7 +1164,12 @@ fn full_attention_tile(
             check()?;
         }
         let score_stride = base + count;
-        resize_into(count * score_stride, &mut attention_scratch.scores)?;
+        resize_attention_scores(
+            count,
+            score_stride,
+            keys.maximum / keys.width,
+            &mut attention_scratch.scores,
+        )?;
         super::quantized_kv::attend_tile(
             keys,
             values,
@@ -1195,8 +1200,14 @@ fn full_attention_tile(
     let max_score_len = base + count;
     let six_head_groups =
         matches!(arithmetic, Arithmetic::PinnedSwift) && g.heads / g.kv_heads == 6;
-    let token_score_stride = if six_head_groups { 6 } else { 4 } * max_score_len;
-    resize_into(count * token_score_stride, &mut attention_scratch.scores)?;
+    let score_heads = if six_head_groups { 6 } else { 4 };
+    let token_score_stride = score_heads * max_score_len;
+    resize_attention_scores(
+        count * score_heads,
+        max_score_len,
+        keys.maximum / keys.width,
+        &mut attention_scratch.scores,
+    )?;
     let query_ref: &[Vec<f32>] = &tile.up[..count];
     // The projected query/gate rows stay immutable through score/value work.
     let projected_ref: &[Vec<f32>] = &tile.mixed[..count];

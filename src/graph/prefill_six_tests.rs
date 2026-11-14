@@ -226,14 +226,19 @@ fn packed_production_prefill_matches_serial_causal_state_and_reserved_scores() -
     ] {
         // The base at token 63 crosses a sealed-page boundary. Thirteen rows
         // exercise uneven worker partitions and a one-token final task.
-        for count in [8, 13, 32] {
+        for count in [1, 3, 8, 13, 32] {
             for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
                 let mut expected = Harness::with_policy(count, 1, policy)?;
                 expected.run(arithmetic, &|| Ok(()))?;
                 let mut actual = Harness::with_policy(count, 4, policy)?;
+                actual.attention_scratch.scores = vec![f32::NAN; count * (63 + count) / 2];
                 actual.run(arithmetic, &|| Ok(()))?;
                 actual.assert_same(&expected)?;
-                assert_eq!(actual.attention_scratch.scores.len(), count * (63 + count));
+                let expected_rows = if count == 1 { 4 } else { count };
+                assert_eq!(
+                    actual.attention_scratch.scores.len(),
+                    expected_rows * (63 + count)
+                );
                 let reservation = tiled_attention_scratch_bytes(
                     &actual.geometry,
                     arithmetic,
@@ -242,7 +247,16 @@ fn packed_production_prefill_matches_serial_causal_state_and_reserved_scores() -
                     count,
                 )?;
                 assert_eq!(reservation, count * 128 * size_of::<f32>());
-                assert!(reservation >= actual.attention_scratch.scores.len() * size_of::<f32>());
+                // Singleton tiles use the ordinary four-worker score reserve.
+                let combined_reservation = reservation.max(4 * 128 * size_of::<f32>());
+                assert!(
+                    combined_reservation
+                        >= actual.attention_scratch.scores.len() * size_of::<f32>()
+                );
+                assert!(
+                    combined_reservation
+                        >= actual.attention_scratch.scores.capacity() * size_of::<f32>()
+                );
                 assert_eq!(actual.keys.tail.len(), 0);
                 assert_eq!(actual.values.tail.len(), 0);
                 assert_eq!(actual.keys.pages.len(), 0);
@@ -301,6 +315,7 @@ fn six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation(
             expected.run(arithmetic, &|| Ok(()))?;
             for workers in worker_counts {
                 let mut actual = Harness::new(count, workers)?;
+                actual.attention_scratch.scores = vec![f32::NAN; 24 * 63];
                 actual.run(arithmetic, &|| Ok(()))?;
                 actual.assert_same(&expected)?;
                 if matches!(arithmetic, Arithmetic::PinnedSwift) && workers > 1 {

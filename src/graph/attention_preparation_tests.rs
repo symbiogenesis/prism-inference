@@ -142,11 +142,15 @@ fn attention_preparation_preserves_serial_bits_across_worker_partitions() -> Res
         expected.run(arithmetic, 1)?;
         for workers in worker_counts {
             let mut actual = Fixture::new()?;
+            // A shorter prior attempt leaves poisoned initialized storage.
+            // Every active score must overwrite it before softmax consumes it.
+            actual.scratch.scores = vec![f32::NAN; 23];
             actual.run(arithmetic, workers)?;
             assert_bits_equal(&expected.scratch.query, &actual.scratch.query);
             assert_bits_equal(&expected.key, &actual.key);
             assert_bits_equal(&expected.value, &actual.value);
             assert_bits_equal(&expected.scratch.attended, &actual.scratch.attended);
+            assert!(actual.scratch.scores.capacity() <= 24 * 3);
         }
     }
     Ok(())

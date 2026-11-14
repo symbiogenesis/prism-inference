@@ -35,6 +35,9 @@ pub use prefill::TiledPrefillStatistics;
 #[cfg(test)]
 #[path = "graph/attention_preparation_tests.rs"]
 mod attention_preparation_tests;
+#[cfg(test)]
+#[path = "graph/attention_scratch_tests.rs"]
+mod attention_scratch_tests;
 mod attention_six;
 mod quantized_kv;
 pub use quantized_kv::KvCachePolicy;
@@ -3757,7 +3760,12 @@ impl Evaluation<'_, '_> {
         } else {
             g.heads
         };
-        resize_into(score_rows * score_len, scores_scratch)?;
+        resize_attention_scores(
+            score_rows,
+            score_len,
+            keys.maximum / keys.width,
+            scores_scratch,
+        )?;
         let scale = 1.0 / small_float(g.head)?.sqrt();
         let arithmetic = self.arithmetic;
         let query_ref: &[f32] = query_scratch;
@@ -4821,6 +4829,43 @@ fn resize_into(count: usize, output: &mut Vec<f32>) -> Result<()> {
     if output.len() != count {
         zeros_into(count, output)?;
     }
+    Ok(())
+}
+
+// Every active score is overwritten before softmax. Preserve initialized old
+// storage, zero only newly exposed elements, and amortize allocation growth
+// within the same full-context score reservation used by admission. Retained
+// capacity from a larger tile may exceed this call's rows, but never requests
+// further growth here. All history/state ownership remains with the caller.
+fn resize_attention_scores(
+    rows: usize,
+    tokens: usize,
+    context: usize,
+    output: &mut Vec<f32>,
+) -> Result<()> {
+    resize_attention_scores_with(rows, tokens, context, output, |output, additional| {
+        output.try_reserve_exact(additional)?;
+        Ok(())
+    })
+}
+
+fn resize_attention_scores_with(
+    rows: usize,
+    tokens: usize,
+    context: usize,
+    output: &mut Vec<f32>,
+    reserve: impl FnOnce(&mut Vec<f32>, usize) -> Result<()>,
+) -> Result<()> {
+    let count = checked_product(&[rows, tokens])?;
+    let maximum = checked_product(&[rows, context])?.min(MAX_STATE_BYTES / size_of::<f32>());
+    if rows == 0 || tokens == 0 || tokens > context || count > maximum {
+        return Err(invalid("invalid attention score scratch bounds"));
+    }
+    if count > output.capacity() {
+        let target = output.capacity().saturating_mul(2).max(count).min(maximum);
+        reserve(output, target - output.len())?;
+    }
+    output.resize(count, 0.0);
     Ok(())
 }
 

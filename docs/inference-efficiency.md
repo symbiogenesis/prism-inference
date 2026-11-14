@@ -111,6 +111,37 @@ final store, retaining their ordered partial-error publication. Scalar atomic
 fallback retains its own failure boundary. These destinations are private graph
 scratch; complete-request rollback governs committed state.
 
+### Bounded attention score growth
+
+Ordinary and tiled attention retain initialized score storage when the active
+extent changes. Every consumed score is overwritten before softmax; unused
+causal suffixes remain unread. Growth zeroes only newly exposed elements and
+reserves geometrically, capped at the existing full-context score reservation.
+Shrinking and retry reuse capacity. Allocation refusal preserves the old extent
+and values; graph/request rollback keeps its existing ownership boundary.
+
+Ordinary packed attention retains one row per worker partition; ordinary FP16
+retains one per query head. Packed tiles reserve one row per token, and FP16 tiles
+reserve four or six per token. A smaller call may retain capacity from a larger
+admitted tile. No precision, head partition, ISA or admission charge changes.
+Geometric growth can retain more capacity during early context than exact growth;
+this change does not claim lower peak process RAM.
+
+For sequential ingestion from empty state, fixed `R` score rows and `N` tokens,
+the removed repeated zero initialization is `4 * R * N * (N - 1) / 2` bytes.
+At four packed worker rows and 262,144 tokens this is 512 GiB minus 2 MiB of
+source-level writes; four rows through 8,192 tokens remove 512 MiB minus 64 KiB.
+The remaining newly exposed score initialization totals `4 * R * N` bytes.
+These are operation counts, not measured memory traffic or request speedups;
+allocator movement and all actual attention work remain separately charged.
+
+Focused controls cover non-power-of-two ceilings, poisoned prior storage,
+signed-zero/subnormal preservation, injected allocation refusal and retry, and
+ordinary/tiled causal results across worker partitions, singleton and short
+tails. Strict native/fallback compilation, full-model state/logits/adapters/
+cancellation, resource/codegen review and matched X1/X2 complete-request benefit
+remain pending before promotion of the selected execution path.
+
 ## Recurrent RMS weight admission
 
 Each recurrent layer borrows its immutable RMS weights through one finite-weight

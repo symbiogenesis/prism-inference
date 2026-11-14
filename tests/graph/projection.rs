@@ -533,3 +533,70 @@ fn cpu_sibling_projection_preserves_full_and_recurrent_state_with_adapter() -> R
     }
     Ok(())
 }
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn q8_sibling_projection_preserves_complete_state_and_targeted_adapters() -> Result<()> {
+    use bonsai_prism_runtime::kernels::RowParallelism;
+
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for recurrent in [false, true] {
+        for adapter_scale in [0.0, 1.3] {
+            let build = |backend| -> Result<Qwen35> {
+                let mut base = sibling_graph_fixture(recurrent)?;
+                for tensor in base
+                    .tensors
+                    .values_mut()
+                    .filter(|tensor| tensor.kind == 142)
+                {
+                    let mut data = Vec::new();
+                    for block in tensor.data.as_chunks::<34>().0 {
+                        data.extend_from_slice(&bonsai_ternary::pack_ptq(block)?);
+                    }
+                    tensor.kind = 143;
+                    tensor.data = Arc::from(data);
+                }
+                let projection = if recurrent {
+                    "blk.0.attn_qkv.weight"
+                } else {
+                    "blk.0.attn_q.weight"
+                };
+                let factors =
+                    rank_one_factors(&base, &["blk.0.ffn_gate.weight", projection], 0.125);
+                let adapter = RankOneAdapter::from_model(factors, &base)?;
+                Qwen35::with_rank_one_adapter(
+                    base,
+                    16,
+                    1024 * 1024,
+                    backend,
+                    adapter,
+                    adapter_scale,
+                )
+            };
+            let mut control = build(MatvecBackend::Scalar)?;
+            let mut graph = build(MatvecBackend::Auto)?;
+            graph.set_row_parallelism(RowParallelism::new(4)?);
+            for token in [0, 1, 0] {
+                assert_eq!(bits(graph.evaluate(token)?), bits(control.evaluate(token)?));
+                assert_eq!(graph_bits(&graph)?, graph_bits(&control)?);
+            }
+            assert!(graph.backend_statistics().grouped_row_dispatches > 0);
+            let checkpoint = graph.checkpoint()?;
+            let control_checkpoint = control.checkpoint()?;
+            graph.ingest(1)?;
+            control.ingest(1)?;
+            assert_eq!(graph_bits(&graph)?, graph_bits(&control)?);
+            graph.restore(&checkpoint)?;
+            control.restore(&control_checkpoint)?;
+            assert_eq!(bits(graph.evaluate(1)?), bits(control.evaluate(1)?));
+            let before_failure = graph_bits(&graph)?;
+            assert!(graph.evaluate(2).is_err());
+            assert_eq!(graph_bits(&graph)?, before_failure);
+            graph.reset()?;
+            control.reset()?;
+            assert_eq!(bits(graph.evaluate(0)?), bits(control.evaluate(0)?));
+            assert_eq!(graph_bits(&graph)?, graph_bits(&control)?);
+        }
+    }
+    Ok(())
+}

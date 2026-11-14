@@ -191,3 +191,78 @@ fn recurrent_bf16_siblings_keep_exact_dots_and_share_one_worker_submission() -> 
     }
     Ok(())
 }
+
+#[test]
+fn q8_sibling_graph_consumer_joins_both_formats_with_exact_preparation() -> Result<()> {
+    for (kind, columns) in [(142, 384), (143, 256)] {
+        let geometry = Geometry {
+            embedding: columns,
+            feed_forward: columns,
+            heads: 1,
+            kv_heads: 1,
+            head: columns,
+            rope: columns,
+            rope_sections: [columns / 2, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 0.000_001,
+            ssm_head: 128,
+            ssm_keys: 2,
+            ssm_values: 4,
+            convolution: 1,
+        };
+        let mut weights = [weight("q", 33), weight("k", 9), weight("v", 5)];
+        for weight in &mut weights {
+            let mut block = [0x66; 34];
+            block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+            let encoded = if kind == 143 {
+                bonsai_ternary::pack_ptq(&block)?.to_vec()
+            } else {
+                block[2] = 0xe4;
+                block.to_vec()
+            };
+            weight.kind = kind;
+            weight.dimensions[0] = columns;
+            weight.data = Arc::from(encoded.repeat(columns / 128 * weight.dimensions[1]));
+        }
+        let input: Vec<_> = (0..columns)
+            .map(|index| [127.0, -128.0, 0.5001, -0.0, 63.5001, 1.5][index % 6])
+            .collect();
+        let transforms = Transforms::default();
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            let mut reference = ProjectionScratch {
+                matvec: arithmetic.scratch(MatvecBackend::Scalar),
+                ..ProjectionScratch::default()
+            };
+            let mut expected: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::new());
+            for (weight, output) in weights.iter().zip(&mut expected) {
+                transforms.project_into(weight, &input, &geometry, output, &mut reference)?;
+            }
+            for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                let mut scratch = ProjectionScratch {
+                    matvec: arithmetic.scratch(backend),
+                    ..ProjectionScratch::default()
+                };
+                scratch.matvec.set_row_parallelism(RowParallelism::new(4)?);
+                let mut actual: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::new());
+                transforms.project_group_into(
+                    weights.each_ref(),
+                    &input,
+                    &geometry,
+                    actual.each_mut(),
+                    &mut scratch,
+                )?;
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert!(
+                        actual
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .eq(expected.iter().map(|value| value.to_bits()))
+                    );
+                }
+                assert_eq!(scratch.matvec.preparation_count(), 1);
+                assert_eq!(scratch.matvec.statistics().grouped_row_dispatches, 1);
+            }
+        }
+    }
+    Ok(())
+}

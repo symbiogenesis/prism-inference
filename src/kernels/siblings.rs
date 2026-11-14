@@ -18,6 +18,13 @@ mod tests;
 #[path = "bf16_siblings.rs"]
 mod bf16;
 
+#[path = "q8_siblings.rs"]
+mod q8;
+
+#[cfg(test)]
+#[path = "q8_siblings_tests.rs"]
+mod q8_tests;
+
 impl PreparedMatvec<'_> {
     /// One atomic output group; original row arithmetic and partitioning remain.
     pub(crate) fn matvec_pq2_siblings_into(

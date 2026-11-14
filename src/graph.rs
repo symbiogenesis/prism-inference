@@ -1639,7 +1639,7 @@ impl Transforms {
                     completed[index..index + group_len].fill(true);
                     continue;
                 }
-                // Compatible CPU PQ2/BF16 siblings already share their exact
+                // Compatible CPU packed/BF16 siblings already share their exact
                 // basis and activation preparation. Submit their row partitions
                 // together, replacing one pool join per matrix with one join
                 // per group. Other formats and external executors stay on
@@ -1650,9 +1650,10 @@ impl Transforms {
                     .count();
                 if cpu_siblings
                     && cpu_group_len >= 2
-                    && (weights[index].kind == crate::kernels::PQ2
-                        && weights[index].dimensions[0].is_multiple_of(256)
-                        || weights[index].kind == crate::kernels::BF16)
+                    && matches!(
+                        weights[index].kind,
+                        crate::kernels::PQ2 | crate::kernels::PTQ1 | crate::kernels::BF16
+                    )
                     && weights.iter().enumerate().skip(index + cpu_group_len).all(
                         |(candidate, weight)| {
                             completed[candidate]
@@ -1665,8 +1666,12 @@ impl Transforms {
                     let outputs = &mut outputs[index..index + cpu_group_len];
                     if weights[index].kind == crate::kernels::BF16 {
                         prepared.matvec_bf16_siblings_into(tensors, outputs)?;
-                    } else {
+                    } else if weights[index].kind == crate::kernels::PQ2
+                        && weights[index].dimensions[0].is_multiple_of(256)
+                    {
                         prepared.matvec_pq2_siblings_into(tensors, outputs)?;
+                    } else {
+                        prepared.matvec_q8_siblings_into(tensors, outputs)?;
                     }
                     completed[index..index + cpu_group_len].fill(true);
                     continue;

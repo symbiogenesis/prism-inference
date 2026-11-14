@@ -97,7 +97,7 @@ signed products widen before summation. A stack-scoped 256-byte decoded block
 adds no retained storage. Scalar forcing/unsupported targets use scalar reductions;
 DOTPROD/I8MM are not selected. Packed tasks share the existing
 [row-worker pool](parallel-rows.md), borrowing activations and writing disjoint
-rows. Floating fallback remains sequential.
+rows. Other unsupported floating formats retain their existing fallback.
 
 Compatible BF16 prompt siblings, including recurrent beta/alpha projections,
 share rounded activation preparation and one joined row-pool submission. Each

@@ -1427,7 +1427,7 @@ fn private_disconnect_rolls_back_and_requires_reset_before_subsequent_success() 
                 &mut worker,
                 Input::Generate(canonical(&body).map_err(|e| format!("{e:?}"))?),
                 &completed_cancellation,
-                Instant::now() + Duration::from_secs(10),
+                Some(Instant::now() + Duration::from_secs(10)),
             ),
             client.read_to_end(&mut response),
         )
@@ -1461,7 +1461,7 @@ fn private_dropped_exchange_cancels_and_recovers_only_after_reset() -> TestResul
                 &mut worker,
                 Input::Generate(canonical(&body).map_err(|e| format!("{e:?}"))?),
                 &cancellation,
-                Instant::now() + Duration::from_secs(10),
+                Some(Instant::now() + Duration::from_secs(10)),
             );
             let receive = async {
                 let mut bytes = Vec::new();

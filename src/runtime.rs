@@ -129,6 +129,8 @@ pub enum PromptReuse {
     Disabled,
     /// Permit exact live-prefix reuse at an unchanged profile and scale bits.
     Latest,
+    /// Permit exact live-prefix reuse and also retain the latest prompt-end checkpoint.
+    PromptEndAndLatest,
 }
 
 struct Snapshot<S> {
@@ -136,6 +138,109 @@ struct Snapshot<S> {
     tokens: Vec<u32>,
     logits: Arc<Vec<f32>>,
     bytes: usize,
+}
+
+struct PromptEndCapture<'a, S> {
+    reserved: usize,
+    slot: &'a mut Option<Snapshot<S>>,
+}
+
+/// Reconciled maximal reusable prefix boundary across token history, paged KV
+/// alignment, recurrent `GDN`/convolution state availability, and identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HybridCheckpointBoundary {
+    /// Maximal shared prefix length safe to reuse without truncating recurrent state.
+    pub position: usize,
+    /// Common token-prefix length matched between prompt and retained history.
+    pub matched_tokens: usize,
+    /// Maximal KV cache prefix after optional page-size alignment.
+    pub kv_bound: usize,
+    /// Whether recurrent state availability or page alignment clamped the boundary.
+    pub clamped_by_recurrent: bool,
+    /// Whether representation and adapter identities matched.
+    pub identity_matched: bool,
+}
+
+impl HybridCheckpointBoundary {
+    /// Reconcile a candidate prefix state against requested prompt tokens and cache bounds.
+    ///
+    /// When `kv_page_alignment` is `Some(page)` with `page > 1`, full-attention KV
+    /// alignment floors down to multiples of `page`; passing `None` permits exact
+    /// unaligned KV tails. When `has_recurrent_layers` is true, recurrent `GDN` and
+    /// convolution buffers are non-truncatable backwards, so an exact committed
+    /// `recurrent_position` (`<= kv_bound`) is required to reuse any nonempty prefix.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep token history, identity, paged KV alignment, and recurrent boundary explicit."
+    )]
+    pub fn reconcile(
+        prompt: &[u32],
+        history_tokens: &[u32],
+        live_identity: &str,
+        candidate_identity: &str,
+        kv_tokens: usize,
+        kv_page_alignment: Option<usize>,
+        has_recurrent_layers: bool,
+        recurrent_position: Option<usize>,
+    ) -> Self {
+        if live_identity != candidate_identity {
+            return Self {
+                position: 0,
+                matched_tokens: 0,
+                kv_bound: 0,
+                clamped_by_recurrent: false,
+                identity_matched: false,
+            };
+        }
+        let matched_tokens = prompt
+            .iter()
+            .zip(history_tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let raw_kv = matched_tokens.min(kv_tokens);
+        let kv_bound = match kv_page_alignment {
+            Some(page) if page > 1 => (raw_kv / page) * page,
+            _ => raw_kv,
+        };
+        if !has_recurrent_layers {
+            return Self {
+                position: kv_bound,
+                matched_tokens,
+                kv_bound,
+                clamped_by_recurrent: false,
+                identity_matched: true,
+            };
+        }
+        let Some(rec_pos) = recurrent_position else {
+            return Self {
+                position: 0,
+                matched_tokens,
+                kv_bound,
+                clamped_by_recurrent: kv_bound > 0,
+                identity_matched: true,
+            };
+        };
+        if rec_pos <= kv_bound {
+            Self {
+                position: rec_pos,
+                matched_tokens,
+                kv_bound,
+                clamped_by_recurrent: rec_pos < kv_bound,
+                identity_matched: true,
+            }
+        } else {
+            // Recurrent buffers at `rec_pos` cannot be rolled backwards to a
+            // shorter matched or page-aligned KV boundary (`kv_bound`).
+            Self {
+                position: 0,
+                matched_tokens,
+                kv_bound,
+                clamped_by_recurrent: true,
+                identity_matched: true,
+            }
+        }
+    }
 }
 
 /// Single-owner native conversation with rollback on cancellation or failure.
@@ -155,6 +260,8 @@ pub struct Runtime<D: Decoder> {
     // Captures/restores share immutable output. Mutation detaches without copying.
     logits: Arc<Vec<f32>>,
     checkpoints: Vec<Snapshot<D::Checkpoint>>,
+    prompt_end_checkpoint: Option<Snapshot<D::Checkpoint>>,
+    retain_prompt_end: bool,
     recycled_checkpoints: Vec<D::Checkpoint>,
     batch_logits: Vec<Vec<f32>>,
     faulted: bool,
@@ -189,8 +296,16 @@ impl Runtime<crate::graph::Qwen35> {
                 "native runtime requires reset after failed restoration",
             ));
         }
-        if reuse == PromptReuse::Latest && current.map(f32::to_bits) == scale.map(f32::to_bits) {
+        if matches!(reuse, PromptReuse::Latest | PromptReuse::PromptEndAndLatest)
+            && current.map(f32::to_bits) == scale.map(f32::to_bits)
+        {
+            if reuse == PromptReuse::PromptEndAndLatest {
+                self.retain_prompt_end = true;
+            }
             return Ok(());
+        }
+        if reuse == PromptReuse::PromptEndAndLatest {
+            self.retain_prompt_end = true;
         }
         if let Some(scale) = scale {
             self.reset_with_adapter_scale(scale)
@@ -234,6 +349,7 @@ impl Runtime<crate::graph::Qwen35> {
         self.faulted = true;
         self.decoder.reset_with_adapter_scale(scale)?;
         self.checkpoints.clear();
+        self.prompt_end_checkpoint = None;
         self.recycled_checkpoints.clear();
         self.tokens.clear();
         mutable_logits(&mut self.logits).clear();
@@ -276,6 +392,8 @@ impl<D: Decoder> Runtime<D> {
             tokens,
             logits: Arc::new(Vec::new()),
             checkpoints,
+            prompt_end_checkpoint: None,
+            retain_prompt_end: false,
             recycled_checkpoints,
             batch_logits,
             faulted: false,
@@ -310,6 +428,81 @@ impl<D: Decoder> Runtime<D> {
         self.checkpoints.len()
     }
 
+    /// Enable or disable retention of a dedicated reusable prompt-end checkpoint.
+    ///
+    /// Disabling clears and recycles any previously retained prompt-end checkpoint.
+    pub fn set_retain_prompt_end(&mut self, retain: bool) {
+        self.retain_prompt_end = retain;
+        if !retain {
+            self.recycle_optional_snapshot(self.prompt_end_checkpoint.take());
+        }
+    }
+
+    /// Whether dedicated prompt-end checkpoint retention is enabled.
+    #[must_use]
+    pub const fn retain_prompt_end(&self) -> bool {
+        self.retain_prompt_end
+    }
+
+    /// Whether a prompt-end checkpoint is currently retained.
+    #[must_use]
+    pub const fn has_prompt_end_checkpoint(&self) -> bool {
+        self.prompt_end_checkpoint.is_some()
+    }
+
+    /// Compute the maximal reusable prefix boundary across live state and saved checkpoints.
+    ///
+    /// Inspects active conversation tokens (when current logits are valid), saved prefix
+    /// checkpoints, and any retained prompt-end checkpoint.
+    #[must_use]
+    pub fn hybrid_boundary(
+        &self,
+        prompt: &[u32],
+        has_recurrent_layers: bool,
+        kv_page_alignment: Option<usize>,
+    ) -> HybridCheckpointBoundary {
+        let identity = self.decoder.identity();
+        let mut best = if !self.tokens.is_empty() && !self.logits.is_empty() {
+            HybridCheckpointBoundary::reconcile(
+                prompt,
+                &self.tokens,
+                identity,
+                identity,
+                self.tokens.len(),
+                kv_page_alignment,
+                has_recurrent_layers,
+                has_recurrent_layers.then_some(self.tokens.len()),
+            )
+        } else {
+            HybridCheckpointBoundary::reconcile(
+                prompt,
+                &[],
+                identity,
+                identity,
+                0,
+                kv_page_alignment,
+                has_recurrent_layers,
+                None,
+            )
+        };
+        for snapshot in self.checkpoints.iter().chain(&self.prompt_end_checkpoint) {
+            let candidate = HybridCheckpointBoundary::reconcile(
+                prompt,
+                &snapshot.tokens,
+                identity,
+                identity,
+                snapshot.tokens.len(),
+                kv_page_alignment,
+                has_recurrent_layers,
+                has_recurrent_layers.then_some(snapshot.tokens.len()),
+            );
+            if candidate.position > best.position {
+                best = candidate;
+            }
+        }
+        best
+    }
+
     /// Drop saved prefixes and clear all model state, recovering a failure latch.
     ///
     /// # Errors
@@ -320,6 +513,9 @@ impl<D: Decoder> Runtime<D> {
         self.faulted = true;
         self.decoder.reset()?;
         while let Some(snapshot) = self.checkpoints.pop() {
+            self.recycle_snapshot(snapshot);
+        }
+        if let Some(snapshot) = self.prompt_end_checkpoint.take() {
             self.recycle_snapshot(snapshot);
         }
         self.tokens.clear();
@@ -671,22 +867,37 @@ impl<D: Decoder> Runtime<D> {
             &mut effects.timings,
             GenerationPhase::RollbackSnapshot,
             0,
-            || self.capture(0, check),
+            || self.capture_transient(0, check),
         )?;
+        let mut prompt_end = None;
         let result = (|| {
             check()?;
-            let completion = self.generate_inner(prompt, options, prefill, check, effects)?;
+            let mut prompt_end_capture = PromptEndCapture {
+                reserved: rollback.bytes,
+                slot: &mut prompt_end,
+            };
+            let completion = self.generate_inner(
+                prompt,
+                options,
+                prefill,
+                check,
+                effects,
+                &mut prompt_end_capture,
+            )?;
             check()?;
             // A failed optional capture still permits success, but deadline
             // expiry during capture must roll back the completed generation.
             let snapshot = if self.limits.checkpoints == 0 {
                 None
             } else {
+                let snapshot_reserved = rollback
+                    .bytes
+                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes));
                 let snapshot = measure(
                     &mut effects.timings,
                     GenerationPhase::CompletionSnapshot,
                     0,
-                    || self.capture(rollback.bytes, check),
+                    || self.capture_reusable(snapshot_reserved, check),
                 )
                 .ok();
                 check()?;
@@ -698,15 +909,8 @@ impl<D: Decoder> Runtime<D> {
             Ok((completion, snapshot)) => {
                 // Snapshots are an optional reuse optimization. A budget miss
                 // does not invalidate an otherwise completed generation.
-                if let Some(snapshot) = snapshot {
-                    // Count pressure alone must not discard a usable prefix
-                    // when its optional replacement could not be captured.
-                    if self.checkpoints.len() == self.limits.checkpoints {
-                        let evicted = self.checkpoints.remove(0);
-                        self.recycle_snapshot(evicted);
-                    }
-                    self.checkpoints.push(snapshot);
-                }
+                self.commit_prompt_end(prompt_end);
+                self.commit_reusable_snapshot(snapshot);
                 self.recycle_snapshot(rollback);
                 Ok(completion)
             }
@@ -734,6 +938,7 @@ impl<D: Decoder> Runtime<D> {
                         Ok(())
                     },
                 )?;
+                self.recycle_optional_snapshot(prompt_end);
                 self.faulted = false;
                 Err(error)
             }
@@ -767,11 +972,7 @@ impl<D: Decoder> Runtime<D> {
         Ok(())
     }
 
-    fn capture(
-        &mut self,
-        reserved: usize,
-        check: &impl Fn() -> Result<()>,
-    ) -> Result<Snapshot<D::Checkpoint>> {
+    fn snapshot_bytes(&self) -> Result<usize> {
         // Charge every shared payload in full, plus its Vec and Arc metadata.
         // Sharing removes copies without lowering the conservative cache bound.
         let logits_capacity = if self.logits.is_empty() {
@@ -784,32 +985,33 @@ impl<D: Decoder> Runtime<D> {
             .and_then(|bytes| bytes.checked_add(size_of::<Vec<f32>>()))
             .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
             .ok_or_else(|| invalid("native logits checkpoint byte count overflow"))?;
-        let bytes = self
-            .tokens
+        self.tokens
             .len()
             .checked_mul(size_of::<u32>())
             .and_then(|size| size.checked_add(logits_bytes))
             .and_then(|size| size.checked_add(self.decoder.checkpoint_bytes()))
             .and_then(|size| size.checked_add(size_of::<Snapshot<D::Checkpoint>>()))
-            .ok_or_else(|| invalid("native checkpoint byte count overflow"))?;
-        if bytes > self.limits.checkpoint_bytes.saturating_sub(reserved) {
-            return Err(invalid("native rollback checkpoint exceeds byte budget"));
+            .ok_or_else(|| invalid("native checkpoint byte count overflow"))
+    }
+
+    fn retained_reusable_bytes(&self) -> Result<usize> {
+        let mut total = self
+            .prompt_end_checkpoint
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.bytes);
+        for checkpoint in &self.checkpoints {
+            total = total
+                .checked_add(checkpoint.bytes)
+                .ok_or_else(|| invalid("native checkpoint byte count overflow"))?;
         }
-        while self
-            .checkpoints
-            .iter()
-            .try_fold(reserved, |total, checkpoint| {
-                total.checked_add(checkpoint.bytes)
-            })
-            .and_then(|size| size.checked_add(bytes))
-            .is_none_or(|total| total > self.limits.checkpoint_bytes)
-        {
-            if self.checkpoints.is_empty() {
-                return Err(invalid("native checkpoint budget exhausted"));
-            }
-            let evicted = self.checkpoints.remove(0);
-            self.recycle_snapshot(evicted);
-        }
+        Ok(total)
+    }
+
+    fn finish_capture(
+        &mut self,
+        bytes: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Snapshot<D::Checkpoint>> {
         let tokens = copy(&self.tokens)?;
         // Invalid/empty output needs no retained backing storage. Keep its
         // dormant allocation unique so reset-only requests can reuse it.
@@ -831,6 +1033,110 @@ impl<D: Decoder> Runtime<D> {
             logits,
             bytes,
         })
+    }
+
+    fn capture_transient(
+        &mut self,
+        reserved: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Snapshot<D::Checkpoint>> {
+        let bytes = self.snapshot_bytes()?;
+        let retained = self.retained_reusable_bytes()?;
+        if reserved
+            .checked_add(retained)
+            .and_then(|total| total.checked_add(bytes))
+            .is_none_or(|total| total > self.limits.checkpoint_bytes)
+        {
+            return Err(invalid("native transient checkpoint exceeds byte budget"));
+        }
+        self.finish_capture(bytes, check)
+    }
+
+    fn capture_reusable(
+        &mut self,
+        reserved: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Snapshot<D::Checkpoint>> {
+        let bytes = self.snapshot_bytes()?;
+        let prompt_end_bytes = self
+            .prompt_end_checkpoint
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.bytes);
+        let static_reserved = reserved.saturating_add(prompt_end_bytes);
+        if bytes > self.limits.checkpoint_bytes.saturating_sub(static_reserved) {
+            return Err(invalid("native rollback checkpoint exceeds byte budget"));
+        }
+        while self
+            .checkpoints
+            .iter()
+            .try_fold(static_reserved, |total, checkpoint| {
+                total.checked_add(checkpoint.bytes)
+            })
+            .and_then(|size| size.checked_add(bytes))
+            .is_none_or(|total| total > self.limits.checkpoint_bytes)
+        {
+            if self.checkpoints.is_empty() {
+                return Err(invalid("native checkpoint budget exhausted"));
+            }
+            let evicted = self.checkpoints.remove(0);
+            self.recycle_snapshot(evicted);
+        }
+        self.finish_capture(bytes, check)
+    }
+
+    #[cfg(test)]
+    fn capture(
+        &mut self,
+        reserved: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Snapshot<D::Checkpoint>> {
+        self.capture_reusable(reserved, check)
+    }
+
+    fn maybe_capture_prompt_end(
+        &mut self,
+        prompt: &[u32],
+        capture: &mut PromptEndCapture<'_, D::Checkpoint>,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        if !self.retain_prompt_end
+            || self
+                .prompt_end_checkpoint
+                .as_ref()
+                .is_some_and(|saved| saved.tokens == prompt)
+        {
+            return Ok(());
+        }
+        let candidate = self.capture_transient(capture.reserved, check).ok();
+        check()?;
+        *capture.slot = candidate;
+        Ok(())
+    }
+
+    fn commit_prompt_end(&mut self, candidate: Option<Snapshot<D::Checkpoint>>) {
+        if let Some(snapshot) = candidate
+            && let Some(previous) = self.prompt_end_checkpoint.replace(snapshot)
+        {
+            self.recycle_snapshot(previous);
+        }
+    }
+
+    fn commit_reusable_snapshot(&mut self, snapshot: Option<Snapshot<D::Checkpoint>>) {
+        if let Some(snapshot) = snapshot {
+            // Count pressure alone must not discard a usable prefix
+            // when its optional replacement could not be captured.
+            if self.checkpoints.len() == self.limits.checkpoints {
+                let evicted = self.checkpoints.remove(0);
+                self.recycle_snapshot(evicted);
+            }
+            self.checkpoints.push(snapshot);
+        }
+    }
+
+    fn recycle_optional_snapshot(&mut self, snapshot: Option<Snapshot<D::Checkpoint>>) {
+        if let Some(snapshot) = snapshot {
+            self.recycle_snapshot(snapshot);
+        }
     }
 
     fn recycle_checkpoint(&mut self, state: D::Checkpoint) {
@@ -873,18 +1179,42 @@ impl<D: Decoder> Runtime<D> {
     }
 
     fn prepare(&mut self, prompt: &[u32], check: &impl Fn() -> Result<()>) -> Result<usize> {
+        enum CandidateSlot {
+            Prefix(usize),
+            PromptEnd,
+        }
+
         if !self.tokens.is_empty() && prompt.starts_with(&self.tokens) && !self.logits.is_empty() {
             return Ok(self.tokens.len());
         }
-        let best = self
+        let best_cached = self
             .checkpoints
             .iter()
             .enumerate()
             .filter(|(_, snapshot)| prompt.starts_with(&snapshot.tokens))
-            .max_by_key(|(_, snapshot)| snapshot.tokens.len())
-            .map(|(index, _)| index);
-        if let Some(index) = best {
-            let snapshot = &self.checkpoints[index];
+            .max_by_key(|(_, snapshot)| snapshot.tokens.len());
+        let best_prompt_end = self
+            .prompt_end_checkpoint
+            .as_ref()
+            .filter(|snapshot| prompt.starts_with(&snapshot.tokens));
+        let best = match (best_cached, best_prompt_end) {
+            (Some((index, cached)), Some(end)) => {
+                if cached.tokens.len() >= end.tokens.len() {
+                    Some(CandidateSlot::Prefix(index))
+                } else {
+                    Some(CandidateSlot::PromptEnd)
+                }
+            }
+            (Some((index, _)), None) => Some(CandidateSlot::Prefix(index)),
+            (None, Some(_)) => Some(CandidateSlot::PromptEnd),
+            (None, None) => None,
+        };
+        let snapshot = match best {
+            Some(CandidateSlot::Prefix(index)) => Some(&self.checkpoints[index]),
+            Some(CandidateSlot::PromptEnd) => self.prompt_end_checkpoint.as_ref(),
+            None => None,
+        };
+        if let Some(snapshot) = snapshot {
             self.tokens
                 .try_reserve_exact(snapshot.tokens.len().saturating_sub(self.tokens.len()))?;
             check()?;
@@ -955,6 +1285,7 @@ impl<D: Decoder> Runtime<D> {
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
         effects: &mut GenerationEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
+        prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
     ) -> Result<Completion> {
         check()?;
         let reused = measure(
@@ -991,6 +1322,7 @@ impl<D: Decoder> Runtime<D> {
                 || self.evaluate(last, check),
             )?;
         }
+        self.maybe_capture_prompt_end(prompt, prompt_end, check)?;
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
             reused_tokens: reused,
@@ -1158,7 +1490,7 @@ impl<D: Decoder> Runtime<D> {
         };
         self.decoder.admit_work(0, evaluations)?;
         let check = || cancellation.check();
-        let rollback = self.capture(0, &check)?;
+        let rollback = self.capture_transient(0, &check)?;
         let result = (|| {
             if batched {
                 return self.verify_batched_draft(draft, &rollback, &check);
@@ -1248,9 +1580,14 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         self.validate_request(prompt, options, prefill)?;
         check()?;
-        let rollback = self.capture(0, check)?;
+        let rollback = self.capture_transient(0, check)?;
+        let mut prompt_end = None;
         let result = (|| {
             check()?;
+            let mut prompt_end_capture = PromptEndCapture {
+                reserved: rollback.bytes,
+                slot: &mut prompt_end,
+            };
             let (completion, stats) = self.generate_speculative_inner(
                 prompt,
                 options,
@@ -1258,12 +1595,16 @@ impl<D: Decoder> Runtime<D> {
                 suffix_config,
                 check,
                 &mut emit,
+                &mut prompt_end_capture,
             )?;
             check()?;
             let snapshot = if self.limits.checkpoints == 0 {
                 None
             } else {
-                let snapshot = self.capture(rollback.bytes, check).ok();
+                let snapshot_reserved = rollback
+                    .bytes
+                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes));
+                let snapshot = self.capture_reusable(snapshot_reserved, check).ok();
                 check()?;
                 snapshot
             };
@@ -1271,13 +1612,8 @@ impl<D: Decoder> Runtime<D> {
         })();
         match result {
             Ok((completion, stats, snapshot)) => {
-                if let Some(snapshot) = snapshot {
-                    if self.checkpoints.len() == self.limits.checkpoints {
-                        let evicted = self.checkpoints.remove(0);
-                        self.recycle_snapshot(evicted);
-                    }
-                    self.checkpoints.push(snapshot);
-                }
+                self.commit_prompt_end(prompt_end);
+                self.commit_reusable_snapshot(snapshot);
                 self.recycle_snapshot(rollback);
                 Ok((completion, stats))
             }
@@ -1296,11 +1632,16 @@ impl<D: Decoder> Runtime<D> {
                 self.faulted = false;
                 self.recycle_checkpoint(state);
                 self.recycle_logits(previous_logits);
+                self.recycle_optional_snapshot(prompt_end);
                 Err(error)
             }
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep suffix configuration and transactional prompt-end capture explicit."
+    )]
     fn generate_speculative_inner(
         &mut self,
         prompt: &[u32],
@@ -1309,6 +1650,7 @@ impl<D: Decoder> Runtime<D> {
         suffix_config: SuffixDraftConfig,
         check: &impl Fn() -> Result<()>,
         emit: &mut impl FnMut(u32) -> Result<()>,
+        prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
     ) -> Result<(Completion, SpeculativeStats)> {
         check()?;
         let reused = self.prepare(prompt, check)?;
@@ -1327,6 +1669,7 @@ impl<D: Decoder> Runtime<D> {
             }
             self.evaluate(last, check)?;
         }
+        self.maybe_capture_prompt_end(prompt, prompt_end, check)?;
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
             reused_tokens: reused,
@@ -2408,6 +2751,311 @@ mod recycling_tests {
                 .any(|&cap| cap > 0),
             "subsequent speculative verification must reuse recycled batch logit rows"
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod boundary_and_checkpoint_tests {
+    use super::{
+        Cancellation, Decoder, Generation, HybridCheckpointBoundary, Limits, Prefill, Result,
+        Runtime,
+    };
+    use std::cell::Cell;
+
+    struct BoundaryDecoder {
+        tokens: Vec<u32>,
+        identity: &'static str,
+        vocab: usize,
+    }
+
+    impl BoundaryDecoder {
+        fn new() -> Self {
+            Self {
+                tokens: Vec::new(),
+                identity: "boundary-test-decoder/v1",
+                vocab: 16,
+            }
+        }
+    }
+
+    impl Decoder for BoundaryDecoder {
+        type Checkpoint = Vec<u32>;
+
+        fn identity(&self) -> &str {
+            self.identity
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab
+        }
+
+        fn checkpoint_bytes(&self) -> usize {
+            self.tokens.len() * size_of::<u32>()
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.tokens.clear();
+            Ok(())
+        }
+
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            let mut output = Vec::new();
+            self.evaluate_into(token, &mut output)?;
+            Ok(output)
+        }
+
+        fn evaluate_into(&mut self, token: u32, output: &mut Vec<f32>) -> Result<()> {
+            self.tokens.push(token);
+            output.clear();
+            output.resize(self.vocab, 0.0);
+            let last = self.tokens.last().copied().unwrap_or(0);
+            let next = usize::try_from((last + 1) % u32::try_from(self.vocab)?)?;
+            output[next] = 10.0;
+            Ok(())
+        }
+
+        fn evaluate_batch_into(
+            &mut self,
+            tokens: &[u32],
+            output: &mut Vec<Vec<f32>>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            output.truncate(tokens.len());
+            while output.len() < tokens.len() {
+                output.push(Vec::new());
+            }
+            for (index, &token) in tokens.iter().enumerate() {
+                check()?;
+                self.evaluate_into(token, &mut output[index])?;
+            }
+            Ok(())
+        }
+
+        fn batched_evaluation_capacity(&self) -> usize {
+            8
+        }
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            Ok(self.tokens.clone())
+        }
+
+        fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+            self.tokens.clear();
+            self.tokens.extend_from_slice(checkpoint);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transient_capture_never_evicts_reusable_prefix() -> Result<()> {
+        let mut runtime = Runtime::new(
+            BoundaryDecoder::new(),
+            Limits {
+                context_tokens: 64,
+                checkpoints: 1,
+                checkpoint_bytes: 128 * 1_024,
+            },
+        )?;
+        let cancellation = Cancellation::default();
+        let options = Generation {
+            max_tokens: 2,
+            stop_tokens: vec![],
+        };
+        runtime.generate(&[1, 2], &options, &cancellation, |_| Ok(()))?;
+        assert_eq!(runtime.checkpoint_count(), 1);
+        let saved_bytes = runtime.checkpoints[0].bytes;
+        let saved_tokens = runtime.checkpoints[0].tokens.clone();
+
+        // Batched draft verification uses a transient checkpoint that must never
+        // displace or evict saved reusable prefixes.
+        let (committed, stats) = runtime.verify_draft_block(&[5, 6], &cancellation)?;
+        assert_eq!(committed, [5, 6, 7]);
+        assert_eq!(stats.draft_tokens_accepted, 2);
+        assert_eq!(runtime.checkpoint_count(), 1);
+        assert_eq!(runtime.checkpoints[0].tokens, saved_tokens);
+
+        // Tight budget leaving room for the existing reusable entry + transient
+        // fails transient capture without evicting `checkpoints[0]`.
+        let needed_transient = runtime.snapshot_bytes()?;
+        runtime.limits.checkpoint_bytes = saved_bytes + needed_transient - 1;
+        assert!(runtime.capture_transient(0, &|| Ok(())).is_err());
+        assert_eq!(runtime.checkpoint_count(), 1);
+        assert_eq!(runtime.checkpoints[0].tokens, saved_tokens);
+
+        runtime.limits.checkpoint_bytes = saved_bytes + needed_transient;
+        let transient = runtime.capture_transient(0, &|| Ok(()))?;
+        assert_eq!(runtime.checkpoint_count(), 1);
+        assert_eq!(runtime.checkpoints[0].tokens, saved_tokens);
+        runtime.recycle_snapshot(transient);
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_end_checkpoint_survives_assistant_decode() -> Result<()> {
+        let mut runtime = Runtime::new(
+            BoundaryDecoder::new(),
+            Limits {
+                context_tokens: 64,
+                checkpoints: 0,
+                checkpoint_bytes: 128 * 1_024,
+            },
+        )?;
+        runtime.set_retain_prompt_end(true);
+        assert!(runtime.retain_prompt_end());
+        assert!(!runtime.has_prompt_end_checkpoint());
+
+        let cancellation = Cancellation::default();
+        let options = Generation {
+            max_tokens: 3,
+            stop_tokens: vec![],
+        };
+        let first = runtime.generate(&[1, 2, 3, 4], &options, &cancellation, |_| Ok(()))?;
+        assert_eq!(first.reused_tokens, 0);
+        assert_eq!(runtime.tokens(), [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(runtime.checkpoint_count(), 0);
+        assert!(runtime.has_prompt_end_checkpoint());
+
+        // Failed follow-up request after assistant decode must preserve the prior
+        // prompt-end checkpoint transactionally.
+        let emitted = Cell::new(0_usize);
+        let failed = runtime.generate(&[9, 10], &options, &cancellation, |_| {
+            emitted.set(emitted.get() + 1);
+            Err(crate::invalid("abort after prompt prefill"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(runtime.tokens(), [1, 2, 3, 4, 5, 6, 7]);
+
+        // Editing/regenerating immediately after the first prompt still hits the
+        // dedicated prompt-end prefix even though assistant tokens advanced past it.
+        let regenerated =
+            runtime.generate(&[1, 2, 3, 4, 0], &options, &cancellation, |_| Ok(()))?;
+        assert_eq!(regenerated.reused_tokens, 4);
+        assert_eq!(runtime.tokens(), [1, 2, 3, 4, 0, 1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_checkpoint_boundary_reconciles_page_and_recurrent_limits() -> Result<()> {
+        let prompt: Vec<u32> = (0..130).collect();
+        let history: Vec<u32> = (0..130).collect();
+        let identity = "qwen35-hybrid-f16/v1";
+
+        // 1. Attention hits all 130 tokens and KV aligns down to 128 (page 64),
+        // while recurrent state is stuck at unaligned position 130: cannot
+        // roll recurrent state backwards, so boundary clamps safely to 0.
+        let clamped_unaligned = HybridCheckpointBoundary::reconcile(
+            &prompt,
+            &history,
+            identity,
+            identity,
+            130,
+            Some(64),
+            true,
+            Some(130),
+        );
+        assert_eq!(clamped_unaligned.matched_tokens, 130);
+        assert_eq!(clamped_unaligned.kv_bound, 128);
+        assert_eq!(clamped_unaligned.position, 0);
+        assert!(clamped_unaligned.clamped_by_recurrent);
+        assert!(clamped_unaligned.identity_matched);
+
+        // 2. When exact unaligned KV tail is permitted (`None`), the exact hybrid
+        // boundary at 130 is reusable.
+        let unaligned_tail_ok = HybridCheckpointBoundary::reconcile(
+            &prompt,
+            &history,
+            identity,
+            identity,
+            130,
+            None,
+            true,
+            Some(130),
+        );
+        assert_eq!(unaligned_tail_ok.position, 130);
+        assert_eq!(unaligned_tail_ok.kv_bound, 130);
+        assert!(!unaligned_tail_ok.clamped_by_recurrent);
+
+        // 3. Aligned recurrent checkpoint at 64 reconciles below KV page bound 128.
+        let aligned_recurrent = HybridCheckpointBoundary::reconcile(
+            &prompt,
+            &history,
+            identity,
+            identity,
+            130,
+            Some(64),
+            true,
+            Some(64),
+        );
+        assert_eq!(aligned_recurrent.kv_bound, 128);
+        assert_eq!(aligned_recurrent.position, 64);
+        assert!(aligned_recurrent.clamped_by_recurrent);
+
+        // 4. Representation/adapter identity mismatch rejects any reuse.
+        let mismatched = HybridCheckpointBoundary::reconcile(
+            &prompt,
+            &history,
+            identity,
+            "qwen35-hybrid-f16/lora:0x3f800000",
+            130,
+            None,
+            true,
+            Some(130),
+        );
+        assert_eq!(mismatched.position, 0);
+        assert!(!mismatched.identity_matched);
+
+        // 5. Missing recurrent state availability clamps hybrid reuse even with
+        // full KV page hits; pure KV (`has_recurrent_layers = false`) reuses 128.
+        let no_recurrent_state = HybridCheckpointBoundary::reconcile(
+            &prompt,
+            &history,
+            identity,
+            identity,
+            130,
+            Some(64),
+            true,
+            None,
+        );
+        assert_eq!(no_recurrent_state.position, 0);
+        assert!(no_recurrent_state.clamped_by_recurrent);
+
+        let pure_kv = HybridCheckpointBoundary::reconcile(
+            &prompt,
+            &history,
+            identity,
+            identity,
+            130,
+            Some(64),
+            false,
+            None,
+        );
+        assert_eq!(pure_kv.position, 128);
+        assert!(!pure_kv.clamped_by_recurrent);
+
+        // 6. Live runtime helper reconciles saved page-aligned vs unaligned state.
+        let mut runtime = Runtime::new(
+            BoundaryDecoder::new(),
+            Limits {
+                context_tokens: 256,
+                checkpoints: 2,
+                checkpoint_bytes: 128 * 1_024,
+            },
+        )?;
+        let cancellation = Cancellation::default();
+        let page_prompt: Vec<u32> = (0_u32..63).map(|value| value % 16).collect();
+        let tail_prompt: Vec<u32> = (0_u32..70).map(|value| value % 16).collect();
+        runtime.generate(
+            &page_prompt,
+            &Generation {
+                max_tokens: 1,
+                stop_tokens: vec![],
+            },
+            &cancellation,
+            |_| Ok(()),
+        )?;
+        let extra = runtime.hybrid_boundary(&tail_prompt, true, Some(64));
+        assert_eq!(extra.position, 64);
         Ok(())
     }
 }

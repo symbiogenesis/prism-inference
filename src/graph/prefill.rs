@@ -3,9 +3,10 @@
 use std::fmt::Write as _;
 
 use super::{
-    Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerState, Qwen35,
-    Transforms, add, add_finite, attention_gate, checked_product, finite, resize_attention_scores,
-    resize_into, rope_frequencies, row_into, small_float,
+    Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerDelta, LayerState,
+    Qwen35, RecurrentAttention, Transforms, add, add_finite, attention_gate, checked_product,
+    finite, l2_norm, recurrent_decay, resize_attention_scores, resize_into, rope_frequencies,
+    row_into, sigmoid, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -413,6 +414,12 @@ impl Qwen35 {
         output: &mut Vec<Vec<f32>>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        if !self.state_consistent {
+            output.clear();
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
         if tokens.is_empty()
             || tokens.len() > self.verification_capacity()
             || self.projection_executor.is_some()
@@ -497,6 +504,11 @@ impl Qwen35 {
         check: &dyn Fn() -> Result<()>,
         mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
         if tokens.is_empty()
             || tokens.len() > MAX_PREFILL_BLOCK_TOKENS
             || tokens
@@ -580,10 +592,10 @@ impl Qwen35 {
                 )?;
             }
         }
-        // A partial layer-major attempt is not a committed token prefix. Mark
-        // position nonempty before any state mutation so explicit reset always
-        // clears provisional state, including failure during the first tile.
-        self.position = base + count;
+        // Mark live state inconsistent before any layer-major mutation so any
+        // mid-tile error or cancellation leaves state unavailable until explicit
+        // reset or restore, and keep `position` at the last committed prefix.
+        self.state_consistent = false;
         let mut frequencies_ready = false;
         let total_layers = self.layers.len();
         let narrow_final = logits.is_none() && self.narrow_last_layer;
@@ -615,7 +627,7 @@ impl Qwen35 {
             if narrow_final && layer_idx + 1 == total_layers {
                 match (&layer.attention, &mut *state) {
                     (Attention::Recurrent(weights), _) => {
-                        gdn::recurrent_tile(
+                        recurrent_state_only_tile(
                             weights,
                             state,
                             delta,
@@ -875,8 +887,191 @@ impl Qwen35 {
                 check()?;
             }
         }
+        self.position = base + count;
+        self.state_consistent = true;
         Ok(())
     }
+}
+
+fn step_recurrent_state_only_conv(
+    layer: &RecurrentAttention,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    convolution: &mut [f32],
+    tile: &mut TiledPrefill,
+    count: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let width = geometry.ssm_head;
+    let hist_width = geometry.convolution - 1;
+    let key_width = geometry.key_width();
+    for ((mixed, alpha), beta) in tile.mixed[..count]
+        .iter_mut()
+        .zip(&mut tile.alpha[..count])
+        .zip(&mut tile.beta[..count])
+    {
+        check()?;
+        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            crate::kernels::pinned_convolution::step_silu_in_place_coefficients(
+                convolution,
+                mixed,
+                layer.convolution.view(),
+                geometry.convolution,
+            )?;
+        } else {
+            for (channel, value) in mixed.iter_mut().enumerate() {
+                let projected = *value;
+                let start = channel * hist_width;
+                let coefficients = &layer.convolution.view().source()
+                    [channel * geometry.convolution..(channel + 1) * geometry.convolution];
+                *value = arithmetic.convolution_row(
+                    &convolution[start..start + hist_width],
+                    projected,
+                    coefficients,
+                )?;
+                if hist_width > 0 {
+                    convolution[start..start + hist_width].rotate_left(1);
+                    convolution[start + hist_width - 1] = projected;
+                }
+            }
+            arithmetic.silu(mixed);
+        }
+        // Only keys feed the state recurrence; queries and output gates are skipped.
+        for head in mixed[key_width..2 * key_width].chunks_exact_mut(width) {
+            l2_norm(head, geometry.epsilon);
+        }
+        for (((alpha_out, beta_out), &time_bias), &decay_weight) in alpha
+            .iter_mut()
+            .zip(beta.iter_mut())
+            .zip(&layer.time_bias)
+            .zip(&layer.decay)
+        {
+            *alpha_out = recurrent_decay(*alpha_out, time_bias, decay_weight)?;
+            *beta_out = sigmoid(*beta_out);
+        }
+    }
+    finite(convolution, "convolution state")
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep causal recurrent state updates, projection reuse and tile scratch explicit."
+)]
+fn recurrent_state_only_tile<'a>(
+    layer: &'a RecurrentAttention,
+    state: &mut LayerState,
+    delta: &mut LayerDelta,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    transforms: &Transforms,
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous_norm: TileReuse<'a>,
+    count: usize,
+    check: &dyn Fn() -> Result<()>,
+    tile: &mut TiledPrefill,
+    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+) -> Result<()> {
+    let (
+        LayerState::Recurrent {
+            convolution: history,
+            matrix: previous,
+        },
+        LayerDelta::Recurrent {
+            convolution,
+            matrix,
+        },
+    ) = (state, delta)
+    else {
+        return Err(invalid("state-only tile requires recurrent state"));
+    };
+    check()?;
+    let previous_qkv_beta = project_tile_pair(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        previous_norm,
+        [&layer.qkv, &layer.beta],
+        &tile.normalized[..count],
+        &mut tile.mixed[..count],
+        &mut tile.beta[..count],
+        &mut tile.transformed[..count],
+        &mut tile.projector,
+        reborrow_executor(&mut executor),
+        check,
+    )?;
+    check()?;
+    let _ = project_tile(
+        transforms,
+        geometry,
+        arithmetic,
+        adapter,
+        adapter_scale,
+        adapter_scratch,
+        projection_scratch,
+        previous_qkv_beta,
+        &layer.alpha,
+        &tile.normalized[..count],
+        &mut tile.alpha[..count],
+        &mut tile.transformed[..count],
+        &mut tile.projector,
+        reborrow_executor(&mut executor),
+        check,
+    )?;
+    resize_into(history.len(), convolution)?;
+    convolution.copy_from_slice(history);
+    resize_into(previous.len(), matrix)?;
+    step_recurrent_state_only_conv(layer, geometry, arithmetic, convolution, tile, count, check)?;
+    let width = geometry.ssm_head;
+    let key_width = geometry.key_width();
+    let head_state_len = width * width;
+    let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
+    let alpha_ref: &[Vec<f32>] = &tile.alpha[..count];
+    let beta_ref: &[Vec<f32>] = &tile.beta[..count];
+    tile.projector.row_parallelism().update_chunks(
+        matrix,
+        head_state_len,
+        |base_head, state_chunk| {
+            for (offset, state_head) in state_chunk.chunks_exact_mut(head_state_len).enumerate() {
+                let head = base_head + offset;
+                let prev_head = &previous[head * head_state_len..(head + 1) * head_state_len];
+                let key_head = head % geometry.ssm_keys;
+                for (token, ((mixed, alpha), beta)) in
+                    mixed_ref.iter().zip(alpha_ref).zip(beta_ref).enumerate()
+                {
+                    let k =
+                        &mixed[key_width + key_head * width..key_width + (key_head + 1) * width];
+                    let v =
+                        &mixed[2 * key_width + head * width..2 * key_width + (head + 1) * width];
+                    let decay = alpha[head];
+                    let beta = beta[head];
+                    for (row_idx, &v_val) in v.iter().enumerate() {
+                        let state_row = &mut state_head[row_idx * width..(row_idx + 1) * width];
+                        let dot_k = if token == 0 {
+                            let prev_row = &prev_head[row_idx * width..(row_idx + 1) * width];
+                            arithmetic.gdn_decay_and_dot_from(prev_row, state_row, k, decay)?
+                        } else {
+                            arithmetic.gdn_decay_and_dot(state_row, k, decay)?
+                        };
+                        let step_delta = (v_val - dot_k) * beta;
+                        arithmetic.gdn_add_scaled(state_row, k, step_delta)?;
+                        finite(state_row, "GDN state")?;
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
+    check()?;
+    std::mem::swap(history, convolution);
+    std::mem::swap(previous, matrix);
+    Ok(())
 }
 
 #[expect(

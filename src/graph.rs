@@ -765,12 +765,11 @@ impl Arithmetic {
         }
     }
 
-    #[cfg(test)]
     fn gdn_add_scaled(self, target: &mut [f32], input: &[f32], scale: f32) -> Result<()> {
         match self {
             Self::Source => {
                 add_scaled_slice_in_place(target, input, scale);
-                Ok(())
+                finite(target, "GDN state")
             }
             Self::PinnedSwift => crate::kernels::pinned_gdn::add_scaled(target, input, scale),
         }
@@ -2136,6 +2135,7 @@ pub struct Qwen35 {
     workspace: Workspace,
     context_limit: usize,
     position: usize,
+    state_consistent: bool,
     vocabulary: usize,
     kv_cache_policy: KvCachePolicy,
     narrow_last_layer: bool,
@@ -2712,7 +2712,19 @@ impl Qwen35 {
                         &format!("{prefix}ssm_dt.bias"),
                         geometry.ssm_values,
                     )?,
-                    decay: vector(&model, &format!("{prefix}ssm_a"), geometry.ssm_values)?,
+                    decay: {
+                        let values =
+                            vector(&model, &format!("{prefix}ssm_a"), geometry.ssm_values)?;
+                        if values
+                            .iter()
+                            .any(|&value| !value.is_finite() || value > 0.0)
+                        {
+                            return Err(invalid(
+                                "recurrent decay ssm_a must be finite and nonpositive",
+                            ));
+                        }
+                        values
+                    },
                     norm: vector(
                         &model,
                         &format!("{prefix}ssm_norm.weight"),
@@ -2867,6 +2879,7 @@ impl Qwen35 {
             },
             context_limit,
             position: 0,
+            state_consistent: true,
             vocabulary,
             kv_cache_policy,
             narrow_last_layer: layer_count >= 4,
@@ -3143,6 +3156,11 @@ impl Qwen35 {
         mut probe: Option<&mut weight_patch::Intervention<'_>>,
         mut timings: Option<&mut TokenTimings>,
     ) -> Result<()> {
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
         let token = usize::try_from(token)?;
         if token >= self.vocabulary || self.position >= self.context_limit {
             return Err(invalid(
@@ -4178,13 +4196,13 @@ impl Evaluation<'_, '_> {
         self.recurrent_attention_state(
             layer,
             &mut scratch.projected,
-            &scratch.gate,
+            Some(&scratch.gate),
             &scratch.beta,
             &scratch.alpha,
             history,
             previous,
             delta,
-            &mut scratch.attended,
+            Some(&mut scratch.attended),
         )?;
         self.project_into(&layer.output, &scratch.attended, output)
     }
@@ -4207,27 +4225,22 @@ impl Evaluation<'_, '_> {
                 &mut scratch.alpha,
             ],
         )?;
-        resize_into(self.geometry.value_width(), &mut scratch.gate)?;
         self.recurrent_attention_state(
             layer,
             &mut scratch.projected,
-            &scratch.gate,
+            None,
             &scratch.beta,
             &scratch.alpha,
             history,
             previous,
             delta,
-            &mut scratch.attended,
+            None,
         )
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and graph operation order auditable together."
-    )]
-    #[expect(
-        clippy::imprecise_flops,
-        reason = "Match the pinned scalar GDN operations, including logf(1+expf(x))."
     )]
     #[expect(
         clippy::too_many_arguments,
@@ -4237,13 +4250,13 @@ impl Evaluation<'_, '_> {
         &self,
         layer: &RecurrentAttention,
         mixed: &mut [f32],
-        gate_ref: &[f32],
+        gate_ref: Option<&[f32]>,
         beta_ref: &[f32],
         alpha_ref: &[f32],
         history: &[f32],
         previous: &[f32],
         delta: &mut LayerDelta,
-        attended: &mut Vec<f32>,
+        attended: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let LayerDelta::Recurrent {
             convolution,
@@ -4361,11 +4374,43 @@ impl Evaluation<'_, '_> {
             }
         }
         resize_into(previous.len(), matrix)?;
+        if let Some((gate_ref, attended)) = gate_ref.zip(attended) {
+            self.recurrent_attention_gated_heads(
+                layer, mixed, gate_ref, beta_ref, alpha_ref, previous, matrix, attended,
+            )?;
+        } else {
+            self.recurrent_attention_state_heads(
+                layer, mixed, beta_ref, alpha_ref, previous, matrix,
+            )?;
+        }
+        finite(convolution, "convolution state")
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep per-head gated GDN matrix update and normalized gate parity auditable together."
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Separate immutable committed state from output gate and attended buffers."
+    )]
+    fn recurrent_attention_gated_heads(
+        &self,
+        layer: &RecurrentAttention,
+        mixed: &[f32],
+        gate_ref: &[f32],
+        beta_ref: &[f32],
+        alpha_ref: &[f32],
+        previous: &[f32],
+        matrix: &mut [f32],
+        attended: &mut Vec<f32>,
+    ) -> Result<()> {
+        let g = self.geometry;
+        let key_width = g.key_width();
         resize_into(g.value_width(), attended)?;
         let scale = 1.0 / small_float(g.ssm_head)?.sqrt();
         let head_state_len = g.ssm_head * g.ssm_head;
         let arithmetic = self.arithmetic;
-        let mixed_ref: &[f32] = mixed;
         let norm = RmsNormWeights::new(&layer.norm)?;
         self.projection
             .matvec
@@ -4386,18 +4431,16 @@ impl Evaluation<'_, '_> {
                             &previous[head * head_state_len..(head + 1) * head_state_len];
                         // ggml repeat tiles key groups; it does not repeat each key head contiguously.
                         let key_head = head % g.ssm_keys;
-                        let q = &mixed_ref[key_head * g.ssm_head..(key_head + 1) * g.ssm_head];
-                        let k = &mixed_ref[key_width + key_head * g.ssm_head
+                        let q = &mixed[key_head * g.ssm_head..(key_head + 1) * g.ssm_head];
+                        let k = &mixed[key_width + key_head * g.ssm_head
                             ..key_width + (key_head + 1) * g.ssm_head];
-                        let v = &mixed_ref[2 * key_width + head * g.ssm_head
+                        let v = &mixed[2 * key_width + head * g.ssm_head
                             ..2 * key_width + (head + 1) * g.ssm_head];
-                        let activation = alpha_ref[head] + layer.time_bias[head];
-                        let softplus = if activation > 20.0 {
-                            activation
-                        } else {
-                            (1.0 + activation.exp()).ln()
-                        };
-                        let decay = (softplus * layer.decay[head]).exp();
+                        let decay = recurrent_decay(
+                            alpha_ref[head],
+                            layer.time_bias[head],
+                            layer.decay[head],
+                        )?;
                         let update = sigmoid(beta_ref[head]);
                         let handled = matches!(arithmetic, Arithmetic::PinnedSwift)
                             && crate::kernels::pinned_gdn::try_step_head_provisional(
@@ -4502,8 +4545,53 @@ impl Evaluation<'_, '_> {
                     }
                     Ok(())
                 },
-            )?;
-        finite(convolution, "convolution state")
+            )
+    }
+
+    fn recurrent_attention_state_heads(
+        &self,
+        layer: &RecurrentAttention,
+        mixed: &[f32],
+        beta_ref: &[f32],
+        alpha_ref: &[f32],
+        previous: &[f32],
+        matrix: &mut [f32],
+    ) -> Result<()> {
+        let g = self.geometry;
+        let key_width = g.key_width();
+        let head_state_len = g.ssm_head * g.ssm_head;
+        let arithmetic = self.arithmetic;
+        self.projection.matvec.row_parallelism().update_chunks(
+            matrix,
+            head_state_len,
+            |base_head, state_chunk| {
+                for (offset, state) in state_chunk.chunks_exact_mut(head_state_len).enumerate() {
+                    let head = base_head + offset;
+                    let prev_state = &previous[head * head_state_len..(head + 1) * head_state_len];
+                    let key_head = head % g.ssm_keys;
+                    let k = &mixed[key_width + key_head * g.ssm_head
+                        ..key_width + (key_head + 1) * g.ssm_head];
+                    let v = &mixed[2 * key_width + head * g.ssm_head
+                        ..2 * key_width + (head + 1) * g.ssm_head];
+                    let decay =
+                        recurrent_decay(alpha_ref[head], layer.time_bias[head], layer.decay[head])?;
+                    let update = sigmoid(beta_ref[head]);
+                    let row_stride = g.ssm_head;
+                    for (row_idx, &value) in v.iter().enumerate() {
+                        let prev_row =
+                            &prev_state[row_idx * row_stride..(row_idx + 1) * row_stride];
+                        let state_row =
+                            &mut state[row_idx * row_stride..(row_idx + 1) * row_stride];
+                        let dot_k =
+                            arithmetic.gdn_decay_and_dot_from(prev_row, state_row, k, decay)?;
+                        let step_delta = (value - dot_k) * update;
+                        arithmetic.gdn_add_scaled(state_row, k, step_delta)?;
+                        finite(state_row, "GDN state")?;
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 }
 
@@ -4524,7 +4612,7 @@ impl Decoder for Qwen35 {
         // advances position, and failed restore staging never changes live state.
         // Avoid refilling the recurrent buffers when callers reset twice (for
         // example request-boundary reset followed by runtime prefix preparation).
-        if self.position == 0 {
+        if self.position == 0 && self.state_consistent {
             return Ok(());
         }
         for state in &mut self.state {
@@ -4543,6 +4631,7 @@ impl Decoder for Qwen35 {
             }
         }
         self.position = 0;
+        self.state_consistent = true;
         Ok(())
     }
 
@@ -4607,6 +4696,11 @@ impl Decoder for Qwen35 {
     }
 
     fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
         Ok(Qwen35Checkpoint {
             provenance: self.provenance.clone(),
             identity: copy_string(&self.identity)?,
@@ -4625,6 +4719,11 @@ impl Decoder for Qwen35 {
     }
 
     fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> Result<()> {
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
         copy_string_into(&self.identity, &mut target.identity)?;
         if self.position == 0 {
             target.layers.clear();
@@ -4660,6 +4759,7 @@ impl Decoder for Qwen35 {
         }
         restore_state_in_place(&mut self.state, &checkpoint.layers, checkpoint.position)?;
         self.position = checkpoint.position;
+        self.state_consistent = true;
         Ok(())
     }
 }
@@ -5383,6 +5483,36 @@ fn l2_norm(input: &mut [f32], epsilon: f32) {
 
 fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
+}
+
+#[expect(
+    clippy::float_cmp,
+    clippy::imprecise_flops,
+    reason = "Guard exact zero ssm_a before log1p/exp product to avoid 0.0 * inf = NaN while matching pinned scalar binary32 softplus."
+)]
+fn recurrent_decay(alpha: f32, time_bias: f32, decay_weight: f32) -> Result<f32> {
+    if !alpha.is_finite() || !time_bias.is_finite() || !decay_weight.is_finite() {
+        return Err(invalid("nonfinite recurrent gate input"));
+    }
+    if decay_weight > 0.0 {
+        return Err(invalid("recurrent decay ssm_a must be nonpositive"));
+    }
+    if decay_weight == 0.0 {
+        return Ok(1.0);
+    }
+    let linear = alpha + time_bias;
+    if linear >= 88.0 {
+        if !linear.is_finite() {
+            return Ok(0.0);
+        }
+        return Ok((linear * decay_weight).exp());
+    }
+    let softplus = if linear > 20.0 {
+        linear
+    } else {
+        (1.0 + linear.exp()).ln()
+    };
+    Ok((softplus * decay_weight).exp())
 }
 
 fn add(target: &mut [f32], other: &[f32]) {
@@ -7030,5 +7160,281 @@ mod tests {
             assert_eq!(matrix.capacity(), mat_cap);
         }
         Ok(())
+    }
+
+    mod state_consistency_and_gate_tests {
+        use std::cell::Cell;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use bonsai_gguf::MetadataValue;
+
+        use super::super::{LayerState, Qwen35, recurrent_decay};
+        use crate::model::{Model, Tensor};
+        use crate::{Decoder, Result, invalid};
+
+        fn weight(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
+            Tensor {
+                name: name.to_owned(),
+                dimensions: dimensions.to_vec(),
+                kind: 0,
+                data: Arc::from(
+                    values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            }
+        }
+
+        fn recurrent_fixture(ssm_a: f32) -> Model {
+            let metadata = BTreeMap::from([
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
+                ("qwen35.block_count".to_owned(), MetadataValue::from(1_u32)),
+                (
+                    "qwen35.context_length".to_owned(),
+                    MetadataValue::from(16_u32),
+                ),
+                (
+                    "qwen35.embedding_length".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.feed_forward_length".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.attention.head_count".to_owned(),
+                    MetadataValue::from(1_u32),
+                ),
+                (
+                    "qwen35.attention.head_count_kv".to_owned(),
+                    MetadataValue::from(1_u32),
+                ),
+                (
+                    "qwen35.attention.key_length".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.attention.value_length".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.attention.layer_norm_rms_epsilon".to_owned(),
+                    MetadataValue::from(1e-6_f32),
+                ),
+                (
+                    "qwen35.rope.dimension_count".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.rope.dimension_sections".to_owned(),
+                    MetadataValue::from(vec![1_u32, 0, 0, 0]),
+                ),
+                (
+                    "qwen35.rope.freq_base".to_owned(),
+                    MetadataValue::from(10_000.0_f32),
+                ),
+                (
+                    "qwen35.ssm.state_size".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.ssm.group_count".to_owned(),
+                    MetadataValue::from(1_u32),
+                ),
+                (
+                    "qwen35.ssm.time_step_rank".to_owned(),
+                    MetadataValue::from(1_u32),
+                ),
+                (
+                    "qwen35.ssm.inner_size".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.ssm.conv_kernel".to_owned(),
+                    MetadataValue::from(2_u32),
+                ),
+                (
+                    "qwen35.full_attention_interval".to_owned(),
+                    MetadataValue::from(1_u32),
+                ),
+                (
+                    "qwen35.attention.recurrent_layers".to_owned(),
+                    MetadataValue::from(vec![true]),
+                ),
+            ]);
+            let mut tensors = BTreeMap::new();
+            let mut insert = |name: &str, dimensions: &[usize], values: &[f32]| {
+                tensors.insert(name.to_owned(), weight(name, dimensions, values));
+            };
+            insert("token_embd.weight", &[2, 2], &[0.75, -0.5, -0.25, 1.0]);
+            insert("output.weight", &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+            insert("output_norm.weight", &[2], &[1.0, 1.0]);
+            insert("blk.0.attn_norm.weight", &[2], &[1.0, 1.0]);
+            insert("blk.0.post_attention_norm.weight", &[2], &[1.0, 1.0]);
+            insert("blk.0.ffn_up.weight", &[2, 2], &[0.5, -0.25, 0.25, 0.5]);
+            insert("blk.0.ffn_gate.weight", &[2, 2], &[0.25, 0.5, -0.5, 0.25]);
+            insert("blk.0.ffn_down.weight", &[2, 2], &[0.5, 0.0, 0.0, 0.5]);
+            insert(
+                "blk.0.attn_qkv.weight",
+                &[2, 6],
+                &[
+                    0.5, -0.25, 0.25, 0.75, -0.5, 0.25, -0.25, 0.5, 0.75, -0.5, 0.25, 0.5,
+                ],
+            );
+            insert("blk.0.attn_gate.weight", &[2, 2], &[1.0, 0.25, -0.25, 1.0]);
+            insert(
+                "blk.0.ssm_conv1d.weight",
+                &[2, 6],
+                &[
+                    0.25, 1.0, 0.25, 1.0, 0.25, 1.0, 0.25, 1.0, 0.25, 1.0, 0.25, 1.0,
+                ],
+            );
+            insert("blk.0.ssm_dt.bias", &[1], &[0.25]);
+            insert("blk.0.ssm_a", &[1], &[ssm_a]);
+            insert("blk.0.ssm_beta.weight", &[2, 1], &[0.5, -0.25]);
+            insert("blk.0.ssm_alpha.weight", &[2, 1], &[-0.25, 0.5]);
+            insert("blk.0.ssm_norm.weight", &[2], &[1.0, 1.0]);
+            insert("blk.0.ssm_out.weight", &[2, 2], &[1.0, -0.25, 0.25, 1.0]);
+            Model {
+                metadata,
+                tensors,
+                identity: "graph-state-consistency-fixture".to_owned(),
+            }
+        }
+
+        fn assert_recurrent_states_bit_eq(left: &[LayerState], right: &[LayerState]) -> Result<()> {
+            assert_eq!(left.len(), right.len());
+            for (l, r) in left.iter().zip(right) {
+                let (
+                    LayerState::Recurrent {
+                        convolution: lc,
+                        matrix: lm,
+                    },
+                    LayerState::Recurrent {
+                        convolution: rc,
+                        matrix: rm,
+                    },
+                ) = (l, r)
+                else {
+                    return Err(invalid("expected recurrent state"));
+                };
+                assert_eq!(lc.len(), rc.len());
+                assert_eq!(lm.len(), rm.len());
+                assert!(lc.iter().zip(rc).all(|(a, b)| a.to_bits() == b.to_bits()));
+                assert!(lm.iter().zip(rm).all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn rejects_positive_ssm_a_and_guards_gate_overflow() -> Result<()> {
+            assert!(Qwen35::new(recurrent_fixture(0.5), 8).is_err());
+            assert!(Qwen35::new(recurrent_fixture(1e-6), 8).is_err());
+            assert!(Qwen35::new(recurrent_fixture(-1.0), 8).is_ok());
+            assert!(Qwen35::new(recurrent_fixture(0.0), 8).is_ok());
+
+            assert!(recurrent_decay(0.0, 0.0, 0.1).is_err());
+            assert!(recurrent_decay(f32::NAN, 0.0, -1.0).is_err());
+
+            let zero_decay = recurrent_decay(90.0, 10.0, 0.0)?;
+            assert_eq!(zero_decay.to_bits(), 1.0_f32.to_bits());
+            let zero_decay_inf = recurrent_decay(f32::MAX, f32::MAX, 0.0)?;
+            assert_eq!(zero_decay_inf.to_bits(), 1.0_f32.to_bits());
+
+            let large_linear = recurrent_decay(88.0, 4.0, -0.5)?;
+            assert!(large_linear.is_finite() && (0.0..=1.0).contains(&large_linear));
+            let overflow_linear = recurrent_decay(f32::MAX, f32::MAX, -1.0)?;
+            assert_eq!(overflow_linear.to_bits(), 0.0_f32.to_bits());
+            Ok(())
+        }
+
+        #[test]
+        fn failed_tile_marks_decoder_inconsistent_until_restore() -> Result<()> {
+            let base = Qwen35::new(recurrent_fixture(-0.5), 8)?;
+            let scratch = base.tiled_prefill_scratch_bytes(8)?;
+            let mut decoder = base.with_tiled_prefill(8, scratch)?;
+            let clean_base = Qwen35::new(recurrent_fixture(-0.5), 8)?;
+            let mut clean =
+                clean_base.with_tiled_prefill(8, clean_base.tiled_prefill_scratch_bytes(8)?)?;
+            let checkpoint0 = clean.checkpoint()?;
+
+            // 1. Fail mid-tile on the very first tile (`position == 0`).
+            let checks = Cell::new(0_usize);
+            let fail_mid_tile = || {
+                let count = checks.get() + 1;
+                checks.set(count);
+                if count >= 6 {
+                    return Err(invalid("injected mid-tile failure"));
+                }
+                Ok(())
+            };
+            assert!(decoder.ingest_block(&[0, 1], &fail_mid_tile).is_err());
+            assert!(!decoder.state_consistent);
+            assert_eq!(decoder.position, 0);
+            assert!(decoder.evaluate(0).is_err());
+            assert!(decoder.ingest_block(&[0], &|| Ok(())).is_err());
+            assert!(decoder.checkpoint().is_err());
+            let mut recycled = checkpoint0.clone();
+            assert!(decoder.checkpoint_into(&mut recycled).is_err());
+
+            // Explicit reset must clear layer state even though position remained 0.
+            decoder.reset()?;
+            assert!(decoder.state_consistent);
+            assert_eq!(decoder.position, 0);
+            assert_eq!(decoder.evaluate(0)?, clean.evaluate(0)?);
+
+            // 2. Fail mid-tile after committed token `[0]`, then restore checkpoint.
+            let saved = decoder.checkpoint()?;
+            checks.set(0);
+            assert!(decoder.ingest_block(&[0, 1], &fail_mid_tile).is_err());
+            assert!(!decoder.state_consistent);
+            assert_eq!(decoder.position, 1);
+            assert!(decoder.evaluate(1).is_err());
+            assert!(decoder.checkpoint().is_err());
+
+            decoder.restore(&saved)?;
+            assert!(decoder.state_consistent);
+            assert_eq!(decoder.position, 1);
+            assert_eq!(decoder.evaluate(1)?, clean.evaluate(1)?);
+            Ok(())
+        }
+
+        #[test]
+        fn recurrent_state_only_and_narrow_final_match_full_state_and_skip_gate() -> Result<()> {
+            let mut full = Qwen35::new(recurrent_fixture(-0.5), 8)?;
+            let mut state_only = Qwen35::new(recurrent_fixture(-0.5), 8)?;
+            state_only.narrow_last_layer = true;
+            // Poison stale `scratch.gate`; state-only mode must neither read nor rely on it.
+            state_only.workspace.attention_scratch.gate = vec![f32::NAN; 2];
+
+            for token in [0_u32, 1_u32] {
+                let _ = full.evaluate(token)?;
+                state_only.ingest(token)?;
+            }
+            assert_recurrent_states_bit_eq(&full.state, &state_only.state)?;
+
+            let tiled_base = Qwen35::new(recurrent_fixture(-0.5), 8)?;
+            let scratch = tiled_base.tiled_prefill_scratch_bytes(8)?;
+            let mut tiled_narrow = tiled_base.with_tiled_prefill(8, scratch)?;
+            tiled_narrow.narrow_last_layer = true;
+            if let Some(tile) = tiled_narrow.tiled_prefill.as_mut() {
+                for slot in &mut tile.attended {
+                    slot.resize(2, f32::NAN);
+                    slot.fill(f32::NAN);
+                }
+                for slot in &mut tile.recurrent_gate {
+                    slot.resize(2, f32::NAN);
+                    slot.fill(f32::NAN);
+                }
+            }
+            tiled_narrow.ingest_block(&[0, 1], &|| Ok(()))?;
+            assert_recurrent_states_bit_eq(&full.state, &tiled_narrow.state)?;
+            Ok(())
+        }
     }
 }

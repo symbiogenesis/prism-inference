@@ -915,6 +915,8 @@ impl SwiftSession {
         if self.prompt_reuse != reuse {
             self.runtime.reset()?;
             self.prompt_reuse = reuse;
+            self.runtime
+                .set_retain_prompt_end(reuse == PromptReuse::PromptEndAndLatest);
         }
         Ok(())
     }

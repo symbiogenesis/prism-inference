@@ -2,8 +2,8 @@
 
 use super::{
     Arc, Cancellation, Completion, Decoder, Finish, FiniteLogits, Generation, Instant,
-    MAX_SPECULATIVE_DRAFT_TOKENS, Prefill, Result, Runtime, Sampler, Snapshot, SpeculativeStats,
-    SuffixDraftConfig, SuffixDrafter, check_deadline, invalid,
+    MAX_SPECULATIVE_DRAFT_TOKENS, Prefill, PromptEndCapture, Result, Runtime, Sampler, Snapshot,
+    SpeculativeStats, SuffixDraftConfig, SuffixDrafter, check_deadline, invalid,
 };
 
 struct SampledSuffixEffects<'a, S, E> {
@@ -116,8 +116,13 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         self.validate_request(prompt, options, prefill)?;
         check()?;
-        let rollback = self.capture(0, check)?;
+        let rollback = self.capture_transient(0, check)?;
+        let mut prompt_end = None;
         let result = (|| {
+            let mut prompt_end_capture = PromptEndCapture {
+                reserved: rollback.bytes,
+                slot: &mut prompt_end,
+            };
             let (completion, stats) = self.sampled_suffix_inner(
                 prompt,
                 options,
@@ -125,13 +130,16 @@ impl<D: Decoder> Runtime<D> {
                 suffix_config,
                 check,
                 effects,
-                rollback.bytes,
+                &mut prompt_end_capture,
             )?;
             check()?;
             let snapshot = if self.limits.checkpoints == 0 {
                 None
             } else {
-                let snapshot = self.capture(rollback.bytes, check).ok();
+                let snapshot_reserved = rollback
+                    .bytes
+                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes));
+                let snapshot = self.capture_reusable(snapshot_reserved, check).ok();
                 check()?;
                 snapshot
             };
@@ -139,13 +147,8 @@ impl<D: Decoder> Runtime<D> {
         })();
         match result {
             Ok((completion, stats, snapshot)) => {
-                if let Some(snapshot) = snapshot {
-                    if self.checkpoints.len() == self.limits.checkpoints {
-                        let evicted = self.checkpoints.remove(0);
-                        self.recycle_snapshot(evicted);
-                    }
-                    self.checkpoints.push(snapshot);
-                }
+                self.commit_prompt_end(prompt_end);
+                self.commit_reusable_snapshot(snapshot);
                 self.recycle_snapshot(rollback);
                 Ok((completion, stats))
             }
@@ -173,6 +176,7 @@ impl<D: Decoder> Runtime<D> {
                 }
                 self.recycle_checkpoint(state);
                 self.recycle_logits(previous_logits);
+                self.recycle_optional_snapshot(prompt_end);
                 Err(error)
             }
         }
@@ -190,7 +194,7 @@ impl<D: Decoder> Runtime<D> {
         suffix_config: SuffixDraftConfig,
         check: &impl Fn() -> Result<()>,
         effects: &mut SampledSuffixEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
-        reserved: usize,
+        prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
     ) -> Result<(Completion, SpeculativeStats)> {
         check()?;
         let reused = self.prepare(prompt, check)?;
@@ -220,6 +224,10 @@ impl<D: Decoder> Runtime<D> {
             }
             self.evaluate(last, check)?;
         }
+        self.maybe_capture_prompt_end(prompt, prompt_end, check)?;
+        let reserved = prompt_end
+            .reserved
+            .saturating_add(prompt_end.slot.as_ref().map_or(0, |s| s.bytes));
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
             reused_tokens: reused,
@@ -322,7 +330,7 @@ impl<D: Decoder> Runtime<D> {
         let mut batch =
             if draft.len() >= 2 && draft.len() <= self.decoder.batched_evaluation_capacity() {
                 self.tokens.try_reserve(draft.len())?;
-                let checkpoint = self.capture(reserved, check)?;
+                let checkpoint = self.capture_transient(reserved, check)?;
                 let mut rows = self.take_batch_rows(draft.len())?;
                 check()?;
                 self.decoder.evaluate_batch_into(draft, &mut rows, check)?;

@@ -150,6 +150,58 @@ fn x1_provisional_gdn_late_failure_keeps_source_and_retries_dirty_delta() -> Res
 }
 
 #[test]
+fn x1_provisional_gdn_query_reduction_rejects_each_nonfinite_state_lane() -> Result<()> {
+    for width in [128, 256] {
+        let committed = vec![0.0; 8 * width];
+        let before = bits(&committed);
+        let previous = std::array::from_fn(|row| &committed[row * width..(row + 1) * width]);
+        for position in 0..width {
+            let mut key = vec![0.0; width];
+            key[position] = 2.0;
+            let query_value =
+                [0.0, -0.0, f32::from_bits(1), -f32::from_bits(1), 0.25][position % 5];
+            let query = vec![query_value; width];
+            for row in [0, 3, 4, 7] {
+                let mut bad_values = [0.125; 8];
+                bad_values[row] = f32::MAX;
+                let mut destination = vec![f32::NAN; committed.len()];
+                let error = step_eight_rows_provisional(
+                    previous,
+                    rows(&mut destination, width)?,
+                    &key,
+                    &query,
+                    0.875,
+                    bad_values,
+                    0.625,
+                )
+                .err()
+                .ok_or_else(|| invalid("nonfinite provisional state was accepted"))?;
+                let expected_error = oracle(&committed, &key, &query, 0.875, bad_values, 0.625)
+                    .err()
+                    .ok_or_else(|| invalid("scalar accepted nonfinite GDN state"))?;
+                assert_eq!(error.to_string(), expected_error.to_string());
+                assert_eq!(bits(&committed), before);
+                let input = [0.125; 8];
+                let (expected_state, expected_output) =
+                    oracle(&committed, &key, &query, 0.875, input, 0.625)?;
+                let output = step_eight_rows_provisional(
+                    previous,
+                    rows(&mut destination, width)?,
+                    &key,
+                    &query,
+                    0.875,
+                    input,
+                    0.625,
+                )?;
+                assert_eq!(bits(&destination), bits(&expected_state));
+                assert_eq!(output.map(f32::to_bits), expected_output.map(f32::to_bits));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn x1_provisional_gdn_geometry_rejects_before_destination_changes() -> Result<()> {
     let width = 128;
     let committed = values(8 * width);

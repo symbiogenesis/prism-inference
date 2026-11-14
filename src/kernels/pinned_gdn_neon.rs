@@ -1530,7 +1530,6 @@ fn update_four_rows_in_place(
     scales: [f32; 4],
 ) -> Option<[f32; 4]> {
     let scales = scales.map(|scale| f32x4::splat(neon, scale));
-    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
     let mut q0 = [f32x4::splat(neon, 0.0); 4];
     let mut q1 = [f32x4::splat(neon, 0.0); 4];
     let mut q2 = [f32x4::splat(neon, 0.0); 4];
@@ -1558,7 +1557,6 @@ fn update_four_rows_in_place(
             let u1 = scale.mul_add_precise(k1, f32x4::from_slice(neon, &state[4..8]));
             let u2 = scale.mul_add_precise(k2, f32x4::from_slice(neon, &state[8..12]));
             let u3 = scale.mul_add_precise(k3, f32x4::from_slice(neon, &state[12..16]));
-            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
             u0.store_slice(&mut state[0..4]);
             u1.store_slice(&mut state[4..8]);
             u2.store_slice(&mut state[8..12]);
@@ -1571,13 +1569,18 @@ fn update_four_rows_in_place(
     }
     let mut outputs = [0.0; 4];
     for r in 0..4 {
+        // Every updated element contributes to this complete pinned dot. An
+        // infinity or NaN remains nonfinite through its query FMA and the
+        // reduction, including a signed-zero query. A finite output therefore
+        // also proves finite state without a second set of element predicates.
+        // This is private disposable state; rejection replays immutable source.
         let out = ((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum();
         if !out.is_finite() {
             return None;
         }
         outputs[r] = out;
     }
-    finite_mask.all_true().then_some(outputs)
+    Some(outputs)
 }
 
 /// Steps 8 GDN state rows across `inputs.len()` tokens simultaneously, keeping all 8

@@ -123,6 +123,25 @@ into separate scratch. [Attention locality](inference-efficiency.md#attention-lo
 defines grouped/paired cache traversal. Ordinary recurrent arithmetic remains
 sequential unless chunkwise GDN is explicitly selected.
 
+Multi-token packed-cache attention partitions tokens across that same worker
+pool. The common normalization/RoPE stage retains binary16 query/K/V rounding;
+each current row uses the ordinary interleaved key/value-head codec order before
+provisional append. A token reads only its preceding encoded rows and its own
+current row, including across sealed pages. Each token processes heads serially
+with one probability row, preserving query rotation, score/softmax, packed-value
+accumulation, inverse transform and output-gate arithmetic. Future tile rows
+cannot enter an earlier token's scores or value sum. There is no expanded K/V
+history, second pool or nested head-worker submission. A failed attention task
+joins workers and clears every tile output; Runtime retains whole-request
+state rollback. One-token tiles and a single worker keep ordinary attention.
+
+This source change covers explicit exact tiled K4/V4, fitted-value K4/V4 and
+K4/V3 profiles; it changes no default or precision identity. Serial-consumer
+controls cover page boundaries, uneven token partitions, raw encoded rows,
+late failures, restored state and conservative scratch. Native/fallback Release
+analysis, complete-model logits/state/adapters/cancellation and matched X2
+complete-request benefit remain required before runtime promotion.
+
 ## Separate chunkwise GDN
 
 `gdn-wy-f32-v1` batches recurrent projections, preserves causal convolution/
@@ -145,7 +164,9 @@ qualification remain required. Different numerical identities cannot share state
 
 Scratch conservatively reserves all tile vectors, both activation contracts,
 floating fallback, every four/six-head score row per token, 64 KiB for triangular
-tables/metadata and 16 KiB for row-task metadata. The latter covers at most
+tables/metadata and 16 KiB for row-task metadata. Packed-cache tiles instead
+reserve one full-context binary32 score row per token: `tokens * context * 4`
+bytes, in addition to ordinary graph scratch. The latter metadata allowance covers at most
 16 tasks and 32 output slices, including serial execution. Add it to ordinary
 live/checkpoint/scratch/worker charges; allocator overhead is separate.
 

@@ -39,7 +39,9 @@ fn tiled_attention_scratch_bytes(
     tokens: usize,
 ) -> Result<usize> {
     if policy != super::KvCachePolicy::F16 {
-        return Ok(0);
+        // Packed tokens retain one probability row each while their heads
+        // execute serially inside a token task. History stays packed.
+        return checked_product(&[tokens, context, size_of::<f32>()]);
     }
     let heads = if matches!(arithmetic, Arithmetic::PinnedSwift)
         && geometry.heads / geometry.kv_heads == 6
@@ -211,7 +213,8 @@ impl Qwen35 {
         // FP16 tiles retain four or six full-context score rows per tile
         // token. Reserve the complete high water independently of the ordinary
         // sequential score allowance and any later worker-policy selection.
-        // Rotated tiles use ordinary per-token attention without tiled scores.
+        // Rotated tiles retain one full-context probability row per token,
+        // with no expanded K/V cache and no nested head-worker submissions.
         let tiled_scores = tiled_attention_scratch_bytes(
             &self.geometry,
             self.arithmetic,
@@ -991,16 +994,10 @@ fn full_attention_tile(
     tile: &mut TiledPrefill,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    // Packed history must retain the codec's ordinary current-token encoding,
-    // score/value order and causal append. The parallel-across-token path below
-    // reads FP16 pages directly, so it is only valid for the FP16 policy. Packed
-    // graphs still share every surrounding projection and the existing private
-    // head workers inside full_attention_state; no cache expansion is needed.
-    if count <= 1
-        || tile.projector.row_parallelism().workers() <= 1
-        || keys.packed.is_some()
-        || values.packed.is_some()
-    {
+    // A one-token tile and the single-worker policy retain the ordinary
+    // attention path. Multi-token packed history uses immutable causal views
+    // after the common normalization/RoPE stage below.
+    if count <= 1 || tile.projector.row_parallelism().workers() <= 1 {
         for index in 0..count {
             check()?;
             if !*frequencies_ready {
@@ -1149,6 +1146,40 @@ fn full_attention_tile(
         .map_err(|_| invalid("prefill attention preparation failure lock poisoned"))?
     {
         return Err(error);
+    }
+    if keys.packed.is_some() || values.packed.is_some() {
+        // Preserve ordinary per-head key/value encoding order. Every append
+        // remains provisional to the layer-major attempt and participates in
+        // the existing whole-request checkpoint/rollback contract.
+        for index in 0..count {
+            check()?;
+            super::quantized_kv::prepare_tile_append(
+                keys,
+                values,
+                &tile.recurrent_gate[index],
+                &tile.beta[index],
+            )?;
+            keys.append(&tile.recurrent_gate[index]);
+            values.append(&tile.beta[index]);
+            check()?;
+        }
+        let score_stride = base + count;
+        resize_into(count * score_stride, &mut attention_scratch.scores)?;
+        super::quantized_kv::attend_tile(
+            keys,
+            values,
+            &tile.up[..count],
+            &tile.mixed[..count],
+            &mut tile.attended[..count],
+            &mut attention_scratch.scores,
+            base,
+            g.heads,
+            1.0 / small_float(g.head)?.sqrt(),
+            arithmetic,
+            tile.projector.row_parallelism(),
+        )?;
+        check()?;
+        return Ok(());
     }
     for index in 0..count {
         if index > 0 {

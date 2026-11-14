@@ -180,6 +180,22 @@ impl PackedCache {
             .chain(self.tail.chunks_exact(self.row_bytes))
     }
 
+    fn row(&self, position: usize) -> Result<&[u8]> {
+        if position >= self.len / self.row_bytes {
+            return Err(invalid("packed KV position exceeds retained history"));
+        }
+        let page_rows = self.page_bytes / self.row_bytes;
+        let page = position / page_rows;
+        let offset = position % page_rows * self.row_bytes;
+        let bytes = self
+            .pages
+            .get(page)
+            .map_or(self.tail.as_slice(), |page| page.as_slice());
+        bytes
+            .get(offset..offset + self.row_bytes)
+            .ok_or_else(|| invalid("invalid packed KV page extent"))
+    }
+
     fn record<'a>(&self, row: &'a [u8], head: usize) -> &'a [u8] {
         let width = self.quantizer.encoded_len();
         &row[head * width..(head + 1) * width]
@@ -339,6 +355,37 @@ fn prepare_current(
     Ok(())
 }
 
+// Tile attention consumes the committed form of its current row, which must
+// have exactly the same interleaved per-head encoding as ordinary attention.
+// Reserve both append destinations before publishing either row.
+pub(super) fn prepare_tile_append(
+    keys: &mut KvCache,
+    values: &mut KvCache,
+    current_key: &[f32],
+    current_value: &[f32],
+) -> Result<()> {
+    let key_cache = keys
+        .packed
+        .as_mut()
+        .ok_or_else(|| invalid("missing packed tile keys"))?;
+    let value_cache = values
+        .packed
+        .as_mut()
+        .ok_or_else(|| invalid("missing packed tile values"))?;
+    key_cache.prepared_ready = false;
+    value_cache.prepared_ready = false;
+    if current_key.len() != keys.width
+        || current_value.len() != values.width
+        || key_cache.heads != value_cache.heads
+        || keys.len != values.len
+    {
+        return Err(invalid("invalid packed tile append geometry"));
+    }
+    prepare_current(key_cache, value_cache, current_key, current_value)?;
+    key_cache.reserve()?;
+    value_cache.reserve()
+}
+
 /// Stream packed history directly: query rotation once, one score row per task,
 /// and one bounded rotated value accumulator per active worker. Independent
 /// query heads use the existing private row pool, with each head retaining its
@@ -398,6 +445,7 @@ pub(super) fn attend(
         projected,
         current_keys: &key_cache.prepared,
         current_values: &value_cache.prepared,
+        history_tokens: tokens,
         heads_per_kv: heads / key_cache.heads,
         scale,
         arithmetic,
@@ -452,6 +500,97 @@ pub(super) fn attend(
     Ok(())
 }
 
+/// Attend already encoded tile rows against their own causal prefixes. Each
+/// token owns one probability row and keeps the ordinary serial head order;
+/// the existing pool partitions tokens without nested head-worker submissions.
+/// Future rows remain immutable and are never consumed by an earlier token.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep causal history, immutable prepared inputs and bounded tile scratch explicit."
+)]
+pub(super) fn attend_tile(
+    keys: &KvCache,
+    values: &KvCache,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    attended: &mut [Vec<f32>],
+    scores: &mut [f32],
+    base: usize,
+    heads: usize,
+    scale: f32,
+    arithmetic: super::Arithmetic,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    let result = (|| {
+        let keys = keys
+            .packed
+            .as_ref()
+            .ok_or_else(|| invalid("missing packed tile keys"))?;
+        let values = values
+            .packed
+            .as_ref()
+            .ok_or_else(|| invalid("missing packed tile values"))?;
+        let count = queries.len();
+        let end = checked_sum(base, count)?;
+        let width = checked_product(&[heads, HEAD_DIM])?;
+        let projected_width = checked_product(&[2, width])?;
+        if count == 0
+            || count > crate::kernels::prefill::MAX_TILE_TOKENS
+            || heads == 0
+            || !heads.is_multiple_of(keys.heads)
+            || keys.heads != values.heads
+            || keys.len / keys.row_bytes != end
+            || values.len / values.row_bytes != end
+            || projected.len() != count
+            || attended.len() != count
+            || queries.iter().any(|row| row.len() != width)
+            || projected.iter().any(|row| row.len() != projected_width)
+            || attended.iter().any(|row| row.len() != width)
+            || scores.len() != checked_product(&[count, end])?
+        {
+            return Err(invalid("invalid packed attention tile geometry"));
+        }
+        parallelism.update_paired_chunks(
+            attended,
+            1,
+            scores,
+            end,
+            |base_token, output_chunk, scores_chunk| {
+                for (offset, (output, scores)) in output_chunk
+                    .iter_mut()
+                    .zip(scores_chunk.chunks_exact_mut(end))
+                    .enumerate()
+                {
+                    let token = base_token + offset;
+                    let position = base + token;
+                    let input = PackedAttention {
+                        keys,
+                        values,
+                        queries: &queries[token],
+                        projected: &projected[token],
+                        current_keys: keys.row(position)?,
+                        current_values: values.row(position)?,
+                        history_tokens: position,
+                        heads_per_kv: heads / keys.heads,
+                        scale,
+                        arithmetic,
+                    };
+                    for (head, output) in output.chunks_exact_mut(HEAD_DIM).enumerate() {
+                        input.attend_head(head, output, &mut scores[..=position])?;
+                    }
+                }
+                Ok(())
+            },
+        )
+    })();
+    if result.is_err() {
+        for row in attended {
+            row.clear();
+        }
+    }
+    result
+}
+
 struct PackedAttention<'a> {
     keys: &'a PackedCache,
     values: &'a PackedCache,
@@ -459,6 +598,7 @@ struct PackedAttention<'a> {
     projected: &'a [f32],
     current_keys: &'a [u8],
     current_values: &'a [u8],
+    history_tokens: usize,
     heads_per_kv: usize,
     scale: f32,
     arithmetic: super::Arithmetic,
@@ -478,10 +618,12 @@ impl PackedAttention<'_> {
             &mut query,
         )?;
         let prepared_query = self.keys.quantizer.prepare_query(&query)?;
-        for (score, row) in probabilities
-            .iter_mut()
-            .zip(self.keys.rows().chain(std::iter::once(self.current_keys)))
-        {
+        for (score, row) in probabilities.iter_mut().zip(
+            self.keys
+                .rows()
+                .take(self.history_tokens)
+                .chain(std::iter::once(self.current_keys)),
+        ) {
             *score = prepared_query.score(self.keys.record(row, kv_head))? * self.scale;
         }
         match self.arithmetic {
@@ -494,6 +636,7 @@ impl PackedAttention<'_> {
         for (&weight, row) in probabilities.iter().zip(
             self.values
                 .rows()
+                .take(self.history_tokens)
                 .chain(std::iter::once(self.current_values)),
         ) {
             accumulator.accumulate(self.values.record(row, kv_head), weight)?;

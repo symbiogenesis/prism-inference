@@ -25,6 +25,14 @@ fn sample(index: usize) -> f32 {
 
 impl Harness {
     fn new(count: usize, workers: usize) -> Result<Self> {
+        Self::with_policy(count, workers, super::super::KvCachePolicy::F16)
+    }
+
+    fn with_policy(
+        count: usize,
+        workers: usize,
+        policy: super::super::KvCachePolicy,
+    ) -> Result<Self> {
         // Use the real pinned rotary geometry; narrow four-channel fixtures
         // cannot execute pinned RMSNorm/RoPE in either comparison arm.
         let geometry = Geometry {
@@ -59,8 +67,8 @@ impl Harness {
             key_norm: vec![1.0; geometry.head],
         };
         let base = 63;
-        let mut keys = KvCache::new(geometry.kv_width(), 128)?;
-        let mut values = KvCache::new(geometry.kv_width(), 128)?;
+        let mut keys = KvCache::with_policy(geometry.kv_width(), 128, policy, true, true)?;
+        let mut values = KvCache::with_policy(geometry.kv_width(), 128, policy, false, true)?;
         for position in 0..base {
             let key: Vec<_> = (0..geometry.kv_width())
                 .map(|index| sample(index + position))
@@ -68,8 +76,8 @@ impl Harness {
             let value: Vec<_> = (0..geometry.kv_width())
                 .map(|index| sample(index + 3 * position + 1))
                 .collect();
-            keys.reserve_append()?;
-            values.reserve_append()?;
+            keys.prepare_append(&key)?;
+            values.prepare_append(&value)?;
             keys.append(&key);
             values.append(&value);
         }
@@ -131,7 +139,7 @@ impl Harness {
         )
     }
 
-    fn assert_same(&self, expected: &Self) {
+    fn assert_same(&self, expected: &Self) -> Result<()> {
         assert!(
             self.tile
                 .attended
@@ -157,6 +165,26 @@ impl Harness {
                 .flatten()
                 .eq(expected.values.tokens().flatten())
         );
+        for (actual, expected) in [
+            (&self.keys, &expected.keys),
+            (&self.values, &expected.values),
+        ] {
+            assert_eq!(actual.len, expected.len);
+            if actual.packed.is_some() {
+                let mut actual_rows = Vec::new();
+                let mut expected_rows = Vec::new();
+                actual.observe_packed(|_, row| {
+                    actual_rows.push(row.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                    Ok(())
+                })?;
+                expected.observe_packed(|_, row| {
+                    expected_rows.push(row.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                    Ok(())
+                })?;
+                assert_eq!(actual_rows, expected_rows);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -186,6 +214,81 @@ fn tiled_attention_reservation_covers_real_score_storage() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn packed_production_prefill_matches_serial_causal_state_and_reserved_scores() -> Result<()> {
+    use super::super::KvCachePolicy;
+
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
+        // The base at token 63 crosses a sealed-page boundary. Thirteen rows
+        // exercise uneven worker partitions and a one-token final task.
+        for count in [8, 13, 32] {
+            for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+                let mut expected = Harness::with_policy(count, 1, policy)?;
+                expected.run(arithmetic, &|| Ok(()))?;
+                let mut actual = Harness::with_policy(count, 4, policy)?;
+                actual.run(arithmetic, &|| Ok(()))?;
+                actual.assert_same(&expected)?;
+                assert_eq!(actual.attention_scratch.scores.len(), count * (63 + count));
+                let reservation = tiled_attention_scratch_bytes(
+                    &actual.geometry,
+                    arithmetic,
+                    policy,
+                    128,
+                    count,
+                )?;
+                assert_eq!(reservation, count * 128 * size_of::<f32>());
+                assert!(reservation >= actual.attention_scratch.scores.len() * size_of::<f32>());
+                assert!(actual.keys.tail.is_empty());
+                assert!(actual.values.tail.is_empty());
+                assert!(actual.keys.pages.is_empty());
+                assert!(actual.values.pages.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn packed_production_prefill_cancellation_restores_full_state_before_reuse() -> Result<()> {
+    let policy = super::super::KvCachePolicy::Rotated4;
+    let mut actual = Harness::with_policy(13, 4, policy)?;
+    let saved_keys = actual.keys.copy()?;
+    let saved_values = actual.values.copy()?;
+    let original_keys = actual.tile.recurrent_gate.clone();
+    let original_values = actual.tile.beta.clone();
+    let calls = Cell::new(0);
+    assert!(
+        actual
+            .run(Arithmetic::PinnedSwift, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 5 {
+                    Err(invalid("cancelled packed production prefill"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(calls.get(), 5);
+    assert!(actual.keys.len > saved_keys.len);
+    assert!(actual.values.len > saved_values.len);
+    actual.keys = saved_keys;
+    actual.values = saved_values;
+    actual.tile.recurrent_gate = original_keys;
+    actual.tile.beta = original_values;
+    actual.run(Arithmetic::PinnedSwift, &|| Ok(()))?;
+    let mut expected = Harness::with_policy(13, 1, policy)?;
+    expected.run(Arithmetic::PinnedSwift, &|| Ok(()))?;
+    actual.assert_same(&expected)?;
+    Ok(())
+}
+
 #[test]
 fn six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation() -> Result<()> {
     #[cfg(feature = "parallel-rows")]
@@ -199,7 +302,7 @@ fn six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation(
             for workers in worker_counts {
                 let mut actual = Harness::new(count, workers)?;
                 actual.run(arithmetic, &|| Ok(()))?;
-                actual.assert_same(&expected);
+                actual.assert_same(&expected)?;
                 if matches!(arithmetic, Arithmetic::PinnedSwift) && workers > 1 {
                     assert_eq!(
                         actual.attention_scratch.scores.len(),
@@ -239,7 +342,7 @@ fn six_head_production_prefill_preserves_causal_state_dispatch_and_cancellation(
     actual.run(Arithmetic::PinnedSwift, &|| Ok(()))?;
     let mut expected = Harness::new(8, 1)?;
     expected.run(Arithmetic::PinnedSwift, &|| Ok(()))?;
-    actual.assert_same(&expected);
+    actual.assert_same(&expected)?;
     Ok(())
 }
 
@@ -292,7 +395,7 @@ fn x1_tiled_qkv_keeps_earliest_key_value_chunk_and_recovers() -> Result<()> {
             actual.run(arithmetic, &|| Ok(()))?;
             let mut expected = Harness::new(13, 1)?;
             expected.run(arithmetic, &|| Ok(()))?;
-            actual.assert_same(&expected);
+            actual.assert_same(&expected)?;
         }
     }
     Ok(())

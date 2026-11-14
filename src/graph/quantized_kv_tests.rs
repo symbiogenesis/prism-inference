@@ -776,6 +776,110 @@ fn populated_caches(
     Ok((keys, values))
 }
 
+#[test]
+fn packed_tile_attention_preserves_raw_rows_and_clears_late_failed_publication() -> Result<()> {
+    let base = 63;
+    let count = 4;
+    let heads = 4;
+    let width = heads * HEAD_DIM;
+    for policy in [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedValues,
+        KvCachePolicy::Rotated4Keys3Values,
+    ] {
+        for scalar in [true, false] {
+            let (mut keys, mut values) = populated_caches(policy, 2, base, scalar)?;
+            let mut reference_keys = keys.copy()?;
+            let mut reference_values = values.copy()?;
+            let mut queries = Vec::new();
+            let mut projected = Vec::new();
+            let mut expected = Vec::new();
+            for token in 0..count {
+                let salt = u16::try_from(token)?;
+                queries.push(input(width, 13 + salt)?);
+                projected.push(input(2 * width, 17 + salt)?);
+                let key = input(keys.width, 21 + salt)?;
+                let value = input(values.width, 31 + salt)?;
+                let mut output = vec![0.0; width];
+                let mut scores = vec![0.0; base + token + 1];
+                attend(
+                    &mut reference_keys,
+                    &mut reference_values,
+                    &queries[token],
+                    &projected[token],
+                    &key,
+                    &value,
+                    &mut output,
+                    &mut scores,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &RowParallelism::default(),
+                )?;
+                expected.push(output);
+                reference_keys.prepare_staged_append(&key)?;
+                reference_values.prepare_staged_append(&value)?;
+                reference_keys.append(&key);
+                reference_values.append(&value);
+                prepare_tile_append(&mut keys, &mut values, &key, &value)?;
+                keys.append(&key);
+                values.append(&value);
+            }
+            let frozen_keys = packed_bytes(&keys);
+            let frozen_values = packed_bytes(&values);
+            assert_eq!(frozen_keys, packed_bytes(&reference_keys));
+            assert_eq!(frozen_values, packed_bytes(&reference_values));
+            let mut output = vec![vec![13.0; width]; count];
+            let mut scores = vec![17.0; count * (base + count)];
+            let parallelism = RowParallelism::new(if cfg!(feature = "parallel-rows") {
+                4
+            } else {
+                1
+            })?;
+            let run = |queries: &[Vec<f32>], output: &mut [Vec<f32>], scores: &mut [f32]| {
+                attend_tile(
+                    &keys,
+                    &values,
+                    queries,
+                    &projected,
+                    output,
+                    scores,
+                    base,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &parallelism,
+                )
+            };
+            let original = queries[count - 1][width - 1];
+            queries[count - 1][width - 1] = f32::NAN;
+            assert!(run(&queries, &mut output, &mut scores).is_err());
+            assert!(output.iter().all(Vec::is_empty));
+            assert_eq!(packed_bytes(&keys), frozen_keys);
+            assert_eq!(packed_bytes(&values), frozen_values);
+            queries[count - 1][width - 1] = original;
+            for row in &mut output {
+                row.resize(width, 13.0);
+            }
+            run(&queries, &mut output, &mut scores)?;
+            assert!(
+                output
+                    .iter()
+                    .flatten()
+                    .map(|value| value.to_bits())
+                    .eq(expected.iter().flatten().map(|value| value.to_bits()))
+            );
+            // A malformed reserve cannot expose the outputs of an earlier
+            // successful tile, and no immutable cache bytes change on failure.
+            assert!(run(&queries, &mut output, &mut scores[..1]).is_err());
+            assert!(output.iter().all(Vec::is_empty));
+            assert_eq!(packed_bytes(&keys), frozen_keys);
+            assert_eq!(packed_bytes(&values), frozen_values);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "parallel-rows")]
 fn attention_bits(
     keys: &mut KvCache,

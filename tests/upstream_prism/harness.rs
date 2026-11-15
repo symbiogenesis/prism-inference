@@ -101,6 +101,7 @@ mod reference_mtmd_chunks;
 mod reference_provider;
 mod reference_quantization;
 mod reference_reasoning;
+mod reference_sampling;
 mod reference_tensor_graph;
 mod reference_threadpool;
 mod reference_unicode;
@@ -414,7 +415,7 @@ const CASES: &[Case] = &[
     register(
         "test-sampling",
         "tests/test-sampling.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         sampling::run,
     ),
     register(

@@ -1,20 +1,135 @@
 // Production sampler primitives and caller-owned observer callbacks. Source
 // schedules, token policies, counts, comparisons and references belong to Rust.
 #pragma once
-#include "sampling.hpp"
+#include "llama.h"
+#include "llama-sampler.h"
+#include "ggml.h"
 #include "ggml-backend.h"
+#include <nlohmann/json.hpp>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
+#include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace prism_backend_sampler {
 using json=nlohmann::ordered_json;
-using prism_sampling::fields;
-using prism_sampling::require;
-using prism_sampling::i32;
-using prism_sampling::u32;
-using prism_sampling::from_bits;
+constexpr std::size_t max_candidates = 131072;
+inline void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
+inline void fields(const json & value, std::initializer_list<const char *> names) {
+    require(value.is_object() && value.size() == names.size(), "sampler fields mismatch");
+    for (const auto * name : names) require(value.contains(name), "missing sampler field");
+}
+inline std::int64_t integer(const json & value) {
+    require(value.is_number_integer(), "sampler value must be integer");
+    if (value.is_number_unsigned()) {
+        const auto number = value.get<std::uint64_t>();
+        require(number <= std::uint64_t(INT64_MAX), "sampler signed integer overflow");
+        return static_cast<std::int64_t>(number);
+    }
+    return value.get<std::int64_t>();
+}
+inline std::int32_t i32(const json & value) {
+    const auto number = integer(value);
+    require(number >= INT32_MIN && number <= INT32_MAX, "sampler i32 overflow");
+    return static_cast<std::int32_t>(number);
+}
+inline std::uint32_t u32(const json & value, std::uint32_t maximum = UINT32_MAX) {
+    const auto number = integer(value);
+    require(number >= 0 && std::uint64_t(number) <= maximum, "sampler unsigned value outside bound");
+    return static_cast<std::uint32_t>(number);
+}
+inline float from_bits(const json & value) {
+    const auto bits = u32(value); float result;
+    std::memcpy(&result, &bits, sizeof(result)); return result;
+}
+inline float parameter_float(const json & value) {
+    const auto result = from_bits(value);
+    require(std::isfinite(result), "sampler parameter must be finite"); return result;
+}
+inline void min_keep(const json & value) { u32(value, static_cast<std::uint32_t>(max_candidates)); }
+inline void parameters(const std::string & type, const json & p) {
+    if (type == "temp") {
+        fields(p, {"TemperatureBits"}); parameter_float(p.at("TemperatureBits"));
+    } else if (type == "temp-ext") {
+        fields(p, {"TemperatureBits", "DeltaBits", "ExponentBits"});
+        parameter_float(p.at("TemperatureBits")); parameter_float(p.at("DeltaBits")); parameter_float(p.at("ExponentBits"));
+    } else if (type == "dist") {
+        fields(p, {"Seed"}); u32(p.at("Seed"));
+    } else if (type == "top-k") {
+        fields(p, {"K"}); i32(p.at("K"));
+    } else if (type == "top-p" || type == "min-p" || type == "typical") {
+        fields(p, {"ProbabilityBits", "MinKeep"}); parameter_float(p.at("ProbabilityBits")); min_keep(p.at("MinKeep"));
+    } else if (type == "xtc") {
+        fields(p, {"ProbabilityBits", "ThresholdBits", "MinKeep", "Seed"});
+        parameter_float(p.at("ProbabilityBits")); parameter_float(p.at("ThresholdBits")); min_keep(p.at("MinKeep")); u32(p.at("Seed"));
+    } else if (type == "penalties") {
+        fields(p, {"VocabularySize", "PenaltyLastN", "RepeatBits", "FrequencyBits", "PresenceBits"});
+        require(u32(p.at("VocabularySize"), max_candidates) > 0, "sampler vocabulary cannot be empty");
+        const auto last = i32(p.at("PenaltyLastN"));
+        require(last >= -1 && last <= static_cast<std::int32_t>(max_candidates), "penalty history exceeds bound");
+        require(parameter_float(p.at("RepeatBits")) > 0, "repeat penalty must be positive");
+        parameter_float(p.at("FrequencyBits")); parameter_float(p.at("PresenceBits"));
+    } else if (type == "dry-testing") {
+        fields(p, {"MultiplierBits", "BaseBits", "AllowedLength", "PenaltyLastN", "SequenceBreakers"});
+        parameter_float(p.at("MultiplierBits")); parameter_float(p.at("BaseBits"));
+        const auto allowed = i32(p.at("AllowedLength")), last = i32(p.at("PenaltyLastN"));
+        require(allowed >= 0 && allowed <= static_cast<std::int32_t>(max_candidates), "DRY allowed length exceeds bound");
+        require(last >= -1 && last <= static_cast<std::int32_t>(max_candidates), "DRY history exceeds bound");
+        const auto & breakers = p.at("SequenceBreakers");
+        require(breakers.is_array() && breakers.size() <= 128, "too many DRY sequence breakers");
+        std::size_t tokens = 0;
+        for (const auto & breaker : breakers) {
+            require(breaker.is_array() && breaker.size() <= 1024, "DRY breaker exceeds bound");
+            tokens += breaker.size(); require(tokens <= 8192, "DRY breaker tokens exceed bound");
+            for (const auto & token : breaker) i32(token);
+        }
+    } else if (type == "top-n-sigma") {
+        fields(p, {"NBits"}); parameter_float(p.at("NBits"));
+    } else throw std::runtime_error("unknown sampler Type");
+}
+inline llama_sampler * create_sampler(const std::string & type, const json & p) {
+    if (type == "temp") return llama_sampler_init_temp(from_bits(p.at("TemperatureBits")));
+    if (type == "temp-ext") return llama_sampler_init_temp_ext(from_bits(p.at("TemperatureBits")), from_bits(p.at("DeltaBits")), from_bits(p.at("ExponentBits")));
+    if (type == "dist") return llama_sampler_init_dist(u32(p.at("Seed")));
+    if (type == "top-k") return llama_sampler_init_top_k(i32(p.at("K")));
+    if (type == "top-p") return llama_sampler_init_top_p(from_bits(p.at("ProbabilityBits")), u32(p.at("MinKeep")));
+    if (type == "min-p") return llama_sampler_init_min_p(from_bits(p.at("ProbabilityBits")), u32(p.at("MinKeep")));
+    if (type == "typical") return llama_sampler_init_typical(from_bits(p.at("ProbabilityBits")), u32(p.at("MinKeep")));
+    if (type == "xtc") return llama_sampler_init_xtc(from_bits(p.at("ProbabilityBits")), from_bits(p.at("ThresholdBits")), u32(p.at("MinKeep")), u32(p.at("Seed")));
+    if (type == "penalties") return llama_sampler_init_penalties(i32(p.at("VocabularySize")), i32(p.at("PenaltyLastN")), from_bits(p.at("RepeatBits")), from_bits(p.at("FrequencyBits")), from_bits(p.at("PresenceBits")));
+    if (type == "dry-testing") {
+        std::vector<std::vector<llama_token>> breakers;
+        for (const auto & entry : p.at("SequenceBreakers")) {
+            std::vector<llama_token> tokens; for (const auto & token : entry) tokens.push_back(i32(token)); breakers.push_back(std::move(tokens));
+        }
+        return llama_sampler_init_dry_testing(from_bits(p.at("MultiplierBits")), from_bits(p.at("BaseBits")), i32(p.at("AllowedLength")), i32(p.at("PenaltyLastN")), breakers);
+    }
+    return llama_sampler_init_top_n_sigma(from_bits(p.at("NBits")));
+}
+struct candidate_storage {
+    std::vector<llama_token_data> backing;
+    llama_token_data_array view{};
+    std::size_t offset() const {
+        const auto begin = reinterpret_cast<std::uintptr_t>(backing.data());
+        const auto pointer = reinterpret_cast<std::uintptr_t>(view.data);
+        const auto bytes = backing.size() * sizeof(llama_token_data);
+        require(pointer >= begin && pointer - begin <= bytes && (pointer - begin) % sizeof(llama_token_data) == 0, "production candidate pointer outside backing storage");
+        const auto index = static_cast<std::size_t>((pointer - begin) / sizeof(llama_token_data));
+        require(view.size <= backing.size() - index, "production candidate view exceeds backing storage");
+        return index;
+    }
+};
 inline std::string text(const json&v,std::size_t maximum=65536){require(v.is_string(),"backend sampler text required");auto s=v.get<std::string>();require(s.size()<=maximum&&s.find('\0')==std::string::npos,"backend sampler text extent differs");return s;}
 inline bool handles(const std::string&op){return op.rfind("bs-",0)==0;}
 inline std::filesystem::path file(const json&v){auto p=std::filesystem::path(text(v));require(p.is_absolute(),"backend sampler file must be absolute");p=std::filesystem::weakly_canonical(p);auto root=std::filesystem::canonical(std::filesystem::current_path());auto relative=p.lexically_relative(root);require(!relative.empty()&&!relative.is_absolute(),"backend sampler file outside session");for(const auto&part:relative)require(part!="..","backend sampler file outside session");return p;}
@@ -25,7 +140,7 @@ struct observer{state*parent;std::string name;std::uint32_t label;std::exception
 struct sampler_owner{llama_sampler*value=nullptr;std::vector<std::shared_ptr<observer>>observers;~sampler_owner(){if(value)llama_sampler_free(value);}};
 struct state{
     std::map<std::uint32_t,std::shared_ptr<sampler_owner>>samplers;
-    std::map<std::uint32_t,std::shared_ptr<prism_sampling::candidate_storage>>candidates;
+    std::map<std::uint32_t,std::shared_ptr<candidate_storage>>candidates;
     std::vector<std::weak_ptr<observer>>observers;
     std::function<json(std::uint64_t,const json&)>sink;
     std::uint64_t request=0;
@@ -44,7 +159,7 @@ struct state{
         i.backend_init=[](llama_sampler*s,ggml_backend_buffer_type_t buft,std::uint32_t outputs){auto&o=**static_cast<std::shared_ptr<observer>*>(s->ctx);try{auto result=event(o,"backend-init",{{"OutputsMaxPerSequence",outputs},{"BufferTypeName",ggml_backend_buft_name(buft)}});fields(result,{"Accept"});require(result.at("Accept").is_boolean(),"backend sampler observer Accept must be boolean");return result.at("Accept").get<bool>();}catch(...){latch(o);return false;}};
         i.backend_apply=[](llama_sampler*s,ggml_context*,ggml_cgraph*,llama_sampler_data*){auto&o=**static_cast<std::shared_ptr<observer>*>(s->ctx);try{auto result=event(o,"backend-apply");require(result.is_object()&&result.empty(),"backend sampler observer void reply differs");}catch(...){latch(o);}};
         return i;}();return &iface;}
-    static json view(const prism_sampling::candidate_storage&c){return{{"BufferSize",c.backing.size()},{"Size",c.view.size},{"Offset",c.offset()},{"Selected",c.view.selected},{"Sorted",c.view.sorted}};}
+    static json view(const candidate_storage&c){return{{"BufferSize",c.backing.size()},{"Size",c.view.size},{"Offset",c.offset()},{"Selected",c.view.selected},{"Sorted",c.view.sorted}};}
     template<class Context,class Model>json execute(const json&o,std::uint32_t worker,Context resolve_context,Model resolve_model){
         require(worker==0,"backend sampler state belongs to worker zero");const auto op=text(o.at("Op"),64);
         if(op=="bs-init"){
@@ -54,7 +169,7 @@ struct state{
             else if(type=="logit-bias"){fields(p,{"VocabularySize","Biases"});auto n=u32(p.at("VocabularySize"),1048576);require(n>0&&p.at("Biases").is_array()&&p.at("Biases").size()<=1048576,"backend sampler bias extent invalid");std::vector<llama_logit_bias>bias;for(const auto&b:p.at("Biases")){fields(b,{"Token","BiasBits"});bias.push_back({i32(b.at("Token")),from_bits(b.at("BiasBits"))});}value->value=llama_sampler_init_logit_bias(std::int32_t(n),std::int32_t(bias.size()),bias.data());}
             else if(type=="observer"){fields(p,{"Name","Label"});auto observed=std::make_shared<observer>();observed->parent=this;observed->name=text(p.at("Name"),128);observed->label=u32(p.at("Label"));auto*owned=new std::shared_ptr<observer>(observed);value->value=llama_sampler_init(observer_interface(),owned);if(!value->value)delete owned;value->observers.push_back(observed);observers.push_back(observed);}
             else if(type=="penalties"){fields(p,{"VocabularySize","PenaltyLastN","RepeatBits","FrequencyBits","PresenceBits"});require(u32(p.at("VocabularySize"),1048576)>0,"backend sampler vocabulary empty");value->value=llama_sampler_init_penalties(i32(p.at("VocabularySize")),i32(p.at("PenaltyLastN")),from_bits(p.at("RepeatBits")),from_bits(p.at("FrequencyBits")),from_bits(p.at("PresenceBits")));}
-            else{prism_sampling::parameters(type,p);value->value=prism_sampling::create_sampler({{"Type",type},{"Parameters",p}});}
+            else{parameters(type,p);value->value=create_sampler(type,p);}
             return{{"Sampler",value->value?json(add(samplers,value)):json(nullptr)}};
         }
         if(op=="bs-chain-add"){fields(o,{"Op","Chain","Sampler"});require(o.at("Chain")!=o.at("Sampler"),"backend sampler cannot own itself");auto chain=sampler(o.at("Chain")),child=sampler(o.at("Sampler"));llama_sampler_chain_add(chain->value,child->value);chain->observers.insert(chain->observers.end(),child->observers.begin(),child->observers.end());child->value=nullptr;samplers.erase(u32(o.at("Sampler")));return nullptr;}
@@ -62,7 +177,7 @@ struct state{
         if(op=="bs-clone"){fields(o,{"Op","Sampler"});auto source=sampler(o.at("Sampler"));auto value=std::make_shared<sampler_owner>();value->value=llama_sampler_clone(source->value);return{{"Sampler",value->value?json(add(samplers,value)):json(nullptr)}};}
         if(op=="bs-copy"){fields(o,{"Op","Destination","Source"});llama_sampler_copy(sampler(o.at("Source"))->value,sampler(o.at("Destination"))->value);return nullptr;}
         if(op=="bs-accept"||op=="bs-free"){if(op=="bs-accept")fields(o,{"Op","Sampler","Token"});else fields(o,{"Op","Sampler"});auto s=sampler(o.at("Sampler"));if(op=="bs-accept")llama_sampler_accept(s->value,i32(o.at("Token")));else samplers.erase(u32(o.at("Sampler")));return nullptr;}
-        if(op=="bs-candidates-new"){fields(o,{"Op","Count","File","Selected","Sorted"});const auto n=u32(o.at("Count"),1048576);require(n>0&&o.at("Sorted").is_boolean(),"backend sampler candidate extent differs");const auto bytes=read(o.at("File"),std::size_t(n)*12);auto c=std::make_shared<prism_sampling::candidate_storage>();c->backing.resize(n);for(std::size_t i=0;i<n;++i){std::memcpy(&c->backing[i].id,bytes.data()+12*i,4);std::memcpy(&c->backing[i].logit,bytes.data()+12*i+4,4);std::memcpy(&c->backing[i].p,bytes.data()+12*i+8,4);}c->view={c->backing.data(),n,prism_sampling::integer(o.at("Selected")),o.at("Sorted").get<bool>()};return{{"Candidates",add(candidates,c)}};}
+        if(op=="bs-candidates-new"){fields(o,{"Op","Count","File","Selected","Sorted"});const auto n=u32(o.at("Count"),1048576);require(n>0&&o.at("Sorted").is_boolean(),"backend sampler candidate extent differs");const auto bytes=read(o.at("File"),std::size_t(n)*12);auto c=std::make_shared<candidate_storage>();c->backing.resize(n);for(std::size_t i=0;i<n;++i){std::memcpy(&c->backing[i].id,bytes.data()+12*i,4);std::memcpy(&c->backing[i].logit,bytes.data()+12*i+4,4);std::memcpy(&c->backing[i].p,bytes.data()+12*i+8,4);}c->view={c->backing.data(),n,integer(o.at("Selected")),o.at("Sorted").get<bool>()};return{{"Candidates",add(candidates,c)}};}
         if(op=="bs-apply"){fields(o,{"Op","Sampler","Candidates"});auto c=get(candidates,o.at("Candidates"));llama_sampler_apply(sampler(o.at("Sampler"))->value,&c->view);return view(*c);}
         if(op=="bs-candidates-export"){fields(o,{"Op","Candidates","File","Selection","Count"});auto c=get(candidates,o.at("Candidates"));const auto selection=text(o.at("Selection"),16);std::size_t offset=0,count=c->backing.size();if(selection=="active"){offset=c->offset();count=c->view.size;}else if(selection=="prefix"){count=u32(o.at("Count"),std::uint32_t(c->backing.size()));}else throw std::runtime_error("backend sampler candidate selection invalid");std::vector<std::uint8_t>bytes(count*12);for(std::size_t i=0;i<count;++i){auto&v=c->backing[offset+i];std::memcpy(bytes.data()+12*i,&v.id,4);std::memcpy(bytes.data()+12*i+4,&v.logit,4);std::memcpy(bytes.data()+12*i+8,&v.p,4);}write(o.at("File"),bytes.data(),bytes.size());auto result=view(*c);result["Rows"]=count;result["Bytes"]=bytes.size();return result;}
         if(op=="bs-candidates-free"){fields(o,{"Op","Candidates"});get(candidates,o.at("Candidates"));candidates.erase(u32(o.at("Candidates")));return nullptr;}

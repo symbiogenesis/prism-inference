@@ -65,6 +65,9 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
     if super::reference_reasoning::handles(value) {
         return super::reference_reasoning::execute(value);
     }
+    if super::reference_sampling::handles(value) {
+        return super::reference_sampling::execute(value);
+    }
     if super::reference_allocation::handles(value) {
         return super::reference_allocation::execute(value);
     }
@@ -115,6 +118,7 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
 pub(super) fn supports(id: &str) -> bool {
     id == MTP_ID
         || id == super::reference_reasoning::ID
+        || id == super::reference_sampling::ID
         || id == super::reference_logging::ID
         || id == super::reference_mtmd::ID
         || id == super::reference_mtmd_chunks::ID
@@ -136,6 +140,7 @@ pub(super) fn handles(value: &Value) -> bool {
         || super::reference_gguf::handles(value)
         || super::reference_grammar_parser::handles(value)
         || super::reference_reasoning::handles(value)
+        || super::reference_sampling::handles(value)
         || super::reference_threadpool::handles(value)
         || super::reference_batch_allocator::handles(value)
         || super::reference_allocation::handles(value)
@@ -152,12 +157,12 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID, super::reference_gguf::ID, super::reference_grammar_parser::ID, super::reference_threadpool::ID, super::reference_batch_allocator::ID, super::reference_allocation::ID, super::reference_quantization::ID, super::reference_unicode::ID, super::reference_arena_graph::ID, super::reference_tensor_graph::IDS[0], super::reference_tensor_graph::IDS[1], super::reference_tensor_graph::IDS[2]],
+    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_sampling::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID, super::reference_gguf::ID, super::reference_grammar_parser::ID, super::reference_threadpool::ID, super::reference_batch_allocator::ID, super::reference_allocation::ID, super::reference_quantization::ID, super::reference_unicode::ID, super::reference_arena_graph::ID, super::reference_tensor_graph::IDS[0], super::reference_tensor_graph::IDS[1], super::reference_tensor_graph::IDS[2]],
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
-        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_gguf::identity(), super::reference_grammar_parser::identity(), super::reference_threadpool::identity(), super::reference_batch_allocator::identity(), super::reference_allocation::identity(), super::reference_quantization::identity(), super::reference_unicode::identity(), super::reference_arena_graph::identity(), super::reference_tensor_graph::identity()],
+        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_sampling::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_gguf::identity(), super::reference_grammar_parser::identity(), super::reference_threadpool::identity(), super::reference_batch_allocator::identity(), super::reference_allocation::identity(), super::reference_quantization::identity(), super::reference_unicode::identity(), super::reference_arena_graph::identity(), super::reference_tensor_graph::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }

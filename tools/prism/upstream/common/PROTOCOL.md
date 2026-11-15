@@ -348,18 +348,22 @@ adapter returns caller-supplied position ranges; unused methods throw.
 
 ## Generic graph allocator observations
 
+This adapter is retired from the native bridge. The ordinary `cpp` reference
+selector and explicit `rust-reference` selection route `allocation-graph` to
+`tests/upstream_prism/reference_allocation.rs` with `nativeReferenceReplay=false`.
+Direct native `allocation-graph` requests reject.
+
 `allocation-graph` takes exact fields `Kind`, `Backends`, `Steps`. Up to three
 backend descriptors supply `Alignment` (power of two, 1..64) and `MaxBufferSize`
-(null for unlimited, or 1..1 MiB). The native input backend supplies real aligned
-backing storage, bounded to 4 MiB per allocation, and production gallocr behavior
-uses the supplied logical limits. Buffer callbacks carry data/size metadata only.
+(null for unlimited, or 1..1 MiB). The independent Rust allocator state machine
+emulates aligned logical buffers, chunk limits and view/liveness metadata without
+allocating native device storage.
 
-One through four steps share the same production gallocr, with fresh graph
+One through four steps share the same allocator state, with fresh graph
 contexts per step. Steps supply `Nodes`, `Output`, per-node `BufferTypes`,
 `ExternalAllocations`, and `Reserve`. Up to 40 nodes describe F32 input, add,
 multiply, concatenate, scale, pad, mean, reshape, permute and view operations.
-Each tensor has at most 16,384 elements and each axis at most 1,024. Exact node
-and context fields are declared in `allocation.hpp`.
+Each tensor has at most 16,384 elements and each axis at most 1,024.
 
 Results contain raw reserve/allocation status, live buffer sizes, tensor buffer
 and relative address offsets, byte extents, source/view references, actual op and

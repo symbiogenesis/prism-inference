@@ -90,6 +90,7 @@ mod quantize_perf;
 mod quantize_stats;
 mod reasoning_budget;
 mod recurrent_rollback;
+mod reference_allocation;
 mod reference_batch_allocator;
 mod reference_grammar_parser;
 mod reference_logging;
@@ -390,7 +391,7 @@ const CASES: &[Case] = &[
     register(
         "test-alloc",
         "tests/test-alloc.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         allocation::run,
     ),
     register(

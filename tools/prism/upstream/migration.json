@@ -76,7 +76,7 @@
       "SourceSha256": "89de1c9549888a37b388474aca89cad3052c1751fbdace09c81e79d5844633db",
       "Category": "model-free",
       "Needs": [
-        "ggml graph allocator and test backend abstraction"
+        "production Rust graph allocator API and independent Rust graph-allocator state machine reference"
       ],
       "AssertionsToPort": "13 original case invocations: tensor/arena/chunk maximums; leftover space; views/in-place; reuse/free; merge at32 andSIZE_MAX; prefer allocation; multiple types; zero; reallocation. Keep byte/allocation counts.",
       "LegacyReferenceRequired": true,

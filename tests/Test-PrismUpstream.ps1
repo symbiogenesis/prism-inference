@@ -197,7 +197,7 @@ $adapters = @{
     PegUnicode = @{ Name = 'peg-unicode'; Id = 'tests/peg-parser/test-unicode.cpp'; Family = 'common' }
     PegParser = @{ Name = 'test-peg-parser'; Family = 'common' }
     BatchAllocator = @{ Name = 'test-batch-alloc'; Family = 'independent' }
-    Allocator = @{ Name = 'test-alloc'; Family = 'common' }
+    Allocator = @{ Name = 'test-alloc'; Family = 'independent' }
     Barrier = @{ Name = 'test-barrier'; Family = 'independent' }
     BackendSampler = @{ Name = 'test-backend-sampler'; Family = 'common' }
     BackendOps = @{ Name = 'test-backend-ops'; Family = 'common' }

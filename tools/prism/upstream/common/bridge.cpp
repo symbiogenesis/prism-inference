@@ -14,7 +14,6 @@
 #undef LOG_ERR
 #undef LOG_CNT
 #include "arena_graph.hpp"
-#include "allocation.hpp"
 #include "sampling.hpp"
 #include "gguf.hpp"
 #include "chat_templates.hpp"
@@ -143,8 +142,6 @@ void validate_operation(const wire_json & operation) {
         prism_peg::validate(operation);
     } else if (prism_arena::handles(kind)) {
         prism_arena::validate(operation);
-    } else if (prism_allocation::handles(kind)) {
-        prism_allocation::validate(operation);
     } else if (prism_sampling::handles(kind)) {
         prism_sampling::validate(operation);
     } else if (prism_gguf::handles(kind)) {
@@ -209,9 +206,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_arena::handles(kind)) {
         return prism_arena::execute(operation);
-    }
-    if (prism_allocation::handles(kind)) {
-        return prism_allocation::execute(operation);
     }
     if (prism_sampling::handles(kind)) {
         return prism_sampling::execute(operation);

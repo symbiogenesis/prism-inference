@@ -905,11 +905,16 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
             "allocation unconditional source assertion count mismatch",
         ));
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-graph-allocator; nativeReferenceReplay=false"
+    };
     Ok(result(
         ID,
         checks.failed == 0,
         format!(
-            "source={SOURCE_SHA}; all13 scenarios,14 graph allocations; original assertions={} (468 unconditional+{} overlap-dependent); failures={}; examples={:?}",
+            "source={SOURCE_SHA}; provider={provider}; all13 scenarios,14 graph allocations; original assertions={} (468 unconditional+{} overlap-dependent); failures={}; examples={:?}",
             checks.original, checks.conditional, checks.failed, checks.examples
         ),
     ))

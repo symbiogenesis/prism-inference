@@ -274,3 +274,16 @@ calling `bonsai_prism_runtime` or any native bridge. Ordinary `cpp` and
 `common/batch_allocator.hpp`, its include/dispatch and its CMake build edge are
 removed (leaving 33 checked-in C++ files across the bridge snapshot). Selecting
 `test-batch-alloc` alone needs no native common bridge.
+
+## Retired allocation-graph native provider
+
+`--target rust-reference --case test-alloc` runs all 13 scenarios and 468+
+original assertions through `tests/upstream_prism/reference_allocation.rs` using
+an independent post-order graph builder, view-aware liveness/in-place allocator
+and sorted free-block chunk manager, without calling `bonsai_prism_runtime` or
+any native bridge. Ordinary `cpp` and `rust-reference` selections disclose
+`nativeReferenceReplay=false`.
+
+`common/allocation.hpp`, its include/dispatch and its CMake build edge are
+removed (leaving 32 checked-in C++ files across the bridge snapshot). Selecting
+`test-alloc` alone needs no native common bridge.

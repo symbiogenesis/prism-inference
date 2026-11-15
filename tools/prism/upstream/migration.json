@@ -394,7 +394,8 @@
       "SourceSha256": "4c3f3b8ba3f4aa426b750815c7420c5af88672037c98f324168038dedd913ece",
       "Category": "model-free",
       "Needs": [
-        "private grammar parser API"
+        "production Rust grammar parser API",
+        "independent Rust character lexer, owned syntax tree and separate instruction lowering"
       ],
       "AssertionsToPort": "Exact compiled grammar rules/stacks/character classes/ranges and valid-invalid grammar expectations.",
       "LegacyReferenceRequired": true,

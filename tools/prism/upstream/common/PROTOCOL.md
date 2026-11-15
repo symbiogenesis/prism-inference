@@ -119,10 +119,18 @@ model/vision/audio support or whole-retirement verdict is claimed.
 
 ## Generic grammar-parser operation
 
-`grammar-parser-parse` takes exact fields `Kind` and `Grammar`. Grammar is a
+This adapter is retired from the native bridge. The ordinary `cpp` reference
+selector and explicit `rust-reference` selection use
+`tests/upstream_prism/reference_grammar_parser.rs`, a character lexer, owned syntax
+tree and separate instruction lowering pass. Production Rust retains its direct
+byte parser. The independent provider imports neither production grammar code nor
+the literal assertion fixture; reports claim no native replay. Direct native
+`grammar-parser-parse` requests reject.
+
+The Rust-owned `grammar-parser-parse` takes exact fields `Kind` and `Grammar`. Grammar is a
 nonempty UTF-8 string of at most 65,536 bytes without NUL characters, since the
-production parser consumes a C string. A fresh `llama_grammar_parser` receives
-each request. The result is `{"Parsed":boolean,"SymbolIds":[{"Name":"...",
+original production parser consumed a C string. Every operation owns fresh
+parser/lowering state. The result is `{"Parsed":boolean,"SymbolIds":[{"Name":"...",
 "Id":number}],"Rules":[[{"Type":number,"Value":number}]]}`. Symbol IDs retain
 the production map's name order, and rules retain the production vector order.
 The result is limited to 4,096 symbols, 4,096 rules and 65,536 total rule elements.

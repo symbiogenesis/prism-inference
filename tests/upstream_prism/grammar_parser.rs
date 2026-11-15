@@ -256,7 +256,15 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     if object["SchemaVersion"] != 1 {
         return Err(invalid("grammar bridge version mismatch"));
     }
-    evaluate(&cases, array(&object["Results"])?)
+    let mut report = evaluate(&cases, array(&object["Results"])?)?;
+    let detail = report["Detail"]
+        .as_str()
+        .ok_or_else(|| invalid("missing grammar source detail"))?;
+    report["Detail"] = json!(format!(
+        "{detail}; provider={}",
+        engine.grammar_parser_provider()
+    ));
+    Ok(report)
 }
 
 #[cfg(test)]

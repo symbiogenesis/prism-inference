@@ -175,7 +175,7 @@ $adapters = @{
     MtpCatchupBatch = @{ Name = 'test-mtp-catchup-batch'; Family = 'common' }
     Jinja = @{ Name = 'test-jinja'; Family = 'common' }
     MtmdImpl = @{ Name = 'test-mtmd-impl'; Family = 'common' }
-    GrammarParser = @{ Name = 'test-grammar-parser'; Family = 'common' }
+    GrammarParser = @{ Name = 'test-grammar-parser'; Family = 'independent' }
     ReasoningBudget = @{ Name = 'test-reasoning-budget'; Family = 'common' }
     Col2im = @{ Name = 'test-col2im-1d'; Family = 'common' }
     Dfly = @{ Name = 'test-dfly-fusion'; Family = 'common' }

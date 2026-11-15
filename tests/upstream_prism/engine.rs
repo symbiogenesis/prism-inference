@@ -72,6 +72,14 @@ impl Engine {
         }
     }
 
+    pub(super) const fn grammar_parser_provider(&self) -> &'static str {
+        if matches!(self.target, Target::Rust) {
+            "production-rust"
+        } else {
+            "independent-rust-syntax-tree-and-lowering; nativeReferenceReplay=false"
+        }
+    }
+
     pub(super) fn new(
         target: Target,
         bridge: Option<PathBuf>,

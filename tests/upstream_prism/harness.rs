@@ -90,6 +90,7 @@ mod quantize_perf;
 mod quantize_stats;
 mod reasoning_budget;
 mod recurrent_rollback;
+mod reference_grammar_parser;
 mod reference_logging;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
@@ -495,7 +496,7 @@ const CASES: &[Case] = &[
     register(
         "test-grammar-parser",
         "tests/test-grammar-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         grammar_parser::run,
     ),
     register(

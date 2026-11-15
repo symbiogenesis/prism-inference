@@ -175,7 +175,7 @@ uses this independent provider and discloses `NativeReferenceReplay: false`.
 
 `common/mtmd.hpp` and its native include/dispatch/CMake edge are removed; direct
 native requests reject. Complete owning hosted acceptance and the remaining
-36 C++ files stay separate, with catalog, required-green-ID and complete backend
+35 C++ files stay separate, with catalog, required-green-ID and complete backend
 and performance schedules unchanged. These metadata controls supply no vision or
 audio-model inference, native arithmetic replay or device-performance verdict.
 
@@ -214,3 +214,37 @@ Reports identify the independent provider and `nativeReferenceReplay=false`.
 removed. Complete owning hosted acceptance and remaining native families stay
 separate; source-derived controls supply no fresh native execution, full-source
 gate, model/codec parity, device behavior or complete retirement verdict.
+
+## Retired grammar-parser native provider
+
+`--target rust-reference --case test-grammar-parser` runs every original grammar
+through `tests/upstream_prism/reference_grammar_parser.rs`. A character lexer
+produces a token stream, an owned syntax tree captures alternatives/groups and
+postfix repetition, and a separate pass allocates encounter-order symbols and
+lowers instructions. Production Rust independently emits instructions while
+scanning bytes. The reference imports neither production grammar code nor the
+expected-answer corpus.
+
+The original 23 variants, including six rejections, preserve all 274 literal
+source assertions: exact lexical symbol order/encounter IDs, generated-rule and
+flattened instruction order, character classes/ranges, finite and unbounded
+repetition, explicit TOKEN/TOKEN_NOT and the pinned expansion threshold. Invalid
+grammar returns no rules; each operation starts with fresh state. Additional
+literal Unicode/escape/group/repetition and typed-request controls exercise the
+independent generic protocol without supplying expected observations from the
+production parser.
+
+The assertion identity remains `tests/test-grammar-parser.cpp`, upstream commit
+`b87ca7225456b06b0975b8239c66b5aecf07e37c`, SHA-256
+`4c3f3b8ba3f4aa426b750815c7420c5af88672037c98f324168038dedd913ece`.
+Its immutable corpus, source/required green IDs and MIT attribution remain.
+The ordinary `cpp` reference selector uses the independent Rust provider and
+discloses it in case details/provider identities with native replay false.
+
+`common/grammar_parser.hpp`, its include/dispatch and its CMake build edge are
+removed. Selecting this source alone needs no native common bridge. Generic
+grammar-parser calls from other source families use the same independent
+provider; their other native operations and independent obligations remain.
+This port supplies no hosted full-source, model, grammar-runtime/token-mask,
+device or complete C++ retirement verdict. Backend geometry and performance
+schedules are unchanged.

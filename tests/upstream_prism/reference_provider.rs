@@ -50,6 +50,9 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
     if super::reference_mtmd_chunks::handles(value) {
         return super::reference_mtmd_chunks::execute(value);
     }
+    if super::reference_grammar_parser::handles(value) {
+        return super::reference_grammar_parser::execute(value);
+    }
     if super::reference_logging::handles(value) {
         return super::reference_logging::execute(value);
     }
@@ -91,12 +94,14 @@ pub(super) fn supports(id: &str) -> bool {
         || id == super::reference_logging::ID
         || id == super::reference_mtmd::ID
         || id == super::reference_mtmd_chunks::ID
+        || id == super::reference_grammar_parser::ID
 }
 
 pub(super) fn handles(value: &Value) -> bool {
     super::reference_logging::handles(value)
         || super::reference_mtmd::handles(value)
         || super::reference_mtmd_chunks::handles(value)
+        || super::reference_grammar_parser::handles(value)
         || super::reference_reasoning::handles(value)
         || value["Operations"].as_array().is_some_and(|operations| {
             !operations.is_empty()
@@ -107,12 +112,12 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID],
+    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID, super::reference_grammar_parser::ID],
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
-        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity()],
+        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_grammar_parser::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }

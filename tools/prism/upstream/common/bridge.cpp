@@ -2,7 +2,6 @@
 // inputs, expected results and assertions; no upstream test source is compiled.
 #include "unicode.h"
 #include "jinja.hpp"
-#include "grammar_parser.hpp"
 #include "tensor_graph.hpp"
 #include "grammar.hpp"
 #include "codec.hpp"
@@ -136,8 +135,6 @@ void validate_operation(const wire_json & operation) {
         }
     } else if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
-    } else if (prism_grammar_parser::handles(kind)) {
-        prism_grammar_parser::validate(operation);
     } else if (prism_tensor_graph::handles(kind)) {
         prism_tensor_graph::validate(operation);
     } else if (prism_grammar::handles(kind)) {
@@ -203,9 +200,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_jinja::handles(kind)) {
         return prism_jinja::execute(operation);
-    }
-    if (prism_grammar_parser::handles(kind)) {
-        return prism_grammar_parser::execute(operation);
     }
     if (prism_tensor_graph::handles(kind)) {
         return prism_tensor_graph::execute(operation);

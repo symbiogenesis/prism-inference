@@ -1757,6 +1757,25 @@ impl Transforms {
         self.project_group_into_with_executor(weights, input, geometry, outputs, scratch, &mut None)
     }
 
+    fn executor_claims_weight(
+        executor: Option<&dyn crate::kernels::Pq2ProjectionExecutor>,
+        weight: &Tensor,
+    ) -> bool {
+        let Some(executor) = executor else {
+            return false;
+        };
+        let columns = weight.dimensions.first().copied().unwrap_or(0);
+        (weight.kind == crate::kernels::PQ2
+            && columns.is_multiple_of(128)
+            && executor.supports_f32(weight))
+            || (weight.kind == crate::kernels::PQ2
+                && columns.is_multiple_of(256)
+                && executor.supports(weight))
+            || ((weight.kind == crate::kernels::PTQ1
+                || (weight.kind == crate::kernels::PQ2 && !columns.is_multiple_of(256)))
+                && executor.supports_q8(weight))
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Keep scoped execution separate from CPU scratch and exact transform ownership."
@@ -1772,7 +1791,7 @@ impl Transforms {
     ) -> Result<()> {
         let mut pre_transformed = scratch.pre_transformed_len.take();
         let mut shared_transformed_ready = false;
-        let cpu_siblings = executor.is_none() && scratch.matvec.row_workers() > 1;
+        let parallel_row_workers = scratch.matvec.row_workers() > 1;
         let result = (|| {
             if N > 4 {
                 return Err(invalid("projection group exceeds four siblings"));
@@ -1864,12 +1883,15 @@ impl Transforms {
                     .iter()
                     .take_while(|weight| weight.kind == weights[index].kind)
                     .count();
-                if cpu_siblings
+                if parallel_row_workers
                     && cpu_group_len >= 2
                     && matches!(
                         weights[index].kind,
                         crate::kernels::PQ2 | crate::kernels::PTQ1 | crate::kernels::BF16
                     )
+                    && !weights[index..index + cpu_group_len]
+                        .iter()
+                        .any(|weight| Self::executor_claims_weight(executor.as_deref(), weight))
                     && weights.iter().enumerate().skip(index + cpu_group_len).all(
                         |(candidate, weight)| {
                             completed[candidate]

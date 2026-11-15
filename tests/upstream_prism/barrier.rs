@@ -303,7 +303,12 @@ pub(super) fn run_with_parameters(engine: &Engine, threads: usize, rounds: usize
         }
         observations.push(json!({"Name":name,"Plans":plans,"Computes":computes,"GraphNodes":expected_nodes,"NativeNanoseconds":value["Nanoseconds"],"WallNanosecondsIncludingTransport":started.elapsed().as_nanos().to_string()}));
     }
-    Ok(result(ID, true, json!({"SourceSha256":"44a60801134d178c8e2c6789c471909ed83c0b8c71055b259478b4d396220cee","Category":"CI-only timed workload completion","OriginalNumericAssertions":0,"AdditionalGuards":"graph extent, exact supplied plan/compute counts, production success statuses","Threads":threads,"Rounds":rounds,"InputInitialization":"source leaves GGML tensor data unspecified; no output values are read","TimingThreshold":null,"Results":observations}).to_string()))
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-threadpool; nativeReferenceReplay=false"
+    };
+    Ok(result(ID, true, json!({"SourceSha256":"44a60801134d178c8e2c6789c471909ed83c0b8c71055b259478b4d396220cee","Provider":provider,"Category":"CI-only timed workload completion","OriginalNumericAssertions":0,"AdditionalGuards":"graph extent, exact supplied plan/compute counts, production success statuses","Threads":threads,"Rounds":rounds,"InputInitialization":"source leaves GGML tensor data unspecified; no output values are read","TimingThreshold":null,"Results":observations}).to_string()))
 }
 
 pub(super) fn run(engine: &Engine) -> Result<Value> {

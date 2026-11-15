@@ -175,7 +175,7 @@ uses this independent provider and discloses `NativeReferenceReplay: false`.
 
 `common/mtmd.hpp` and its native include/dispatch/CMake edge are removed; direct
 native requests reject. Complete owning hosted acceptance and the remaining
-35 C++ files stay separate, with catalog, required-green-ID and complete backend
+34 C++ files stay separate, with catalog, required-green-ID and complete backend
 and performance schedules unchanged. These metadata controls supply no vision or
 audio-model inference, native arithmetic replay or device-performance verdict.
 
@@ -248,3 +248,16 @@ provider; their other native operations and independent obligations remain.
 This port supplies no hosted full-source, model, grammar-runtime/token-mask,
 device or complete C++ retirement verdict. Backend geometry and performance
 schedules are unchanged.
+
+## Retired threadpool native provider
+
+`--target rust-reference --case test-barrier` runs the `cpu-threadpool` schedule
+through `tests/upstream_prism/reference_threadpool.rs` with scoped OS worker
+threads, mutex/condvar epoch dispatch and per-step barrier synchronization across
+active threads and independent slot plans, without calling `bonsai_prism_runtime`
+or any native bridge. Timing modes retain CI-only timing separation rules, while
+ordinary `cpp` and `rust-reference` selections disclose `nativeReferenceReplay=false`.
+
+`common/threadpool.hpp`, its include/dispatch and its CMake build edge are removed
+(leaving 34 checked-in C++ files across the bridge snapshot). Selecting
+`test-barrier` alone needs no native common bridge.

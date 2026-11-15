@@ -96,6 +96,7 @@ mod reference_mtmd;
 mod reference_mtmd_chunks;
 mod reference_provider;
 mod reference_reasoning;
+mod reference_threadpool;
 mod schema_python;
 mod tokenizer_roundtrip;
 mod validator;
@@ -249,7 +250,7 @@ const CASES: &[Case] = &[
     register(
         "test-barrier",
         "tests/test-barrier.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         barrier::run,
     ),
     register(

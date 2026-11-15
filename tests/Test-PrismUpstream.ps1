@@ -198,7 +198,7 @@ $adapters = @{
     PegParser = @{ Name = 'test-peg-parser'; Family = 'common' }
     BatchAllocator = @{ Name = 'test-batch-alloc'; Family = 'common' }
     Allocator = @{ Name = 'test-alloc'; Family = 'common' }
-    Barrier = @{ Name = 'test-barrier'; Family = 'common' }
+    Barrier = @{ Name = 'test-barrier'; Family = 'independent' }
     BackendSampler = @{ Name = 'test-backend-sampler'; Family = 'common' }
     BackendOps = @{ Name = 'test-backend-ops'; Family = 'common' }
     ExportGraph = @{ Name = 'test-export-graph-ops'; Family = 'common' }

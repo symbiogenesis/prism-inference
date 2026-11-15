@@ -138,7 +138,7 @@
       "SourceSha256": "44a60801134d178c8e2c6789c471909ed83c0b8c71055b259478b4d396220cee",
       "Category": "correctness-and-benchmark",
       "Needs": [
-        "ggml CPU barrier/active-thread production path",
+        "independent scoped OS-worker threadpool and step-barrier reference",
         "native concurrency backend",
         "CI timing lane"
       ],

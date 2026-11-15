@@ -30,7 +30,6 @@
 #include "optimizer.hpp"
 #include "quantization.hpp"
 #include "dspark.hpp"
-#include "threadpool.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
 #include "public_c_abi.h"
@@ -175,8 +174,6 @@ void validate_operation(const wire_json & operation) {
         prism_quantization::validate(operation);
     } else if (prism_backend_ops::handles(kind)) {
         prism_backend_ops::validate(operation);
-    } else if (kind == "cpu-threadpool") {
-        prism_threadpool::validate(operation);
     } else if (prism_dspark::handles(kind)) {
         prism_dspark::validate(operation);
     } else {
@@ -260,9 +257,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_backend_ops::handles(kind)) {
         return prism_backend_ops::execute(operation);
-    }
-    if (kind == "cpu-threadpool") {
-        return prism_threadpool::execute(operation);
     }
     if (prism_dspark::handles(kind)) {
         return prism_dspark::execute(operation);

@@ -40,6 +40,12 @@ pub const MAX_OUTPUT_TOKENS: usize = 4_096;
 pub const TENSOR_PAYLOAD_BYTES: usize = 7_195_047_936;
 /// Maximum live FP16 KV and F32 recurrent/convolution payload at 8K context.
 pub const STATE_PAYLOAD_BYTES: usize = 693_764_096;
+/// Complete immutable multimodal projector GGUF byte length.
+pub const MMPROJ_BYTES: u64 = 629_246_976;
+/// SHA-256 digest of the pinned `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` artifact.
+pub const MMPROJ_SHA256: &str = "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903";
+/// Exact serialized tensor payload bytes, excluding header and alignment gaps.
+pub const MMPROJ_TENSOR_PAYLOAD_BYTES: usize = 629_227_328;
 
 const SIGN_SHA256: &str = "3d1ea9136a6044cd680cc1e92cde65e9dd7238e1288fe2effabec5d201c48bed";
 
@@ -185,6 +191,252 @@ pub fn inspect_representation(
     representation: Representation,
 ) -> Result<LoadReceipt> {
     Ok(verify(path, memory_limit, representation)?.1)
+}
+
+/// Conservative loader accounting for the pinned `mmproj` artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmprojLoadReceipt {
+    /// Conservative parser charge for retained metadata and descriptors.
+    pub header_charge_bytes: usize,
+    /// Exact immutable serialized tensor payload retained by the projector.
+    pub tensor_payload_bytes: usize,
+    /// Header charge plus all retained serialized tensor payloads.
+    pub retained_storage_bytes: usize,
+    /// Largest tensor payload in bytes.
+    pub largest_tensor_bytes: usize,
+    /// Counts in `F32`, `F16`, and `Q8_0` order.
+    pub tensor_counts: [usize; 3],
+}
+
+/// Loads only the pinned Swift multimodal projector through one verified handle.
+///
+/// # Errors
+/// Rejects artifact drift, malformed metadata, any extra or missing tensor,
+/// encoding/dimension drift, insufficient storage budgets, and I/O errors.
+pub fn load_mmproj(path: &Path, memory_limit: usize) -> Result<(Model, MmprojLoadReceipt)> {
+    let (reader, receipt) = verify_mmproj(path, memory_limit)?;
+    let model = Model::load_verified(reader, MMPROJ_SHA256, memory_limit, &mut |_| Ok(true))?;
+    Ok((model, receipt))
+}
+
+/// Verifies the full pinned `mmproj` artifact and header without retaining weights.
+///
+/// # Errors
+/// Rejects changed identity, declarations, inventory, or the storage budget.
+pub fn inspect_mmproj(path: &Path, memory_limit: usize) -> Result<MmprojLoadReceipt> {
+    Ok(verify_mmproj(path, memory_limit)?.1)
+}
+
+fn verify_mmproj(path: &Path, memory_limit: usize) -> Result<(VerifiedModel, MmprojLoadReceipt)> {
+    let reader = VerifiedModel::open(path, "Stock", MMPROJ_BYTES, MMPROJ_SHA256, memory_limit)?;
+    validate_mmproj_metadata(reader.metadata())?;
+    let (tensor_counts, tensor_payload_bytes, largest_tensor_bytes) = validate_mmproj_layouts(
+        reader.tensors().len(),
+        reader.tensors().iter().map(|tensor| {
+            (
+                tensor.name.as_str(),
+                tensor.dimensions.as_slice(),
+                tensor.type_id,
+                tensor.bytes,
+            )
+        }),
+    )?;
+    let header_charge_bytes = reader.retained_bytes();
+    let retained_storage_bytes = header_charge_bytes
+        .checked_add(tensor_payload_bytes)
+        .ok_or_else(|| invalid("Swift mmproj retained storage accounting overflow"))?;
+    if retained_storage_bytes > memory_limit {
+        return Err(invalid(
+            "Swift mmproj retained storage exceeds its memory budget",
+        ));
+    }
+    Ok((
+        reader,
+        MmprojLoadReceipt {
+            header_charge_bytes,
+            tensor_payload_bytes,
+            retained_storage_bytes,
+            largest_tensor_bytes,
+            tensor_counts,
+        },
+    ))
+}
+
+/// Checks the pinned `qwen3vl` `mmproj` metadata contract.
+///
+/// # Errors
+/// Rejects missing, incompatible, or drifted vision projector declarations.
+pub fn validate_mmproj_metadata(metadata: &Metadata) -> Result<()> {
+    if metadata.len() < 22 || metadata.len() > 64 {
+        return Err(invalid("Swift mmproj metadata inventory mismatch"));
+    }
+    for (key, value) in [
+        ("general.architecture", "clip"),
+        ("general.type", "mmproj"),
+        ("general.name", "Hf"),
+        ("general.size_label", "461M"),
+        ("general.license", "apache-2.0"),
+        ("clip.projector_type", "qwen3vl_merger"),
+    ] {
+        if metadata.get(key).and_then(MetadataValue::as_str) != Some(value) {
+            return Err(invalid(format!("Swift mmproj metadata mismatch: {key}")));
+        }
+    }
+    for (key, value) in [("clip.has_vision_encoder", true), ("clip.use_gelu", true)] {
+        if metadata.get(key).and_then(MetadataValue::as_bool) != Some(value) {
+            return Err(invalid(format!("Swift mmproj boolean mismatch: {key}")));
+        }
+    }
+    for (key, forbidden) in [("clip.has_audio_encoder", true), ("clip.use_silu", true)] {
+        if metadata.get(key).and_then(MetadataValue::as_bool) == Some(forbidden) {
+            return Err(invalid(format!("Swift mmproj unsupported flag: {key}")));
+        }
+    }
+    for (key, value) in [
+        ("general.file_type", 7_u64),
+        ("general.quantization_version", 2),
+        ("clip.vision.projection_dim", 5_120),
+        ("clip.vision.image_size", 768),
+        ("clip.vision.patch_size", 16),
+        ("clip.vision.embedding_length", 1_152),
+        ("clip.vision.feed_forward_length", 4_304),
+        ("clip.vision.block_count", 27),
+        ("clip.vision.attention.head_count", 16),
+        ("clip.vision.spatial_merge_size", 2),
+    ] {
+        if metadata.get(key).and_then(MetadataValue::as_u64) != Some(value) {
+            return Err(invalid(format!("Swift mmproj integer mismatch: {key}")));
+        }
+    }
+    if let Some(alignment) = metadata.get("general.alignment")
+        && alignment.as_u64() != Some(32)
+    {
+        return Err(invalid("Swift mmproj alignment mismatch"));
+    }
+    let eps = metadata
+        .get("clip.vision.attention.layer_norm_epsilon")
+        .and_then(MetadataValue::as_f64)
+        .ok_or_else(|| invalid("Swift mmproj layer norm epsilon missing"))?;
+    if !eps.is_finite() || (eps - f64::from(1e-6_f32)).abs() > 1e-12 {
+        return Err(invalid("Swift mmproj layer norm epsilon mismatch"));
+    }
+    match metadata
+        .get("clip.vision.is_deepstack_layers")
+        .and_then(MetadataValue::as_array)
+    {
+        Some(MetadataArray::Bool(values))
+            if values.len() == 27 && values.iter().all(|enabled| !*enabled) => {}
+        _ => return Err(invalid("Swift mmproj deepstack array mismatch")),
+    }
+    for key in ["clip.vision.image_mean", "clip.vision.image_std"] {
+        match metadata.get(key).and_then(MetadataValue::as_array) {
+            Some(MetadataArray::F32(values))
+                if values.len() == 3
+                    && values.iter().all(|&v| v.to_bits() == 0.5_f32.to_bits()) => {}
+            _ => {
+                return Err(invalid(format!(
+                    "Swift mmproj normalization mismatch: {key}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the expected tensor inventory `(gguf_type_id, dimensions)` for the pinned `mmproj`.
+#[must_use]
+pub fn expected_mmproj_tensors() -> BTreeMap<String, (u32, Vec<u64>)> {
+    let mut expected = BTreeMap::new();
+    expected.insert(
+        "v.patch_embd.weight".to_owned(),
+        (0, vec![16, 16, 3, 1_152]),
+    );
+    expected.insert(
+        "v.patch_embd.weight.1".to_owned(),
+        (0, vec![16, 16, 3, 1_152]),
+    );
+    expected.insert("v.patch_embd.bias".to_owned(), (0, vec![1_152]));
+    expected.insert("v.position_embd.weight".to_owned(), (0, vec![1_152, 2_304]));
+    expected.insert("v.post_ln.weight".to_owned(), (0, vec![1_152]));
+    expected.insert("v.post_ln.bias".to_owned(), (0, vec![1_152]));
+    expected.insert("mm.0.weight".to_owned(), (8, vec![4_608, 4_608]));
+    expected.insert("mm.0.bias".to_owned(), (0, vec![4_608]));
+    expected.insert("mm.2.weight".to_owned(), (8, vec![4_608, 5_120]));
+    expected.insert("mm.2.bias".to_owned(), (0, vec![5_120]));
+    for block in 0..27 {
+        expected.insert(format!("v.blk.{block}.ln1.weight"), (0, vec![1_152]));
+        expected.insert(format!("v.blk.{block}.ln1.bias"), (0, vec![1_152]));
+        expected.insert(
+            format!("v.blk.{block}.attn_qkv.weight"),
+            (8, vec![1_152, 3_456]),
+        );
+        expected.insert(format!("v.blk.{block}.attn_qkv.bias"), (0, vec![3_456]));
+        expected.insert(
+            format!("v.blk.{block}.attn_out.weight"),
+            (8, vec![1_152, 1_152]),
+        );
+        expected.insert(format!("v.blk.{block}.attn_out.bias"), (0, vec![1_152]));
+        expected.insert(format!("v.blk.{block}.ln2.weight"), (0, vec![1_152]));
+        expected.insert(format!("v.blk.{block}.ln2.bias"), (0, vec![1_152]));
+        expected.insert(
+            format!("v.blk.{block}.ffn_up.weight"),
+            (8, vec![1_152, 4_304]),
+        );
+        expected.insert(format!("v.blk.{block}.ffn_up.bias"), (0, vec![4_304]));
+        expected.insert(
+            format!("v.blk.{block}.ffn_down.weight"),
+            (1, vec![4_304, 1_152]),
+        );
+        expected.insert(format!("v.blk.{block}.ffn_down.bias"), (0, vec![1_152]));
+    }
+    expected
+}
+
+/// Validates tensor names, dimensions, encodings, and total byte size for the pinned `mmproj`.
+///
+/// # Errors
+/// Rejects missing, extra, renamed, reshaped, or re-typed tensors or mismatched byte counts.
+pub fn validate_mmproj_layouts<'a>(
+    count: usize,
+    tensors: impl IntoIterator<Item = (&'a str, &'a [u64], u32, u64)>,
+) -> Result<([usize; 3], usize, usize)> {
+    let expected = expected_mmproj_tensors();
+    if count != expected.len() {
+        return Err(invalid("Swift mmproj tensor inventory count mismatch"));
+    }
+    let mut counts = [0; 3];
+    let mut bytes = 0_usize;
+    let mut largest = 0_usize;
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, dimensions, kind, payload_bytes) in tensors {
+        if !seen.insert(name)
+            || expected
+                .get(name)
+                .is_none_or(|(expected_kind, expected_dimensions)| {
+                    *expected_kind != kind || expected_dimensions != dimensions
+                })
+        {
+            return Err(invalid(format!(
+                "Swift mmproj tensor layout mismatch: {name}"
+            )));
+        }
+        let slot = match kind {
+            0 => 0,
+            1 => 1,
+            8 => 2,
+            _ => return Err(invalid("Swift mmproj tensor encoding mismatch")),
+        };
+        counts[slot] += 1;
+        let length = usize::try_from(payload_bytes)?;
+        bytes = bytes
+            .checked_add(length)
+            .ok_or_else(|| invalid("Swift mmproj tensor accounting overflow"))?;
+        largest = largest.max(length);
+    }
+    if counts != [224, 27, 83] || bytes != MMPROJ_TENSOR_PAYLOAD_BYTES {
+        return Err(invalid("Swift mmproj tensor payload inventory mismatch"));
+    }
+    Ok((counts, bytes, largest))
 }
 
 fn verify(
@@ -659,5 +911,88 @@ mod tests {
             MetadataValue::from("qwen35"),
         );
         assert!(validate_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn mmproj_inventory_and_metadata_match_pinned_q8_artifact() -> Result<()> {
+        let mut metadata = Metadata::new();
+        for (key, value) in [
+            ("general.architecture", "clip"),
+            ("general.type", "mmproj"),
+            ("general.name", "Hf"),
+            ("general.size_label", "461M"),
+            ("general.license", "apache-2.0"),
+            ("clip.projector_type", "qwen3vl_merger"),
+        ] {
+            metadata.insert(key.to_owned(), MetadataValue::from(value));
+        }
+        metadata.insert(
+            "clip.has_vision_encoder".to_owned(),
+            MetadataValue::from(true),
+        );
+        metadata.insert("clip.use_gelu".to_owned(), MetadataValue::from(true));
+        for (key, value) in [
+            ("general.file_type", 7_u32),
+            ("general.quantization_version", 2),
+            ("clip.vision.projection_dim", 5_120),
+            ("clip.vision.image_size", 768),
+            ("clip.vision.patch_size", 16),
+            ("clip.vision.embedding_length", 1_152),
+            ("clip.vision.feed_forward_length", 4_304),
+            ("clip.vision.block_count", 27),
+            ("clip.vision.attention.head_count", 16),
+            ("clip.vision.spatial_merge_size", 2),
+        ] {
+            metadata.insert(key.to_owned(), MetadataValue::from(value));
+        }
+        metadata.insert(
+            "clip.vision.attention.layer_norm_epsilon".to_owned(),
+            MetadataValue::F32(1e-6_f32),
+        );
+        metadata.insert(
+            "clip.vision.is_deepstack_layers".to_owned(),
+            MetadataValue::Array(MetadataArray::Bool(vec![false; 27])),
+        );
+        metadata.insert(
+            "clip.vision.image_mean".to_owned(),
+            MetadataValue::Array(MetadataArray::F32(vec![0.5, 0.5, 0.5])),
+        );
+        metadata.insert(
+            "clip.vision.image_std".to_owned(),
+            MetadataValue::Array(MetadataArray::F32(vec![0.5, 0.5, 0.5])),
+        );
+        validate_mmproj_metadata(&metadata)?;
+
+        let expected = expected_mmproj_tensors();
+        let descriptors: Vec<(String, Vec<u64>, u32, u64)> = expected
+            .into_iter()
+            .map(|(name, (kind, dims))| {
+                let elements = dims.iter().product::<u64>();
+                let bytes = match kind {
+                    0 => elements * 4,
+                    1 => elements * 2,
+                    8 => (elements / 32) * 34,
+                    _ => 0,
+                };
+                (name, dims, kind, bytes)
+            })
+            .collect();
+        assert_eq!(
+            validate_mmproj_layouts(
+                descriptors.len(),
+                descriptors
+                    .iter()
+                    .map(|(n, d, k, b)| (n.as_str(), d.as_slice(), *k, *b)),
+            )?,
+            ([224, 27, 83], MMPROJ_TENSOR_PAYLOAD_BYTES, 25_067_520)
+        );
+
+        let mut drifted = metadata;
+        drifted.insert(
+            "clip.projector_type".to_owned(),
+            MetadataValue::from("qwen2vl_merger"),
+        );
+        assert!(validate_mmproj_metadata(&drifted).is_err());
+        Ok(())
     }
 }

@@ -85,7 +85,7 @@ source observations, not captured native output. Reports identify target
 `rust-reference` and `ObservationProvider.Kind: independent-rust-reference`,
 with `NativeReferenceReplay`, `CompleteSourceGate` and `NativeRetirementQualified`
 false. The selector also admits the explicitly migrated reasoning-budget,
-concurrent logger and MTMD geometry sources below; it rejects other sources,
+concurrent logger, MTMD geometry and public chunk sources below; it rejects other sources,
 full catalogs, benchmarks, diagnostics
 and native bridge options. The ordinary owning `cpp` reference arm also uses
 this provider for the MTP source, preserving all six source predicates and the
@@ -175,6 +175,42 @@ uses this independent provider and discloses `NativeReferenceReplay: false`.
 
 `common/mtmd.hpp` and its native include/dispatch/CMake edge are removed; direct
 native requests reject. Complete owning hosted acceptance and the remaining
-37 C++ files stay separate, with catalog, required-green-ID and complete backend
+36 C++ files stay separate, with catalog, required-green-ID and complete backend
 and performance schedules unchanged. These metadata controls supply no vision or
 audio-model inference, native arithmetic replay or device-performance verdict.
+
+## Retired public MTMD chunk native provider
+
+`--target rust-reference --case test-mtmd-c-api` runs all 46 original source
+conditions through the unchanged assertion schedule against
+`tests/upstream_prism/reference_mtmd_chunks.rs`. The ordinary `cpp` reference
+selector uses the same independent provider. It constructs the source-defined
+five-token text and 4x4 image with sixteen placeholder frames using flat wire
+field recipes, then decodes with a bounded cursor. It calls neither production
+Rust chunk APIs nor a native library. The reference supports the original
+factory and all states reachable through its bounded chunk transport; it does
+not claim general model/media preprocessing or allocation-failure equivalence.
+
+Default `image_marker` remains null. Exact 42/226-byte cache lengths, all 261
+aggregate tokens, ordered text IDs, image identity/position metadata, tiny saves,
+every truncated prefix, successful roundtrips, trailing capacity and borrowed/
+owned/null-handle lifetimes have focused controls. Pixel buffers are absent from
+placeholder metadata as in upstream. The original required green ID and all
+source predicates remain protected; backend geometries and separate performance
+schedules are unchanged.
+
+All reviewed sources use upstream commit
+`b87ca7225456b06b0975b8239c66b5aecf07e37c`; MIT terms remain in [LICENSE](LICENSE).
+
+| Source | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `tests/test-mtmd-c-api.c` | 5,735 | `bdeb47199c1bc878566c7b47dd4905e6b82fb42586ad92aabc6ee27e1647d884` |
+| `tools/mtmd/mtmd.cpp` | 103,968 | `9300de0676f5a3100ab67b0194e4999a57b217d12ef5c0c933069d7bf9592925` |
+| `tools/mtmd/mtmd-helper.cpp` | 34,595 | `de3eb3ae5d261635051bc50d3dae89f5ff8420e06ab616dedfca2d7348ea4eaf` |
+| `tools/mtmd/clip-impl.h` | 43,760 | `23060c1dea9dec19a722d1ff7f5639996826a49be6ab5446aec5b0a7e0d6c335` |
+
+Reports identify the independent provider and `nativeReferenceReplay=false`.
+`common/mtmd_chunks.hpp`, its operative include/dispatch and CMake edge are
+removed. Complete owning hosted acceptance and remaining native families stay
+separate; source-derived controls supply no fresh native execution, full-source
+gate, model/codec parity, device behavior or complete retirement verdict.

@@ -17,7 +17,6 @@
 #include "arena_graph.hpp"
 #include "batch_allocator.hpp"
 #include "allocation.hpp"
-#include "mtmd_chunks.hpp"
 #include "sampling.hpp"
 #include "gguf.hpp"
 #include "chat_templates.hpp"
@@ -153,8 +152,6 @@ void validate_operation(const wire_json & operation) {
         prism_batch_allocator::validate(operation);
     } else if (prism_allocation::handles(kind)) {
         prism_allocation::validate(operation);
-    } else if (kind == "mtmd-chunks-trace") {
-        prism_mtmd_chunks::validate(operation);
     } else if (prism_sampling::handles(kind)) {
         prism_sampling::validate(operation);
     } else if (prism_gguf::handles(kind)) {
@@ -230,9 +227,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_allocation::handles(kind)) {
         return prism_allocation::execute(operation);
-    }
-    if (kind == "mtmd-chunks-trace") {
-        return prism_mtmd_chunks::execute(operation);
     }
     if (prism_sampling::handles(kind)) {
         return prism_sampling::execute(operation);

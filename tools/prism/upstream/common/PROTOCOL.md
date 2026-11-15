@@ -353,10 +353,11 @@ and relative address offsets, byte extents, source/view references, actual op an
 flags, production in-place capability, output flags, graph nodes and leaves.
 This operation does not execute tensor computation.
 
-The generic `mtmd-chunks-trace` transport exposes production public chunk collection, serialization,
-reload and decoder-position APIs with bounded handles and buffers. Its explicit `create-test-inputs`
-action calls the pinned production public `mtmd_test_create_input_chunks` factory, as the original
-source does. Opaque populated chunks originate in that production factory.
+`mtmd-chunks-trace` is retired from this native bridge and direct requests reject.
+The owning Rust reference arm uses a separate source-derived factory and bounded
+wire-packet decoder for the complete `tests/test-mtmd-c-api.c` contract. The Rust
+production arm retains its independent media chunk APIs. Both preserve the
+original source assertions; this replacement supplies no captured native output.
 
 The `sampler-trace` transport owns scoped production sampler and candidate handles. Rust supplies
 constructors, raw IEEE binary32 candidate fields and ordered apply, accept, reset, clone, copy and

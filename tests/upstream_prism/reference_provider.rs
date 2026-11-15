@@ -1,7 +1,8 @@
 //! Independent mathematical observations for explicitly migrated source routes.
 //!
 //! This module never calls the production Rust runtime or a native bridge. It
-//! supplies no backend, model, tokenizer, codec, ABI or performance observations.
+//! supplies no native execution, model arithmetic, backend, ABI or performance
+//! observations.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,6 +47,9 @@ fn first_decode_fits(batch: i32, catchup: i32, anchors: i32) -> bool {
 }
 
 pub(super) fn execute(value: &Value) -> Result<Value> {
+    if super::reference_mtmd_chunks::handles(value) {
+        return super::reference_mtmd_chunks::execute(value);
+    }
     if super::reference_logging::handles(value) {
         return super::reference_logging::execute(value);
     }
@@ -86,11 +90,13 @@ pub(super) fn supports(id: &str) -> bool {
         || id == super::reference_reasoning::ID
         || id == super::reference_logging::ID
         || id == super::reference_mtmd::ID
+        || id == super::reference_mtmd_chunks::ID
 }
 
 pub(super) fn handles(value: &Value) -> bool {
     super::reference_logging::handles(value)
         || super::reference_mtmd::handles(value)
+        || super::reference_mtmd_chunks::handles(value)
         || super::reference_reasoning::handles(value)
         || value["Operations"].as_array().is_some_and(|operations| {
             !operations.is_empty()
@@ -101,12 +107,12 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_logging::ID, super::reference_mtmd::ID],
+    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID],
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
-        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_logging::identity(), super::reference_mtmd::identity()],
+        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }

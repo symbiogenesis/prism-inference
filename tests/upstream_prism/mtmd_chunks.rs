@@ -1,7 +1,7 @@
 //! Complete test-mtmd-c-api.c checks expressed in safe Rust.
 //!
-//! The public upstream fixture factory remains a production-library operation;
-//! every traversal, save/load request, comparison and verdict belongs to Rust.
+//! Production and independent reference providers each preserve the original
+//! source-defined synthetic factory. Every request and assertion belongs to Rust.
 //! Upstream MIT attribution: tools/prism/upstream/LICENSE.
 
 use serde_json::{Value, json};
@@ -262,11 +262,16 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     if checks.count != 46 {
         return Err(invalid("pinned MTMD C API source condition count drifted"));
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-mtmd-chunk-wire; nativeReferenceReplay=false"
+    };
     Ok(result(
         ID,
         checks.failures.is_empty(),
         format!(
-            "All46 original creation/traversal/text/image/serialization conditions; chunks={count}; public upstream fixture factory retained as production operation; all requests and assertions in Rust; failed={}: {}",
+            "provider={provider}; All46 original creation/traversal/text/image/serialization conditions; chunks={count}; source-defined synthetic factory retained; all requests and assertions in Rust; failed={}: {}",
             checks.failures.len(),
             checks.failures.join("; ")
         ),

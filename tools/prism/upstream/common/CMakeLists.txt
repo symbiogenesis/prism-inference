@@ -58,7 +58,7 @@ if(MSVC)
   target_compile_options(prism-upstream-server-context PRIVATE /utf-8)
 endif()
 
-add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp jinja.hpp grammar_parser.hpp tensor_graph.hpp grammar.hpp codec.hpp peg.hpp arena_graph.hpp batch_allocator.hpp allocation.hpp mtmd_chunks.hpp sampling.hpp gguf.hpp chat_templates.hpp chat_parser.hpp chat_auto.hpp vocab.hpp vocab_session.hpp model_runtime.hpp json_schema.hpp chat_analysis.hpp public_c_abi.c public_c_abi.h arg_parser.hpp model_resolution.hpp chat.hpp generated_model.hpp optimizer.hpp quantization.hpp dspark.hpp threadpool.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp codec_buffers.hpp)
+add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp jinja.hpp grammar_parser.hpp tensor_graph.hpp grammar.hpp codec.hpp peg.hpp arena_graph.hpp batch_allocator.hpp allocation.hpp sampling.hpp gguf.hpp chat_templates.hpp chat_parser.hpp chat_auto.hpp vocab.hpp vocab_session.hpp model_runtime.hpp json_schema.hpp chat_analysis.hpp public_c_abi.c public_c_abi.h arg_parser.hpp model_resolution.hpp chat.hpp generated_model.hpp optimizer.hpp quantization.hpp dspark.hpp threadpool.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp codec_buffers.hpp)
 target_include_directories(prism-upstream-common-bridge PRIVATE "${PRISM_SOURCE_DIR}/src" "${PRISM_SOURCE_DIR}" "${PRISM_SOURCE_DIR}/ggml/src")
 target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd prism-upstream-server-context)
 # The same-revision CI tool bundle also supplies the small ggml-only wrapper.

@@ -528,8 +528,8 @@
       "SourceSha256": "bdeb47199c1bc878566c7b47dd4905e6b82fb42586ad92aabc6ee27e1647d884",
       "Category": "model-free",
       "Needs": [
-        "libmtmd C API",
-        "synthetic chunk creator or Rust-controlled constructor APIs"
+        "source-defined synthetic chunk factory and MTMD v1 wire contract",
+        "independent Rust reference and production Rust media chunk APIs"
       ],
       "AssertionsToPort": "Default marker; text/image/audio chunks positive counts and valid token/ID/position metadata; save query exact size; too-small save; truncated load rejected; full roundtrip exact metadata/token/ID equality.",
       "LegacyReferenceRequired": false,

@@ -202,7 +202,7 @@ impl QueueComputeReport {
     #[must_use]
     pub const fn completed_cycle(self) -> bool {
         self.metadata.metadata_prepared()
-            && matches!(self.metadata.architecture, Some(81))
+            && matches!(self.metadata.architecture, Some(arch) if crate::is_supported_htp_architecture(arch))
             && self.unsigned_process_requested
             && matches!(self.process_initialization_result, Some(0))
             && self.process_initialization_domain_after.is_some()

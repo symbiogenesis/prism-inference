@@ -38,11 +38,105 @@ pub struct SessionPreparationReport {
     pub uri_verified: bool,
 }
 
+/// Return `true` when `architecture` identifies a bundled signed HTP target (`v73` or `v81`).
+#[must_use]
+pub const fn is_supported_htp_architecture(architecture: u32) -> bool {
+    matches!(architecture, 73 | 81)
+}
+
+/// Hardware capability profile for an opened Hexagon CDSP HTP session (`v73` or `v81`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HtpArchProfile {
+    /// Decoded Hexagon CDSP architecture version (`73` on Snapdragon X1 Elite, `81` on X2 Elite).
+    pub architecture: u32,
+    /// Bounded HVX-128 worker threads requested at queue startup and in `kparams` solvers.
+    pub hvx_workers: u32,
+    /// Bounded VTCM scratchpad budget (bytes) requested at queue startup and in `kparams` solvers.
+    pub vtcm_bytes: u32,
+    /// Whether the DSP hardware supports 64-bit DMA strides beyond `HTP_DMA32_MAX_STRIDE_BYTES`.
+    pub dma64_capable: bool,
+}
+
+impl HtpArchProfile {
+    /// Fixed default profile for Hexagon `v81` (8 HVX-128 threads, 4 MiB VTCM request, DMA64).
+    #[must_use]
+    pub const fn v81() -> Self {
+        Self {
+            architecture: 81,
+            hvx_workers: crate::HMX_Q2_HVX_WORKERS,
+            vtcm_bytes: crate::NATIVE_Q2_VTCM_REQUEST_BYTES,
+            dma64_capable: true,
+        }
+    }
+
+    /// Conservative default profile for Hexagon `v73` when FastRPC HVX/VTCM capability queries return zero.
+    #[must_use]
+    pub const fn v73_default() -> Self {
+        Self {
+            architecture: 73,
+            hvx_workers: 4,
+            vtcm_bytes: crate::HMX_Q2_VTCM_REQUEST_BYTES,
+            dma64_capable: false,
+        }
+    }
+
+    /// Derive a bounded HTP capability profile from the driver's reported architecture,
+    /// `Hvx128` context count, and total `VtcmPage * VtcmCount` bytes.
+    ///
+    /// Returns `None` for any architecture other than `v73` or `v81`.
+    #[must_use]
+    pub const fn for_architecture(
+        architecture: u32,
+        hvx128_contexts: u32,
+        vtcm_total_bytes: u32,
+    ) -> Option<Self> {
+        if !is_supported_htp_architecture(architecture) {
+            return None;
+        }
+        let default_workers = match architecture {
+            73 => 4,
+            81 => crate::HMX_Q2_HVX_WORKERS,
+            _ => 1,
+        };
+        let hvx_workers = if hvx128_contexts == 0 {
+            default_workers
+        } else if hvx128_contexts > crate::HMX_Q2_HVX_WORKERS {
+            crate::HMX_Q2_HVX_WORKERS
+        } else {
+            hvx128_contexts
+        };
+        let vtcm_bytes = if vtcm_total_bytes == 0 {
+            match architecture {
+                73 => crate::HMX_Q2_VTCM_REQUEST_BYTES,
+                81 => crate::NATIVE_Q2_VTCM_REQUEST_BYTES,
+                _ => 65_536,
+            }
+        } else if vtcm_total_bytes >= 8 * 1024 * 1024 {
+            crate::NATIVE_Q2_VTCM_REQUEST_BYTES
+        } else {
+            let headroom = vtcm_total_bytes / 8;
+            let usable = vtcm_total_bytes.saturating_sub(headroom);
+            if usable < 65_536 {
+                65_536
+            } else if usable > crate::NATIVE_Q2_VTCM_REQUEST_BYTES {
+                crate::NATIVE_Q2_VTCM_REQUEST_BYTES
+            } else {
+                usable
+            }
+        };
+        Some(Self {
+            architecture,
+            hvx_workers,
+            vtcm_bytes,
+            dma64_capable: architecture >= 81,
+        })
+    }
+}
+
 impl SessionPreparationReport {
     pub(crate) const fn new(raw: u32) -> Self {
         let architecture = match crate::decode_architecture(raw) {
-            Some(73) => Some(73),
-            Some(81) => Some(81),
+            Some(arch) if is_supported_htp_architecture(arch) => Some(arch),
             _ => None,
         };
         Self {
@@ -90,14 +184,22 @@ pub(crate) fn checked_uri(architecture: u32, bytes: &[u8]) -> bool {
 }
 
 pub(crate) fn self_check() -> bool {
-    let Some(module) = module_uri(81) else {
+    let Some(module_81) = module_uri(81) else {
         return false;
     };
-    let mut uri = module.to_bytes().to_vec();
-    uri.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
-    checked_uri(81, &uri)
-        && !checked_uri(73, &uri)
+    let Some(module_73) = module_uri(73) else {
+        return false;
+    };
+    let mut uri_81 = module_81.to_bytes().to_vec();
+    uri_81.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
+    let mut uri_73 = module_73.to_bytes().to_vec();
+    uri_73.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
+    checked_uri(81, &uri_81)
+        && checked_uri(73, &uri_73)
+        && !checked_uri(73, &uri_81)
+        && !checked_uri(81, &uri_73)
         && !SessionPreparationReport::new(0x81).metadata_prepared()
+        && !SessionPreparationReport::new(0x73).metadata_prepared()
         && MAP_FD == 2
         && MAP_FD_DELAYED == 3
 }
@@ -109,14 +211,30 @@ mod tests {
     #[test]
     fn uri_is_bound_to_exact_architecture_domain_and_default_session() {
         assert!(self_check());
-        let mut uri = module_uri(81).map_or_default(CStr::to_bytes).to_vec();
-        uri.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
-        assert!(checked_uri(81, &uri));
-        assert!(!checked_uri(82, &uri));
-        assert!(!checked_uri(81, &uri[..uri.len() - 1]));
-        uri.truncate(uri.len() - 2);
-        uri.extend_from_slice(b"1\0");
-        assert!(!checked_uri(81, &uri));
+        for arch in [73_u32, 81_u32] {
+            let mut uri = module_uri(arch).map_or_default(CStr::to_bytes).to_vec();
+            uri.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
+            assert!(checked_uri(arch, &uri));
+            assert!(!checked_uri(82, &uri));
+            assert!(!checked_uri(arch, &uri[..uri.len() - 1]));
+        }
+        assert_eq!(HtpArchProfile::for_architecture(73, 0, 0), Some(HtpArchProfile::v73_default()));
+        assert_eq!(
+            HtpArchProfile::for_architecture(73, 6, 4 * 1024 * 1024),
+            Some(HtpArchProfile {
+                architecture: 73,
+                hvx_workers: 6,
+                vtcm_bytes: 3_670_016,
+                dma64_capable: false,
+            })
+        );
+        assert_eq!(HtpArchProfile::for_architecture(81, 8, 8 * 1024 * 1024), Some(HtpArchProfile::v81()));
+        assert_eq!(HtpArchProfile::for_architecture(68, 4, 2 * 1024 * 1024), None);
+        let mut tail = module_uri(81).map_or_default(CStr::to_bytes).to_vec();
+        tail.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
+        tail.truncate(tail.len() - 2);
+        tail.extend_from_slice(b"1\0");
+        assert!(!checked_uri(81, &tail));
         assert!(!checked_uri(81, b"\0"));
     }
 

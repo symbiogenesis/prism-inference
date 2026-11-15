@@ -403,6 +403,11 @@ impl Drop for WorkerThreadHexagonExecutor {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn has_signed_htp_module(dir: &std::path::Path) -> bool {
+    dir.join("libggml-htp-v81.so").is_file() || dir.join("libggml-htp-v73.so").is_file()
+}
+
 #[cfg(windows)]
 #[expect(
     clippy::redundant_pub_crate,
@@ -427,7 +432,7 @@ pub(crate) fn register_hexagon_model_path(model: &std::path::Path) {
                 for segment in relative {
                     candidate.push(segment);
                 }
-                if candidate.join("libggml-htp-v81.so").is_file() {
+                if has_signed_htp_module(&candidate) {
                     let _ = HEXAGON_PACKAGE_HINT.set(candidate);
                     return;
                 }
@@ -441,7 +446,7 @@ pub(crate) fn register_hexagon_model_path(model: &std::path::Path) {
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
     if let Some(hint) = HEXAGON_PACKAGE_HINT.get()
-        && hint.join("libggml-htp-v81.so").is_file()
+        && has_signed_htp_module(hint)
     {
         return Some(hint.clone());
     }
@@ -450,7 +455,7 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
             .join("SwiftBonsai2")
             .join("hexagon")
             .join("runtime");
-        if candidate.join("libggml-htp-v81.so").is_file() {
+        if has_signed_htp_module(&candidate) {
             return Some(candidate);
         }
     }
@@ -458,10 +463,7 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
         .join("Bonsai-Hexagon-SessionNext-20261030")
         .join("signed-q2-package")
         .join("runtime");
-    staged
-        .join("libggml-htp-v81.so")
-        .is_file()
-        .then_some(staged)
+    has_signed_htp_module(&staged).then_some(staged)
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
@@ -472,7 +474,13 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
         return None;
     }
     let package_dir = discover_hexagon_package_directory()?;
-    let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+    let mut driver = hexagon_native_rpc::Driver::open_system().ok()?;
+    let arch = driver
+        .capability(hexagon_native_rpc::Capability::Architecture)
+        .ok()
+        .and_then(hexagon_native_rpc::decode_architecture)
+        .unwrap_or(81);
+    let mut limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
         hexagon_native_rpc::NATIVE_Q2_MAX_COLUMNS,
         hexagon_native_rpc::NATIVE_Q2_MAX_ROWS,
         24_000,
@@ -484,8 +492,10 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
     })
     .map(hexagon_native_rpc::NativeQ2ProjectionLimits::with_persistent_session)
     .ok()?;
-    let q2_session = hexagon_native_rpc::Driver::open_system()
-        .ok()?
+    if arch == 73 {
+        limits = limits.with_partial_secondary_arenas();
+    }
+    let q2_session = driver
         .open_native_q2_session(&package_dir, limits)
         .ok()?;
     let mut executor =
@@ -505,12 +515,27 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
         let tensor = session.projection_tensor(name)?;
         tensors.push(tensor.clone());
     }
-    executor.select_and_prewarm_tensors(&tensors).ok()?;
+    if executor.htp_architecture() == 73 {
+        executor.select_prefix_and_prewarm_tensors(&tensors).ok()?;
+    } else {
+        executor.select_and_prewarm_tensors(&tensors).ok()?;
+    }
     let residency = executor.residency_statistics();
-    let startup = ProjectionStartup::NativeQ2 {
-        resident_tensors: residency.tensors_prepared,
-        resident_weight_bytes: residency.weight_payload_bytes_prepared,
-        host_metadata_bytes: residency.metadata_payload_bytes,
+    let startup = if residency.tensors_prepared == 168
+        && residency.weight_payload_bytes_prepared == 2_888_663_040
+    {
+        ProjectionStartup::NativeQ2 {
+            resident_tensors: residency.tensors_prepared,
+            resident_weight_bytes: residency.weight_payload_bytes_prepared,
+            host_metadata_bytes: residency.metadata_payload_bytes,
+        }
+    } else {
+        ProjectionStartup::NativeQ2Partial {
+            architecture: executor.htp_architecture(),
+            resident_tensors: residency.tensors_prepared,
+            resident_weight_bytes: residency.weight_payload_bytes_prepared,
+            host_metadata_bytes: residency.metadata_payload_bytes,
+        }
     };
     if !startup.valid(Placement::Auto) {
         return None;

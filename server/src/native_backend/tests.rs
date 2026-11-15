@@ -312,6 +312,34 @@ fn projection_startup_waits_for_owner_and_binds_resident_observations() -> TestR
     );
     drop(worker);
     assert!(observed.terminated.load(Ordering::Acquire));
+
+    let partial = Observation {
+        startup_projection: Some(ProjectionStartup::NativeQ2Partial {
+            architecture: 73,
+            resident_tensors: 84,
+            resident_weight_bytes: 1_444_331_520,
+            host_metadata_bytes: 262_064,
+        }),
+        ..Observation::default()
+    };
+    let partial_worker =
+        Worker::with_placement(FakeEngine(partial.clone()), 42, Placement::Auto)
+            .map_err(|error| format!("{error:?}"))?;
+    let partial_readiness = partial_worker.profile.readiness(partial_worker.seed);
+    assert_eq!(
+        partial_readiness["data"][0]["startup_projection"],
+        json!({
+            "schema_version": 1,
+            "requested": "auto",
+            "effective": "hexagon-native-q2-partial",
+            "identity": "hexagon-v73-hvx-native-q2-partial-v1-experimental",
+            "resident_tensors": 84,
+            "resident_weight_bytes": 1_444_331_520_u64,
+            "host_metadata_bytes": 262_064,
+        })
+    );
+    drop(partial_worker);
+    assert!(partial.terminated.load(Ordering::Acquire));
     Ok(())
 }
 
@@ -328,6 +356,33 @@ fn projection_startup_rejects_failure_or_inconsistent_observations_and_joins_own
                 resident_tensors: 167,
                 resident_weight_bytes: 2_888_663_040,
                 host_metadata_bytes: 1,
+            }),
+            ..Observation::default()
+        },
+        Observation {
+            startup_projection: Some(ProjectionStartup::NativeQ2Partial {
+                architecture: 68,
+                resident_tensors: 84,
+                resident_weight_bytes: 1_000_000,
+                host_metadata_bytes: 1024,
+            }),
+            ..Observation::default()
+        },
+        Observation {
+            startup_projection: Some(ProjectionStartup::NativeQ2Partial {
+                architecture: 73,
+                resident_tensors: 0,
+                resident_weight_bytes: 1_000_000,
+                host_metadata_bytes: 1024,
+            }),
+            ..Observation::default()
+        },
+        Observation {
+            startup_projection: Some(ProjectionStartup::NativeQ2Partial {
+                architecture: 73,
+                resident_tensors: 168,
+                resident_weight_bytes: 1_000_000,
+                host_metadata_bytes: 1024,
             }),
             ..Observation::default()
         },

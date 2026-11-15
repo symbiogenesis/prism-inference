@@ -3,7 +3,7 @@
 //! All layouts and solver formulas match `ggml-hexagon.dll` / `libggml-htp-v81.so`
 //! from the signed package (`19cce6919992fdffd92e0ac152caaf1e2b8f254e`).
 
-use crate::{Error, HMX_Q2_HVX_WORKERS, HMX_Q2_VTCM_REQUEST_BYTES};
+use crate::{Error, HMX_Q2_VTCM_REQUEST_BYTES};
 
 /// Operation codes supported by the signed `libggml-htp-v81.so` CDSP binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,13 +129,13 @@ pub const fn htp_fastdiv(divisor: u32) -> u64 {
 }
 
 /// Solve the 64-byte `kparams` block (`op_desc[72..136]`) for `HTP_OP_RMS_NORM` (`9`),
-/// `HTP_OP_RMS_NORM_MUL` (`10`), `HTP_OP_UNARY_SILU` (`11`) and `HTP_OP_HADAMARD` (`69`).
-///
-/// Matches `htp_kparams_solve_unary` (`0x18002A41C`) in `ggml-hexagon.dll`.
+/// `HTP_OP_RMS_NORM_MUL` (`10`), `HTP_OP_UNARY_SILU` (`11`) and `HTP_OP_HADAMARD` (`69`)
+/// using the active [`HtpArchProfile`](crate::HtpArchProfile).
 ///
 /// # Errors
-/// Rejects zero extents or configurations that exceed the 2 MiB VTCM budget.
-pub fn solve_unary_kparams(
+/// Rejects zero extents or configurations that exceed the profile's VTCM budget or DMA32 stride limits.
+pub fn solve_unary_kparams_for_profile(
+    profile: crate::HtpArchProfile,
     op: HtpOpCode,
     columns: u32,
     rows: u32,
@@ -153,7 +153,7 @@ pub fn solve_unary_kparams(
         return Err(Error::Contract);
     }
     let row_bytes = columns.checked_mul(4).ok_or(Error::Contract)?;
-    let n_threads = rows.clamp(1, HMX_Q2_HVX_WORKERS);
+    let n_threads = rows.clamp(1, profile.hvx_workers.max(1));
     let nrows_per_thread = rows.div_ceil(n_threads);
     let bcast_src1 = u32::from(op == HtpOpCode::RmsNormMul && src1_rows <= 1);
     let buffers_per_row = match op {
@@ -171,7 +171,8 @@ pub fn solve_unary_kparams(
         .and_then(|bytes| bytes.checked_mul(n_threads))
         .and_then(|bytes| bytes.checked_add(bcast_vtcm))
         .ok_or(Error::Contract)?;
-    if per_thread_vtcm > HMX_Q2_VTCM_REQUEST_BYTES {
+    let vtcm_limit = profile.vtcm_bytes.min(HMX_Q2_VTCM_REQUEST_BYTES);
+    if per_thread_vtcm > vtcm_limit {
         return Err(Error::Contract);
     }
     let mut kp = [0_u8; 64];
@@ -190,13 +191,32 @@ pub fn solve_unary_kparams(
     Ok(kp)
 }
 
-/// Solve the 12-byte `kparams` block (`op_desc[72..84]`) for `HTP_OP_GLU_SWIGLU` (`22`).
+/// Solve the 64-byte `kparams` block (`op_desc[72..136]`) for `HTP_OP_RMS_NORM` (`9`),
+/// `HTP_OP_RMS_NORM_MUL` (`10`), `HTP_OP_UNARY_SILU` (`11`) and `HTP_OP_HADAMARD` (`69`).
 ///
-/// Matches `htp_kparams_solve_glu` (`0x18002AE5C`) in `ggml-hexagon.dll`.
+/// Matches `htp_kparams_solve_unary` (`0x18002A41C`) in `ggml-hexagon.dll`.
 ///
 /// # Errors
-/// Rejects zero extents or row sizes that cannot fit at least 2 rows in VTCM.
-pub fn solve_glu_kparams(columns: u32, rows: u32) -> Result<[u8; 12], Error> {
+/// Rejects zero extents or configurations that exceed the 2 MiB VTCM budget.
+pub fn solve_unary_kparams(
+    op: HtpOpCode,
+    columns: u32,
+    rows: u32,
+    src1_rows: u32,
+) -> Result<[u8; 64], Error> {
+    solve_unary_kparams_for_profile(crate::HtpArchProfile::v81(), op, columns, rows, src1_rows)
+}
+
+/// Solve the 12-byte `kparams` block (`op_desc[72..84]`) for `HTP_OP_GLU_SWIGLU` (`22`)
+/// using the active [`HtpArchProfile`](crate::HtpArchProfile).
+///
+/// # Errors
+/// Rejects zero extents or row sizes that cannot fit at least 2 rows in the profile's VTCM budget.
+pub fn solve_glu_kparams_for_profile(
+    profile: crate::HtpArchProfile,
+    columns: u32,
+    rows: u32,
+) -> Result<[u8; 12], Error> {
     if columns == 0 || rows == 0 {
         return Err(Error::Contract);
     }
@@ -205,12 +225,13 @@ pub fn solve_glu_kparams(columns: u32, rows: u32) -> Result<[u8; 12], Error> {
     if requires_dma64_stride(u64::from(aligned_row)) {
         return Err(Error::Contract);
     }
-    let n_threads = rows.clamp(1, HMX_Q2_HVX_WORKERS);
+    let n_threads = rows.clamp(1, profile.hvx_workers.max(1));
     let per_step_bytes = aligned_row
         .checked_mul(n_threads)
         .and_then(|bytes| bytes.checked_mul(3))
         .ok_or(Error::Contract)?;
-    let max_chunk_rows = HMX_Q2_VTCM_REQUEST_BYTES / per_step_bytes;
+    let vtcm_limit = profile.vtcm_bytes.min(HMX_Q2_VTCM_REQUEST_BYTES);
+    let max_chunk_rows = vtcm_limit / per_step_bytes;
     if max_chunk_rows < 2 {
         return Err(Error::Contract);
     }
@@ -235,14 +256,28 @@ pub fn solve_glu_kparams(columns: u32, rows: u32) -> Result<[u8; 12], Error> {
     Ok(kp)
 }
 
-/// Solve the 96-byte `kparams` block (`op_desc[72..168]`) for contiguous same-shape `F32`
-/// binary operations (`HTP_OP_MUL = 0`, `HTP_OP_ADD = 1`, `HTP_OP_SUB = 2`, `HTP_OP_DIV = 3`).
+/// Solve the 12-byte `kparams` block (`op_desc[72..84]`) for `HTP_OP_GLU_SWIGLU` (`22`).
 ///
-/// Matches `htp_kparams_solve_binary` (`0x18002CB00`) in `ggml-hexagon.dll`.
+/// Matches `htp_kparams_solve_glu` (`0x18002AE5C`) in `ggml-hexagon.dll`.
+///
+/// # Errors
+/// Rejects zero extents or row sizes that cannot fit at least 2 rows in VTCM.
+pub fn solve_glu_kparams(columns: u32, rows: u32) -> Result<[u8; 12], Error> {
+    solve_glu_kparams_for_profile(crate::HtpArchProfile::v81(), columns, rows)
+}
+
+/// Solve the 96-byte `kparams` block (`op_desc[72..168]`) for contiguous same-shape `F32`
+/// binary operations (`HTP_OP_MUL = 0`, `HTP_OP_ADD = 1`, `HTP_OP_SUB = 2`, `HTP_OP_DIV = 3`)
+/// using the active [`HtpArchProfile`](crate::HtpArchProfile).
 ///
 /// # Errors
 /// Rejects non-binary opcodes, zero extents or VTCM overflow.
-pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u8; 96], Error> {
+pub fn solve_binary_kparams_for_profile(
+    profile: crate::HtpArchProfile,
+    op: HtpOpCode,
+    columns: u32,
+    rows: u32,
+) -> Result<[u8; 96], Error> {
     if !matches!(
         op,
         HtpOpCode::Mul | HtpOpCode::Add | HtpOpCode::Sub | HtpOpCode::Div
@@ -251,15 +286,16 @@ pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u
     {
         return Err(Error::Contract);
     }
+    let worker_cap = profile.hvx_workers.max(1);
     let total_elems = columns.checked_mul(rows).ok_or(Error::Contract)?;
     let max_chunk_elems = 32_768_u32 / 4;
     let target = total_elems
-        .div_ceil(HMX_Q2_HVX_WORKERS * 2)
+        .div_ceil(worker_cap * 2)
         .next_multiple_of(32)
         .max(256)
         .min(max_chunk_elems);
     let n_chunks = total_elems.div_ceil(target);
-    let n_threads = n_chunks.clamp(1, HMX_Q2_HVX_WORKERS);
+    let n_threads = n_chunks.clamp(1, worker_cap);
     let chunk_bytes = (target * 4).next_multiple_of(128);
     let row_bytes = columns
         .checked_mul(4)
@@ -272,7 +308,8 @@ pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u
         .checked_mul(3)
         .and_then(|bytes| bytes.checked_mul(n_threads))
         .ok_or(Error::Contract)?;
-    if vtcm_size > HMX_Q2_VTCM_REQUEST_BYTES {
+    let vtcm_limit = profile.vtcm_bytes.min(HMX_Q2_VTCM_REQUEST_BYTES);
+    if vtcm_size > vtcm_limit {
         return Err(Error::Contract);
     }
     let mut kp = [0_u8; 96];
@@ -292,6 +329,17 @@ pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u
         put64(&mut kp, offset, htp_fastdiv(1));
     }
     Ok(kp)
+}
+
+/// Solve the 96-byte `kparams` block (`op_desc[72..168]`) for contiguous same-shape `F32`
+/// binary operations (`HTP_OP_MUL = 0`, `HTP_OP_ADD = 1`, `HTP_OP_SUB = 2`, `HTP_OP_DIV = 3`).
+///
+/// Matches `htp_kparams_solve_binary` (`0x18002CB00`) in `ggml-hexagon.dll`.
+///
+/// # Errors
+/// Rejects non-binary opcodes, zero extents or VTCM overflow.
+pub fn solve_binary_kparams(op: HtpOpCode, columns: u32, rows: u32) -> Result<[u8; 96], Error> {
+    solve_binary_kparams_for_profile(crate::HtpArchProfile::v81(), op, columns, rows)
 }
 
 fn put32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -355,6 +403,30 @@ mod tests {
             u64::from(HTP_DMA32_MAX_STRIDE_BYTES) + 1
         ));
         assert!(solve_binary_kparams(HtpOpCode::Add, 4_194_304, 1).is_err());
+
+        let v73 = crate::HtpArchProfile::v73_default();
+        let mul_v73 = solve_binary_kparams_for_profile(v73, HtpOpCode::Mul, 17_408, 1)?;
+        assert_eq!(mul_v73[0], 6);
+        assert_eq!(
+            u32::from_le_bytes([mul_v73[8], mul_v73[9], mul_v73[10], mul_v73[11]]),
+            4
+        );
+        let mul_vtcm = u32::from_le_bytes([mul_v73[36], mul_v73[37], mul_v73[38], mul_v73[39]]);
+        assert!(mul_vtcm > 0 && mul_vtcm <= v73.vtcm_bytes);
+        let glu_v73 = solve_glu_kparams_for_profile(v73, 32, 160)?;
+        let rms_v73 = solve_unary_kparams_for_profile(v73, HtpOpCode::RmsNormMul, 5120, 8, 1)?;
+        assert_eq!(
+            u32::from_le_bytes([glu_v73[0], glu_v73[1], glu_v73[2], glu_v73[3]]),
+            4
+        );
+        let glu_vtcm = u32::from_le_bytes([glu_v73[8], glu_v73[9], glu_v73[10], glu_v73[11]]);
+        assert!(glu_vtcm > 0 && glu_vtcm <= v73.vtcm_bytes);
+        assert_eq!(
+            u32::from_le_bytes([rms_v73[0], rms_v73[1], rms_v73[2], rms_v73[3]]),
+            4
+        );
+        let rms_vtcm = u32::from_le_bytes([rms_v73[24], rms_v73[25], rms_v73[26], rms_v73[27]]);
+        assert!(rms_vtcm > 0 && rms_vtcm <= v73.vtcm_bytes);
         Ok(())
     }
 }

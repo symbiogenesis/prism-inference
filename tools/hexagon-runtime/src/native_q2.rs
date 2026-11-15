@@ -473,6 +473,12 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(self)
     }
 
+    /// Active HTP DSP architecture version reported by the underlying submitter (`81` or `73`).
+    #[must_use]
+    pub fn htp_architecture(&self) -> u32 {
+        self.submitter.htp_architecture()
+    }
+
     /// Native-arena preparation and host metadata observations.
     #[must_use]
     pub fn residency_statistics(&self) -> NativeQ2ResidencyStatistics {
@@ -705,8 +711,72 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                     ));
                 }
             }
+            self.scratch_weights = weights;
         }
         Ok(())
+    }
+
+    /// Pre-warm as many leading `tensors` as fit in the opened resident weight
+    /// arena(s), binding the executor's allowed tensor set strictly to that
+    /// admitted prefix.
+    ///
+    /// Intended for `Hexagon v73` (`X1`) devices whose DSP/FastRPC secondary
+    /// arena ceiling may admit a layer prefix rather than all 168 projections;
+    /// unselected tail tensors return `Ok(false)` from [`Self::execute_f32`] and
+    /// fall back cleanly to CPU or GPU execution.
+    ///
+    /// # Errors
+    /// Rejects empty selections, already-bound executors, unsupported tensors
+    /// before reaching capacity, or an arena too small to hold even one tensor.
+    pub fn select_prefix_and_prewarm_tensors(&mut self, tensors: &[Tensor]) -> Result<usize> {
+        if tensors.is_empty() || self.allowed_tensors.is_some() || self.failed {
+            return Err(invalid("invalid native Q2 selected tensor configuration"));
+        }
+        let mut selected = Vec::new();
+        if self.residency.is_some() {
+            let mut weights = std::mem::take(&mut self.scratch_weights);
+            for tensor in tensors {
+                if !self.supports_f32(tensor) {
+                    self.scratch_weights = weights;
+                    return Err(invalid("unsupported native Q2 selected projection tensor"));
+                }
+                if !self.prewarm_tensor_with_scratch(tensor, &mut weights)? {
+                    break;
+                }
+                selected
+                    .try_reserve(1)
+                    .map_err(|_| invalid("native Q2 selected tensor metadata allocation failed"))?;
+                selected.push(tensor.clone());
+            }
+            self.scratch_weights = weights;
+        } else {
+            selected
+                .try_reserve_exact(tensors.len())
+                .map_err(|_| invalid("native Q2 selected tensor metadata allocation failed"))?;
+            for tensor in tensors {
+                if !self.supports_f32(tensor) {
+                    return Err(invalid("unsupported native Q2 selected projection tensor"));
+                }
+                selected.push(tensor.clone());
+            }
+        }
+        let prepared = selected.len();
+        if prepared == 0 {
+            self.failed = true;
+            return Err(invalid(
+                "native Q2 resident arena exhausted before preparing any tensor",
+            ));
+        }
+        selected.sort_by(|left, right| selected_tensor_key(left).cmp(&selected_tensor_key(right)));
+        let min_addr = selected
+            .first()
+            .map_or(0, |tensor| tensor.data.as_ptr().addr());
+        let max_addr = selected
+            .last()
+            .map_or(0, |tensor| tensor.data.as_ptr().addr());
+        self.allowed_addr_range = (min_addr, max_addr);
+        self.allowed_tensors = Some(selected);
+        Ok(prepared)
     }
 
     fn project_single_op(
@@ -5259,6 +5329,63 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn select_prefix_and_prewarm_tensors_admits_fitting_prefix_and_falls_back_on_tail() -> Result<()>
+    {
+        let columns = 256;
+        let blocks = columns / 128;
+        let make_tensor = |name: &str, rows: usize| {
+            let mut data = vec![0x55_u8; rows * blocks * 34];
+            for block in data.as_chunks_mut::<34>().0 {
+                block[0] = 0x00;
+                block[1] = 0x38;
+            }
+            Tensor {
+                name: name.to_owned(),
+                dimensions: vec![columns, rows],
+                kind: 142,
+                data: Arc::from(data),
+            }
+        };
+        let first = make_tensor("blk.0.ffn_gate.weight", 32);
+        let second = make_tensor("blk.0.ffn_up.weight", 32);
+        let third = make_tensor("blk.0.ffn_down.weight", 32);
+        // Native packed [256, 32] Q2_0 extent is 2304 bytes; 5000 bytes admits 2 tensors and skips the 3rd.
+        let limits = NativeQ2ProjectionLimits::new(5120, 17_408, 64, Duration::from_secs(4))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(5000)
+            .map_err(|_| invalid("residency"))?;
+        let mut submitter = MockNativeSubmitter {
+            batch_ffn: false,
+            ffn_pair_calls: 0,
+            calls: 0,
+            resident_calls: 0,
+            remaining: 64,
+            residency_bytes: 5000,
+        };
+        let mut executor = NativeQ2Executor::new(&mut submitter, limits, 64 * 1024 * 1024)
+            .with_resident_weights(16_384)?;
+        let prepared = executor.select_prefix_and_prewarm_tensors(&[
+            first.clone(),
+            second.clone(),
+            third.clone(),
+        ])?;
+        assert_eq!(prepared, 2);
+        assert_eq!(executor.residency_statistics().tensors_prepared, 2);
+
+        assert!(Pq2ProjectionExecutor::supports_f32(&executor, &first));
+        assert!(!Pq2ProjectionExecutor::supports_f32(&executor, &third));
+        let activation = vec![1.0_f32; columns];
+        let mut output = Vec::new();
+        Pq2ProjectionExecutor::project_f32(&mut executor, &first, &activation, true, &mut output)?;
+        assert_eq!(output.len(), 32);
+        assert!(
+            Pq2ProjectionExecutor::project_f32(&mut executor, &third, &activation, true, &mut output)
+                .is_err()
+        );
         Ok(())
     }
 }

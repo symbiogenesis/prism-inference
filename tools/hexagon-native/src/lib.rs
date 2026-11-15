@@ -35,7 +35,8 @@ pub use hmx_projection::{
 };
 pub use htp_ops::{
     HTP_DMA32_MAX_STRIDE_BYTES, HtpOpCode, HtpOpPassFlags, htp_fastdiv, requires_dma64_stride,
-    solve_binary_kparams, solve_glu_kparams, solve_unary_kparams,
+    solve_binary_kparams, solve_binary_kparams_for_profile, solve_glu_kparams,
+    solve_glu_kparams_for_profile, solve_unary_kparams, solve_unary_kparams_for_profile,
 };
 pub use native_q2::{
     NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES, NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES,
@@ -51,7 +52,8 @@ pub use projection::{
     Q2ProjectionReport,
 };
 pub use session::{
-    GET_EFFECTIVE_DOMAIN_ID, GET_URI, MAP_FD, MAP_FD_DELAYED, SessionPreparationReport,
+    GET_EFFECTIVE_DOMAIN_ID, GET_URI, HtpArchProfile, MAP_FD, MAP_FD_DELAYED,
+    SessionPreparationReport, is_supported_htp_architecture,
 };
 pub use session_mapping::SessionMappingReport;
 
@@ -1001,6 +1003,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 output: &mut [f32],
             ) -> Result<(), Error> {
                 $dispatch!(self, submit(columns, rows, weights, activation, output))
+            }
+
+            fn htp_architecture(&self) -> u32 {
+                $dispatch!(self, htp_architecture())
             }
         }
     };

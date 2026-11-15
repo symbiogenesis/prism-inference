@@ -12,7 +12,7 @@
 )]
 
 use crate::{
-    Error, HMX_Q2_HVX_WORKERS, HMX_Q2_POWER_MODE_BURST, HMX_Q2_VTCM_REQUEST_BYTES,
+    Error, HMX_Q2_POWER_MODE_BURST, HMX_Q2_VTCM_REQUEST_BYTES,
     Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits, Q2ProjectionReport, compute, hmx_projection,
     projection,
 };
@@ -166,6 +166,7 @@ pub struct NativeQ2ProjectionLimits {
     pub(crate) columns: usize,
     pub(crate) common: Q2ProjectionLimits,
     pub(crate) resident_weight_bytes: usize,
+    pub(crate) allow_partial_secondary_arenas: bool,
 }
 
 impl NativeQ2ProjectionLimits {
@@ -187,6 +188,7 @@ impl NativeQ2ProjectionLimits {
             columns,
             common: Q2ProjectionLimits::new(rows, operations, duration)?,
             resident_weight_bytes: 0,
+            allow_partial_secondary_arenas: false,
         })
     }
 
@@ -200,6 +202,21 @@ impl NativeQ2ProjectionLimits {
         }
         self.resident_weight_bytes = bytes;
         Ok(self)
+    }
+
+    /// Allow opening a session with a mapped prefix of secondary weight arenas when
+    /// a `FastRPC` secondary allocation or DSP mapping hits a driver/address-space ceiling
+    /// (for example on `v73` CDSP devices).
+    #[must_use]
+    pub const fn with_partial_secondary_arenas(mut self) -> Self {
+        self.allow_partial_secondary_arenas = true;
+        self
+    }
+
+    /// Whether partial secondary-arena residency fallback is permitted on session open.
+    #[must_use]
+    pub const fn allows_partial_secondary_arenas(self) -> bool {
+        self.allow_partial_secondary_arenas
     }
 
     /// Enable persistent service-lifetime operation without idle wall-clock expiration.
@@ -271,8 +288,10 @@ pub struct NativeQ2WeightHandle {
     columns: usize,
     rows: usize,
     // Geometry is immutable for the lifetime of the registry reservation. Keep
-    // its solver result with the handle instead of resolving it for every token.
+    // its solver result and HVX worker count with the handle instead of resolving
+    // it for every token.
     hvx_params: (u8, u32, u32),
+    hvx_workers: u8,
 }
 
 impl NativeQ2WeightHandle {
@@ -310,15 +329,43 @@ pub struct NativeQ2WeightRegistry {
     arena_count: usize,
     active_arena: usize,
     total_used: usize,
+    profile: crate::HtpArchProfile,
 }
 
 impl NativeQ2WeightRegistry {
-    /// Create one independent owner with an explicitly admitted payload bound.
+    /// Create one independent owner with an explicitly admitted payload bound
+    /// using the default `v81` HTP hardware profile.
     ///
     /// # Errors
     /// Rejects capacity above `NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES`.
     pub fn new(capacity_bytes: usize) -> Result<Self, Error> {
         let (capacities, arena_count) = arena_capacities(capacity_bytes).ok_or(Error::Contract)?;
+        Self::from_arena_capacities_for_profile(capacities, arena_count, crate::HtpArchProfile::v81())
+    }
+
+    /// Create one independent owner over an explicit mapped arena slice and hardware profile
+    /// (used when partial secondary arena allocation truncates mapped arenas on `v73`).
+    ///
+    /// # Errors
+    /// Rejects `arena_count == 0`, `arena_count > NATIVE_Q2_MAX_WEIGHT_ARENAS`, or capacities
+    /// whose sum exceeds `NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES`.
+    pub fn from_arena_capacities_for_profile(
+        mut capacities: [usize; NATIVE_Q2_MAX_WEIGHT_ARENAS],
+        arena_count: usize,
+        profile: crate::HtpArchProfile,
+    ) -> Result<Self, Error> {
+        if arena_count == 0 || arena_count > NATIVE_Q2_MAX_WEIGHT_ARENAS {
+            return Err(Error::Contract);
+        }
+        let mut idx = arena_count;
+        while idx < NATIVE_Q2_MAX_WEIGHT_ARENAS {
+            capacities[idx] = 0;
+            idx += 1;
+        }
+        let total: usize = capacities[..arena_count].iter().copied().sum();
+        if total > NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES {
+            return Err(Error::Contract);
+        }
         Ok(Self {
             owner: NEXT_NATIVE_REGISTRY_OWNER.fetch_add(1, Ordering::Relaxed),
             capacities,
@@ -326,6 +373,7 @@ impl NativeQ2WeightRegistry {
             arena_count,
             active_arena: 0,
             total_used: 0,
+            profile,
         })
     }
 
@@ -369,7 +417,8 @@ impl NativeQ2WeightRegistry {
         rows: usize,
         weight_bytes: usize,
     ) -> Result<Option<NativeQ2WeightHandle>, Error> {
-        let hvx_params = hvx_mv_params(columns, rows)?;
+        let hvx_params = hvx_mv_params_for_profile(self.profile, columns, rows)?;
+        let hvx_workers = u8::try_from(self.profile.hvx_workers.max(1)).map_err(|_| Error::Contract)?;
         let mut arena_idx = self.active_arena;
         while arena_idx < self.arena_count {
             let start = self.used[arena_idx].next_multiple_of(128);
@@ -386,6 +435,7 @@ impl NativeQ2WeightRegistry {
                     columns,
                     rows,
                     hvx_params,
+                    hvx_workers,
                 }));
             }
             arena_idx += 1;
@@ -779,6 +829,11 @@ pub trait NativeQ2Submitter {
         result
     }
 
+    /// Reported Hexagon HTP ISA version (`81` on X2, `73` on X1).
+    fn htp_architecture(&self) -> u32 {
+        81
+    }
+
     /// Submit tiled `HTP_TYPE_Q2_0` weights (`[columns, rows]`) and one `F32`
     /// activation vector (`[columns]`) in a single DSP operation.
     ///
@@ -796,6 +851,10 @@ pub trait NativeQ2Submitter {
 }
 
 impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
+    fn htp_architecture(&self) -> u32 {
+        (**self).htp_architecture()
+    }
+
     fn maximum_resident_token_batch(&self) -> usize {
         (**self).maximum_resident_token_batch()
     }
@@ -1018,11 +1077,16 @@ pub(crate) const fn working_allocation(columns: usize, rows: usize) -> usize {
     }
 }
 
-pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], Error> {
+pub(crate) fn start_wire_for_profile(
+    profile: crate::HtpArchProfile,
+    queue_id: u64,
+    allocation: usize,
+) -> Result<[u8; 48], Error> {
     let mut result = compute::start_wire(queue_id);
-    put32(&mut result, 16, HMX_Q2_HVX_WORKERS);
+    let vtcm_request = profile.vtcm_bytes.min(NATIVE_Q2_VTCM_REQUEST_BYTES);
+    put32(&mut result, 16, profile.hvx_workers.max(1));
     put32(&mut result, 20, 1);
-    put32(&mut result, 24, NATIVE_Q2_VTCM_REQUEST_BYTES);
+    put32(&mut result, 24, vtcm_request);
     put32(&mut result, 40, HMX_Q2_POWER_MODE_BURST);
     put64(
         &mut result,
@@ -1032,13 +1096,26 @@ pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], E
     Ok(result)
 }
 
+#[allow(
+    dead_code,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn start_wire(queue_id: u64, allocation: usize) -> Result<[u8; 48], Error> {
+    start_wire_for_profile(crate::HtpArchProfile::v81(), queue_id, allocation)
+}
+
 /// Specialization of `htp_kparams_solve_matmul` (`0x1800282F0`) and
 /// `htp_kparams_solve_hvx_mv` (`0x1800322DC` + `0x180029EB0`) at pinned
 /// `19cce691` for `src0 = HTP_TYPE_Q2_0 (42)`, `src1 = F32`, `dst = F32`,
-/// `N = 1`, `n_hvx = 8` and `2 MiB` / `4 MiB` VTCM.
+/// `N = 1`, parameterized by the opened HTP architecture's HVX worker count
+/// and VTCM capacity (`v81`: 8 HVX, 2/4 MiB VTCM; `v73`: 4 HVX, 2 MiB VTCM).
 ///
 /// Returns `(n_prefetch, src1_row_size, vtcm_size)`.
-pub(crate) fn hvx_mv_params(columns: usize, rows: usize) -> Result<(u8, u32, u32), Error> {
+pub(crate) fn hvx_mv_params_for_profile(
+    profile: crate::HtpArchProfile,
+    columns: usize,
+    rows: usize,
+) -> Result<(u8, u32, u32), Error> {
     if columns == 0
         || columns > NATIVE_Q2_MAX_COLUMNS
         || !columns.is_multiple_of(128)
@@ -1048,13 +1125,14 @@ pub(crate) fn hvx_mv_params(columns: usize, rows: usize) -> Result<(u8, u32, u32
     {
         return Err(Error::Contract);
     }
-    let vtcm_request = if columns > 6144 {
+    let desired_vtcm = if columns > 6144 {
         NATIVE_Q2_VTCM_REQUEST_BYTES
     } else {
         HMX_Q2_VTCM_REQUEST_BYTES
     };
+    let vtcm_request = desired_vtcm.min(profile.vtcm_bytes);
     let vtcm_budget = usize::try_from(vtcm_request).map_err(|_| Error::Contract)?;
-    let n_threads = usize::try_from(HMX_Q2_HVX_WORKERS).map_err(|_| Error::Contract)?;
+    let n_threads = usize::try_from(profile.hvx_workers.max(1)).map_err(|_| Error::Contract)?;
     let k_groups = ((columns + 127) >> 5) & !3;
     let src1_row_size = k_groups * 1280;
     let k_tiles = (columns + 63) >> 6;
@@ -1076,6 +1154,14 @@ pub(crate) fn hvx_mv_params(columns: usize, rows: usize) -> Result<(u8, u32, u32
         n_prefetch >>= 1;
     }
     Err(Error::Contract)
+}
+
+#[allow(
+    dead_code,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn hvx_mv_params(columns: usize, rows: usize) -> Result<(u8, u32, u32), Error> {
+    hvx_mv_params_for_profile(crate::HtpArchProfile::v81(), columns, rows)
 }
 
 pub(crate) fn validate_inputs(
@@ -1233,7 +1319,8 @@ pub(crate) fn validate_weights(
     Ok(())
 }
 
-pub(crate) fn image(
+pub(crate) fn image_for_profile(
+    profile: crate::HtpArchProfile,
     bytes: &mut [u8],
     base: u64,
     fd: u32,
@@ -1247,6 +1334,7 @@ pub(crate) fn image(
         return Err(Error::Contract);
     }
     let weights_offset = (active.output + rows * 4).next_multiple_of(128);
+    let hvx_workers = u8::try_from(profile.hvx_workers.max(1)).map_err(|_| Error::Contract)?;
     write_frame(
         bytes,
         base,
@@ -1257,10 +1345,36 @@ pub(crate) fn image(
         weights_offset,
         active,
         activation,
-        hvx_mv_params(columns, rows)?,
+        hvx_mv_params_for_profile(profile, columns, rows)?,
+        hvx_workers,
     )?;
     bytes[weights_offset..weights_offset + weights.len()].copy_from_slice(weights);
     Ok(active)
+}
+
+#[allow(
+    dead_code,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn image(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    columns: usize,
+    rows: usize,
+    weights: &[u8],
+    activation: &[f32],
+) -> Result<projection::Layout, Error> {
+    image_for_profile(
+        crate::HtpArchProfile::v81(),
+        bytes,
+        base,
+        fd,
+        columns,
+        rows,
+        weights,
+        activation,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1312,6 +1426,7 @@ pub(crate) fn image_resident(
             active,
             activation,
             handle.hvx_params,
+            handle.hvx_workers,
         )?;
         return Ok(ResidentLayout {
             output: active.output,
@@ -1360,6 +1475,7 @@ pub(crate) fn image_resident(
         active.activation,
         active.output,
         handle.hvx_params,
+        handle.hvx_workers,
     )?;
     for (dst, &value) in working[active.activation..active.activation + act_bytes]
         .as_chunks_mut::<4>()
@@ -1563,7 +1679,9 @@ fn image_multi_resident_with_pad<const B: usize>(
         // relocate every member-specific field. Handles, arena validation and
         // submission order remain unchanged; no template survives the packet.
         if let Some(previous) = handles[..member].iter().position(|previous| {
-            previous.rows == handle.rows && previous.hvx_params == handle.hvx_params
+            previous.rows == handle.rows
+                && previous.hvx_params == handle.hvx_params
+                && previous.hvx_workers == handle.hvx_workers
         }) {
             copy_member_descriptors(
                 working,
@@ -1592,6 +1710,7 @@ fn image_multi_resident_with_pad<const B: usize>(
             act_offsets[member],
             output_offsets[member],
             handle.hvx_params,
+            handle.hvx_workers,
         )?;
     }
     for (member, &activation) in activations.iter().enumerate() {
@@ -1635,7 +1754,8 @@ pub(crate) struct FfnSwigluLayout {
     clippy::too_many_arguments,
     reason = "Keep 2x Q2_0 MulMat + 1x GluSwiglu descriptor assembly and VTCM pass flags together"
 )]
-pub(crate) fn image_ffn_swiglu_resident(
+pub(crate) fn image_ffn_swiglu_resident_for_profile(
+    profile: crate::HtpArchProfile,
     bytes: &mut [u8],
     base: u64,
     fd: u32,
@@ -1681,8 +1801,11 @@ pub(crate) fn image_ffn_swiglu_resident(
     working.copy_within(old_ops_base..old_ops_base + 2 * 232, new_ops_base);
     working[tensors_base + 6 * 56..new_ops_base].fill(0);
 
-    // Chained VTCM flags on Op 0 (gate) and Op 1 (up) when 3 * out_bytes fits inside 1 MiB of VTCM.
-    let vtcm_chain = out_bytes.saturating_mul(3) <= 1_048_576;
+    // Chained VTCM flags on Op 0 (gate) and Op 1 (up) when 3 * out_bytes fits inside half of active VTCM (up to 1 MiB).
+    let vtcm_chain_budget = usize::try_from(profile.vtcm_bytes / 2)
+        .unwrap_or(usize::MAX)
+        .min(1_048_576);
+    let vtcm_chain = out_bytes.saturating_mul(3) <= vtcm_chain_budget;
     let matmul_pass = if vtcm_chain {
         crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
     } else {
@@ -1705,7 +1828,7 @@ pub(crate) fn image_ffn_swiglu_resident(
     };
     let glu_cols_u32 = u32::try_from(glu_cols).map_err(|_| Error::Contract)?;
     let glu_rows_u32 = u32::try_from(glu_rows).map_err(|_| Error::Contract)?;
-    let glu_kp = crate::htp_ops::solve_glu_kparams(glu_cols_u32, glu_rows_u32)?;
+    let glu_kp = crate::htp_ops::solve_glu_kparams_for_profile(profile, glu_cols_u32, glu_rows_u32)?;
     let glu_row_bytes = glu_cols * 4;
 
     for (ti_offset, buf_offset) in [
@@ -1768,6 +1891,34 @@ pub(crate) fn image_ffn_swiglu_resident(
     })
 }
 
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn image_ffn_swiglu_resident(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    activation: &[f32],
+) -> Result<FfnSwigluLayout, Error> {
+    image_ffn_swiglu_resident_for_profile(
+        crate::HtpArchProfile::v81(),
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        gate_handle,
+        up_handle,
+        activation,
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct FfnSwigluMulti2Layout {
     pub(crate) output_offsets: [usize; 2],
@@ -1784,7 +1935,8 @@ pub(crate) struct FfnSwigluMulti2Layout {
     clippy::too_many_arguments,
     reason = "Keep 2-token 6-op FFN SwiGLU descriptor assembly and VTCM pass flags together"
 )]
-pub(crate) fn image_ffn_swiglu_multi2_resident(
+pub(crate) fn image_ffn_swiglu_multi2_resident_for_profile(
+    profile: crate::HtpArchProfile,
     bytes: &mut [u8],
     base: u64,
     fd: u32,
@@ -1863,7 +2015,10 @@ pub(crate) fn image_ffn_swiglu_multi2_resident(
     put16(working, op4_desc + 202, 13);
     put16(working, op4_desc + 220, 14);
 
-    let vtcm_chain = out_bytes.saturating_mul(3) <= 1_048_576;
+    let vtcm_chain_budget = usize::try_from(profile.vtcm_bytes / 2)
+        .unwrap_or(usize::MAX)
+        .min(1_048_576);
+    let vtcm_chain = out_bytes.saturating_mul(3) <= vtcm_chain_budget;
     let matmul_pass = if vtcm_chain {
         crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
     } else {
@@ -1886,7 +2041,7 @@ pub(crate) fn image_ffn_swiglu_multi2_resident(
     };
     let glu_cols_u32 = u32::try_from(glu_cols).map_err(|_| Error::Contract)?;
     let glu_rows_u32 = u32::try_from(glu_rows).map_err(|_| Error::Contract)?;
-    let glu_kp = crate::htp_ops::solve_glu_kparams(glu_cols_u32, glu_rows_u32)?;
+    let glu_kp = crate::htp_ops::solve_glu_kparams_for_profile(profile, glu_cols_u32, glu_rows_u32)?;
     let glu_row_bytes = glu_cols * 4;
 
     for (ti_offset, buf_offset) in [
@@ -1954,6 +2109,34 @@ pub(crate) fn image_ffn_swiglu_multi2_resident(
     })
 }
 
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn image_ffn_swiglu_multi2_resident(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    activations: [&[f32]; 2],
+) -> Result<FfnSwigluMulti2Layout, Error> {
+    image_ffn_swiglu_multi2_resident_for_profile(
+        crate::HtpArchProfile::v81(),
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        gate_handle,
+        up_handle,
+        activations,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
     dead_code,
@@ -2019,7 +2202,8 @@ fn write_f32_2d_tensor_desc(
     clippy::too_many_arguments,
     reason = "Keep full intra-layer FFN 4/5/6-op packet inputs together"
 )]
-pub(crate) fn image_ffn_full_chain_resident(
+pub(crate) fn image_ffn_full_chain_resident_for_profile(
+    profile: crate::HtpArchProfile,
     bytes: &mut [u8],
     base: u64,
     fd: u32,
@@ -2033,6 +2217,7 @@ pub(crate) fn image_ffn_full_chain_resident(
     hadamard_block_size: Option<u32>,
 ) -> Result<FfnFullChainLayout, Error> {
     let active = image_ffn_full_chain_resident_batch(
+        profile,
         bytes,
         base,
         fd,
@@ -2054,6 +2239,40 @@ pub(crate) fn image_ffn_full_chain_resident(
     })
 }
 
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn image_ffn_full_chain_resident(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    down_handle: &NativeQ2WeightHandle,
+    activation: &[f32],
+    residual: Option<&[f32]>,
+    hadamard_block_size: Option<u32>,
+) -> Result<FfnFullChainLayout, Error> {
+    image_ffn_full_chain_resident_for_profile(
+        crate::HtpArchProfile::v81(),
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        gate_handle,
+        up_handle,
+        down_handle,
+        activation,
+        residual,
+        hadamard_block_size,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FfnFullChainBatchLayout<const B: usize> {
     pub(crate) output_offsets: [usize; B],
@@ -2067,7 +2286,8 @@ pub(crate) struct FfnFullChainBatchLayout<const B: usize> {
     clippy::too_many_arguments,
     reason = "Keep two-token FFN chain packet inputs together"
 )]
-pub(crate) fn image_ffn_full_chain_resident_multi2(
+pub(crate) fn image_ffn_full_chain_resident_multi2_for_profile(
+    profile: crate::HtpArchProfile,
     bytes: &mut [u8],
     base: u64,
     fd: u32,
@@ -2079,6 +2299,7 @@ pub(crate) fn image_ffn_full_chain_resident_multi2(
     hadamard_block_size: Option<u32>,
 ) -> Result<FfnFullChainBatchLayout<2>, Error> {
     image_ffn_full_chain_resident_batch(
+        profile,
         bytes,
         base,
         fd,
@@ -2093,12 +2314,43 @@ pub(crate) fn image_ffn_full_chain_resident_multi2(
     )
 }
 
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "Default v81 wrapper retained for existing unit tests"
+)]
+pub(crate) fn image_ffn_full_chain_resident_multi2(
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    handles: [&NativeQ2WeightHandle; 3],
+    activations: [&[f32]; 2],
+    residuals: [Option<&[f32]>; 2],
+    hadamard_block_size: Option<u32>,
+) -> Result<FfnFullChainBatchLayout<2>, Error> {
+    image_ffn_full_chain_resident_multi2_for_profile(
+        crate::HtpArchProfile::v81(),
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        handles,
+        activations,
+        residuals,
+        hadamard_block_size,
+    )
+}
+
 #[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,
     reason = "Keep exact per-token FFN descriptors, checked offsets and index rebasing in one bounded packet builder"
 )]
 fn image_ffn_full_chain_resident_batch<const B: usize>(
+    profile: crate::HtpArchProfile,
     bytes: &mut [u8],
     base: u64,
     fd: u32,
@@ -2270,7 +2522,10 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             return Err(Error::Contract);
         }
 
-        let vtcm_chain = ffn_bytes.saturating_mul(3) <= 1_048_576;
+        let vtcm_chain_budget = usize::try_from(profile.vtcm_bytes / 2)
+            .unwrap_or(usize::MAX)
+            .min(1_048_576);
+        let vtcm_chain = ffn_bytes.saturating_mul(3) <= vtcm_chain_budget;
         let keep_vtcm = if vtcm_chain {
             crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
         } else {
@@ -2291,6 +2546,7 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             act_offset,
             gate_out_offset,
             gate_handle.hvx_params,
+            gate_handle.hvx_workers,
         )?;
         put32(working, ops_base + 4, keep_vtcm.bits());
 
@@ -2307,6 +2563,7 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             act_offset,
             up_out_offset,
             up_handle.hvx_params,
+            up_handle.hvx_workers,
         )?;
         put32(working, ops_base + 232 + 4, keep_vtcm.bits());
 
@@ -2316,7 +2573,8 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         } else {
             (ffn_dim / 2, 2_usize)
         };
-        let glu_kp = crate::htp_ops::solve_glu_kparams(
+        let glu_kp = crate::htp_ops::solve_glu_kparams_for_profile(
+            profile,
             u32::try_from(glu_cols).map_err(|_| Error::Contract)?,
             u32::try_from(glu_rows).map_err(|_| Error::Contract)?,
         )?;
@@ -2362,7 +2620,8 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         if let Some(block_size) = hadamard_block_size {
             let block_cols = usize::try_from(block_size).map_err(|_| Error::Contract)?;
             let block_rows = ffn_dim / block_cols;
-            let had_kp = crate::htp_ops::solve_unary_kparams(
+            let had_kp = crate::htp_ops::solve_unary_kparams_for_profile(
+                profile,
                 crate::htp_ops::HtpOpCode::Hadamard,
                 block_size,
                 u32::try_from(block_rows).map_err(|_| Error::Contract)?,
@@ -2422,6 +2681,7 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             hadamard_out_offset,
             down_out_offset,
             down_handle.hvx_params,
+            down_handle.hvx_workers,
         )?;
         let down_flags = if vtcm_chain {
             let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM;
@@ -2439,7 +2699,8 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
 
         // Optional Final Op: HTP_OP_ADD(down_out, residual) -> final_out.
         if residual.is_some() {
-            let add_kp = crate::htp_ops::solve_binary_kparams(
+            let add_kp = crate::htp_ops::solve_binary_kparams_for_profile(
+                profile,
                 crate::htp_ops::HtpOpCode::Add,
                 u32::try_from(hidden).map_err(|_| Error::Contract)?,
                 1,
@@ -2569,6 +2830,7 @@ fn write_frame(
     active: projection::Layout,
     activation: &[f32],
     hvx_params: (u8, u32, u32),
+    hvx_workers: u8,
 ) -> Result<(), Error> {
     if activation.len() != columns {
         return Err(Error::Contract);
@@ -2585,6 +2847,7 @@ fn write_frame(
         active.activation,
         active.output,
         hvx_params,
+        hvx_workers,
     )?;
     let act_bytes = columns * 4;
     let out_bytes = rows * 4;
@@ -2619,6 +2882,7 @@ fn write_descriptors(
     act_offset: usize,
     out_offset: usize,
     hvx_params: (u8, u32, u32),
+    hvx_workers: u8,
 ) -> Result<(), Error> {
     bytes[..1024].fill(0);
     put64(bytes, 0, base);
@@ -2641,6 +2905,7 @@ fn write_descriptors(
         act_offset,
         out_offset,
         hvx_params,
+        hvx_workers,
     )
 }
 
@@ -2661,6 +2926,7 @@ fn write_member_descriptors(
     act_offset: usize,
     out_offset: usize,
     hvx_params: (u8, u32, u32),
+    hvx_workers: u8,
 ) -> Result<(), Error> {
     let (n_prefetch, src1_row_size, vtcm_size) = hvx_params;
     let weight_row_bytes = 36 * (columns / 128);
@@ -2726,8 +2992,8 @@ fn write_member_descriptors(
     }
     let kp = op_desc + 72;
     put32(bytes, op_desc, 4); // HTP_OP_MUL_MAT, no stub or fusion flags.
-    bytes[kp] = 7; // HTP_MM_KERNEL_HVX_QUANT_ROW_N1 (N = 1 < n_threads = 8).
-    bytes[kp + 4] = u8::try_from(HMX_Q2_HVX_WORKERS).map_err(|_| Error::Contract)?;
+    bytes[kp] = 7; // HTP_MM_KERNEL_HVX_QUANT_ROW_N1 (N = 1 < n_threads).
+    bytes[kp + 4] = hvx_workers;
     bytes[kp + 6] = n_prefetch;
     for (offset, value) in [(16, 576), (20, 640), (24, src1_row_size), (28, vtcm_size)] {
         put32(bytes, kp + offset, value);
@@ -3194,6 +3460,7 @@ mod tests {
                 activation_offsets[member],
                 offset,
                 handle.hvx_params,
+                handle.hvx_workers,
             )?;
             for word in bytes[offset..offset + handle.rows * 4]
                 .as_chunks_mut::<4>()
@@ -3380,6 +3647,7 @@ mod tests {
                     4096,
                     8192,
                     handle.hvx_params,
+                    handle.hvx_workers,
                 )?;
                 let kernel = 192 + 72;
                 assert_eq!(actual[kernel], 7);
@@ -3932,6 +4200,43 @@ mod tests {
         }
         assert_eq!(six_reg.used_bytes(), 2_888_663_040);
         assert_eq!(six_reg.remaining_bytes(), 0);
+
+        // Verify Hexagon v73 (4 HVX threads, 2 MiB VTCM) parameter solver and partial-arena registry.
+        let v73 = crate::HtpArchProfile::v73_default();
+        assert_eq!(
+            hvx_mv_params_for_profile(v73, 5120, 17_408)?,
+            (8, 204_800, 1_912_832)
+        );
+        assert_eq!(
+            hvx_mv_params_for_profile(v73, 17_408, 5120)?,
+            (1, 696_320, 1_413_120)
+        );
+        let wire_v73 = start_wire_for_profile(v73, 1, 64 * 1024)?;
+        assert_eq!(
+            u32::from_le_bytes([wire_v73[16], wire_v73[17], wire_v73[18], wire_v73[19]]),
+            4
+        );
+        assert_eq!(
+            u32::from_le_bytes([wire_v73[24], wire_v73[25], wire_v73[26], wire_v73[27]]),
+            2 * 1024 * 1024
+        );
+        let mut partial_caps = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+        partial_caps[0] = NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES;
+        partial_caps[1] = NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES;
+        let mut v73_reg = NativeQ2WeightRegistry::from_arena_capacities_for_profile(partial_caps, 2, v73)?;
+        assert_eq!(
+            v73_reg.remaining_bytes(),
+            NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES + NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
+        );
+        let h_v73 = v73_reg
+            .prepare_validated(17_408, 5120, NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES)?
+            .ok_or(Error::Contract)?;
+        assert_eq!(h_v73.arena_index(), 0);
+        assert!(
+            v73_reg
+                .prepare_validated(5120, 17_408, 460_062_721)?
+                .is_none()
+        );
         Ok(())
     }
 }

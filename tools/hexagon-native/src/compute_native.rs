@@ -280,13 +280,13 @@ pub(super) fn probe_fixture(
     fixture: compute::ComputeFixture,
 ) -> Result<QueueComputeReport, Error> {
     let (report, opened) = open_module(driver, package, &mut progress, fixture)?;
-    let Some((handle, domain, calls)) = opened else {
+    let Some((handle, domain, calls, _arch_profile)) = opened else {
         return Ok(report);
     };
     Ok(exercise(report, handle, domain, &calls, &mut progress))
 }
 
-type OpenedModule = (u64, i32, Calls);
+type OpenedModule = (u64, i32, Calls, crate::HtpArchProfile);
 
 fn open_module(
     mut driver: Driver,
@@ -297,10 +297,20 @@ fn open_module(
     crate::self_check()?;
     let raw = driver.capability(Capability::Architecture)?;
     let metadata = SessionPreparationReport::new(raw);
-    if metadata.architecture != Some(81) {
+    let Some(architecture) = metadata
+        .architecture
+        .filter(|&arch| crate::is_supported_htp_architecture(arch))
+    else {
         return Ok((QueueComputeReport::new_fixture(metadata, fixture), None));
-    }
-    let guards = session_mapping_native::package_guards(package, 81)?;
+    };
+    let hvx128_contexts = driver.capability(Capability::Hvx128).unwrap_or(0);
+    let vtcm_page = driver.capability(Capability::VtcmPage).unwrap_or(0);
+    let vtcm_count = driver.capability(Capability::VtcmCount).unwrap_or(0);
+    let vtcm_total_bytes = vtcm_page.saturating_mul(vtcm_count);
+    let arch_profile =
+        crate::HtpArchProfile::for_architecture(architecture, hvx128_contexts, vtcm_total_bytes)
+            .ok_or(Error::Contract)?;
+    let guards = session_mapping_native::package_guards(package, architecture)?;
     let calls = calls(&driver, fixture)?;
     let control = session_native::session_control(&driver)?;
     let metadata = session_native::prepare_effective_domain(raw, control);
@@ -342,7 +352,7 @@ fn open_module(
     }
     let mut handle = u64::MAX;
     entered(&mut report, "compute-module-open-entered", progress);
-    // SAFETY: URI is the exact validated, terminated v81/default-CDSP module URI.
+    // SAFETY: URI is the exact validated, terminated supported HTP/default-CDSP module URI.
     let result = unsafe { (calls.open)(uri.as_ptr().cast(), &raw mut handle) };
     report.module_open_result = Some(result);
     report.handle_observed = handle != u64::MAX;
@@ -350,7 +360,7 @@ fn open_module(
         report.stage = "compute-module-open-refused-pinned";
         return Ok((report, None));
     }
-    Ok((report, Some((handle, domain, calls))))
+    Ok((report, Some((handle, domain, calls, arch_profile))))
 }
 
 #[expect(

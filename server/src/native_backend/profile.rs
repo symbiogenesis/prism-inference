@@ -32,6 +32,19 @@ pub(super) enum ProjectionStartup {
         resident_weight_bytes: u64,
         host_metadata_bytes: usize,
     },
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")),
+        allow(
+            dead_code,
+            reason = "Only Windows ARM64 initializes a native Hexagon executor; other targets retain the wire-validation controls."
+        )
+    )]
+    NativeQ2Partial {
+        architecture: u32,
+        resident_tensors: u64,
+        resident_weight_bytes: u64,
+        host_metadata_bytes: usize,
+    },
 }
 
 impl ProjectionStartup {
@@ -54,6 +67,18 @@ impl ProjectionStartup {
                     && *resident_weight_bytes == 2_888_663_040
                     && (1..=524_288).contains(host_metadata_bytes)
             }
+            Self::NativeQ2Partial {
+                architecture,
+                resident_tensors,
+                resident_weight_bytes,
+                host_metadata_bytes,
+            } => {
+                placement == Placement::Auto
+                    && matches!(*architecture, 73 | 81)
+                    && (1..168).contains(resident_tensors)
+                    && (1..2_888_663_040).contains(resident_weight_bytes)
+                    && (1..=524_288).contains(host_metadata_bytes)
+            }
         }
     }
 
@@ -68,6 +93,21 @@ impl ProjectionStartup {
             } => (
                 "hexagon-native-q2",
                 Some("hexagon-hvx-native-q2-resident-v1-experimental"),
+                *resident_tensors,
+                *resident_weight_bytes,
+                *host_metadata_bytes,
+            ),
+            Self::NativeQ2Partial {
+                architecture,
+                resident_tensors,
+                resident_weight_bytes,
+                host_metadata_bytes,
+            } => (
+                "hexagon-native-q2-partial",
+                match *architecture {
+                    73 => Some("hexagon-v73-hvx-native-q2-partial-v1-experimental"),
+                    _ => Some("hexagon-v81-hvx-native-q2-partial-v1-experimental"),
+                },
                 *resident_tensors,
                 *resident_weight_bytes,
                 *host_metadata_bytes,

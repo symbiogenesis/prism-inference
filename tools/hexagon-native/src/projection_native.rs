@@ -197,7 +197,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
     )?;
     report.queue = queue_report;
     report.queue.hmx_bitplane = mode.is_hmx();
-    let Some((handle, domain, calls)) = opened else {
+    let Some((handle, domain, calls, arch_profile)) = opened else {
         return Ok(report);
     };
     if Instant::now() >= work_deadline {
@@ -330,7 +330,9 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         Mode::Hmx | Mode::HmxBatch4 | Mode::HmxBatch10 => {
             hmx_projection::start_wire(queue_id, allocation_bytes)?
         }
-        Mode::NativeQ2 { .. } => native_q2::start_wire(queue_id, total_mapped_bytes)?,
+        Mode::NativeQ2 { .. } => {
+            native_q2::start_wire_for_profile(arch_profile, queue_id, total_mapped_bytes)?
+        }
     };
     let mut argument = RemoteBuffer {
         pointer: start.as_mut_ptr().cast(),
@@ -357,6 +359,13 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         map: calls.map,
         unmap: calls.unmap,
     });
+    let native_weight_budget = if mode.is_native_q2() {
+        resident_weight_bytes
+    } else {
+        0
+    };
+    let (native_caps, native_cap_count) =
+        native_q2::arena_capacities(native_weight_budget).ok_or(Error::Contract)?;
     let (work_result, session_failed) = {
         let mut session = Session {
             report: &mut report,
@@ -370,16 +379,17 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
             mapper,
             limits,
             mode,
+            arch_profile,
             resident_weights: HmxQ2WeightRegistry::new(if mode.is_hmx() {
                 resident_weight_bytes
             } else {
                 0
             })?,
-            native_resident_weights: NativeQ2WeightRegistry::new(if mode.is_native_q2() {
-                resident_weight_bytes
-            } else {
-                0
-            })?,
+            native_resident_weights: NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+                native_caps,
+                native_cap_count,
+                arch_profile,
+            )?,
             dirty_resident_weights: false,
             work_deadline,
             progress: &mut progress,
@@ -449,6 +459,7 @@ struct Session<'a, P> {
     mapper: Option<DomainMapper>,
     limits: Q2ProjectionLimits,
     mode: Mode,
+    arch_profile: crate::HtpArchProfile,
     resident_weights: HmxQ2WeightRegistry,
     native_resident_weights: NativeQ2WeightRegistry,
     dirty_resident_weights: bool,
@@ -811,7 +822,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                         bytes,
                     },
                     Activation::NativeQ2(values),
-                ) => native_q2::image(
+                ) => native_q2::image_for_profile(
+                    self.arch_profile,
                     &mut image[..working_bytes],
                     base,
                     self.expected.fd,
@@ -1326,7 +1338,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             let image = unsafe {
                 std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            let Ok(active) = native_q2::image_ffn_swiglu_resident(
+            let Ok(active) = native_q2::image_ffn_swiglu_resident_for_profile(
+                self.arch_profile,
                 image,
                 base,
                 self.expected.fd,
@@ -1487,7 +1500,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             let image = unsafe {
                 std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            let Ok(active) = native_q2::image_ffn_full_chain_resident(
+            let Ok(active) = native_q2::image_ffn_full_chain_resident_for_profile(
+                self.arch_profile,
                 image,
                 base,
                 self.expected.fd,
@@ -1667,7 +1681,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             let image = unsafe {
                 std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            let Ok(active) = native_q2::image_ffn_full_chain_resident_multi2(
+            let Ok(active) = native_q2::image_ffn_full_chain_resident_multi2_for_profile(
+                self.arch_profile,
                 image,
                 base,
                 self.expected.fd,
@@ -1862,7 +1877,8 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             let image = unsafe {
                 std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            let Ok(active) = native_q2::image_ffn_swiglu_multi2_resident(
+            let Ok(active) = native_q2::image_ffn_swiglu_multi2_resident_for_profile(
+                self.arch_profile,
                 image,
                 base,
                 self.expected.fd,
@@ -2229,6 +2245,10 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
 }
 
 impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
+    fn htp_architecture(&self) -> u32 {
+        self.arch_profile.architecture
+    }
+
     fn remaining_operations(&self) -> Option<u64> {
         if self.failed {
             Some(0)
@@ -2499,6 +2519,7 @@ pub(crate) struct NativeQ2Session {
     expected: QueueBuffer,
     limits: Q2ProjectionLimits,
     columns: usize,
+    arch_profile: crate::HtpArchProfile,
     resident_weights: HmxQ2WeightRegistry,
     native_resident_weights: NativeQ2WeightRegistry,
     dirty_resident_weights: bool,
@@ -2537,7 +2558,7 @@ pub(super) fn open_native_q2(
         compute::ComputeFixture::GuardedQ2NoBlock,
     )?;
     report.queue = queue_report;
-    let (handle, domain, calls) = opened.ok_or(Error::Contract)?;
+    let (handle, domain, calls, arch_profile) = opened.ok_or(Error::Contract)?;
     if !limits.common.persistent && Instant::now() >= work_deadline {
         return Err(Error::Contract);
     }
@@ -2546,12 +2567,23 @@ pub(super) fn open_native_q2(
         limits.common.rows,
         limits.resident_weight_bytes,
     )?;
+    let (arena_capacities, cap_count) =
+        native_q2::arena_capacities(limits.resident_weight_bytes).ok_or(Error::Contract)?;
+    if cap_count != arena_count {
+        return Err(Error::Contract);
+    }
     let allocation_bytes = arena_allocations[0];
     let allocator_request = i32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     let descriptor_size = u32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     // SAFETY: one explicitly bounded cached system-heap allocation, under i32 limits.
     let memory = unsafe { (calls.alloc)(25, 1, allocator_request) };
     if memory.is_null() || !memory.addr().is_multiple_of(4096) {
+        if !memory.is_null() {
+            // SAFETY: unaligned pointer came directly from calls.alloc above and is unmapped.
+            unsafe {
+                (calls.free)(memory);
+            }
+        }
         return Err(Error::Contract);
     }
     // SAFETY: fresh, exclusive, correctly aligned allocator-owned extent.
@@ -2560,14 +2592,43 @@ pub(super) fn open_native_q2(
     }
     // SAFETY: only this driver's fresh allocator-owned pointer is passed back.
     let fd = unsafe { (calls.to_fd)(memory) };
-    let fd_u32 = u32::try_from(fd).map_err(|_| Error::Contract)?;
+    let Ok(fd_u32) = u32::try_from(fd) else {
+        // SAFETY: primary pointer failed FD conversion before mapping.
+        unsafe {
+            (calls.free)(memory);
+        }
+        return Err(Error::Contract);
+    };
+    // SAFETY: exact aligned pointer/FD/length and original validated effective domain.
+    let result = unsafe { (calls.map)(domain, fd, memory, 0, allocation_bytes, 2) };
+    report.queue.mapping_result = Some(result);
+    if result != 0 {
+        // SAFETY: primary pointer failed DSP mapping before session ownership.
+        unsafe {
+            (calls.free)(memory);
+        }
+        return Err(Error::Contract);
+    }
     let mut extra_arenas = [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS];
-    let extra_arena_count = arena_count.saturating_sub(1);
+    let mut mapped_capacities = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+    mapped_capacities[0] = arena_capacities[0];
+    let mut total_mapped_bytes = allocation_bytes;
+    let mut actual_extra_count = 0_usize;
+    let allow_partial = limits.allows_partial_secondary_arenas();
     for (extra_idx, &extra_bytes) in arena_allocations[1..arena_count].iter().enumerate() {
         let extra_req = i32::try_from(extra_bytes).map_err(|_| Error::Contract)?;
         // SAFETY: each secondary weight arena is bounded by 480 MiB (< i32::MAX).
         let extra_mem = unsafe { (calls.alloc)(25, 1, extra_req) };
         if extra_mem.is_null() || !extra_mem.addr().is_multiple_of(4096) {
+            if !extra_mem.is_null() {
+                // SAFETY: unaligned secondary pointer is unmapped and not retained.
+                unsafe {
+                    (calls.free)(extra_mem);
+                }
+            }
+            if allow_partial {
+                break;
+            }
             return Err(Error::Contract);
         }
         // SAFETY: fresh, exclusive, page-aligned allocator-owned secondary arena.
@@ -2576,7 +2637,28 @@ pub(super) fn open_native_q2(
         }
         // SAFETY: only this driver's fresh allocator-owned pointer is passed back.
         let extra_fd = unsafe { (calls.to_fd)(extra_mem) };
-        let extra_fd_u32 = u32::try_from(extra_fd).map_err(|_| Error::Contract)?;
+        let Ok(extra_fd_u32) = u32::try_from(extra_fd) else {
+            // SAFETY: fresh secondary pointer failed FD conversion before mapping.
+            unsafe {
+                (calls.free)(extra_mem);
+            }
+            if allow_partial {
+                break;
+            }
+            return Err(Error::Contract);
+        };
+        // SAFETY: exact aligned pointer/FD/length for each secondary weight arena.
+        let extra_res = unsafe { (calls.map)(domain, extra_fd, extra_mem, 0, extra_bytes, 2) };
+        if extra_res != 0 {
+            // SAFETY: fresh secondary pointer failed DSP mapping and is not retained.
+            unsafe {
+                (calls.free)(extra_mem);
+            }
+            if allow_partial {
+                break;
+            }
+            return Err(Error::Contract);
+        }
         extra_arenas[extra_idx] = ExtraWeightArena {
             memory: extra_mem,
             fd: extra_fd,
@@ -2585,24 +2667,11 @@ pub(super) fn open_native_q2(
             dirty: false,
             dsp_mapped: false,
         };
+        mapped_capacities[1 + extra_idx] = arena_capacities[1 + extra_idx];
+        total_mapped_bytes += extra_bytes;
+        actual_extra_count = extra_idx + 1;
     }
     report.queue.allocation_succeeded = true;
-    // SAFETY: exact aligned pointer/FD/length and original validated effective domain.
-    let result = unsafe { (calls.map)(domain, fd, memory, 0, allocation_bytes, 2) };
-    report.queue.mapping_result = Some(result);
-    if result != 0 {
-        return Err(Error::Contract);
-    }
-    let mut total_mapped_bytes = allocation_bytes;
-    for extra in &extra_arenas[..extra_arena_count] {
-        // SAFETY: exact aligned pointer/FD/length for each secondary weight arena.
-        let extra_res =
-            unsafe { (calls.map)(domain, extra.fd, extra.memory, 0, extra.allocation_bytes, 2) };
-        if extra_res != 0 {
-            return Err(Error::Contract);
-        }
-        total_mapped_bytes += extra.allocation_bytes;
-    }
     report.mapped_allocation_bytes = total_mapped_bytes;
     let mut queue = null_mut();
     // SAFETY: fixed bounded queues, no callbacks/context; exact checked public ABI.
@@ -2629,7 +2698,7 @@ pub(super) fn open_native_q2(
     if result != 0 || queue_id == u64::MAX {
         return Err(Error::Contract);
     }
-    let mut start = native_q2::start_wire(queue_id, total_mapped_bytes)?;
+    let mut start = native_q2::start_wire_for_profile(arch_profile, queue_id, total_mapped_bytes)?;
     let mut argument = RemoteBuffer {
         pointer: start.as_mut_ptr().cast(),
         bytes: start.len(),
@@ -2654,14 +2723,19 @@ pub(super) fn open_native_q2(
         fd,
         allocation_bytes,
         extra_arenas,
-        extra_arena_count,
+        extra_arena_count: actual_extra_count,
         queue,
         memory,
         expected,
         limits: limits.common,
         columns: limits.columns,
+        arch_profile,
         resident_weights: HmxQ2WeightRegistry::new(0)?,
-        native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes)?,
+        native_resident_weights: NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+            mapped_capacities,
+            1 + actual_extra_count,
+            arch_profile,
+        )?,
         dirty_resident_weights: false,
         work_deadline,
         report,
@@ -2695,6 +2769,7 @@ impl NativeQ2Session {
             mode: Mode::NativeQ2 {
                 columns: self.columns,
             },
+            arch_profile: self.arch_profile,
             resident_weights: self.resident_weights,
             native_resident_weights: self.native_resident_weights,
             dirty_resident_weights: self.dirty_resident_weights,
@@ -2712,6 +2787,10 @@ impl NativeQ2Session {
 }
 
 impl NativeQ2Submitter for NativeQ2Session {
+    fn htp_architecture(&self) -> u32 {
+        self.arch_profile.architecture
+    }
+
     fn remaining_operations(&self) -> Option<u64> {
         if self.failed {
             Some(0)
@@ -3240,6 +3319,7 @@ mod tests {
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -3354,6 +3434,7 @@ mod tests {
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -3467,6 +3548,7 @@ mod tests {
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: if case == 4 {
                     Instant::now()
                 } else {
@@ -3603,6 +3685,7 @@ mod tests {
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -3737,6 +3820,7 @@ mod tests {
                 resident_weights: HmxQ2WeightRegistry::new(limits.resident_weight_bytes())?,
                 native_resident_weights: NativeQ2WeightRegistry::new(0)?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -3840,6 +3924,7 @@ mod tests {
                 resident_weights: HmxQ2WeightRegistry::new(0)?,
                 native_resident_weights: NativeQ2WeightRegistry::new(capacity)?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: Instant::now() + Duration::from_secs(4),
                 progress: &mut progress,
                 failed: false,
@@ -3985,6 +4070,7 @@ mod tests {
             resident_weights: HmxQ2WeightRegistry::new(0)?,
             native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes())?,
             dirty_resident_weights: false,
+            arch_profile: crate::HtpArchProfile::v81(),
             work_deadline: Instant::now() + Duration::from_secs(1),
             progress: &mut progress,
             failed: false,
@@ -4143,6 +4229,7 @@ mod tests {
                     limits.resident_weight_bytes(),
                 )?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -4286,6 +4373,7 @@ mod tests {
                         limits.resident_weight_bytes(),
                     )?,
                     dirty_resident_weights: false,
+                    arch_profile: crate::HtpArchProfile::v81(),
                     work_deadline: Instant::now() + Duration::from_secs(1),
                     progress: &mut progress,
                     failed: false,
@@ -4411,6 +4499,7 @@ mod tests {
                     limits.resident_weight_bytes(),
                 )?,
                 dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
                 work_deadline: Instant::now() + Duration::from_secs(1),
                 progress: &mut progress,
                 failed: false,
@@ -4548,6 +4637,7 @@ mod tests {
             resident_weights: HmxQ2WeightRegistry::new(0)?,
             native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes())?,
             dirty_resident_weights: false,
+            arch_profile: crate::HtpArchProfile::v81(),
             work_deadline: Instant::now() + Duration::from_secs(1),
             progress: &mut progress,
             failed: false,
@@ -4688,6 +4778,7 @@ mod tests {
             resident_weights: HmxQ2WeightRegistry::new(0)?,
             native_resident_weights: registry,
             dirty_resident_weights: false,
+            arch_profile: crate::HtpArchProfile::v81(),
             work_deadline: Instant::now() + Duration::from_secs(1),
             progress: &mut progress,
             failed: false,
@@ -4836,6 +4927,7 @@ mod tests {
             resident_weights: HmxQ2WeightRegistry::new(0)?,
             native_resident_weights: NativeQ2WeightRegistry::new(limits.resident_weight_bytes())?,
             dirty_resident_weights: false,
+            arch_profile: crate::HtpArchProfile::v81(),
             work_deadline: Instant::now() + Duration::from_secs(1),
             progress: &mut progress,
             failed: false,
@@ -4906,6 +4998,66 @@ mod tests {
         assert_eq!(STATE.lock().map_err(|_| Error::Contract)?.writes, writes);
         assert_eq!(session.report.operations_completed, 18);
         assert_eq!(NativeQ2Submitter::maximum_resident_token_batch(&session), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn v73_native_q2_session_reports_arch_73_and_partial_two_arena_registry() -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 4, Duration::from_secs(4))?
+            .with_resident_weights(962_887_680)?
+            .with_partial_secondary_arenas();
+        assert!(limits.allows_partial_secondary_arenas());
+        let mut memory = vec![0_u8; 32_768];
+        let pointer = memory.as_mut_ptr().cast::<c_void>();
+        let expected = QueueBuffer {
+            fd: 7,
+            size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+            offset: 0,
+            flags: 0x90,
+            pointer,
+        };
+        let mut partial_caps = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+        partial_caps[0] = native_q2::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES;
+        partial_caps[1] = native_q2::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES;
+        let v73 = crate::HtpArchProfile::v73_default();
+        assert_eq!(v73.architecture, 73);
+        assert_eq!(v73.hvx_workers, 4);
+        assert_eq!(v73.vtcm_bytes, 2 * 1024 * 1024);
+        let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(73));
+        report.queue.poisoned = true;
+        let queue_write = WriteCall::Nonblocking(write);
+        let mut progress = |_: &Q2ProjectionReport| {};
+        let session = Session {
+            report: &mut report,
+            queue_write: &queue_write,
+            queue_read: read,
+            queue: null_mut(),
+            memory: pointer,
+            expected,
+            extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+            extra_arena_count: 1,
+            mapper: None,
+            limits: limits.common,
+            mode: Mode::NativeQ2 { columns: 128 },
+            arch_profile: v73,
+            resident_weights: HmxQ2WeightRegistry::new(0)?,
+            native_resident_weights: NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+                partial_caps,
+                2,
+                v73,
+            )?,
+            dirty_resident_weights: false,
+            work_deadline: Instant::now() + Duration::from_secs(1),
+            progress: &mut progress,
+            failed: false,
+        };
+        assert_eq!(NativeQ2Submitter::htp_architecture(&session), 73);
+        assert_eq!(
+            NativeQ2Submitter::residency_capacity_bytes(&session),
+            native_q2::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+                + native_q2::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
+        );
         Ok(())
     }
 }

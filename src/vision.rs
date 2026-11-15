@@ -381,59 +381,17 @@ impl SwiftVisionEncoder {
         let rope_cache = build_vit_rope_cache(&self.config, &patch_coords)?;
 
         for block in &self.blocks {
-            residual.copy_from_slice(&hidden);
-            layer_norm_rows(
-                &hidden,
-                n_pos,
-                self.config.hidden_size,
-                &block.ln1_w,
-                &block.ln1_b,
-                self.config.eps,
-                &mut norm_buf,
-                &self.row_parallelism,
-            )?;
-            run_self_attention(
+            self.run_vit_block(
                 block,
-                &self.config,
                 n_pos,
                 &rope_cache,
-                &norm_buf,
+                &mut hidden,
+                &mut residual,
+                &mut norm_buf,
                 &mut attn,
                 &mut attn_out_buf,
                 &mut projector,
-                &self.row_parallelism,
             )?;
-            for (h, (&res, &attn_val)) in hidden.iter_mut().zip(residual.iter().zip(&attn_out_buf))
-            {
-                *h = res + attn_val;
-            }
-            if !is_finite_slice(&hidden) {
-                return Err(invalid("nonfinite values after ViT attention residual"));
-            }
-
-            residual.copy_from_slice(&hidden);
-            layer_norm_rows(
-                &hidden,
-                n_pos,
-                self.config.hidden_size,
-                &block.ln2_w,
-                &block.ln2_b,
-                self.config.eps,
-                &mut norm_buf,
-                &self.row_parallelism,
-            )?;
-            run_mlp_block(
-                block,
-                &self.config,
-                n_pos,
-                &norm_buf,
-                &residual,
-                &mut hidden,
-                &mut projector,
-            )?;
-            if !is_finite_slice(&hidden) {
-                return Err(invalid("nonfinite values after ViT MLP residual"));
-            }
         }
 
         layer_norm_rows(
@@ -453,6 +411,77 @@ impl SwiftVisionEncoder {
             sha256,
             embeddings: Arc::from(embeddings),
         })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Reuse layer-level ViT scratch buffers across transformer blocks."
+    )]
+    fn run_vit_block(
+        &self,
+        block: &VitBlock,
+        n_pos: usize,
+        rope_cache: &[(f32, f32)],
+        hidden: &mut [f32],
+        residual: &mut [f32],
+        norm_buf: &mut [f32],
+        attn: &mut AttentionScratch,
+        attn_out_buf: &mut [f32],
+        projector: &mut TiledProjector,
+    ) -> Result<()> {
+        residual.copy_from_slice(hidden);
+        layer_norm_rows(
+            hidden,
+            n_pos,
+            self.config.hidden_size,
+            &block.ln1_w,
+            &block.ln1_b,
+            self.config.eps,
+            norm_buf,
+            &self.row_parallelism,
+        )?;
+        run_self_attention(
+            block,
+            &self.config,
+            n_pos,
+            rope_cache,
+            norm_buf,
+            attn,
+            attn_out_buf,
+            projector,
+            &self.row_parallelism,
+        )?;
+        for (h, (&res, &attn_val)) in hidden.iter_mut().zip(residual.iter().zip(&*attn_out_buf)) {
+            *h = res + attn_val;
+        }
+        if !is_finite_slice(hidden) {
+            return Err(invalid("nonfinite values after ViT attention residual"));
+        }
+
+        residual.copy_from_slice(hidden);
+        layer_norm_rows(
+            hidden,
+            n_pos,
+            self.config.hidden_size,
+            &block.ln2_w,
+            &block.ln2_b,
+            self.config.eps,
+            norm_buf,
+            &self.row_parallelism,
+        )?;
+        run_mlp_block(
+            block,
+            &self.config,
+            n_pos,
+            norm_buf,
+            residual,
+            hidden,
+            projector,
+        )?;
+        if !is_finite_slice(hidden) {
+            return Err(invalid("nonfinite values after ViT MLP residual"));
+        }
+        Ok(())
     }
 
     #[expect(
@@ -561,12 +590,7 @@ impl SwiftVisionEncoder {
 
         for tile_start in (0..n_tokens).step_by(MAX_TILE_TOKENS) {
             let chunk = (n_tokens - tile_start).min(MAX_TILE_TOKENS);
-            for t in 0..chunk {
-                let tok = tile_start + t;
-                projector.inputs[t].resize(merge_dim, 0.0);
-                projector.inputs[t]
-                    .copy_from_slice(&normed[tok * merge_dim..(tok + 1) * merge_dim]);
-            }
+            copy_tile_rows(&mut projector.inputs, chunk, normed, tile_start, merge_dim);
             projector.tile.project_with_previous(
                 None,
                 &self.mm_0_w,
@@ -624,6 +648,20 @@ impl AttentionScratch {
             v_heads: vec![0.0_f32; len],
             head_out: vec![0.0_f32; len],
         }
+    }
+}
+
+fn copy_tile_rows(
+    inputs: &mut [Vec<f32>],
+    chunk: usize,
+    src: &[f32],
+    tile_start: usize,
+    width: usize,
+) {
+    for (t, dst) in inputs.iter_mut().take(chunk).enumerate() {
+        let tok = tile_start + t;
+        dst.resize(width, 0.0);
+        dst.copy_from_slice(&src[tok * width..(tok + 1) * width]);
     }
 }
 
@@ -752,7 +790,8 @@ fn resize_bicubic_normalize(
         for (offset, dst_row) in chunk.chunks_exact_mut(horiz_row_len).enumerate() {
             let sy = base_sy + offset;
             let src_row = &rgb[sy * src_w * 3..(sy + 1) * src_w * 3];
-            for (dst_px, &(idx, weights)) in dst_row.chunks_exact_mut(3).zip(&x_taps) {
+            for (dst_px, &(idx, weights)) in dst_row.as_chunks_mut::<3>().0.iter_mut().zip(&x_taps)
+            {
                 for (c, dst_ch) in dst_px.iter_mut().enumerate() {
                     let mut sum = 0.0_f64;
                     for (&ix, &w) in idx.iter().zip(&weights) {
@@ -1033,11 +1072,7 @@ fn fill_qkv_heads(
     let head_plane = n_pos * d_head;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
-        for t in 0..chunk {
-            let tok = tile_start + t;
-            projector.inputs[t].resize(d, 0.0);
-            projector.inputs[t].copy_from_slice(&normed[tok * d..(tok + 1) * d]);
-        }
+        copy_tile_rows(&mut projector.inputs, chunk, normed, tile_start, d);
         projector.tile.project_with_previous(
             None,
             &block.attn_qkv_w,
@@ -1204,9 +1239,8 @@ fn project_attn_output(
     let head_plane = n_pos * d_head;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
-        for t in 0..chunk {
+        for (t, dst) in projector.inputs.iter_mut().take(chunk).enumerate() {
             let tok = tile_start + t;
-            let dst = &mut projector.inputs[t];
             dst.resize(d, 0.0);
             for head in 0..config.num_heads {
                 let src_off = head * head_plane + tok * d_head;
@@ -1247,11 +1281,7 @@ fn run_mlp_block(
     let d = config.hidden_size;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
-        for t in 0..chunk {
-            let tok = tile_start + t;
-            projector.inputs[t].resize(d, 0.0);
-            projector.inputs[t].copy_from_slice(&normed[tok * d..(tok + 1) * d]);
-        }
+        copy_tile_rows(&mut projector.inputs, chunk, normed, tile_start, d);
         projector.tile.project_with_previous(
             None,
             &block.ffn_up_w,
@@ -1885,82 +1915,34 @@ mod tests {
 
     fn non_uniform_mmproj_model() -> Result<Model> {
         let mut model = synthetic_mmproj_model()?;
-        let patch_elems = 2 * 2 * 3 * 32;
-        model.tensors.insert(
-            "v.patch_embd.weight".to_owned(),
-            f32_tensor(
-                "v.patch_embd.weight",
-                vec![2, 2, 3, 32],
-                &varied_values(patch_elems, 3, 0.015),
-            ),
-        );
-        model.tensors.insert(
-            "v.patch_embd.weight.1".to_owned(),
-            f32_tensor(
-                "v.patch_embd.weight.1",
-                vec![2, 2, 3, 32],
-                &varied_values(patch_elems, 11, 0.012),
-            ),
-        );
-        model.tensors.insert(
-            "v.patch_embd.bias".to_owned(),
-            f32_tensor("v.patch_embd.bias", vec![32], &varied_values(32, 5, 0.02)),
-        );
-        model.tensors.insert(
-            "v.position_embd.weight".to_owned(),
-            f32_tensor(
-                "v.position_embd.weight",
-                vec![32, 4],
-                &varied_values(32 * 4, 7, 0.01),
-            ),
-        );
-        model.tensors.insert(
-            "v.blk.0.attn_qkv.weight".to_owned(),
-            q8_0_tensor(
-                "v.blk.0.attn_qkv.weight",
-                32,
-                96,
-                &varied_values(32 * 96, 13, 0.025),
-            )?,
-        );
-        model.tensors.insert(
-            "v.blk.0.attn_qkv.bias".to_owned(),
-            f32_tensor(
-                "v.blk.0.attn_qkv.bias",
-                vec![96],
-                &varied_values(96, 2, 0.01),
-            ),
-        );
-        model.tensors.insert(
-            "v.blk.0.attn_out.weight".to_owned(),
-            q8_0_tensor(
-                "v.blk.0.attn_out.weight",
-                32,
-                32,
-                &varied_values(32 * 32, 19, 0.02),
-            )?,
-        );
-        model.tensors.insert(
-            "v.blk.0.attn_out.bias".to_owned(),
-            f32_tensor(
-                "v.blk.0.attn_out.bias",
-                vec![32],
-                &varied_values(32, 9, 0.01),
-            ),
-        );
-        model.tensors.insert(
-            "v.blk.0.ffn_up.weight".to_owned(),
-            q8_0_tensor(
-                "v.blk.0.ffn_up.weight",
-                32,
-                64,
-                &varied_values(32 * 64, 23, 0.02),
-            )?,
-        );
-        model.tensors.insert(
-            "v.blk.0.ffn_up.bias".to_owned(),
-            f32_tensor("v.blk.0.ffn_up.bias", vec![64], &varied_values(64, 4, 0.01)),
-        );
+        for (name, dims, seed, scale) in [
+            ("v.patch_embd.weight", vec![2, 2, 3, 32], 3, 0.015),
+            ("v.patch_embd.weight.1", vec![2, 2, 3, 32], 11, 0.012),
+            ("v.patch_embd.bias", vec![32], 5, 0.02),
+            ("v.position_embd.weight", vec![32, 4], 7, 0.01),
+            ("v.blk.0.attn_qkv.bias", vec![96], 2, 0.01),
+            ("v.blk.0.attn_out.bias", vec![32], 9, 0.01),
+            ("v.blk.0.ffn_up.bias", vec![64], 4, 0.01),
+            ("v.blk.0.ffn_down.bias", vec![32], 15, 0.01),
+        ] {
+            let count = dims.iter().product();
+            model.tensors.insert(
+                name.to_owned(),
+                f32_tensor(name, dims, &varied_values(count, seed, scale)),
+            );
+        }
+        for (name, cols, rows, seed, scale) in [
+            ("v.blk.0.attn_qkv.weight", 32, 96, 13, 0.025),
+            ("v.blk.0.attn_out.weight", 32, 32, 19, 0.02),
+            ("v.blk.0.ffn_up.weight", 32, 64, 23, 0.02),
+            ("mm.0.weight", 128, 128, 31, 0.012),
+            ("mm.2.weight", 128, 32, 37, 0.015),
+        ] {
+            model.tensors.insert(
+                name.to_owned(),
+                q8_0_tensor(name, cols, rows, &varied_values(cols * rows, seed, scale))?,
+            );
+        }
         model.tensors.insert(
             "v.blk.0.ffn_down.weight".to_owned(),
             f16_tensor(
@@ -1969,27 +1951,6 @@ mod tests {
                 32,
                 &varied_values(64 * 32, 29, 0.018),
             )?,
-        );
-        model.tensors.insert(
-            "v.blk.0.ffn_down.bias".to_owned(),
-            f32_tensor(
-                "v.blk.0.ffn_down.bias",
-                vec![32],
-                &varied_values(32, 15, 0.01),
-            ),
-        );
-        model.tensors.insert(
-            "mm.0.weight".to_owned(),
-            q8_0_tensor(
-                "mm.0.weight",
-                128,
-                128,
-                &varied_values(128 * 128, 31, 0.012),
-            )?,
-        );
-        model.tensors.insert(
-            "mm.2.weight".to_owned(),
-            q8_0_tensor("mm.2.weight", 128, 32, &varied_values(128 * 32, 37, 0.015))?,
         );
         Ok(model)
     }

@@ -373,9 +373,7 @@ fn bf16_weight(name: &str, cols: usize, rows: usize) -> Tensor {
     }
 }
 
-#[test]
-fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_mixed() -> Result<()>
-{
+fn partial_executor_test_context() -> (Geometry, Vec<f32>) {
     let geometry = Geometry {
         embedding: 512,
         feed_forward: 512,
@@ -394,8 +392,55 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
     let input: Vec<_> = (0..512)
         .map(|index| [127.0, -127.0, 0.5001, -0.0, 63.5001, 1.5, -0.5001][index % 7])
         .collect();
+    (geometry, input)
+}
 
-    // 1. All-CPU fallback group [q, k, v] while a partial executor is active must still join.
+fn run_partial_executor_case<const N: usize>(
+    transforms: &Transforms,
+    weights: [&Tensor; N],
+    (geometry, input): (&Geometry, &[f32]),
+    arithmetic: Arithmetic,
+    executor: &mut PartialExecutorFixture,
+    expected: &[Vec<f32>; N],
+    (expected_calls, expected_dispatches, expected_successes): (&[&str], u64, u64),
+) -> Result<()> {
+    let mut scratch = ProjectionScratch {
+        matvec: arithmetic.scratch(executor.backend),
+        ..ProjectionScratch::default()
+    };
+    scratch.matvec.set_row_parallelism(RowParallelism::new(4)?);
+    let mut actual = std::array::from_fn::<_, N, _>(|_| Vec::new());
+    let mut exec_opt: Option<&mut dyn Pq2ProjectionExecutor> = Some(executor);
+    transforms.project_group_into_with_executor(
+        weights,
+        input,
+        geometry,
+        actual.each_mut(),
+        &mut scratch,
+        &mut exec_opt,
+    )?;
+    for (act, exp) in actual.iter().zip(expected) {
+        assert!(
+            act.iter()
+                .map(|v| v.to_bits())
+                .eq(exp.iter().map(|v| v.to_bits()))
+        );
+    }
+    assert_eq!(executor.calls, expected_calls);
+    assert_eq!(
+        scratch.matvec.statistics().grouped_row_dispatches,
+        expected_dispatches
+    );
+    assert_eq!(
+        scratch.matvec.statistics().matrix_successes,
+        expected_successes
+    );
+    Ok(())
+}
+
+#[test]
+fn partial_executor_joins_unclaimed_siblings_and_splits_mixed() -> Result<()> {
+    let (geometry, input) = partial_executor_test_context();
     let qkv_weights = [weight("q", 17), weight("k", 5), weight("v", 9)];
     let transforms_qkv = Transforms::default();
     for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
@@ -409,12 +454,7 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
                 transforms_qkv.project_into(w, &input, &geometry, out, &mut ref_scratch)?;
             }
 
-            let mut scratch = ProjectionScratch {
-                matvec: arithmetic.scratch(backend),
-                ..ProjectionScratch::default()
-            };
-            scratch.matvec.set_row_parallelism(RowParallelism::new(4)?);
-            let mut actual = std::array::from_fn::<_, 3, _>(|_| Vec::new());
+            // 1. All-CPU fallback group [q, k, v] while a partial executor is active must still join.
             let mut executor = PartialExecutorFixture {
                 f32_claimed: BTreeSet::new(),
                 f32_group_claimed: false,
@@ -423,35 +463,17 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
                 backend,
                 calls: Vec::new(),
             };
-            let mut exec_opt: Option<&mut dyn Pq2ProjectionExecutor> = Some(&mut executor);
-            transforms_qkv.project_group_into_with_executor(
+            run_partial_executor_case(
+                &transforms_qkv,
                 qkv_weights.each_ref(),
-                &input,
-                &geometry,
-                actual.each_mut(),
-                &mut scratch,
-                &mut exec_opt,
+                (&geometry, &input),
+                arithmetic,
+                &mut executor,
+                &expected,
+                (&[], 1, 3),
             )?;
-            for (act, exp) in actual.iter().zip(&expected) {
-                assert!(
-                    act.iter()
-                        .map(|v| v.to_bits())
-                        .eq(exp.iter().map(|v| v.to_bits()))
-                );
-            }
-            assert!(executor.calls.is_empty());
-            assert_eq!(scratch.matvec.statistics().grouped_row_dispatches, 1);
-            assert_eq!(scratch.matvec.statistics().matrix_successes, 3);
 
             // 2. Mixed ownership within same-kind group [q (claimed), k, v]: safe fallback.
-            let mut mixed_scratch = ProjectionScratch {
-                matvec: arithmetic.scratch(backend),
-                ..ProjectionScratch::default()
-            };
-            mixed_scratch
-                .matvec
-                .set_row_parallelism(RowParallelism::new(4)?);
-            let mut mixed_actual = std::array::from_fn::<_, 3, _>(|_| Vec::new());
             let mut mixed_exec = PartialExecutorFixture {
                 f32_claimed: BTreeSet::from(["q".to_owned()]),
                 f32_group_claimed: false,
@@ -460,28 +482,23 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
                 backend,
                 calls: Vec::new(),
             };
-            let mut mixed_opt: Option<&mut dyn Pq2ProjectionExecutor> = Some(&mut mixed_exec);
-            transforms_qkv.project_group_into_with_executor(
+            run_partial_executor_case(
+                &transforms_qkv,
                 qkv_weights.each_ref(),
-                &input,
-                &geometry,
-                mixed_actual.each_mut(),
-                &mut mixed_scratch,
-                &mut mixed_opt,
+                (&geometry, &input),
+                arithmetic,
+                &mut mixed_exec,
+                &expected,
+                (&["f32:q"], 0, 2),
             )?;
-            for (act, exp) in mixed_actual.iter().zip(&expected) {
-                assert!(
-                    act.iter()
-                        .map(|v| v.to_bits())
-                        .eq(exp.iter().map(|v| v.to_bits()))
-                );
-            }
-            assert_eq!(mixed_exec.calls, vec!["f32:q"]);
-            assert_eq!(mixed_scratch.matvec.statistics().grouped_row_dispatches, 0);
-            assert_eq!(mixed_scratch.matvec.statistics().matrix_successes, 2);
         }
     }
+    Ok(())
+}
 
+#[test]
+fn partial_executor_joins_recurrent_bf16_siblings() -> Result<()> {
+    let (geometry, input) = partial_executor_test_context();
     // 3. Recurrent [qkv, gate (PQ2 claimed), beta, alpha (BF16 unclaimed)] under both F32-group and Q8_K.
     let rec_weights = [
         weight("qkv", 17),
@@ -506,14 +523,6 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
             }
 
             // 3a: Partial executor claims [qkv, gate] via F32 group.
-            let mut f32_scratch = ProjectionScratch {
-                matvec: arithmetic.scratch(backend),
-                ..ProjectionScratch::default()
-            };
-            f32_scratch
-                .matvec
-                .set_row_parallelism(RowParallelism::new(4)?);
-            let mut f32_actual = std::array::from_fn::<_, 4, _>(|_| Vec::new());
             let mut f32_exec = PartialExecutorFixture {
                 f32_claimed: BTreeSet::from(["qkv".to_owned(), "gate".to_owned()]),
                 f32_group_claimed: true,
@@ -522,35 +531,17 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
                 backend,
                 calls: Vec::new(),
             };
-            let mut f32_opt: Option<&mut dyn Pq2ProjectionExecutor> = Some(&mut f32_exec);
-            rec_transforms.project_group_into_with_executor(
+            run_partial_executor_case(
+                &rec_transforms,
                 rec_weights.each_ref(),
-                &input,
-                &geometry,
-                f32_actual.each_mut(),
-                &mut f32_scratch,
-                &mut f32_opt,
+                (&geometry, &input),
+                arithmetic,
+                &mut f32_exec,
+                &expected,
+                (&["f32_group:qkv", "f32_group:gate"], 1, 2),
             )?;
-            for (act, exp) in f32_actual.iter().zip(&expected) {
-                assert!(
-                    act.iter()
-                        .map(|v| v.to_bits())
-                        .eq(exp.iter().map(|v| v.to_bits()))
-                );
-            }
-            assert_eq!(f32_exec.calls, vec!["f32_group:qkv", "f32_group:gate"]);
-            assert_eq!(f32_scratch.matvec.statistics().grouped_row_dispatches, 1);
-            assert_eq!(f32_scratch.matvec.statistics().matrix_successes, 2);
 
             // 3b: Partial executor claims [qkv, gate] via Q8_K.
-            let mut q8k_scratch = ProjectionScratch {
-                matvec: arithmetic.scratch(backend),
-                ..ProjectionScratch::default()
-            };
-            q8k_scratch
-                .matvec
-                .set_row_parallelism(RowParallelism::new(4)?);
-            let mut q8k_actual = std::array::from_fn::<_, 4, _>(|_| Vec::new());
             let mut q8k_exec = PartialExecutorFixture {
                 f32_claimed: BTreeSet::new(),
                 f32_group_claimed: false,
@@ -562,25 +553,15 @@ fn partial_executor_joins_cpu_siblings_on_unclaimed_and_bf16_groups_and_splits_m
                 backend,
                 calls: Vec::new(),
             };
-            let mut q8k_opt: Option<&mut dyn Pq2ProjectionExecutor> = Some(&mut q8k_exec);
-            rec_transforms.project_group_into_with_executor(
+            run_partial_executor_case(
+                &rec_transforms,
                 rec_weights.each_ref(),
-                &input,
-                &geometry,
-                q8k_actual.each_mut(),
-                &mut q8k_scratch,
-                &mut q8k_opt,
+                (&geometry, &input),
+                arithmetic,
+                &mut q8k_exec,
+                &expected,
+                (&["q8k:qkv", "q8k:gate"], 1, 2),
             )?;
-            for (act, exp) in q8k_actual.iter().zip(&expected) {
-                assert!(
-                    act.iter()
-                        .map(|v| v.to_bits())
-                        .eq(exp.iter().map(|v| v.to_bits()))
-                );
-            }
-            assert_eq!(q8k_exec.calls, vec!["q8k:qkv", "q8k:gate"]);
-            assert_eq!(q8k_scratch.matvec.statistics().grouped_row_dispatches, 1);
-            assert_eq!(q8k_scratch.matvec.statistics().matrix_successes, 2);
         }
     }
     Ok(())

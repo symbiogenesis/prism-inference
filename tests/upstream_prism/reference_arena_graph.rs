@@ -197,7 +197,10 @@ fn parse_dimensions(raw: &[u64], expected_rank: Option<usize>) -> Result<Descrip
     let mut count = 1_usize;
     for (target, &dim) in ne.iter_mut().zip(raw) {
         let extent = usize::try_from(dim)?;
-        require((1..=8192).contains(&extent), "arena tensor dimension outside bound")?;
+        require(
+            (1..=8192).contains(&extent),
+            "arena tensor dimension outside bound",
+        )?;
         *target = extent;
         count = count
             .checked_mul(extent)
@@ -208,17 +211,26 @@ fn parse_dimensions(raw: &[u64], expected_rank: Option<usize>) -> Result<Descrip
 }
 
 fn unary_input(inputs: &[u64], available: usize) -> Result<usize> {
-    require(inputs.len() == 1 && available > 0, "arena unary input count mismatch")?;
+    require(
+        inputs.len() == 1 && available > 0,
+        "arena unary input count mismatch",
+    )?;
     let idx = usize::try_from(inputs[0])?;
     require(idx < available, "arena input reference out of range")?;
     Ok(idx)
 }
 
 fn binary_inputs(inputs: &[u64], available: usize) -> Result<(usize, usize)> {
-    require(inputs.len() == 2 && available > 0, "arena binary input count mismatch")?;
+    require(
+        inputs.len() == 2 && available > 0,
+        "arena binary input count mismatch",
+    )?;
     let a = usize::try_from(inputs[0])?;
     let b = usize::try_from(inputs[1])?;
-    require(a < available && b < available, "arena input reference out of range")?;
+    require(
+        a < available && b < available,
+        "arena input reference out of range",
+    )?;
     Ok((a, b))
 }
 
@@ -361,7 +373,10 @@ fn plan_arena(
     allocation: Option<&AllocationSpec>,
 ) -> Result<ArenaPlan> {
     require(graph.kind == "tensor-graph", "unknown arena graph Kind")?;
-    require((1..=16).contains(&graph.threads), "arena Threads outside bound")?;
+    require(
+        (1..=16).contains(&graph.threads),
+        "arena Threads outside bound",
+    )?;
     require(
         (1..=96).contains(&graph.nodes.len()),
         "arena graph requires 1..96 nodes",
@@ -374,7 +389,10 @@ fn plan_arena(
         storage = storage
             .checked_add(planned.shape.bytes())
             .ok_or_else(|| invalid("arena cumulative storage overflow"))?;
-        require(storage <= MAX_STORAGE, "arena cumulative storage exceeds bound")?;
+        require(
+            storage <= MAX_STORAGE,
+            "arena cumulative storage exceeds bound",
+        )?;
         shapes.push(planned.shape);
         nodes.push(planned);
     }
@@ -525,10 +543,11 @@ fn pack_offsets(nodes: &[PlannedNode], offsets: &mut [usize]) -> Result<usize> {
 
 fn resolve_arena_layout(plan: &ArenaPlan) -> Result<(usize, Vec<usize>)> {
     let mut offsets = vec![0_usize; plan.nodes.len()];
-    let buffer_bytes = plan.allocation.as_ref().map_or_else(
-        || pack_offsets(&plan.nodes, &mut offsets),
-        |alloc| Ok(apply_allocation(alloc, &mut offsets)),
-    )?;
+    let buffer_bytes = if let Some(alloc) = plan.allocation.as_ref() {
+        apply_allocation(alloc, &mut offsets)
+    } else {
+        pack_offsets(&plan.nodes, &mut offsets)?
+    };
     for (idx, node) in plan.nodes.iter().enumerate() {
         if let PlannedOp::View2d { src, offset_bytes } = node.op {
             offsets[idx] = offsets[src]
@@ -600,6 +619,14 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn execute(value: &Value) -> Result<Value> {
+    if value["Operations"].as_array().is_some_and(|operations| {
+        operations.iter().any(|operation| {
+            operation["Kind"].as_str() == Some("cpu-buffer-info")
+                && operation.as_object().is_none_or(|object| object.len() != 1)
+        })
+    }) {
+        return Err(invalid("cpu-buffer-info forbids extra fields"));
+    }
     let request: Request = serde_json::from_value(value.clone())?;
     require(
         request.schema_version == 1 && (1..=128).contains(&request.operations.len()),
@@ -619,10 +646,8 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
     let results = plans
         .iter()
         .map(|plan| {
-            plan.as_ref().map_or_else(
-                || Ok(json!({"Alignment": ALIGNMENT})),
-                run_arena,
-            )
+            plan.as_ref()
+                .map_or_else(|| Ok(json!({"Alignment": ALIGNMENT})), run_arena)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(json!({"SchemaVersion": 1, "Results": results}))
@@ -681,7 +706,11 @@ mod tests {
         Ok((x, w))
     }
 
-    fn moe_sample_graph(n_embd: usize, n_exp: usize, n_tok: usize) -> Result<(Value, Vec<usize>, Vec<usize>)> {
+    fn moe_sample_graph(
+        n_embd: usize,
+        n_exp: usize,
+        n_tok: usize,
+    ) -> Result<(Value, Vec<usize>, Vec<usize>)> {
         let (x, w) = sample_inputs(n_embd, n_exp, n_tok)?;
         let mut nodes = vec![
             json!({"Op": "input", "Type": "F32", "Dimensions": [n_embd, n_exp, n_tok], "DataHex": f32_hex(&x)}),
@@ -721,7 +750,12 @@ mod tests {
         Ok((op, sizes, adds))
     }
 
-    fn layout_allocation(sizes: &[usize], adds: &[usize], layout: usize, alignment: usize) -> Result<Value> {
+    fn layout_allocation(
+        sizes: &[usize],
+        adds: &[usize],
+        layout: usize,
+        alignment: usize,
+    ) -> Result<Value> {
         let total = sizes.iter().sum::<usize>() + 4096 + sizes.len() * alignment;
         let mut offsets = vec![Value::Null; sizes.len()];
         let mut cursor = 0_usize;
@@ -776,11 +810,12 @@ mod tests {
 
     #[test]
     fn independent_arena_graph_executes_buffer_info_and_all_three_layouts() -> Result<()> {
-        let info_req = json!({"SchemaVersion": 1, "Operations": [{"Kind": "cpu-buffer-info"}]});
-        assert!(handles(&info_req));
-        let info_res = execute(&info_req)?;
+        let buffer_info_request =
+            json!({"SchemaVersion": 1, "Operations": [{"Kind": "cpu-buffer-info"}]});
+        assert!(handles(&buffer_info_request));
+        let buffer_info_response = execute(&buffer_info_request)?;
         let alignment = usize::try_from(
-            info_res["Results"][0]["Alignment"]
+            buffer_info_response["Results"][0]["Alignment"]
                 .as_u64()
                 .ok_or_else(|| invalid("missing Alignment"))?,
         )?;
@@ -882,7 +917,10 @@ mod tests {
         bad_view_oob["Graph"]["Nodes"][3]["OffsetBytes"] = json!(100 * 4);
         assert!(execute(&wrap(bad_view_oob)).is_err());
 
-        assert!(execute(&json!({"SchemaVersion": 2, "Operations": [{"Kind": "cpu-buffer-info"}]})).is_err());
+        assert!(
+            execute(&json!({"SchemaVersion": 2, "Operations": [{"Kind": "cpu-buffer-info"}]}))
+                .is_err()
+        );
         assert!(execute(&json!({"SchemaVersion": 1, "Operations": [{"Kind": "cpu-buffer-info", "Extra": 1}]})).is_err());
         assert!(execute(&json!({"SchemaVersion": 1, "Operations": []})).is_err());
         Ok(())

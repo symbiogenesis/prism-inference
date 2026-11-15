@@ -36,9 +36,7 @@ struct Operation {
     steps: Vec<StepInput>,
 }
 
-fn nullable_u64<'de, D: Deserializer<'de>>(
-    input: D,
-) -> std::result::Result<Option<u64>, D::Error> {
+fn nullable_u64<'de, D: Deserializer<'de>>(input: D) -> std::result::Result<Option<u64>, D::Error> {
     Option::deserialize(input)
 }
 
@@ -251,10 +249,14 @@ fn validate_backends(backends: &[BackendInput]) -> Result<Vec<BackendSpec>> {
         .collect()
 }
 
+type ExternalAllocations = (Vec<(usize, usize)>, [bool; 3]);
+type UnaryValidation = (Op, [usize; 4], Option<usize>, u64, [Option<usize>; 10]);
+type ExternalPlacements = (Vec<(usize, u64)>, Vec<Option<(usize, u64)>>);
+
 fn validate_external(
     external: &[ExternalInput],
     backend_count: usize,
-) -> Result<(Vec<(usize, usize)>, [bool; 3])> {
+) -> Result<ExternalAllocations> {
     require(
         external.len() <= 2,
         "allocation external context count outside bound",
@@ -276,11 +278,7 @@ fn validate_external(
     Ok((mapped, seen))
 }
 
-fn preceding_shape<'a>(
-    shapes: &'a [[usize; 4]],
-    index: usize,
-    input: usize,
-) -> Result<&'a [usize; 4]> {
+fn preceding_shape(shapes: &[[usize; 4]], index: usize, input: usize) -> Result<&[usize; 4]> {
     require(input < index, "allocation node input must precede node")?;
     shapes
         .get(input)
@@ -386,15 +384,15 @@ fn validate_unary(
     index: usize,
     shapes: &[[usize; 4]],
     descs: &[TensorDesc],
-) -> Result<(Op, [usize; 4], Option<usize>, u64, [Option<usize>; 10])> {
-    let inputs = match node {
-        NodeInput::Mean { inputs, .. }
-        | NodeInput::Scale { inputs, .. }
-        | NodeInput::Pad { inputs, .. }
-        | NodeInput::Reshape { inputs, .. }
-        | NodeInput::Permute { inputs, .. }
-        | NodeInput::View { inputs, .. } => inputs,
-        _ => return Err(invalid("unexpected allocation unary node")),
+) -> Result<UnaryValidation> {
+    let (NodeInput::Mean { inputs, .. }
+    | NodeInput::Scale { inputs, .. }
+    | NodeInput::Pad { inputs, .. }
+    | NodeInput::Reshape { inputs, .. }
+    | NodeInput::Permute { inputs, .. }
+    | NodeInput::View { inputs, .. }) = node
+    else {
+        return Err(invalid("unexpected allocation unary node"));
     };
     require(inputs.len() == 1, "allocation unary input count mismatch")?;
     let source = inputs[0];
@@ -420,8 +418,7 @@ fn validate_unary(
             Ok((Op::Pad, dims, None, 0, sources))
         }
         _ => {
-            let (op, dims, root, offs) =
-                validate_reshape_permute_view(node, source, orig, descs)?;
+            let (op, dims, root, offs) = validate_reshape_permute_view(node, source, orig, descs)?;
             Ok((op, dims, Some(root), offs, sources))
         }
     }
@@ -430,7 +427,7 @@ fn validate_unary(
 fn validate_node(
     node: &NodeInput,
     index: usize,
-    external_present: &[bool; 3],
+    external_present: [bool; 3],
     shapes: &mut Vec<[usize; 4]>,
     descs: &mut Vec<TensorDesc>,
 ) -> Result<()> {
@@ -506,7 +503,7 @@ fn validate_step(step: &StepInput, backend_count: usize) -> Result<ValidatedStep
     let mut shapes = Vec::with_capacity(step.nodes.len());
     let mut tensors = Vec::with_capacity(step.nodes.len());
     for (index, node) in step.nodes.iter().enumerate() {
-        validate_node(node, index, &external_present, &mut shapes, &mut tensors)?;
+        validate_node(node, index, external_present, &mut shapes, &mut tensors)?;
     }
     tensors[step.output].flags |= 2;
     Ok(ValidatedStep {
@@ -519,7 +516,10 @@ fn validate_step(step: &StepInput, backend_count: usize) -> Result<ValidatedStep
 }
 
 fn validate_operation(operation: &Operation) -> Result<ValidatedOperation> {
-    require(operation.kind == "allocation-graph", "unknown allocation Kind")?;
+    require(
+        operation.kind == "allocation-graph",
+        "unknown allocation Kind",
+    )?;
     let backends = validate_backends(&operation.backends)?;
     require(
         !operation.steps.is_empty() && operation.steps.len() <= MAX_STEPS,
@@ -582,10 +582,7 @@ fn align_up(value: u64, alignment: u64) -> Result<u64> {
         .ok_or_else(|| invalid("allocation alignment overflow"))
 }
 
-fn allocate_external(
-    step: &ValidatedStep,
-    backends: &[BackendSpec],
-) -> Result<(Vec<(usize, u64)>, Vec<Option<(usize, u64)>>)> {
+fn allocate_external(step: &ValidatedStep, backends: &[BackendSpec]) -> Result<ExternalPlacements> {
     let mut buffers = Vec::new();
     let mut placements = vec![None; step.tensors.len()];
     for &(context, buft) in &step.external {
@@ -607,7 +604,7 @@ fn allocate_external(
             } else {
                 let id = buffers.len();
                 buffers.push((buft, current_size));
-                for (tensor_idx, placed_off) in entries.drain(..) {
+                for (tensor_idx, placed_off) in std::mem::take(&mut entries) {
                     placements[tensor_idx] = Some((id, placed_off));
                 }
                 entries.push((index, 0));
@@ -1040,11 +1037,7 @@ fn resolve_placement(
     Ok(allocs[index].map(|alloc| (table.chunk_ids[alloc.buft][alloc.chunk], alloc.offset)))
 }
 
-fn tensor_snapshot(
-    index: usize,
-    tensor: &TensorDesc,
-    placement: Option<(usize, u64)>,
-) -> Value {
+fn tensor_snapshot(index: usize, tensor: &TensorDesc, placement: Option<(usize, u64)>) -> Value {
     let buffer = placement.map(|(buf_id, _)| buf_id);
     let offset = placement.map(|(_, offset)| offset);
     let sources = tensor
@@ -1165,11 +1158,18 @@ mod tests {
     use super::*;
 
     fn envelope(operations: Value) -> Value {
-        json!({"SchemaVersion": 1, "Operations": operations})
+        let mut object = serde_json::Map::new();
+        object.insert("SchemaVersion".into(), json!(1));
+        object.insert("Operations".into(), operations);
+        Value::Object(object)
     }
 
     fn single_op(backends: Value, steps: Value) -> Value {
-        envelope(json!([{"Kind": "allocation-graph", "Backends": backends, "Steps": steps}]))
+        let mut operation = serde_json::Map::new();
+        operation.insert("Kind".into(), Value::String("allocation-graph".into()));
+        operation.insert("Backends".into(), backends);
+        operation.insert("Steps".into(), steps);
+        envelope(Value::Array(vec![Value::Object(operation)]))
     }
 
     fn step(
@@ -1179,13 +1179,16 @@ mod tests {
         external: Value,
         reserve: bool,
     ) -> Value {
-        json!({
-            "Nodes": nodes,
-            "Output": output,
-            "BufferTypes": buffer_types,
-            "ExternalAllocations": external,
-            "Reserve": reserve
-        })
+        let mut object = serde_json::Map::new();
+        object.insert("Nodes".into(), nodes);
+        object.insert("Output".into(), json!(output));
+        object.insert(
+            "BufferTypes".into(),
+            Value::Array(buffer_types.into_iter().map(Value::from).collect()),
+        );
+        object.insert("ExternalAllocations".into(), external);
+        object.insert("Reserve".into(), Value::Bool(reserve));
+        Value::Object(object)
     }
 
     fn backend_total(observation: &Value, backend: usize) -> Result<u64> {
@@ -1381,8 +1384,14 @@ mod tests {
         assert!(backend_total(view_obs, 0)? <= 24);
         assert_eq!(view_obs["Tensors"][3]["ViewSource"], 0);
         assert_eq!(view_obs["Tensors"][3]["Offset"], 4);
-        assert_eq!(view_obs["Tensors"][5]["Buffer"], view_obs["Tensors"][4]["Buffer"]);
-        assert_eq!(view_obs["Tensors"][5]["Offset"], view_obs["Tensors"][4]["Offset"]);
+        assert_eq!(
+            view_obs["Tensors"][5]["Buffer"],
+            view_obs["Tensors"][4]["Buffer"]
+        );
+        assert_eq!(
+            view_obs["Tensors"][5]["Offset"],
+            view_obs["Tensors"][4]["Offset"]
+        );
         Ok(())
     }
 
@@ -1580,7 +1589,10 @@ mod tests {
         assert_eq!(obs["Tensors"][3]["ViewSource"], 0);
         assert_eq!(obs["Tensors"][1]["DataPresent"], json!(true));
         assert_eq!(obs["Tensors"][4]["Bytes"], 24);
-        assert_eq!(obs["Tensors"][4]["Sources"].as_array().map(Vec::len), Some(10));
+        assert_eq!(
+            obs["Tensors"][4]["Sources"].as_array().map(Vec::len),
+            Some(10)
+        );
         assert_eq!(obs["GraphLeaves"], json!([0, 1]));
         assert_eq!(obs["GraphNodes"], json!([4]));
 
@@ -1635,13 +1647,22 @@ mod tests {
                 json!([&valid_step]),
             ),
             single_op(json!([{"Alignment": 8}]), json!([&valid_step])),
-            single_op(json!([{"MaxBufferSize": 0, "Alignment": 8}]), json!([&valid_step])),
+            single_op(
+                json!([{"MaxBufferSize": 0, "Alignment": 8}]),
+                json!([&valid_step]),
+            ),
             single_op(
                 json!([{"MaxBufferSize": 1_048_577, "Alignment": 8}]),
                 json!([&valid_step]),
             ),
-            single_op(json!([{"MaxBufferSize": null, "Alignment": 0}]), json!([&valid_step])),
-            single_op(json!([{"MaxBufferSize": null, "Alignment": 6}]), json!([&valid_step])),
+            single_op(
+                json!([{"MaxBufferSize": null, "Alignment": 0}]),
+                json!([&valid_step]),
+            ),
+            single_op(
+                json!([{"MaxBufferSize": null, "Alignment": 6}]),
+                json!([&valid_step]),
+            ),
             single_op(
                 json!([{"MaxBufferSize": null, "Alignment": 128}]),
                 json!([&valid_step]),
@@ -1657,35 +1678,174 @@ mod tests {
     }
 
     #[test]
-    fn independent_allocation_rejects_invalid_steps_and_shapes() {
+    fn independent_allocation_rejects_invalid_steps() {
         for bad_step in [
             step(json!([]), 0, vec![], json!([]), false),
-            step(json!(vec![json!({"Op": "input", "Context": 0, "Elements": 1}); 41]), 0, vec![0; 41], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 0}]), 0, vec![0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 1025}]), 0, vec![0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 1, "Elements": 4}]), 0, vec![0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}]), 1, vec![0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}]), 0, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}]), 0, vec![1], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}]), 0, vec![0], json!([{"Context": 0, "BufferType": 0}]), false),
-            step(json!([{"Op": "input", "Context": 1, "Elements": 4}]), 0, vec![0], json!([{"Context": 1, "BufferType": 0}, {"Context": 1, "BufferType": 0}]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}]), 0, vec![0], json!([{"Context": 1, "BufferType": 0}]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "add", "Context": 0, "Inputs": [0, 1]}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "input", "Context": 0, "Elements": 2}, {"Op": "add", "Context": 0, "Inputs": [0, 1]}]), 2, vec![0, 0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "reshape", "Context": 0, "Inputs": [0], "Dimensions": [2, 2]}, {"Op": "concat", "Context": 0, "Inputs": [0, 1]}]), 2, vec![0, 0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "scale", "Context": 0, "Inputs": [0], "Factor": 1e40_f64}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "reshape", "Context": 0, "Inputs": [0], "Dimensions": [2, 3]}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "permute", "Context": 0, "Inputs": [0], "Axes": [0, 0, 2, 3]}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "view", "Context": 0, "Inputs": [0], "Elements": 2, "OffsetBytes": 2}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "view", "Context": 0, "Inputs": [0], "Elements": 4, "OffsetBytes": 4}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 1000}, {"Op": "pad", "Context": 0, "Inputs": [0], "Amount": 25}]), 1, vec![0, 0], json!([]), false),
-            step(json!([{"Op": "input", "Context": 0, "Elements": 4, "Extra": 1}]), 0, vec![0], json!([]), false),
+            step(
+                json!(vec![
+                    json!({"Op": "input", "Context": 0, "Elements": 1});
+                    41
+                ]),
+                0,
+                vec![0; 41],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 0}]),
+                0,
+                vec![0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 1025}]),
+                0,
+                vec![0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 1, "Elements": 4}]),
+                0,
+                vec![0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}]),
+                1,
+                vec![0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}]),
+                0,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}]),
+                0,
+                vec![1],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}]),
+                0,
+                vec![0],
+                json!([{"Context": 0, "BufferType": 0}]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 1, "Elements": 4}]),
+                0,
+                vec![0],
+                json!([{"Context": 1, "BufferType": 0}, {"Context": 1, "BufferType": 0}]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}]),
+                0,
+                vec![0],
+                json!([{"Context": 1, "BufferType": 0}]),
+                false,
+            ),
         ] {
-            assert!(execute(&single_op(
-                json!([{"MaxBufferSize": null, "Alignment": 8}]),
-                json!([bad_step]),
-            ))
-            .is_err());
+            assert!(
+                execute(&single_op(
+                    json!([{"MaxBufferSize": null, "Alignment": 8}]),
+                    json!([bad_step]),
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn independent_allocation_rejects_invalid_shapes() {
+        for bad_step in [
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "add", "Context": 0, "Inputs": [0, 1]}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "input", "Context": 0, "Elements": 2}, {"Op": "add", "Context": 0, "Inputs": [0, 1]}]),
+                2,
+                vec![0, 0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "reshape", "Context": 0, "Inputs": [0], "Dimensions": [2, 2]}, {"Op": "concat", "Context": 0, "Inputs": [0, 1]}]),
+                2,
+                vec![0, 0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "scale", "Context": 0, "Inputs": [0], "Factor": 1e40_f64}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "reshape", "Context": 0, "Inputs": [0], "Dimensions": [2, 3]}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "permute", "Context": 0, "Inputs": [0], "Axes": [0, 0, 2, 3]}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "view", "Context": 0, "Inputs": [0], "Elements": 2, "OffsetBytes": 2}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4}, {"Op": "view", "Context": 0, "Inputs": [0], "Elements": 4, "OffsetBytes": 4}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 1000}, {"Op": "pad", "Context": 0, "Inputs": [0], "Amount": 25}]),
+                1,
+                vec![0, 0],
+                json!([]),
+                false,
+            ),
+            step(
+                json!([{"Op": "input", "Context": 0, "Elements": 4, "Extra": 1}]),
+                0,
+                vec![0],
+                json!([]),
+                false,
+            ),
+        ] {
+            assert!(
+                execute(&single_op(
+                    json!([{"MaxBufferSize": null, "Alignment": 8}]),
+                    json!([bad_step]),
+                ))
+                .is_err()
+            );
         }
     }
 }

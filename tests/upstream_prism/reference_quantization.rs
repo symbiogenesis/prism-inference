@@ -78,7 +78,7 @@ struct TensorDesc {
 #[serde(tag = "Op", deny_unknown_fields)]
 enum Action {
     #[serde(rename = "allows")]
-    Allows {},
+    Allows,
     #[serde(rename = "types")]
     Types {
         #[serde(rename = "Ftype")]
@@ -98,10 +98,9 @@ struct ValidatedModel<'a> {
 
 impl ValidatedModel<'_> {
     const fn gqa(&self) -> u32 {
-        if self.kv_heads == 0 {
-            0
-        } else {
-            self.heads / self.kv_heads
+        match self.heads.checked_div(self.kv_heads) {
+            Some(ratio) => ratio,
+            None => 0,
         }
     }
 }
@@ -374,7 +373,7 @@ fn validate_actions(tensors: &[ValidatedTensor], actions: &[Action]) -> Result<(
     let mut returned = 0_usize;
     for action in actions {
         match action {
-            Action::Allows {} => {
+            Action::Allows => {
                 returned = returned
                     .checked_add(tensors.len())
                     .ok_or_else(|| invalid("quantization response entries exceed bound"))?;
@@ -468,7 +467,11 @@ fn category(name: &str) -> Category {
     Category::Other
 }
 
-fn parse_layer(model: &ValidatedModel<'_>, tensor: &ValidatedTensor, counter: usize) -> Result<usize> {
+fn parse_layer(
+    model: &ValidatedModel<'_>,
+    tensor: &ValidatedTensor,
+    counter: usize,
+) -> Result<usize> {
     if model.experts <= 1 {
         return Ok(counter);
     }
@@ -812,7 +815,7 @@ fn execute_model(
     let mut results = Vec::with_capacity(actions.len());
     for action in actions {
         match action {
-            Action::Allows {} => {
+            Action::Allows => {
                 let allowed = tensors.iter().map(allows).collect::<Vec<_>>();
                 let names = tensors
                     .iter()
@@ -875,9 +878,23 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
             "independent quantization operations must number 1 through 128",
         ));
     }
+    if value["Operations"].as_array().is_some_and(|operations| {
+        operations.iter().any(|operation| {
+            operation["Actions"].as_array().is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    action["Op"].as_str() == Some("allows")
+                        && action.as_object().is_none_or(|object| object.len() != 1)
+                })
+            })
+        })
+    }) {
+        return Err(invalid("allows action forbids extra fields"));
+    }
     let request: Request = serde_json::from_value(value.clone())?;
     if request.schema_version != 1 {
-        return Err(invalid("independent quantization requires schema version 1"));
+        return Err(invalid(
+            "independent quantization requires schema version 1",
+        ));
     }
     let validated = request
         .operations
@@ -918,13 +935,7 @@ pub(super) fn identity() -> Value {
 mod tests {
     use super::*;
 
-    fn model_json(
-        arch: &str,
-        layers: u32,
-        heads: u32,
-        kv_heads: u32,
-        experts: u32,
-    ) -> Value {
+    fn model_json(arch: &str, layers: u32, heads: u32, kv_heads: u32, experts: u32) -> Value {
         json!({
             "Architecture": arch,
             "Embedding": 4096,
@@ -1083,7 +1094,7 @@ mod tests {
         assert_eq!(q2k["Types"], json!([10, 10, 10, 13, 11, 10, 10, 11, 14]));
         let bf16 = run_single_types(&llama80, &llama80_tensors, 32)?;
         assert_eq!(bf16["DefaultType"], 30);
-        assert_eq!(bf16["Types"], json!([30; 9]));
+        assert_eq!(bf16["Types"], json!(vec![30; 9]));
 
         let mixtral = model_json("llama", 32, 32, 8, 8);
         let moe_tensors = [
@@ -1171,8 +1182,7 @@ mod tests {
         assert_eq!(iq2m["Types"], json!([21, 13, 21, 21, 21, 21, 17]));
 
         let dense = model_json("llama", 8, 8, 8, 0);
-        for (ftype, cols, expected) in [(23, 288, 20), (15, 288, 6), (15, 270, 1), (141, 288, 2)]
-        {
+        for (ftype, cols, expected) in [(23, 288, 20), (15, 288, 6), (15, 270, 1), (141, 288, 2)] {
             assert_eq!(
                 run_single_types(
                     &dense,
@@ -1207,17 +1217,40 @@ mod tests {
             json!({"SchemaVersion": 1, "Operations": [{"Kind": "quantization-info", "Ftypes": [1024]}]}),
             json!({"SchemaVersion": 1, "Operations": [{"Kind": "quantization-info", "Ftypes": vec![0; 1025]}]}),
             json!({"SchemaVersion": 1, "Operations": [{"Kind": "quantization-info", "Ftypes": []}], "Extra": 1}),
-            model_request(&model_json("unknown-arch", 4, 8, 8, 0), &json!([&good]), &json!([])),
-            model_request(&model_json("llama", 0, 8, 8, 0), &json!([&good]), &json!([])),
-            model_request(&model_json("llama", 513, 8, 8, 0), &json!([&good]), &json!([])),
-            model_request(&model, &json!([]), &json!([])),
-            model_request(&model, &json!([tensor_json("blk.0.attn_q.weight", [0, 256, 1, 1])]), &json!([])),
             model_request(
-                &model,
-                &json!([tensor_json("blk.0.attn_q.weight", [2_000_000_000, 2_000_000_000, 1, 1])]),
+                &model_json("unknown-arch", 4, 8, 8, 0),
+                &json!([&good]),
                 &json!([]),
             ),
-            model_request(&model, &json!([tensor_json(&utf8_cut, [256, 256, 1, 1])]), &json!([])),
+            model_request(
+                &model_json("llama", 0, 8, 8, 0),
+                &json!([&good]),
+                &json!([]),
+            ),
+            model_request(
+                &model_json("llama", 513, 8, 8, 0),
+                &json!([&good]),
+                &json!([]),
+            ),
+            model_request(&model, &json!([]), &json!([])),
+            model_request(
+                &model,
+                &json!([tensor_json("blk.0.attn_q.weight", [0, 256, 1, 1])]),
+                &json!([]),
+            ),
+            model_request(
+                &model,
+                &json!([tensor_json(
+                    "blk.0.attn_q.weight",
+                    [2_000_000_000, 2_000_000_000, 1, 1]
+                )]),
+                &json!([]),
+            ),
+            model_request(
+                &model,
+                &json!([tensor_json(&utf8_cut, [256, 256, 1, 1])]),
+                &json!([]),
+            ),
         ] {
             assert!(execute(&request).is_err());
         }
@@ -1230,13 +1263,37 @@ mod tests {
         let norm = tensor_json("blk.0.attn_norm.weight", [256, 4, 1, 1]);
 
         for request in [
-            model_request(&model, &json!([&good]), &json!([{"Op": "allows", "Extra": 1}])),
+            model_request(
+                &model,
+                &json!([&good]),
+                &json!([{"Op": "allows", "Extra": 1}]),
+            ),
             model_request(&model, &json!([&good]), &json!([{"Op": "unknown"}])),
-            model_request(&model, &json!([&good]), &json!([{"Op": "types", "Ftype": 39, "TensorIndices": [0]}])),
-            model_request(&model, &json!([&good]), &json!([{"Op": "types", "Ftype": 4, "TensorIndices": [0]}])),
-            model_request(&model, &json!([&good]), &json!([{"Op": "types", "Ftype": 15, "TensorIndices": [1]}])),
-            model_request(&model, &json!([&good]), &json!(vec![json!({"Op": "allows"}); 129])),
-            model_request(&model, &json!([norm]), &json!([{"Op": "types", "Ftype": 15, "TensorIndices": [0]}])),
+            model_request(
+                &model,
+                &json!([&good]),
+                &json!([{"Op": "types", "Ftype": 39, "TensorIndices": [0]}]),
+            ),
+            model_request(
+                &model,
+                &json!([&good]),
+                &json!([{"Op": "types", "Ftype": 4, "TensorIndices": [0]}]),
+            ),
+            model_request(
+                &model,
+                &json!([&good]),
+                &json!([{"Op": "types", "Ftype": 15, "TensorIndices": [1]}]),
+            ),
+            model_request(
+                &model,
+                &json!([&good]),
+                &json!(vec![json!({"Op": "allows"}); 129]),
+            ),
+            model_request(
+                &model,
+                &json!([norm]),
+                &json!([{"Op": "types", "Ftype": 15, "TensorIndices": [0]}]),
+            ),
             model_request(
                 &model,
                 &json!([tensor_json("blk.0.attn_q.weight", [33, 256, 1, 1])]),

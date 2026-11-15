@@ -97,6 +97,7 @@ enum RawNode {
         inputs: Vec<u64>,
         stride: u64,
         padding: u64,
+        #[serde(default = "default_one_u64")]
         dilation: u64,
         channels: u64,
     },
@@ -105,12 +106,19 @@ enum RawNode {
         inputs: Vec<u64>,
         rotations: u64,
         mode: u64,
+        #[serde(default = "default_rope_context")]
         context: u64,
+        #[serde(default = "default_rope_freq_base")]
         frequency_base: f64,
+        #[serde(default = "default_one_f64")]
         frequency_scale: f64,
+        #[serde(default)]
         extension_factor: f64,
+        #[serde(default = "default_one_f64")]
         attention_factor: f64,
+        #[serde(default = "default_rope_beta_fast")]
         beta_fast: f64,
+        #[serde(default = "default_one_f64")]
         beta_slow: f64,
     },
     #[serde(rename = "rope_multi")]
@@ -127,6 +135,26 @@ enum RawNode {
         beta_slow: f64,
         sections: Vec<u64>,
     },
+}
+
+const fn default_one_u64() -> u64 {
+    1
+}
+
+const fn default_rope_context() -> u64 {
+    32_768
+}
+
+const fn default_rope_freq_base() -> f64 {
+    10_000.0
+}
+
+const fn default_one_f64() -> f64 {
+    1.0
+}
+
+const fn default_rope_beta_fast() -> f64 {
+    32.0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,7 +209,10 @@ impl Tensor {
         let expected = count
             .checked_mul(dtype.byte_size())
             .ok_or_else(|| invalid("tensor byte size overflow"))?;
-        require(bytes.len() == expected, "tensor byte buffer length mismatch")?;
+        require(
+            bytes.len() == expected,
+            "tensor byte buffer length mismatch",
+        )?;
         Ok(Self {
             dtype,
             ne,
@@ -394,7 +425,10 @@ fn validated_count(ne: [usize; 4]) -> Result<usize> {
 }
 
 fn parse_dimensions(raw: &[u64], expected_rank: Option<usize>) -> Result<[usize; 4]> {
-    require(!raw.is_empty() && raw.len() <= 4, "tensor requires 1..4 dimensions")?;
+    require(
+        !raw.is_empty() && raw.len() <= 4,
+        "tensor requires 1..4 dimensions",
+    )?;
     if let Some(rank) = expected_rank {
         require(raw.len() == rank, "tensor rank mismatch")?;
     }
@@ -445,7 +479,9 @@ fn unhex(text: &str) -> Result<Vec<u8>> {
 fn unary_input<'a>(inputs: &[u64], nodes: &'a [Tensor]) -> Result<&'a Tensor> {
     require(inputs.len() == 1, "unary op requires 1 input")?;
     let idx = usize::try_from(inputs[0])?;
-    nodes.get(idx).ok_or_else(|| invalid("tensor input index out of range"))
+    nodes
+        .get(idx)
+        .ok_or_else(|| invalid("tensor input index out of range"))
 }
 
 fn binary_inputs<'a>(inputs: &[u64], nodes: &'a [Tensor]) -> Result<(&'a Tensor, &'a Tensor)> {
@@ -513,16 +549,19 @@ fn eval_transpose(src: &Tensor) -> Tensor {
 fn eval_permute(src: &Tensor, axes_raw: &[u64]) -> Result<Tensor> {
     require(axes_raw.len() == 4, "permute requires 4 axes")?;
     let mut seen = [false; 4];
-    let mut axes = [0_usize; 4];
-    for (slot, &raw) in axes.iter_mut().zip(axes_raw) {
+    let mut perm_axes = [0_usize; 4];
+    for (slot, &raw) in perm_axes.iter_mut().zip(axes_raw) {
         let axis = usize::try_from(raw)?;
-        require(axis < 4 && !seen[axis], "permute requires valid 0..4 axis permutation")?;
+        require(
+            axis < 4 && !seen[axis],
+            "permute requires valid 0..4 axis permutation",
+        )?;
         seen[axis] = true;
         *slot = axis;
     }
     let mut ne = [0_usize; 4];
     let mut strides = [0_usize; 4];
-    for (src_axis, &dst_axis) in axes.iter().enumerate() {
+    for (src_axis, &dst_axis) in perm_axes.iter().enumerate() {
         ne[dst_axis] = src.ne[src_axis];
         strides[dst_axis] = src.strides[src_axis];
     }
@@ -758,28 +797,35 @@ fn eval_conv_transpose_1d(
         "conv_transpose_1d requires contiguous F32 inputs",
     )?;
     let stride = usize::try_from(stride_u64)?;
-    require((1..=4096).contains(&stride), "conv_transpose_1d stride outside bound")?;
-    require(padding_u64 == 0 && dilation_u64 == 1, "conv_transpose_1d requires padding 0 dilation 1")?;
+    require(
+        (1..=4096).contains(&stride),
+        "conv_transpose_1d stride outside bound",
+    )?;
+    require(
+        padding_u64 == 0 && dilation_u64 == 1,
+        "conv_transpose_1d requires padding 0 dilation 1",
+    )?;
     require(
         a.ne[3] == 1 && b.ne[2] == 1 && b.ne[3] == 1 && a.ne[2] == b.ne[1],
         "conv_transpose_1d tensor dimension mismatch",
     )?;
-    let (k_len, oc_len, ic_len, il_len) = (a.ne[0], a.ne[1], a.ne[2], b.ne[0]);
-    let ol_len = (il_len - 1)
+    let (kernel_len, filters, depth, steps) = (a.ne[0], a.ne[1], a.ne[2], b.ne[0]);
+    let out_steps = (steps - 1)
         .checked_mul(stride)
-        .and_then(|base| base.checked_add(k_len))
+        .and_then(|base| base.checked_add(kernel_len))
         .ok_or_else(|| invalid("conv_transpose_1d output length overflow"))?;
-    let out_ne = [ol_len, oc_len, 1, 1];
+    let out_ne = [out_steps, filters, 1, 1];
     let count = validated_count(out_ne)?;
     let mut acc = vec![0.0_f32; count];
-    for ic in 0..ic_len {
-        for il in 0..il_len {
-            let vb = b.read_f32_at(b.offset + (il + ic * il_len) * 4)?;
-            for oc in 0..oc_len {
-                for k in 0..k_len {
-                    let va = a.read_f32_at(a.offset + (k + (oc + ic * oc_len) * k_len) * 4)?;
+    for ic in 0..depth {
+        for il in 0..steps {
+            let vb = b.read_f32_at(b.offset + (il + ic * steps) * 4)?;
+            for oc in 0..filters {
+                for k in 0..kernel_len {
+                    let va =
+                        a.read_f32_at(a.offset + (k + (oc + ic * filters) * kernel_len) * 4)?;
                     let prod = va * vb;
-                    acc[il * stride + k + oc * ol_len] += prod;
+                    acc[il * stride + k + oc * out_steps] += prod;
                 }
             }
         }
@@ -790,7 +836,7 @@ fn eval_conv_transpose_1d(
 
 fn eval_col2im_1d(
     src: &Tensor,
-    stride_u64: u64,
+    raw_stride: u64,
     padding_u64: u64,
     dilation_u64: u64,
     channels_u64: u64,
@@ -800,25 +846,29 @@ fn eval_col2im_1d(
         "col2im_1d requires contiguous non-I32 input",
     )?;
     require(src.ne[3] == 1, "col2im_1d requires ne[3] == 1")?;
-    let stride = usize::try_from(stride_u64)?;
+    let stride = usize::try_from(raw_stride)?;
     let padding = usize::try_from(padding_u64)?;
     let dilation = usize::try_from(dilation_u64)?;
     let channels = usize::try_from(channels_u64)?;
-    require((1..=4096).contains(&stride), "col2im_1d stride outside bound")?;
+    require(
+        (1..=4096).contains(&stride),
+        "col2im_1d stride outside bound",
+    )?;
     require(padding <= 4096, "col2im_1d padding outside bound")?;
-    require((1..=4096).contains(&dilation), "col2im_1d dilation outside bound")?;
+    require(
+        (1..=4096).contains(&dilation),
+        "col2im_1d dilation outside bound",
+    )?;
     require(
         (1..=8192).contains(&channels) && src.ne[0].is_multiple_of(channels),
         "col2im_1d channel count mismatch",
     )?;
     let kernel = src.ne[0] / channels;
     let il = src.ne[1];
-    let stride_i64 = i64::try_from(stride)?;
+    let stride_signed = i64::try_from(stride)?;
     let pad_i64 = i64::try_from(padding)?;
     let dil_i64 = i64::try_from(dilation)?;
-    let ol_i64 = i64::try_from(il - 1)? * stride_i64
-        + dil_i64 * i64::try_from(kernel - 1)?
-        + 1
+    let ol_i64 = i64::try_from(il - 1)? * stride_signed + dil_i64 * i64::try_from(kernel - 1)? + 1
         - 2 * pad_i64;
     require(ol_i64 > 0, "col2im_1d output length must be positive")?;
     let ol = usize::try_from(ol_i64)?;
@@ -827,7 +877,7 @@ fn eval_col2im_1d(
     let mut acc = vec![0.0_f32; count];
     for batch in 0..src.ne[2] {
         for il_idx in 0..il {
-            let base_pos = i64::try_from(il_idx)? * stride_i64 - pad_i64;
+            let base_pos = i64::try_from(il_idx)? * stride_signed - pad_i64;
             for oc in 0..channels {
                 for k_idx in 0..kernel {
                     let pos = base_pos + i64::try_from(k_idx)? * dil_i64;
@@ -928,7 +978,10 @@ fn yarn_corr_dims(params: &RopeParams) -> Result<(f64, f64)> {
     let max_dim = f64::from(u32::try_from(params.rotations - 1)?);
     let corr_dim = |n_rot: f64| -> Result<f64> {
         let ratio = params.context / (n_rot * TAU);
-        require(ratio.is_finite() && ratio > 0.0, "invalid YaRN correction domain")?;
+        require(
+            ratio.is_finite() && ratio > 0.0,
+            "invalid YaRN correction domain",
+        )?;
         Ok(n_dims_f * ratio.ln() / (2.0 * ln_base))
     };
     let low = corr_dim(params.beta_fast)?.floor().max(0.0);
@@ -958,7 +1011,7 @@ fn rope_cos_sin(
         let scaled = theta_interp * (1.0 - ramp);
         let extra = theta_extrap * ramp;
         let log_scale = (1.0_f64 / params.freq_scale).ln();
-        let mscale_corr = 1.0_f64 + 0.1_f64 * log_scale;
+        let mscale_corr = 0.1_f64.mul_add(log_scale, 1.0_f64);
         (scaled + extra, params.attn_factor * mscale_corr)
     };
     Ok((
@@ -1039,7 +1092,7 @@ fn rotate_rope_row(
 fn eval_rope(a: &Tensor, pos: &Tensor, params: &RopeParams) -> Result<Tensor> {
     validate_rope_params(a, pos, params)?;
     let corr = yarn_corr_dims(params)?;
-    let (ne0, ne1, ne2, ne3) = (a.ne[0], a.ne[1], a.ne[2], a.ne[3]);
+    let [ne0, ne1, ne2, ne3] = a.ne;
     let n_pairs = if params.mode == 24 {
         params.rotations
     } else {
@@ -1212,7 +1265,10 @@ fn eval_node(node: &RawNode, nodes: &[Tensor]) -> Result<Tensor> {
 }
 
 fn execute_graph(threads: u64, raw_nodes: &[RawNode], raw_outputs: &[u64]) -> Result<Value> {
-    require((1..=16).contains(&threads), "tensor-graph Threads outside bound")?;
+    require(
+        (1..=16).contains(&threads),
+        "tensor-graph Threads outside bound",
+    )?;
     require(
         (1..=96).contains(&raw_nodes.len()),
         "tensor-graph requires 1..96 nodes",
@@ -1382,7 +1438,10 @@ mod tests {
         require_eq_len(actual.len(), expected.len())?;
         for (&a, &e) in actual.iter().zip(expected) {
             let diff = (a - e).abs();
-            assert!(diff <= tol, "mismatch: actual={a}, expected={e}, diff={diff}");
+            assert!(
+                diff <= tol,
+                "mismatch: actual={a}, expected={e}, diff={diff}"
+            );
         }
         Ok(())
     }
@@ -1458,8 +1517,11 @@ mod tests {
     }
 
     #[test]
-    fn independent_col2im_and_conv_transpose_match_across_types_padding_and_dilation() -> Result<()> {
-        let a = [1.0_f32, -2.0, 0.5, 3.0, -1.5, 2.0, 0.25, -0.5, 1.5, -1.0, 0.75, 2.5];
+    fn independent_col2im_and_conv_transpose_match_across_types_padding_and_dilation() -> Result<()>
+    {
+        let a = [
+            1.0_f32, -2.0, 0.5, 3.0, -1.5, 2.0, 0.25, -0.5, 1.5, -1.0, 0.75, 2.5,
+        ];
         let b = [1.0_f32, 2.0, -1.0, 0.5, -2.0, 1.5];
         let req = wrap_graph(
             2,
@@ -1494,18 +1556,20 @@ mod tests {
         let conv = decode_f32_hex(outs[0]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
         let col_f32 = decode_f32_hex(outs[1]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
         assert_close(&col_f32, &conv, 1e-5)?;
-        let col_f16: Vec<f32> = decode_u16_hex(outs[2]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?
-            .into_iter()
-            .map(f16_to_f32)
-            .collect();
-        let col_bf16: Vec<f32> = decode_u16_hex(outs[3]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?
-            .into_iter()
-            .map(bf16_to_f32)
-            .collect();
-        assert_close(&col_f16, &conv, 0.05)?;
-        assert_close(&col_bf16, &conv, 0.2)?;
+        let half_out: Vec<f32> =
+            decode_u16_hex(outs[2]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?
+                .into_iter()
+                .map(f16_to_f32)
+                .collect();
+        let bfloat_out: Vec<f32> =
+            decode_u16_hex(outs[3]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?
+                .into_iter()
+                .map(bf16_to_f32)
+                .collect();
+        assert_close(&half_out, &conv, 0.05)?;
+        assert_close(&bfloat_out, &conv, 0.2)?;
 
-        let dil_req = wrap_graph(
+        let dilated_request = wrap_graph(
             1,
             &[
                 json!({"Op": "input", "Type": "F32", "Dimensions": [4, 2], "DataHex": f32_hex(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])}),
@@ -1513,8 +1577,8 @@ mod tests {
             ],
             &[1],
         );
-        let dil_res = execute(&dil_req)?;
-        let dil_out = &dil_res["Results"][0]["Outputs"][0];
+        let dilated_response = execute(&dilated_request)?;
+        let dil_out = &dilated_response["Results"][0]["Outputs"][0];
         assert_eq!(dil_out["Dimensions"], json!([3, 2, 1, 1]));
         let dil_vals = decode_f32_hex(dil_out["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
         assert_close(&dil_vals, &[0.0, 7.0, 0.0, 0.0, 11.0, 0.0], 1e-6)
@@ -1568,19 +1632,25 @@ mod tests {
         let cont = decode_f32_hex(outs[3]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
         assert_close(&cont, &[1.0, 3.0, 2.0, 4.0], 1e-6)?;
         let combined = decode_f32_hex(outs[4]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
-        assert_close(&combined, &[4.0 * 3.0 / r0, 7.0 * 4.0 / r0, 0.0, 6.0 * 2.0 / r1], 1e-5)
+        assert_close(
+            &combined,
+            &[4.0 * 3.0 / r0, 7.0 * 4.0 / r0, 0.0, 6.0 * 2.0 / r1],
+            1e-5,
+        )
     }
 
     #[test]
     fn independent_rope_covers_all_five_modes_and_composition() -> Result<()> {
-        let data = [1.0_f32, 0.5, -0.25, 1.5, 0.75, -1.0, 2.0, -0.5, 0.25, 1.25, -0.75, 0.5];
+        let data = [
+            1.0_f32, 0.5, -0.25, 1.5, 0.75, -1.0, 2.0, -0.5, 0.25, 1.25, -0.75, 0.5,
+        ];
         for mode in [0_u64, 2, 8, 24, 40] {
             let (dims, rots, tail) = if mode == 24 {
                 ([8_u64, 1, 1, 1], 4_u64, 8_usize)
             } else {
                 ([6_u64, 2, 1, 1], 4_u64, 12_usize)
             };
-            let (p100, pm67, p33) = if mode >= 8 {
+            let (pos_forward, pos_rewind, pos_net) = if mode >= 8 {
                 ([100, 50, 20, 0], [-67, -30, -10, 0], [33, 20, 10, 0])
             } else {
                 ([100, 0, 0, 0], [-67, 0, 0, 0], [33, 0, 0, 0])
@@ -1610,9 +1680,9 @@ mod tests {
                 2,
                 &[
                     json!({"Op": "input", "Type": "F32", "Dimensions": dims, "DataHex": f32_hex(&data[..tail])}),
-                    json!({"Op": "input", "Type": "I32", "Dimensions": [pos_len], "DataHex": i32_hex(&p100[..pos_len])}),
-                    json!({"Op": "input", "Type": "I32", "Dimensions": [pos_len], "DataHex": i32_hex(&pm67[..pos_len])}),
-                    json!({"Op": "input", "Type": "I32", "Dimensions": [pos_len], "DataHex": i32_hex(&p33[..pos_len])}),
+                    json!({"Op": "input", "Type": "I32", "Dimensions": [pos_len], "DataHex": i32_hex(&pos_forward[..pos_len])}),
+                    json!({"Op": "input", "Type": "I32", "Dimensions": [pos_len], "DataHex": i32_hex(&pos_rewind[..pos_len])}),
+                    json!({"Op": "input", "Type": "I32", "Dimensions": [pos_len], "DataHex": i32_hex(&pos_net[..pos_len])}),
                     make_rope(0, 1),
                     make_rope(4, 2),
                     make_rope(0, 3),
@@ -1624,7 +1694,8 @@ mod tests {
                 .as_array()
                 .ok_or_else(|| invalid("missing Outputs"))?;
             let comp = decode_f32_hex(outs[0]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
-            let single = decode_f32_hex(outs[1]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
+            let single =
+                decode_f32_hex(outs[1]["DataHex"].as_str().ok_or_else(|| invalid("hex"))?)?;
             assert_close(&comp, &single, 1e-4)?;
             if mode < 24 {
                 assert_close(&single[4..6], &data[4..6], 1e-6)?;
@@ -1664,19 +1735,19 @@ mod tests {
                 .as_str()
                 .ok_or_else(|| invalid("hex"))?,
         )?;
-        let mscale = 1.2_f64 * (1.0_f64 + 0.1_f64 * 2.0_f64.ln());
+        let mscale = 1.2_f64 * 0.1_f64.mul_add(2.0_f64.ln(), 1.0_f64);
         assert!((f64::from(out[0].hypot(out[1])) - mscale).abs() < 1e-5);
-        assert!((f64::from(out[0]) - mscale * 10.0_f64.cos()).abs() < 1e-5);
-        assert!((f64::from(out[1]) - mscale * 10.0_f64.sin()).abs() < 1e-5);
+        assert!(mscale.mul_add(-10.0_f64.cos(), f64::from(out[0])).abs() < 1e-5);
+        assert!(mscale.mul_add(-10.0_f64.sin(), f64::from(out[1])).abs() < 1e-5);
         let freq3 = 10_000.0_f64.powf(-0.75);
         let mid_theta = 7.5_f64 * freq3;
-        assert!((f64::from(out[6]) - mscale * mid_theta.cos()).abs() < 1e-5);
-        assert!((f64::from(out[7]) - mscale * mid_theta.sin()).abs() < 1e-5);
+        assert!(mscale.mul_add(-mid_theta.cos(), f64::from(out[6])).abs() < 1e-5);
+        assert!(mscale.mul_add(-mid_theta.sin(), f64::from(out[7])).abs() < 1e-5);
         Ok(())
     }
 
     #[test]
-    fn independent_tensor_graph_refuses_envelope_bounds_cycles_and_shapes() -> Result<()> {
+    fn independent_tensor_graph_refuses_envelope_bounds_cycles_and_shapes() {
         let base_in = json!({"Op": "input", "Type": "F32", "Dimensions": [2, 2], "DataHex": f32_hex(&[1.0, 2.0, 3.0, 4.0])});
         assert!(execute(&json!({"SchemaVersion": 2, "Operations": [{"Kind": "tensor-graph", "Threads": 1, "Nodes": [base_in], "Outputs": [0]}]})).is_err());
         assert!(execute(&json!({"SchemaVersion": 1, "Operations": []})).is_err());
@@ -1688,32 +1759,137 @@ mod tests {
 
         let bad_nan = json!({"Op": "input", "Type": "F32", "Dimensions": [2], "DataHex": f32_hex(&[1.0, f32::NAN])});
         assert!(execute(&wrap_graph(1, &[bad_nan], &[0])).is_err());
-        assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "add", "Inputs": [0, 1]})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "reshape", "Inputs": [0], "Dimensions": [3]})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "transpose", "Inputs": [0]})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "transpose", "Inputs": [0]}), json!({"Op": "reshape", "Inputs": [1], "Dimensions": [4]})], &[2])).is_err());
-        assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "permute", "Inputs": [0], "Axes": [0, 0, 1, 2]})], &[1])).is_err());
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[base_in.clone(), json!({"Op": "add", "Inputs": [0, 1]})],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    base_in.clone(),
+                    json!({"Op": "reshape", "Inputs": [0], "Dimensions": [3]})
+                ],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[base_in.clone(), json!({"Op": "transpose", "Inputs": [0]})],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    base_in.clone(),
+                    json!({"Op": "transpose", "Inputs": [0]}),
+                    json!({"Op": "reshape", "Inputs": [1], "Dimensions": [4]})
+                ],
+                &[2]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    base_in.clone(),
+                    json!({"Op": "permute", "Inputs": [0], "Axes": [0, 0, 1, 2]})
+                ],
+                &[1]
+            ))
+            .is_err()
+        );
         assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "view_2d", "Inputs": [0], "Dimensions": [2, 2], "RowStrideBytes": 4, "OffsetBytes": 0})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "transpose", "Inputs": [0]}), json!({"Op": "mul_mat", "Inputs": [1, 0]})], &[2])).is_err());
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    base_in.clone(),
+                    json!({"Op": "transpose", "Inputs": [0]}),
+                    json!({"Op": "mul_mat", "Inputs": [1, 0]})
+                ],
+                &[2]
+            ))
+            .is_err()
+        );
         assert!(execute(&wrap_graph(1, &[base_in.clone(), json!({"Op": "input", "Type": "F32", "Dimensions": [3], "DataHex": f32_hex(&[1.0, 2.0, 3.0])}), json!({"Op": "add", "Inputs": [0, 1]})], &[2])).is_err());
         assert!(execute(&wrap_graph(1, &[base_in, json!({"Op": "input", "Type": "F32", "Dimensions": [3, 2], "DataHex": f32_hex(&[1.0; 6])}), json!({"Op": "mul_mat", "Inputs": [0, 1]})], &[2])).is_err());
-        Ok(())
     }
 
     #[test]
-    fn independent_tensor_graph_refuses_op_specific_domain_errors() -> Result<()> {
+    fn independent_tensor_graph_refuses_op_specific_domain_errors() {
         let f32_in = json!({"Op": "input", "Type": "F32", "Dimensions": [4, 2], "DataHex": f32_hex(&[1.0; 8])});
-        let i32_in = json!({"Op": "input", "Type": "I32", "Dimensions": [1], "DataHex": i32_hex(&[5])});
-        assert!(execute(&wrap_graph(1, &[f32_in.clone(), json!({"Op": "cast", "Inputs": [0], "Type": "I32"})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[i32_in.clone(), json!({"Op": "cast", "Inputs": [0], "Type": "F16"})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[f32_in.clone(), json!({"Op": "rms_norm", "Inputs": [0], "Epsilon": -0.1})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[f32_in.clone(), json!({"Op": "rms_norm", "Inputs": [0], "Epsilon": 1.5})], &[1])).is_err());
-        assert!(execute(&wrap_graph(1, &[i32_in.clone(), json!({"Op": "col2im_1d", "Inputs": [0], "Stride": 1, "Padding": 0, "Dilation": 1, "Channels": 1})], &[1])).is_err());
+        let i32_in =
+            json!({"Op": "input", "Type": "I32", "Dimensions": [1], "DataHex": i32_hex(&[5])});
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    f32_in.clone(),
+                    json!({"Op": "cast", "Inputs": [0], "Type": "I32"})
+                ],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    i32_in.clone(),
+                    json!({"Op": "cast", "Inputs": [0], "Type": "F16"})
+                ],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    f32_in.clone(),
+                    json!({"Op": "rms_norm", "Inputs": [0], "Epsilon": -0.1})
+                ],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    f32_in.clone(),
+                    json!({"Op": "rms_norm", "Inputs": [0], "Epsilon": 1.5})
+                ],
+                &[1]
+            ))
+            .is_err()
+        );
+        assert!(execute(&wrap_graph(1, &[i32_in, json!({"Op": "col2im_1d", "Inputs": [0], "Stride": 1, "Padding": 0, "Dilation": 1, "Channels": 1})], &[1])).is_err());
         assert!(execute(&wrap_graph(1, &[f32_in.clone(), json!({"Op": "col2im_1d", "Inputs": [0], "Stride": 1, "Padding": 100, "Dilation": 1, "Channels": 2})], &[1])).is_err());
 
         let k_in = json!({"Op": "input", "Type": "F32", "Dimensions": [2, 1, 1], "DataHex": f32_hex(&[1.0, 2.0])});
-        assert!(execute(&wrap_graph(1, &[k_in, f32_in.clone(), json!({"Op": "conv_transpose_1d", "Inputs": [0, 1], "Stride": 1, "Padding": 1, "Dilation": 1})], &[2])).is_err());
+        assert!(execute(&wrap_graph(1, &[k_in, f32_in, json!({"Op": "conv_transpose_1d", "Inputs": [0, 1], "Stride": 1, "Padding": 1, "Dilation": 1})], &[2])).is_err());
+        assert!(!handles(
+            &json!({"Operations": [{"Kind": "cpu-arena-graph"}]})
+        ));
+    }
 
+    #[test]
+    fn independent_tensor_graph_refuses_rope_domain_errors() {
+        let f32_in = json!({"Op": "input", "Type": "F32", "Dimensions": [4, 2], "DataHex": f32_hex(&[1.0; 8])});
+        let i32_in =
+            json!({"Op": "input", "Type": "I32", "Dimensions": [1], "DataHex": i32_hex(&[5])});
         let bad_rope = |mode: u64, op_name: &str, rots: u64, sections: Option<Value>| -> Value {
             let mut n = json!({
                 "Op": op_name, "Inputs": [0, 1], "Rotations": rots, "Mode": mode, "Context": 4096,
@@ -1727,13 +1903,69 @@ mod tests {
         };
         let r_in = json!({"Op": "input", "Type": "F32", "Dimensions": [6, 1, 1], "DataHex": f32_hex(&[1.0; 6])});
         let p4 = json!({"Op": "input", "Type": "I32", "Dimensions": [4], "DataHex": i32_hex(&[1, 2, 3, 4])});
-        assert!(execute(&wrap_graph(1, &[r_in.clone(), i32_in.clone(), bad_rope(8, "rope", 4, None)], &[2])).is_err());
-        assert!(execute(&wrap_graph(1, &[r_in.clone(), p4.clone(), bad_rope(2, "rope_multi", 4, Some(json!([1, 1, 0, 0])))], &[2])).is_err());
-        assert!(execute(&wrap_graph(1, &[r_in.clone(), p4.clone(), bad_rope(24, "rope_multi", 4, Some(json!([1, 1, 0, 0])))], &[2])).is_err());
-        assert!(execute(&wrap_graph(1, &[r_in.clone(), p4, bad_rope(8, "rope_multi", 4, Some(json!([1, 2, 0, 0])))], &[2])).is_err());
-        assert!(execute(&wrap_graph(1, &[r_in, i32_in.clone(), bad_rope(8, "rope_multi", 4, Some(json!([1, 1, 0, 0])))], &[2])).is_err());
-        assert!(execute(&wrap_graph(1, &[f32_in, i32_in, bad_rope(0, "rope", 3, None)], &[2])).is_err());
-        assert!(!handles(&json!({"Operations": [{"Kind": "cpu-arena-graph"}]})));
-        Ok(())
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[r_in.clone(), i32_in.clone(), bad_rope(8, "rope", 4, None)],
+                &[2]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    r_in.clone(),
+                    p4.clone(),
+                    bad_rope(2, "rope_multi", 4, Some(json!([1, 1, 0, 0])))
+                ],
+                &[2]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    r_in.clone(),
+                    p4.clone(),
+                    bad_rope(24, "rope_multi", 4, Some(json!([1, 1, 0, 0])))
+                ],
+                &[2]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    r_in.clone(),
+                    p4,
+                    bad_rope(8, "rope_multi", 4, Some(json!([1, 2, 0, 0])))
+                ],
+                &[2]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[
+                    r_in,
+                    i32_in.clone(),
+                    bad_rope(8, "rope_multi", 4, Some(json!([1, 1, 0, 0])))
+                ],
+                &[2]
+            ))
+            .is_err()
+        );
+        assert!(
+            execute(&wrap_graph(
+                1,
+                &[f32_in, i32_in, bad_rope(0, "rope", 3, None)],
+                &[2]
+            ))
+            .is_err()
+        );
     }
 }

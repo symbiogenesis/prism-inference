@@ -84,7 +84,9 @@ pub(super) fn run_unicode(engine: &Engine) -> Result<Value> {
     Ok(result(
         UNICODE_ID,
         actual == expected,
-        format!("provider={provider}; 1 original regex split assertion; expected={expected:?}; actual={actual:?}"),
+        format!(
+            "provider={provider}; 1 original regex split assertion; expected={expected:?}; actual={actual:?}"
+        ),
     ))
 }
 

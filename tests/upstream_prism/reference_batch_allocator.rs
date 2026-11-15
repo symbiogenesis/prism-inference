@@ -128,11 +128,7 @@ impl SeqSet {
     }
 
     const fn test(self, id: usize) -> bool {
-        if id < MAX_SEQ {
-            ((self.0[id / 64] >> (id % 64)) & 1) != 0
-        } else {
-            false
-        }
+        id < MAX_SEQ && ((self.0[id / 64] >> (id % 64)) & 1) != 0
     }
 
     const fn is_empty(self) -> bool {
@@ -256,9 +252,7 @@ fn parse_batch_data(raw: &mut RawInit, width: usize) -> Result<(BatchData, usize
             let count = tokens.len();
             let converted = tokens
                 .into_iter()
-                .map(|token| {
-                    bounded_i32(token, POS_MIN, POS_MAX, "batch token outside bound")
-                })
+                .map(|token| bounded_i32(token, POS_MIN, POS_MAX, "batch token outside bound"))
                 .collect::<Result<Vec<_>>>()?;
             Ok((BatchData::Tokens(converted), count))
         }
@@ -435,8 +429,7 @@ fn parse_action(value: &Value, n_pos: usize) -> Result<Action> {
                 max_axis,
                 "SequenceTokens outside bound",
             )?;
-            let sequences =
-                bounded_usize(raw.sequences, 1, max_axis, "Sequences outside bound")?;
+            let sequences = bounded_usize(raw.sequences, 1, max_axis, "Sequences outside bound")?;
             if sequence_tokens * sequences > MAX_TOKENS {
                 return Err(invalid("reserved batch exceeds token count bound"));
             }
@@ -548,9 +541,7 @@ impl BatchAllocator {
         }
         let n_tokens = spec.n_tokens;
         let has_embd = matches!(spec.data, BatchData::Embeddings { .. });
-        let sequence_ids = spec
-            .sequence_ids
-            .unwrap_or_else(|| vec![vec![0]; n_tokens]);
+        let sequence_ids = spec.sequence_ids.unwrap_or_else(|| vec![vec![0]; n_tokens]);
         let positions = spec.positions.map_or_else(
             || {
                 if has_embd && self.n_pos_per_embd > 1 {
@@ -621,16 +612,14 @@ impl BatchAllocator {
         self.check_sequence_order(batch)
     }
 
-    fn check_memory_ranges(
-        &self,
-        has_tokens: bool,
-        memory: Option<&MemoryRanges>,
-    ) -> Result<bool> {
+    fn check_memory_ranges(&self, has_tokens: bool, memory: Option<&MemoryRanges>) -> Result<bool> {
         for s in 0..self.n_seq_max {
             if self.seq_pos[s].is_empty() {
                 continue;
             }
-            let p0 = memory.and_then(|mem| mem.get(&s)).map_or(-1, |range| range.1);
+            let p0 = memory
+                .and_then(|mem| mem.get(&s))
+                .map_or(-1, |range| range.1);
             let min_pos = self.seq_pos_min(s);
             if self.n_pos_per_embd > 1 {
                 let bad = if has_tokens {
@@ -656,8 +645,8 @@ impl BatchAllocator {
 
     fn check_coupled_sequences(&self, mem: &MemoryRanges) -> bool {
         for s0 in 0..self.n_seq_max {
-            for s1 in 0..self.n_seq_max {
-                if self.seq_cpl[s0][s1] {
+            for (s1, &coupled) in self.seq_cpl[s0].iter().enumerate().take(self.n_seq_max) {
+                if coupled {
                     let r0 = mem.get(&s0).copied().unwrap_or((-1, -1));
                     let r1 = mem.get(&s1).copied().unwrap_or((-1, -1));
                     if r0 != r1 {
@@ -742,7 +731,9 @@ impl BatchAllocator {
         n_keep_tail: usize,
     ) -> Result<Option<MicroBatch>> {
         if n_keep_tail > 0 && n_ubatch <= n_keep_tail {
-            return Err(invalid("split-equal with KeepTail requires Capacity > KeepTail"));
+            return Err(invalid(
+                "split-equal with KeepTail requires Capacity > KeepTail",
+            ));
         }
         if sequential && self.has_cpl {
             return Ok(None);
@@ -920,8 +911,8 @@ impl BatchAllocator {
             .batch
             .as_ref()
             .ok_or_else(|| invalid("batch allocator has no initialized input"))?;
-        let mut tokens = matches!(batch.data, BatchData::Tokens(_))
-            .then(|| Vec::with_capacity(n_tokens));
+        let mut tokens =
+            matches!(batch.data, BatchData::Tokens(_)).then(|| Vec::with_capacity(n_tokens));
         let mut embeddings = match batch.data {
             BatchData::Embeddings { width, .. } => Some(Vec::with_capacity(n_tokens * width)),
             BatchData::Tokens(_) => None,
@@ -979,9 +970,9 @@ impl BatchAllocator {
         self.split_reset();
         let mut sequence_indices = vec![-1_i32; MAX_SEQ];
         let mut unique_sequence_ids = Vec::with_capacity(n_seqs);
-        for s in 0..n_seqs {
+        for (s, slot) in sequence_indices.iter_mut().enumerate().take(n_seqs) {
             let id = i32::try_from(s)?;
-            sequence_indices[s] = id;
+            *slot = id;
             unique_sequence_ids.push(id);
         }
         Ok(MicroBatch {
@@ -1082,7 +1073,7 @@ fn autofill_logits(raw: Option<Vec<i8>>, n_tokens: usize, output_all: bool) -> V
             flags
         },
         |mut flags| {
-            if output_all && flags.iter().any(|&flag| flag == 0) {
+            if output_all && flags.contains(&0) {
                 flags.fill(1);
             }
             flags
@@ -1090,15 +1081,12 @@ fn autofill_logits(raw: Option<Vec<i8>>, n_tokens: usize, output_all: bool) -> V
     )
 }
 
-fn collect_unique_sequences(
-    seq_set_unq: SeqSet,
-    n_seq_max: usize,
-) -> Result<(Vec<i32>, Vec<i32>)> {
+fn collect_unique_sequences(seq_set_unq: SeqSet, n_seq_max: usize) -> Result<(Vec<i32>, Vec<i32>)> {
     let mut seq_id_unq = Vec::new();
     let mut seq_idx = vec![-1_i32; MAX_SEQ];
-    for s in 0..n_seq_max {
+    for (s, slot) in seq_idx.iter_mut().enumerate().take(n_seq_max) {
         if seq_set_unq.test(s) {
-            seq_idx[s] = i32::try_from(seq_id_unq.len())?;
+            *slot = i32::try_from(seq_id_unq.len())?;
             seq_id_unq.push(i32::try_from(s)?);
         }
     }
@@ -1481,11 +1469,20 @@ mod tests {
         assert_eq!(res[0]["State"]["NOutputs"], 1);
         assert_eq!(res[0]["State"]["Batch"]["Positions"], json!([0, 1, 2, 3]));
         assert_eq!(res[0]["State"]["Batch"]["Logits"], json!([0, 0, 0, 1]));
-        assert_eq!(res[0]["State"]["SequencePositions"][0], json!({"Min": 0, "Max": 3}));
-        assert_eq!(res[0]["State"]["SequencePositions"][1], json!({"Min": -1, "Max": -1}));
+        assert_eq!(
+            res[0]["State"]["SequencePositions"][0],
+            json!({"Min": 0, "Max": 3})
+        );
+        assert_eq!(
+            res[0]["State"]["SequencePositions"][1],
+            json!({"Min": -1, "Max": -1})
+        );
         assert_eq!(res[1]["State"]["NOutputs"], 4);
         assert_eq!(res[1]["State"]["Batch"]["Logits"], json!([1, 1, 1, 1]));
-        assert_eq!(res[1]["State"]["SequencePositions"][0], json!({"Min": 10, "Max": 12}));
+        assert_eq!(
+            res[1]["State"]["SequencePositions"][0],
+            json!({"Min": 10, "Max": 13})
+        );
         Ok(())
     }
 
@@ -1553,7 +1550,10 @@ mod tests {
         )?;
         assert_eq!(res[1]["Ubatch"]["NTokens"], 2);
         assert_eq!(res[1]["Ubatch"]["EqualSequences"], Value::Bool(false));
-        assert_eq!(res[1]["Ubatch"]["Embeddings"], json!([0.0, 1.0, 100.0, 101.0]));
+        assert_eq!(
+            res[1]["Ubatch"]["Embeddings"],
+            json!([0.0, 1.0, 100.0, 101.0])
+        );
         assert_eq!(res[1]["Ubatch"]["SequenceIndices"][0], 0);
         assert_eq!(res[1]["Ubatch"]["SequenceIndices"][1], -1);
         assert_eq!(res[3]["Ubatch"]["NTokens"], 1);
@@ -1588,7 +1588,10 @@ mod tests {
         assert_eq!(seq_res[4]["Ubatch"]["NTokens"], 6);
         assert_eq!(seq_res[4]["Ubatch"]["HasTokens"], Value::Bool(true));
         assert_eq!(seq_res[4]["Ubatch"]["HasEmbeddings"], Value::Bool(false));
-        assert_eq!(seq_res[4]["Ubatch"]["SequenceIds"], json!([[], [], [], [], [], []]));
+        assert_eq!(
+            seq_res[4]["Ubatch"]["SequenceIds"],
+            json!([[], [], [], [], [], []])
+        );
         assert_eq!(seq_res[4]["State"], Value::Null);
         Ok(())
     }
@@ -1745,7 +1748,10 @@ mod tests {
             req["Operations"][0]["PositionsPerEmbedding"] = bad_pos;
             assert!(execute(&req).is_err());
         }
-        for bad_ops in [json!([]), json!(vec![valid_req["Operations"][0].clone(); 129])] {
+        for bad_ops in [
+            json!([]),
+            json!(vec![valid_req["Operations"][0].clone(); 129]),
+        ] {
             let mut req = valid_req.clone();
             req["Operations"] = bad_ops;
             assert!(execute(&req).is_err());

@@ -377,7 +377,10 @@ mod tests {
     use super::*;
 
     fn wrap(operation: Value) -> Value {
-        json!({"SchemaVersion": 1, "Operations": [operation]})
+        let mut object = serde_json::Map::new();
+        object.insert("SchemaVersion".into(), json!(1));
+        object.insert("Operations".into(), Value::Array(vec![operation]));
+        Value::Object(object)
     }
 
     #[test]
@@ -433,10 +436,7 @@ mod tests {
             "Expressions": [r"\s+"],
             "ByteEncoding": false,
         }));
-        assert_eq!(
-            execute(&empty_text)?["Results"][0],
-            json!({"Pieces": []})
-        );
+        assert_eq!(execute(&empty_text)?["Results"][0], json!({"Pieces": []}));
         Ok(())
     }
 
@@ -490,7 +490,9 @@ mod tests {
 
     #[test]
     fn independent_unicode_rejects_session_ops_bad_hex_and_protocol_bounds() {
-        assert!(!handles(&json!({"Op": "unicode-decode", "InputsHex": ["00"]})));
+        assert!(!handles(
+            &json!({"Op": "unicode-decode", "InputsHex": ["00"]})
+        ));
         assert!(!handles(&json!({"SchemaVersion": 1, "Operations": []})));
         assert!(!handles(&wrap(json!({"Kind": "cpu-threadpool"}))));
 

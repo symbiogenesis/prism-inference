@@ -193,7 +193,7 @@ impl Drop for PoolGuard<'_> {
     }
 }
 
-fn lock_unpoisoned<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -218,11 +218,11 @@ fn validate_node(
         NodeDesc::Input { kind, dimensions } => {
             if dimensions.is_empty()
                 || dimensions.len() > 2
-                || dimensions
-                    .iter()
-                    .any(|&dim| !(1..=MAX_DIM).contains(&dim))
+                || dimensions.iter().any(|&dim| !(1..=MAX_DIM).contains(&dim))
             {
-                return Err(invalid("independent threadpool input dimensions outside bound"));
+                return Err(invalid(
+                    "independent threadpool input dimensions outside bound",
+                ));
             }
             let dim0 = usize::try_from(dimensions[0])?;
             let dim1 = if dimensions.len() == 2 {
@@ -234,14 +234,20 @@ fn validate_node(
         }
         NodeDesc::MulMat { a, b } => {
             if index == 0 || *a >= index || *b >= index {
-                return Err(invalid("independent threadpool mul_mat index outside bound"));
+                return Err(invalid(
+                    "independent threadpool mul_mat index outside bound",
+                ));
             }
             if shapes[*a][0] != shapes[*b][0] || kinds[*b] != TensorKind::F32 {
                 return Err(invalid(
                     "independent threadpool matrix dimensions or right-hand type mismatch",
                 ));
             }
-            ([shapes[*a][1], shapes[*b][1]], TensorKind::F32, Some((*a, *b)))
+            (
+                [shapes[*a][1], shapes[*b][1]],
+                TensorKind::F32,
+                Some((*a, *b)),
+            )
         }
     };
     shapes.push(shape);
@@ -279,14 +285,20 @@ fn validate_graph(
     storage_bytes: &mut usize,
 ) -> Result<GraphInfo> {
     if graph.nodes.is_empty() || graph.nodes.len() > MAX_NODES_PER_GRAPH {
-        return Err(invalid("independent threadpool graph node count outside bound"));
+        return Err(invalid(
+            "independent threadpool graph node count outside bound",
+        ));
     }
     *total_nodes += graph.nodes.len();
     if *total_nodes > MAX_TOTAL_NODES {
-        return Err(invalid("independent threadpool total node count outside bound"));
+        return Err(invalid(
+            "independent threadpool total node count outside bound",
+        ));
     }
     if graph.output >= graph.nodes.len() {
-        return Err(invalid("independent threadpool graph output index outside bound"));
+        return Err(invalid(
+            "independent threadpool graph output index outside bound",
+        ));
     }
     let mut shapes = Vec::with_capacity(graph.nodes.len());
     let mut kinds = Vec::with_capacity(graph.nodes.len());
@@ -299,7 +311,9 @@ fn validate_graph(
             .row_bytes(shape[0])
             .ok_or_else(|| invalid("independent threadpool quantized row is incomplete"))?;
         if row > context_bytes / shape[1] {
-            return Err(invalid("independent threadpool tensor exceeds context bound"));
+            return Err(invalid(
+                "independent threadpool tensor exceeds context bound",
+            ));
         }
         let bytes = row
             .checked_mul(shape[1])
@@ -331,13 +345,17 @@ fn validate_actions(actions: &[ActionDesc], graph_count: usize, pool_threads: us
                     || *graph >= graph_count
                     || !(1..=pool_threads).contains(threads)
                 {
-                    return Err(invalid("independent threadpool plan parameter outside bound"));
+                    return Err(invalid(
+                        "independent threadpool plan parameter outside bound",
+                    ));
                 }
                 planned[*slot] = true;
             }
             ActionDesc::Compute { slot } => {
                 if *slot >= MAX_SLOTS || !planned[*slot] {
-                    return Err(invalid("independent threadpool plan used before construction"));
+                    return Err(invalid(
+                        "independent threadpool plan used before construction",
+                    ));
                 }
             }
             ActionDesc::TimerStart => {
@@ -367,7 +385,9 @@ fn validate_operation(operation: &Operation) -> Result<Vec<GraphInfo>> {
         || operation.graphs.is_empty()
         || operation.graphs.len() > MAX_GRAPHS
     {
-        return Err(invalid("independent threadpool configuration outside bound"));
+        return Err(invalid(
+            "independent threadpool configuration outside bound",
+        ));
     }
     let context_bytes = usize::try_from(operation.context_bytes)?;
     let mut total_nodes = 0_usize;
@@ -375,9 +395,7 @@ fn validate_operation(operation: &Operation) -> Result<Vec<GraphInfo>> {
     let graphs = operation
         .graphs
         .iter()
-        .map(|graph| {
-            validate_graph(graph, context_bytes, &mut total_nodes, &mut storage_bytes)
-        })
+        .map(|graph| validate_graph(graph, context_bytes, &mut total_nodes, &mut storage_bytes))
         .collect::<Result<Vec<_>>>()?;
     let metadata = total_nodes
         .checked_mul(NODE_OVERHEAD_BYTES)
@@ -390,7 +408,9 @@ fn validate_operation(operation: &Operation) -> Result<Vec<GraphInfo>> {
         })
         .ok_or_else(|| invalid("independent threadpool metadata overflow"))?;
     if metadata > context_bytes / 4 {
-        return Err(invalid("independent threadpool metadata exceeds context bound"));
+        return Err(invalid(
+            "independent threadpool metadata exceeds context bound",
+        ));
     }
     validate_actions(&operation.actions, graphs.len(), operation.pool_threads)?;
     Ok(graphs)
@@ -464,7 +484,7 @@ fn execute_schedule(
     let mut plans: [Option<Arc<CompiledPlan>>; MAX_SLOTS] = std::array::from_fn(|_| None);
     let mut planned = 0_usize;
     let mut statuses = Vec::new();
-    let mut times = Vec::new();
+    let mut nanoseconds = Vec::new();
     let mut timer: Option<Instant> = None;
     let mut epoch = 0_u64;
     for action in &operation.actions {
@@ -490,9 +510,9 @@ fn execute_schedule(
                 planned += 1;
             }
             ActionDesc::Compute { slot } => {
-                let plan = plans[*slot]
-                    .as_ref()
-                    .ok_or_else(|| invalid("independent threadpool plan used before construction"))?;
+                let plan = plans[*slot].as_ref().ok_or_else(|| {
+                    invalid("independent threadpool plan used before construction")
+                })?;
                 if plan.threads > 1 {
                     epoch += 1;
                     dispatch_plan(epoch, plan, shared);
@@ -510,16 +530,19 @@ fn execute_schedule(
                 let started = timer
                     .take()
                     .ok_or_else(|| invalid("independent threadpool timer not running"))?;
-                times.push(u64::try_from(started.elapsed().as_nanos())?);
+                nanoseconds.push(u64::try_from(started.elapsed().as_nanos())?);
             }
         }
     }
-    let node_counts = graphs.iter().map(|graph| graph.node_count).collect::<Vec<_>>();
+    let node_counts = graphs
+        .iter()
+        .map(|graph| graph.node_count)
+        .collect::<Vec<_>>();
     Ok(json!({
         "GraphNodeCounts": node_counts,
         "Plans": planned,
         "ComputeStatuses": statuses,
-        "Nanoseconds": times,
+        "Nanoseconds": nanoseconds,
     }))
 }
 
@@ -606,7 +629,10 @@ mod tests {
     }
 
     fn wrap(operation: Value) -> Value {
-        json!({"SchemaVersion": 1, "Operations": [operation]})
+        let mut object = serde_json::Map::new();
+        object.insert("SchemaVersion".into(), json!(1));
+        object.insert("Operations".into(), Value::Array(vec![operation]));
+        Value::Object(object)
     }
 
     #[test]

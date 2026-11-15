@@ -125,8 +125,9 @@ pub async fn serve_with_placement(
     {
         return Err(NativeBackendError::Configuration);
     }
-    let policy =
-        RequestPolicy::new(address.port(), &key).map_err(|_| NativeBackendError::Configuration)?;
+    let policy = RequestPolicy::new(address.port(), &key)
+        .map_err(|_| NativeBackendError::Configuration)?
+        .with_vision(session.has_vision());
     if placement == Placement::Cpu {
         session.set_projection_executor(None);
     }
@@ -554,7 +555,12 @@ fn canonical_for_profile(
     bytes: &[u8],
     profile: &ModelProfile,
 ) -> Result<PendingChat, NativeBackendError> {
-    if bytes.len() > MAX_BODY_BYTES {
+    let max_body_bytes = if profile.vision {
+        crate::MAX_MULTIMODAL_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if bytes.len() > max_body_bytes {
         return Err(NativeBackendError::Schema);
     }
     let Object(body): Object<FixedBody<'_>> =
@@ -570,7 +576,7 @@ fn canonical_for_profile(
     } {
         return Err(NativeBackendError::Schema);
     }
-    if !crate::valid_history(&body.messages)
+    if !crate::valid_history_for_vision(&body.messages, profile.vision)
         || !(1..=MAX_COMPLETION_TOKENS).contains(&body.max_completion_tokens)
         || body.n != 1
         || body.cache_prompt

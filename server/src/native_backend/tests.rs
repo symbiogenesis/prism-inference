@@ -1,6 +1,7 @@
 //! Focused private HTTP and acknowledged worker lifecycle contracts.
 
 use super::*;
+use crate::MAX_MULTIMODAL_BODY_BYTES;
 use bonsai_prism_runtime::{
     runtime::{Completion, Finish},
     swift_session::TextEvent,
@@ -17,9 +18,12 @@ const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 
 fn pending(stream: bool, max_completion_tokens: u32) -> Result<PendingChat, NativeBackendError> {
     let body = serde_json::to_vec(&json!({"messages":[{"role":"user","content":"A scene."}],"stream":stream,"max_completion_tokens":max_completion_tokens})).map_err(|_|NativeBackendError::Schema)?;
-    crate::AuthorizedHead { length: body.len() }
-        .prepare(&body)
-        .map_err(NativeBackendError::Admission)
+    crate::AuthorizedHead {
+        length: body.len(),
+        vision: false,
+    }
+    .prepare(&body)
+    .map_err(NativeBackendError::Admission)
 }
 
 fn request(route: &str, body: &[u8], authenticated: bool) -> Vec<u8> {
@@ -779,9 +783,20 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
         ..ModelProfile::default()
     }
     .readiness(42);
-    let mut expected_reused = legacy;
+    let mut expected_reused = legacy.clone();
     expected_reused["data"][0]["prompt_reuse"] = json!("latest");
     assert_eq!(reused, expected_reused);
+    let vision = ModelProfile {
+        vision: true,
+        image_max_tokens: Some(1_024),
+        ..ModelProfile::default()
+    }
+    .readiness(42);
+    let mut expected_vision = legacy;
+    expected_vision["data"][0]["vision"] = json!(true);
+    expected_vision["data"][0]["mmproj_sha256"] = json!(swift::MMPROJ_SHA256);
+    expected_vision["data"][0]["image_max_tokens"] = json!(1_024);
+    assert_eq!(vision, expected_vision);
     for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
         for adapter in [false, true] {
             let reply = ModelProfile {
@@ -1901,5 +1916,104 @@ fn private_expected_probe_and_context_rejections_are_not_failure_diagnostics() -
         write_request_failure(&mut bytes, error)?;
         assert_eq!(bytes.len(), 0);
     }
+    Ok(())
+}
+
+#[test]
+fn private_canonical_body_gates_and_limits_multimodal_user_parts() -> TestResult {
+    let fixed = |messages: Value| {
+        serde_json::to_vec(&json!({
+            "messages": messages,
+            "max_completion_tokens": 16,
+            "stream": false,
+            "n": 1,
+            "cache_prompt": false,
+            "n_cache_reuse": 0,
+            "ignore_eos": false,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repeat_penalty": 1.0,
+            "chat_template_kwargs": {
+                "enable_thinking": true,
+                "reasoning_effort": "xhigh",
+                "preserve_thinking": true
+            }
+        }))
+    };
+    let png_url = "data:image/png;base64,AQID";
+    let user_parts_body = fixed(json!([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this frame."},
+            {"type": "image_url", "image_url": {"url": png_url}}
+        ]
+    }]))?;
+    let text_only = ModelProfile::default();
+    assert!(matches!(
+        canonical_for_profile(&user_parts_body, &text_only),
+        Err(NativeBackendError::Schema)
+    ));
+    let large_valid_text_body = fixed(json!([{
+        "role": "user",
+        "content": "x".repeat(MAX_BODY_BYTES)
+    }]))?;
+    assert!(large_valid_text_body.len() > MAX_BODY_BYTES);
+    assert!(matches!(
+        canonical_for_profile(&large_valid_text_body, &text_only),
+        Err(NativeBackendError::Schema)
+    ));
+
+    let vision = ModelProfile {
+        vision: true,
+        image_max_tokens: Some(1_024),
+        ..ModelProfile::default()
+    };
+    assert!(canonical_for_profile(&large_valid_text_body, &vision).is_ok());
+    let Ok(admitted) = canonical_for_profile(&user_parts_body, &vision) else {
+        return Err("expected valid multimodal user parts to be admitted".into());
+    };
+    let parsed: Value = serde_json::from_slice(&admitted.body)?;
+    assert_eq!(
+        parsed["messages"][0]["content"][1]["image_url"]["url"],
+        png_url
+    );
+
+    for role in ["assistant", "system"] {
+        let non_user_image = fixed(json!([{
+            "role": role,
+            "content": [
+                {"type": "text", "text": "Not allowed."},
+                {"type": "image_url", "image_url": {"url": png_url}}
+            ]
+        }]))?;
+        assert!(matches!(
+            canonical_for_profile(&non_user_image, &vision),
+            Err(NativeBackendError::Schema)
+        ));
+    }
+
+    let twenty_five_images: Vec<Value> = std::iter::repeat_n(
+        json!({"type": "image_url", "image_url": {"url": png_url}}),
+        25,
+    )
+    .collect();
+    let over_image_cap = fixed(json!([{
+        "role": "user",
+        "content": twenty_five_images
+    }]))?;
+    assert!(matches!(
+        canonical_for_profile(&over_image_cap, &vision),
+        Err(NativeBackendError::Schema)
+    ));
+
+    let over_multimodal_cap = vec![b' '; MAX_MULTIMODAL_BODY_BYTES + 1];
+    assert!(matches!(
+        canonical_for_profile(&over_multimodal_cap, &vision),
+        Err(NativeBackendError::Schema)
+    ));
     Ok(())
 }

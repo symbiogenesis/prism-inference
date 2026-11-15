@@ -20,14 +20,18 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{borrow::Cow, fmt, marker::PhantomData};
 use subtle::ConstantTimeEq;
 
-/// Largest accepted client request body in bytes.
+/// Largest accepted text-only client request body in bytes.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Largest accepted multimodal client request body in bytes.
+pub const MAX_MULTIMODAL_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Largest accepted HTTP header block in bytes.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Largest accepted number of HTTP header fields, including duplicates.
 pub const MAX_HEADERS: usize = 64;
 /// Largest accepted number of messages in one chat history.
 pub const MAX_MESSAGES: usize = 128;
+/// Largest accepted number of content parts inside one user message.
+pub const MAX_CONTENT_PARTS: usize = 32;
 /// Largest allowed completion token budget.
 pub const MAX_COMPLETION_TOKENS: u32 = 4096;
 /// Total prompt and completion context budget of the pinned model.
@@ -71,6 +75,7 @@ pub struct RequestPolicy {
     authority: String,
     origin: String,
     authorization: [u8; 71], // "Bearer " + 64 lowercase hex characters
+    vision: bool,
 }
 
 impl RequestPolicy {
@@ -91,7 +96,23 @@ impl RequestPolicy {
             origin: format!("http://{authority}"),
             authority,
             authorization,
+            vision: false,
         })
+    }
+
+    /// Enable or disable multimodal request framing and schema admission.
+    #[must_use]
+    pub const fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
+    }
+
+    const fn max_body_bytes(&self) -> usize {
+        if self.vision {
+            MAX_MULTIMODAL_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES
+        }
     }
 
     /// Check the parsed head before the transport accepts a bounded body.
@@ -125,10 +146,13 @@ impl RequestPolicy {
                 n.checked_mul(10)?.checked_add(usize::from(b - b'0'))
             })
             .ok_or(Rejection::BodySize)?;
-        if length == 0 || length > MAX_BODY_BYTES {
+        if length == 0 || length > self.max_body_bytes() {
             return Err(Rejection::BodySize);
         }
-        Ok(AuthorizedHead { length })
+        Ok(AuthorizedHead {
+            length,
+            vision: self.vision,
+        })
     }
 
     pub(crate) fn check_common_head(
@@ -218,6 +242,7 @@ pub(crate) fn contains_header(headers: &[httparse::Header<'_>], name: &str) -> b
 /// Constructed only by successful head validation; does not retain the key.
 pub struct AuthorizedHead {
     length: usize,
+    vision: bool,
 }
 
 impl AuthorizedHead {
@@ -227,14 +252,19 @@ impl AuthorizedHead {
     /// Returns [`Rejection`] for a mismatched length, invalid schema, unsupported
     /// message history, completion limit or canonical serialization failure.
     pub fn prepare(self, body: &[u8]) -> Result<PendingChat, Rejection> {
-        if body.len() != self.length || body.len() > MAX_BODY_BYTES {
+        let max_body_bytes = if self.vision {
+            MAX_MULTIMODAL_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES
+        };
+        if body.len() != self.length || body.len() > max_body_bytes {
             return Err(Rejection::BodySize);
         }
         // Deserialize directly: maps/Value would silently erase duplicate keys.
         // Parser error strings can include private values; never propagate them.
         let Object(chat): Object<ClientChat<'_>> =
             serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
-        if !valid_history(&chat.messages) {
+        if !valid_history_for_vision(&chat.messages, self.vision) {
             return Err(Rejection::ChatSchema);
         }
         if !(1..=MAX_COMPLETION_TOKENS).contains(&chat.max_completion_tokens) {
@@ -289,7 +319,7 @@ const fn default_stream() -> bool {
     true
 }
 
-/// Text only; strings resembling URLs remain plain text and are never fetched.
+/// Text or user multimodal parts (`text` + inline base64 image data URLs only).
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Message<'a> {
@@ -297,7 +327,7 @@ struct Message<'a> {
     // JSON text without escapes can be borrowed until canonical serialization;
     // escaped text still uses Serde's owned decoding without changing its bytes.
     #[serde(borrow)]
-    content: Cow<'a, str>,
+    content: MessageContent<'a>,
     #[serde(
         default,
         borrow,
@@ -305,6 +335,228 @@ struct Message<'a> {
         skip_serializing_if = "Option::is_none"
     )]
     reasoning_content: Option<Cow<'a, str>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MessageContent<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<ContentPart<'a>>),
+}
+
+impl MessageContent<'_> {
+    fn image_count(&self) -> usize {
+        match self {
+            Self::Text(_) => 0,
+            Self::Parts(parts) => parts
+                .iter()
+                .filter(|part| matches!(part, ContentPart::ImageUrl { .. }))
+                .count(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart<'a> {
+    Text { text: Cow<'a, str> },
+    ImageUrl { image_url: ImageUrl<'a> },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ImageUrl<'a> {
+    #[serde(borrow)]
+    url: Cow<'a, str>,
+}
+
+enum ContentPartField {
+    Type,
+    Text,
+    ImageUrl,
+}
+
+impl<'de> Deserialize<'de> for ContentPartField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldVisitor;
+        impl de::Visitor<'_> for FieldVisitor {
+            type Value = ContentPartField;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a supported content part field")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<ContentPartField, E> {
+                match value {
+                    "type" => Ok(ContentPartField::Type),
+                    "text" => Ok(ContentPartField::Text),
+                    "image_url" => Ok(ContentPartField::ImageUrl),
+                    other => Err(E::unknown_field(other, &["type", "text", "image_url"])),
+                }
+            }
+        }
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+enum ContentPartKind {
+    Text,
+    ImageUrl,
+}
+
+impl<'de> Deserialize<'de> for ContentPartKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KindVisitor;
+        impl de::Visitor<'_> for KindVisitor {
+            type Value = ContentPartKind;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a content part type")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<ContentPartKind, E> {
+                match value {
+                    "text" => Ok(ContentPartKind::Text),
+                    "image_url" => Ok(ContentPartKind::ImageUrl),
+                    _ => Err(E::custom("unsupported content part type")),
+                }
+            }
+        }
+        deserializer.deserialize_str(KindVisitor)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for ContentPart<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct BorrowedStr<'a>(#[serde(borrow)] Cow<'a, str>);
+        struct PartVisitor<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> de::Visitor<'de> for PartVisitor<'a> {
+            type Value = ContentPart<'a>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a text or image_url content part object")
+            }
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut kind = None;
+                let mut text = None;
+                let mut image_url = None;
+                while let Some(key) = map.next_key::<ContentPartField>()? {
+                    match key {
+                        ContentPartField::Type => {
+                            if kind.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            kind = Some(map.next_value::<ContentPartKind>()?);
+                        }
+                        ContentPartField::Text => {
+                            if text.is_some() {
+                                return Err(de::Error::duplicate_field("text"));
+                            }
+                            let BorrowedStr(value) = map.next_value::<BorrowedStr<'a>>()?;
+                            text = Some(value);
+                        }
+                        ContentPartField::ImageUrl => {
+                            if image_url.is_some() {
+                                return Err(de::Error::duplicate_field("image_url"));
+                            }
+                            let Object(value) = map.next_value::<Object<ImageUrl<'a>>>()?;
+                            image_url = Some(value);
+                        }
+                    }
+                }
+                match kind.ok_or_else(|| de::Error::missing_field("type"))? {
+                    ContentPartKind::Text => match (text, image_url) {
+                        (Some(text), None) => Ok(ContentPart::Text { text }),
+                        (None, _) => Err(de::Error::missing_field("text")),
+                        (_, Some(_)) => {
+                            Err(de::Error::unknown_field("image_url", &["type", "text"]))
+                        }
+                    },
+                    ContentPartKind::ImageUrl => match (image_url, text) {
+                        (Some(image_url), None) => {
+                            if !valid_image_data_url(&image_url.url) {
+                                return Err(de::Error::custom("unsupported image data url"));
+                            }
+                            Ok(ContentPart::ImageUrl { image_url })
+                        }
+                        (None, _) => Err(de::Error::missing_field("image_url")),
+                        (_, Some(_)) => {
+                            Err(de::Error::unknown_field("text", &["type", "image_url"]))
+                        }
+                    },
+                }
+            }
+        }
+        deserializer.deserialize_map(PartVisitor(PhantomData))
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for MessageContent<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContentVisitor<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> de::Visitor<'de> for ContentVisitor<'a> {
+            type Value = MessageContent<'a>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a message content string or bounded content part array")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(Cow::Borrowed(value)))
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(Cow::Owned(value.to_owned())))
+            }
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(Cow::Owned(value)))
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut parts = Vec::new();
+                while let Some(Object(part)) = sequence.next_element::<Object<ContentPart<'a>>>()? {
+                    if parts.len() == MAX_CONTENT_PARTS {
+                        return Err(de::Error::custom("too many content parts"));
+                    }
+                    parts.push(part);
+                }
+                if parts.is_empty() {
+                    return Err(de::Error::custom("content parts must not be empty"));
+                }
+                Ok(MessageContent::Parts(parts))
+            }
+        }
+        deserializer.deserialize_any(ContentVisitor(PhantomData))
+    }
+}
+
+fn valid_image_data_url(url: &str) -> bool {
+    if url.len() > bonsai_prism_runtime::vision::decode::MAX_DATA_URL_BYTES {
+        return false;
+    }
+    let Some(payload) = url
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| url.strip_prefix("data:image/x-portable-pixmap;base64,"))
+    else {
+        return false;
+    };
+    let bytes = payload.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let pad = if bytes.ends_with(b"==") {
+        2
+    } else {
+        usize::from(bytes.ends_with(b"="))
+    };
+    let Some(decoded_len) = (bytes.len() / 4)
+        .checked_mul(3)
+        .and_then(|n| n.checked_sub(pad))
+    else {
+        return false;
+    };
+    if decoded_len > bonsai_prism_runtime::vision::decode::MAX_ENCODED_IMAGE_BYTES {
+        return false;
+    }
+    let prefix_len = bytes.len() - pad;
+    bytes[..prefix_len]
+        .iter()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/'))
 }
 
 fn deserialize_reasoning_content<'de, D: Deserializer<'de>>(
@@ -407,9 +659,11 @@ fn deserialize_messages<'de, D: Deserializer<'de>>(
 fn valid_history(messages: &[Message<'_>]) -> bool {
     if messages.is_empty()
         || messages.len() > MAX_MESSAGES
-        || messages
-            .iter()
-            .any(|message| message.reasoning_content.is_some() && message.role != Role::Assistant)
+        || messages.iter().any(|message| {
+            (message.reasoning_content.is_some() && message.role != Role::Assistant)
+                || (matches!(message.content, MessageContent::Parts(_))
+                    && message.role != Role::User)
+        })
     {
         return false;
     }
@@ -428,6 +682,25 @@ fn valid_history(messages: &[Message<'_>]) -> bool {
                     Role::Assistant
                 }
         })
+}
+
+fn valid_history_for_vision(messages: &[Message<'_>], vision: bool) -> bool {
+    if !valid_history(messages) {
+        return false;
+    }
+    if !vision {
+        return messages
+            .iter()
+            .all(|message| matches!(message.content, MessageContent::Text(_)));
+    }
+    let mut total_images = 0usize;
+    for message in messages {
+        total_images = total_images.saturating_add(message.content.image_count());
+        if total_images > bonsai_prism_runtime::swift_session::MAX_PROMPT_IMAGES {
+            return false;
+        }
+    }
+    true
 }
 
 /// Exposes canonical bytes only to a trusted counter before context admission.
@@ -535,7 +808,13 @@ struct ChatTemplateKwargs {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientChat, Cow, Message, Object, Role, valid_history};
+    use super::{
+        ClientChat, ContentPart, Cow, MAX_BODY_BYTES, MAX_MULTIMODAL_BODY_BYTES, Message,
+        MessageContent, Object, Rejection, RequestPolicy, Role, valid_history,
+        valid_history_for_vision,
+    };
+
+    const TEST_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn every_short_role_history_matches_the_accepted_language() {
@@ -557,7 +836,7 @@ mod tests {
                     spelling.push(letter);
                     messages.push(Message {
                         role,
-                        content: Cow::Borrowed(""),
+                        content: MessageContent::Text(Cow::Borrowed("")),
                         reasoning_content: None,
                     });
                 }
@@ -577,10 +856,15 @@ mod tests {
         )?;
         assert!(matches!(
             chat.messages[0].content,
-            Cow::Borrowed("plain text")
+            MessageContent::Text(Cow::Borrowed("plain text"))
         ));
-        assert!(matches!(chat.messages[1].content, Cow::Owned(_)));
-        assert_eq!(chat.messages[1].content, "line\n雪");
+        assert!(matches!(
+            chat.messages[1].content,
+            MessageContent::Text(Cow::Owned(_))
+        ));
+        if let MessageContent::Text(ref text) = chat.messages[1].content {
+            assert_eq!(text, "line\n雪");
+        }
         Ok(())
     }
 
@@ -601,6 +885,111 @@ mod tests {
             chat.messages[1].reasoning_content.as_deref(),
             Some("line\n雪")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn multimodal_head_and_schema_gate_vision_bounds_and_data_urls() -> Result<(), Rejection> {
+        let text_policy = RequestPolicy::new(8080, TEST_KEY)?;
+        let vision_policy = RequestPolicy::new(8080, TEST_KEY)?.with_vision(true);
+        let oversize = (MAX_BODY_BYTES + 1).to_string();
+        let headers = [
+            httparse::Header {
+                name: "authorization",
+                value: format!("Bearer {TEST_KEY}").leak().as_bytes(),
+            },
+            httparse::Header {
+                name: "host",
+                value: b"127.0.0.1:8080",
+            },
+            httparse::Header {
+                name: "content-type",
+                value: b"application/json",
+            },
+            httparse::Header {
+                name: "content-length",
+                value: oversize.as_bytes(),
+            },
+        ];
+        assert_eq!(
+            text_policy
+                .check_head("POST", "/v1/chat/completions", 1, &headers)
+                .err(),
+            Some(Rejection::BodySize)
+        );
+        assert!(
+            vision_policy
+                .check_head("POST", "/v1/chat/completions", 1, &headers)
+                .is_ok()
+        );
+        let too_big = (MAX_MULTIMODAL_BODY_BYTES + 1).to_string();
+        let huge_headers = [
+            headers[0],
+            headers[1],
+            headers[2],
+            httparse::Header {
+                name: "content-length",
+                value: too_big.as_bytes(),
+            },
+        ];
+        assert_eq!(
+            vision_policy
+                .check_head("POST", "/v1/chat/completions", 1, &huge_headers)
+                .err(),
+            Some(Rejection::BodySize)
+        );
+
+        let mm_body = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"text","text":"Describe."}]}]}"#;
+        assert_eq!(
+            super::AuthorizedHead {
+                length: mm_body.len(),
+                vision: false,
+            }
+            .prepare(mm_body)
+            .err(),
+            Some(Rejection::ChatSchema)
+        );
+        let pending = super::AuthorizedHead {
+            length: mm_body.len(),
+            vision: true,
+        }
+        .prepare(mm_body)?;
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&pending.body).map_err(|_| Rejection::ChatSchema)?;
+        assert_eq!(parsed["messages"][0]["content"][0]["type"], "image_url");
+
+        for rejected in [
+            br#"{"messages":[{"role":"user","content":[]}]}"#.as_slice(),
+            br#"{"messages":[{"role":"assistant","content":[{"type":"text","text":"nope"}]}]}"#,
+            br#"{"messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},{"role":"user","content":"hi"}]}"#,
+            br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}"#,
+            br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///c:/a.png"}}]}]}"#,
+            br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}"#,
+            br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#,
+        ] {
+            assert!(
+                super::AuthorizedHead {
+                    length: rejected.len(),
+                    vision: true,
+                }
+                .prepare(rejected)
+                .is_err()
+            );
+        }
+        assert!(matches!(
+            serde_json::from_slice::<Object<ContentPart<'_>>>(br#"{"type":"text","text":"x"}"#),
+            Ok(Object(ContentPart::Text { .. }))
+        ));
+        assert!(!valid_history_for_vision(
+            &[Message {
+                role: Role::User,
+                content: MessageContent::Parts(vec![ContentPart::Text {
+                    text: Cow::Borrowed("hi")
+                }]),
+                reasoning_content: None,
+            }],
+            false
+        ));
         Ok(())
     }
 }

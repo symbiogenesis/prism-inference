@@ -75,6 +75,8 @@ impl Engine for SwiftSession {
             projection_startup: ProjectionStartup::default(),
             representation: self.representation(),
             adapter: self.adapter_identity().is_some(),
+            vision: self.has_vision(),
+            image_max_tokens: self.has_vision().then(|| self.max_image_tokens()),
             prompt_reuse: self.prompt_reuse(),
             row_workers: self.row_workers(),
             context_tokens: self.context_tokens(),
@@ -1005,9 +1007,12 @@ mod tests {
 
     fn sample_pending() -> Result<PendingChat, String> {
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
-        AuthorizedHead { length: body.len() }
-            .prepare(body)
-            .map_err(|error| format!("{error:?}"))
+        AuthorizedHead {
+            length: body.len(),
+            vision: false,
+        }
+        .prepare(body)
+        .map_err(|error| format!("{error:?}"))
     }
 
     #[test]

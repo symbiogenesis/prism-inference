@@ -131,6 +131,8 @@ pub(super) struct ModelProfile {
     pub projection_startup: ProjectionStartup,
     pub representation: Representation,
     pub adapter: bool,
+    pub vision: bool,
+    pub image_max_tokens: Option<usize>,
     pub prompt_reuse: PromptReuse,
     pub row_workers: usize,
     pub context_tokens: usize,
@@ -147,6 +149,8 @@ impl Default for ModelProfile {
             projection_startup: ProjectionStartup::default(),
             representation: Representation::default(),
             adapter: false,
+            vision: false,
+            image_max_tokens: None,
             prompt_reuse: PromptReuse::default(),
             row_workers: 1,
             context_tokens: swift::CONTEXT_TOKENS,
@@ -181,6 +185,13 @@ impl ModelProfile {
             model["supports_abliteration_scale"] = json!(self.adapter);
             if self.adapter {
                 model["abliteration_scale_range"] = json!([0, 2]);
+            }
+        }
+        if self.vision {
+            model["vision"] = json!(true);
+            model["mmproj_sha256"] = json!(swift::MMPROJ_SHA256);
+            if let Some(max_tokens) = self.image_max_tokens {
+                model["image_max_tokens"] = json!(max_tokens);
             }
         }
         if self.prompt_reuse == PromptReuse::Latest {

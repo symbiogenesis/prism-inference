@@ -8,7 +8,8 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     runtime::PromptReuse,
     swift_session::{
-        CpuPrefill, CpuSpeculation, SwiftSession, validate_context_capacity_with_kv,
+        CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS, MIN_IMAGE_TOKENS,
+        MMPROJ_MEMORY_BYTES, SwiftSession, validate_context_capacity_with_kv,
         validate_execution_capacity_with_kv,
     },
 };
@@ -29,6 +30,8 @@ struct Config {
     row_workers: usize,
     representation: Representation,
     adapter: Option<PathBuf>,
+    mmproj: Option<PathBuf>,
+    image_max_tokens: usize,
     prompt_reuse: PromptReuse,
     kv_cache: KvCachePolicy,
     cpu_prefill: Option<CpuPrefill>,
@@ -76,6 +79,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut cpu_family = None;
     let mut repacked_ptq1 = false;
     let mut adapter = None;
+    let mut mmproj = None;
+    let mut image_max_tokens = None;
     let mut prompt_reuse = None;
     let mut kv_cache = None;
     let mut placement = None;
@@ -98,6 +103,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Some("--model") if model.is_none() => model = Some(PathBuf::from(value)),
             Some("--key-file") if key.is_none() => key = Some(PathBuf::from(value)),
             Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
+            Some("--mmproj") if mmproj.is_none() => mmproj = Some(PathBuf::from(value)),
+            Some("--image-max-tokens") if image_max_tokens.is_none() => {
+                image_max_tokens = Some(value);
+            }
             Some("--context-tokens") if context_tokens.is_none() => context_tokens = Some(value),
             Some("--memory-limit-bytes") if memory_limit_bytes.is_none() => {
                 memory_limit_bytes = Some(value);
@@ -185,6 +194,23 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             _ => return Err(invalid()),
         }
     }
+    let resolved_image_max_tokens = match image_max_tokens {
+        Some(raw) => {
+            if mmproj.is_none() {
+                return Err(invalid());
+            }
+            let parsed = raw
+                .to_str()
+                .ok_or_else(invalid)?
+                .parse::<usize>()
+                .map_err(|_| invalid())?;
+            if !(MIN_IMAGE_TOKENS..=MAX_IMAGE_TOKENS).contains(&parsed) {
+                return Err(invalid());
+            }
+            parsed
+        }
+        None => DEFAULT_MAX_IMAGE_TOKENS,
+    };
     let config = Config {
         placement: placement.unwrap_or_default(),
         model: model.ok_or_else(invalid)?,
@@ -199,6 +225,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Representation::Pq2
         },
         adapter,
+        mmproj,
+        image_max_tokens: resolved_image_max_tokens,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
         cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch)?,
@@ -215,6 +243,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
         )?,
     };
+    if config.mmproj.is_some() && config.cpu_speculation.is_some() {
+        return Err(invalid());
+    }
     if config.cpu_prefill.is_some() || config.cpu_speculation.is_some() {
         let (context, memory) = config.capacity.ok_or_else(invalid)?;
         if kv_cache.is_none() {
@@ -240,6 +271,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     for path in [&config.model, &config.key]
         .into_iter()
         .chain(config.adapter.as_ref())
+        .chain(config.mmproj.as_ref())
     {
         validate_read_path(path)?;
     }
@@ -382,10 +414,23 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     }
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
         .map_err(|error| startup::at(Stage::Environment, &error))?;
-    let required_available_bytes = config.capacity.map_or(
+    let base_required_bytes = config.capacity.map_or(
         crate::configuration::REQUIRED_AVAILABLE_BYTES,
         |(_, memory)| memory + 4 * 1024 * 1024 * 1024,
     );
+    let vision_reserve_bytes = if config.mmproj.is_some() {
+        u64::try_from(MMPROJ_MEMORY_BYTES).map_err(|_| startup::at(Stage::Arguments, &invalid()))?
+    } else {
+        0
+    };
+    let required_available_bytes = base_required_bytes
+        .checked_add(vision_reserve_bytes)
+        .ok_or_else(|| {
+            startup::at(
+                Stage::Memory,
+                &io::Error::other("native Swift startup memory limit overflow"),
+            )
+        })?;
     if bonsai_windows_process::available_memory_bytes()
         .map_err(|error| startup::at(Stage::Memory, &error))?
         < required_available_bytes
@@ -418,6 +463,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     session
         .set_prompt_reuse(config.prompt_reuse)
         .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+    if let Some(ref mmproj) = config.mmproj {
+        session
+            .load_vision(mmproj, config.image_max_tokens)
+            .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1157,6 +1207,67 @@ mod tests {
         assert!(parse(dup_draft).is_err());
         suffix_default.drain(15..19);
         assert!(parse(suffix_default).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_mmproj_and_image_max_tokens_parse_and_validate_bounds() -> io::Result<()> {
+        let (directory, [model, key, _]) = files()?;
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+        let base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        // --image-max-tokens requires --mmproj.
+        let mut orphan_tokens = base.clone();
+        orphan_tokens.extend(["--image-max-tokens", "1024"].map(OsString::from));
+        assert!(parse(orphan_tokens).is_err());
+
+        let mut with_mmproj = base.clone();
+        with_mmproj.extend(["--mmproj".into(), mmproj.clone().into_os_string()]);
+        let default_cfg = parse(with_mmproj.clone())?;
+        assert_eq!(default_cfg.mmproj.as_deref(), Some(mmproj.as_path()));
+        assert_eq!(default_cfg.image_max_tokens, DEFAULT_MAX_IMAGE_TOKENS);
+
+        let mut bounded = with_mmproj.clone();
+        bounded.extend(["--image-max-tokens", "512"].map(OsString::from));
+        assert_eq!(parse(bounded)?.image_max_tokens, 512);
+
+        for invalid_tokens in ["0", "63", "4097", "abc"] {
+            let mut bad = with_mmproj.clone();
+            bad.extend(["--image-max-tokens", invalid_tokens].map(OsString::from));
+            assert!(parse(bad).is_err());
+        }
+        let mut duplicate = with_mmproj;
+        duplicate.extend(["--mmproj".into(), mmproj.into_os_string()]);
+        assert!(parse(duplicate).is_err());
+
+        let (_dir2, spec_base, _memory) = speculation_arguments()?;
+        let mut conflict = spec_base;
+        let spec_mmproj = directory.path().join("spec-mmproj.gguf");
+        std::fs::write(&spec_mmproj, [])?;
+        conflict.extend([
+            "--spec-type".into(),
+            "suffix".into(),
+            "--cpu-verification-scratch-bytes".into(),
+            "16777216".into(),
+            "--cpu-speculative-checkpoint-bytes".into(),
+            bonsai_prism_runtime::swift_session::STATE_MEMORY_BYTES
+                .to_string()
+                .into(),
+            "--mmproj".into(),
+            spec_mmproj.into_os_string(),
+        ]);
+        assert!(parse(conflict).is_err());
+        drop(base);
         Ok(())
     }
 }

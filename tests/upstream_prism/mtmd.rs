@@ -180,7 +180,17 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
                 .to_owned(),
         ));
     };
-    evaluate(response_results(&response)?)
+    let mut report = evaluate(response_results(&response)?)?;
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-mtmd-geometry; nativeReferenceReplay=false"
+    };
+    let detail = report["Detail"]
+        .as_str()
+        .ok_or_else(|| invalid("MTMD result detail missing"))?;
+    report["Detail"] = json!(format!("provider={provider}; {detail}"));
+    Ok(report)
 }
 
 #[cfg(test)]

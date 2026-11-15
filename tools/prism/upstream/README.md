@@ -84,8 +84,9 @@ Retain the upstream MIT terms in [LICENSE](LICENSE). Source identities are revie
 source observations, not captured native output. Reports identify target
 `rust-reference` and `ObservationProvider.Kind: independent-rust-reference`,
 with `NativeReferenceReplay`, `CompleteSourceGate` and `NativeRetirementQualified`
-false. The selector also admits the explicitly migrated reasoning-budget and
-concurrent logger sources below; it rejects other sources, full catalogs, benchmarks, diagnostics
+false. The selector also admits the explicitly migrated reasoning-budget,
+concurrent logger and MTMD geometry sources below; it rejects other sources,
+full catalogs, benchmarks, diagnostics
 and native bridge options. The ordinary owning `cpp` reference arm also uses
 this provider for the MTP source, preserving all six source predicates and the
 protected green ID. Its native include and dispatch are retired; the Rust
@@ -144,5 +145,36 @@ fresh native execution, whole-source gate or full-retirement verdict is implied.
 
 `common/concurrency.hpp` and its native include, dispatch and build edges are
 removed. Direct native logger requests reject. Complete owning hosted acceptance
-and the remaining 38 C++ files are separate gates; backend geometry and separate
+and the remaining C++ files are separate gates; backend geometry and separate
 performance schedules are unchanged.
+
+## Retired MTMD tiling and temporal grouping provider
+
+`--target rust-reference --case test-mtmd-impl` executes all 29 original source
+assertions: five LFM2 tiling decisions, twelve group-size results and twelve
+independent remaining-bitmap counts. The original case order, five geometries
+(including the 720 tie), twelve text/image/video/audio sequences, source ID and
+immutable assertion corpus are unchanged.
+
+`reference_mtmd.rs` independently minimizes distance on a bounded integer lattice,
+preferring even indices for ties. It applies the original patch-size minimum and
+strict two-times token-area threshold. Temporal grouping partitions original
+equal-frame runs into pairs and separately counts surviving original bitmap
+positions; it does not call production's quotient/remainder tiler or mutate the
+production media vector. Audio, plain images, dimensions and intervening text
+retain their original group boundaries. Whole-request typed bounds and owned
+metadata replace native temporary bitmap pools; rejected input produces no partial
+observation and subsequent requests use fresh state.
+
+Provider identities bind upstream commit
+`b87ca7225456b06b0975b8239c66b5aecf07e37c`, the complete source test SHA-256
+`b6cffd8cbe193c590cb25b98e480f5db6615f8da3ef7e732ca85b19a2345388b` and the
+original `mtmd.cpp`, `mtmd-image.cpp`, `mtmd-image.h` and `clip-model.h` identities.
+The upstream MIT terms remain in `LICENSE`. The ordinary `cpp` reference arm
+uses this independent provider and discloses `NativeReferenceReplay: false`.
+
+`common/mtmd.hpp` and its native include/dispatch/CMake edge are removed; direct
+native requests reject. Complete owning hosted acceptance and the remaining
+37 C++ files stay separate, with catalog, required-green-ID and complete backend
+and performance schedules unchanged. These metadata controls supply no vision or
+audio-model inference, native arithmetic replay or device-performance verdict.

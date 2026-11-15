@@ -540,7 +540,8 @@
       "SourceSha256": "b6cffd8cbe193c590cb25b98e480f5db6615f8da3ef7e732ca85b19a2345388b",
       "Category": "model-free",
       "Needs": [
-        "libmtmd private image preprocessor and temporal merge APIs"
+        "production Rust image tiling and temporal merge APIs",
+        "independent Rust nearest-even lattice and original-run partition reference"
       ],
       "AssertionsToPort": "5 LFM2 should_tile geometries including ties-to-even720;12 temporal groups with images/video/audio/text/mismatched sizes and n_merge1; remaining bitmap part count.",
       "LegacyReferenceRequired": false,

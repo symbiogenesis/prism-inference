@@ -91,6 +91,7 @@ mod quantize_stats;
 mod reasoning_budget;
 mod recurrent_rollback;
 mod reference_logging;
+mod reference_mtmd;
 mod reference_provider;
 mod reference_reasoning;
 mod schema_python;

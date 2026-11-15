@@ -90,10 +90,14 @@ that cannot be encoded as JSON yields a standard encoding exception observation.
 
 ## Generic MTMD operations
 
+These operations are retired from the native bridge and reject there. The Rust
+production and independent reference adapters preserve the exact protocol below.
+
 `mtmd-image-should-tile` takes exact fields `Kind`, `PatchSize`, `Merge`,
-`MinImageTokens`, `MaxImageTokens`, `Width`, `Height`. It forwards the populated
-production hyperparameters and image size to
-`mtmd_image_preprocessor_lfm2::should_tile`, returning `{"ShouldTile":boolean}`.
+`MinImageTokens`, `MaxImageTokens`, `Width`, `Height`, returning
+`{"ShouldTile":boolean}`. The independent reference minimizes exact distance to
+the alignment lattice with even-index tie breaking, applies the patch-size clamp,
+and compares area strictly against twice the maximum token-area allowance.
 Patch size ranges from 1 through 64, merge from 1 through 8, token bounds from 1
 through 4,096 in ascending order, and dimensions from 1 through 4,096.
 
@@ -104,10 +108,14 @@ from 1 through 64 and parts contains at most 64 descriptors:
 - `{"Kind":"bitmap","Width":100,"Height":100,"Mergeable":true}`: dimensions 1 through 4,096.
 - `{"Kind":"audio","Samples":100,"Mergeable":true}`: sample count 1 through 1,048,576.
 
-The adapter constructs production bitmap handles with null payload pointers,
-sets the supplied mergeability flags, and calls `mtmd_group_mergeable_bitmaps`.
-It returns `{"GroupSizes":[...],"RemainingBitmapParts":number}` from the actual
-groups and mutated part list.
+The independent reference partitions original runs of equal-sized mergeable
+images into pairs, even when `Merge` exceeds two. Text, audio and nonmergeable or
+different-sized images break runs. It returns
+`{"GroupSizes":[...],"RemainingBitmapParts":number}` and counts original-vector
+survivors independently of group sizes. Each request owns its metadata and drops
+it after the observation; no native payload or borrowed handle survives. Every
+operation is validated before producing results. No fresh native execution,
+model/vision/audio support or whole-retirement verdict is claimed.
 
 ## Generic grammar-parser operation
 

@@ -32,7 +32,10 @@ header and dispatch are retired. The complete eight-worker logger smoke source
 uses a separate bounded-channel Rust reference with joined producers, explicit
 flush/free and owned-consumer teardown; its native header and dispatch are also
 retired. The production Rust logger remains independently exercised. The source
-has no output-content assertions. Reports and retained case details identify the
+has no output-content assertions. MTMD's 29 tiling/temporal-grouping assertions
+use a separate exact nearest-lattice/run-partition Rust provider, preserving the
+ties-to-even boundary and independently counted surviving bitmap positions; its
+native header/include/dispatch is retired. Reports and retained case details identify the
 provider without claiming native replay. Native bridges provide bounded serialization and production calls;
 they contain no expected outputs, random generators or acceptance policy.
 Upstream test executables and fixture exporters are not built.

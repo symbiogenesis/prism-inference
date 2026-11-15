@@ -160,6 +160,7 @@ impl<D: Decoder> Runtime<D> {
                 let Snapshot {
                     state,
                     tokens,
+                    media_spans,
                     logits,
                     ..
                 } = rollback;
@@ -171,6 +172,7 @@ impl<D: Decoder> Runtime<D> {
                     self.decoder.restore(&state)
                 };
                 self.tokens = tokens;
+                self.media_spans = media_spans;
                 let previous_logits = std::mem::replace(&mut self.logits, logits);
                 restored?;
                 if !already_faulted {
@@ -464,12 +466,14 @@ impl<D: Decoder> Runtime<D> {
         let Snapshot {
             state,
             tokens,
+            media_spans,
             logits,
             ..
         } = checkpoint;
         self.faulted = true;
         let restored = self.decoder.restore(&state);
         self.tokens = tokens;
+        self.media_spans = media_spans;
         let previous_logits = std::mem::replace(&mut self.logits, logits);
         restored?;
         self.faulted = false;

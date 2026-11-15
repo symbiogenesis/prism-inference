@@ -134,9 +134,34 @@ pub enum PromptReuse {
     PromptEndAndLatest,
 }
 
+/// A contiguous range of placeholder tokens in a prompt backed by one encoded image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaSpan {
+    /// Start token index in the linearized prompt token slice.
+    pub offset: usize,
+    /// Number of placeholder tokens covered by this image chunk (`grid_width * grid_height`).
+    pub len: usize,
+    /// Merged patch grid width in tokens per row.
+    pub grid_width: usize,
+    /// Merged patch grid height in rows.
+    pub grid_height: usize,
+    /// SHA-256 digest of the canonical image bytes for prefix-reuse equality.
+    pub content_sha256: [u8; 32],
+}
+
+/// Borrowed image chunk paired with its flattened hidden-state embeddings (`len * d_model`).
+#[derive(Clone, Copy, Debug)]
+pub struct MultimodalChunk<'a> {
+    /// Placeholder token span and image identity in the linearized prompt.
+    pub span: MediaSpan,
+    /// Row-major `F32` embeddings produced by the vision projector.
+    pub embeddings: &'a [f32],
+}
+
 struct Snapshot<S> {
     state: S,
     tokens: Vec<u32>,
+    media_spans: Vec<MediaSpan>,
     logits: Arc<Vec<f32>>,
     bytes: usize,
 }
@@ -277,6 +302,7 @@ pub struct Runtime<D: Decoder> {
     decoder: D,
     limits: Limits,
     tokens: Vec<u32>,
+    media_spans: Vec<MediaSpan>,
     // Empty means invalid; a valid decoder vocabulary is always nonempty.
     // Captures/restores share immutable output. Mutation detaches without copying.
     logits: Arc<Vec<f32>>,
@@ -374,6 +400,7 @@ impl Runtime<crate::graph::Qwen35> {
         self.prompt_end_checkpoint = None;
         self.recycled_checkpoints.clear();
         self.tokens.clear();
+        self.media_spans.clear();
         mutable_logits(&mut self.logits).clear();
         self.faulted = false;
         Ok(())
@@ -412,6 +439,7 @@ impl<D: Decoder> Runtime<D> {
             decoder,
             limits,
             tokens,
+            media_spans: Vec::new(),
             logits: Arc::new(Vec::new()),
             checkpoints,
             prompt_end_checkpoint: None,
@@ -433,6 +461,12 @@ impl<D: Decoder> Runtime<D> {
     #[must_use]
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    /// Committed multimodal image spans aligned with [`Self::tokens`].
+    #[must_use]
+    pub fn media_spans(&self) -> &[MediaSpan] {
+        &self.media_spans
     }
 
     /// Inspect the decoder's identity and diagnostics without changing ownership.
@@ -549,6 +583,7 @@ impl<D: Decoder> Runtime<D> {
             self.recycle_snapshot(snapshot);
         }
         self.tokens.clear();
+        self.media_spans.clear();
         mutable_logits(&mut self.logits).clear();
         self.faulted = false;
         Ok(())
@@ -750,6 +785,7 @@ impl<D: Decoder> Runtime<D> {
         let deadline = deadline.into();
         self.generate_sampled_observed(
             prompt,
+            &[],
             options,
             prefill,
             &|| check_deadline(cancellation, deadline, Instant::now()),
@@ -758,6 +794,120 @@ impl<D: Decoder> Runtime<D> {
                 emit,
                 timings: Some(timings),
                 terminal_state_only: false,
+            },
+        )
+    }
+
+    /// Generate with multimodal image chunks inserted at their exact token spans.
+    ///
+    /// Uses the same sampling, prefix-reuse, cancellation and rollback contract as
+    /// [`Self::generate_sampled_until`].
+    ///
+    /// # Errors
+    /// Rejects invalid chunks, overlaps, nonfinite embeddings, or any error
+    /// returned by [`Self::generate_sampled_until`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Multimodal sampling adds chunk payloads to the explicit deadline API."
+    )]
+    pub fn generate_multimodal_sampled_until<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        sampler: &mut S,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Completion> {
+        let deadline = deadline.into();
+        self.generate_sampled_observed(
+            prompt,
+            chunks,
+            options,
+            prefill,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            GenerationEffects {
+                sampler,
+                emit,
+                timings: None,
+                terminal_state_only: false,
+            },
+        )
+    }
+
+    /// Generate with multimodal image chunks and fixed-size runtime phase timings.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::generate_multimodal_sampled_until`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Optional attribution extends the explicit multimodal deadline API."
+    )]
+    pub fn generate_multimodal_sampled_until_with_timings<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        sampler: &mut S,
+        timings: &mut GenerationTimings,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Completion> {
+        let deadline = deadline.into();
+        self.generate_sampled_observed(
+            prompt,
+            chunks,
+            options,
+            prefill,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            GenerationEffects {
+                sampler,
+                emit,
+                timings: Some(timings),
+                terminal_state_only: false,
+            },
+        )
+    }
+
+    /// Finish a reset-only multimodal request without retaining prefix checkpoints or terminal logits.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The reset-only multimodal service preserves deadline, sampler and timing attribution arguments."
+    )]
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn generate_multimodal_sampled_until_for_reset<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        sampler: &mut S,
+        timings: Option<&mut GenerationTimings>,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Completion> {
+        let deadline = deadline.into();
+        if self.limits.checkpoints != 0 {
+            return Err(invalid(
+                "reset-only generation cannot retain prefix checkpoints",
+            ));
+        }
+        self.generate_sampled_observed(
+            prompt,
+            chunks,
+            options,
+            prefill,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            GenerationEffects {
+                sampler,
+                emit,
+                timings,
+                terminal_state_only: true,
             },
         )
     }
@@ -792,6 +942,7 @@ impl<D: Decoder> Runtime<D> {
         }
         self.generate_sampled_observed(
             prompt,
+            &[],
             options,
             prefill,
             &|| check_deadline(cancellation, deadline, Instant::now()),
@@ -826,6 +977,7 @@ impl<D: Decoder> Runtime<D> {
     ) -> Result<Completion> {
         self.generate_sampled_observed(
             prompt,
+            &[],
             options,
             prefill,
             check,
@@ -841,6 +993,7 @@ impl<D: Decoder> Runtime<D> {
     fn generate_sampled_observed<S: Sampler + Clone>(
         &mut self,
         prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
@@ -856,7 +1009,8 @@ impl<D: Decoder> Runtime<D> {
             0,
             || Ok(effects.sampler.clone()),
         )?;
-        let result = self.generate_transaction(prompt, options, prefill, check, &mut effects);
+        let result =
+            self.generate_transaction(prompt, chunks, options, prefill, check, &mut effects);
         if result.is_err() {
             measure(
                 &mut effects.timings,
@@ -880,6 +1034,7 @@ impl<D: Decoder> Runtime<D> {
     fn generate_transaction(
         &mut self,
         prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
@@ -892,6 +1047,7 @@ impl<D: Decoder> Runtime<D> {
         }
         check()?;
         self.validate_request(prompt, options, prefill)?;
+        validate_multimodal_chunks(prompt, chunks)?;
         check()?;
         let rollback = measure(
             &mut effects.timings,
@@ -908,6 +1064,7 @@ impl<D: Decoder> Runtime<D> {
             };
             let completion = self.generate_inner(
                 prompt,
+                chunks,
                 options,
                 prefill,
                 check,
@@ -954,6 +1111,7 @@ impl<D: Decoder> Runtime<D> {
                         let Snapshot {
                             state,
                             tokens,
+                            media_spans,
                             logits,
                             ..
                         } = rollback;
@@ -961,6 +1119,7 @@ impl<D: Decoder> Runtime<D> {
                         // History describes the committed request even if backend
                         // recovery fails and admission remains closed.
                         self.tokens = tokens;
+                        self.media_spans = media_spans;
                         let previous_logits = std::mem::replace(&mut self.logits, logits);
                         restored?;
                         self.recycle_checkpoint(state);
@@ -1015,9 +1174,15 @@ impl<D: Decoder> Runtime<D> {
             .and_then(|bytes| bytes.checked_add(size_of::<Vec<f32>>()))
             .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
             .ok_or_else(|| invalid("native logits checkpoint byte count overflow"))?;
+        let media_bytes = self
+            .media_spans
+            .len()
+            .checked_mul(size_of::<MediaSpan>())
+            .ok_or_else(|| invalid("native media span checkpoint byte count overflow"))?;
         self.tokens
             .len()
             .checked_mul(size_of::<u32>())
+            .and_then(|size| size.checked_add(media_bytes))
             .and_then(|size| size.checked_add(logits_bytes))
             .and_then(|size| size.checked_add(self.decoder.checkpoint_bytes()))
             .and_then(|size| size.checked_add(size_of::<Snapshot<D::Checkpoint>>()))
@@ -1043,6 +1208,7 @@ impl<D: Decoder> Runtime<D> {
         check: &impl Fn() -> Result<()>,
     ) -> Result<Snapshot<D::Checkpoint>> {
         let tokens = copy(&self.tokens)?;
+        let media_spans = copy(&self.media_spans)?;
         // Invalid/empty output needs no retained backing storage. Keep its
         // dormant allocation unique so reset-only requests can reuse it.
         let logits = if self.logits.is_empty() {
@@ -1069,6 +1235,7 @@ impl<D: Decoder> Runtime<D> {
         Ok(Snapshot {
             state,
             tokens,
+            media_spans,
             logits,
             bytes,
         })
@@ -1138,11 +1305,21 @@ impl<D: Decoder> Runtime<D> {
         capture: &mut PromptEndCapture<'_, D::Checkpoint>,
         check: &impl Fn() -> Result<()>,
     ) -> Result<()> {
+        self.maybe_capture_prompt_end_with_spans(prompt, &[], capture, check)
+    }
+
+    fn maybe_capture_prompt_end_with_spans(
+        &mut self,
+        prompt: &[u32],
+        spans: &[MediaSpan],
+        capture: &mut PromptEndCapture<'_, D::Checkpoint>,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
         if !self.retain_prompt_end
             || self
                 .prompt_end_checkpoint
                 .as_ref()
-                .is_some_and(|saved| saved.tokens == prompt)
+                .is_some_and(|saved| saved.tokens == prompt && saved.media_spans == spans)
         {
             return Ok(());
         }
@@ -1236,24 +1413,47 @@ impl<D: Decoder> Runtime<D> {
     }
 
     fn prepare(&mut self, prompt: &[u32], check: &impl Fn() -> Result<()>) -> Result<usize> {
+        self.prepare_with_spans(prompt, &[], check)
+    }
+
+    fn prepare_with_spans(
+        &mut self,
+        prompt: &[u32],
+        incoming_spans: &[MediaSpan],
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<usize> {
         enum CandidateSlot {
             Prefix(usize),
             PromptEnd,
         }
 
-        if !self.tokens.is_empty() && prompt.starts_with(&self.tokens) && !self.logits.is_empty() {
+        if !self.tokens.is_empty()
+            && prefix_matches_media(prompt, incoming_spans, &self.tokens, &self.media_spans)
+            && !self.logits.is_empty()
+        {
             return Ok(self.tokens.len());
         }
         let best_cached = self
             .checkpoints
             .iter()
             .enumerate()
-            .filter(|(_, snapshot)| prompt.starts_with(&snapshot.tokens))
+            .filter(|(_, snapshot)| {
+                prefix_matches_media(
+                    prompt,
+                    incoming_spans,
+                    &snapshot.tokens,
+                    &snapshot.media_spans,
+                )
+            })
             .max_by_key(|(_, snapshot)| snapshot.tokens.len());
-        let best_prompt_end = self
-            .prompt_end_checkpoint
-            .as_ref()
-            .filter(|snapshot| prompt.starts_with(&snapshot.tokens));
+        let best_prompt_end = self.prompt_end_checkpoint.as_ref().filter(|snapshot| {
+            prefix_matches_media(
+                prompt,
+                incoming_spans,
+                &snapshot.tokens,
+                &snapshot.media_spans,
+            )
+        });
         let best = match (best_cached, best_prompt_end) {
             (Some((index, cached)), Some(end)) => {
                 if cached.tokens.len() >= end.tokens.len() {
@@ -1286,6 +1486,8 @@ impl<D: Decoder> Runtime<D> {
             check()?;
             self.tokens.clear();
             self.tokens.extend_from_slice(&snapshot.tokens);
+            self.media_spans.clear();
+            self.media_spans.extend_from_slice(&snapshot.media_spans);
             let previous_logits = std::mem::replace(&mut self.logits, Arc::clone(&snapshot.logits));
             self.recycle_logits(previous_logits);
         } else {
@@ -1293,6 +1495,7 @@ impl<D: Decoder> Runtime<D> {
             self.decoder.reset()?;
             check()?;
             self.tokens.clear();
+            self.media_spans.clear();
             mutable_logits(&mut self.logits).clear();
         }
         Ok(self.tokens.len())
@@ -1378,9 +1581,152 @@ impl<D: Decoder> Runtime<D> {
         Ok(())
     }
 
+    fn evaluate_image_chunk(
+        &mut self,
+        prompt_slice: &[u32],
+        chunk: &MultimodalChunk<'_>,
+        want_logits: bool,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        check()?;
+        let tokens_cap_before = self.tokens.capacity();
+        self.tokens.try_reserve(chunk.span.len)?;
+        if self.tokens.capacity() > tokens_cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
+        self.media_spans.try_reserve(1)?;
+        if want_logits {
+            let shared = Arc::strong_count(&self.logits) > 1;
+            let reused_from_pool = shared && !self.batch_logits.is_empty();
+            let prev_logits_cap = self.logits.capacity();
+            let output = mutable_logits_with_scratch(&mut self.logits, &mut self.batch_logits);
+            let output_cap_before = output.capacity();
+            output.clear();
+            check()?;
+            let result = self
+                .decoder
+                .evaluate_image_chunk(
+                    chunk.embeddings,
+                    chunk.span.grid_width,
+                    chunk.span.grid_height,
+                    Some(output),
+                    check,
+                )
+                .and_then(|()| {
+                    if output.len() != self.decoder.vocab_size()
+                        || !output.iter().all(|value| value.is_finite())
+                    {
+                        return Err(invalid(
+                            "native decoder returned invalid image-chunk logits",
+                        ));
+                    }
+                    check()
+                });
+            let output_cap_after = output.capacity();
+            if shared
+                && !reused_from_pool
+                && prev_logits_cap > 0
+                && output_cap_after == prev_logits_cap
+            {
+                self.reallocation_witness.same_size_reallocations = self
+                    .reallocation_witness
+                    .same_size_reallocations
+                    .saturating_add(1);
+            } else if output_cap_after > output_cap_before {
+                self.reallocation_witness.growth_reallocations = self
+                    .reallocation_witness
+                    .growth_reallocations
+                    .saturating_add(1);
+            } else if output_cap_after > 0 {
+                self.reallocation_witness.reused_preparations = self
+                    .reallocation_witness
+                    .reused_preparations
+                    .saturating_add(1);
+            }
+            if let Err(error) = result {
+                output.clear();
+                return Err(error);
+            }
+        } else {
+            mutable_logits(&mut self.logits).clear();
+            check()?;
+            self.decoder.evaluate_image_chunk(
+                chunk.embeddings,
+                chunk.span.grid_width,
+                chunk.span.grid_height,
+                None,
+                check,
+            )?;
+            check()?;
+        }
+        self.tokens.extend_from_slice(prompt_slice);
+        self.media_spans.push(chunk.span);
+        Ok(())
+    }
+
+    fn prefill_remaining(
+        &mut self,
+        prompt: &[u32],
+        reused: usize,
+        chunks: &[MultimodalChunk<'_>],
+        prefill: Prefill,
+        timings: &mut Option<&mut GenerationTimings>,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        let mut cursor = reused;
+        for chunk in chunks.iter().filter(|chunk| chunk.span.offset >= reused) {
+            for block in prompt[cursor..chunk.span.offset].chunks(prefill.block_tokens) {
+                measure(
+                    timings,
+                    GenerationPhase::PrefillIngestion,
+                    block.len(),
+                    || self.ingest_block(block, check),
+                )?;
+            }
+            let chunk_end = chunk.span.offset + chunk.span.len;
+            let want_logits = chunk_end == prompt.len();
+            let phase = if want_logits {
+                GenerationPhase::PrefillEvaluation
+            } else {
+                GenerationPhase::PrefillIngestion
+            };
+            measure(timings, phase, chunk.span.len, || {
+                self.evaluate_image_chunk(
+                    &prompt[chunk.span.offset..chunk_end],
+                    chunk,
+                    want_logits,
+                    check,
+                )
+            })?;
+            cursor = chunk_end;
+        }
+        if let Some((&last, prefix)) = prompt[cursor..].split_last() {
+            for block in prefix.chunks(prefill.block_tokens) {
+                measure(
+                    timings,
+                    GenerationPhase::PrefillIngestion,
+                    block.len(),
+                    || self.ingest_block(block, check),
+                )?;
+            }
+            measure(timings, GenerationPhase::PrefillEvaluation, 1, || {
+                self.evaluate(last, check)
+            })?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Text and multimodal execution share one guarded transaction sequence."
+    )]
     fn generate_inner(
         &mut self,
         prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
@@ -1388,11 +1734,12 @@ impl<D: Decoder> Runtime<D> {
         prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
     ) -> Result<Completion> {
         check()?;
+        let incoming_spans: Vec<MediaSpan> = chunks.iter().map(|chunk| chunk.span).collect();
         let reused = measure(
             &mut effects.timings,
             GenerationPhase::PrefixPreparation,
             0,
-            || self.prepare(prompt, check),
+            || self.prepare_with_spans(prompt, &incoming_spans, check),
         )?;
         if let Some(timings) = effects.timings.as_deref_mut() {
             timings.reused_tokens = Some(reused);
@@ -1406,23 +1753,8 @@ impl<D: Decoder> Runtime<D> {
         self.decoder
             .admit_work(remaining.saturating_sub(1), evaluations)?;
         check()?;
-        if let Some((&last, prefix)) = prompt[reused..].split_last() {
-            for block in prefix.chunks(prefill.block_tokens) {
-                measure(
-                    &mut effects.timings,
-                    GenerationPhase::PrefillIngestion,
-                    block.len(),
-                    || self.ingest_block(block, check),
-                )?;
-            }
-            measure(
-                &mut effects.timings,
-                GenerationPhase::PrefillEvaluation,
-                1,
-                || self.evaluate(last, check),
-            )?;
-        }
-        self.maybe_capture_prompt_end(prompt, prompt_end, check)?;
+        self.prefill_remaining(prompt, reused, chunks, prefill, &mut effects.timings, check)?;
+        self.maybe_capture_prompt_end_with_spans(prompt, &incoming_spans, prompt_end, check)?;
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
             reused_tokens: reused,
@@ -1652,11 +1984,13 @@ impl<D: Decoder> Runtime<D> {
                 let Snapshot {
                     state,
                     tokens,
+                    media_spans,
                     logits,
                     ..
                 } = rollback;
                 let restored = self.decoder.restore(&state);
                 self.tokens = tokens;
+                self.media_spans = media_spans;
                 let previous_logits = std::mem::replace(&mut self.logits, logits);
                 restored?;
                 self.faulted = false;
@@ -1797,11 +2131,13 @@ impl<D: Decoder> Runtime<D> {
                 let Snapshot {
                     state,
                     tokens,
+                    media_spans,
                     logits,
                     ..
                 } = rollback;
                 let restored = self.decoder.restore(&state);
                 self.tokens = tokens;
+                self.media_spans = media_spans;
                 let previous_logits = std::mem::replace(&mut self.logits, logits);
                 restored?;
                 self.faulted = false;
@@ -1979,6 +2315,48 @@ impl<D: Decoder> Runtime<D> {
         completion.generated_tokens += 1;
         Ok(false)
     }
+}
+
+fn prefix_matches_media(
+    prompt: &[u32],
+    incoming_spans: &[MediaSpan],
+    prefix_tokens: &[u32],
+    prefix_media: &[MediaSpan],
+) -> bool {
+    prompt.starts_with(prefix_tokens)
+        && incoming_spans
+            .iter()
+            .take_while(|span| span.offset < prefix_tokens.len())
+            .copied()
+            .eq(prefix_media.iter().copied())
+}
+
+fn validate_multimodal_chunks(prompt: &[u32], chunks: &[MultimodalChunk<'_>]) -> Result<()> {
+    let mut prev_end = 0_usize;
+    for chunk in chunks {
+        let span = chunk.span;
+        if span.grid_width == 0
+            || span.grid_height == 0
+            || span.grid_width.checked_mul(span.grid_height) != Some(span.len)
+            || span.offset < prev_end
+        {
+            return Err(invalid("invalid or overlapping multimodal span"));
+        }
+        let Some(end) = span.offset.checked_add(span.len) else {
+            return Err(invalid("multimodal span offset overflow"));
+        };
+        if end > prompt.len() {
+            return Err(invalid("multimodal span extends beyond prompt tokens"));
+        }
+        if chunk.embeddings.is_empty()
+            || !chunk.embeddings.len().is_multiple_of(span.len)
+            || !chunk.embeddings.iter().all(|value| value.is_finite())
+        {
+            return Err(invalid("invalid or nonfinite multimodal embeddings"));
+        }
+        prev_end = end;
+    }
+    Ok(())
 }
 
 fn check_deadline(
@@ -2886,6 +3264,10 @@ mod recycling_tests {
             Ok(())
         }
 
+        fn batched_evaluation_capacity(&self) -> usize {
+            8
+        }
+
         fn checkpoint(&self) -> Result<Self::Checkpoint> {
             let mut copy = Vec::new();
             copy.try_reserve_exact(self.tokens.len().max(16))?;
@@ -2978,6 +3360,8 @@ mod recycling_tests {
             &cancellation,
             |_| Ok(()),
         )?;
+        let _ = runtime.verify_draft_block(&[1, 2], &cancellation)?;
+        let _ = runtime.verify_draft_block(&[1, 2], &cancellation)?;
         assert!(runtime.batch_logits.len() <= MAX_RECYCLED_BATCH_LOGITS);
         let actual_retained_bits: Vec<u32> = retained_shared.iter().map(|v| v.to_bits()).collect();
         assert_eq!(actual_retained_bits, retained_bits);
@@ -3338,6 +3722,24 @@ mod boundary_and_checkpoint_tests {
                 Ok(vec![5.0, 0.0, 0.0])
             }
         }
+        fn evaluate_batch_into(
+            &mut self,
+            tokens: &[u32],
+            output: &mut Vec<Vec<f32>>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            output.truncate(tokens.len());
+            while output.len() < tokens.len() {
+                output.push(Vec::new());
+            }
+            for (index, &token) in tokens.iter().enumerate() {
+                check()?;
+                let logits = self.evaluate(token)?;
+                output[index].clear();
+                output[index].extend_from_slice(&logits);
+            }
+            Ok(())
+        }
         fn batched_evaluation_capacity(&self) -> usize {
             8
         }
@@ -3461,7 +3863,8 @@ mod boundary_and_checkpoint_tests {
             &cancel,
             |_| Ok(()),
         )?;
-        // Warm up checkpoint & batch logits pools on first transient verification block.
+        // Warm up checkpoint & batch logits pools on initial transient verification rounds.
+        let _ = runtime.verify_draft_block(&[0, 1], &cancel)?;
         let _ = runtime.verify_draft_block(&[0, 1], &cancel)?;
         let warmup = runtime.reallocation_witness();
         assert!(warmup.growth_reallocations > 0);
@@ -3476,6 +3879,302 @@ mod boundary_and_checkpoint_tests {
             warmup.same_size_reallocations
         );
         assert!(steady.reused_preparations > warmup.reused_preparations);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Op {
+        TextIngest(Vec<u32>),
+        TextEval(u32),
+        ImageChunk {
+            width: usize,
+            height: usize,
+            want_logits: bool,
+        },
+    }
+
+    struct MultimodalMockDecoder {
+        tokens: Vec<u32>,
+        ops: Vec<Op>,
+        fail_on_image_calls: Option<usize>,
+        image_calls: usize,
+    }
+
+    impl MultimodalMockDecoder {
+        fn new() -> Self {
+            Self {
+                tokens: Vec::new(),
+                ops: Vec::new(),
+                fail_on_image_calls: None,
+                image_calls: 0,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockCheckpoint {
+        tokens: Vec<u32>,
+        image_calls: usize,
+    }
+
+    impl Decoder for MultimodalMockDecoder {
+        type Checkpoint = MockCheckpoint;
+
+        fn identity(&self) -> &'static str {
+            "multimodal-mock/v1"
+        }
+
+        fn vocab_size(&self) -> usize {
+            16
+        }
+
+        fn checkpoint_bytes(&self) -> usize {
+            self.tokens.len() * 4
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.tokens.clear();
+            Ok(())
+        }
+
+        fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
+            check()?;
+            self.tokens.extend_from_slice(tokens);
+            self.ops.push(Op::TextIngest(tokens.to_vec()));
+            Ok(())
+        }
+
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            self.tokens.push(token);
+            self.ops.push(Op::TextEval(token));
+            let mut logits = vec![-1.0; 16];
+            logits[usize::try_from((token + 1) % 16)?] = 1.0;
+            Ok(logits)
+        }
+
+        fn evaluate_image_chunk(
+            &mut self,
+            embeddings: &[f32],
+            grid_width: usize,
+            grid_height: usize,
+            logits: Option<&mut Vec<f32>>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            check()?;
+            self.image_calls += 1;
+            if self.fail_on_image_calls == Some(self.image_calls) {
+                return Err(invalid("injected image-chunk failure"));
+            }
+            let count = grid_width * grid_height;
+            assert_eq!(embeddings.len(), count * 2);
+            self.tokens.extend(std::iter::repeat_n(9_u32, count));
+            self.ops.push(Op::ImageChunk {
+                width: grid_width,
+                height: grid_height,
+                want_logits: logits.is_some(),
+            });
+            if let Some(output) = logits {
+                output.clear();
+                output.resize(16, -1.0);
+                output[3] = 2.0;
+            }
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            Ok(MockCheckpoint {
+                tokens: self.tokens.clone(),
+                image_calls: self.image_calls,
+            })
+        }
+
+        fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+            self.tokens.clone_from(&checkpoint.tokens);
+            self.image_calls = checkpoint.image_calls;
+            Ok(())
+        }
+    }
+
+    fn make_chunk(offset: usize, w: usize, h: usize, hash_byte: u8) -> (MediaSpan, Vec<f32>) {
+        let len = w * h;
+        (
+            MediaSpan {
+                offset,
+                len,
+                grid_width: w,
+                grid_height: h,
+                content_sha256: [hash_byte; 32],
+            },
+            vec![0.25_f32; len * 2],
+        )
+    }
+
+    #[test]
+    fn multimodal_prefill_and_prefix_reuse_track_media_spans() -> Result<()> {
+        let limits = Limits {
+            context_tokens: 64,
+            checkpoints: 2,
+            checkpoint_bytes: 32_768,
+        };
+        let mut runtime = Runtime::new(MultimodalMockDecoder::new(), limits)?;
+        let cancel = Cancellation::default();
+        let options = Generation {
+            max_tokens: 1,
+            stop_tokens: Vec::new(),
+        };
+        let mut sampler = Greedy;
+
+        let (span1, emb1) = make_chunk(2, 2, 2, 0xAA);
+        let prompt1 = [1, 2, 9, 9, 9, 9, 4];
+        let mut out = Vec::new();
+        let first = runtime.generate_multimodal_sampled_until(
+            &prompt1,
+            &[MultimodalChunk {
+                span: span1,
+                embeddings: &emb1,
+            }],
+            &options,
+            Prefill { block_tokens: 4 },
+            &cancel,
+            None,
+            &mut sampler,
+            |tok| {
+                out.push(tok);
+                Ok(())
+            },
+        )?;
+        assert_eq!(out, [5]);
+        assert_eq!(first.reused_tokens, 0);
+        assert_eq!(runtime.media_spans(), [span1]);
+        assert_eq!(
+            runtime.decoder().ops,
+            vec![
+                Op::TextIngest(vec![1, 2]),
+                Op::ImageChunk {
+                    width: 2,
+                    height: 2,
+                    want_logits: false
+                },
+                Op::TextEval(4),
+                Op::TextEval(5),
+            ]
+        );
+
+        let mut prompt2 = prompt1.to_vec();
+        prompt2.extend_from_slice(&[5, 6]);
+        let before_ops = runtime.decoder().ops.len();
+        let second = runtime.generate_multimodal_sampled_until(
+            &prompt2,
+            &[MultimodalChunk {
+                span: span1,
+                embeddings: &emb1,
+            }],
+            &options,
+            Prefill::default(),
+            &cancel,
+            None,
+            &mut sampler,
+            |_| Ok(()),
+        )?;
+        assert_eq!(second.reused_tokens, 8);
+        assert_eq!(
+            &runtime.decoder().ops[before_ops..],
+            &[Op::TextEval(6), Op::TextEval(7)]
+        );
+
+        let (span_changed, emb_changed) = make_chunk(2, 2, 2, 0xBB);
+        let third = runtime.generate_multimodal_sampled_until(
+            &prompt2,
+            &[MultimodalChunk {
+                span: span_changed,
+                embeddings: &emb_changed,
+            }],
+            &options,
+            Prefill::default(),
+            &cancel,
+            None,
+            &mut sampler,
+            |_| Ok(()),
+        )?;
+        assert_eq!(third.reused_tokens, 0);
+        assert_eq!(runtime.media_spans(), [span_changed]);
+
+        let text_only = runtime.generate_sampled_until(
+            &prompt2,
+            &options,
+            Prefill::default(),
+            &cancel,
+            None,
+            &mut sampler,
+            |_| Ok(()),
+        )?;
+        assert_eq!(text_only.reused_tokens, 0);
+        assert_eq!(runtime.media_spans(), []);
+        Ok(())
+    }
+
+    #[test]
+    fn multimodal_rollback_and_reset_only_preserve_invariants() -> Result<()> {
+        let mut runtime = Runtime::new(
+            MultimodalMockDecoder::new(),
+            Limits {
+                context_tokens: 64,
+                checkpoints: 0,
+                checkpoint_bytes: 32_768,
+            },
+        )?;
+        let cancel = Cancellation::default();
+        let options = Generation {
+            max_tokens: 1,
+            stop_tokens: Vec::new(),
+        };
+        let mut sampler = Greedy;
+
+        let (span_end, emb_end) = make_chunk(1, 2, 1, 0xCC);
+        runtime.decoder.fail_on_image_calls = Some(1);
+        let err = runtime.generate_multimodal_sampled_until_for_reset(
+            &[1, 9, 9],
+            &[MultimodalChunk {
+                span: span_end,
+                embeddings: &emb_end,
+            }],
+            &options,
+            Prefill::default(),
+            &cancel,
+            None,
+            &mut sampler,
+            None,
+            |_| Ok(()),
+        );
+        assert!(err.is_err());
+        assert_eq!(runtime.media_spans(), []);
+
+        runtime.decoder.fail_on_image_calls = None;
+        let mut terminal_out = Vec::new();
+        runtime.generate_multimodal_sampled_until_for_reset(
+            &[1, 9, 9],
+            &[MultimodalChunk {
+                span: span_end,
+                embeddings: &emb_end,
+            }],
+            &options,
+            Prefill::default(),
+            &cancel,
+            None,
+            &mut sampler,
+            None,
+            |tok| {
+                terminal_out.push(tok);
+                Ok(())
+            },
+        )?;
+        assert_eq!(terminal_out, [3]);
+        assert_eq!(runtime.media_spans(), [span_end]);
         Ok(())
     }
 }

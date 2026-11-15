@@ -14,18 +14,35 @@ use crate::{
     kernels::{MatvecBackend, RowParallelism},
     model::{
         lora::{AdapterStorage, EditedAdapter, RankOneAdapter},
-        swift::{self, LoadReceipt, Representation},
+        swift::{self, LoadReceipt, MmprojLoadReceipt, Representation},
     },
-    runtime::{Cancellation, Completion, GenerationTimings, Limits, Prefill, PromptReuse, Runtime},
+    runtime::{
+        Cancellation, Completion, GenerationTimings, Limits, MediaSpan, MultimodalChunk, Prefill,
+        PromptReuse, Runtime,
+    },
     sampling::SwiftSampler,
     speculative::{SpeculativeStats, SuffixDraftConfig},
-    swift_chat::SwiftChatSession,
+    swift_chat::{
+        ContentPart, ImageChunkPlan, MultimodalContent, MultimodalMessage, SwiftChatSession,
+    },
     text_output::Utf8Output,
+    vision::{EncodedImage, SwiftVisionEncoder, VisionConfig},
     vocabulary::Vocabulary,
 };
 
 /// Maximum retained model storage admitted by this Swift session.
 pub const MODEL_MEMORY_BYTES: usize = 8 * 1024 * 1024 * 1024;
+/// Conservative host commit reserve for the verified Qwen3-VL vision projector.
+pub const MMPROJ_MEMORY_BYTES: usize = 768 * 1024 * 1024;
+/// Default maximum visual placeholder tokens admitted per input image.
+pub const DEFAULT_MAX_IMAGE_TOKENS: usize = 1_024;
+/// Smallest selectable per-image token budget.
+pub const MIN_IMAGE_TOKENS: usize = 64;
+/// Largest selectable per-image token budget.
+pub const MAX_IMAGE_TOKENS: usize = 4_096;
+/// Maximum number of images permitted in a single conversation prompt.
+pub const MAX_PROMPT_IMAGES: usize = 24;
+const MAX_CONTENT_PARTS: usize = 128;
 /// Development-default Swift attention cache; explicit FP16 remains available.
 ///
 /// This approximate K4/V4 policy does not establish full-model quality or device
@@ -495,11 +512,17 @@ impl SwiftExecutionMemoryLedger {
 /// Largest complete displayed output retained or delivered by one request.
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
+struct PreparedMediaChunk {
+    span: MediaSpan,
+    encoded: EncodedImage,
+}
+
 /// Exact rendered and counted input, sealed by its originating verified session.
 pub struct PreparedChat {
     owner: Arc<()>,
     adapter_scale: Option<f32>,
     tokens: Vec<u32>,
+    media_chunks: Vec<PreparedMediaChunk>,
     output_tokens: usize,
     enable_thinking: bool,
 }
@@ -515,6 +538,12 @@ impl PreparedChat {
     #[must_use]
     pub const fn prompt_tokens(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Number of encoded visual image chunks included in the prepared prompt.
+    #[must_use]
+    pub const fn image_count(&self) -> usize {
+        self.media_chunks.len()
     }
 
     /// Complete output allowance reserved before model execution.
@@ -562,6 +591,9 @@ pub struct SwiftSession {
     delivery_fault: bool,
     prompt_reuse: PromptReuse,
     last_speculative_stats: Option<SpeculativeStats>,
+    vision: Option<Arc<SwiftVisionEncoder>>,
+    mmproj_receipt: Option<MmprojLoadReceipt>,
+    max_image_tokens: usize,
     receipt: LoadReceipt,
 }
 
@@ -917,6 +949,9 @@ impl SwiftSession {
             delivery_fault: false,
             prompt_reuse: PromptReuse::Disabled,
             last_speculative_stats: None,
+            vision: None,
+            mmproj_receipt: None,
+            max_image_tokens: DEFAULT_MAX_IMAGE_TOKENS,
             receipt,
         })
     }
@@ -1077,6 +1112,55 @@ impl SwiftSession {
         self.last_speculative_stats.as_ref()
     }
 
+    /// Load and verify the pinned Qwen3-VL `mmproj` projector for multimodal prompts.
+    ///
+    /// # Errors
+    /// Rejects closed admission, out-of-range image token budgets, hash/metadata
+    /// drift, or storage budget exhaustion before enabling vision encoding.
+    pub fn load_vision(
+        &mut self,
+        mmproj_path: &Path,
+        max_image_tokens: usize,
+    ) -> Result<&MmprojLoadReceipt> {
+        if self.is_faulted() {
+            return Err(invalid("Swift session requires reset"));
+        }
+        validate_vision_token_budget(max_image_tokens)?;
+        let (encoder, receipt) = SwiftVisionEncoder::load(
+            mmproj_path,
+            MMPROJ_MEMORY_BYTES,
+            self.requested_backend(),
+            self.clone_row_parallelism(),
+        )?;
+        self.vision = Some(Arc::new(encoder));
+        self.max_image_tokens = max_image_tokens;
+        Ok(self.mmproj_receipt.insert(receipt))
+    }
+
+    /// Whether a verified vision projector is loaded on this session.
+    #[must_use]
+    pub const fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Verified storage accounting receipt for the loaded `mmproj` artifact.
+    #[must_use]
+    pub const fn mmproj_receipt(&self) -> Option<&MmprojLoadReceipt> {
+        self.mmproj_receipt.as_ref()
+    }
+
+    /// Hyperparameters verified from the loaded `mmproj` artifact, when present.
+    #[must_use]
+    pub fn vision_config(&self) -> Option<&VisionConfig> {
+        self.vision.as_deref().map(SwiftVisionEncoder::config)
+    }
+
+    /// Maximum vision placeholder token budget configured per input image.
+    #[must_use]
+    pub const fn max_image_tokens(&self) -> usize {
+        self.max_image_tokens
+    }
+
     /// Itemized host process commit and external accelerator memory ledger.
     ///
     /// # Errors
@@ -1143,6 +1227,14 @@ impl SwiftSession {
         enable_thinking: bool,
         adapter_scale: Option<f32>,
     ) -> Result<PreparedChat> {
+        if messages_have_array_content(messages) {
+            return self.prepare_multimodal_with_settings(
+                messages,
+                output_tokens,
+                enable_thinking,
+                adapter_scale,
+            );
+        }
         validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
@@ -1154,6 +1246,92 @@ impl SwiftSession {
             owner: self.owner.clone(),
             adapter_scale,
             tokens: prompt.tokenization.token_ids,
+            media_chunks: Vec::new(),
+            output_tokens,
+            enable_thinking,
+        })
+    }
+
+    /// Encode image attachments, splice vision patch spans and seal exact prompt tokens.
+    ///
+    /// # Errors
+    /// Rejects closed admission, missing vision projector, malformed parts/URLs,
+    /// image decode errors, mismatched settings and context overflow.
+    pub fn prepare_multimodal_with_settings(
+        &self,
+        messages: &Value,
+        output_tokens: usize,
+        enable_thinking: bool,
+        adapter_scale: Option<f32>,
+    ) -> Result<PreparedChat> {
+        validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
+        if self.is_faulted() {
+            return Err(invalid("Swift session requires reset"));
+        }
+        let vision = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| invalid("Swift vision projector is not loaded"))?;
+        let raw_messages = parse_multimodal_messages(messages)?;
+        let encoded_images =
+            encode_parsed_images(&raw_messages, vision.as_ref(), self.max_image_tokens)?;
+        let mut part_lists = Vec::with_capacity(raw_messages.len());
+        for message in &raw_messages {
+            let mut parts = Vec::with_capacity(message.parts.len());
+            for part in &message.parts {
+                match part {
+                    ParsedPart::Text(text) => parts.push(ContentPart::Text(text.as_str())),
+                    ParsedPart::ImageUrl { image_index, .. } => {
+                        let encoded = &encoded_images[*image_index];
+                        parts.push(ContentPart::Image(ImageChunkPlan {
+                            grid_width: encoded.grid_width,
+                            grid_height: encoded.grid_height,
+                        }));
+                    }
+                }
+            }
+            part_lists.push(parts);
+        }
+        let mm_messages: Vec<MultimodalMessage<'_>> = raw_messages
+            .iter()
+            .zip(part_lists.iter())
+            .map(|(message, parts)| MultimodalMessage {
+                role: message.role.as_str(),
+                content: message.text.as_deref().map_or(
+                    MultimodalContent::Parts(parts.as_slice()),
+                    MultimodalContent::Text,
+                ),
+                reasoning_content: message.reasoning_content.as_deref(),
+            })
+            .collect();
+        let prepared = self.chat.prepare_multimodal_with_thinking(
+            &mm_messages,
+            output_tokens,
+            enable_thinking,
+        )?;
+        if prepared.image_spans.len() != encoded_images.len() {
+            return Err(invalid("multimodal image span count mismatch"));
+        }
+        let media_chunks = prepared
+            .image_spans
+            .into_iter()
+            .zip(encoded_images)
+            .map(|(span, encoded)| PreparedMediaChunk {
+                span: MediaSpan {
+                    offset: span.token_offset,
+                    len: span.token_count,
+                    grid_width: span.grid_width,
+                    grid_height: span.grid_height,
+                    content_sha256: encoded.sha256,
+                },
+                encoded,
+            })
+            .collect();
+        Ok(PreparedChat {
+            owner: self.owner.clone(),
+            adapter_scale,
+            tokens: prepared.tokenization.token_ids,
+            media_chunks,
             output_tokens,
             enable_thinking,
         })
@@ -1234,6 +1412,11 @@ impl SwiftSession {
         let deadline = deadline.into();
         self.last_speculative_stats = None;
         suffix_config.validate()?;
+        if !prompt.media_chunks.is_empty() {
+            return Err(invalid(
+                "CPU suffix speculation does not support multimodal image prompts",
+            ));
+        }
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
@@ -1285,7 +1468,8 @@ impl SwiftSession {
         timings: Option<&mut GenerationTimings>,
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
-        if timings.is_some() && self.cpu_speculation.is_some() {
+        let is_multimodal = !prompt.media_chunks.is_empty();
+        if timings.is_some() && self.cpu_speculation.is_some() && !is_multimodal {
             return Err(invalid(
                 "runtime phase timings are unavailable for CPU speculation",
             ));
@@ -1314,7 +1498,19 @@ impl SwiftSession {
             )
         };
         let mut recorded_stats = None;
-        let completion = if let Some(speculation) = self.cpu_speculation {
+        let completion = if is_multimodal {
+            execute_multimodal_completion(
+                &mut self.runtime,
+                self.prompt_reuse,
+                &mut self.sampler,
+                prompt,
+                &options,
+                cancellation,
+                deadline,
+                timings,
+                consume,
+            )?
+        } else if let Some(speculation) = self.cpu_speculation {
             let (completion, stats) = self.runtime.generate_sampled_speculative_until(
                 &prompt.tokens,
                 &options,
@@ -1373,6 +1569,247 @@ impl SwiftSession {
         self.last_speculative_stats = recorded_stats;
         Ok(completion)
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrowing disjoint session fields keeps the token output closure free of mutable session overlap."
+)]
+fn execute_multimodal_completion(
+    runtime: &mut Runtime<Qwen35>,
+    prompt_reuse: PromptReuse,
+    sampler: &mut SwiftSampler,
+    prompt: &PreparedChat,
+    options: &crate::runtime::Generation,
+    cancellation: &Cancellation,
+    deadline: Option<Instant>,
+    timings: Option<&mut GenerationTimings>,
+    consume: impl FnMut(u32) -> Result<()>,
+) -> Result<Completion> {
+    let chunks: Vec<MultimodalChunk<'_>> = prompt
+        .media_chunks
+        .iter()
+        .map(|chunk| MultimodalChunk {
+            span: chunk.span,
+            embeddings: &chunk.encoded.embeddings,
+        })
+        .collect();
+    if prompt_reuse == PromptReuse::Disabled {
+        runtime.generate_multimodal_sampled_until_for_reset(
+            &prompt.tokens,
+            &chunks,
+            options,
+            Prefill { block_tokens: 64 },
+            cancellation,
+            deadline,
+            sampler,
+            timings,
+            consume,
+        )
+    } else if let Some(timings) = timings {
+        runtime.generate_multimodal_sampled_until_with_timings(
+            &prompt.tokens,
+            &chunks,
+            options,
+            Prefill { block_tokens: 64 },
+            cancellation,
+            deadline,
+            sampler,
+            timings,
+            consume,
+        )
+    } else {
+        runtime.generate_multimodal_sampled_until(
+            &prompt.tokens,
+            &chunks,
+            options,
+            Prefill { block_tokens: 64 },
+            cancellation,
+            deadline,
+            sampler,
+            consume,
+        )
+    }
+}
+
+fn messages_have_array_content(messages: &Value) -> bool {
+    messages.as_array().is_some_and(|list| {
+        list.iter()
+            .any(|message| message.get("content").is_some_and(Value::is_array))
+    })
+}
+
+fn validate_vision_token_budget(max_image_tokens: usize) -> Result<()> {
+    if !(MIN_IMAGE_TOKENS..=MAX_IMAGE_TOKENS).contains(&max_image_tokens) {
+        return Err(invalid(
+            "Swift image token budget must be from 64 through 4096",
+        ));
+    }
+    Ok(())
+}
+
+enum ParsedPart {
+    Text(String),
+    ImageUrl { url: String, image_index: usize },
+}
+
+struct ParsedMessage {
+    role: String,
+    text: Option<String>,
+    parts: Vec<ParsedPart>,
+    reasoning_content: Option<String>,
+}
+
+fn parse_multimodal_part(part: &Value, image_count: &mut usize) -> Result<ParsedPart> {
+    let object = part
+        .as_object()
+        .ok_or_else(|| invalid("Swift multimodal content part must be an object"))?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Swift multimodal part requires type"))?;
+    match kind {
+        "text" => {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "text"))
+            {
+                return Err(invalid("unsupported Swift multimodal text part field"));
+            }
+            let text = object
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("Swift multimodal text part requires text"))?;
+            Ok(ParsedPart::Text(text.to_owned()))
+        }
+        "image_url" => {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "image_url"))
+            {
+                return Err(invalid("unsupported Swift multimodal image_url part field"));
+            }
+            let image_obj = object
+                .get("image_url")
+                .and_then(Value::as_object)
+                .ok_or_else(|| invalid("Swift image_url part requires image_url object"))?;
+            if image_obj
+                .keys()
+                .any(|key| !matches!(key.as_str(), "url" | "detail"))
+            {
+                return Err(invalid("unsupported Swift image_url object field"));
+            }
+            if let Some(detail) = image_obj.get("detail")
+                && !detail
+                    .as_str()
+                    .is_some_and(|value| matches!(value, "auto" | "low" | "high"))
+            {
+                return Err(invalid("invalid Swift image_url detail value"));
+            }
+            let url = image_obj
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("Swift image_url requires url string"))?;
+            if *image_count >= MAX_PROMPT_IMAGES {
+                return Err(invalid("Swift prompt image count exceeds supported bounds"));
+            }
+            let image_index = *image_count;
+            *image_count += 1;
+            Ok(ParsedPart::ImageUrl {
+                url: url.to_owned(),
+                image_index,
+            })
+        }
+        _ => Err(invalid("unsupported Swift multimodal part type")),
+    }
+}
+
+fn parse_multimodal_messages(messages: &Value) -> Result<Vec<ParsedMessage>> {
+    let array = messages
+        .as_array()
+        .ok_or_else(|| invalid("Swift messages must be an array"))?;
+    if array.is_empty() || array.len() > crate::swift_chat::MAX_MESSAGES {
+        return Err(invalid("Swift message count exceeds supported bounds"));
+    }
+    let mut parsed = Vec::with_capacity(array.len());
+    let mut image_count = 0_usize;
+    for (index, message) in array.iter().enumerate() {
+        let object = message
+            .as_object()
+            .ok_or_else(|| invalid("Swift message must be an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "role" | "content" | "reasoning_content"))
+        {
+            return Err(invalid("unsupported Swift message field"));
+        }
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("Swift message role must be text"))?;
+        if !(matches!(role, "user" | "assistant") || role == "system" && index == 0) {
+            return Err(invalid("unsupported Swift message role"));
+        }
+        let reasoning_content = if let Some(reasoning) = object.get("reasoning_content") {
+            if role != "assistant" {
+                return Err(invalid(
+                    "Swift reasoning history requires an assistant turn",
+                ));
+            }
+            Some(
+                reasoning
+                    .as_str()
+                    .ok_or_else(|| invalid("Swift reasoning history must be text"))?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let (text, parts) = match object.get("content") {
+            Some(Value::String(text)) => (Some(text.clone()), Vec::new()),
+            Some(Value::Array(raw_parts)) => {
+                if role != "user" {
+                    return Err(invalid(
+                        "Swift multimodal content parts are only allowed on user turns",
+                    ));
+                }
+                if raw_parts.is_empty() || raw_parts.len() > MAX_CONTENT_PARTS {
+                    return Err(invalid(
+                        "Swift multimodal content part count exceeds supported bounds",
+                    ));
+                }
+                let mut parts = Vec::with_capacity(raw_parts.len());
+                for part in raw_parts {
+                    parts.push(parse_multimodal_part(part, &mut image_count)?);
+                }
+                (None, parts)
+            }
+            _ => return Err(invalid("Swift message content must be text or part array")),
+        };
+        parsed.push(ParsedMessage {
+            role: role.to_owned(),
+            text,
+            parts,
+            reasoning_content,
+        });
+    }
+    Ok(parsed)
+}
+
+fn encode_parsed_images(
+    messages: &[ParsedMessage],
+    vision: &SwiftVisionEncoder,
+    max_image_tokens: usize,
+) -> Result<Vec<EncodedImage>> {
+    let mut encoded = Vec::new();
+    for message in messages {
+        for part in &message.parts {
+            if let ParsedPart::ImageUrl { url, .. } = part {
+                encoded.push(vision.encode_data_url(url, max_image_tokens)?);
+            }
+        }
+    }
+    Ok(encoded)
 }
 
 fn emit_decoded_token(
@@ -1666,12 +2103,14 @@ mod tests {
             owner: owner.clone(),
             adapter_scale: Some(-0.0),
             tokens: vec![1, 2],
+            media_chunks: Vec::new(),
             output_tokens: 3,
             enable_thinking: false,
         };
         validate_prompt_owner(&owner, &prompt)?;
         assert!(validate_prompt_owner(&Arc::new(()), &prompt).is_err());
         assert_eq!(prompt.prompt_tokens(), 2);
+        assert_eq!(prompt.image_count(), 0);
         assert_eq!(prompt.output_tokens(), 3);
         assert!(!prompt.thinking_enabled());
         assert_eq!(
@@ -1805,6 +2244,61 @@ mod tests {
         assert_eq!(chunks, vec!["\u{fffd}".to_owned(), "<|im_end|>".to_owned()]);
         assert_eq!(interrupted.pending_bytes(), b"");
         assert_eq!(interrupted_bytes, "\u{fffd}<|im_end|>".len());
+        Ok(())
+    }
+
+    #[test]
+    fn vision_token_budget_and_mmproj_reserve_enforce_bounds() -> Result<()> {
+        assert!(super::MMPROJ_MEMORY_BYTES >= usize::try_from(crate::model::swift::MMPROJ_BYTES)?);
+        assert!(super::validate_vision_token_budget(63).is_err());
+        assert!(super::validate_vision_token_budget(4_097).is_err());
+        super::validate_vision_token_budget(super::MIN_IMAGE_TOKENS)?;
+        super::validate_vision_token_budget(super::DEFAULT_MAX_IMAGE_TOKENS)?;
+        super::validate_vision_token_budget(super::MAX_IMAGE_TOKENS)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multimodal_message_parser_enforces_user_roles_parts_and_image_cap() -> Result<()> {
+        let valid = serde_json::json!([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}}
+            ]}
+        ]);
+        assert!(super::messages_have_array_content(&valid));
+        let parsed = super::parse_multimodal_messages(&valid)?;
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].parts.len(), 2);
+
+        let assistant_parts = serde_json::json!([
+            {"role": "assistant", "content": [{"type": "text", "text": "nope"}]},
+            {"role": "user", "content": "ok"}
+        ]);
+        assert!(super::parse_multimodal_messages(&assistant_parts).is_err());
+
+        let empty_parts = serde_json::json!([
+            {"role": "user", "content": []}
+        ]);
+        assert!(super::parse_multimodal_messages(&empty_parts).is_err());
+
+        let bad_detail = serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "ultra"}}
+            ]}
+        ]);
+        assert!(super::parse_multimodal_messages(&bad_detail).is_err());
+
+        let mut too_many = Vec::new();
+        for _ in 0..=super::MAX_PROMPT_IMAGES {
+            too_many.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"}
+            }));
+        }
+        let overflow = serde_json::json!([{"role": "user", "content": too_many}]);
+        assert!(super::parse_multimodal_messages(&overflow).is_err());
         Ok(())
     }
 }

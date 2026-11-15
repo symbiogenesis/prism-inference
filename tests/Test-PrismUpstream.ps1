@@ -180,9 +180,9 @@ $adapters = @{
     Col2im = @{ Name = 'test-col2im-1d'; Family = 'independent' }
     Dfly = @{ Name = 'test-dfly-fusion'; Family = 'independent' }
     Rope = @{ Name = 'test-rope'; Family = 'independent' }
-    LlamaGrammar = @{ Name = 'test-llama-grammar'; Family = 'common' }
+    LlamaGrammar = @{ Name = 'test-llama-grammar'; Family = 'independent' }
     LlGuidance = @{ Name = 'test-grammar-llguidance'; Family = 'common' }
-    GrammarIntegration = @{ Name = 'test-grammar-integration'; Family = 'common' }
+    GrammarIntegration = @{ Name = 'test-grammar-integration'; Family = 'independent' }
     Quantize = @{ Name = 'test-quantize-fns'; Family = 'common' }
     QuantizePerf = @{ Name = 'test-quantize-perf'; Family = 'common' }
     QuantizeStats = @{ Name = 'test-quantize-stats'; Family = 'common' }
@@ -209,12 +209,12 @@ $adapters = @{
     TokenizerRandom = @{ Name = 'test-tokenizer-random'; Id = 'tests/test-tokenizer-random.py'; Family = 'common' }
     ChatTemplate = @{ Name = 'test-chat-template'; Family = 'common' }
     MtmdCApi = @{ Name = 'test-mtmd-c-api'; Id = 'tests/test-mtmd-c-api.c'; Family = 'common' }
-    Sampling = @{ Name = 'test-sampling'; Family = 'common' }
+    Sampling = @{ Name = 'test-sampling'; Family = 'independent' }
     ChatPeg = @{ Name = 'test-chat-peg-parser'; Family = 'common' }
-    Gguf = @{ Name = 'test-gguf'; Family = 'common' }
+    Gguf = @{ Name = 'test-gguf'; Family = 'independent' }
     ChatAuto = @{ Name = 'test-chat-auto-parser'; Family = 'common' }
     Tokenizer0 = @{ Name = 'test-tokenizer-0'; Family = 'common' }
-    JsonSchema = @{ Name = 'test-json-schema-to-grammar'; Family = 'common' }
+    JsonSchema = @{ Name = 'test-json-schema-to-grammar'; Family = 'independent' }
     ChatAnalysis = @{ Name = 'test-chat-analysis'; Family = 'common' }
     PublicC = @{ Name = 'test-c'; Id = 'tests/test-c.c'; Family = 'common' }
     DsparkLogSnr = @{ Name = 'test-dspark-logsnr-meta'; Family = 'common' }
@@ -228,7 +228,7 @@ $adapters = @{
     KvMeanCenter = @{ Name = 'test-kv-mean-center'; Family = 'common' }
     Optimizer = @{ Name = 'test-opt'; Family = 'common' }
     DoubleFloat = @{ Name = 'test-double-float'; Family = 'independent' }
-    GbnfValidator = @{ Name = 'test-gbnf-validator'; Family = 'common' }
+    GbnfValidator = @{ Name = 'test-gbnf-validator'; Family = 'independent' }
     ArgParser = @{ Name = 'test-arg-parser'; Family = 'common' }
     Chat = @{ Name = 'test-chat'; Family = 'common' }
     ModelResolution = @{ Name = 'test-model-resolution'; Family = 'common' }

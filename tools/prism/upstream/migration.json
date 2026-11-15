@@ -335,7 +335,7 @@
       "Needs": [
         "GBNF grammar file",
         "input UTF-8 file",
-        "llama grammar production API"
+        "clean-room Rust reference grammar provider (reference_grammar.rs)"
       ],
       "AssertionsToPort": "Parse supplied grammar and evaluate every input codepoint/accept state with correct exit code; invent no single default fixture because original requires two paths.",
       "LegacyReferenceRequired": false,
@@ -359,7 +359,7 @@
       "SourceSha256": "38515758a58762f3084db5cd0ce8ddf28d84c78774598a0bbae0fd4c612ea023",
       "Category": "model-free",
       "Needs": [
-        "gguf metadata/tensor reader-writer and backend calls",
+        "clean-room Rust reference GGUF provider (reference_gguf.rs)",
         "external working directory"
       ],
       "AssertionsToPort": "All handcrafted malformed files; seed12345 metadata and tensor roundtrips; metadata-only/full; file/buffer/callback reads; set_kv copy and double-copy invariants across backends.",
@@ -371,7 +371,7 @@
       "SourceSha256": "6acd7735c8f6db1d3869bd2de5ea7a585accc75e3f8627eb163be11bc123716a",
       "Category": "model-free",
       "Needs": [
-        "llama grammar and JSON-schema conversion APIs"
+        "clean-room Rust reference grammar and JSON-schema providers (reference_grammar.rs, reference_json_schema.rs)"
       ],
       "AssertionsToPort": "All accepted/rejected strings; simple/complex grammar; clones; chars/quantifiers; missing root/reference/left recursion/root symbol; JSON schemas; preserve literal domain.",
       "LegacyReferenceRequired": true,
@@ -418,9 +418,8 @@
       "SourceSha256": "409361847bab0707ee02749c4e6978a63f9cc9f119ffff40de8c69b0c948e99d",
       "Category": "python-reference-required",
       "Needs": [
-        "C++ JSON-schema/grammar production APIs",
-        "Python>=3.8",
-        "bundled examples/json_schema_to_grammar.py"
+        "clean-room Rust reference JSON-schema provider (reference_json_schema.rs)",
+        "checked-in JSON-schema test cases corpus"
       ],
       "AssertionsToPort": "All literal schema->grammar status and output strings; invalid/unsupported regexp degradation; expectation parseability; identical table against Python reference; Python skip remains explicit.",
       "LegacyReferenceRequired": false,
@@ -456,7 +455,7 @@
       "SourceSha256": "18405dcd2ff94a2625e8d6e884ac74b704fc60f9c039dbb270ca550f6b2dad76",
       "Category": "model-free",
       "Needs": [
-        "private llama grammar parser/runtime APIs"
+        "clean-room Rust reference grammar provider (reference_grammar.rs)"
       ],
       "AssertionsToPort": "Every original grammar stack/candidate rejection/accept and copied state expectation; retain unicode/invalid transitions.",
       "LegacyReferenceRequired": true,
@@ -721,7 +720,7 @@
       "SourceSha256": "817543792852df22e78f705192793ec5797c872708274d572c24c2fb0c95a8ac",
       "Category": "correctness-and-benchmark",
       "Needs": [
-        "llama sampler public APIs",
+        "clean-room Rust reference sampler provider (reference_sampling.rs)",
         "CI benchmark lane"
       ],
       "AssertionsToPort": "All temp/temp-ext/topk/topp/minp/XTC/typical/penalties/DRY/top-n-sigma tables plus sampler queue combinations; preserve default test_perf separately.",

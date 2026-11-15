@@ -176,6 +176,13 @@ reference selector and explicit `rust-reference` selection route `tensor-graph` 
 
 ## Generic stateful grammar operations
 
+`common/grammar.hpp` and `common/json_schema.hpp` are retired from the native
+bridge. `--target rust-reference` routes grammar and JSON-schema cases through
+`tests/upstream_prism/reference_grammar.rs` and
+`tests/upstream_prism/reference_json_schema.rs` (`nativeReferenceReplay=false`),
+and direct native bridge requests for `grammar-trace`, `json-schema-to-grammar`,
+`json-schema-convert`, `json-schema-info`, and `gbnf-validator` reject.
+
 `json-schema-to-grammar` takes exact fields `Kind`, `SchemaJson` (a JSON string
 of at most 256 KiB), `ForceGbnf` (boolean), and returns `GrammarText` directly from
 the production converter. Parsing the raw JSON text preserves property ordering.
@@ -349,6 +356,13 @@ The owning Rust reference arm uses a separate source-derived factory and bounded
 wire-packet decoder for the complete `tests/test-mtmd-c-api.c` contract. The Rust
 production arm retains its independent media chunk APIs. Both preserve the
 original source assertions; this replacement supplies no captured native output.
+
+`common/sampling.hpp` and `common/gguf.hpp` are retired from the native bridge.
+`--target rust-reference` routes sampling and GGUF cases through
+`tests/upstream_prism/reference_sampling.rs` and
+`tests/upstream_prism/reference_gguf.rs` (`nativeReferenceReplay=false`), and
+direct native bridge requests for `sampler-trace`, `gguf-inventory`, `gguf-read`,
+and `gguf-context-trace` reject.
 
 The `sampler-trace` transport owns scoped production sampler and candidate handles. Rust supplies
 constructors, raw IEEE binary32 candidate fields and ordered apply, accept, reset, clone, copy and

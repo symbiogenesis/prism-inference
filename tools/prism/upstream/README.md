@@ -345,3 +345,21 @@ conversions, `col2im_1d`, `conv_transpose_1d`, `rms_norm`, `soft_max`, `mul_mat`
 removed (leaving 29 checked-in C++ files across the bridge snapshot). Selecting
 `test-col2im-1d`, `test-dfly-fusion` or `test-rope` alone needs no native
 common bridge.
+
+## Retired GGUF, sampling, grammar and JSON-schema native providers
+
+`--target rust-reference` supports `test-gguf` through
+`tests/upstream_prism/reference_gguf.rs`, `test-sampling` through
+`tests/upstream_prism/reference_sampling.rs`, `test-llama-grammar`,
+`test-gbnf-validator` and `test-grammar-integration` through
+`tests/upstream_prism/reference_grammar.rs`, and `test-json-schema-to-grammar`
+(plus schema conversion in `test-grammar-integration`) through
+`tests/upstream_prism/reference_json_schema.rs`, without calling
+`bonsai_prism_runtime` or any native bridge. Ordinary `cpp` and
+`rust-reference` selections disclose `nativeReferenceReplay=false`.
+
+`common/gguf.hpp`, `common/sampling.hpp`, `common/grammar.hpp` and
+`common/json_schema.hpp`, along with their bridge includes/dispatch and CMake
+build edges, are removed (leaving 25 checked-in C++ files and 2 checked-in C
+files, 27 native files total, across the bridge snapshot). Selecting those cases
+needs no native common bridge.

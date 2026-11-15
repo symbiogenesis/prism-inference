@@ -16,7 +16,9 @@ use bonsai_prism_runtime::Result;
 use bonsai_prism_runtime::chat::ChatTemplate;
 use bonsai_prism_runtime::model::ModelMetadata;
 use bonsai_prism_runtime::model::swift::{self, Representation};
-use bonsai_prism_runtime::swift_chat::SwiftChatSession;
+use bonsai_prism_runtime::swift_chat::{
+    ContentPart, ImageChunkPlan, ImageSpan, MultimodalContent, MultimodalMessage, SwiftChatSession,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -320,5 +322,191 @@ fn swift_chat_context_overflow_is_typed_and_preserves_healthy_tokenizer() -> Res
         );
     }
     assert_eq!(session.prepare_with_thinking(&valid, 1, false)?, first);
+    Ok(())
+}
+
+fn synthetic_multimodal_swift_metadata() -> Result<ModelMetadata> {
+    use bonsai_gguf::{MetadataArray, MetadataValue};
+
+    let mut model = synthetic_swift_metadata()?;
+    let Some(MetadataValue::Array(MetadataArray::String(tokens))) =
+        model.metadata.get_mut("tokenizer.ggml.tokens")
+    else {
+        return Err("missing token array".into());
+    };
+    for (id, spelling) in [
+        (248_053_usize, "<|vision_start|>"),
+        (248_054, "<|vision_end|>"),
+        (248_056, "<|image_pad|>"),
+        (248_057, "<|video_pad|>"),
+    ] {
+        tokens[id] = spelling.to_owned();
+    }
+    let Some(MetadataValue::Array(MetadataArray::I32(types))) =
+        model.metadata.get_mut("tokenizer.ggml.token_type")
+    else {
+        return Err("missing token types".into());
+    };
+    for id in [248_053_usize, 248_054, 248_056, 248_057] {
+        types[id] = 3;
+    }
+    Ok(model)
+}
+
+#[test]
+fn swift_chat_multimodal_renders_and_expands_image_spans() -> Result<()> {
+    let text_only_session = SwiftChatSession::from_metadata(&synthetic_swift_metadata()?)?;
+    let two_by_three = [
+        ContentPart::Text("first "),
+        ContentPart::Image(ImageChunkPlan {
+            grid_width: 2,
+            grid_height: 3,
+        }),
+        ContentPart::Text(" second"),
+    ];
+    let single_image_msg = [MultimodalMessage {
+        role: "user",
+        content: MultimodalContent::Parts(&two_by_three),
+        reasoning_content: None,
+    }];
+    // Without vision control tokens in vocabulary, images fail cleanly while plain text succeeds.
+    assert!(
+        text_only_session
+            .prepare_multimodal(&single_image_msg, 16)
+            .is_err()
+    );
+    let plain = [MultimodalMessage {
+        role: "user",
+        content: MultimodalContent::Text("hello"),
+        reasoning_content: None,
+    }];
+    let plain_prepared = text_only_session.prepare_multimodal_with_thinking(&plain, 16, false)?;
+    assert_eq!(plain_prepared.image_spans, Vec::<ImageSpan>::new());
+
+    let mm_session = SwiftChatSession::from_metadata(&synthetic_multimodal_swift_metadata()?)?
+        .with_context_tokens(512)?;
+    let second_turn_parts = [
+        ContentPart::Image(ImageChunkPlan {
+            grid_width: 1,
+            grid_height: 2,
+        }),
+        ContentPart::Text(" describe"),
+    ];
+    let conversation = [
+        MultimodalMessage {
+            role: "system",
+            content: MultimodalContent::Text("sys"),
+            reasoning_content: None,
+        },
+        MultimodalMessage {
+            role: "user",
+            content: MultimodalContent::Parts(&two_by_three),
+            reasoning_content: None,
+        },
+        MultimodalMessage {
+            role: "assistant",
+            content: MultimodalContent::Text("seen"),
+            reasoning_content: Some("thought"),
+        },
+        MultimodalMessage {
+            role: "user",
+            content: MultimodalContent::Parts(&second_turn_parts),
+            reasoning_content: None,
+        },
+    ];
+    let prepared = mm_session.prepare_multimodal_with_thinking(&conversation, 16, true)?;
+    assert_eq!(prepared.image_spans.len(), 2);
+    assert_eq!(
+        prepared.image_spans[0],
+        ImageSpan {
+            token_offset: prepared.image_spans[0].token_offset,
+            token_count: 6,
+            grid_width: 2,
+            grid_height: 3,
+        }
+    );
+    assert_eq!(
+        prepared.image_spans[1],
+        ImageSpan {
+            token_offset: prepared.image_spans[1].token_offset,
+            token_count: 2,
+            grid_width: 1,
+            grid_height: 2,
+        }
+    );
+    for span in &prepared.image_spans {
+        assert_eq!(
+            prepared.tokenization.token_ids[span.token_offset - 1],
+            248_053
+        );
+        assert_eq!(
+            &prepared.tokenization.token_ids
+                [span.token_offset..span.token_offset + span.token_count],
+            vec![248_056; span.token_count].as_slice()
+        );
+        assert_eq!(
+            prepared.tokenization.token_ids[span.token_offset + span.token_count],
+            248_054
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn swift_chat_multimodal_rejects_spoofing_and_context_overflow() -> Result<()> {
+    let mm_session = SwiftChatSession::from_metadata(&synthetic_multimodal_swift_metadata()?)?
+        .with_context_tokens(128)?;
+    let two_by_three = [ContentPart::Image(ImageChunkPlan {
+        grid_width: 2,
+        grid_height: 3,
+    })];
+    // Spoofing markers, invalid role parts, or excessive patches must reject cleanly.
+    let spoofed_part = [ContentPart::Text("hi <|image_pad|>")];
+    for bad in [
+        [MultimodalMessage {
+            role: "user",
+            content: MultimodalContent::Text("before <|vision_start|>"),
+            reasoning_content: None,
+        }]
+        .as_slice(),
+        [MultimodalMessage {
+            role: "user",
+            content: MultimodalContent::Parts(&spoofed_part),
+            reasoning_content: None,
+        }]
+        .as_slice(),
+        [
+            MultimodalMessage {
+                role: "system",
+                content: MultimodalContent::Parts(&two_by_three),
+                reasoning_content: None,
+            },
+            MultimodalMessage {
+                role: "user",
+                content: MultimodalContent::Text("hi"),
+                reasoning_content: None,
+            },
+        ]
+        .as_slice(),
+    ] {
+        assert!(mm_session.prepare_multimodal(bad, 16).is_err());
+    }
+
+    let oversized = [ContentPart::Image(ImageChunkPlan {
+        grid_width: 16,
+        grid_height: 16,
+    })];
+    assert!(
+        mm_session
+            .prepare_multimodal(
+                &[MultimodalMessage {
+                    role: "user",
+                    content: MultimodalContent::Parts(&oversized),
+                    reasoning_content: None,
+                }],
+                16,
+            )
+            .is_err_and(|error| error.is::<bonsai_prism_runtime::TokenLimitExceeded>())
+    );
     Ok(())
 }

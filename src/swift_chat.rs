@@ -32,6 +32,11 @@ const NATIVE_STOPS: [(u32, &str); 5] = [
     (248_065, "<|file_sep|>"),
 ];
 const NATIVE_STOP_IDS: [u32; 5] = [248_044, 248_046, 248_063, 248_064, 248_065];
+const VISION_START_MARKER: &str = "<|vision_start|>";
+const VISION_END_MARKER: &str = "<|vision_end|>";
+const IMAGE_PAD_MARKER: &str = "<|image_pad|>";
+const VIDEO_PAD_MARKER: &str = "<|video_pad|>";
+const IMAGE_RENDERED_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 /// Legacy default prompt-plus-output capacity for fixed Swift qualification callers.
 pub const CONTEXT_TOKENS: usize = 8192;
 /// Largest complete output allowance, including every reasoning token.
@@ -40,6 +45,83 @@ pub const MAX_OUTPUT_TOKENS: usize = 4096;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Largest number of supplied text chat messages, including a system message.
 pub const MAX_MESSAGES: usize = 128;
+
+/// Planned 2D vision patch grid for one image placeholder in a Swift prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageChunkPlan {
+    /// Merged patch columns (`width_patches`).
+    pub grid_width: usize,
+    /// Merged patch rows (`height_patches`).
+    pub grid_height: usize,
+}
+
+impl ImageChunkPlan {
+    /// Total merged visual patch tokens (`grid_width * grid_height`).
+    ///
+    /// # Errors
+    /// Rejects zero dimensions or arithmetic overflow.
+    pub fn patch_count(self) -> Result<usize> {
+        if self.grid_width == 0 || self.grid_height == 0 {
+            return Err(invalid("Swift image grid dimensions must be nonzero"));
+        }
+        self.grid_width
+            .checked_mul(self.grid_height)
+            .ok_or_else(|| invalid("Swift image patch count overflow"))
+    }
+}
+
+/// One ordered content part inside a multimodal `user` turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentPart<'a> {
+    /// Ordinary UTF-8 text part.
+    Text(&'a str),
+    /// Planned image part expanded to `<|vision_start|>`, `nx * ny` pads, and `<|vision_end|>`.
+    Image(ImageChunkPlan),
+}
+
+/// Message payload for multimodal Swift prompt preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MultimodalContent<'a> {
+    /// Plain text string message content.
+    Text(&'a str),
+    /// Ordered sequence of text and image parts (`user` turns only).
+    Parts(&'a [ContentPart<'a>]),
+}
+
+/// Borrowed multimodal message matching the pinned Swift chat contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MultimodalMessage<'a> {
+    /// Turn role: `"system"` (leading only), `"user"`, or `"assistant"`.
+    pub role: &'a str,
+    /// Plain text or `user` multipart content.
+    pub content: MultimodalContent<'a>,
+    /// Optional preserved reasoning text on `"assistant"` turns only.
+    pub reasoning_content: Option<&'a str>,
+}
+
+/// Exact `<|image_pad|>` token range and spatial grid for one image in a prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageSpan {
+    /// Index of the first `<|image_pad|>` token inside [`TokenizationResult::token_ids`].
+    pub token_offset: usize,
+    /// Number of `<|image_pad|>` tokens (`grid_width * grid_height`).
+    pub token_count: usize,
+    /// Merged patch columns (`grid_width`).
+    pub grid_width: usize,
+    /// Merged patch rows (`grid_height`).
+    pub grid_height: usize,
+}
+
+/// Exact rendered multimodal prompt, expanded token IDs and image spans.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedMultimodalPrompt {
+    /// Exact UTF-8 bytes rendered by the verified embedded template.
+    pub rendered: String,
+    /// Complete prompt IDs with `<|image_pad|>` expanded per grid and context/output accounting.
+    pub tokenization: TokenizationResult,
+    /// Non-overlapping `<|image_pad|>` ranges in prompt order.
+    pub image_spans: Vec<ImageSpan>,
+}
 
 /// Exact rendered prompt and the token IDs that passed full output reservation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -351,6 +433,242 @@ impl SwiftChatSession {
             tokenization,
         })
     }
+
+    /// Render, expand visual patch placeholders and reserve output before any graph execution.
+    ///
+    /// # Errors
+    /// Rejects unsupported message shapes/roles, injected vision control markers,
+    /// zero/overflowing image grids, missing vision vocabulary tokens, template
+    /// errors, output bounds outside 1 through 4096, and context overflow
+    /// ([`crate::TokenLimitExceeded`]).
+    pub fn prepare_multimodal(
+        &self,
+        messages: &[MultimodalMessage<'_>],
+        reserved_output_tokens: usize,
+    ) -> Result<PreparedMultimodalPrompt> {
+        self.prepare_multimodal_with_thinking(messages, reserved_output_tokens, true)
+    }
+
+    /// Render multimodal messages with the selected thinking mode and reserve output.
+    ///
+    /// # Errors
+    /// Returns the same validation, vocabulary, template and token-budget errors as
+    /// [`Self::prepare_multimodal`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep multimodal message validation, marker expansion and exact TokenLimitExceeded accounting in one auditable sequence."
+    )]
+    pub fn prepare_multimodal_with_thinking(
+        &self,
+        messages: &[MultimodalMessage<'_>],
+        reserved_output_tokens: usize,
+        enable_thinking: bool,
+    ) -> Result<PreparedMultimodalPrompt> {
+        let budget = output_budget(reserved_output_tokens, self.context_tokens)?;
+        let prompt_limit = budget.prompt_token_limit()?;
+        if messages.is_empty() || messages.len() > MAX_MESSAGES {
+            return Err(invalid("Swift message count exceeds supported bounds"));
+        }
+        let mut supplied_bytes = 0_usize;
+        let mut image_plans = Vec::new();
+        let mut json_messages = Vec::with_capacity(messages.len());
+        for (index, message) in messages.iter().enumerate() {
+            if !(matches!(message.role, "user" | "assistant")
+                || message.role == "system" && index == 0)
+            {
+                return Err(invalid("unsupported Swift message role"));
+            }
+            if message.reasoning_content.is_some() && message.role != "assistant" {
+                return Err(invalid(
+                    "Swift reasoning history requires an assistant turn",
+                ));
+            }
+            let content_value = match message.content {
+                MultimodalContent::Text(text) => {
+                    reject_vision_control_markers(text)?;
+                    supplied_bytes = supplied_bytes
+                        .checked_add(text.len())
+                        .ok_or_else(|| invalid("Swift message byte bound exceeded"))?;
+                    Value::String(text.to_owned())
+                }
+                MultimodalContent::Parts(parts) => {
+                    if message.role != "user" {
+                        return Err(invalid(
+                            "multimodal content parts are only allowed on user turns",
+                        ));
+                    }
+                    let mut json_parts = Vec::with_capacity(parts.len());
+                    for part in parts {
+                        match *part {
+                            ContentPart::Text(text) => {
+                                reject_vision_control_markers(text)?;
+                                supplied_bytes = supplied_bytes
+                                    .checked_add(text.len())
+                                    .ok_or_else(|| invalid("Swift message byte bound exceeded"))?;
+                                json_parts.push(json!({"type": "text", "text": text}));
+                            }
+                            ContentPart::Image(plan) => {
+                                let _ = plan.patch_count()?;
+                                image_plans.push(plan);
+                                json_parts.push(json!({"type": "image"}));
+                            }
+                        }
+                    }
+                    Value::Array(json_parts)
+                }
+            };
+            let mut object = serde_json::Map::new();
+            object.insert("role".to_owned(), Value::String(message.role.to_owned()));
+            object.insert("content".to_owned(), content_value);
+            if let Some(reasoning) = message.reasoning_content {
+                reject_vision_control_markers(reasoning)?;
+                supplied_bytes = supplied_bytes
+                    .checked_add(reasoning.len())
+                    .ok_or_else(|| invalid("Swift message byte bound exceeded"))?;
+                object.insert(
+                    "reasoning_content".to_owned(),
+                    Value::String(reasoning.to_owned()),
+                );
+            }
+            if supplied_bytes > MAX_MESSAGE_BYTES {
+                return Err(invalid("Swift message byte bound exceeded"));
+            }
+            json_messages.push(Value::Object(object));
+        }
+        if messages.last().map(|message| message.role) != Some("user") {
+            return Err(invalid("Swift chat generation requires a final user turn"));
+        }
+        let rendered = self.template.render_json(
+            Value::Array(json_messages),
+            true,
+            &json!({"enable_thinking": enable_thinking, "reasoning_effort": "xhigh", "preserve_thinking": true}),
+        )?;
+        if image_plans.is_empty() {
+            let tokenization = self.tokenization.encode(
+                &rendered,
+                TextTokenizationPolicy {
+                    special_input: SpecialInputPolicy::Parse,
+                    insert_special: SpecialTokenInsertion::None,
+                    budget,
+                },
+            )?;
+            return Ok(PreparedMultimodalPrompt {
+                rendered,
+                tokenization,
+                image_spans: Vec::new(),
+            });
+        }
+        let (vision_start_id, image_pad_id, vision_end_id) = self.resolve_vision_tokens()?;
+        let segments: Vec<&str> = rendered.split(IMAGE_RENDERED_MARKER).collect();
+        if segments.len() != image_plans.len() + 1 {
+            return Err(invalid("rendered multimodal image placeholder mismatch"));
+        }
+        let mut token_ids = Vec::new();
+        let mut image_spans = Vec::with_capacity(image_plans.len());
+        for (idx, segment) in segments.iter().enumerate() {
+            if !segment.is_empty() {
+                let remaining = prompt_limit.saturating_sub(token_ids.len());
+                if remaining == 0 {
+                    return Err(Box::new(crate::TokenLimitExceeded));
+                }
+                let seg_budget = TokenBudget {
+                    context: self.context_tokens,
+                    reserved_output_tokens: self.context_tokens - remaining,
+                };
+                let encoded = self.tokenization.encode(
+                    segment,
+                    TextTokenizationPolicy {
+                        special_input: SpecialInputPolicy::Parse,
+                        insert_special: SpecialTokenInsertion::None,
+                        budget: seg_budget,
+                    },
+                )?;
+                token_ids.try_reserve(encoded.token_ids.len())?;
+                token_ids.extend_from_slice(&encoded.token_ids);
+            }
+            if let Some(&plan) = image_plans.get(idx) {
+                let patches = plan.patch_count()?;
+                let needed = 2_usize
+                    .checked_add(patches)
+                    .ok_or_else(|| invalid("image token span overflow"))?;
+                if token_ids
+                    .len()
+                    .checked_add(needed)
+                    .is_none_or(|total| total > prompt_limit)
+                {
+                    return Err(Box::new(crate::TokenLimitExceeded));
+                }
+                token_ids.try_reserve(needed)?;
+                token_ids.push(vision_start_id);
+                let token_offset = token_ids.len();
+                token_ids.resize(token_offset + patches, image_pad_id);
+                token_ids.push(vision_end_id);
+                image_spans.push(ImageSpan {
+                    token_offset,
+                    token_count: patches,
+                    grid_width: plan.grid_width,
+                    grid_height: plan.grid_height,
+                });
+            }
+        }
+        Ok(PreparedMultimodalPrompt {
+            rendered,
+            tokenization: TokenizationResult {
+                token_ids,
+                context: budget.context,
+                reserved_output_tokens: budget.reserved_output_tokens,
+            },
+            image_spans,
+        })
+    }
+
+    fn resolve_vision_tokens(&self) -> Result<(u32, u32, u32)> {
+        let vision_start = self.resolve_single_special_token(VISION_START_MARKER)?;
+        let image_pad = self.resolve_single_special_token(IMAGE_PAD_MARKER)?;
+        let vision_end = self.resolve_single_special_token(VISION_END_MARKER)?;
+        let _ = self.resolve_single_special_token(VIDEO_PAD_MARKER)?;
+        if vision_start == image_pad || image_pad == vision_end || vision_start == vision_end {
+            return Err(invalid("Swift vision control tokens must be distinct"));
+        }
+        Ok((vision_start, image_pad, vision_end))
+    }
+
+    fn resolve_single_special_token(&self, marker: &str) -> Result<u32> {
+        let encoded = self.tokenization.encode(
+            marker,
+            TextTokenizationPolicy {
+                special_input: SpecialInputPolicy::Parse,
+                insert_special: SpecialTokenInsertion::None,
+                budget: TokenBudget {
+                    context: self.context_tokens,
+                    reserved_output_tokens: 0,
+                },
+            },
+        )?;
+        match encoded.token_ids.as_slice() {
+            [token] => Ok(*token),
+            _ => Err(invalid(format!(
+                "Swift vocabulary lacks single control token for {marker}"
+            ))),
+        }
+    }
+}
+
+fn reject_vision_control_markers(text: &str) -> Result<()> {
+    if [
+        VISION_START_MARKER,
+        VISION_END_MARKER,
+        IMAGE_PAD_MARKER,
+        VIDEO_PAD_MARKER,
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return Err(invalid(
+            "Swift message text must not contain vision control markers",
+        ));
+    }
+    Ok(())
 }
 
 fn output_budget(reserved_output_tokens: usize, context_tokens: usize) -> Result<TokenBudget> {
@@ -394,6 +712,7 @@ pub(crate) fn validate_messages(messages: &Value) -> Result<()> {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("Swift message content must be text"))?;
+        reject_vision_control_markers(content)?;
         supplied_bytes = supplied_bytes
             .checked_add(content.len())
             .ok_or_else(|| invalid("Swift message byte bound exceeded"))?;
@@ -406,6 +725,7 @@ pub(crate) fn validate_messages(messages: &Value) -> Result<()> {
             let reasoning = reasoning
                 .as_str()
                 .ok_or_else(|| invalid("Swift reasoning history must be text"))?;
+            reject_vision_control_markers(reasoning)?;
             supplied_bytes = supplied_bytes
                 .checked_add(reasoning.len())
                 .ok_or_else(|| invalid("Swift message byte bound exceeded"))?;
@@ -427,7 +747,10 @@ pub(crate) fn validate_messages(messages: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MESSAGE_BYTES, output_budget, validate_messages};
+    use super::{
+        ImageChunkPlan, MAX_MESSAGE_BYTES, output_budget, reject_vision_control_markers,
+        validate_messages,
+    };
     use serde_json::json;
 
     #[test]
@@ -447,13 +770,48 @@ mod tests {
     }
 
     #[test]
-    fn swift_chat_rejects_unsupported_shapes_before_rendering() {
+    fn swift_chat_rejects_unsupported_shapes_and_vision_markers_before_rendering() {
+        for marker in [
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+        ] {
+            assert!(reject_vision_control_markers(&format!("prefix {marker} suffix")).is_err());
+        }
+        assert!(
+            ImageChunkPlan {
+                grid_width: 0,
+                grid_height: 2
+            }
+            .patch_count()
+            .is_err()
+        );
+        assert!(
+            ImageChunkPlan {
+                grid_width: 2,
+                grid_height: 0
+            }
+            .patch_count()
+            .is_err()
+        );
+        assert_eq!(
+            ImageChunkPlan {
+                grid_width: 3,
+                grid_height: 4
+            }
+            .patch_count()
+            .ok(),
+            Some(12)
+        );
         for messages in [
             json!([]),
             json!({}),
             json!([{"role":"assistant","content":"answer"}]),
             json!([{"role":"user","content":"q","reasoning_content":"r"}]),
             json!([{"role":"user","content":[{"type":"text","text":"q"}]}]),
+            json!([{"role":"user","content":"<|vision_start|><|image_pad|><|vision_end|>"}]),
+            json!([{"role":"user","content":"q"},{"role":"assistant","content":"a","reasoning_content":"<|image_pad|>"},{"role":"user","content":"next"}]),
             json!([{"role":"user","content":"q","tools":[]}]),
             json!([{"role":"tool","content":"q"}]),
             json!([{"role":"user","content":"q"},{"role":"system","content":"s"}]),

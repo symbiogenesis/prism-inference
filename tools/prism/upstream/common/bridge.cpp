@@ -8,6 +8,13 @@
 #include "grammar.hpp"
 #include "codec.hpp"
 #include "peg.hpp"
+// MTMD publishes its own logging macros; later common headers include log.h.
+#undef LOG_DBG
+#undef LOG_TRC
+#undef LOG_INF
+#undef LOG_WRN
+#undef LOG_ERR
+#undef LOG_CNT
 #include "arena_graph.hpp"
 #include "batch_allocator.hpp"
 #include "allocation.hpp"

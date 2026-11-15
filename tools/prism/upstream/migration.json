@@ -518,7 +518,7 @@
       "SourceSha256": "099680dac156e3289db96ad1143973271205d27b878ea07661097fa9eba699eb",
       "Category": "model-free",
       "Needs": [
-        "ggml CPU/backend graph and explicit layout placement APIs"
+        "independent clean-room arena-graph reference provider (reference_arena_graph.rs)"
       ],
       "AssertionsToPort": "48 combinations layouts none/W-in-dst/X-in-dst xexperts2/4/8/15 xembd64/66 xtokens1/7; bitwise CPU reference; status and overlap/alias placement.",
       "LegacyReferenceRequired": true,

@@ -317,3 +317,16 @@ Ordinary `cpp` and `rust-reference` selections disclose
 The `#include "unicode.h"` header include and top-level `unicode-*` dispatch
 in `common/bridge.cpp` are removed (31 checked-in C++ files remain across the
 bridge snapshot). Selecting `test-unicode` alone needs no native common bridge.
+
+## Retired arena-graph native provider
+
+`--target rust-reference --case test-moe-weighted-reduce` runs all 48 source
+geometries/layouts across manual `W_IN_DST` / `X_IN_DST` aliased and plain
+reference graphs through `tests/upstream_prism/reference_arena_graph.rs` using
+an independent flat byte-arena evaluator, without calling `bonsai_prism_runtime`
+or any native bridge. Ordinary `cpp` and `rust-reference` selections disclose
+`nativeReferenceReplay=false`.
+
+`common/arena_graph.hpp`, its include/dispatch and its CMake build edge are
+removed (leaving 30 checked-in C++ files across the bridge snapshot). Selecting
+`test-moe-weighted-reduce` alone needs no native common bridge.

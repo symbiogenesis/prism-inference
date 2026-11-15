@@ -188,7 +188,7 @@ $adapters = @{
     QuantizeStats = @{ Name = 'test-quantize-stats'; Family = 'common' }
     PtqCuda = @{ Name = 'test-ptq1_0-cuda-dot'; Family = 'common' }
     Log = @{ Name = 'test-log'; Family = 'common' }
-    MoeReduce = @{ Name = 'test-moe-weighted-reduce'; Family = 'common' }
+    MoeReduce = @{ Name = 'test-moe-weighted-reduce'; Family = 'independent' }
     PegBasic = @{ Name = 'peg-basic'; Id = 'tests/peg-parser/test-basic.cpp'; Family = 'common' }
     PegGbnf = @{ Name = 'peg-gbnf'; Id = 'tests/peg-parser/test-gbnf-generation.cpp'; Family = 'common' }
     PegJson = @{ Name = 'peg-json'; Id = 'tests/peg-parser/test-json-parser.cpp'; Family = 'common' }

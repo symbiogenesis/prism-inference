@@ -229,11 +229,16 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     if count != 48 {
         return Err(invalid("MoE source case count drifted"));
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-arena-graph; nativeReferenceReplay=false"
+    };
     Ok(result(
         ID,
         failed.is_empty(),
         format!(
-            "All 48 source geometries/layouts executed against a plain production CPU reference with bitwise comparisons; manual W_IN_DST and X_IN_DST overlaps retained. CPU fallback only; CUDA fusion unqualified. failed={}: {}",
+            "provider={provider}; All 48 source geometries/layouts executed against a plain reference with bitwise comparisons; manual W_IN_DST and X_IN_DST overlaps retained. CPU fallback only; CUDA fusion unqualified. failed={}: {}",
             failed.len(),
             failed.join("; ")
         ),

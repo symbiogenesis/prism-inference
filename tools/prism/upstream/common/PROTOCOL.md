@@ -307,15 +307,11 @@ output-content parity; the original source has no content assertions.
 
 ## CPU arena placement transport
 
-`cpu-buffer-info` takes only `Kind` and returns production CPU buffer `Alignment`.
-`cpu-arena-graph` takes `Kind`, `Graph`, `Forward`, `Allocation`. Graph is the
-existing tensor-graph descriptor, restricted to F32 input, multiply, add and 2-D
-views. Forward supplies explicit graph expansion indices. Allocation is null for
-the production context allocator, or `{BufferBytes,Offsets}` for manual placement;
-view offsets are null, deriving storage from their source. Offsets and extents
-must fit the supplied buffer and meet the actual backend alignment.
-The result is raw production `Status` and output `DataHex` values. CPU thread
-count comes from Graph; the pinned CPU backend defaults to four threads.
+This adapter (`common/arena_graph.hpp`) is retired from the native bridge. The ordinary `cpp`
+reference selector and explicit `rust-reference` selection route `cpu-buffer-info` and
+`cpu-arena-graph` to `tests/upstream_prism/reference_arena_graph.rs` with
+`nativeReferenceReplay=false`. Direct native `cpu-buffer-info` and `cpu-arena-graph` requests
+reject.
 
 ## Generic batch allocator trace
 

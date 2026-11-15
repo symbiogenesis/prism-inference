@@ -356,16 +356,13 @@ mod tests {
                     .map(|values| values.map(f32::to_bits)),
                 expected_unfused.map(|values| values.map(f32::to_bits))
             );
-            let prepared = detected.prepare_scaled(&activation);
-            assert!(prepared.is_some());
-            if let Some(prepared) = prepared {
-                assert_eq!(
-                    prepared
-                        .dot_scaled_rows::<16, true>(refs)
-                        .map(|values| values.map(f32::to_bits)),
-                    expected_fused.map(|values| values.map(f32::to_bits))
-                );
-            }
+            assert_eq!(
+                detected
+                    .prepare_scaled(&activation)
+                    .and_then(|prepared| prepared.dot_scaled_rows::<16, true>(refs))
+                    .map(|values| values.map(f32::to_bits)),
+                expected_fused.map(|values| values.map(f32::to_bits))
+            );
             for (row, &bytes) in refs.iter().enumerate() {
                 assert_eq!(
                     detected

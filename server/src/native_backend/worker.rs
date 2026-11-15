@@ -474,12 +474,6 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
         return None;
     }
     let package_dir = discover_hexagon_package_directory()?;
-    let mut driver = hexagon_native_rpc::Driver::open_system().ok()?;
-    let arch = driver
-        .capability(hexagon_native_rpc::Capability::Architecture)
-        .ok()
-        .and_then(hexagon_native_rpc::decode_architecture)
-        .unwrap_or(81);
     let mut limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
         hexagon_native_rpc::NATIVE_Q2_MAX_COLUMNS,
         hexagon_native_rpc::NATIVE_Q2_MAX_ROWS,
@@ -492,10 +486,18 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
     })
     .map(hexagon_native_rpc::NativeQ2ProjectionLimits::with_persistent_session)
     .ok()?;
-    if arch == 73 {
-        limits = limits.with_partial_secondary_arenas();
-    }
-    let q2_session = driver.open_native_q2_session(&package_dir, limits).ok()?;
+    let q2_session = {
+        let mut driver = hexagon_native_rpc::Driver::open_system().ok()?;
+        let arch = driver
+            .capability(hexagon_native_rpc::Capability::Architecture)
+            .ok()
+            .and_then(hexagon_native_rpc::decode_architecture)
+            .unwrap_or(81);
+        if arch == 73 {
+            limits = limits.with_partial_secondary_arenas();
+        }
+        driver.open_native_q2_session(&package_dir, limits).ok()?
+    };
     let mut executor =
         bonsai_hexagon_runtime::NativeQ2Executor::new(q2_session, limits, 64 * 1024 * 1024)
             .with_row_parallelism(session.clone_row_parallelism())

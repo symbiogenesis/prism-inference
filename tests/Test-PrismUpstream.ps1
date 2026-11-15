@@ -177,9 +177,9 @@ $adapters = @{
     MtmdImpl = @{ Name = 'test-mtmd-impl'; Family = 'common' }
     GrammarParser = @{ Name = 'test-grammar-parser'; Family = 'independent' }
     ReasoningBudget = @{ Name = 'test-reasoning-budget'; Family = 'common' }
-    Col2im = @{ Name = 'test-col2im-1d'; Family = 'common' }
-    Dfly = @{ Name = 'test-dfly-fusion'; Family = 'common' }
-    Rope = @{ Name = 'test-rope'; Family = 'common' }
+    Col2im = @{ Name = 'test-col2im-1d'; Family = 'independent' }
+    Dfly = @{ Name = 'test-dfly-fusion'; Family = 'independent' }
+    Rope = @{ Name = 'test-rope'; Family = 'independent' }
     LlamaGrammar = @{ Name = 'test-llama-grammar'; Family = 'common' }
     LlGuidance = @{ Name = 'test-grammar-llguidance'; Family = 'common' }
     GrammarIntegration = @{ Name = 'test-grammar-integration'; Family = 'common' }

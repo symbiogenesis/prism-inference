@@ -330,3 +330,18 @@ or any native bridge. Ordinary `cpp` and `rust-reference` selections disclose
 `common/arena_graph.hpp`, its include/dispatch and its CMake build edge are
 removed (leaving 30 checked-in C++ files across the bridge snapshot). Selecting
 `test-moe-weighted-reduce` alone needs no native common bridge.
+
+## Retired tensor-graph native provider
+
+`--target rust-reference` supports `test-col2im-1d`, `test-dfly-fusion` and
+`test-rope` through `tests/upstream_prism/reference_tensor_graph.rs` using an
+independent strided tensor-graph evaluator (covering `F32`/`F16`/`BF16` RNE
+conversions, `col2im_1d`, `conv_transpose_1d`, `rms_norm`, `soft_max`, `mul_mat`,
+`view_2d` and normal/NeoX/MRoPE/vision/IMRoPE rotations), without calling
+`bonsai_prism_runtime` or any native bridge. Ordinary `cpp` and
+`rust-reference` selections disclose `nativeReferenceReplay=false`.
+
+`common/tensor_graph.hpp`, its include/dispatch and its CMake build edge are
+removed (leaving 29 checked-in C++ files across the bridge snapshot). Selecting
+`test-col2im-1d`, `test-dfly-fusion` or `test-rope` alone needs no native
+common bridge.

@@ -234,7 +234,7 @@
       "SourceSha256": "8b0b9fec8a5f7177722060fccfa67ddcd4b1073c833e1511bc4106b03f6c8323",
       "Category": "model-free",
       "Needs": [
-        "ggml graph calls and F32/F16/BF16 conversion"
+        "independent clean-room tensor-graph reference provider (reference_tensor_graph.rs)"
       ],
       "AssertionsToPort": "11 original geometries with IC7; cropped overlap/gap/single-column outputs; NMSE <=1e-7 F32 and <=5e-4 F16/BF16; exact output shapes.",
       "LegacyReferenceRequired": true,
@@ -245,7 +245,7 @@
       "SourceSha256": "504161d9c3ec6f5ca621b12dc952b5a9cc2e631edb4ad225132b219057eb1fdd",
       "Category": "model-free",
       "Needs": [
-        "ggml graph softmax/matmul/rms/view/permutation calls"
+        "independent clean-room tensor-graph reference provider (reference_tensor_graph.rs)"
       ],
       "AssertionsToPort": "Non-square embd8 feat5 layer3 tokens4; independent weighted/base/RMS reference; full and layer1 slice abs error <1e-4; per-layer separation >1e-3.",
       "LegacyReferenceRequired": true,
@@ -697,7 +697,7 @@
       "SourceSha256": "cca4b2a3acbce6c410ec808f1cf263b191aea2c7a3b5df6d14b17c6be13871df",
       "Category": "model-free",
       "Needs": [
-        "ggml RoPE normal/NeoX/MRoPE/vision/IMRoPE graph APIs"
+        "independent clean-room tensor-graph reference provider (reference_tensor_graph.rs)"
       ],
       "AssertionsToPort": "All5 modes with exact original shape/positions/sections; compose +100 then -67 equals +33; both relative L1 errors<1e-4.",
       "LegacyReferenceRequired": true,

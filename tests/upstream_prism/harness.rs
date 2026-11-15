@@ -100,6 +100,7 @@ mod reference_mtmd_chunks;
 mod reference_provider;
 mod reference_quantization;
 mod reference_reasoning;
+mod reference_tensor_graph;
 mod reference_threadpool;
 mod reference_unicode;
 mod schema_python;
@@ -514,19 +515,19 @@ const CASES: &[Case] = &[
     register(
         "test-col2im-1d",
         "tests/test-col2im-1d.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         numerics::run_col2im,
     ),
     register(
         "test-dfly-fusion",
         "tests/test-dfly-fusion.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         numerics::run_dfly,
     ),
     register(
         "test-rope",
         "tests/test-rope.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         numerics::run_rope,
     ),
     register(

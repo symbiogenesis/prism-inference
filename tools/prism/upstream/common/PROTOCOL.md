@@ -169,26 +169,10 @@ transport rejects reset rather than claiming additional source coverage.
 
 ## Generic tensor graphs
 
-`tensor-graph` takes exact fields `Kind`, `Threads` (1 through 16), `Nodes`
-(1 through 96) and `Outputs` (1 through 16 prior node indices). An input node is
-`{"Op":"input","Type":"F32"|"I32","Dimensions":[...],"DataHex":"..."}`.
-Dimensions number 1 through 4, each 1 through 8,192, with at most 2,097,152
-elements per tensor. Raw bytes are little-endian hex in ggml storage order and
-must match the shape and type exactly. F32 inputs must contain finite values.
-
-Other nodes take `Op` and `Inputs` (prior node indices), plus the exact operation
-parameters accepted in `tensor_graph.hpp`. Supported production operations are
-`cont`, `transpose`, `soft_max`, `permute`, `reshape`, `cast`, `mul_mat`, `add`,
-`mul`, `rms_norm`, `view_2d`, `conv_transpose_1d`, `col2im_1d`, `rope` and
-`rope_multi`. Cast outputs additionally support F16 and BF16. Shape, type,
-broadcast, view extent and operation parameter validity are checked before any
-ggml graph is constructed.
-
-The adapter allocates a 128 MiB ggml context, with a conservative cumulative
-storage estimate capped at 96 MiB, then executes the graph using the supplied
-thread count. The response is `{"Outputs":[{"Type":"...","Dimensions":[four
-padded dimensions],"DataHex":"..."}]}` in requested output order. Outputs must
-be contiguous, and their combined hex data is limited to 15 MiB.
+This adapter (`common/tensor_graph.hpp`) is retired from the native bridge. The ordinary `cpp`
+reference selector and explicit `rust-reference` selection route `tensor-graph` to
+`tests/upstream_prism/reference_tensor_graph.rs` with `nativeReferenceReplay=false`. Direct native
+`tensor-graph` requests reject.
 
 ## Generic stateful grammar operations
 

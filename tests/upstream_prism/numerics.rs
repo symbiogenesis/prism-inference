@@ -339,11 +339,16 @@ pub(super) fn run_col2im(engine: &Engine) -> Result<Value> {
             }
         }
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-tensor-graph; nativeReferenceReplay=false"
+    };
     Ok(result(
         COL2IM_ID,
         failures.is_empty(),
         format!(
-            "11 original geometries x F32/F16/BF16; cropped NMSE <=1e-7/5e-4/5e-4; failed={}; {}",
+            "provider={provider}; 11 original geometries x F32/F16/BF16; cropped NMSE <=1e-7/5e-4/5e-4; failed={}; {}",
             failures.len(),
             failures.join("; ")
         ),
@@ -470,11 +475,16 @@ pub(super) fn run_dfly(engine: &Engine) -> Result<Value> {
             minimum_separation = minimum_separation.min(squared.sqrt());
         }
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-tensor-graph; nativeReferenceReplay=false"
+    };
     Ok(result(
         DFLY_ID,
         maximum < 1e-4 && slice_error < 1e-4 && minimum_separation > 1e-3,
         format!(
-            "3 original contracts; embd8/feat5/layer3/token4; max_abs={maximum}; layer1_slice_abs={slice_error}; min_layer_separation={minimum_separation}"
+            "provider={provider}; 3 original contracts; embd8/feat5/layer3/token4; max_abs={maximum}; layer1_slice_abs={slice_error}; min_layer_separation={minimum_separation}"
         ),
     ))
 }
@@ -547,11 +557,16 @@ pub(super) fn run_rope(engine: &Engine) -> Result<Value> {
             }
         }
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-tensor-graph; nativeReferenceReplay=false"
+    };
     Ok(result(
         ROPE_ID,
         failures.is_empty(),
         format!(
-            "5 original modes 0/2/8/24/40; full 256x32x73x1; 10 relative-L1 assertions <0.0001f; failed={}; {}",
+            "provider={provider}; 5 original modes 0/2/8/24/40; full 256x32x73x1; 10 relative-L1 assertions <0.0001f; failed={}; {}",
             failures.len(),
             failures.join("; ")
         ),

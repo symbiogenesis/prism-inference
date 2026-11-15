@@ -1,7 +1,6 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
 #include "jinja.hpp"
-#include "tensor_graph.hpp"
 #include "grammar.hpp"
 #include "codec.hpp"
 #include "peg.hpp"
@@ -110,8 +109,6 @@ void validate_operation(const wire_json & operation) {
         require_keys(operation, {"Kind"});
     } else if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
-    } else if (prism_tensor_graph::handles(kind)) {
-        prism_tensor_graph::validate(operation);
     } else if (prism_grammar::handles(kind)) {
         prism_grammar::validate(operation);
     } else if (prism_codec::handles(kind)) {
@@ -161,9 +158,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_jinja::handles(kind)) {
         return prism_jinja::execute(operation);
-    }
-    if (prism_tensor_graph::handles(kind)) {
-        return prism_tensor_graph::execute(operation);
     }
     if (prism_grammar::handles(kind)) {
         return prism_grammar::execute(operation);

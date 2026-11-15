@@ -36,6 +36,27 @@ struct Config {
     capacity: Option<(usize, u64)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuFamily {
+    X1,
+    X2,
+}
+
+impl CpuFamily {
+    const fn default_row_workers(self) -> usize {
+        match self {
+            Self::X1 => 8,
+            Self::X2 => 6,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpecType {
+    None,
+    Suffix,
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -52,12 +73,14 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut child = false;
     let (mut model, mut key, mut port, mut seed) = (None, None, None, None);
     let mut row_workers = None;
+    let mut cpu_family = None;
     let mut repacked_ptq1 = false;
     let mut adapter = None;
     let mut prompt_reuse = None;
     let mut kv_cache = None;
     let mut placement = None;
     let (mut prefill_tokens, mut prefill_scratch) = (None, None);
+    let (mut spec_type, mut draft_max) = (None, None);
     let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) =
         (None, None, None);
     let (mut context_tokens, mut memory_limit_bytes) = (None, None);
@@ -137,6 +160,21 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                     _ => return Err(invalid()),
                 });
             }
+            Some("--cpu-family") if cpu_family.is_none() => {
+                cpu_family = Some(match value.to_str() {
+                    Some("x1") => CpuFamily::X1,
+                    Some("x2") => CpuFamily::X2,
+                    _ => return Err(invalid()),
+                });
+            }
+            Some("--spec-type") if spec_type.is_none() => {
+                spec_type = Some(match value.to_str() {
+                    Some("none") => SpecType::None,
+                    Some("suffix") => SpecType::Suffix,
+                    _ => return Err(invalid()),
+                });
+            }
+            Some("--draft-max") if draft_max.is_none() => draft_max = Some(value),
             Some("--placement") if placement.is_none() => {
                 placement = Some(match value.to_str() {
                     Some("auto") => Placement::Auto,
@@ -153,7 +191,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         key: key.ok_or_else(invalid)?,
         port: port.filter(|&n| n >= 1024).ok_or_else(invalid)?,
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
-        row_workers: row_workers.unwrap_or(1),
+        row_workers: row_workers
+            .unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers)),
         representation: if repacked_ptq1 {
             Representation::CurrentRepackedPtq1
         } else {
@@ -163,7 +202,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
         cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch)?,
-        cpu_speculation: parse_speculation(
+        cpu_speculation: resolve_speculation(
+            spec_type,
+            draft_max,
             speculative_tokens,
             verification_scratch,
             speculative_checkpoint,
@@ -203,6 +244,43 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         validate_read_path(path)?;
     }
     Ok(config)
+}
+
+fn resolve_speculation(
+    spec_type: Option<SpecType>,
+    draft_max: Option<OsString>,
+    speculative_tokens: Option<OsString>,
+    verification_scratch: Option<OsString>,
+    speculative_checkpoint: Option<OsString>,
+) -> io::Result<Option<CpuSpeculation>> {
+    if draft_max.is_some() && speculative_tokens.is_some() {
+        return Err(invalid());
+    }
+    if draft_max.is_some() && spec_type != Some(SpecType::Suffix) {
+        return Err(invalid());
+    }
+    match spec_type {
+        Some(SpecType::None) => {
+            if speculative_tokens.is_some()
+                || verification_scratch.is_some()
+                || speculative_checkpoint.is_some()
+            {
+                return Err(invalid());
+            }
+            Ok(None)
+        }
+        Some(SpecType::Suffix) => {
+            let tokens = draft_max
+                .or(speculative_tokens)
+                .unwrap_or_else(|| OsString::from("4"));
+            parse_speculation(Some(tokens), verification_scratch, speculative_checkpoint)
+        }
+        None => parse_speculation(
+            speculative_tokens,
+            verification_scratch,
+            speculative_checkpoint,
+        ),
+    }
 }
 
 fn parse_prefill(
@@ -989,6 +1067,96 @@ mod tests {
             selected.extend(["--kv-cache", name].map(OsString::from));
             assert!(parse(selected).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_cpu_family_and_spec_type_flags_enforce_bounds_and_defaults() -> io::Result<()> {
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        for (family, expected_workers) in [("x1", 8_usize), ("x2", 6_usize)] {
+            let mut family_only = base.clone();
+            family_only.extend(["--cpu-family", family].map(OsString::from));
+            let parsed = parse(family_only.clone());
+            assert_eq!(
+                parsed.as_ref().map(|config| config.row_workers).ok(),
+                cfg!(feature = "parallel-rows").then_some(expected_workers)
+            );
+            let mut overridden = family_only.clone();
+            overridden.extend(["--row-workers", "1"].map(OsString::from));
+            assert_eq!(parse(overridden)?.row_workers, 1);
+            family_only.extend(["--cpu-family", family].map(OsString::from));
+            assert!(parse(family_only).is_err());
+        }
+        for invalid_family in ["", "x3", "X1", "x2 "] {
+            let mut args = base.clone();
+            args.extend(["--cpu-family", invalid_family].map(OsString::from));
+            assert!(parse(args).is_err());
+        }
+
+        let mut none_args = base.clone();
+        none_args.extend(["--spec-type", "none"].map(OsString::from));
+        assert!(parse(none_args.clone())?.cpu_speculation.is_none());
+        for extra in [
+            vec!["--spec-type", "none"],
+            vec!["--draft-max", "4"],
+            vec!["--cpu-speculative-tokens", "4"],
+            vec!["--cpu-verification-scratch-bytes", "16777216"],
+            vec!["--cpu-speculative-checkpoint-bytes", "1073741824"],
+        ] {
+            let mut args = none_args.clone();
+            args.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(args).is_err());
+        }
+        let mut bare_draft = base;
+        bare_draft.extend(["--draft-max", "4"].map(OsString::from));
+        assert!(parse(bare_draft).is_err());
+
+        let (_dir2, spec_base, _memory) = speculation_arguments()?;
+        let logits = 16 * 1024 * 1024;
+        let checkpoint = bonsai_prism_runtime::swift_session::STATE_MEMORY_BYTES;
+        let mut suffix_default = spec_base;
+        suffix_default.extend([
+            "--spec-type".into(),
+            "suffix".into(),
+            "--cpu-verification-scratch-bytes".into(),
+            logits.to_string().into(),
+            "--cpu-speculative-checkpoint-bytes".into(),
+            checkpoint.to_string().into(),
+        ]);
+        let default_cfg = parse(suffix_default.clone())?;
+        assert_eq!(default_cfg.cpu_speculation.ok_or_else(invalid)?.tokens(), 4);
+
+        for draft_max in 1..=8 {
+            let mut bounded = suffix_default.clone();
+            bounded.extend(["--draft-max", &draft_max.to_string()].map(OsString::from));
+            let cfg = parse(bounded)?;
+            assert_eq!(cfg.cpu_speculation.ok_or_else(invalid)?.tokens(), draft_max);
+        }
+        for bad_draft in ["0", "9", "abc"] {
+            let mut invalid_draft = suffix_default.clone();
+            invalid_draft.extend(["--draft-max", bad_draft].map(OsString::from));
+            assert!(parse(invalid_draft).is_err());
+        }
+        let mut conflict = suffix_default.clone();
+        conflict.extend(["--draft-max", "4", "--cpu-speculative-tokens", "4"].map(OsString::from));
+        assert!(parse(conflict).is_err());
+        let mut dup_draft = suffix_default.clone();
+        dup_draft.extend(["--draft-max", "4", "--draft-max", "2"].map(OsString::from));
+        assert!(parse(dup_draft).is_err());
+        suffix_default.drain(15..19);
+        assert!(parse(suffix_default).is_err());
         Ok(())
     }
 }

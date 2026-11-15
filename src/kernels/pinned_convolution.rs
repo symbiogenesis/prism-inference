@@ -168,7 +168,16 @@ pub(crate) fn step_into(
     width: usize,
     next_history: &mut [f32],
 ) -> Result<()> {
-    step_into_inner::<false, false>(history, mixed, coefficients, width, next_history)
+    step_into_inner::<false, false, false>(
+        history,
+        mixed,
+        coefficients,
+        width,
+        0,
+        0,
+        1.0,
+        next_history,
+    )
 }
 
 /// Evaluates all channels of one causal convolution step, applies pinned `SiLU`
@@ -184,7 +193,16 @@ pub(crate) fn step_silu_into(
     width: usize,
     next_history: &mut [f32],
 ) -> Result<()> {
-    step_into_inner::<true, false>(history, mixed, coefficients, width, next_history)
+    step_into_inner::<true, false, false>(
+        history,
+        mixed,
+        coefficients,
+        width,
+        0,
+        0,
+        1.0,
+        next_history,
+    )
 }
 
 /// Runs the exact one-token convolution using immutable prepared model weights.
@@ -199,25 +217,287 @@ pub(crate) fn step_silu_into_coefficients(
     next_history: &mut [f32],
 ) -> Result<()> {
     if coefficients.prepared {
-        step_into_inner::<true, true>(history, mixed, coefficients.values, width, next_history)
+        step_into_inner::<true, true, false>(
+            history,
+            mixed,
+            coefficients.values,
+            width,
+            0,
+            0,
+            1.0,
+            next_history,
+        )
     } else {
-        step_into_inner::<true, false>(history, mixed, coefficients.values, width, next_history)
+        step_into_inner::<true, false, false>(
+            history,
+            mixed,
+            coefficients.values,
+            width,
+            0,
+            0,
+            1.0,
+            next_history,
+        )
+    }
+}
+
+/// Runs one-token causal convolution using immutable prepared model weights,
+/// fuses pinned `SiLU` in registers before storing `mixed`, and applies per-head
+/// clamped L2 normalization over `mixed[..norm_channels]` in exact `f64`
+/// increasing-channel order matching [`super::l2_norm_in_place`].
+///
+/// # Errors
+/// Rejects invalid geometry, normalization bounds, nonpositive/nonfinite
+/// `epsilon`, or nonfinite inputs and outputs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep borrowed state, prepared coefficients, and normalization geometry explicit without heap allocation."
+)]
+pub(crate) fn step_silu_clamped_l2_into_coefficients(
+    history: &[f32],
+    mixed: &mut [f32],
+    coefficients: CoefficientSlice<'_>,
+    width: usize,
+    norm_channels: usize,
+    head_width: usize,
+    epsilon: f32,
+    next_history: &mut [f32],
+) -> Result<()> {
+    if coefficients.prepared {
+        step_into_inner::<true, true, true>(
+            history,
+            mixed,
+            coefficients.values,
+            width,
+            norm_channels,
+            head_width,
+            epsilon,
+            next_history,
+        )
+    } else {
+        step_into_inner::<true, false, true>(
+            history,
+            mixed,
+            coefficients.values,
+            width,
+            norm_channels,
+            head_width,
+            epsilon,
+            next_history,
+        )
+    }
+}
+
+#[inline]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "The pinned scalar numerical contract explicitly rounds this value to binary32."
+)]
+fn l2_scale_from_squares(squares: f64, epsilon: f32) -> f32 {
+    1.0 / (squares as f32).sqrt().max(epsilon)
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn scale_l2_head_neon(neon: fearless_simd::Neon, slice: &mut [f32], scale: f32) {
+    use fearless_simd::{f32x4, prelude::*};
+    let scale_vec = f32x4::splat(neon, scale);
+    let (blocks16, rem16) = slice.as_chunks_mut::<16>();
+    for block in blocks16 {
+        let v0 = f32x4::from_slice(neon, &block[0..4]) * scale_vec;
+        let v1 = f32x4::from_slice(neon, &block[4..8]) * scale_vec;
+        let v2 = f32x4::from_slice(neon, &block[8..12]) * scale_vec;
+        let v3 = f32x4::from_slice(neon, &block[12..16]) * scale_vec;
+        v0.store_slice(&mut block[0..4]);
+        v1.store_slice(&mut block[4..8]);
+        v2.store_slice(&mut block[8..12]);
+        v3.store_slice(&mut block[12..16]);
+    }
+    let (chunks, tail) = rem16.as_chunks_mut::<4>();
+    for chunk in chunks {
+        (f32x4::from_slice(neon, chunk) * scale_vec).store_slice(chunk);
+    }
+    for value in tail {
+        *value *= scale;
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+struct ClampedL2State {
+    norm_channels: usize,
+    head_width: usize,
+    epsilon: f32,
+    squares: f64,
+    head_start: usize,
+    in_head: usize,
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+impl ClampedL2State {
+    const fn new(norm_channels: usize, head_width: usize, epsilon: f32) -> Self {
+        Self {
+            norm_channels,
+            head_width,
+            epsilon,
+            squares: 0.0,
+            head_start: 0,
+            in_head: 0,
+        }
+    }
+
+    fn finish_head_neon(&mut self, neon: fearless_simd::Neon, mixed: &mut [f32]) -> Result<()> {
+        let head_end = self.head_start + self.head_width;
+        let head = mixed
+            .get_mut(self.head_start..head_end)
+            .ok_or_else(|| invalid("pinned convolution normalization head bounds mismatch"))?;
+        let scale = l2_scale_from_squares(self.squares, self.epsilon);
+        scale_l2_head_neon(neon, head, scale);
+        self.head_start = head_end;
+        self.in_head = 0;
+        self.squares = 0.0;
+        Ok(())
+    }
+
+    fn accumulate_squares_neon(
+        &mut self,
+        neon: fearless_simd::Neon,
+        mixed: &mut [f32],
+        base_ch: usize,
+        squares: &[f32],
+    ) -> Result<()> {
+        for (lane, &sq) in squares.iter().enumerate() {
+            if base_ch + lane >= self.norm_channels {
+                break;
+            }
+            self.squares += f64::from(sq);
+            self.in_head += 1;
+            if self.in_head == self.head_width {
+                self.finish_head_neon(neon, mixed)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn accumulate_pair_neon(
+        &mut self,
+        neon: fearless_simd::Neon,
+        mixed: &mut [f32],
+        base_ch: usize,
+        sq0: [f32; 4],
+        sq1: [f32; 4],
+    ) -> Result<()> {
+        if self.norm_channels - base_ch >= 8 && self.in_head + 8 <= self.head_width {
+            self.squares += f64::from(sq0[0]);
+            self.squares += f64::from(sq0[1]);
+            self.squares += f64::from(sq0[2]);
+            self.squares += f64::from(sq0[3]);
+            self.squares += f64::from(sq1[0]);
+            self.squares += f64::from(sq1[1]);
+            self.squares += f64::from(sq1[2]);
+            self.squares += f64::from(sq1[3]);
+            self.in_head += 8;
+            if self.in_head == self.head_width {
+                self.finish_head_neon(neon, mixed)?;
+            }
+            return Ok(());
+        }
+        self.accumulate_squares_neon(neon, mixed, base_ch, &sq0)?;
+        self.accumulate_squares_neon(neon, mixed, base_ch + 4, &sq1)
+    }
+
+    fn accumulate_quad_neon(
+        &mut self,
+        neon: fearless_simd::Neon,
+        mixed: &mut [f32],
+        base_ch: usize,
+        sq: [f32; 4],
+    ) -> Result<()> {
+        if self.norm_channels - base_ch >= 4 && self.in_head + 4 <= self.head_width {
+            self.squares += f64::from(sq[0]);
+            self.squares += f64::from(sq[1]);
+            self.squares += f64::from(sq[2]);
+            self.squares += f64::from(sq[3]);
+            self.in_head += 4;
+            if self.in_head == self.head_width {
+                self.finish_head_neon(neon, mixed)?;
+            }
+            return Ok(());
+        }
+        self.accumulate_squares_neon(neon, mixed, base_ch, &sq)
+    }
+
+    fn accumulate_tail_neon(
+        &mut self,
+        neon: fearless_simd::Neon,
+        mixed: &mut [f32],
+        rem_base: usize,
+    ) -> Result<()> {
+        let end = mixed.len().min(self.norm_channels);
+        for ch in rem_base..end {
+            let value = mixed[ch];
+            self.squares += f64::from(value * value);
+            self.in_head += 1;
+            if self.in_head == self.head_width {
+                self.finish_head_neon(neon, mixed)?;
+            }
+        }
+        Ok(())
     }
 }
 
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "Keep NEON four-channel convolution, optional SiLU fusion and scalar fallback together."
+    reason = "Keep NEON four-channel convolution, optional SiLU/L2 fusion and scalar fallback together."
 )]
-fn step_into_inner<const SILU: bool, const PREPARED: bool>(
+fn step_into_inner<const SILU: bool, const PREPARED: bool, const CLAMPED_L2: bool>(
     history: &[f32],
     mixed: &mut [f32],
     coefficients: &[f32],
     width: usize,
+    norm_channels: usize,
+    head_width: usize,
+    epsilon: f32,
     next_history: &mut [f32],
 ) -> Result<()> {
     if width == 0 {
         return Err(invalid("pinned convolution requires coefficients"));
+    }
+    if CLAMPED_L2 {
+        if norm_channels > mixed.len() {
+            return Err(invalid(
+                "pinned convolution normalization exceeds mixed channels",
+            ));
+        }
+        if norm_channels > 0 && (head_width == 0 || !norm_channels.is_multiple_of(head_width)) {
+            return Err(invalid(
+                "pinned convolution normalization head width mismatch",
+            ));
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(invalid(
+                "pinned convolution normalization requires positive finite epsilon",
+            ));
+        }
     }
     let hist_width = width - 1;
     if coefficients.len() != mixed.len().saturating_mul(width)
@@ -241,12 +521,20 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
         let mut finite_mask = zero.is_finite();
-        let (m_pairs, m_rem8) = mixed.as_chunks_mut::<8>();
-        let (h_pairs, h_rem24) = history.as_chunks::<24>();
-        let (n_pairs, n_rem24) = next_history.as_chunks_mut::<24>();
-        let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
-        for (((m_pair, h_pair), n_pair), c_pair) in
-            m_pairs.iter_mut().zip(h_pairs).zip(n_pairs).zip(c_pairs)
+        let channels = mixed.len();
+        let pair_count = channels / 8;
+        let pair_channels = pair_count * 8;
+        let (h_pairs, h_rem24) = history.split_at(pair_count * 24);
+        let (n_pairs, n_rem24) = next_history.split_at_mut(pair_count * 24);
+        let (c_pairs, c_rem32) = coefficients.split_at(pair_count * 32);
+        let mut l2_state = ClampedL2State::new(norm_channels, head_width, epsilon);
+        for (pair_idx, ((h_pair, n_pair), c_pair)) in h_pairs
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .zip(n_pairs.as_chunks_mut::<24>().0)
+            .zip(c_pairs.as_chunks::<32>().0)
+            .enumerate()
         {
             let [tap0_0, tap0_1, tap0_2, tap0_3] =
                 coefficient_taps::<PREPARED>(neon, &c_pair[0..16]);
@@ -258,6 +546,10 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
             let h1_t0 = f32x4::load_array(neon, [h_pair[12], h_pair[15], h_pair[18], h_pair[21]]);
             let h1_t1 = f32x4::load_array(neon, [h_pair[13], h_pair[16], h_pair[19], h_pair[22]]);
             let h1_t2 = f32x4::load_array(neon, [h_pair[14], h_pair[17], h_pair[20], h_pair[23]]);
+            let base_ch = pair_idx * 8;
+            let Some(m_pair) = mixed.get_mut(base_ch..base_ch + 8) else {
+                return Err(invalid("pinned convolution mixed slice bounds mismatch"));
+            };
             let p0 = f32x4::from_slice(neon, &m_pair[0..4]);
             let p1 = f32x4::from_slice(neon, &m_pair[4..8]);
             let mut sum0 = zero;
@@ -271,36 +563,58 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
             let out0 = p0.mul_add_precise(tap0_3, sum0);
             let out1 = p1.mul_add_precise(tap1_3, sum1);
             finite_mask = finite_mask & out0.is_finite() & out1.is_finite();
-            let [p0_0, p0_1, p0_2, p0_3, p1_0, p1_1, p1_2, p1_3] = *m_pair;
-            if SILU {
-                let s0 = out0 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out0));
-                let s1 = out1 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out1));
-                s0.store_slice(&mut m_pair[0..4]);
-                s1.store_slice(&mut m_pair[4..8]);
-            } else {
-                out0.store_slice(&mut m_pair[0..4]);
-                out1.store_slice(&mut m_pair[4..8]);
-            }
+            let [p0_0, p0_1, p0_2, p0_3, p1_0, p1_1, p1_2, p1_3] = [
+                m_pair[0], m_pair[1], m_pair[2], m_pair[3], m_pair[4], m_pair[5], m_pair[6],
+                m_pair[7],
+            ];
             *n_pair = [
                 h_pair[1], h_pair[2], p0_0, h_pair[4], h_pair[5], p0_1, h_pair[7], h_pair[8], p0_2,
                 h_pair[10], h_pair[11], p0_3, h_pair[13], h_pair[14], p1_0, h_pair[16], h_pair[17],
                 p1_1, h_pair[19], h_pair[20], p1_2, h_pair[22], h_pair[23], p1_3,
             ];
+            if SILU {
+                let s0 = out0 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out0));
+                let s1 = out1 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out1));
+                s0.store_slice(&mut m_pair[0..4]);
+                s1.store_slice(&mut m_pair[4..8]);
+                if CLAMPED_L2 && base_ch < norm_channels {
+                    if !(out0.is_finite() & out1.is_finite() & s0.is_finite() & s1.is_finite())
+                        .all_true()
+                    {
+                        return Err(invalid("nonfinite kernel output"));
+                    }
+                    let sq0 = (s0 * s0).to_array();
+                    let sq1 = (s1 * s1).to_array();
+                    l2_state.accumulate_pair_neon(neon, mixed, base_ch, sq0, sq1)?;
+                }
+            } else {
+                out0.store_slice(&mut m_pair[0..4]);
+                out1.store_slice(&mut m_pair[4..8]);
+            }
         }
-        let (m_chunks, m_rem) = m_rem8.as_chunks_mut::<4>();
-        let (h_chunks, h_rem) = h_rem24.as_chunks::<12>();
-        let (n_chunks, n_rem) = n_rem24.as_chunks_mut::<12>();
-        let (c_chunks, c_rem) = c_rem32.as_chunks::<16>();
-        for (((m_chunk, h_chunk), n_chunk), c_chunk) in m_chunks
-            .iter_mut()
-            .zip(h_chunks)
-            .zip(n_chunks)
-            .zip(c_chunks)
+        let chunk_count = (channels - pair_channels) / 4;
+        let chunk_channels = chunk_count * 4;
+        let chunk_base = pair_channels;
+        let rem_base = chunk_base + chunk_channels;
+        let (h_chunks, h_rem) = h_rem24.split_at(chunk_count * 12);
+        let (n_chunks, n_rem) = n_rem24.split_at_mut(chunk_count * 12);
+        let (c_chunks, c_rem) = c_rem32.split_at(chunk_count * 16);
+        for (chunk_idx, ((h_chunk, n_chunk), c_chunk)) in h_chunks
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .zip(n_chunks.as_chunks_mut::<12>().0)
+            .zip(c_chunks.as_chunks::<16>().0)
+            .enumerate()
         {
             let [tap0, tap1, tap2, tap3] = coefficient_taps::<PREPARED>(neon, &c_chunk[0..16]);
             let h_t0 = f32x4::load_array(neon, [h_chunk[0], h_chunk[3], h_chunk[6], h_chunk[9]]);
             let h_t1 = f32x4::load_array(neon, [h_chunk[1], h_chunk[4], h_chunk[7], h_chunk[10]]);
             let h_t2 = f32x4::load_array(neon, [h_chunk[2], h_chunk[5], h_chunk[8], h_chunk[11]]);
+            let base_ch = chunk_base + chunk_idx * 4;
+            let Some(m_chunk) = mixed.get_mut(base_ch..base_ch + 4) else {
+                return Err(invalid("pinned convolution mixed chunk bounds mismatch"));
+            };
             let p = f32x4::from_slice(neon, m_chunk);
             let mut sum = zero;
             sum = h_t0.mul_add_precise(tap0, sum);
@@ -308,13 +622,7 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
             sum = h_t2.mul_add_precise(tap2, sum);
             let out = p.mul_add_precise(tap3, sum);
             finite_mask &= out.is_finite();
-            let [p0, p1, p2, p3] = *m_chunk;
-            if SILU {
-                (out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out)))
-                    .store_slice(m_chunk);
-            } else {
-                out.store_slice(m_chunk);
-            }
+            let [p0, p1, p2, p3] = [m_chunk[0], m_chunk[1], m_chunk[2], m_chunk[3]];
             *n_chunk = [
                 h_chunk[1],
                 h_chunk[2],
@@ -329,10 +637,24 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
                 h_chunk[11],
                 p3,
             ];
+            if SILU {
+                let s = out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out));
+                s.store_slice(m_chunk);
+                if CLAMPED_L2 && base_ch < norm_channels {
+                    if !(out.is_finite() & s.is_finite()).all_true() {
+                        return Err(invalid("nonfinite kernel output"));
+                    }
+                    let sq = (s * s).to_array();
+                    l2_state.accumulate_quad_neon(neon, mixed, base_ch, sq)?;
+                }
+            } else {
+                out.store_slice(m_chunk);
+            }
         }
         if !finite_mask.all_true() {
             return Err(invalid("nonfinite kernel output"));
         }
+        let m_rem = &mut mixed[rem_base..];
         for (((mixed_value, h_slice), n_slice), c_slice) in m_rem
             .iter_mut()
             .zip(h_rem.as_chunks::<3>().0)
@@ -347,6 +669,12 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
         }
         if SILU {
             super::pinned_activations::silu_in_place(m_rem);
+        }
+        if CLAMPED_L2 && rem_base < norm_channels {
+            if !mixed[rem_base..].iter().all(|value| value.is_finite()) {
+                return Err(invalid("nonfinite kernel output"));
+            }
+            l2_state.accumulate_tail_neon(neon, mixed, rem_base)?;
         }
         return Ok(());
     }
@@ -373,6 +701,23 @@ fn step_into_inner<const SILU: bool, const PREPARED: bool>(
     }
     if SILU {
         super::pinned_activations::silu_in_place(mixed);
+    }
+    if CLAMPED_L2 {
+        if !mixed.iter().all(|value| value.is_finite()) {
+            return Err(invalid("nonfinite kernel output"));
+        }
+        if norm_channels > 0 {
+            for head in mixed[..norm_channels].chunks_exact_mut(head_width) {
+                let mut squares = 0.0_f64;
+                for &value in &*head {
+                    squares += f64::from(value * value);
+                }
+                let scale = l2_scale_from_squares(squares, epsilon);
+                for value in head {
+                    *value *= scale;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1985,6 +2330,154 @@ mod tests {
                         assert_eq!(bits(&history), expected_history);
                         assert_eq!(bits(&mixed), expected_mixed);
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Exhaustively checks 0-ULP fused SiLU+clamped L2 parity across prepared/raw, 128/132/134 widths, sub-epsilon clamping, value tails, and fault rejection."
+    )]
+    fn x1_fused_step_silu_clamped_l2_matches_unfused_bits_and_rejects_faults() -> Result<()> {
+        let width = 4_usize;
+        let epsilon = 1e-6_f32;
+        let cases = [
+            // (head_width, norm_heads, value_channels, allow_prepared, tiny_sub_eps)
+            (128_usize, 2_usize, 128_usize, true, false),
+            (128, 4, 0, true, false),
+            (128, 2, 64, true, true),
+            (132, 2, 132, true, false),
+            (132, 3, 68, true, true),
+            (134, 1, 0, false, false),
+            (134, 2, 69, false, false),
+            (134, 1, 3, false, true),
+        ];
+        for (head_width, norm_heads, value_channels, allow_prepared, tiny_sub_eps) in cases {
+            let norm_channels = head_width * norm_heads;
+            let channels = norm_channels + value_channels;
+            let history_init: Vec<f32> = (0..channels * (width - 1))
+                .map(|idx| {
+                    let base = [-0.75_f32, 0.5, -0.25, 1.125, -0.375, 0.0, -0.0][idx % 7];
+                    if tiny_sub_eps { base * 1e-10 } else { base }
+                })
+                .collect();
+            let mixed_init: Vec<f32> = (0..channels)
+                .map(|ch| {
+                    let base = [0.625_f32, -1.25, 0.25, -0.5, 1.5, -0.125][ch % 6];
+                    if tiny_sub_eps { base * 1e-10 } else { base }
+                })
+                .collect();
+            let coefficients_raw: Vec<f32> = (0..channels * width)
+                .map(|idx| {
+                    let base = [0.25_f32, -0.125, 0.5, -0.375, 0.75][idx % 5];
+                    if tiny_sub_eps { base * 1e-3 } else { base }
+                })
+                .collect();
+            let prepared_modes: &[bool] = if allow_prepared {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &prepared in prepared_modes {
+                let coeff = super::Coefficients::new(coefficients_raw.clone(), width, prepared);
+                let mut ref_mixed = mixed_init.clone();
+                let mut ref_next_history = vec![0.0_f32; history_init.len()];
+                super::step_silu_into_coefficients(
+                    &history_init,
+                    &mut ref_mixed,
+                    coeff.view(),
+                    width,
+                    &mut ref_next_history,
+                )?;
+                for head in ref_mixed[..norm_channels].chunks_exact_mut(head_width) {
+                    crate::kernels::l2_norm_in_place(head, epsilon);
+                }
+
+                let mut fused_mixed = mixed_init.clone();
+                let mut fused_next_history = vec![0.0_f32; history_init.len()];
+                super::step_silu_clamped_l2_into_coefficients(
+                    &history_init,
+                    &mut fused_mixed,
+                    coeff.view(),
+                    width,
+                    norm_channels,
+                    head_width,
+                    epsilon,
+                    &mut fused_next_history,
+                )?;
+
+                assert_eq!(
+                    bits(&fused_mixed),
+                    bits(&ref_mixed),
+                    "mixed mismatch head_width={head_width} norm_heads={norm_heads} value_channels={value_channels} prepared={prepared} tiny={tiny_sub_eps}"
+                );
+                assert_eq!(bits(&fused_next_history), bits(&ref_next_history));
+
+                // Fault rejections: invalid norm geometry, invalid epsilon, and non-finite inputs.
+                assert!(
+                    super::step_silu_clamped_l2_into_coefficients(
+                        &history_init,
+                        &mut fused_mixed,
+                        coeff.view(),
+                        width,
+                        channels + 1,
+                        head_width,
+                        epsilon,
+                        &mut fused_next_history,
+                    )
+                    .is_err()
+                );
+                for bad_eps in [0.0_f32, -1e-6, f32::NAN, f32::INFINITY] {
+                    assert!(
+                        super::step_silu_clamped_l2_into_coefficients(
+                            &history_init,
+                            &mut fused_mixed,
+                            coeff.view(),
+                            width,
+                            norm_channels,
+                            head_width,
+                            bad_eps,
+                            &mut fused_next_history,
+                        )
+                        .is_err()
+                    );
+                }
+                for fault in [f32::NAN, f32::INFINITY] {
+                    let mut bad_mixed = mixed_init.clone();
+                    bad_mixed[norm_channels.saturating_sub(1)] = fault;
+                    let mut bad_next = vec![0.0_f32; history_init.len()];
+                    assert!(
+                        super::step_silu_clamped_l2_into_coefficients(
+                            &history_init,
+                            &mut bad_mixed,
+                            coeff.view(),
+                            width,
+                            norm_channels,
+                            head_width,
+                            epsilon,
+                            &mut bad_next,
+                        )
+                        .is_err()
+                    );
+                    let mut bad_hist = history_init.clone();
+                    bad_hist[0] = fault;
+                    let mut clean_mixed = mixed_init.clone();
+                    assert!(
+                        super::step_silu_clamped_l2_into_coefficients(
+                            &bad_hist,
+                            &mut clean_mixed,
+                            coeff.view(),
+                            width,
+                            norm_channels,
+                            head_width,
+                            epsilon,
+                            &mut bad_next,
+                        )
+                        .is_err()
+                    );
                 }
             }
         }

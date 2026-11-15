@@ -525,6 +525,146 @@ fn publish_reduced(
     Ok(())
 }
 
+pub(super) fn pack_f16_rows<const HEADS: usize>(
+    neon: Neon,
+    scores: [&[f32]; HEADS],
+    packed: &mut [[u16; HEADS]],
+) {
+    let mut token = 0;
+    while token + 4 <= packed.len() {
+        for (head, row) in scores.iter().enumerate() {
+            let chunk: [f32; 4] = [row[token], row[token + 1], row[token + 2], row[token + 3]];
+            let bits = super::super::neon::half_bits_x4(neon, f32x4::load_array(neon, chunk));
+            for (lane, slot) in packed[token..token + 4].iter_mut().enumerate() {
+                slot[head] = bits[lane];
+            }
+        }
+        token += 4;
+    }
+    for (idx, slot) in packed.iter_mut().enumerate().skip(token) {
+        for (head, dst) in slot.iter_mut().enumerate() {
+            *dst = super::super::half_bits(scores[head][idx]);
+        }
+    }
+}
+
+#[expect(
+    clippy::large_stack_arrays,
+    clippy::too_many_lines,
+    reason = "Keep explicit 4-head NEON accumulators unrolled within the bounded 32 KiB stack tile."
+)]
+pub(super) fn value_tile_four_packed_gated<'a>(
+    neon: Neon,
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[[u16; 4]],
+    range: &std::ops::Range<usize>,
+    outputs: [&mut [f32]; 4],
+    gates: [&[f32]; 4],
+) -> Result<()> {
+    const GROUPS: usize = VALUE_TILE_FOUR / 4;
+    let out_len = outputs[0].len();
+    let groups = out_len / 4;
+    let past_len = weights.len() - 1;
+    let mut sums = [[[f32x4::splat(neon, 0.0); GROUPS]; 16]; 4];
+    let mut token = 0;
+    let (weight_pairs, weight_tail) = weights[..past_len].as_chunks::<2>();
+    for [w0_bits, w1_bits] in weight_pairs {
+        let Some(row0) = past.next().and_then(|row| row.get(range.start..range.end)) else {
+            return Err(invalid("pinned attention value row is short"));
+        };
+        let Some(row1) = past.next().and_then(|row| row.get(range.start..range.end)) else {
+            return Err(invalid("pinned attention value row is short"));
+        };
+        let combined = [
+            w0_bits[0], w0_bits[1], w0_bits[2], w0_bits[3], w1_bits[0], w1_bits[1], w1_bits[2],
+            w1_bits[3],
+        ];
+        let (w0_vec, w1_vec) = super::super::neon::f16_bits_to_f32_x8(neon, &combined);
+        let w0 = w0_vec.to_array();
+        let w1 = w1_vec.to_array();
+        let w0_splat = w0.map(|weight| f32x4::splat(neon, weight));
+        let w1_splat = w1.map(|weight| f32x4::splat(neon, weight));
+        let lane0 = token % 16;
+        let lane1 = (token + 1) % 16;
+        token += 2;
+        let (chunks8_0, rem0) = row0.as_chunks::<8>();
+        let (chunks8_1, rem1) = row1.as_chunks::<8>();
+        for (pair_idx, (c0, c1)) in chunks8_0.iter().zip(chunks8_1).enumerate() {
+            let (v0_0, v0_1) = super::super::neon::f16_bits_to_f32_x8(neon, c0);
+            let (v1_0, v1_1) = super::super::neon::f16_bits_to_f32_x8(neon, c1);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            for h in 0..4 {
+                sums[h][lane0][g0] = v0_0.mul_add(w0_splat[h], sums[h][lane0][g0]);
+                sums[h][lane0][g1] = v0_1.mul_add(w0_splat[h], sums[h][lane0][g1]);
+                sums[h][lane1][g0] = v1_0.mul_add(w1_splat[h], sums[h][lane1][g0]);
+                sums[h][lane1][g1] = v1_1.mul_add(w1_splat[h], sums[h][lane1][g1]);
+            }
+        }
+        if let ([vals0], [vals1]) = (rem0.as_chunks::<4>().0, rem1.as_chunks::<4>().0) {
+            let v0 = super::super::neon::f16_bits_to_f32_x4(neon, *vals0);
+            let v1 = super::super::neon::f16_bits_to_f32_x4(neon, *vals1);
+            let g = groups - 1;
+            for h in 0..4 {
+                sums[h][lane0][g] = v0.mul_add(w0_splat[h], sums[h][lane0][g]);
+                sums[h][lane1][g] = v1.mul_add(w1_splat[h], sums[h][lane1][g]);
+            }
+        }
+    }
+    if let Some(&tail_bits) = weight_tail.first() {
+        let Some(row) = past.next().and_then(|row| row.get(range.start..range.end)) else {
+            return Err(invalid("pinned attention value row is short"));
+        };
+        let w_tail = super::super::neon::f16_bits_to_f32_x4(neon, tail_bits).to_array();
+        let w_splat = w_tail.map(|weight| f32x4::splat(neon, weight));
+        let lane = token % 16;
+        let (chunks8, rem) = row.as_chunks::<8>();
+        for (pair_idx, chunk8) in chunks8.iter().enumerate() {
+            let (v0, v1) = super::super::neon::f16_bits_to_f32_x8(neon, chunk8);
+            let g0 = pair_idx * 2;
+            let g1 = g0 + 1;
+            for h in 0..4 {
+                sums[h][lane][g0] = v0.mul_add(w_splat[h], sums[h][lane][g0]);
+                sums[h][lane][g1] = v1.mul_add(w_splat[h], sums[h][lane][g1]);
+            }
+        }
+        if let [vals4] = rem.as_chunks::<4>().0 {
+            let v = super::super::neon::f16_bits_to_f32_x4(neon, *vals4);
+            let g = groups - 1;
+            for h in 0..4 {
+                sums[h][lane][g] = v.mul_add(w_splat[h], sums[h][lane][g]);
+            }
+        }
+    }
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last_lane = past_len % 16;
+    let w_last = super::super::neon::f16_bits_to_f32_x4(neon, weights[past_len]).to_array();
+    let w_splat = w_last.map(|weight| f32x4::splat(neon, weight));
+    for (g, current_chunk) in current.as_chunks::<4>().0.iter().enumerate() {
+        let v = f32x4::load_array(neon, *current_chunk);
+        for h in 0..4 {
+            sums[h][last_lane][g] = v.mul_add(w_splat[h], sums[h][last_lane][g]);
+        }
+    }
+    if !reduce_four_heads::<GROUPS>(&mut sums, groups) {
+        return Err(invalid("nonfinite pinned attention value reduction"));
+    }
+    for ((head_sums, gate), output) in sums.iter().zip(gates).zip(outputs) {
+        for (group, out_chunk) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            publish_reduced(
+                neon,
+                head_sums[0][group],
+                Some(&gate[group * 4..group * 4 + 4]),
+                out_chunk,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Reduces a validated F16 key slice and F32 query slice with four NEON FMA registers.
 pub(super) fn dot_f16(neon: Neon, key: &[u16], query: &[f32]) -> Result<f32> {
     let mut sums = [f32x4::splat(neon, 0.0); 4];

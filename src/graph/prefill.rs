@@ -1246,6 +1246,7 @@ fn full_attention_tile(
                 values,
                 &mut attention_scratch.query,
                 &mut attention_scratch.scores,
+                &mut attention_scratch.packed_probs,
                 &mut attention_scratch.frequencies,
                 &mut tile.attended[index],
             );

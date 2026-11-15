@@ -218,7 +218,10 @@ mod tests {
             assert!(!checked_uri(82, &uri));
             assert!(!checked_uri(arch, &uri[..uri.len() - 1]));
         }
-        assert_eq!(HtpArchProfile::for_architecture(73, 0, 0), Some(HtpArchProfile::v73_default()));
+        assert_eq!(
+            HtpArchProfile::for_architecture(73, 0, 0),
+            Some(HtpArchProfile::v73_default())
+        );
         assert_eq!(
             HtpArchProfile::for_architecture(73, 6, 4 * 1024 * 1024),
             Some(HtpArchProfile {
@@ -228,8 +231,14 @@ mod tests {
                 dma64_capable: false,
             })
         );
-        assert_eq!(HtpArchProfile::for_architecture(81, 8, 8 * 1024 * 1024), Some(HtpArchProfile::v81()));
-        assert_eq!(HtpArchProfile::for_architecture(68, 4, 2 * 1024 * 1024), None);
+        assert_eq!(
+            HtpArchProfile::for_architecture(81, 8, 8 * 1024 * 1024),
+            Some(HtpArchProfile::v81())
+        );
+        assert_eq!(
+            HtpArchProfile::for_architecture(68, 4, 2 * 1024 * 1024),
+            None
+        );
         let mut tail = module_uri(81).map_or_default(CStr::to_bytes).to_vec();
         tail.extend_from_slice(c"&_dom=cdsp&_session=0".to_bytes_with_nul());
         tail.truncate(tail.len() - 2);

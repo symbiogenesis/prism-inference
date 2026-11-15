@@ -5383,8 +5383,14 @@ mod tests {
         Pq2ProjectionExecutor::project_f32(&mut executor, &first, &activation, true, &mut output)?;
         assert_eq!(output.len(), 32);
         assert!(
-            Pq2ProjectionExecutor::project_f32(&mut executor, &third, &activation, true, &mut output)
-                .is_err()
+            Pq2ProjectionExecutor::project_f32(
+                &mut executor,
+                &third,
+                &activation,
+                true,
+                &mut output
+            )
+            .is_err()
         );
         Ok(())
     }

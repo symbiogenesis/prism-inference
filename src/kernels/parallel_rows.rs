@@ -423,6 +423,85 @@ impl RowParallelism {
         self.workers > 1 && rows > 1
     }
 
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves distinct typed 16/8/4/1 row closures without dynamic dispatch."
+    )]
+    pub(super) fn fill_sixteen_rows(
+        &self,
+        data: &[u8],
+        row_bytes: usize,
+        output: &mut Vec<f32>,
+        errors: &mut Vec<Option<crate::Error>>,
+        dot_sixteen: impl Fn([&[u8]; 16]) -> Result<[f32; 16]> + Sync,
+        dot_eight: impl Fn([&[u8]; 8]) -> Result<[f32; 8]> + Sync,
+        dot_four: impl Fn([&[u8]; 4]) -> Result<[f32; 4]> + Sync,
+        dot: impl Fn(&[u8]) -> Result<f32> + Sync,
+    ) -> Result<()> {
+        errors.clear();
+        let rows = data.len() / row_bytes;
+        #[cfg(not(feature = "parallel-rows"))]
+        if self.uses_pool(rows) {
+            return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        if output.len() != rows {
+            output.clear();
+            output.try_reserve_exact(rows)?;
+            output.resize(rows, 0.0);
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool
+            && rows > 1
+        {
+            use rayon::prelude::*;
+
+            let task_rows = rows.div_ceil(self.workers);
+            let tasks = rows.div_ceil(task_rows);
+            errors.try_reserve_exact(tasks)?;
+            errors.resize_with(tasks, || None);
+            pool.install(|| {
+                output
+                    .par_chunks_mut(task_rows)
+                    .zip(errors.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(task, (chunk, error))| {
+                        let start = task * task_rows * row_bytes;
+                        let bytes = &data[start..start + chunk.len() * row_bytes];
+                        if let Err(failure) = fill_sixteen_batched_chunk(
+                            chunk,
+                            bytes,
+                            row_bytes,
+                            &dot_sixteen,
+                            &dot_eight,
+                            &dot_four,
+                            &dot,
+                        ) {
+                            *error = Some(failure);
+                        }
+                    });
+            });
+            let failure = errors.iter_mut().find_map(Option::take);
+            errors.clear();
+            return failure.map_or(Ok(()), Err);
+        }
+        fill_sixteen_batched_chunk(
+            output,
+            data,
+            row_bytes,
+            &dot_sixteen,
+            &dot_eight,
+            &dot_four,
+            &dot,
+        )
+    }
+
     pub(super) fn fill(
         &self,
         data: &[u8],
@@ -596,4 +675,41 @@ pub(super) fn fill_batched_chunk(
         *value = dot(row)?;
     }
     Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn fill_sixteen_batched_chunk(
+    chunk: &mut [f32],
+    bytes: &[u8],
+    row_bytes: usize,
+    dot_sixteen: &(impl Fn([&[u8]; 16]) -> Result<[f32; 16]> + Sync),
+    dot_eight: &(impl Fn([&[u8]; 8]) -> Result<[f32; 8]> + Sync),
+    dot_four: &(impl Fn([&[u8]; 4]) -> Result<[f32; 4]> + Sync),
+    dot: &(impl Fn(&[u8]) -> Result<f32> + Sync),
+) -> Result<()> {
+    let (sixteens, after_sixteens) = chunk.as_chunks_mut::<16>();
+    let sixteens_len = sixteens.len() * 16 * row_bytes;
+    let (sixteen_bytes, rest_bytes) = bytes.split_at(sixteens_len);
+    for (out_sixteen, group) in sixteens
+        .iter_mut()
+        .zip(sixteen_bytes.chunks_exact(16 * row_bytes))
+    {
+        let rows: [&[u8]; 16] =
+            std::array::from_fn(|row| &group[row * row_bytes..(row + 1) * row_bytes]);
+        *out_sixteen = dot_sixteen(rows)?;
+    }
+    fill_batched_chunk(
+        rest_bytes,
+        row_bytes,
+        after_sixteens,
+        dot_eight,
+        dot_four,
+        dot,
+    )
 }

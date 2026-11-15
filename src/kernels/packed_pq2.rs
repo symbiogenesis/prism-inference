@@ -370,6 +370,47 @@ pub(super) fn dot_eight_rows<const FUSED: bool>(
     Ok([lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]])
 }
 
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+pub(super) fn dot_sixteen_rows<const FUSED: bool>(
+    rows: [&[u8]; 16],
+    input: &Activations,
+) -> Result<[f32; 16]> {
+    if input.is_empty()
+        || rows
+            .iter()
+            .any(|bytes| bytes.len() / 34 != input.len() || !bytes.len().is_multiple_of(34))
+    {
+        return Err(invalid("incompatible packed consumption activation extent"));
+    }
+    if let Some(dotprod) = input.dotprod {
+        return dotprod
+            .dot_scaled_rows::<16, FUSED>(rows, input)
+            .ok_or_else(|| invalid("nonfinite tensor or activation value"));
+    }
+    let lo = dot_eight_rows::<FUSED>(
+        [
+            rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+        ],
+        input,
+    )?;
+    let hi = dot_eight_rows::<FUSED>(
+        [
+            rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+        ],
+        input,
+    )?;
+    Ok([
+        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3], hi[4],
+        hi[5], hi[6], hi[7],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1007,6 +1048,165 @@ mod native_tests {
         assert!(dot_row::<true>(&weights, &prepared).is_err());
         assert!(dot_four_rows::<true>([&weights; 4], &prepared).is_err());
         assert!(dot_eight_rows::<true>([&weights; 8], &prepared).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Tests 16-row packed PQ2 kernel against row reference across fused/unfused and block counts."
+    )]
+    fn x1_packed_pq2_sixteen_rows_match_row_reference_across_geometries() -> Result<()> {
+        let mut input = [
+            Q8KBlock {
+                scale: 0.0,
+                values: [0_i8; 256],
+                sums: [0_i16; 16],
+            },
+            Q8KBlock {
+                scale: 0.0,
+                values: [0_i8; 256],
+                sums: [0_i16; 16],
+            },
+        ];
+        for (block_idx, block) in input.iter_mut().enumerate() {
+            block.scale = if block_idx == 0 { 0.0625 } else { -0.03125 };
+            for (elem_idx, slot) in block.values.iter_mut().enumerate() {
+                let raw = i8::try_from((block_idx * 37 + elem_idx * 19) % 199).unwrap_or(0);
+                *slot = raw.wrapping_sub(99);
+            }
+            for (group_idx, group_sum) in block.sums.iter_mut().enumerate() {
+                let start = group_idx * 16;
+                *group_sum = block.values[start..start + 16]
+                    .iter()
+                    .map(|&v| i16::from(v))
+                    .sum();
+            }
+        }
+        let mut detected = super::Activations::default();
+        let mut baseline = super::Activations::default();
+        prepare(&input, &mut detected)?;
+        super::prepare_with_layout(&input, &mut baseline, true)?;
+
+        let scale_bits_pool: [u16; 16] = [
+            0x3c00, 0xbc00, 0x3800, 0xb800, 0x3a00, 0xba00, 0x3400, 0xb400, 0x3e00, 0xbe00, 0x4000,
+            0xc000, 0x3600, 0xb600, 0x8000, 0x0000,
+        ];
+        let mut rows_data = vec![[0_u8; 136]; 33];
+        for (row_idx, row) in rows_data.iter_mut().enumerate() {
+            for block_idx in 0..4 {
+                let start = block_idx * 34;
+                let le = scale_bits_pool[(row_idx + block_idx * 5) % 16].to_le_bytes();
+                row[start] = le[0];
+                row[start + 1] = le[1];
+                for byte_idx in 0..32 {
+                    row[start + 2 + byte_idx] =
+                        u8::try_from((row_idx * 41 + block_idx * 23 + byte_idx * 17 + 9) % 256)
+                            .unwrap_or(0);
+                }
+            }
+        }
+
+        let refs16: [&[u8]; 16] = std::array::from_fn(|r| rows_data[r].as_slice());
+        let expected_fused: Vec<u32> = rows_data
+            .iter()
+            .map(|row| dot_row::<true>(row, &baseline).map(f32::to_bits))
+            .collect::<Result<_>>()?;
+        let expected_source: Vec<u32> = rows_data
+            .iter()
+            .map(|row| dot_row::<false>(row, &baseline).map(f32::to_bits))
+            .collect::<Result<_>>()?;
+
+        for activations in [&detected, &baseline] {
+            let consumer = super::Consumer::new(activations)?;
+            assert_eq!(
+                consumer.dot_sixteen_rows::<true>(refs16)?.map(f32::to_bits),
+                expected_fused[..16]
+            );
+            assert_eq!(
+                consumer
+                    .dot_sixteen_rows::<false>(refs16)?
+                    .map(f32::to_bits),
+                expected_source[..16]
+            );
+            assert_eq!(
+                super::dot_sixteen_rows::<true>(refs16, activations)?.map(f32::to_bits),
+                expected_fused[..16]
+            );
+            assert_eq!(
+                super::dot_sixteen_rows::<false>(refs16, activations)?.map(f32::to_bits),
+                expected_source[..16]
+            );
+
+            let mut bad_rows = refs16;
+            bad_rows[15] = &rows_data[15][..135];
+            assert_eq!(
+                consumer
+                    .dot_sixteen_rows::<true>(bad_rows)
+                    .err()
+                    .map(|err| err.to_string())
+                    .as_deref(),
+                Some("incompatible packed consumption activation extent")
+            );
+        }
+
+        let flat_data: Vec<u8> = rows_data
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
+        let pool = crate::kernels::RowParallelism::default();
+        let consumer = super::Consumer::new(&detected)?;
+        let mut errors = Vec::new();
+        for row_count in 1..=33_usize {
+            let slice = &flat_data[..row_count * 136];
+            for pinned in [true, false] {
+                let mut output = Vec::new();
+                pool.fill_sixteen_rows(
+                    slice,
+                    136,
+                    &mut output,
+                    &mut errors,
+                    |rows| {
+                        if pinned {
+                            consumer.dot_sixteen_rows::<true>(rows)
+                        } else {
+                            consumer.dot_sixteen_rows::<false>(rows)
+                        }
+                    },
+                    |rows| {
+                        if pinned {
+                            consumer.dot_eight_rows::<true>(rows)
+                        } else {
+                            consumer.dot_eight_rows::<false>(rows)
+                        }
+                    },
+                    |rows| {
+                        if pinned {
+                            consumer.dot_four_rows::<true>(rows)
+                        } else {
+                            consumer.dot_four_rows::<false>(rows)
+                        }
+                    },
+                    |row| {
+                        if pinned {
+                            consumer.dot_row::<true>(row)
+                        } else {
+                            consumer.dot_row::<false>(row)
+                        }
+                    },
+                )?;
+                let actual_bits: Vec<u32> = output.into_iter().map(f32::to_bits).collect();
+                let expected = if pinned {
+                    &expected_fused[..row_count]
+                } else {
+                    &expected_source[..row_count]
+                };
+                assert_eq!(
+                    actual_bits, expected,
+                    "row_count={row_count} pinned={pinned}"
+                );
+            }
+        }
         Ok(())
     }
 }

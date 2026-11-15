@@ -424,6 +424,12 @@ pub(super) fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
 }
 
 #[inline]
+pub(super) fn half_bits_x4(neon: Neon, v: f32x4<Neon>) -> [u16; 4] {
+    let bits = half_bits_u32x4(neon, v);
+    [bits[0], bits[1], bits[2], bits[3]].map(|lane| u16::try_from(lane).unwrap_or(0))
+}
+
+#[inline]
 const fn scale_u16(block: &[u8; 34]) -> u16 {
     u16::from_le_bytes([block[0], block[1]])
 }
@@ -3889,6 +3895,264 @@ pub(super) fn dot_ptq1_eight_rows_source(
                     outputs[r],
                 );
             }
+        }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    for out in &mut outputs {
+        *out = super::finite(*out)?;
+    }
+    Ok(outputs)
+}
+
+#[inline]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Streams sixteen PTQ1 rows per block across ARMv8.2-A SDOT while delegating baseline NEON to eight-row helpers."
+)]
+pub(super) fn dot_ptq1_sixteen_rows_pinned(
+    rows: [&[u8]; 16],
+    input: &[super::Q8Block],
+) -> Result<[f32; 16]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        let lo = dot_ptq1_eight_rows_pinned(
+            [
+                rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+            ],
+            input,
+        )?;
+        let hi = dot_ptq1_eight_rows_pinned(
+            [
+                rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+            ],
+            input,
+        )?;
+        return Ok([
+            lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3],
+            hi[4], hi[5], hi[6], hi[7],
+        ]);
+    };
+    if !bonsai_neon_dot::has_dotprod() {
+        let lo = dot_ptq1_eight_rows_pinned(
+            [
+                rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+            ],
+            input,
+        )?;
+        let hi = dot_ptq1_eight_rows_pinned(
+            [
+                rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+            ],
+            input,
+        )?;
+        return Ok([
+            lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3],
+            hi[4], hi[5], hi[6], hi[7],
+        ]);
+    }
+    let mut lanes = [f32x4::splat(neon, 0.0); 16];
+    let mut scales_finite = lanes[0].is_finite();
+    let chunks = rows.map(|row| row.as_chunks::<28>().0);
+    let block_count = chunks.iter().map(|c| c.len()).min().unwrap_or(0);
+    for (index, _) in chunks[0].iter().enumerate().take(block_count) {
+        let activations = <&[super::Q8Block; 4]>::try_from(
+            input
+                .get(index * 4..index * 4 + 4)
+                .ok_or_else(|| crate::invalid("incompatible PTQ1 activation extent"))?,
+        )?;
+        let blocks: [&[u8; 28]; 16] = std::array::from_fn(|row| &chunks[row][index]);
+        let (scales0, scales1) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                ptq1_scale_u16(blocks[0]),
+                ptq1_scale_u16(blocks[1]),
+                ptq1_scale_u16(blocks[2]),
+                ptq1_scale_u16(blocks[3]),
+                ptq1_scale_u16(blocks[4]),
+                ptq1_scale_u16(blocks[5]),
+                ptq1_scale_u16(blocks[6]),
+                ptq1_scale_u16(blocks[7]),
+            ],
+        );
+        let (scales2, scales3) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                ptq1_scale_u16(blocks[8]),
+                ptq1_scale_u16(blocks[9]),
+                ptq1_scale_u16(blocks[10]),
+                ptq1_scale_u16(blocks[11]),
+                ptq1_scale_u16(blocks[12]),
+                ptq1_scale_u16(blocks[13]),
+                ptq1_scale_u16(blocks[14]),
+                ptq1_scale_u16(blocks[15]),
+            ],
+        );
+        scales_finite = scales_finite
+            & scales0.is_finite()
+            & scales1.is_finite()
+            & scales2.is_finite()
+            & scales3.is_finite();
+        let row_scale_quads = [
+            scales0.to_array(),
+            scales1.to_array(),
+            scales2.to_array(),
+            scales3.to_array(),
+        ];
+        let a0 = activations[0].scale;
+        let a1 = activations[1].scale;
+        let a2 = activations[2].scale;
+        let a3 = activations[3].scale;
+        let act_values = [
+            &activations[0].values,
+            &activations[1].values,
+            &activations[2].values,
+            &activations[3].values,
+        ];
+        let all_lanes = bonsai_neon_dot::dot_ptq1_sixteen_rows_lanes(blocks, act_values);
+        for (r, row_lanes) in all_lanes.iter().enumerate() {
+            let rs = row_scale_quads[r / 4][r % 4];
+            let mut lane = lanes[r];
+            let f0 = i32x4::from_slice(neon, &row_lanes[0]).to_float::<f32x4<Neon>>();
+            lane = f0.mul_add_precise(f32x4::splat(neon, rs * a0), lane);
+            let f1 = i32x4::from_slice(neon, &row_lanes[1]).to_float::<f32x4<Neon>>();
+            lane = f1.mul_add_precise(f32x4::splat(neon, rs * a1), lane);
+            let f2 = i32x4::from_slice(neon, &row_lanes[2]).to_float::<f32x4<Neon>>();
+            lane = f2.mul_add_precise(f32x4::splat(neon, rs * a2), lane);
+            let f3 = i32x4::from_slice(neon, &row_lanes[3]).to_float::<f32x4<Neon>>();
+            lanes[r] = f3.mul_add_precise(f32x4::splat(neon, rs * a3), lane);
+        }
+    }
+    if !scales_finite.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    let mut out = [0.0_f32; 16];
+    for (dst, lane) in out.iter_mut().zip(lanes) {
+        let [l0, l1, l2, l3] = lane.to_array();
+        *dst = super::finite((l0 + l1) + (l2 + l3))?;
+    }
+    Ok(out)
+}
+
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Streams sixteen PTQ1 rows per block across ARMv8.2-A SDOT while preserving source multiply-then-add rounding."
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Streams sixteen PTQ1 rows per block with source rounding."
+)]
+pub(super) fn dot_ptq1_sixteen_rows_source(
+    rows: [&[u8]; 16],
+    input: &[super::Q8Block],
+) -> Result<[f32; 16]> {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        let lo = dot_ptq1_eight_rows_source(
+            [
+                rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+            ],
+            input,
+        )?;
+        let hi = dot_ptq1_eight_rows_source(
+            [
+                rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+            ],
+            input,
+        )?;
+        return Ok([
+            lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3],
+            hi[4], hi[5], hi[6], hi[7],
+        ]);
+    };
+    if !bonsai_neon_dot::has_dotprod() {
+        let lo = dot_ptq1_eight_rows_source(
+            [
+                rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+            ],
+            input,
+        )?;
+        let hi = dot_ptq1_eight_rows_source(
+            [
+                rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+            ],
+            input,
+        )?;
+        return Ok([
+            lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3],
+            hi[4], hi[5], hi[6], hi[7],
+        ]);
+    }
+    let mut outputs = [0.0_f32; 16];
+    let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let chunks = rows.map(|row| row.as_chunks::<28>().0);
+    let block_count = chunks.iter().map(|c| c.len()).min().unwrap_or(0);
+    for (index, _) in chunks[0].iter().enumerate().take(block_count) {
+        let activations = <&[super::Q8Block; 4]>::try_from(
+            input
+                .get(index * 4..index * 4 + 4)
+                .ok_or_else(|| crate::invalid("incompatible PTQ1 activation extent"))?,
+        )?;
+        let blocks: [&[u8; 28]; 16] = std::array::from_fn(|row| &chunks[row][index]);
+        let (scales0, scales1) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                ptq1_scale_u16(blocks[0]),
+                ptq1_scale_u16(blocks[1]),
+                ptq1_scale_u16(blocks[2]),
+                ptq1_scale_u16(blocks[3]),
+                ptq1_scale_u16(blocks[4]),
+                ptq1_scale_u16(blocks[5]),
+                ptq1_scale_u16(blocks[6]),
+                ptq1_scale_u16(blocks[7]),
+            ],
+        );
+        let (scales2, scales3) = f16_bits_to_f32_x8(
+            neon,
+            &[
+                ptq1_scale_u16(blocks[8]),
+                ptq1_scale_u16(blocks[9]),
+                ptq1_scale_u16(blocks[10]),
+                ptq1_scale_u16(blocks[11]),
+                ptq1_scale_u16(blocks[12]),
+                ptq1_scale_u16(blocks[13]),
+                ptq1_scale_u16(blocks[14]),
+                ptq1_scale_u16(blocks[15]),
+            ],
+        );
+        scales_finite = scales_finite
+            & scales0.is_finite()
+            & scales1.is_finite()
+            & scales2.is_finite()
+            & scales3.is_finite();
+        let row_scale_quads = [
+            scales0.to_array(),
+            scales1.to_array(),
+            scales2.to_array(),
+            scales3.to_array(),
+        ];
+        let act_scales = f32x4::from_slice(
+            neon,
+            &[
+                activations[0].scale,
+                activations[1].scale,
+                activations[2].scale,
+                activations[3].scale,
+            ],
+        );
+        let act_values = [
+            &activations[0].values,
+            &activations[1].values,
+            &activations[2].values,
+            &activations[3].values,
+        ];
+        let all_groups = bonsai_neon_dot::dot_ptq1_sixteen_rows_groups(blocks, act_values);
+        for (r, groups) in all_groups.iter().enumerate() {
+            let rs = row_scale_quads[r / 4][r % 4];
+            let prod =
+                (i32x4::from_slice(neon, groups).to_float::<f32x4<Neon>>() * act_scales).to_array();
+            let sum = (((0.0 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+            outputs[r] += rs * sum;
         }
     }
     if !scales_finite.all_true() {

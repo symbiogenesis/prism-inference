@@ -178,3 +178,161 @@ fn few_token_projection_tails_preserve_scalar_bits_and_failure_recovery() -> Res
     }
     Ok(())
 }
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn verify_neon_pq2_two_token_direct(
+    tensor: &Tensor,
+    inputs: &[Vec<f32>],
+    expected: &[Vec<u32>],
+    columns: usize,
+    rows: usize,
+    pinned: bool,
+) -> Result<()> {
+    let count = inputs.len();
+    if !matches!(rows, 4 | 8) || count > 14 {
+        return Ok(());
+    }
+    let row_bytes = (columns / 128) * 34;
+    let mut raw_preps = Vec::with_capacity(count);
+    let mut precomputed_preps = Vec::with_capacity(count);
+    for input in inputs {
+        let mut raw = if pinned {
+            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+        } else {
+            MatvecScratch::with_backend(MatvecBackend::Scalar)
+        };
+        let _ = raw.prepare(tensor, input)?;
+        raw.pq2_consumption = crate::kernels::packed_pq2::Activations::default();
+        raw_preps.push(raw);
+
+        let mut pre = if pinned {
+            MatvecScratch::with_pinned_backend(MatvecBackend::ExperimentalNeon)
+        } else {
+            MatvecScratch::with_backend(MatvecBackend::ExperimentalNeon)
+        };
+        let _ = pre.prepare(tensor, input)?;
+        precomputed_preps.push(pre);
+    }
+    for preps in [&raw_preps[..], &precomputed_preps[..]] {
+        let mut decoded = 0_u64;
+        if rows == 4 {
+            let row_refs: [&[u8]; 4] =
+                std::array::from_fn(|row| &tensor.data[row * row_bytes..(row + 1) * row_bytes]);
+            let out = dot::dot_four_rows::<MAX_TILE_TOKENS>(
+                row_refs,
+                preps,
+                PQ2,
+                columns,
+                pinned,
+                MatvecBackend::ExperimentalNeon,
+                &mut decoded,
+            )
+            .ok_or_else(|| crate::invalid("missing neon 4-row prefill"))??;
+            for (row, out_row) in out.iter().enumerate() {
+                let row_bits: Vec<u32> =
+                    out_row[..count].iter().copied().map(f32::to_bits).collect();
+                let expected_row: Vec<u32> = expected.iter().map(|tok| tok[row]).collect();
+                assert_eq!(row_bits, expected_row);
+            }
+        } else {
+            let row_refs: [&[u8]; 8] =
+                std::array::from_fn(|row| &tensor.data[row * row_bytes..(row + 1) * row_bytes]);
+            let out = dot::dot_eight_rows::<MAX_TILE_TOKENS>(
+                row_refs,
+                preps,
+                PQ2,
+                columns,
+                pinned,
+                MatvecBackend::ExperimentalNeon,
+                &mut decoded,
+            )
+            .ok_or_else(|| crate::invalid("missing neon 8-row prefill"))??;
+            for (row, out_row) in out.iter().enumerate() {
+                let row_bits: Vec<u32> =
+                    out_row[..count].iter().copied().map(f32::to_bits).collect();
+                let expected_row: Vec<u32> = expected.iter().map(|tok| tok[row]).collect();
+                assert_eq!(row_bits, expected_row);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn x1_pq2_two_token_prefill_matches_scalar_bits_across_token_and_row_counts() -> Result<()> {
+    for columns in [128_usize, 256, 384] {
+        for rows in [4_usize, 8, 12, 16] {
+            let mut data = Vec::with_capacity(rows * (columns / 128) * 34);
+            for row in 0..rows {
+                let values: Vec<f32> = (0..columns)
+                    .map(|column| {
+                        [1.25, -2.5, 0.0, -0.0, 0.5, -0.375, 3.0][(column * 3 + row * 5) % 7]
+                    })
+                    .collect();
+                data.extend_from_slice(&super::super::quantize_row(PQ2, &values)?);
+            }
+            let tensor = Tensor {
+                name: format!("x1-pq2-{columns}x{rows}"),
+                dimensions: vec![columns, rows],
+                kind: PQ2,
+                data: Arc::from(data),
+            };
+            for count in [2_usize, 3, 6, 7, 10, 14, 24] {
+                let inputs: Vec<Vec<f32>> = (0..count)
+                    .map(|token| {
+                        (0..columns)
+                            .map(|column| {
+                                [1.5, -64.0, 0.25, -0.5, 31.75, -3.25][(column + token * 7) % 6]
+                            })
+                            .collect()
+                    })
+                    .collect();
+                for pinned in [false, true] {
+                    let expected: Vec<Vec<u32>> = inputs
+                        .iter()
+                        .map(|input| {
+                            let mut scratch = if pinned {
+                                MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                            } else {
+                                MatvecScratch::with_backend(MatvecBackend::Scalar)
+                            };
+                            let mut output = Vec::new();
+                            matvec_into(&tensor, input, &mut output, &mut scratch)?;
+                            Ok(output.into_iter().map(f32::to_bits).collect())
+                        })
+                        .collect::<Result<_>>()?;
+                    for backend in [MatvecBackend::Auto, MatvecBackend::ExperimentalNeon] {
+                        let mut tile = ProjectionTile::with_backend(backend);
+                        let mut actual = vec![Vec::new(); count];
+                        tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
+                        let bits: Vec<Vec<u32>> = actual
+                            .iter()
+                            .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                            .collect();
+                        assert_eq!(
+                            bits, expected,
+                            "tile mismatch columns={columns} rows={rows} count={count} pinned={pinned}"
+                        );
+                    }
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    verify_neon_pq2_two_token_direct(
+                        &tensor, &inputs, &expected, columns, rows, pinned,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}

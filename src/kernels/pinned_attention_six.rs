@@ -18,6 +18,22 @@ pub(crate) fn dot(key: &[u16], queries: [&[f32]; 6]) -> Result<[f32; 6]> {
     dot_many(key, queries)
 }
 
+/// Reads and converts each cached F16 key element once across `HEADS` query heads
+/// (`HEADS` in `{2, 3, 6}`) sharing a six-head KV group.
+///
+/// # Errors
+/// Rejects unsupported group sizes, empty, mismatched or oversized rows and
+/// nonfinite reductions.
+pub(crate) fn dot_group<const HEADS: usize>(
+    key: &[u16],
+    queries: [&[f32]; HEADS],
+) -> Result<[f32; HEADS]> {
+    if !matches!(HEADS, 2 | 3 | 6) {
+        return Err(invalid("invalid six-group query head count"));
+    }
+    dot_many(key, queries)
+}
+
 /// Shares one cached key conversion across both tokens of a six-head pair.
 ///
 /// Twelve native-lane accumulators occupy 768 bytes, below the existing value
@@ -130,6 +146,113 @@ pub(crate) fn value_tile_gated<'a>(
         return value_tile_neon(neon, past, current, weights, &(offset..end), outputs, gates);
     }
     value_tile_scalar(past, current, weights, &(offset..end), outputs, gates)
+}
+
+/// Reduces one KV head for `HEADS` query heads (`HEADS` in `{2, 3, 6}`) using
+/// `[token][head]` packed binary16 weights, then applies original gates.
+///
+/// # Errors
+/// Rejects invalid group sizes, extents, cache-row counts, nonfinite inputs
+/// and nonfinite reductions before publishing any output.
+pub(crate) fn value_tile_group_packed_gated<'a, const HEADS: usize>(
+    past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[[u16; HEADS]],
+    offset: usize,
+    mut outputs: [&mut [f32]; HEADS],
+    gates: [&[f32]; HEADS],
+) -> Result<()> {
+    let width = current.len();
+    let count = weights.len();
+    if !matches!(HEADS, 2 | 3 | 6)
+        || width == 0
+        || width > VALUE_TILE
+        || count == 0
+        || count > crate::model::swift::CONTEXT_TOKENS
+        || outputs.iter().any(|output| output.len() != width)
+        || gates.iter().any(|gate| gate.len() != width)
+        || weights
+            .iter()
+            .flatten()
+            .any(|&bits| (bits & 0x7c00) == 0x7c00)
+        || current.iter().any(|value| !value.is_finite())
+    {
+        return Err(invalid("invalid pinned group attention value tile"));
+    }
+    let end = offset
+        .checked_add(width)
+        .ok_or_else(|| invalid("pinned attention value offset overflow"))?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if width.is_multiple_of(4)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return neon::value_tile_group_packed_neon(
+            neon,
+            past,
+            current,
+            weights,
+            &(offset..end),
+            outputs,
+            gates,
+        );
+    }
+    value_tile_group_packed_scalar(past, current, weights, &(offset..end), &mut outputs, gates)
+}
+
+fn value_tile_group_packed_scalar<'a, const HEADS: usize>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[[u16; HEADS]],
+    range: &std::ops::Range<usize>,
+    outputs: &mut [&mut [f32]; HEADS],
+    gates: [&[f32]; HEADS],
+) -> Result<()> {
+    let width = current.len();
+    let past_len = weights.len() - 1;
+    let mut sums = [[[0.0_f32; 16]; VALUE_TILE]; HEADS];
+    for (token, weight_bits) in weights[..past_len].iter().enumerate() {
+        let values = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let lane = token % 16;
+        let decoded_weights = weight_bits.map(bonsai_ternary::half_to_float);
+        for (channel, &bits) in values.iter().enumerate() {
+            let value = bonsai_ternary::half_to_float(bits);
+            for head in 0..HEADS {
+                sums[head][channel][lane] =
+                    value.mul_add(decoded_weights[head], sums[head][channel][lane]);
+            }
+        }
+    }
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last_lane = past_len % 16;
+    let last_weights = weights[past_len].map(bonsai_ternary::half_to_float);
+    for (channel, &value) in current.iter().enumerate() {
+        for head in 0..HEADS {
+            sums[head][channel][last_lane] =
+                value.mul_add(last_weights[head], sums[head][channel][last_lane]);
+        }
+    }
+    let mut reduced = [[0.0_f32; VALUE_TILE]; HEADS];
+    for head in 0..HEADS {
+        for channel in 0..width {
+            reduced[head][channel] = reduce(&sums[head][channel])?;
+        }
+    }
+    for head in 0..HEADS {
+        outputs[head].copy_from_slice(&reduced[head][..width]);
+        crate::kernels::mul_sigmoid_in_place(outputs[head], gates[head]);
+    }
+    Ok(())
 }
 
 #[expect(

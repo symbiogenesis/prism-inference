@@ -495,9 +495,7 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
     if arch == 73 {
         limits = limits.with_partial_secondary_arenas();
     }
-    let q2_session = driver
-        .open_native_q2_session(&package_dir, limits)
-        .ok()?;
+    let q2_session = driver.open_native_q2_session(&package_dir, limits).ok()?;
     let mut executor =
         bonsai_hexagon_runtime::NativeQ2Executor::new(q2_session, limits, 64 * 1024 * 1024)
             .with_row_parallelism(session.clone_row_parallelism())

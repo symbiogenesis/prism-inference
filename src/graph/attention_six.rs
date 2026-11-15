@@ -5,23 +5,18 @@ use crate::kernels::pinned_attention::{self, six};
 use crate::{Result, invalid};
 
 fn rows<T>(values: &mut [T], width: usize) -> Result<[&mut [T]; 6]> {
-    if width == 0 || values.len() != 6 * width {
-        return Err(invalid("invalid six-head attention scratch geometry"));
-    }
-    let mut rows = values.chunks_exact_mut(width);
-    let (Some(first), Some(second), Some(third), Some(fourth), Some(fifth), Some(sixth)) = (
-        rows.next(),
-        rows.next(),
-        rows.next(),
-        rows.next(),
-        rows.next(),
-        rows.next(),
-    ) else {
-        return Err(invalid("incomplete six-head attention scratch rows"));
-    };
-    Ok([first, second, third, fourth, fifth, sixth])
+    rows_group::<T, 6>(values, width)
 }
 
+fn rows_group<T, const HEADS: usize>(values: &mut [T], width: usize) -> Result<[&mut [T]; HEADS]> {
+    if HEADS == 0 || width == 0 || values.len() != HEADS * width {
+        return Err(invalid("invalid group attention scratch geometry"));
+    }
+    let mut rows = values.chunks_exact_mut(width);
+    Ok(std::array::from_fn(|_| rows.next().unwrap_or_default()))
+}
+
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Borrow existing transactional graph projections, caches and disjoint worker scratch directly."
@@ -156,6 +151,116 @@ fn apply_values(
             scores,
             offset + start,
             [o0, o1, o2, o3, o4, o5],
+            gates.map(|gate| &gate[start..end]),
+        )?;
+    }
+    Ok(())
+}
+
+/// Evaluates `HEADS` (`HEADS` in `{2, 3, 6}`) contiguous query heads sharing a single
+/// six-head KV group during decode using consumer-ordered `[token][head]` packed
+/// binary16 attention probabilities.
+///
+/// # Errors
+/// Rejects unsupported group sizes, misaligned heads, cross-KV spans or nonfinite reductions.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrow existing transactional graph projections, caches and disjoint worker scratch directly."
+)]
+pub(super) fn attend_group<const HEADS: usize>(
+    geometry: &Geometry,
+    head: usize,
+    queries: &[f32],
+    projected: &[f32],
+    keys: &KvCache,
+    values: &KvCache,
+    current_key: &[f32],
+    current_value: &[f32],
+    output: &mut [f32],
+    scores: &mut [f32],
+    packed_probs: &mut [[u16; HEADS]],
+    scale: f32,
+) -> Result<()> {
+    let width = geometry.head;
+    if !matches!(HEADS, 2 | 3 | 6)
+        || width == 0
+        || !head.is_multiple_of(HEADS)
+        || head + HEADS > geometry.heads
+        || geometry.kv_heads == 0
+        || geometry.heads / geometry.kv_heads != 6
+        || head / 6 != (head + HEADS - 1) / 6
+        || keys.width != geometry.kv_heads * width
+        || values.width != keys.width
+        || queries.len() != geometry.heads * width
+        || projected.len() != 2 * geometry.heads * width
+        || current_key.len() != keys.width
+        || current_value.len() != values.width
+    {
+        return Err(invalid("invalid group attention decode geometry"));
+    }
+    let past_tokens = keys.len / keys.width;
+    if past_tokens > values.len / values.width {
+        return Err(invalid("invalid group attention cache length"));
+    }
+    let offset = head / 6 * width;
+    let query_rows: [&[f32]; HEADS] =
+        std::array::from_fn(|index| &queries[(head + index) * width..(head + index + 1) * width]);
+    let score_len = past_tokens + 1;
+    let mut scores = rows_group::<f32, HEADS>(scores, score_len)?;
+    if packed_probs.len() != score_len {
+        return Err(invalid("invalid group attention packed probability length"));
+    }
+    for (position, key) in keys.tokens().take(past_tokens).enumerate() {
+        let dots = six::dot_group(&key[offset..offset + width], query_rows)?;
+        for (score, dot) in scores.iter_mut().zip(dots) {
+            score[position] = dot * scale;
+        }
+    }
+    for (score, query) in scores.iter_mut().zip(query_rows) {
+        score[score_len - 1] =
+            pinned_attention::dot_f32(&current_key[offset..offset + width], query)? * scale;
+    }
+    let score_refs = scores.each_mut().map(|row| &mut **row);
+    pinned_attention::softmax_pack_f16(score_refs, packed_probs)?;
+    apply_values_group(
+        geometry,
+        head,
+        projected,
+        values,
+        current_value,
+        output,
+        packed_probs,
+        past_tokens,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrow packed probability slice and the original cache/projection without extra scratch."
+)]
+fn apply_values_group<const HEADS: usize>(
+    geometry: &Geometry,
+    head: usize,
+    projected: &[f32],
+    values: &KvCache,
+    current_value: &[f32],
+    output: &mut [f32],
+    packed_probs: &[[u16; HEADS]],
+    past_tokens: usize,
+) -> Result<()> {
+    let width = geometry.head;
+    let offset = head / 6 * width;
+    let gates: [&[f32]; HEADS] =
+        std::array::from_fn(|index| attention_gate(projected, head + index, width));
+    let mut out_rows = rows_group::<f32, HEADS>(output, width)?;
+    for start in (0..width).step_by(six::VALUE_TILE) {
+        let end = (start + six::VALUE_TILE).min(width);
+        six::value_tile_group_packed_gated(
+            values.tokens().take(past_tokens),
+            &current_value[offset + start..offset + end],
+            packed_probs,
+            offset + start,
+            out_rows.each_mut().map(|row| &mut row[start..end]),
             gates.map(|gate| &gate[start..end]),
         )?;
     }

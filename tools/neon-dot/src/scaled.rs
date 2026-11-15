@@ -24,7 +24,7 @@ pub(super) fn valid<const ROWS: usize>(rows: [&[u8]; ROWS], activation: &[Pq2Act
 }
 
 pub(super) fn valid_rows<const ROWS: usize>(rows: [&[u8]; ROWS], count: usize) -> bool {
-    matches!(ROWS, 1 | 4 | 8)
+    matches!(ROWS, 1 | 4 | 8 | 16)
         && count != 0
         && count
             .checked_mul(34)
@@ -292,6 +292,115 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn x1_scaled_pq2_rows_preserve_16_row_parity_and_errors() {
+        let mut raw_values = [[0_i8; 128]; 2];
+        for (block_idx, block) in raw_values.iter_mut().enumerate() {
+            for (elem_idx, slot) in block.iter_mut().enumerate() {
+                let raw = i8::try_from((block_idx * 43 + elem_idx * 17) % 199).unwrap_or(0);
+                *slot = raw.wrapping_sub(99);
+            }
+        }
+        let activation = [
+            Pq2Activation {
+                values: raw_values[0],
+                scale: 0.125,
+                sum: raw_values[0].iter().map(|&v| i32::from(v)).sum(),
+            },
+            Pq2Activation {
+                values: raw_values[1],
+                scale: -0.0625,
+                sum: raw_values[1].iter().map(|&v| i32::from(v)).sum(),
+            },
+        ];
+        let scale_pool: [u16; 16] = [
+            0x3c00, 0xbc00, 0x3800, 0xb800, 0x4000, 0xc000, 0x3400, 0xb400, 0x8000, 0x0000, 0x3e00,
+            0xbe00, 0x4200, 0xc200, 0x3600, 0xb600,
+        ];
+        let mut rows = [[0_u8; 68]; 16];
+        for (row_idx, row) in rows.iter_mut().enumerate() {
+            for (block_idx, scale_bits) in [scale_pool[row_idx], scale_pool[(row_idx + 7) % 16]]
+                .into_iter()
+                .enumerate()
+            {
+                let start = block_idx * 34;
+                let le = scale_bits.to_le_bytes();
+                row[start] = le[0];
+                row[start + 1] = le[1];
+                for byte_idx in 0..32 {
+                    row[start + 2 + byte_idx] =
+                        u8::try_from((row_idx * 29 + block_idx * 53 + byte_idx * 13 + 3) % 256)
+                            .unwrap_or(0);
+                }
+            }
+        }
+        let refs: [&[u8]; 16] = std::array::from_fn(|row| rows[row].as_slice());
+        let expected_fused = portable::<16, true>(refs, &activation);
+        let expected_unfused = portable::<16, false>(refs, &activation);
+        assert!(expected_fused.is_some());
+        assert!(expected_unfused.is_some());
+
+        if let Some(detected) = crate::Pq2Dotprod::detect() {
+            assert_eq!(
+                detected
+                    .dot_scaled_rows::<16, true>(refs, &activation)
+                    .map(|values| values.map(f32::to_bits)),
+                expected_fused.map(|values| values.map(f32::to_bits))
+            );
+            assert_eq!(
+                detected
+                    .dot_scaled_rows::<16, false>(refs, &activation)
+                    .map(|values| values.map(f32::to_bits)),
+                expected_unfused.map(|values| values.map(f32::to_bits))
+            );
+            let prepared = detected.prepare_scaled(&activation);
+            assert!(prepared.is_some());
+            if let Some(prepared) = prepared {
+                assert_eq!(
+                    prepared
+                        .dot_scaled_rows::<16, true>(refs)
+                        .map(|values| values.map(f32::to_bits)),
+                    expected_fused.map(|values| values.map(f32::to_bits))
+                );
+            }
+            for (row, &bytes) in refs.iter().enumerate() {
+                assert_eq!(
+                    detected
+                        .dot_scaled_rows::<1, true>([bytes], &activation)
+                        .map(|value| value[0].to_bits()),
+                    expected_fused.map(|values| values[row].to_bits())
+                );
+            }
+
+            let mut short_refs = refs;
+            short_refs[15] = &rows[15][..67];
+            assert!(
+                detected
+                    .dot_scaled_rows::<16, true>(short_refs, &activation)
+                    .is_none()
+            );
+
+            let mut bad_scale_rows = rows;
+            let nan_bits = 0x7e00_u16.to_le_bytes();
+            bad_scale_rows[11][34] = nan_bits[0];
+            bad_scale_rows[11][35] = nan_bits[1];
+            let bad_refs: [&[u8]; 16] = std::array::from_fn(|row| bad_scale_rows[row].as_slice());
+            assert!(
+                detected
+                    .dot_scaled_rows::<16, true>(bad_refs, &activation)
+                    .is_none()
+            );
+
+            let mut inf_act = activation;
+            inf_act[1].scale = f32::INFINITY;
+            assert!(
+                detected
+                    .dot_scaled_rows::<16, true>(refs, &inf_act)
+                    .is_none()
+            );
         }
     }
 }

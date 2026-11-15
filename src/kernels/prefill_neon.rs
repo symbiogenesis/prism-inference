@@ -582,8 +582,54 @@ pub(in crate::kernels::prefill) fn dot_pq2_four_rows<const TOKENS: usize>(
                     next.store_slice(&mut sums[r][base..base + 4]);
                 }
             }
-            let rem_base = chunks4.len() * 4;
-            for (offset, scratch) in rem4.iter().enumerate() {
+            let base2 = chunks4.len() * 4;
+            let (chunks2, rem2) = rem4.as_chunks::<2>();
+            for (chunk_idx, chunk) in chunks2.iter().enumerate() {
+                let token0 = base2 + chunk_idx * 2;
+                let (dots, act_scales) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    (
+                        dotprod.dot_four_rows_two_tokens(
+                            packed_rows,
+                            [&a0.values, &a1.values],
+                            [a0.sum, a1.sum],
+                        ),
+                        [a0.scale, a1.scale],
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    (
+                        bonsai_neon_dot::dot_pq2_four_rows_two_tokens(
+                            packed_rows,
+                            [
+                                a0.values[start..start + 128].try_into().ok()?,
+                                a1.values[start..start + 128].try_into().ok()?,
+                            ],
+                            [
+                                q8k_half_sum(neon, &a0.sums, half),
+                                q8k_half_sum(neon, &a1.sums, half),
+                            ],
+                        ),
+                        [a0.scale, a1.scale],
+                    )
+                };
+                for r in 0..4 {
+                    for (t, &scale) in act_scales.iter().enumerate() {
+                        let d = row_scales[r] * scale;
+                        let dot_f32 = crate::kernels::integer_float(dots[r][t]);
+                        let token = token0 + t;
+                        sums[r][token] = if pinned {
+                            d.mul_add(dot_f32, sums[r][token])
+                        } else {
+                            sums[r][token] + d * dot_f32
+                        };
+                    }
+                }
+            }
+            let rem_base = base2 + chunks2.len() * 2;
+            for (offset, scratch) in rem2.iter().enumerate() {
                 let token = rem_base + offset;
                 let (dots, act_scale) = if has_precomputed {
                     let act_block = &scratch.pq2_consumption[index];
@@ -969,8 +1015,54 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     }
                 }
             }
-            let rem_base = base4 + chunks4.len() * 4;
-            for (offset, scratch) in rem4.iter().enumerate() {
+            let base2 = base4 + chunks4.len() * 4;
+            let (chunks2, rem2) = rem4.as_chunks::<2>();
+            for (chunk_idx, chunk) in chunks2.iter().enumerate() {
+                let token0 = base2 + chunk_idx * 2;
+                let (dots8, act_scales) = if has_precomputed {
+                    let a0 = &chunk[0].pq2_consumption[index];
+                    let a1 = &chunk[1].pq2_consumption[index];
+                    (
+                        dotprod.dot_eight_rows_two_tokens(
+                            packed_all,
+                            [&a0.values, &a1.values],
+                            [a0.sum, a1.sum],
+                        ),
+                        [a0.scale, a1.scale],
+                    )
+                } else {
+                    let a0 = &chunk[0].q8k[q8k_idx];
+                    let a1 = &chunk[1].q8k[q8k_idx];
+                    (
+                        bonsai_neon_dot::dot_pq2_eight_rows_two_tokens(
+                            packed_all,
+                            [
+                                a0.values[start..start + 128].try_into().ok()?,
+                                a1.values[start..start + 128].try_into().ok()?,
+                            ],
+                            [
+                                q8k_half_sum(neon, &a0.sums, half),
+                                q8k_half_sum(neon, &a1.sums, half),
+                            ],
+                        ),
+                        [a0.scale, a1.scale],
+                    )
+                };
+                for row in 0..8 {
+                    for (t, &scale) in act_scales.iter().enumerate() {
+                        let d = row_scales[row] * scale;
+                        let dot_f32 = crate::kernels::integer_float(dots8[row][t]);
+                        let token = token0 + t;
+                        sums[row][token] = if pinned {
+                            d.mul_add(dot_f32, sums[row][token])
+                        } else {
+                            sums[row][token] + d * dot_f32
+                        };
+                    }
+                }
+            }
+            let rem_base = base2 + chunks2.len() * 2;
+            for (offset, scratch) in rem2.iter().enumerate() {
                 let token = rem_base + offset;
                 if has_precomputed {
                     let act_block = &scratch.pq2_consumption[index];

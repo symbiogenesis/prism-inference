@@ -2223,11 +2223,18 @@ impl MatvecScratch {
         }
         let pinned = self.pinned_accumulation;
         let activations = packed_pq2::Consumer::new(&self.pq2_consumption)?;
-        self.row_parallelism.fill_four_rows(
+        self.row_parallelism.fill_sixteen_rows(
             data,
             row_bytes,
             output,
             &mut self.row_errors,
+            |rows| {
+                if pinned {
+                    activations.dot_sixteen_rows::<true>(rows)
+                } else {
+                    activations.dot_sixteen_rows::<false>(rows)
+                }
+            },
             |rows| {
                 if pinned {
                     activations.dot_eight_rows::<true>(rows)
@@ -2698,21 +2705,23 @@ impl PreparedMatvec<'_> {
                 {
                     let q8 = &scratch.q8;
                     if scratch.pinned_accumulation {
-                        return scratch.row_parallelism.fill_four_rows(
+                        return scratch.row_parallelism.fill_sixteen_rows(
                             &tensor.data,
                             row_bytes,
                             output,
                             &mut scratch.row_errors,
+                            |rows| neon::dot_ptq1_sixteen_rows_pinned(rows, q8),
                             |rows| neon::dot_ptq1_eight_rows_pinned(rows, q8),
                             |rows| neon::dot_ptq1_four_rows_pinned(rows, q8),
                             |bytes| neon::dot_ptq1_row_pinned(bytes, q8),
                         );
                     }
-                    return scratch.row_parallelism.fill_four_rows(
+                    return scratch.row_parallelism.fill_sixteen_rows(
                         &tensor.data,
                         row_bytes,
                         output,
                         &mut scratch.row_errors,
+                        |rows| neon::dot_ptq1_sixteen_rows_source(rows, q8),
                         |rows| neon::dot_ptq1_eight_rows_source(rows, q8),
                         |rows| neon::dot_ptq1_four_rows_source(rows, q8),
                         |bytes| neon::dot_ptq1_row_source(bytes, q8),
@@ -5601,6 +5610,88 @@ mod tests {
                     for (&actual, &expected) in output.iter().zip(&expected_ptq1) {
                         assert!((actual - expected).abs() <= 1e-4);
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn x1_ptq1_sixteen_rows_match_row_reference_across_geometries() -> crate::Result<()> {
+        for columns in [128_usize, 256, 384] {
+            let input: Vec<f32> = (0..columns)
+                .map(|idx| {
+                    let signed = match idx % 7 {
+                        0 => 1.5,
+                        1 => -2.25,
+                        2 => 0.75,
+                        3 => -1.125,
+                        4 => 3.0,
+                        5 => -0.5,
+                        _ => 0.25,
+                    };
+                    signed * f32::from(u8::try_from(idx % 5).unwrap_or(0)).mul_add(0.125, 1.0)
+                })
+                .collect();
+            let max_rows = 33_usize;
+            let row_bytes = (columns / 128) * 28;
+            let mut all_rows = Vec::with_capacity(max_rows * row_bytes);
+            let mut single_row_tensors = Vec::with_capacity(max_rows);
+            for row in 0..max_rows {
+                let scale = 0.125_f32.mul_add(f32::from(u8::try_from(row % 19)?), 0.75);
+                let mut weights = vec![0.0_f32; columns];
+                for (col, slot) in weights.iter_mut().enumerate() {
+                    *slot = match (col * 3 + row * 5) % 6 {
+                        0 | 2 => scale,
+                        1 | 4 => -scale,
+                        _ => 0.0,
+                    };
+                }
+                let encoded = super::quantize_row(super::PTQ1, &weights)?;
+                all_rows.extend_from_slice(&encoded);
+                single_row_tensors.push(Tensor {
+                    name: format!("ptq1_single_{columns}_{row}"),
+                    dimensions: vec![columns, 1],
+                    kind: super::PTQ1,
+                    data: Arc::from(encoded),
+                });
+            }
+
+            let mut expected_single_pinned = Vec::with_capacity(max_rows);
+            let mut expected_single_source = Vec::with_capacity(max_rows);
+            let mut ref_out = Vec::new();
+            let mut ref_pinned =
+                MatvecScratch::with_pinned_backend(super::MatvecBackend::ExperimentalNeon);
+            let mut ref_source =
+                MatvecScratch::with_backend(super::MatvecBackend::ExperimentalNeon);
+            for single in &single_row_tensors {
+                matvec_into(single, &input, &mut ref_out, &mut ref_pinned)?;
+                expected_single_pinned.push(ref_out[0].to_bits());
+                matvec_into(single, &input, &mut ref_out, &mut ref_source)?;
+                expected_single_source.push(ref_out[0].to_bits());
+            }
+
+            for rows in 1_usize..=max_rows {
+                let tensor = Tensor {
+                    name: format!("ptq1_multi_{columns}_{rows}"),
+                    dimensions: vec![columns, rows],
+                    kind: super::PTQ1,
+                    data: Arc::from(all_rows[..rows * row_bytes].to_vec()),
+                };
+                for backend in [
+                    super::MatvecBackend::Auto,
+                    super::MatvecBackend::ExperimentalNeon,
+                ] {
+                    let mut out = Vec::new();
+                    let mut pinned = MatvecScratch::with_pinned_backend(backend);
+                    matvec_into(&tensor, &input, &mut out, &mut pinned)?;
+                    let actual_pinned: Vec<u32> = out.iter().copied().map(f32::to_bits).collect();
+                    assert_eq!(actual_pinned, expected_single_pinned[..rows]);
+
+                    let mut source = MatvecScratch::with_backend(backend);
+                    matvec_into(&tensor, &input, &mut out, &mut source)?;
+                    let actual_source: Vec<u32> = out.iter().copied().map(f32::to_bits).collect();
+                    assert_eq!(actual_source, expected_single_source[..rows]);
                 }
             }
         }

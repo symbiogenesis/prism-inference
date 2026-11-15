@@ -68,7 +68,7 @@ pub struct Pq2Prepared<'a> {
 }
 
 impl Pq2Prepared<'_> {
-    /// Consumes one, four or eight complete rows using the validated scope.
+    /// Consumes one, four, eight or sixteen complete rows using the validated scope.
     ///
     /// Row extents, packed weight scales and final results remain checked on
     /// every call. Original integer correction and floating accumulation order
@@ -118,7 +118,7 @@ impl Pq2Dotprod {
 
     /// Consumes complete packed rows inside one detected `SDOT` invocation.
     ///
-    /// Supports one, four or eight rows of original 34-byte PQ2 blocks. Every
+    /// Supports one, four, eight or sixteen rows of original 34-byte PQ2 blocks. Every
     /// block retains its original scale product and ordered fused or separate
     /// accumulation; no weights or activations are copied or retained.
     /// Returns `None` for unsupported geometry or a nonfinite scale/result.
@@ -154,6 +154,54 @@ impl Pq2Dotprod {
             #[cfg(target_arch = "aarch64")]
             i8mm,
         })
+    }
+
+    /// Computes a 4-row by 2-token exact integer tile from pre-transposed planes.
+    #[inline]
+    #[must_use]
+    pub fn dot_four_rows_two_tokens(
+        self,
+        packed: [&[u8; 32]; 4],
+        planes: [&[i8; 128]; 2],
+        activation_sums: [i32; 2],
+    ) -> [[i32; 2]; 4] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_four_rows_two_tokens(self, packed, planes, activation_sums)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| {
+                [
+                    self.dot(row, planes[0], activation_sums[0]),
+                    self.dot(row, planes[1], activation_sums[1]),
+                ]
+            })
+        }
+    }
+
+    /// Computes an 8-row by 2-token exact integer tile from pre-transposed planes.
+    #[inline]
+    #[must_use]
+    pub fn dot_eight_rows_two_tokens(
+        self,
+        packed: [&[u8; 32]; 8],
+        planes: [&[i8; 128]; 2],
+        activation_sums: [i32; 2],
+    ) -> [[i32; 2]; 8] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_eight_rows_two_tokens(self, packed, planes, activation_sums)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            packed.map(|row| {
+                [
+                    self.dot(row, planes[0], activation_sums[0]),
+                    self.dot(row, planes[1], activation_sums[1]),
+                ]
+            })
+        }
     }
 
     /// Computes one exact unsigned-code dot minus the supplied activation sum.
@@ -589,6 +637,74 @@ pub fn dot_ptq1_8x1_groups(
                 &halves[1],
             )
         })
+    })
+}
+
+/// Computes the 16-row by 4-group 4-lane `DOTPROD` sums for packed `PTQ1_0` blocks.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_sixteen_rows_lanes(
+    packed: [&[u8; 28]; 16],
+    activations: [&[i8; 32]; 4],
+) -> [[[i32; 4]; 4]; 16] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(lanes) = aarch64::dot_ptq1_sixteen_rows_lanes(packed, activations) {
+        return lanes;
+    }
+    packed.map(|block| dot_ptq1_block_lanes(block, activations))
+}
+
+/// Computes the 16-row by 4-group 32-element integer dot sums for packed `PTQ1_0` blocks.
+#[inline]
+#[must_use]
+pub fn dot_ptq1_sixteen_rows_groups(
+    packed: [&[u8; 28]; 16],
+    activations: [&[i8; 32]; 4],
+) -> [[i32; 4]; 16] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(groups) = aarch64::dot_ptq1_sixteen_rows_groups(packed, activations) {
+        return groups;
+    }
+    packed.map(|block| dot_ptq1_block_groups(block, activations))
+}
+
+/// Computes a 4-row by 2-token exact unsigned-code dot tile for `PQ2` weights.
+#[inline]
+#[must_use]
+pub fn dot_pq2_four_rows_two_tokens(
+    packed: [&[u8; 32]; 4],
+    acts: [&[i8; 128]; 2],
+    activation_sums: [i32; 2],
+) -> [[i32; 2]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::dot_pq2_four_rows_two_tokens(packed, acts, activation_sums) {
+        return tile;
+    }
+    packed.map(|row| {
+        [
+            dot_pq2_sequential_scalar(row, acts[0], activation_sums[0]),
+            dot_pq2_sequential_scalar(row, acts[1], activation_sums[1]),
+        ]
+    })
+}
+
+/// Computes an 8-row by 2-token exact unsigned-code dot tile for `PQ2` weights.
+#[inline]
+#[must_use]
+pub fn dot_pq2_eight_rows_two_tokens(
+    packed: [&[u8; 32]; 8],
+    acts: [&[i8; 128]; 2],
+    activation_sums: [i32; 2],
+) -> [[i32; 2]; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(tile) = aarch64::dot_pq2_eight_rows_two_tokens(packed, acts, activation_sums) {
+        return tile;
+    }
+    packed.map(|row| {
+        [
+            dot_pq2_sequential_scalar(row, acts[0], activation_sums[0]),
+            dot_pq2_sequential_scalar(row, acts[1], activation_sums[1]),
+        ]
     })
 }
 
@@ -1318,6 +1434,104 @@ mod tests {
                     tile8x4
                 );
             }
+        }
+    }
+
+    #[test]
+    fn pq2_two_token_and_ptq1_sixteen_row_kernels_match_reference() {
+        let rows: [[u8; 32]; 8] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| {
+                r.to_le_bytes()[0]
+                    .wrapping_mul(31)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(73))
+                    .wrapping_add(11)
+            })
+        });
+        let acts: [[i8; 128]; 2] = std::array::from_fn(|t| {
+            std::array::from_fn(|i| {
+                i8::from_ne_bytes([t.to_le_bytes()[0]
+                    .wrapping_mul(41)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(29))
+                    .wrapping_sub(63)])
+            })
+        });
+        let sums = [
+            acts[0].iter().map(|&v| i32::from(v)).sum(),
+            acts[1].iter().map(|&v| i32::from(v)).sum(),
+        ];
+        let row_refs8: [&[u8; 32]; 8] = std::array::from_fn(|r| &rows[r]);
+        let row_refs4: [&[u8; 32]; 4] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+        let act_refs2: [&[i8; 128]; 2] = [&acts[0], &acts[1]];
+        let expected8: [[i32; 2]; 8] = std::array::from_fn(|r| {
+            [
+                dot_pq2_sequential_scalar(&rows[r], &acts[0], sums[0]),
+                dot_pq2_sequential_scalar(&rows[r], &acts[1], sums[1]),
+            ]
+        });
+        assert_eq!(
+            dot_pq2_eight_rows_two_tokens(row_refs8, act_refs2, sums),
+            expected8
+        );
+        assert_eq!(
+            dot_pq2_four_rows_two_tokens(row_refs4, act_refs2, sums),
+            [expected8[0], expected8[1], expected8[2], expected8[3]]
+        );
+
+        let planes: [[i8; 128]; 2] = std::array::from_fn(|t| {
+            std::array::from_fn(|index| {
+                acts[t][(index / 64) * 64 + (index % 16) * 4 + (index / 16) % 4]
+            })
+        });
+        let plane_refs2: [&[i8; 128]; 2] = [&planes[0], &planes[1]];
+        if let Some(detected) = Pq2Dotprod::detect() {
+            #[cfg(target_arch = "aarch64")]
+            let sdot_only = Pq2Dotprod {
+                i8mm: false,
+                ..detected
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let sdot_only = detected;
+            for capability in [detected, sdot_only] {
+                assert_eq!(
+                    capability.dot_eight_rows_two_tokens(row_refs8, plane_refs2, sums),
+                    expected8
+                );
+                assert_eq!(
+                    capability.dot_four_rows_two_tokens(row_refs4, plane_refs2, sums),
+                    [expected8[0], expected8[1], expected8[2], expected8[3]]
+                );
+            }
+        }
+
+        let ptq_rows: [[u8; 28]; 16] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| {
+                r.to_le_bytes()[0]
+                    .wrapping_mul(37)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(83))
+                    .wrapping_add(5)
+            })
+        });
+        let ptq_acts: [[i8; 32]; 4] = std::array::from_fn(|g| {
+            std::array::from_fn(|i| {
+                i8::from_ne_bytes([g.to_le_bytes()[0]
+                    .wrapping_mul(53)
+                    .wrapping_add(i.to_le_bytes()[0].wrapping_mul(19))
+                    .wrapping_sub(31)])
+            })
+        });
+        let ptq_row_refs: [&[u8; 28]; 16] = std::array::from_fn(|r| &ptq_rows[r]);
+        let ptq_act_refs: [&[i8; 32]; 4] = [&ptq_acts[0], &ptq_acts[1], &ptq_acts[2], &ptq_acts[3]];
+        let actual_lanes = dot_ptq1_sixteen_rows_lanes(ptq_row_refs, ptq_act_refs);
+        let actual_groups = dot_ptq1_sixteen_rows_groups(ptq_row_refs, ptq_act_refs);
+        for r in 0..16 {
+            assert_eq!(
+                actual_lanes[r],
+                dot_ptq1_block_lanes(&ptq_rows[r], ptq_act_refs)
+            );
+            assert_eq!(
+                actual_groups[r],
+                dot_ptq1_block_groups(&ptq_rows[r], ptq_act_refs)
+            );
         }
     }
 

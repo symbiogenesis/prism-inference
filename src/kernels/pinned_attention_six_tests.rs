@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use bonsai_ternary::half_to_float;
 
-use super::{dot, dot_pair, value_tile_gated};
+use super::{dot, dot_group, dot_pair, value_tile_gated, value_tile_group_packed_gated};
 
 fn outputs(values: &mut [Vec<f32>; 6]) -> [&mut [f32]; 6] {
     let [first, second, third, fourth, fifth, sixth] = values;
@@ -317,5 +317,95 @@ fn six_head_paired_scores_match_independent_native_lanes_and_reject_bad_rows() -
     let mut queries = [[&[1.0_f32][..]; 6]; 2];
     queries[1][5] = &[f32::NAN];
     assert!(dot_pair(&[0x3c00], queries).is_err());
+    Ok(())
+}
+
+fn check_group_packed<const HEADS: usize>() -> crate::Result<()> {
+    let pattern = [0, 0x8000, 1, 0x8001, 0x3555, 0xb555, 0x3c00, 0xbc00];
+    let key = vec![0x3c00_u16; 64];
+    let queries_dot: [Vec<f32>; HEADS] = std::array::from_fn(|head| {
+        (0..64)
+            .map(|i| half_to_float(pattern[(i + head * 3) % pattern.len()]))
+            .collect()
+    });
+    let actual_dot = dot_group(&key, queries_dot.each_ref().map(Vec::as_slice))?;
+    for (head, query) in queries_dot.iter().enumerate() {
+        let expected = super::super::dot(key.iter().copied().map(half_to_float), query)?;
+        assert_eq!(actual_dot[head].to_bits(), expected.to_bits());
+    }
+    for count in [1, 2, 15, 16, 17, 65] {
+        for width in [3, 4, 8, 31, 64] {
+            let offset = 4;
+            let rows: Vec<Vec<u16>> = (0..count - 1)
+                .map(|token| {
+                    (0..offset + width)
+                        .map(|c| pattern[(token + c) % 8])
+                        .collect()
+                })
+                .collect();
+            let current: Vec<f32> = (0..width).map(|c| half_to_float(pattern[c % 8])).collect();
+            let mut raw_scores: [Vec<f32>; HEADS] = std::array::from_fn(|head| {
+                (0..count)
+                    .map(|t| [-2.0_f32, -0.5, 0.25, 1.5][(t + head) % 4])
+                    .collect()
+            });
+            let mut f32_scores = raw_scores.clone();
+            for row in &mut f32_scores {
+                super::super::softmax_round_f16(row)?;
+            }
+            let mut packed = vec![[0_u16; HEADS]; count];
+            let score_refs = raw_scores.each_mut().map(Vec::as_mut_slice);
+            super::super::softmax_pack_f16(score_refs, &mut packed)?;
+            let gates: [Vec<f32>; HEADS] = std::array::from_fn(|head| {
+                (0..width)
+                    .map(|c| [-4.0, -1.0, 0.0, 1.0, 4.0][(c + head) % 5])
+                    .collect()
+            });
+            let mut actual: [Vec<f32>; HEADS] = std::array::from_fn(|_| vec![19.0; width]);
+            let mut actual_refs = actual.each_mut();
+            let out_slices: [&mut [f32]; HEADS] = actual_refs.each_mut().map(|v| v.as_mut_slice());
+            value_tile_group_packed_gated(
+                rows.iter().map(Vec::as_slice),
+                &current,
+                &packed,
+                offset,
+                out_slices,
+                gates.each_ref().map(Vec::as_slice),
+            )?;
+            for (head, output) in actual.iter().enumerate() {
+                for (channel, &output) in output.iter().enumerate() {
+                    let expected = super::super::dot(
+                        rows.iter()
+                            .map(|row| half_to_float(row[offset + channel]))
+                            .chain(std::iter::once(current[channel])),
+                        &f32_scores[head],
+                    )? * (1.0 / (1.0 + (-gates[head][channel]).exp()));
+                    assert_eq!(output.to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn group_scores_and_packed_values_match_six_head_oracle() -> crate::Result<()> {
+    check_group_packed::<2>()?;
+    check_group_packed::<3>()?;
+    check_group_packed::<6>()?;
+    assert!(dot_group::<4>(&[0x3c00; 4], [&[1.0; 4]; 4]).is_err());
+    let mut bad_out = [[0.0; 4]; 4];
+    let [o0, o1, o2, o3] = &mut bad_out;
+    assert!(
+        value_tile_group_packed_gated::<4>(
+            std::iter::empty(),
+            &[1.0; 4],
+            &[[0x3c00; 4]],
+            0,
+            [o0, o1, o2, o3],
+            [&[0.0; 4]; 4],
+        )
+        .is_err()
+    );
     Ok(())
 }

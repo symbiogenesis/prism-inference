@@ -55,6 +55,18 @@ impl<'a> Consumer<'a> {
         super::dot_eight_rows::<FUSED>(rows, self.input)
     }
 
+    pub(in crate::kernels) fn dot_sixteen_rows<const FUSED: bool>(
+        &self,
+        rows: [&[u8]; 16],
+    ) -> Result<[f32; 16]> {
+        if let Some(dotprod) = self.dotprod {
+            return dotprod
+                .dot_scaled_rows::<16, FUSED>(rows)
+                .ok_or_else(|| self.failure(rows));
+        }
+        super::dot_sixteen_rows::<FUSED>(rows, self.input)
+    }
+
     // The safe helper checks every row extent before touching a packed block.
     // Only repeat that classification after rejection to preserve diagnostics;
     // successful row tiles do not need a second geometry scan here.

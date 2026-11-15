@@ -109,6 +109,7 @@ impl Fixture {
             &mut self.values,
             &mut self.scratch.query,
             &mut self.scratch.scores,
+            &mut self.scratch.packed_probs,
             &mut self.scratch.frequencies,
             &mut self.scratch.attended,
         )
@@ -117,6 +118,7 @@ impl Fixture {
     fn assert_unpublished(&self) {
         assert_eq!(self.scratch.attended.len(), 0);
         assert_eq!(self.scratch.scores.len(), 0);
+        assert_eq!(self.scratch.packed_probs.len(), 0);
         assert_eq!(self.keys.tokens().count(), 2);
         assert_eq!(self.values.tokens().count(), 2);
     }

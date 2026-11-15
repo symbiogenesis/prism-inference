@@ -177,6 +177,143 @@ pub(crate) fn value_tile_four_gated<'a>(
     value_tile_four_inner(past, current, weights, offset, outputs, Some(gates))
 }
 
+/// Accumulates four attention heads across shared F16 value rows using `[token][head]`
+/// packed binary16 probabilities and fuses each output lane's sigmoid gate.
+///
+/// # Errors
+/// Rejects invalid value-tile geometry, gate widths, nonfinite inputs, incomplete
+/// caches and nonfinite reductions.
+pub(crate) fn value_tile_four_packed_gated<'a>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[[u16; 4]],
+    offset: usize,
+    mut outputs: [&mut [f32]; 4],
+    gates: [&[f32]; 4],
+) -> Result<()> {
+    let out_len = outputs[0].len();
+    let weight_len = weights.len();
+    if out_len == 0
+        || out_len > VALUE_TILE_FOUR
+        || weight_len == 0
+        || weight_len > crate::model::swift::CONTEXT_TOKENS
+        || outputs.iter().any(|out| out.len() != out_len)
+        || gates.iter().any(|gate| gate.len() != out_len)
+        || weights
+            .iter()
+            .flatten()
+            .any(|&bits| (bits & 0x7c00) == 0x7c00)
+        || current.iter().any(|value| !value.is_finite())
+    {
+        return Err(invalid("invalid pinned attention packed value tile"));
+    }
+    if current.len() != out_len {
+        return Err(invalid(
+            "invalid pinned attention current value tile length",
+        ));
+    }
+    let end = offset
+        .checked_add(out_len)
+        .ok_or_else(|| invalid("pinned attention value offset overflow"))?;
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if out_len.is_multiple_of(4)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return neon::value_tile_four_packed_gated(
+            neon,
+            past,
+            current,
+            weights,
+            &(offset..end),
+            outputs,
+            gates,
+        );
+    }
+
+    value_tile_four_packed_scalar(&mut past, current, weights, &(offset..end), &mut outputs)?;
+    for (output, gate) in outputs.into_iter().zip(gates) {
+        super::mul_sigmoid_in_place(output, gate);
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::large_stack_arrays,
+    clippy::needless_range_loop,
+    reason = "Keep explicit 4-head x 4x4 temporal indices aligned with the bounded 32 KiB accumulator."
+)]
+fn value_tile_four_packed_scalar<'a>(
+    past: &mut impl Iterator<Item = &'a [u16]>,
+    current: &[f32],
+    weights: &[[u16; 4]],
+    range: &std::ops::Range<usize>,
+    outputs: &mut [&mut [f32]; 4],
+) -> Result<()> {
+    let out_len = outputs[0].len();
+    let weight_len = weights.len();
+    let past_len = weight_len - 1;
+    let mut sums = [[[[0.0_f32; 4]; 4]; VALUE_TILE_FOUR]; 4];
+    for (index, weight_bits) in weights[..past_len].iter().enumerate() {
+        let values = past
+            .next()
+            .and_then(|row| row.get(range.start..range.end))
+            .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        let r = index % 16 / 4;
+        let c = index % 4;
+        let decoded_weights = weight_bits.map(bonsai_ternary::half_to_float);
+        for (channel, &value) in values.iter().enumerate() {
+            let decoded = bonsai_ternary::half_to_float(value);
+            for h in 0..4 {
+                let lane = &mut sums[h][channel][r][c];
+                *lane = decoded.mul_add(decoded_weights[h], *lane);
+            }
+        }
+    }
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    let last_r = past_len % 16 / 4;
+    let last_c = past_len % 4;
+    let last_weights = weights[past_len].map(bonsai_ternary::half_to_float);
+    for (channel, &value) in current.iter().enumerate() {
+        for h in 0..4 {
+            let lane = &mut sums[h][channel][last_r][last_c];
+            *lane = value.mul_add(last_weights[h], *lane);
+        }
+    }
+    for index in weight_len..padded_dot_steps(weight_len) {
+        let r = index % 16 / 4;
+        let c = index % 4;
+        for h in 0..4 {
+            for sum in &mut sums[h][..out_len] {
+                let lane = &mut sum[r][c];
+                *lane = 0.0_f32.mul_add(0.0, *lane);
+            }
+        }
+    }
+    let mut staged = [[0.0_f32; VALUE_TILE_FOUR]; 4];
+    for h in 0..4 {
+        for (out, sum) in staged[h][..out_len].iter_mut().zip(&sums[h][..out_len]) {
+            let mut lanes = [0.0; 4];
+            for (index, lane) in lanes.iter_mut().enumerate() {
+                *lane = (sum[0][index] + sum[2][index]) + (sum[1][index] + sum[3][index]);
+            }
+            *out = super::finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+        }
+    }
+    for (output, stage) in outputs.iter_mut().zip(&staged) {
+        output.copy_from_slice(&stage[..out_len]);
+    }
+    Ok(())
+}
+
 fn value_tile_four_inner<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
@@ -1049,6 +1186,48 @@ pub(crate) fn softmax_rotated_kv(scores: &mut [f32]) -> Result<()> {
     softmax_with_rounding::<true>(scores, crate::model::swift::TRAINING_CONTEXT_TOKENS)
 }
 
+/// Normalizes `HEADS` score rows with pinned binary16 rounding and packs the
+/// resulting probabilities in `[token][head]` consumer order.
+///
+/// # Errors
+/// Rejects empty, mismatched or oversized rows and nonfinite inputs before mutating.
+pub(crate) fn softmax_pack_f16<const HEADS: usize>(
+    mut scores: [&mut [f32]; HEADS],
+    packed: &mut [[u16; HEADS]],
+) -> Result<()> {
+    if HEADS == 0
+        || packed.is_empty()
+        || packed.len() > crate::model::swift::CONTEXT_TOKENS
+        || scores
+            .iter()
+            .any(|row| row.len() != packed.len() || row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(invalid(
+            "invalid pinned softmax packed geometry or nonfinite scores",
+        ));
+    }
+    for row in &mut scores {
+        softmax_round_f16(row)?;
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        neon::pack_f16_rows(neon, scores.each_ref().map(|row| &**row), packed);
+        return Ok(());
+    }
+    for (token, slot) in packed.iter_mut().enumerate() {
+        for (head, dst) in slot.iter_mut().enumerate() {
+            *dst = super::half_bits(scores[head][token]);
+        }
+    }
+    Ok(())
+}
+
 /// Retains the pinned out-of-place operator oracle for focused comparisons.
 ///
 /// # Errors
@@ -1757,6 +1936,89 @@ mod tests {
                 .all(|&value| value.is_finite() && value >= 0.0)
         );
         assert!(scores[8_255] > scores[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_softmax_and_value_tile_four_match_f32_gated_bits() -> crate::Result<()> {
+        let value_pattern = [0_u16, 0x8000, 1, 0x0400, 0x3c00, 0xbc00, 0x3800, 0xb800];
+        let score_pattern = [-3.5_f32, -0.5, 0.0, 1.25, 2.75, -1.75, 0.625];
+        let gate_pattern = [-4.0_f32, -1.0, 0.0, 1.0, 4.0];
+        for history in [0, 1, 2, 7, 15, 16, 17, 33] {
+            let total = history + 1;
+            let rows: Vec<[u16; super::VALUE_TILE_FOUR]> = (0..total)
+                .map(|pos| {
+                    std::array::from_fn(|ch| value_pattern[(pos * 5 + ch) % value_pattern.len()])
+                })
+                .collect();
+            let current: [f32; super::VALUE_TILE_FOUR] =
+                std::array::from_fn(|ch| half_to_float(rows[history][ch]));
+            for width in [4, 12, 24, VALUE_TILE, super::VALUE_TILE_FOUR] {
+                let mut scores_f32: [Vec<f32>; 4] = std::array::from_fn(|head| {
+                    (0..total)
+                        .map(|t| score_pattern[(t * 3 + head * 2) % score_pattern.len()])
+                        .collect()
+                });
+                let mut scores_for_pack = scores_f32.clone();
+                for head_scores in &mut scores_f32 {
+                    super::softmax_round_f16(head_scores)?;
+                }
+                let mut packed = vec![[0_u16; 4]; total];
+                let [s0, s1, s2, s3] = &mut scores_for_pack;
+                super::softmax_pack_f16([s0, s1, s2, s3], &mut packed)?;
+                for (head, head_scores) in scores_f32.iter().enumerate() {
+                    for (tok, &prob) in head_scores.iter().enumerate() {
+                        assert_eq!(half_to_float(packed[tok][head]).to_bits(), prob.to_bits());
+                    }
+                }
+                let gates_storage: [Vec<f32>; 4] = std::array::from_fn(|head| {
+                    (0..width)
+                        .map(|ch| gate_pattern[(head + ch) % gate_pattern.len()])
+                        .collect()
+                });
+                let gate_refs: [&[f32]; 4] = std::array::from_fn(|head| &gates_storage[head][..]);
+                let weight_refs: [&[f32]; 4] = std::array::from_fn(|head| &scores_f32[head][..]);
+                let mut expected = [[0.0_f32; super::VALUE_TILE_FOUR]; 4];
+                let [e0, e1, e2, e3] = &mut expected;
+                super::value_tile_four_gated(
+                    rows[..history]
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR]>::as_slice),
+                    &current[..width],
+                    weight_refs,
+                    0,
+                    [
+                        &mut e0[..width],
+                        &mut e1[..width],
+                        &mut e2[..width],
+                        &mut e3[..width],
+                    ],
+                    gate_refs,
+                )?;
+                let mut actual = [[f32::NAN; super::VALUE_TILE_FOUR]; 4];
+                let [a0, a1, a2, a3] = &mut actual;
+                super::value_tile_four_packed_gated(
+                    rows[..history]
+                        .iter()
+                        .map(<[u16; super::VALUE_TILE_FOUR]>::as_slice),
+                    &current[..width],
+                    &packed,
+                    0,
+                    [
+                        &mut a0[..width],
+                        &mut a1[..width],
+                        &mut a2[..width],
+                        &mut a3[..width],
+                    ],
+                    gate_refs,
+                )?;
+                for head in 0..4 {
+                    for ch in 0..width {
+                        assert_eq!(actual[head][ch].to_bits(), expected[head][ch].to_bits());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

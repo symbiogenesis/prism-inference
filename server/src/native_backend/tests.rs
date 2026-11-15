@@ -322,9 +322,8 @@ fn projection_startup_waits_for_owner_and_binds_resident_observations() -> TestR
         }),
         ..Observation::default()
     };
-    let partial_worker =
-        Worker::with_placement(FakeEngine(partial.clone()), 42, Placement::Auto)
-            .map_err(|error| format!("{error:?}"))?;
+    let partial_worker = Worker::with_placement(FakeEngine(partial.clone()), 42, Placement::Auto)
+        .map_err(|error| format!("{error:?}"))?;
     let partial_readiness = partial_worker.profile.readiness(partial_worker.seed);
     assert_eq!(
         partial_readiness["data"][0]["startup_projection"],

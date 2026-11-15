@@ -1497,6 +1497,7 @@ struct AttentionScratch {
     gate: Vec<f32>,
     attended: Vec<f32>,
     scores: Vec<f32>,
+    packed_probs: Vec<u16>,
     frequencies: Vec<(f32, f32)>,
     beta: Vec<f32>,
     alpha: Vec<f32>,
@@ -1769,6 +1770,7 @@ impl Transforms {
         executor: &mut Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     ) -> Result<()> {
         let mut pre_transformed = scratch.pre_transformed_len.take();
+        let mut shared_transformed_ready = false;
         let cpu_siblings = executor.is_none() && scratch.matvec.row_workers() > 1;
         let result = (|| {
             if N > 4 {
@@ -1781,10 +1783,11 @@ impl Transforms {
                 }
                 let basis = self.basis(weights[index]);
                 let activation = if basis.0 {
-                    if basis.1
-                        || pre_transformed.take() != Some(input.len())
-                        || scratch.transformed.len() != input.len()
-                    {
+                    let can_reuse = !basis.1
+                        && scratch.transformed.len() == input.len()
+                        && (shared_transformed_ready || pre_transformed == Some(input.len()));
+                    pre_transformed = None;
+                    if !can_reuse {
                         self.transform_into_with_parallelism(
                             weights[index],
                             input,
@@ -1792,11 +1795,12 @@ impl Transforms {
                             scratch.matvec.row_parallelism(),
                             &mut scratch.transformed,
                         )?;
+                        #[cfg(test)]
+                        {
+                            scratch.transforms += 1;
+                        }
                     }
-                    #[cfg(test)]
-                    {
-                        scratch.transforms += 1;
-                    }
+                    shared_transformed_ready = !basis.1;
                     scratch.transformed.as_slice()
                 } else {
                     input
@@ -3796,6 +3800,7 @@ impl Evaluation<'_, '_> {
             values,
             &mut scratch.query,
             &mut scratch.scores,
+            &mut scratch.packed_probs,
             &mut scratch.frequencies,
             &mut scratch.attended,
         )?;
@@ -3865,9 +3870,14 @@ impl Evaluation<'_, '_> {
         values: &mut KvCache,
         query_scratch: &mut Vec<f32>,
         scores_scratch: &mut Vec<f32>,
+        packed_probs_scratch: &mut Vec<u16>,
         frequencies_scratch: &mut Vec<(f32, f32)>,
         attended: &mut Vec<f32>,
     ) -> Result<()> {
+        enum FourProbs<'a> {
+            Packed(&'a [[u16; 4]]),
+            Unpacked([&'a [f32]; 4]),
+        }
         let g = self.geometry;
         // Geometry and position are shared by every full-attention layer in
         // this token evaluation. Reuse the exact scalar frequencies for Q/K
@@ -4004,34 +4014,58 @@ impl Evaluation<'_, '_> {
                 self.projection.matvec.row_parallelism(),
             );
         }
-        // Preserve whole six-head KV groups when partitioning Swift decode.
-        // Other geometries and source-order arithmetic keep their old dispatch.
-        let head_unit = if matches!(arithmetic, Arithmetic::PinnedSwift)
-            && heads_per_kv == 6
-            && self.projection.matvec.row_parallelism().workers() <= g.kv_heads
-        {
-            6
+        // Preserve KV-aligned Swift decode groups across 4-, 8-, and 12-worker
+        // allocations (6, 3, and 2 query heads per unit). Other geometries and
+        // source-order arithmetic keep their existing dispatch.
+        let workers = self.projection.matvec.row_parallelism().workers();
+        let head_unit = if matches!(arithmetic, Arithmetic::PinnedSwift) && heads_per_kv == 6 {
+            if workers <= g.kv_heads {
+                6
+            } else if workers <= 2 * g.kv_heads {
+                3
+            } else {
+                2
+            }
         } else {
             1
         };
-        self.projection
-            .matvec
-            .row_parallelism()
-            .update_paired_chunks(
-                attended,
-                head_unit * g.head,
-                scores_scratch,
-                head_unit * score_len,
-                |base_unit, attended_chunk, scores_chunk| {
-                    let base_head = base_unit * head_unit;
-                    let chunk_heads = attended_chunk.len() / g.head;
-                    let mut head_offset = 0;
-                    while head_offset < chunk_heads {
-                        let head = base_head + head_offset;
-                        let kv_head = head / heads_per_kv;
-                        let offset = kv_head * g.head;
-                        if head_unit == 6 {
-                            attention_six::attend(
+        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            resize_attention_packed_probs(
+                g.heads,
+                score_len,
+                keys.maximum / keys.width,
+                packed_probs_scratch,
+            )?;
+        }
+        let attend_f16_chunk = |base_unit: usize,
+                                attended_chunk: &mut [f32],
+                                scores_chunk: &mut [f32],
+                                mut packed_chunk: Option<&mut [u16]>|
+         -> Result<()> {
+            let base_head = base_unit * head_unit;
+            let chunk_heads = attended_chunk.len() / g.head;
+            let mut head_offset = 0;
+            while head_offset < chunk_heads {
+                let head = base_head + head_offset;
+                let kv_head = head / heads_per_kv;
+                let offset = kv_head * g.head;
+                if matches!(head_unit, 2 | 3 | 6) {
+                    let Some(packed) = packed_chunk.as_deref_mut() else {
+                        return Err(invalid("missing packed probabilities for grouped decode"));
+                    };
+                    let att_slice = &mut attended_chunk
+                        [head_offset * g.head..(head_offset + head_unit) * g.head];
+                    let score_slice = &mut scores_chunk
+                        [head_offset * score_len..(head_offset + head_unit) * score_len];
+                    let packed_slice =
+                        &mut packed[head_offset * score_len..(head_offset + head_unit) * score_len];
+                    match head_unit {
+                        6 => {
+                            let (packed_group, rem) = packed_slice.as_chunks_mut::<6>();
+                            if !rem.is_empty() {
+                                return Err(invalid("unaligned six-head packed probability slice"));
+                            }
+                            attention_six::attend_group::<6>(
                                 g,
                                 head,
                                 query_ref,
@@ -4040,191 +4074,276 @@ impl Evaluation<'_, '_> {
                                 values,
                                 key_ref,
                                 value_ref,
-                                &mut attended_chunk
-                                    [head_offset * g.head..(head_offset + 6) * g.head],
-                                &mut scores_chunk
-                                    [head_offset * score_len..(head_offset + 6) * score_len],
+                                att_slice,
+                                score_slice,
+                                packed_group,
                                 scale,
                             )?;
-                            head_offset += 6;
-                            continue;
                         }
-                        if head_offset + 4 <= chunk_heads && kv_head == (head + 3) / heads_per_kv {
-                            let (r01, r23) = attended_chunk
-                                [head_offset * g.head..(head_offset + 4) * g.head]
-                                .split_at_mut(2 * g.head);
-                            let (r0, r1) = r01.split_at_mut(g.head);
-                            let (r2, r3) = r23.split_at_mut(g.head);
-                            let (s01, s23) = scores_chunk
-                                [head_offset * score_len..(head_offset + 4) * score_len]
-                                .split_at_mut(2 * score_len);
-                            let (s0, s1) = s01.split_at_mut(score_len);
-                            let (s2, s3) = s23.split_at_mut(score_len);
-                            let queries = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[h * g.head..(h + 1) * g.head]
-                            });
-                            let mut past_iter = keys.tokens().enumerate();
-                            while let Some((pos0, p0)) = past_iter.next() {
-                                if let Some((_, p1)) = past_iter.next() {
-                                    if let Some((_, p2)) = past_iter.next() {
-                                        if let Some((_, p3)) = past_iter.next() {
-                                            let dots4 = arithmetic
-                                                .attention_dot_four_keys_four_queries(
-                                                    queries,
-                                                    [
-                                                        &p0[offset..offset + g.head],
-                                                        &p1[offset..offset + g.head],
-                                                        &p2[offset..offset + g.head],
-                                                        &p3[offset..offset + g.head],
-                                                    ],
-                                                )?;
-                                            for (k_off, dots) in dots4.into_iter().enumerate() {
-                                                let pos = pos0 + k_off;
-                                                s0[pos] = dots[0] * scale;
-                                                s1[pos] = dots[1] * scale;
-                                                s2[pos] = dots[2] * scale;
-                                                s3[pos] = dots[3] * scale;
-                                            }
-                                        } else {
-                                            let dots2 = arithmetic
-                                                .attention_dot_two_keys_four_queries(
-                                                    queries,
-                                                    [
-                                                        &p0[offset..offset + g.head],
-                                                        &p1[offset..offset + g.head],
-                                                    ],
-                                                )?;
-                                            for (k_off, dots) in dots2.into_iter().enumerate() {
-                                                let pos = pos0 + k_off;
-                                                s0[pos] = dots[0] * scale;
-                                                s1[pos] = dots[1] * scale;
-                                                s2[pos] = dots[2] * scale;
-                                                s3[pos] = dots[3] * scale;
-                                            }
-                                            let pos2 = pos0 + 2;
-                                            let dots = arithmetic.attention_dot_four(
-                                                queries,
-                                                &p2[offset..offset + g.head],
-                                            )?;
-                                            s0[pos2] = dots[0] * scale;
-                                            s1[pos2] = dots[1] * scale;
-                                            s2[pos2] = dots[2] * scale;
-                                            s3[pos2] = dots[3] * scale;
-                                        }
-                                    } else {
-                                        let dots2 = arithmetic
-                                            .attention_dot_two_keys_four_queries(
-                                                queries,
-                                                [
-                                                    &p0[offset..offset + g.head],
-                                                    &p1[offset..offset + g.head],
-                                                ],
-                                            )?;
-                                        for (k_off, dots) in dots2.into_iter().enumerate() {
-                                            let pos = pos0 + k_off;
-                                            s0[pos] = dots[0] * scale;
-                                            s1[pos] = dots[1] * scale;
-                                            s2[pos] = dots[2] * scale;
-                                            s3[pos] = dots[3] * scale;
-                                        }
+                        3 => {
+                            let (packed_group, rem) = packed_slice.as_chunks_mut::<3>();
+                            if !rem.is_empty() {
+                                return Err(invalid(
+                                    "unaligned three-head packed probability slice",
+                                ));
+                            }
+                            attention_six::attend_group::<3>(
+                                g,
+                                head,
+                                query_ref,
+                                projected,
+                                keys,
+                                values,
+                                key_ref,
+                                value_ref,
+                                att_slice,
+                                score_slice,
+                                packed_group,
+                                scale,
+                            )?;
+                        }
+                        _ => {
+                            let (packed_group, rem) = packed_slice.as_chunks_mut::<2>();
+                            if !rem.is_empty() {
+                                return Err(invalid("unaligned two-head packed probability slice"));
+                            }
+                            attention_six::attend_group::<2>(
+                                g,
+                                head,
+                                query_ref,
+                                projected,
+                                keys,
+                                values,
+                                key_ref,
+                                value_ref,
+                                att_slice,
+                                score_slice,
+                                packed_group,
+                                scale,
+                            )?;
+                        }
+                    }
+                    head_offset += head_unit;
+                    continue;
+                }
+                if head_offset + 4 <= chunk_heads && kv_head == (head + 3) / heads_per_kv {
+                    let (r01, r23) = attended_chunk
+                        [head_offset * g.head..(head_offset + 4) * g.head]
+                        .split_at_mut(2 * g.head);
+                    let (r0, r1) = r01.split_at_mut(g.head);
+                    let (r2, r3) = r23.split_at_mut(g.head);
+                    let (s01, s23) = scores_chunk
+                        [head_offset * score_len..(head_offset + 4) * score_len]
+                        .split_at_mut(2 * score_len);
+                    let (s0, s1) = s01.split_at_mut(score_len);
+                    let (s2, s3) = s23.split_at_mut(score_len);
+                    let queries = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[h * g.head..(h + 1) * g.head]
+                    });
+                    let mut past_iter = keys.tokens().enumerate();
+                    while let Some((pos0, p0)) = past_iter.next() {
+                        if let Some((_, p1)) = past_iter.next() {
+                            if let Some((_, p2)) = past_iter.next() {
+                                if let Some((_, p3)) = past_iter.next() {
+                                    let dots4 = arithmetic.attention_dot_four_keys_four_queries(
+                                        queries,
+                                        [
+                                            &p0[offset..offset + g.head],
+                                            &p1[offset..offset + g.head],
+                                            &p2[offset..offset + g.head],
+                                            &p3[offset..offset + g.head],
+                                        ],
+                                    )?;
+                                    for (k_off, dots) in dots4.into_iter().enumerate() {
+                                        let pos = pos0 + k_off;
+                                        s0[pos] = dots[0] * scale;
+                                        s1[pos] = dots[1] * scale;
+                                        s2[pos] = dots[2] * scale;
+                                        s3[pos] = dots[3] * scale;
                                     }
                                 } else {
+                                    let dots2 = arithmetic.attention_dot_two_keys_four_queries(
+                                        queries,
+                                        [
+                                            &p0[offset..offset + g.head],
+                                            &p1[offset..offset + g.head],
+                                        ],
+                                    )?;
+                                    for (k_off, dots) in dots2.into_iter().enumerate() {
+                                        let pos = pos0 + k_off;
+                                        s0[pos] = dots[0] * scale;
+                                        s1[pos] = dots[1] * scale;
+                                        s2[pos] = dots[2] * scale;
+                                        s3[pos] = dots[3] * scale;
+                                    }
+                                    let pos2 = pos0 + 2;
                                     let dots = arithmetic.attention_dot_four(
                                         queries,
-                                        &p0[offset..offset + g.head],
+                                        &p2[offset..offset + g.head],
                                     )?;
-                                    s0[pos0] = dots[0] * scale;
-                                    s1[pos0] = dots[1] * scale;
-                                    s2[pos0] = dots[2] * scale;
-                                    s3[pos0] = dots[3] * scale;
+                                    s0[pos2] = dots[0] * scale;
+                                    s1[pos2] = dots[1] * scale;
+                                    s2[pos2] = dots[2] * scale;
+                                    s3[pos2] = dots[3] * scale;
+                                }
+                            } else {
+                                let dots2 = arithmetic.attention_dot_two_keys_four_queries(
+                                    queries,
+                                    [&p0[offset..offset + g.head], &p1[offset..offset + g.head]],
+                                )?;
+                                for (k_off, dots) in dots2.into_iter().enumerate() {
+                                    let pos = pos0 + k_off;
+                                    s0[pos] = dots[0] * scale;
+                                    s1[pos] = dots[1] * scale;
+                                    s2[pos] = dots[2] * scale;
+                                    s3[pos] = dots[3] * scale;
                                 }
                             }
-                            let current_dots = arithmetic.attention_current_dot_four(
-                                queries,
-                                &key_ref[offset..offset + g.head],
-                            )?;
-                            s0[score_len - 1] = current_dots[0] * scale;
-                            s1[score_len - 1] = current_dots[1] * scale;
-                            s2[score_len - 1] = current_dots[2] * scale;
-                            s3[score_len - 1] = current_dots[3] * scale;
-                            for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
-                                arithmetic.attention_softmax_round_f16(scores)?;
+                        } else {
+                            let dots = arithmetic
+                                .attention_dot_four(queries, &p0[offset..offset + g.head])?;
+                            s0[pos0] = dots[0] * scale;
+                            s1[pos0] = dots[1] * scale;
+                            s2[pos0] = dots[2] * scale;
+                            s3[pos0] = dots[3] * scale;
+                        }
+                    }
+                    let current_dots = arithmetic
+                        .attention_current_dot_four(queries, &key_ref[offset..offset + g.head])?;
+                    s0[score_len - 1] = current_dots[0] * scale;
+                    s1[score_len - 1] = current_dots[1] * scale;
+                    s2[score_len - 1] = current_dots[2] * scale;
+                    s3[score_len - 1] = current_dots[3] * scale;
+                    let probs = if let Some(packed) = &mut packed_chunk {
+                        let (packed_four, rem) = packed
+                            [head_offset * score_len..(head_offset + 4) * score_len]
+                            .as_chunks_mut::<4>();
+                        if !rem.is_empty() || packed_four.len() != score_len {
+                            return Err(invalid("invalid four-head packed probability geometry"));
+                        }
+                        crate::kernels::pinned_attention::softmax_pack_f16(
+                            [s0, s1, s2, s3],
+                            packed_four,
+                        )?;
+                        FourProbs::Packed(packed_four)
+                    } else {
+                        for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
+                            arithmetic.attention_softmax_round_f16(scores)?;
+                        }
+                        FourProbs::Unpacked([s0, s1, s2, s3])
+                    };
+                    let g0 = attention_gate(projected, head, g.head);
+                    let g1 = attention_gate(projected, head + 1, g.head);
+                    let g2 = attention_gate(projected, head + 2, g.head);
+                    let g3 = attention_gate(projected, head + 3, g.head);
+                    for (tile, (((out0, out1), out2), out3)) in r0
+                        .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
+                        .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                        .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                        .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                        .enumerate()
+                    {
+                        let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE_FOUR;
+                        let len = out0.len();
+                        let gates = [
+                            &g0[dimension..dimension + len],
+                            &g1[dimension..dimension + len],
+                            &g2[dimension..dimension + len],
+                            &g3[dimension..dimension + len],
+                        ];
+                        match probs {
+                            FourProbs::Packed(packed_four) => {
+                                crate::kernels::pinned_attention::value_tile_four_packed_gated(
+                                    values.tokens().take(score_len - 1),
+                                    &value_ref[offset + dimension..offset + dimension + len],
+                                    packed_four,
+                                    offset + dimension,
+                                    [out0, out1, out2, out3],
+                                    gates,
+                                )?;
                             }
-                            let probs: [&[f32]; 4] = [s0, s1, s2, s3];
-                            let g0 = attention_gate(projected, head, g.head);
-                            let g1 = attention_gate(projected, head + 1, g.head);
-                            let g2 = attention_gate(projected, head + 2, g.head);
-                            let g3 = attention_gate(projected, head + 3, g.head);
-                            for (tile, (((out0, out1), out2), out3)) in
-                                r0.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
-                                    .zip(r1.chunks_mut(
-                                        crate::kernels::pinned_attention::VALUE_TILE_FOUR,
-                                    ))
-                                    .zip(r2.chunks_mut(
-                                        crate::kernels::pinned_attention::VALUE_TILE_FOUR,
-                                    ))
-                                    .zip(r3.chunks_mut(
-                                        crate::kernels::pinned_attention::VALUE_TILE_FOUR,
-                                    ))
-                                    .enumerate()
-                            {
-                                let dimension =
-                                    tile * crate::kernels::pinned_attention::VALUE_TILE_FOUR;
-                                let len = out0.len();
+                            FourProbs::Unpacked(unpacked) => {
                                 arithmetic.attention_value_tile_four(
                                     values,
                                     &value_ref[offset + dimension..offset + dimension + len],
                                     offset + dimension,
-                                    probs,
+                                    unpacked,
                                     [out0, out1, out2, out3],
-                                    [
-                                        &g0[dimension..dimension + len],
-                                        &g1[dimension..dimension + len],
-                                        &g2[dimension..dimension + len],
-                                        &g3[dimension..dimension + len],
-                                    ],
+                                    gates,
                                 )?;
                             }
-                            head_offset += 4;
-                            continue;
                         }
-                        let result =
-                            &mut attended_chunk[head_offset * g.head..(head_offset + 1) * g.head];
-                        let scores = &mut scores_chunk
-                            [head_offset * score_len..(head_offset + 1) * score_len];
-                        let q = &query_ref[head * g.head..(head + 1) * g.head];
-                        for (pos, past) in keys.tokens().enumerate() {
-                            scores[pos] = arithmetic
-                                .attention_dot(q, &past[offset..offset + g.head])?
-                                * scale;
-                        }
-                        scores[score_len - 1] = arithmetic
-                            .attention_current_dot(q, &key_ref[offset..offset + g.head])?
-                            * scale;
-                        // Nonflash V(F16) x softmax(F16) also converts its RHS to F16.
-                        arithmetic.attention_softmax_round_f16(scores)?;
-                        let g_head = attention_gate(projected, head, g.head);
-                        for (tile, out) in result
-                            .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
-                            .enumerate()
-                        {
-                            let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
-                            let len = out.len();
-                            arithmetic.attention_value_tile(
-                                values,
-                                &value_ref[offset + dimension..offset + dimension + len],
-                                offset + dimension,
-                                scores,
-                                out,
-                            )?;
-                            mul_sigmoid_in_place(out, &g_head[dimension..dimension + len]);
-                        }
-                        head_offset += 1;
                     }
-                    Ok(())
-                },
-            )
+                    head_offset += 4;
+                    continue;
+                }
+                let result = &mut attended_chunk[head_offset * g.head..(head_offset + 1) * g.head];
+                let scores =
+                    &mut scores_chunk[head_offset * score_len..(head_offset + 1) * score_len];
+                let q = &query_ref[head * g.head..(head + 1) * g.head];
+                for (pos, past) in keys.tokens().enumerate() {
+                    scores[pos] =
+                        arithmetic.attention_dot(q, &past[offset..offset + g.head])? * scale;
+                }
+                scores[score_len - 1] =
+                    arithmetic.attention_current_dot(q, &key_ref[offset..offset + g.head])? * scale;
+                // Nonflash V(F16) x softmax(F16) also converts its RHS to F16.
+                arithmetic.attention_softmax_round_f16(scores)?;
+                let g_head = attention_gate(projected, head, g.head);
+                for (tile, out) in result
+                    .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                    .enumerate()
+                {
+                    let dimension = tile * crate::kernels::pinned_attention::VALUE_TILE;
+                    let len = out.len();
+                    arithmetic.attention_value_tile(
+                        values,
+                        &value_ref[offset + dimension..offset + dimension + len],
+                        offset + dimension,
+                        scores,
+                        out,
+                    )?;
+                    mul_sigmoid_in_place(out, &g_head[dimension..dimension + len]);
+                }
+                head_offset += 1;
+            }
+            Ok(())
+        };
+        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            self.projection
+                .matvec
+                .row_parallelism()
+                .update_triple_chunks(
+                    attended,
+                    head_unit * g.head,
+                    scores_scratch,
+                    head_unit * score_len,
+                    packed_probs_scratch,
+                    head_unit * score_len,
+                    |base_unit, attended_chunk, scores_chunk, packed_chunk| {
+                        attend_f16_chunk(
+                            base_unit,
+                            attended_chunk,
+                            scores_chunk,
+                            Some(packed_chunk),
+                        )
+                    },
+                )
+        } else {
+            self.projection
+                .matvec
+                .row_parallelism()
+                .update_paired_chunks(
+                    attended,
+                    head_unit * g.head,
+                    scores_scratch,
+                    head_unit * score_len,
+                    |base_unit, attended_chunk, scores_chunk| {
+                        attend_f16_chunk(base_unit, attended_chunk, scores_chunk, None)
+                    },
+                )
+        }
     }
 
     #[expect(
@@ -4358,13 +4477,26 @@ impl Evaluation<'_, '_> {
                             .convolution
                             .range(head * head_coeff..(head + 1) * head_coeff);
                         if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                            crate::kernels::pinned_convolution::step_silu_into_coefficients(
-                                h_slice,
-                                head_mixed,
-                                c_slice,
-                                g.convolution,
-                                head_conv,
-                            )?;
+                            if head < qk_heads {
+                                crate::kernels::pinned_convolution::step_silu_clamped_l2_into_coefficients(
+                                    h_slice,
+                                    head_mixed,
+                                    c_slice,
+                                    g.convolution,
+                                    head_mixed.len(),
+                                    g.ssm_head,
+                                    g.epsilon,
+                                    head_conv,
+                                )?;
+                            } else {
+                                crate::kernels::pinned_convolution::step_silu_into_coefficients(
+                                    h_slice,
+                                    head_mixed,
+                                    c_slice,
+                                    g.convolution,
+                                    head_conv,
+                                )?;
+                            }
                         } else {
                             for (channel, mixed_value) in head_mixed.iter_mut().enumerate() {
                                 let projected = *mixed_value;
@@ -4387,46 +4519,47 @@ impl Evaluation<'_, '_> {
                                 }
                             }
                             arithmetic.silu(head_mixed);
-                        }
-                        if head < qk_heads {
-                            l2_norm(head_mixed, g.epsilon);
+                            if head < qk_heads {
+                                l2_norm(head_mixed, g.epsilon);
+                            }
                         }
                     }
                     Ok(())
                 },
             )?;
+        } else if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            crate::kernels::pinned_convolution::step_silu_clamped_l2_into_coefficients(
+                history,
+                mixed,
+                layer.convolution.view(),
+                g.convolution,
+                2 * key_width,
+                g.ssm_head,
+                g.epsilon,
+                convolution,
+            )?;
         } else {
-            if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                crate::kernels::pinned_convolution::step_silu_into_coefficients(
-                    history,
-                    mixed,
-                    layer.convolution.view(),
-                    g.convolution,
-                    convolution,
+            for (channel, mixed_value) in mixed.iter_mut().enumerate() {
+                let projected = *mixed_value;
+                let start = channel * hist_width;
+                let coefficients = &layer.convolution.view().source()
+                    [channel * g.convolution..(channel + 1) * g.convolution];
+                *mixed_value = arithmetic.convolution_row(
+                    &history[start..start + hist_width],
+                    projected,
+                    coefficients,
                 )?;
-            } else {
-                for (channel, mixed_value) in mixed.iter_mut().enumerate() {
-                    let projected = *mixed_value;
-                    let start = channel * hist_width;
-                    let coefficients = &layer.convolution.view().source()
-                        [channel * g.convolution..(channel + 1) * g.convolution];
-                    *mixed_value = arithmetic.convolution_row(
-                        &history[start..start + hist_width],
-                        projected,
-                        coefficients,
-                    )?;
-                    if hist_width == 3 {
-                        convolution[start] = history[start + 1];
-                        convolution[start + 1] = history[start + 2];
-                        convolution[start + 2] = projected;
-                    } else if hist_width > 0 {
-                        convolution[start..start + hist_width - 1]
-                            .copy_from_slice(&history[start + 1..start + hist_width]);
-                        convolution[start + hist_width - 1] = projected;
-                    }
+                if hist_width == 3 {
+                    convolution[start] = history[start + 1];
+                    convolution[start + 1] = history[start + 2];
+                    convolution[start + 2] = projected;
+                } else if hist_width > 0 {
+                    convolution[start..start + hist_width - 1]
+                        .copy_from_slice(&history[start + 1..start + hist_width]);
+                    convolution[start + hist_width - 1] = projected;
                 }
-                arithmetic.silu(mixed);
             }
+            arithmetic.silu(mixed);
             for head in mixed[..2 * key_width].chunks_exact_mut(g.ssm_head) {
                 l2_norm(head, g.epsilon);
             }
@@ -5170,8 +5303,31 @@ fn resize_attention_scores_with(
     output: &mut Vec<f32>,
     reserve: impl FnOnce(&mut Vec<f32>, usize) -> Result<()>,
 ) -> Result<()> {
+    resize_attention_buffer_with(rows, tokens, context, 0.0, output, reserve)
+}
+
+fn resize_attention_packed_probs(
+    rows: usize,
+    tokens: usize,
+    context: usize,
+    output: &mut Vec<u16>,
+) -> Result<()> {
+    resize_attention_buffer_with(rows, tokens, context, 0, output, |output, additional| {
+        output.try_reserve_exact(additional)?;
+        Ok(())
+    })
+}
+
+fn resize_attention_buffer_with<T: Copy>(
+    rows: usize,
+    tokens: usize,
+    context: usize,
+    zero: T,
+    output: &mut Vec<T>,
+    reserve: impl FnOnce(&mut Vec<T>, usize) -> Result<()>,
+) -> Result<()> {
     let count = checked_product(&[rows, tokens])?;
-    let maximum = checked_product(&[rows, context])?.min(MAX_STATE_BYTES / size_of::<f32>());
+    let maximum = checked_product(&[rows, context])?.min(MAX_STATE_BYTES / size_of::<T>());
     if rows == 0 || tokens == 0 || tokens > context || count > maximum {
         return Err(invalid("invalid attention score scratch bounds"));
     }
@@ -5179,7 +5335,7 @@ fn resize_attention_scores_with(
         let target = output.capacity().saturating_mul(2).max(count).min(maximum);
         reserve(output, target - output.len())?;
     }
-    output.resize(count, 0.0);
+    output.resize(count, zero);
     Ok(())
 }
 
@@ -5937,7 +6093,7 @@ mod tests {
                     &mut scratch,
                 )?;
                 assert_eq!(scratch.matvec.preparation_count() - before, 2);
-                assert_eq!(scratch.transforms - transforms_before, 2);
+                assert_eq!(scratch.transforms - transforms_before, 1);
                 transforms.project_into(
                     &legacy,
                     &input,
@@ -6104,7 +6260,7 @@ mod tests {
         )?;
         assert_eq!(executor.f32_calls, 2);
         assert_eq!(executor.f32_group_calls, 0);
-        assert_eq!(scratch.transforms, 2);
+        assert_eq!(scratch.transforms, 1);
         assert_eq!(scratch.matvec.preparation_count(), 2);
         assert_eq!(scratch.matvec.statistics().matrix_successes, 2);
 
@@ -6197,10 +6353,140 @@ mod tests {
         )?;
         assert_eq!(grouped_executor.f32_calls, 0);
         assert_eq!(grouped_executor.f32_group_calls, 1);
-        assert_eq!(grouped_scratch.transforms, 2);
+        assert_eq!(grouped_scratch.transforms, 1);
         assert_eq!(grouped_scratch.matvec.preparation_count(), 2);
         assert_eq!(grouped_scratch.matvec.statistics().matrix_successes, 2);
         assert_eq!(grouped_outputs, expected);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "End-to-end 0-ULP parity test across mixed PQ2/Q8_0/F16 contract groups."
+    )]
+    fn x1_mixed_contract_group_reuses_same_basis_transform_once_with_zero_ulp_parity() -> Result<()>
+    {
+        let width = 256_usize;
+        let geometry = projection_geometry(width);
+        let qkv = projection_weight("blk.0.attn_qkv.weight", 142, width);
+        let gate = projection_weight("blk.0.attn_gate.weight", 142, width);
+        let alpha = projection_weight("blk.0.ssm_alpha.weight", 8, width);
+        let beta = Tensor {
+            name: "blk.0.ssm_beta.weight".to_owned(),
+            dimensions: vec![width],
+            kind: 30,
+            data: Arc::from(
+                (0..width)
+                    .flat_map(|idx| [0x3f80_u16, 0xc000, 0x3e80, 0xbd00][idx % 4].to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            ),
+        };
+        let ssm_out = projection_weight("blk.0.ssm_out.weight", 142, width);
+        let beta_f32 = projection_weight("blk.0.post_beta.weight", 0, width);
+        let transforms = Transforms {
+            block: 128,
+            weights: BTreeSet::from([
+                qkv.name.clone(),
+                gate.name.clone(),
+                beta.name.clone(),
+                alpha.name.clone(),
+                ssm_out.name.clone(),
+                beta_f32.name.clone(),
+            ]),
+            inverse_embedding: false,
+            grouped_values: true,
+            signs: BTreeMap::new(),
+        };
+        let input: Vec<f32> = (0..width)
+            .map(|idx| [1.25, -0.75, 0.5, -2.0, 0.125, -0.375][idx % 6])
+            .collect();
+
+        // 1. Four-sibling mixed-contract `[qkv, gate, beta, alpha]` transforms once.
+        let mut expected4 = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut ind4 = ProjectionScratch::default();
+        for (weight, out) in [&qkv, &gate, &beta, &alpha].into_iter().zip(&mut expected4) {
+            transforms.project_into(weight, &input, &geometry, out, &mut ind4)?;
+        }
+        assert_eq!(ind4.transforms, 4);
+        let mut actual4 = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut scratch4 = ProjectionScratch::default();
+        transforms.project_group_into(
+            [&qkv, &gate, &beta, &alpha],
+            &input,
+            &geometry,
+            actual4.each_mut(),
+            &mut scratch4,
+        )?;
+        assert_eq!(scratch4.transforms, 1);
+        for (actual, expected) in actual4.iter().zip(&expected4) {
+            assert_eq!(
+                actual.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // 2. Three-sibling mixed-contract `[qkv, beta, alpha]` transforms once.
+        let mut expected3 = [Vec::new(), Vec::new(), Vec::new()];
+        let mut ind3 = ProjectionScratch::default();
+        for (weight, out) in [&qkv, &beta, &alpha].into_iter().zip(&mut expected3) {
+            transforms.project_into(weight, &input, &geometry, out, &mut ind3)?;
+        }
+        assert_eq!(ind3.transforms, 3);
+        let mut actual3 = [Vec::new(), Vec::new(), Vec::new()];
+        let mut scratch3 = ProjectionScratch::default();
+        transforms.project_group_into(
+            [&qkv, &beta, &alpha],
+            &input,
+            &geometry,
+            actual3.each_mut(),
+            &mut scratch3,
+        )?;
+        assert_eq!(scratch3.transforms, 1);
+        for (actual, expected) in actual3.iter().zip(&expected3) {
+            assert_eq!(
+                actual.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // 3. Interleaved `basis.1 == true` (`ssm_out.weight`) invalidates shared basis cache.
+        let mut expected_interleaved = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut ind_int = ProjectionScratch::default();
+        for (weight, out) in [&qkv, &ssm_out, &beta_f32, &alpha]
+            .into_iter()
+            .zip(&mut expected_interleaved)
+        {
+            transforms.project_into(weight, &input, &geometry, out, &mut ind_int)?;
+        }
+        let mut actual_interleaved = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut scratch_int = ProjectionScratch::default();
+        transforms.project_group_into(
+            [&qkv, &ssm_out, &beta_f32, &alpha],
+            &input,
+            &geometry,
+            actual_interleaved.each_mut(),
+            &mut scratch_int,
+        )?;
+        assert_eq!(scratch_int.transforms, 3);
+        for (actual, expected) in actual_interleaved.iter().zip(&expected_interleaved) {
+            assert_eq!(
+                actual.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            );
+        }
         Ok(())
     }
 
@@ -6327,6 +6613,7 @@ mod tests {
                     &mut values,
                     &mut scratch.query,
                     &mut scratch.scores,
+                    &mut scratch.packed_probs,
                     &mut scratch.frequencies,
                     &mut scratch.attended,
                 )
@@ -6347,6 +6634,7 @@ mod tests {
             &mut values,
             &mut scratch.query,
             &mut scratch.scores,
+            &mut scratch.packed_probs,
             &mut scratch.frequencies,
             &mut scratch.attended,
         )?;
@@ -6423,6 +6711,224 @@ mod tests {
                     workers,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "End-to-end 0-ULP attention group and packed 4-head test across GQA ratios and workers."
+    )]
+    fn x1_full_attention_group_and_packed_four_head_preserve_serial_bits_across_workers()
+    -> Result<()> {
+        for (heads, kv_heads) in [(24_usize, 4_usize), (16_usize, 4_usize)] {
+            let mut geometry = projection_geometry(256);
+            geometry.heads = heads;
+            geometry.kv_heads = kv_heads;
+            geometry.rope = 64;
+            geometry.rope_sections = [11, 11, 10, 0];
+            geometry.rope_base = 10_000_000.0;
+            let layer = super::FullAttention {
+                query: projection_weight("q", 0, geometry.head),
+                key: projection_weight("k", 0, geometry.head),
+                value: projection_weight("v", 0, geometry.head),
+                output: projection_weight("out", 0, geometry.head),
+                query_norm: vec![1.0; geometry.head],
+                key_norm: vec![1.0; geometry.head],
+            };
+            let kv_width = kv_heads * geometry.head;
+            let history_tokens = 17_usize;
+            let mut projected = vec![0.0_f32; geometry.query_gate_width()];
+            for (head, pair) in projected.chunks_exact_mut(2 * geometry.head).enumerate() {
+                for (ch, slot) in pair[..geometry.head].iter_mut().enumerate() {
+                    *slot = [-0.5_f32, 0.25, -0.125, 0.75][(head + ch) % 4];
+                }
+                for (ch, gate) in pair[geometry.head..].iter_mut().enumerate() {
+                    *gate = [-2.0_f32, -0.5, 0.0, 0.5, 2.0][(head + ch) % 5];
+                }
+            }
+            let current_key: Vec<f32> = (0..kv_width)
+                .map(|i| [0.25_f32, -0.5, 0.125, -0.25][i % 4])
+                .collect();
+            let current_value: Vec<f32> = (0..kv_width)
+                .map(|i| [0.5_f32, -0.25, 1.0, -0.5][i % 4])
+                .collect();
+            let run_once = |workers: usize| -> Result<Vec<f32>> {
+                let mut projection = ProjectionScratch::default();
+                projection
+                    .matvec
+                    .set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
+                let transforms = Transforms::default();
+                let mut adapter = crate::model::lora::Scratch::default();
+                let mut evaluation = super::Evaluation {
+                    geometry: &geometry,
+                    arithmetic: Arithmetic::PinnedSwift,
+                    transforms: &transforms,
+                    position: history_tokens,
+                    frequencies_ready: false,
+                    projection: &mut projection,
+                    adapter: None,
+                    adapter_scale: 0.0,
+                    adapter_scratch: &mut adapter,
+                    executor: None,
+                };
+                let mut keys = KvCache::new(kv_width, 32)?;
+                let mut values = KvCache::new(kv_width, 32)?;
+                for step in 0..history_tokens {
+                    keys.reserve_append()?;
+                    values.reserve_append()?;
+                    let row_k: Vec<f32> = (0..kv_width)
+                        .map(|i| [-0.5_f32, 0.25, 0.75, -0.125][(step * 3 + i) % 4])
+                        .collect();
+                    let row_v: Vec<f32> = (0..kv_width)
+                        .map(|i| [0.125_f32, -0.5, 0.25, -1.0][(step * 5 + i) % 4])
+                        .collect();
+                    keys.append(&row_k);
+                    values.append(&row_v);
+                }
+                let mut scratch = super::AttentionScratch::default();
+                let mut key = current_key.clone();
+                let mut value = current_value.clone();
+                evaluation.full_attention_state(
+                    &layer,
+                    &projected,
+                    &mut key,
+                    &mut value,
+                    &mut keys,
+                    &mut values,
+                    &mut scratch.query,
+                    &mut scratch.scores,
+                    &mut scratch.packed_probs,
+                    &mut scratch.frequencies,
+                    &mut scratch.attended,
+                )?;
+                Ok(scratch.attended)
+            };
+            let serial = run_once(1)?;
+            #[cfg(feature = "parallel-rows")]
+            let worker_counts = [1, 4, 6, 8, 12];
+            #[cfg(not(feature = "parallel-rows"))]
+            let worker_counts = [1];
+            for workers in worker_counts {
+                let actual = run_once(workers)?;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    serial.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "heads={heads}, kv_heads={kv_heads}, workers={workers}",
+                );
+            }
+        }
+        // Also compare attend_group::<6>, attend_group::<3>, attend_group::<2> directly
+        // against attention_six::attend on one full 6-head KV group.
+        let mut geometry = projection_geometry(256);
+        geometry.heads = 6;
+        geometry.kv_heads = 1;
+        geometry.rope = 64;
+        let width = geometry.kv_heads * geometry.head;
+        let mut keys = KvCache::new(width, 32)?;
+        let mut values = KvCache::new(width, 32)?;
+        for step in 0..17_usize {
+            keys.reserve_append()?;
+            values.reserve_append()?;
+            let k: Vec<f32> = (0..width)
+                .map(|i| [0.25_f32, -0.5, 0.5][(step + i) % 3])
+                .collect();
+            let v: Vec<f32> = (0..width)
+                .map(|i| [-0.25_f32, 0.75, -0.5][(step + i) % 3])
+                .collect();
+            keys.append(&k);
+            values.append(&v);
+        }
+        let queries: Vec<f32> = (0..geometry.heads * geometry.head)
+            .map(|i| [-0.5_f32, 0.25, 0.125, -0.25][i % 4])
+            .collect();
+        let projected: Vec<f32> = (0..geometry.query_gate_width())
+            .map(|i| [-1.0_f32, -0.25, 0.0, 0.5, 1.5][i % 5])
+            .collect();
+        let cur_k = vec![0.5_f32; width];
+        let cur_v = vec![-0.25_f32; width];
+        let scale = 1.0 / 16.0;
+        let score_len = 18;
+        let mut oracle = vec![0.0_f32; geometry.heads * geometry.head];
+        let mut oracle_scores = vec![0.0_f32; 6 * score_len];
+        super::attention_six::attend(
+            &geometry,
+            0,
+            &queries,
+            &projected,
+            &keys,
+            &values,
+            &cur_k,
+            &cur_v,
+            &mut oracle,
+            &mut oracle_scores,
+            scale,
+        )?;
+        let mut out6 = vec![0.0_f32; 6 * geometry.head];
+        let mut s6 = vec![0.0_f32; 6 * score_len];
+        let mut p6 = vec![[0_u16; 6]; score_len];
+        super::attention_six::attend_group::<6>(
+            &geometry, 0, &queries, &projected, &keys, &values, &cur_k, &cur_v, &mut out6, &mut s6,
+            &mut p6, scale,
+        )?;
+        assert_eq!(
+            out6.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            oracle.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+        for chunk in 0..2 {
+            let mut out3 = vec![0.0_f32; 3 * geometry.head];
+            let mut s3 = vec![0.0_f32; 3 * score_len];
+            let mut p3 = vec![[0_u16; 3]; score_len];
+            super::attention_six::attend_group::<3>(
+                &geometry,
+                chunk * 3,
+                &queries,
+                &projected,
+                &keys,
+                &values,
+                &cur_k,
+                &cur_v,
+                &mut out3,
+                &mut s3,
+                &mut p3,
+                scale,
+            )?;
+            let start = chunk * 3 * geometry.head;
+            assert_eq!(
+                out3.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                oracle[start..start + 3 * geometry.head]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for chunk in 0..3 {
+            let mut out2 = vec![0.0_f32; 2 * geometry.head];
+            let mut s2 = vec![0.0_f32; 2 * score_len];
+            let mut p2 = vec![[0_u16; 2]; score_len];
+            super::attention_six::attend_group::<2>(
+                &geometry,
+                chunk * 2,
+                &queries,
+                &projected,
+                &keys,
+                &values,
+                &cur_k,
+                &cur_v,
+                &mut out2,
+                &mut s2,
+                &mut p2,
+                scale,
+            )?;
+            let start = chunk * 2 * geometry.head;
+            assert_eq!(
+                out2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                oracle[start..start + 2 * geometry.head]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            );
         }
         Ok(())
     }

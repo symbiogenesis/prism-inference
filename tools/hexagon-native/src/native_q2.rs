@@ -12,9 +12,8 @@
 )]
 
 use crate::{
-    Error, HMX_Q2_POWER_MODE_BURST, HMX_Q2_VTCM_REQUEST_BYTES,
-    Q2_PROJECTION_MAX_ROWS, Q2ProjectionLimits, Q2ProjectionReport, compute, hmx_projection,
-    projection,
+    Error, HMX_Q2_POWER_MODE_BURST, HMX_Q2_VTCM_REQUEST_BYTES, Q2_PROJECTION_MAX_ROWS,
+    Q2ProjectionLimits, Q2ProjectionReport, compute, hmx_projection, projection,
 };
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -340,7 +339,11 @@ impl NativeQ2WeightRegistry {
     /// Rejects capacity above `NATIVE_Q2_MAX_RESIDENT_WEIGHT_BYTES`.
     pub fn new(capacity_bytes: usize) -> Result<Self, Error> {
         let (capacities, arena_count) = arena_capacities(capacity_bytes).ok_or(Error::Contract)?;
-        Self::from_arena_capacities_for_profile(capacities, arena_count, crate::HtpArchProfile::v81())
+        Self::from_arena_capacities_for_profile(
+            capacities,
+            arena_count,
+            crate::HtpArchProfile::v81(),
+        )
     }
 
     /// Create one independent owner over an explicit mapped arena slice and hardware profile
@@ -418,7 +421,8 @@ impl NativeQ2WeightRegistry {
         weight_bytes: usize,
     ) -> Result<Option<NativeQ2WeightHandle>, Error> {
         let hvx_params = hvx_mv_params_for_profile(self.profile, columns, rows)?;
-        let hvx_workers = u8::try_from(self.profile.hvx_workers.max(1)).map_err(|_| Error::Contract)?;
+        let hvx_workers =
+            u8::try_from(self.profile.hvx_workers.max(1)).map_err(|_| Error::Contract)?;
         let mut arena_idx = self.active_arena;
         while arena_idx < self.arena_count {
             let start = self.used[arena_idx].next_multiple_of(128);
@@ -1828,7 +1832,8 @@ pub(crate) fn image_ffn_swiglu_resident_for_profile(
     };
     let glu_cols_u32 = u32::try_from(glu_cols).map_err(|_| Error::Contract)?;
     let glu_rows_u32 = u32::try_from(glu_rows).map_err(|_| Error::Contract)?;
-    let glu_kp = crate::htp_ops::solve_glu_kparams_for_profile(profile, glu_cols_u32, glu_rows_u32)?;
+    let glu_kp =
+        crate::htp_ops::solve_glu_kparams_for_profile(profile, glu_cols_u32, glu_rows_u32)?;
     let glu_row_bytes = glu_cols * 4;
 
     for (ti_offset, buf_offset) in [
@@ -2041,7 +2046,8 @@ pub(crate) fn image_ffn_swiglu_multi2_resident_for_profile(
     };
     let glu_cols_u32 = u32::try_from(glu_cols).map_err(|_| Error::Contract)?;
     let glu_rows_u32 = u32::try_from(glu_rows).map_err(|_| Error::Contract)?;
-    let glu_kp = crate::htp_ops::solve_glu_kparams_for_profile(profile, glu_cols_u32, glu_rows_u32)?;
+    let glu_kp =
+        crate::htp_ops::solve_glu_kparams_for_profile(profile, glu_cols_u32, glu_rows_u32)?;
     let glu_row_bytes = glu_cols * 4;
 
     for (ti_offset, buf_offset) in [
@@ -4223,7 +4229,8 @@ mod tests {
         let mut partial_caps = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
         partial_caps[0] = NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES;
         partial_caps[1] = NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES;
-        let mut v73_reg = NativeQ2WeightRegistry::from_arena_capacities_for_profile(partial_caps, 2, v73)?;
+        let mut v73_reg =
+            NativeQ2WeightRegistry::from_arena_capacities_for_profile(partial_caps, 2, v73)?;
         assert_eq!(
             v73_reg.remaining_bytes(),
             NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES + NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES

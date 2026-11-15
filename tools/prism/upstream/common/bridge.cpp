@@ -26,7 +26,6 @@
 #include "arg_parser.hpp"
 #include "chat.hpp"
 #include "optimizer.hpp"
-#include "quantization.hpp"
 #include "dspark.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
@@ -164,8 +163,6 @@ void validate_operation(const wire_json & operation) {
         prism_chat::validate(operation);
     } else if (prism_optimizer::handles(kind)) {
         prism_optimizer::validate(operation);
-    } else if (prism_quantization::handles(kind)) {
-        prism_quantization::validate(operation);
     } else if (prism_backend_ops::handles(kind)) {
         prism_backend_ops::validate(operation);
     } else if (prism_dspark::handles(kind)) {
@@ -239,9 +236,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_optimizer::handles(kind)) {
         return prism_optimizer::execute(operation);
-    }
-    if (prism_quantization::handles(kind)) {
-        return prism_quantization::execute(operation);
     }
     if (prism_backend_ops::handles(kind)) {
         return prism_backend_ops::execute(operation);

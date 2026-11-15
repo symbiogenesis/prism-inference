@@ -626,7 +626,8 @@
       "Needs": [
         "SSL metadata fetcher",
         "11 exact remote metadata schemas",
-        "12 bundled tests/snapshots/*.schema files"
+        "12 bundled tests/snapshots/*.schema files",
+        "independent clean-room quantization policy reference provider (reference_quantization.rs)"
       ],
       "AssertionsToPort": "For every model and ftype compare default/per-tensor selected quant type against pinned schema; all overrides; --generate is reference generation not passing test. Need freeze remote metadata revisions/digests.",
       "LegacyReferenceRequired": false,

@@ -287,3 +287,18 @@ any native bridge. Ordinary `cpp` and `rust-reference` selections disclose
 `common/allocation.hpp`, its include/dispatch and its CMake build edge are
 removed (leaving 32 checked-in C++ files across the bridge snapshot). Selecting
 `test-alloc` alone needs no native common bridge.
+
+## Retired quantization-policy native provider
+
+`--target rust-reference --case test-quant-type-selection` runs all 363 pinned
+model-ftype schema sections and per-tensor storage type assertions through
+`tests/upstream_prism/reference_quantization.rs` using clean-room architecture
+predicates, role classification and fallback selection, without calling
+`bonsai_prism_runtime`, any native bridge or expected-answer fixtures (it reads
+only the frozen GGUF model metadata header inputs and asserts against the pinned
+`tests/snapshots/*.schema` suites as before). Ordinary `cpp` and
+`rust-reference` selections disclose `nativeReferenceReplay=false`.
+
+`common/quantization.hpp`, its include/dispatch and its CMake build edge are
+removed (leaving 31 checked-in C++ files across the bridge snapshot). Selecting
+`test-quant-type-selection` alone needs no native common bridge.

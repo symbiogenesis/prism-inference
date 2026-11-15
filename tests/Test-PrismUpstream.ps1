@@ -222,7 +222,7 @@ $adapters = @{
     DsparkLoop = @{ Name = 'test-dspark-loop'; Family = 'common' }
     DsparkRealEval = @{ Name = 'test-dspark-real-eval'; Family = 'common' }
     GgufMetadata = @{ Name = 'test-gguf-model-data'; Family = 'independent' }
-    QuantSelection = @{ Name = 'test-quant-type-selection'; Family = 'common' }
+    QuantSelection = @{ Name = 'test-quant-type-selection'; Family = 'independent' }
     Architectures = @{ Name = 'test-llama-archs'; Family = 'common' }
     RecurrentRollback = @{ Name = 'test-recurrent-state-rollback'; Family = 'common' }
     KvMeanCenter = @{ Name = 'test-kv-mean-center'; Family = 'common' }

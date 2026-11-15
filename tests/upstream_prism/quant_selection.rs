@@ -695,11 +695,16 @@ pub(super) fn run_quantization(engine: &Engine) -> Result<Value> {
         }
         model_rows.push(json!({"Repo":repo,"Quant":quant,"Schema":format!("{file}.schema"),"SchemaSha256":digest(&schema),"Sections":33,"Overrides":expected_overrides,"QuantizableTensors":indices.len(),"Predicates":predicates,"FailedSections":bad,"Input":input_summary(&model)}));
     }
+    let provider_kind = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-quantization-policy; nativeReferenceReplay=false"
+    };
     let mut output = result(
         QUANT_ID,
         total == 363 && failed.is_empty(),
         format!(
-            "{total}/363 complete source sections across all11models; failures={failed:?}; frozen realheaders; schema expectations unchanged"
+            "provider={provider_kind}; {total}/363 complete source sections across all11models; failures={failed:?}; frozen realheaders; schema expectations unchanged"
         ),
     );
     output["Models"] = json!(model_rows);

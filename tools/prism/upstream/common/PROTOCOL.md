@@ -476,11 +476,10 @@ contexts/buffers/datasets/optimizers/results,256 tensor descriptors,1MiB per dat
 fit epochs are accepted. Context and buffer lifetimes are validated separately from numerical test
 predicates.
 
-`quantization-info` returns production GGML type names and default types for supplied ftype IDs.
-`quantization-model` constructs a production metadata-only quantization model and F32 tensor
-descriptors from supplied dimensions/names. Explicit `allows` actions return actual quantizability
-flags and production tensor names; `types` actions classify the caller's ordered tensor indices. At
-most32768 tensor descriptors and128 actions are accepted, with two million returned classifications.
+The native `quantization-info` and `quantization-model` bridge operations (formerly provided by retired
+`common/quantization.hpp`) are removed. Independent `test-quant-type-selection` checks run in-process
+through `tests/upstream_prism/reference_quantization.rs` and disclose `nativeReferenceReplay=false`;
+direct native requests reject as unsupported.
 
 `backend-graph` accepts `Directory`, `MaxFileBytes` and either an `Actions` array or an absolute
 `ActionsFile` beneath that directory. Native `call` actions

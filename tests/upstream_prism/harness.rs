@@ -97,6 +97,7 @@ mod reference_logging;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
 mod reference_provider;
+mod reference_quantization;
 mod reference_reasoning;
 mod reference_threadpool;
 mod schema_python;
@@ -246,7 +247,7 @@ const CASES: &[Case] = &[
     register(
         "test-quant-type-selection",
         "tests/test-quant-type-selection.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         quant_selection::run_quantization,
     ),
     register(

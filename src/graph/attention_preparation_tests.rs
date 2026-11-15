@@ -93,6 +93,7 @@ impl Fixture {
             arithmetic,
             transforms: &transforms,
             position: 2,
+            mrope_positions: [2, 2, 2, 0],
             frequencies_ready: false,
             projection: &mut projection,
             adapter: None,

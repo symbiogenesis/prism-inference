@@ -1519,6 +1519,7 @@ struct Evaluation<'a, 'executor> {
     arithmetic: Arithmetic,
     transforms: &'a Transforms,
     position: usize,
+    mrope_positions: [usize; 4],
     frequencies_ready: bool,
     projection: &'a mut ProjectionScratch,
     adapter: Option<&'a RankOneAdapter>,
@@ -2136,6 +2137,7 @@ pub struct Qwen35Checkpoint {
     identity: String,
     context_limit: usize,
     position: usize,
+    mrope_position: usize,
     layers: Vec<LayerState>,
     projection_plan_digest: Option<[u8; 32]>,
 }
@@ -2197,6 +2199,7 @@ pub struct Qwen35 {
     workspace: Workspace,
     context_limit: usize,
     position: usize,
+    mrope_position: usize,
     state_consistent: bool,
     vocabulary: usize,
     kv_cache_policy: KvCachePolicy,
@@ -2941,6 +2944,7 @@ impl Qwen35 {
             },
             context_limit,
             position: 0,
+            mrope_position: 0,
             state_consistent: true,
             vocabulary,
             kv_cache_policy,
@@ -3169,6 +3173,115 @@ impl Qwen35 {
         self.workspace.projection.fusions
     }
 
+    /// Current interleaved `MRoPE` coordinate counter for text and subsequent
+    /// multimodal inputs.
+    ///
+    /// Equal to sequence position for text-only conversations; advances by
+    /// `grid_width.max(grid_height)` after each evaluated image chunk.
+    #[must_use]
+    pub const fn mrope_position(&self) -> usize {
+        self.mrope_position
+    }
+
+    /// Ingest a spatially gridded sequence of projected vision patch embeddings
+    /// causally using 3D interleaved `MRoPE` coordinates, advancing sequence
+    /// position by `grid_width * grid_height` and `mrope_position` by
+    /// `grid_width.max(grid_height)`.
+    ///
+    /// On error or cancellation, decoder state is transactionally restored to
+    /// its pre-chunk checkpoint and `logits` (if supplied) is cleared.
+    ///
+    /// # Errors
+    /// Rejects inconsistent state, zero or overflowing grid bounds, mismatched
+    /// or nonfinite embeddings, exhausted context, cancellation checks, and
+    /// underlying decoder failures.
+    pub fn evaluate_image_chunk(
+        &mut self,
+        embeddings: &[f32],
+        grid_width: usize,
+        grid_height: usize,
+        mut logits: Option<&mut Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if let Some(buffer) = logits.as_deref_mut() {
+            buffer.clear();
+        }
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
+        if grid_width == 0 || grid_height == 0 {
+            return Err(invalid("image chunk grid dimensions must be nonzero"));
+        }
+        let patch_count = grid_width
+            .checked_mul(grid_height)
+            .ok_or_else(|| invalid("image chunk patch count overflow"))?;
+        let width = self.geometry.embedding;
+        let expected_len = patch_count
+            .checked_mul(width)
+            .ok_or_else(|| invalid("image chunk embedding length overflow"))?;
+        if embeddings.len() != expected_len {
+            return Err(invalid("image chunk embedding length mismatch"));
+        }
+        if self
+            .position
+            .checked_add(patch_count)
+            .is_none_or(|end| end > self.context_limit)
+        {
+            return Err(invalid("image chunk exceeds remaining context"));
+        }
+        finite(embeddings, "vision embedding input")?;
+        check()?;
+        let saved = self.checkpoint()?;
+        let p0 = self.mrope_position;
+        let mut executor = self.projection_executor.take();
+        let result = (|| -> Result<()> {
+            for patch_idx in 0..patch_count {
+                check()?;
+                let y = patch_idx / grid_width;
+                let x = patch_idx % grid_width;
+                let patch = &embeddings[patch_idx * width..(patch_idx + 1) * width];
+                copy_into(patch, &mut self.workspace.hidden)?;
+                let patch_logits = if patch_idx + 1 == patch_count {
+                    logits.as_deref_mut()
+                } else {
+                    None
+                };
+                self.evaluate_hidden_with_executor(
+                    patch_logits,
+                    executor.as_mut().map(Self::coerce_executor),
+                    None,
+                    None,
+                    [p0, p0 + y, p0 + x, 0],
+                    0,
+                )?;
+                check()?;
+            }
+            let axis_advance = grid_width.max(grid_height);
+            self.mrope_position = p0
+                .checked_add(axis_advance)
+                .ok_or_else(|| invalid("MRoPE position overflow"))?;
+            Ok(())
+        })();
+        self.projection_executor = executor;
+        if result.is_err() {
+            if let Some(buffer) = logits {
+                buffer.clear();
+            }
+            if self.restore(&saved).is_err() {
+                self.state_consistent = false;
+            }
+        }
+        result
+    }
+
+    const fn coerce_executor(
+        executor: &mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
+    ) -> &mut (dyn crate::kernels::Pq2ProjectionExecutor + '_) {
+        &mut **executor
+    }
+
     fn evaluate_token_into(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
         self.evaluate_token_recorded_into(token, logits, None)
     }
@@ -3179,16 +3292,11 @@ impl Qwen35 {
         logits: Option<&mut Vec<f32>>,
         timings: Option<&mut TokenTimings>,
     ) -> Result<()> {
-        const fn coerce_executor<'a>(
-            executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
-        ) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
-            &mut **executor
-        }
         let mut executor = self.projection_executor.take();
         let result = self.evaluate_token_recorded_with_executor(
             token,
             logits,
-            executor.as_mut().map(coerce_executor),
+            executor.as_mut().map(Self::coerce_executor),
             None,
             timings,
         );
@@ -3206,17 +3314,13 @@ impl Qwen35 {
         self.evaluate_token_recorded_with_executor(token, logits, executor, probe, None)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep validation and transactional graph operation order auditable together."
-    )]
     fn evaluate_token_recorded_with_executor(
         &mut self,
         token: u32,
         logits: Option<&mut Vec<f32>>,
         executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
-        mut probe: Option<&mut weight_patch::Intervention<'_>>,
-        mut timings: Option<&mut TokenTimings>,
+        probe: Option<&mut weight_patch::Intervention<'_>>,
+        timings: Option<&mut TokenTimings>,
     ) -> Result<()> {
         if !self.state_consistent {
             return Err(invalid(
@@ -3229,6 +3333,45 @@ impl Qwen35 {
                 "token is outside the vocabulary or context is exhausted",
             ));
         }
+        let hidden = &mut self.workspace.hidden;
+        row_into(&self.embedding, token, hidden)?;
+        if self.transforms.inverse_embedding {
+            self.transforms.rotate_with_parallelism(
+                hidden,
+                self.workspace.projection.matvec.row_parallelism(),
+            )?;
+            self.transforms.sign(hidden);
+        }
+        if let Some(adapter) = &self.adapter {
+            adapter.embedding(
+                token,
+                self.adapter_scale,
+                hidden,
+                &mut self.workspace.adapter,
+            )?;
+        }
+        let mrope = [
+            self.mrope_position,
+            self.mrope_position,
+            self.mrope_position,
+            0,
+        ];
+        self.evaluate_hidden_with_executor(logits, executor, probe, timings, mrope, 1)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep validation and transactional graph operation order auditable together across token and multimodal residuals."
+    )]
+    fn evaluate_hidden_with_executor(
+        &mut self,
+        logits: Option<&mut Vec<f32>>,
+        executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        mut probe: Option<&mut weight_patch::Intervention<'_>>,
+        mut timings: Option<&mut TokenTimings>,
+        mrope_positions: [usize; 4],
+        mrope_advance: usize,
+    ) -> Result<()> {
         let Workspace {
             hidden,
             normalized,
@@ -3243,6 +3386,7 @@ impl Qwen35 {
             arithmetic: self.arithmetic,
             transforms: &self.transforms,
             position: self.position,
+            mrope_positions,
             frequencies_ready: false,
             projection,
             adapter: self.adapter.as_ref(),
@@ -3250,20 +3394,6 @@ impl Qwen35 {
             adapter_scratch,
             executor,
         };
-        row_into(&self.embedding, token, hidden)?;
-        if self.transforms.inverse_embedding {
-            self.transforms
-                .rotate_with_parallelism(hidden, evaluation.projection.matvec.row_parallelism())?;
-            self.transforms.sign(hidden);
-        }
-        if let Some(adapter) = &self.adapter {
-            adapter.embedding(
-                token,
-                self.adapter_scale,
-                hidden,
-                evaluation.adapter_scratch,
-            )?;
-        }
         let total_layers = self.layers.len();
         let narrow_final = logits.is_none() && self.narrow_last_layer;
         for (layer_idx, ((layer, state), delta)) in self
@@ -3470,6 +3600,7 @@ impl Qwen35 {
             }
         }
         self.position += 1;
+        self.mrope_position += mrope_advance;
         Ok(())
     }
 }
@@ -3820,7 +3951,7 @@ impl Evaluation<'_, '_> {
         self.project_group_into([&layer.key, &layer.value], input, [key, value])?;
         let g = self.geometry;
         if !self.frequencies_ready {
-            rope_frequencies(g, self.position, &mut scratch.frequencies)?;
+            rope_frequencies_mrope(g, self.mrope_positions, &mut scratch.frequencies)?;
             self.frequencies_ready = true;
         }
         let arithmetic = self.arithmetic;
@@ -3883,7 +4014,7 @@ impl Evaluation<'_, '_> {
         // this token evaluation. Reuse the exact scalar frequencies for Q/K
         // and subsequent layers; the flag resets for every evaluation attempt.
         if !self.frequencies_ready {
-            rope_frequencies(g, self.position, frequencies_scratch)?;
+            rope_frequencies_mrope(g, self.mrope_positions, frequencies_scratch)?;
             self.frequencies_ready = true;
         }
         resize_into(g.head * g.heads, query_scratch)?;
@@ -4803,7 +4934,7 @@ impl Decoder for Qwen35 {
         // advances position, and failed restore staging never changes live state.
         // Avoid refilling the recurrent buffers when callers reset twice (for
         // example request-boundary reset followed by runtime prefix preparation).
-        if self.position == 0 && self.state_consistent {
+        if self.position == 0 && self.mrope_position == 0 && self.state_consistent {
             return Ok(());
         }
         for state in &mut self.state {
@@ -4822,6 +4953,7 @@ impl Decoder for Qwen35 {
             }
         }
         self.position = 0;
+        self.mrope_position = 0;
         self.state_consistent = true;
         Ok(())
     }
@@ -4866,6 +4998,16 @@ impl Decoder for Qwen35 {
     ) -> Result<()> {
         self.evaluate_verification_block(tokens, output, check)
     }
+    fn evaluate_image_chunk(
+        &mut self,
+        embeddings: &[f32],
+        grid_width: usize,
+        grid_height: usize,
+        logits: Option<&mut Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        Self::evaluate_image_chunk(self, embeddings, grid_width, grid_height, logits, check)
+    }
     fn checkpoint_bytes(&self) -> usize {
         // Deliberately charge each referenced page in full for every snapshot,
         // including its Arc header and page table. Runtime admission therefore
@@ -4897,6 +5039,7 @@ impl Decoder for Qwen35 {
             identity: copy_string(&self.identity)?,
             context_limit: self.context_limit,
             position: self.position,
+            mrope_position: self.mrope_position,
             // Graph evaluation commits all layer deltas and position together.
             // Position zero therefore has one exact representation, even after
             // a failed first evaluation has populated workspace scratch.
@@ -4924,6 +5067,7 @@ impl Decoder for Qwen35 {
         target.provenance = self.provenance.clone();
         target.context_limit = self.context_limit;
         target.position = self.position;
+        target.mrope_position = self.mrope_position;
         target.projection_plan_digest = None;
         Ok(())
     }
@@ -4943,6 +5087,11 @@ impl Decoder for Qwen35 {
                 "checkpoint belongs to a different model or context",
             ));
         }
+        if checkpoint.mrope_position > checkpoint.position {
+            return Err(invalid(
+                "checkpoint belongs to a different model or context",
+            ));
+        }
         if checkpoint.position == 0 {
             // All provenance and shape checks precede this infallible reset of
             // existing live storage; scratch and other snapshots remain private.
@@ -4950,6 +5099,7 @@ impl Decoder for Qwen35 {
         }
         restore_state_in_place(&mut self.state, &checkpoint.layers, checkpoint.position)?;
         self.position = checkpoint.position;
+        self.mrope_position = checkpoint.mrope_position;
         self.state_consistent = true;
         Ok(())
     }
@@ -5740,29 +5890,43 @@ fn add_finite(target: &mut [f32], other: &[f32], operation: &str) -> Result<()> 
     Ok(())
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::as_conversions,
-    reason = "Bounded token positions are converted to the same binary32 RoPE input as Prism."
-)]
 fn rope_frequencies(
     geometry: &Geometry,
     position: usize,
     frequencies: &mut Vec<(f32, f32)>,
 ) -> Result<()> {
+    rope_frequencies_mrope(geometry, [position, position, position, 0], frequencies)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "Bounded token positions are converted to the same binary32 RoPE input as Prism."
+)]
+fn rope_frequencies_mrope(
+    geometry: &Geometry,
+    positions: [usize; 4],
+    frequencies: &mut Vec<(f32, f32)>,
+) -> Result<()> {
     let theta_scale = geometry.rope_base.powf(-2.0 / small_float(geometry.rope)?);
     prepare(frequencies, geometry.rope / 2)?;
-    let mut theta = position as f32;
+    let mut thetas = [
+        positions[0] as f32,
+        positions[1] as f32,
+        positions[2] as f32,
+        positions[3] as f32,
+    ];
     for index in 0..geometry.rope / 2 {
-        // Text positions are [p,p,p,0]. Interleaved MRoPE falls back to the
-        // fourth (zero) position for sectors outside their declared section.
-        let angle = if index < 3 * geometry.rope_sections[index % 3] {
-            theta
+        let sector = index % 3;
+        let angle = if index < 3 * geometry.rope_sections[sector] {
+            thetas[sector]
         } else {
-            0.0
+            thetas[3]
         };
         frequencies.push((angle.cos(), angle.sin()));
-        theta *= theta_scale;
+        for theta in &mut thetas {
+            *theta *= theta_scale;
+        }
     }
     Ok(())
 }
@@ -5795,7 +5959,7 @@ mod tests {
     use super::{
         Arithmetic, Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES,
         ProjectionScratch, Transforms, append_decayed_head, copy_state, dot, dot_f16,
-        half_to_float, restore_state, rope, rope_frequencies,
+        half_to_float, restore_state, rope, rope_frequencies, rope_frequencies_mrope,
     };
     use crate::Result;
     use crate::kernels::half_bits;
@@ -6585,6 +6749,7 @@ mod tests {
             arithmetic,
             transforms: &transforms,
             position: 0,
+            mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
             adapter: None,
@@ -6766,6 +6931,7 @@ mod tests {
                     arithmetic: Arithmetic::PinnedSwift,
                     transforms: &transforms,
                     position: history_tokens,
+                    mrope_positions: [history_tokens, history_tokens, history_tokens, 0],
                     frequencies_ready: false,
                     projection: &mut projection,
                     adapter: None,
@@ -7145,6 +7311,60 @@ mod tests {
         assert_eq!(input[10].to_bits(), 2.0_f32.to_bits());
         assert!((input[0] - 3.0_f32.cos()).abs() < 0.000_001);
         assert!((input[6] - 3.0_f32.sin()).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn imrope_routes_temporal_height_width_sectors_and_matches_text_bits() -> Result<()> {
+        let geometry = Geometry {
+            embedding: 12,
+            feed_forward: 12,
+            heads: 1,
+            kv_heads: 1,
+            head: 12,
+            rope: 12,
+            rope_sections: [2, 1, 1, 0],
+            rope_base: 10_000.0,
+            epsilon: 0.000_001,
+            ssm_head: 1,
+            ssm_keys: 1,
+            ssm_values: 1,
+            convolution: 1,
+        };
+        let mut text_freqs = Vec::new();
+        let mut mrope_text_freqs = Vec::new();
+        for pos in [0, 3, 17] {
+            rope_frequencies(&geometry, pos, &mut text_freqs)?;
+            rope_frequencies_mrope(&geometry, [pos, pos, pos, 0], &mut mrope_text_freqs)?;
+            assert_eq!(text_freqs.len(), mrope_text_freqs.len());
+            for ((lc, ls), (rc, rs)) in text_freqs.iter().zip(&mrope_text_freqs) {
+                assert_eq!(lc.to_bits(), rc.to_bits());
+                assert_eq!(ls.to_bits(), rs.to_bits());
+            }
+        }
+
+        let mut freqs = Vec::new();
+        rope_frequencies_mrope(&geometry, [3, 7, 11, 0], &mut freqs)?;
+        let scale = 10_000.0_f32.powf(-2.0 / 12.0);
+        // Pair 0 (sector t, < 3 * 2): 3.0
+        // Pair 1 (sector h, < 3 * 1): 7.0 * scale
+        // Pair 2 (sector w, < 3 * 1): 11.0 * scale^2
+        // Pair 3 (sector t, < 3 * 2): 3.0 * scale^3
+        // Pair 4 (sector h, >= 3 * 1): fallback 0.0
+        // Pair 5 (sector w, >= 3 * 1): fallback 0.0
+        let expected_angles = [
+            3.0_f32,
+            7.0_f32 * scale,
+            11.0_f32 * scale * scale,
+            3.0_f32 * scale * scale * scale,
+            0.0_f32,
+            0.0_f32,
+        ];
+        assert_eq!(freqs.len(), expected_angles.len());
+        for (&(cos_v, sin_v), expected_angle) in freqs.iter().zip(expected_angles) {
+            assert!((cos_v - expected_angle.cos()).abs() < 1e-6);
+            assert!((sin_v - expected_angle.sin()).abs() < 1e-6);
+        }
         Ok(())
     }
 
@@ -8056,6 +8276,218 @@ mod tests {
                         .is_ok()
                 );
             }
+            Ok(())
+        }
+
+        fn full_attention_fixture() -> Model {
+            let mut metadata = recurrent_metadata();
+            metadata.insert(
+                "qwen35.context_length".to_owned(),
+                MetadataValue::from(32_u32),
+            );
+            metadata.insert(
+                "qwen35.embedding_length".to_owned(),
+                MetadataValue::from(4_u32),
+            );
+            metadata.insert(
+                "qwen35.feed_forward_length".to_owned(),
+                MetadataValue::from(4_u32),
+            );
+            metadata.insert(
+                "qwen35.attention.key_length".to_owned(),
+                MetadataValue::from(6_u32),
+            );
+            metadata.insert(
+                "qwen35.attention.value_length".to_owned(),
+                MetadataValue::from(6_u32),
+            );
+            metadata.insert(
+                "qwen35.rope.dimension_count".to_owned(),
+                MetadataValue::from(6_u32),
+            );
+            metadata.insert(
+                "qwen35.rope.dimension_sections".to_owned(),
+                MetadataValue::from(vec![1_u32, 1, 1, 0]),
+            );
+            metadata.insert(
+                "qwen35.attention.recurrent_layers".to_owned(),
+                MetadataValue::from(vec![false]),
+            );
+            let mut tensors = BTreeMap::new();
+            let fill = |len: usize, seed: f32| -> Vec<f32> {
+                (0..len)
+                    .map(|idx| {
+                        let pat = [0.25_f32, -0.125, 0.5, -0.25, 0.375, -0.5][idx % 6];
+                        seed.mul_add(0.0625, pat)
+                    })
+                    .collect()
+            };
+            let mut insert = |name: &str, dimensions: &[usize], values: Vec<f32>| {
+                tensors.insert(name.to_owned(), weight(name, dimensions, &values));
+            };
+            insert("token_embd.weight", &[4, 2], fill(8, 1.0));
+            insert("output.weight", &[4, 2], fill(8, -1.0));
+            insert("output_norm.weight", &[4], vec![1.0; 4]);
+            insert("blk.0.attn_norm.weight", &[4], vec![1.0; 4]);
+            insert("blk.0.post_attention_norm.weight", &[4], vec![1.0; 4]);
+            insert("blk.0.attn_q.weight", &[4, 12], fill(48, 0.5));
+            insert("blk.0.attn_k.weight", &[4, 6], fill(24, -0.5));
+            insert("blk.0.attn_v.weight", &[4, 6], fill(24, 0.25));
+            insert("blk.0.attn_output.weight", &[6, 4], fill(24, -0.25));
+            insert("blk.0.attn_q_norm.weight", &[6], vec![1.0; 6]);
+            insert("blk.0.attn_k_norm.weight", &[6], vec![1.0; 6]);
+            insert("blk.0.ffn_up.weight", &[4, 4], fill(16, 0.5));
+            insert("blk.0.ffn_gate.weight", &[4, 4], fill(16, -0.5));
+            insert("blk.0.ffn_down.weight", &[4, 4], fill(16, 0.25));
+            Model {
+                metadata,
+                tensors,
+                identity: "graph-full-attention-image-fixture".to_owned(),
+            }
+        }
+
+        #[test]
+        fn evaluate_image_chunk_tracks_positions_checkpoint_and_tiled_text_tail() -> Result<()> {
+            let mut decoder = Qwen35::new(full_attention_fixture(), 32)?;
+            let tiled_base = Qwen35::new(full_attention_fixture(), 32)?;
+            let tiled_scratch = tiled_base.tiled_prefill_scratch_bytes(8)?;
+            let mut tiled = tiled_base.with_tiled_prefill(8, tiled_scratch)?;
+
+            for model in [&mut decoder, &mut tiled] {
+                model.ingest(0)?;
+                model.ingest(1)?;
+                assert_eq!(model.position, 2);
+                assert_eq!(model.mrope_position(), 2);
+            }
+
+            // Ingest a 2x3 patch grid (6 KV tokens, MRoPE advances by max(2, 3) = 3).
+            let embeddings: Vec<f32> = (0..(6 * 4))
+                .map(|idx| [0.5_f32, -0.25, 0.75, -0.125][idx % 4])
+                .collect();
+            let mut image_logits = Vec::new();
+            decoder.evaluate_image_chunk(&embeddings, 2, 3, Some(&mut image_logits), &|| Ok(()))?;
+            assert_eq!(image_logits.len(), decoder.vocab_size());
+            assert!(image_logits.iter().all(|value| value.is_finite()));
+            assert_eq!(decoder.position, 8);
+            assert_eq!(decoder.mrope_position(), 5);
+
+            tiled.evaluate_image_chunk(&embeddings, 2, 3, None, &|| Ok(()))?;
+            assert_eq!(tiled.position, 8);
+            assert_eq!(tiled.mrope_position(), 5);
+
+            let saved = decoder.checkpoint()?;
+            let mut recycled = decoder.checkpoint()?;
+
+            // Subsequent text advances both `position` and `mrope_position` from distinct bases.
+            decoder.ingest_block(&[0, 1], &|| Ok(()))?;
+            tiled.ingest_block(&[0, 1], &|| Ok(()))?;
+            assert_eq!(decoder.position, 10);
+            assert_eq!(decoder.mrope_position(), 7);
+            assert_eq!(tiled.position, 10);
+            assert_eq!(tiled.mrope_position(), 7);
+
+            let mut untiled_after = Vec::new();
+            let mut tiled_after = Vec::new();
+            decoder.evaluate_into(0, &mut untiled_after)?;
+            tiled.evaluate_into(0, &mut tiled_after)?;
+            assert!(
+                untiled_after
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .eq(tiled_after.iter().map(|value| value.to_bits()))
+            );
+
+            // Checkpoint / checkpoint_into / restore preserve mismatched (position, mrope_position).
+            decoder.checkpoint_into(&mut recycled)?;
+            let mut third_step = Vec::new();
+            decoder.evaluate_into(1, &mut third_step)?;
+            decoder.restore(&recycled)?;
+            assert_eq!(decoder.position, 11);
+            assert_eq!(decoder.mrope_position(), 8);
+            let mut replayed = Vec::new();
+            decoder.evaluate_into(1, &mut replayed)?;
+            assert!(
+                third_step
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .eq(replayed.iter().map(|value| value.to_bits()))
+            );
+
+            decoder.restore(&saved)?;
+            assert_eq!(decoder.position, 8);
+            assert_eq!(decoder.mrope_position(), 5);
+
+            decoder.reset()?;
+            assert_eq!(decoder.position, 0);
+            assert_eq!(decoder.mrope_position(), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn evaluate_image_chunk_rolls_back_on_cancellation_and_invalid_inputs() -> Result<()> {
+            let mut decoder = Qwen35::new(recurrent_fixture(-0.5), 16)?;
+            let mut clean = Qwen35::new(recurrent_fixture(-0.5), 16)?;
+            decoder.ingest(0)?;
+            clean.ingest(0)?;
+
+            // Invalid inputs must reject before mutating position, mrope_position or state.
+            let mut logits = vec![1.0_f32; 2];
+            assert!(
+                decoder
+                    .evaluate_image_chunk(&[0.5, -0.5], 0, 1, Some(&mut logits), &|| Ok(()))
+                    .is_err()
+            );
+            let empty: &[f32] = &[];
+            assert_eq!(logits, empty);
+            assert!(
+                decoder
+                    .evaluate_image_chunk(&[0.5], 1, 1, None, &|| Ok(()))
+                    .is_err()
+            );
+            assert!(
+                decoder
+                    .evaluate_image_chunk(&[f32::NAN, 0.5], 1, 1, None, &|| Ok(()))
+                    .is_err()
+            );
+            let oversized = vec![0.25_f32; 16 * 2];
+            assert!(
+                decoder
+                    .evaluate_image_chunk(&oversized, 4, 4, None, &|| Ok(()))
+                    .is_err()
+            );
+            assert_eq!(decoder.position, 1);
+            assert_eq!(decoder.mrope_position(), 1);
+            assert!(decoder.state_consistent);
+
+            // Cancel partway through a 2x2 image chunk and verify full rollback.
+            let patches = vec![0.25_f32, -0.5, 0.75, -0.25, -0.5, 0.25, 0.125, 0.5];
+            let checks = Cell::new(0_usize);
+            let cancel_mid_chunk = || {
+                let count = checks.get() + 1;
+                checks.set(count);
+                if count >= 4 {
+                    return Err(invalid("injected mid-chunk cancellation"));
+                }
+                Ok(())
+            };
+            let mut partial_logits = vec![0.0_f32; 2];
+            assert!(
+                decoder
+                    .evaluate_image_chunk(
+                        &patches,
+                        2,
+                        2,
+                        Some(&mut partial_logits),
+                        &cancel_mid_chunk
+                    )
+                    .is_err()
+            );
+            assert_eq!(partial_logits, empty);
+            assert!(decoder.state_consistent);
+            assert_eq!(decoder.position, 1);
+            assert_eq!(decoder.mrope_position(), 1);
+            assert_recurrent_states_bit_eq(&decoder.state, &clean.state)?;
+            assert_eq!(decoder.evaluate(1)?, clean.evaluate(1)?);
             Ok(())
         }
     }

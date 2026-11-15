@@ -153,6 +153,7 @@ fn recurrent_rms_weight_scope_integrates_worker_heads_and_recovers_failed_layer_
                 arithmetic,
                 transforms: &transforms,
                 position: 0,
+                mrope_positions: [0; 4],
                 frequencies_ready: false,
                 projection: &mut projection,
                 adapter: None,

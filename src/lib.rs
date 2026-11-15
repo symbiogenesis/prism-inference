@@ -273,6 +273,31 @@ pub trait Decoder {
         output.clear();
         Err(invalid("batched decoder evaluation is not selected"))
     }
+    /// Include a spatially gridded sequence of pre-projected vision embeddings
+    /// in decoder state using interleaved 3D `MRoPE` coordinates.
+    ///
+    /// Implementations that do not support multimodal vision residuals refuse
+    /// without mutating decoder state and clear `logits` if supplied.
+    ///
+    /// # Errors
+    /// Rejects unsupported decoders, invalid grid dimensions, mismatched or
+    /// nonfinite embeddings, exhausted context, cancellation checks, and
+    /// underlying decoder failures.
+    fn evaluate_image_chunk(
+        &mut self,
+        _embeddings: &[f32],
+        _grid_width: usize,
+        _grid_height: usize,
+        logits: Option<&mut Vec<f32>>,
+        _check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if let Some(buffer) = logits {
+            buffer.clear();
+        }
+        Err(invalid(
+            "multimodal image-chunk evaluation is not supported by this decoder",
+        ))
+    }
     /// Capture every mutable component needed for exact prefix restoration.
     ///
     /// # Errors

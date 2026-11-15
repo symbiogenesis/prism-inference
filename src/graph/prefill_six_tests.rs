@@ -125,6 +125,7 @@ impl Harness {
             arithmetic,
             &self.transforms,
             self.base,
+            self.base,
             self.count,
             &mut frequencies_ready,
             &mut self.keys,

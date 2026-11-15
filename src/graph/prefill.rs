@@ -587,6 +587,7 @@ impl Qwen35 {
     ) -> Result<()> {
         let count = tokens.len();
         let base = self.position;
+        let mrope_base = self.mrope_position;
         for (token, hidden) in tokens.iter().zip(&mut tile.hidden) {
             check()?;
             row_into(&self.embedding, usize::try_from(*token)?, hidden)?;
@@ -681,7 +682,7 @@ impl Qwen35 {
                             weights,
                             &self.geometry,
                             self.arithmetic,
-                            base,
+                            mrope_base,
                             count,
                             &mut frequencies_ready,
                             keys,
@@ -742,6 +743,7 @@ impl Qwen35 {
                         self.arithmetic,
                         &self.transforms,
                         base,
+                        mrope_base,
                         count,
                         &mut frequencies_ready,
                         keys,
@@ -900,6 +902,7 @@ impl Qwen35 {
             }
         }
         self.position = base + count;
+        self.mrope_position = mrope_base + count;
         self.state_consistent = true;
         Ok(())
     }
@@ -1094,7 +1097,7 @@ fn full_attention_kv_only_tile(
     weights: &FullAttention,
     g: &Geometry,
     arithmetic: Arithmetic,
-    base: usize,
+    mrope_base: usize,
     count: usize,
     frequencies_ready: &mut bool,
     keys: &mut KvCache,
@@ -1105,7 +1108,7 @@ fn full_attention_kv_only_tile(
     check()?;
     if !*frequencies_ready {
         for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
-            rope_frequencies(g, base + index, frequencies)?;
+            rope_frequencies(g, mrope_base + index, frequencies)?;
         }
         *frequencies_ready = true;
     }
@@ -1200,6 +1203,7 @@ fn full_attention_tile(
     arithmetic: Arithmetic,
     transforms: &Transforms,
     base: usize,
+    mrope_base: usize,
     count: usize,
     frequencies_ready: &mut bool,
     keys: &mut KvCache,
@@ -1219,7 +1223,7 @@ fn full_attention_tile(
         for index in 0..count {
             check()?;
             if !*frequencies_ready {
-                rope_frequencies(g, base + index, &mut tile.frequencies[index])?;
+                rope_frequencies(g, mrope_base + index, &mut tile.frequencies[index])?;
             }
             std::mem::swap(
                 &mut attention_scratch.frequencies,
@@ -1230,6 +1234,12 @@ fn full_attention_tile(
                 arithmetic,
                 transforms,
                 position: base + index,
+                mrope_positions: [
+                    mrope_base + index,
+                    mrope_base + index,
+                    mrope_base + index,
+                    0,
+                ],
                 frequencies_ready: true,
                 projection,
                 adapter,
@@ -1268,7 +1278,7 @@ fn full_attention_tile(
     check()?;
     if !*frequencies_ready {
         for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
-            rope_frequencies(g, base + index, frequencies)?;
+            rope_frequencies(g, mrope_base + index, frequencies)?;
         }
         *frequencies_ready = true;
     }

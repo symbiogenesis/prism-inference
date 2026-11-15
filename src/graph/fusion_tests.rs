@@ -90,12 +90,11 @@ fn fusion_verification_counts_real_norm_paths_and_separate_arithmetic() -> Resul
                 if unrelated {
                     transforms.weights.insert("unrelated.graph.node".into());
                 }
-                let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
-                    &[1, 4]
+                for &workers in if cfg!(feature = "parallel-rows") {
+                    &[1_usize, 4][..]
                 } else {
-                    &[1]
-                };
-                for &workers in worker_counts {
+                    &[1_usize][..]
+                } {
                     let mut projection = ProjectionScratch {
                         matvec: arithmetic.scratch(MatvecBackend::Scalar),
                         ..ProjectionScratch::default()
@@ -112,6 +111,7 @@ fn fusion_verification_counts_real_norm_paths_and_separate_arithmetic() -> Resul
                         arithmetic,
                         transforms: &transforms,
                         position: 0,
+                        mrope_positions: [0; 4],
                         frequencies_ready: false,
                         projection: &mut projection,
                         adapter: None,
@@ -225,6 +225,7 @@ fn fusion_verification_swiglu_counts_execution_against_separate_operations() -> 
             arithmetic,
             transforms: &transforms,
             position: 0,
+            mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
             adapter: None,
@@ -281,6 +282,7 @@ fn fusion_verification_rejects_successful_fallback_as_completed_fusion() -> Resu
             arithmetic,
             transforms: &transforms,
             position: 0,
+            mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
             adapter: None,

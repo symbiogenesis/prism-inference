@@ -497,6 +497,7 @@ mod tests {
             workspace: super::super::Workspace::default(),
             context_limit: 8,
             position: 0,
+            mrope_position: 0,
             state_consistent: true,
             vocabulary: 2,
             kv_cache_policy: super::super::KvCachePolicy::F16,

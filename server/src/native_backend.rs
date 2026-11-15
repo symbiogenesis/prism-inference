@@ -150,6 +150,47 @@ pub async fn serve_with_placement(
     }
 }
 
+/// Serve a verified session over parent-owned anonymous broker pipes.
+///
+/// Uses fixed host authority `127.0.0.1:1024` for request validation without
+/// binding any socket or reading a key file on disk, and signals
+/// `KIND_SERVER_READY` only after worker initialization completes.
+pub(crate) async fn serve_broker_pipe_with_placement(
+    endpoint: crate::broker_pipe::ServerEndpoint,
+    mut session: SwiftSession,
+    key: &str,
+    placement: Placement,
+) -> Result<(), NativeBackendError> {
+    let policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, key)
+        .map_err(|_| NativeBackendError::Configuration)?
+        .with_vision(session.has_vision());
+    if placement == Placement::Cpu {
+        session.set_projection_executor(None);
+    }
+    let seed = session.seed();
+    let worker = Worker::with_placement(session, seed, placement)?;
+    serve_broker_pipe_with_worker(endpoint, &policy, worker).await
+}
+
+async fn serve_broker_pipe_with_worker(
+    mut endpoint: crate::broker_pipe::ServerEndpoint,
+    policy: &RequestPolicy,
+    mut worker: Worker,
+) -> Result<(), NativeBackendError> {
+    endpoint.mark_ready().map_err(|_| NativeBackendError::Io)?;
+    loop {
+        match endpoint.accept().await {
+            Ok(Some(client)) => {
+                if let Err(error) = serve_connection(client, policy, &mut worker, None).await {
+                    let _ = write_request_failure(&mut std::io::stderr().lock(), error);
+                }
+            }
+            Ok(None) => return Ok(()),
+            Err(_) => return Err(NativeBackendError::Io),
+        }
+    }
+}
+
 fn write_request_failure(
     writer: &mut impl std::io::Write,
     error: NativeBackendError,
@@ -266,7 +307,14 @@ async fn exchange<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     let mut byte = [0; 1];
     let mut abandoned = pin!(input.read(&mut byte));
     let delivered = AtomicBool::new(false);
-    let mut pipeline = pin!(deliver(output, events, &delivered, deadline));
+    let terminal_written = AtomicBool::new(false);
+    let mut pipeline = pin!(deliver(
+        output,
+        events,
+        &delivered,
+        &terminal_written,
+        deadline
+    ));
     let mut timer = pin!(async {
         if let Some(deadline) = deadline {
             tokio::time::sleep_until(deadline).await;
@@ -280,7 +328,10 @@ async fn exchange<C: AsyncRead + AsyncWrite + Unpin + 'static>(
         {
             return std::task::Poll::Ready(Err(NativeBackendError::Deadline));
         }
-        if !delivered.load(Ordering::Acquire) && abandoned.as_mut().poll(cx).is_ready() {
+        if !delivered.load(Ordering::Acquire)
+            && !terminal_written.load(Ordering::Acquire)
+            && abandoned.as_mut().poll(cx).is_ready()
+        {
             return std::task::Poll::Ready(Err(NativeBackendError::ClientAbandoned));
         }
         pipeline.as_mut().poll(cx)
@@ -298,6 +349,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
     output: W,
     mut events: tokio::sync::mpsc::Receiver<Event>,
     delivered: &AtomicBool,
+    terminal_written: &AtomicBool,
     deadline: Option<Instant>,
 ) -> Result<(), NativeBackendError> {
     let mut writer = Some(output);
@@ -305,21 +357,23 @@ async fn deliver<W: AsyncWrite + Unpin>(
     while let Some(Event { output, ack }) = events.recv().await {
         match output {
             Output::Count(count) => {
-                write_json(
+                write_terminal_json(
                     writer.as_mut().ok_or(NativeBackendError::Engine)?,
                     200,
                     &json!({"input_tokens":count,"object":"response.input_tokens"}),
                     deadline,
+                    Some(terminal_written),
                 )
                 .await?;
                 delivered.store(true, Ordering::Release);
             }
             Output::Reset => {
-                write_json(
+                write_terminal_json(
                     writer.as_mut().ok_or(NativeBackendError::Engine)?,
                     200,
                     &json!({"status":"ok"}),
                     deadline,
+                    Some(terminal_written),
                 )
                 .await?;
                 delivered.store(true, Ordering::Release);
@@ -347,7 +401,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
                 response
                     .take()
                     .ok_or(NativeBackendError::Engine)?
-                    .complete(value)
+                    .complete_marking_terminal(value, terminal_written)
                     .await
                     .map_err(NativeBackendError::Response)?;
                 delivered.store(true, Ordering::Release);
@@ -653,6 +707,16 @@ async fn write_json<W: AsyncWrite + Unpin>(
     body: &Value,
     deadline: Option<Instant>,
 ) -> Result<(), NativeBackendError> {
+    write_terminal_json(client, status, body, deadline, None).await
+}
+
+async fn write_terminal_json<W: AsyncWrite + Unpin>(
+    client: &mut W,
+    status: u16,
+    body: &Value,
+    deadline: Option<Instant>,
+    terminal_written: Option<&AtomicBool>,
+) -> Result<(), NativeBackendError> {
     let bytes = serde_json::to_vec(body).map_err(|_| NativeBackendError::Schema)?;
     let reason = if status == 200 {
         "OK"
@@ -673,6 +737,9 @@ async fn write_json<W: AsyncWrite + Unpin>(
     timeout_at(deadline, async {
         client.write_all(head.as_bytes()).await?;
         client.write_all(&bytes).await?;
+        if let Some(flag) = terminal_written {
+            flag.store(true, Ordering::Release);
+        }
         client.flush().await?;
         client.shutdown().await
     })

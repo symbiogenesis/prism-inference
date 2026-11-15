@@ -3,6 +3,7 @@
 //! The owning launcher retains process, Job, artifact and memory protections.
 #![forbid(unsafe_code)]
 
+mod broker_pipe;
 mod configuration;
 pub mod native_backend;
 #[cfg(windows)]

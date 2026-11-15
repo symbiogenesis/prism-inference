@@ -21,11 +21,16 @@ use crate::{
     startup::{self, Stage},
 };
 
+#[derive(Debug, Eq, PartialEq)]
+enum ChildTransport {
+    Loopback { port: u16, key: PathBuf },
+    BrokerPipe,
+}
+
 struct Config {
     placement: Placement,
     model: PathBuf,
-    key: PathBuf,
-    port: u16,
+    transport: ChildTransport,
     seed: u32,
     row_workers: usize,
     representation: Representation,
@@ -74,6 +79,7 @@ fn invalid() -> io::Error {
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut arguments = arguments.into_iter();
     let mut child = false;
+    let mut broker_pipe = false;
     let (mut model, mut key, mut port, mut seed) = (None, None, None, None);
     let mut row_workers = None;
     let mut cpu_family = None;
@@ -92,6 +98,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     while let Some(argument) = arguments.next() {
         if argument == "--native-engine-child" && !child {
             child = true;
+            continue;
+        }
+        if argument == "--broker-pipe" && !broker_pipe {
+            broker_pipe = true;
             continue;
         }
         if argument == "--use-repacked-ptq1" && !repacked_ptq1 {
@@ -211,11 +221,21 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         }
         None => DEFAULT_MAX_IMAGE_TOKENS,
     };
+    let transport = if broker_pipe {
+        if key.is_some() || port.is_some() {
+            return Err(invalid());
+        }
+        ChildTransport::BrokerPipe
+    } else {
+        let key = key.ok_or_else(invalid)?;
+        let port = port.filter(|&n| n >= 1024).ok_or_else(invalid)?;
+        validate_read_path(&key)?;
+        ChildTransport::Loopback { port, key }
+    };
     let config = Config {
         placement: placement.unwrap_or_default(),
         model: model.ok_or_else(invalid)?,
-        key: key.ok_or_else(invalid)?,
-        port: port.filter(|&n| n >= 1024).ok_or_else(invalid)?,
+        transport,
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
         row_workers: row_workers
             .unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers)),
@@ -268,8 +288,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     if !child {
         return Err(invalid());
     }
-    for path in [&config.model, &config.key]
-        .into_iter()
+    for path in std::iter::once(&config.model)
         .chain(config.adapter.as_ref())
         .chain(config.mmproj.as_ref())
     {
@@ -398,6 +417,94 @@ fn parse_capacity(
     }
 }
 
+enum PreparedTransport {
+    Loopback {
+        port: u16,
+        guard: bonsai_windows_credentials::RetainedCredential,
+        key: String,
+    },
+    BrokerPipe {
+        endpoint: crate::broker_pipe::ServerEndpoint,
+        key: crate::broker_pipe::ScrubbedKey,
+    },
+}
+
+fn prepare_transport(transport: &ChildTransport) -> io::Result<PreparedTransport> {
+    match transport {
+        ChildTransport::Loopback {
+            port,
+            key: key_path,
+        } => {
+            let (guard, key) = crate::configuration::read_key(key_path)
+                .map_err(|error| startup::at(Stage::Key, &error))?;
+            Ok(PreparedTransport::Loopback {
+                port: *port,
+                guard,
+                key,
+            })
+        }
+        ChildTransport::BrokerPipe => {
+            let (endpoint, key) = crate::broker_pipe::ServerEndpoint::accept_stdio()
+                .map_err(|error| startup::at(Stage::Key, &error))?;
+            Ok(PreparedTransport::BrokerPipe { endpoint, key })
+        }
+    }
+}
+
+fn required_memory_bytes(config: &Config) -> io::Result<u64> {
+    let base_required_bytes = config.capacity.map_or(
+        crate::configuration::REQUIRED_AVAILABLE_BYTES,
+        |(_, memory)| memory + 4 * 1024 * 1024 * 1024,
+    );
+    let vision_reserve_bytes = if config.mmproj.is_some() {
+        u64::try_from(MMPROJ_MEMORY_BYTES).map_err(|_| startup::at(Stage::Arguments, &invalid()))?
+    } else {
+        0
+    };
+    base_required_bytes
+        .checked_add(vision_reserve_bytes)
+        .ok_or_else(|| {
+            startup::at(
+                Stage::Memory,
+                &io::Error::other("native Swift startup memory limit overflow"),
+            )
+        })
+}
+
+async fn serve_prepared(
+    prepared_transport: PreparedTransport,
+    session: SwiftSession,
+    placement: Placement,
+) -> io::Result<()> {
+    let served = match prepared_transport {
+        PreparedTransport::Loopback { port, guard, key } => {
+            let listener = bound_loopback_socket(port)
+                .and_then(|socket| socket.listen(1))
+                .map_err(|error| startup::at(Stage::Listener, &error))?;
+            let result =
+                crate::native_backend::serve_with_placement(listener, session, key, placement)
+                    .await;
+            drop(guard);
+            result
+        }
+        PreparedTransport::BrokerPipe { endpoint, key } => {
+            crate::native_backend::serve_broker_pipe_with_placement(
+                endpoint,
+                session,
+                key.as_str(),
+                placement,
+            )
+            .await
+        }
+    };
+    served.map_err(|_| {
+        startup::at(
+            Stage::Backend,
+            &io::Error::other("native Swift backend admission closed"),
+        )
+    })
+}
+
 /// Start only the private backend selected by `--native-engine-child`.
 ///
 /// The Windows development launcher supplies its protected key, external model,
@@ -409,28 +516,24 @@ fn parse_capacity(
 /// verified model loading, listener setup and backend lifecycle failures.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     let config = parse(arguments).map_err(|error| startup::at(Stage::Arguments, &error))?;
+    if matches!(config.transport, ChildTransport::BrokerPipe)
+        && !bonsai_windows_credentials::is_app_container()
+            .map_err(|error| startup::at(Stage::Environment, &error))?
+    {
+        return Err(startup::at(
+            Stage::Environment,
+            &io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "broker-pipe worker requires an AppContainer token",
+            ),
+        ));
+    }
     if config.placement == Placement::Auto {
         crate::native_backend::register_hexagon_model_path(&config.model);
     }
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
         .map_err(|error| startup::at(Stage::Environment, &error))?;
-    let base_required_bytes = config.capacity.map_or(
-        crate::configuration::REQUIRED_AVAILABLE_BYTES,
-        |(_, memory)| memory + 4 * 1024 * 1024 * 1024,
-    );
-    let vision_reserve_bytes = if config.mmproj.is_some() {
-        u64::try_from(MMPROJ_MEMORY_BYTES).map_err(|_| startup::at(Stage::Arguments, &invalid()))?
-    } else {
-        0
-    };
-    let required_available_bytes = base_required_bytes
-        .checked_add(vision_reserve_bytes)
-        .ok_or_else(|| {
-            startup::at(
-                Stage::Memory,
-                &io::Error::other("native Swift startup memory limit overflow"),
-            )
-        })?;
+    let required_available_bytes = required_memory_bytes(&config)?;
     if bonsai_windows_process::available_memory_bytes()
         .map_err(|error| startup::at(Stage::Memory, &error))?
         < required_available_bytes
@@ -440,8 +543,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
             &io::Error::other("native Swift startup memory admission rejected"),
         ));
     }
-    let (_key_guard, key) = crate::configuration::read_key(&config.key)
-        .map_err(|error| startup::at(Stage::Key, &error))?;
+    let prepared_transport = prepare_transport(&config.transport)?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
     let mut session = SwiftSession::load_profile_with_execution(
@@ -472,19 +574,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         .enable_all()
         .build()
         .map_err(|error| startup::at(Stage::Runtime, &error))?;
-    runtime.block_on(async {
-        let listener = bound_loopback_socket(config.port)
-            .and_then(|socket| socket.listen(1))
-            .map_err(|error| startup::at(Stage::Listener, &error))?;
-        crate::native_backend::serve_with_placement(listener, session, key, config.placement)
-            .await
-            .map_err(|_| {
-                startup::at(
-                    Stage::Backend,
-                    &io::Error::other("native Swift backend admission closed"),
-                )
-            })
-    })
+    runtime.block_on(serve_prepared(
+        prepared_transport,
+        session,
+        config.placement,
+    ))
 }
 
 #[cfg(test)]
@@ -1268,6 +1362,48 @@ mod tests {
         ]);
         assert!(parse(conflict).is_err());
         drop(base);
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_broker_pipe_is_exclusive_and_requires_app_container() -> io::Result<()> {
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--broker-pipe".into(),
+            "--model".into(),
+            model.clone(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        let parsed = parse(base.clone())?;
+        assert_eq!(parsed.transport, ChildTransport::BrokerPipe);
+
+        let mut duplicate = base.clone();
+        duplicate.push("--broker-pipe".into());
+        assert!(parse(duplicate).is_err());
+
+        for conflict in [
+            vec![OsString::from("--port"), OsString::from("8081")],
+            vec![OsString::from("--key-file"), key],
+        ] {
+            let mut invalid_mix = base.clone();
+            invalid_mix.extend(conflict);
+            assert!(parse(invalid_mix).is_err());
+        }
+
+        if !bonsai_windows_credentials::is_app_container()? {
+            let error = run(base)
+                .err()
+                .ok_or_else(|| io::Error::other("broker-pipe ran without AppContainer"))?;
+            let mut output = Vec::new();
+            startup::write_failure(&mut output, &error)?;
+            let output = String::from_utf8(output).map_err(io::Error::other)?;
+            assert!(output.starts_with(
+                "private-inference-startup-failed stage=environment errorKind=PermissionDenied osCode="
+            ));
+            assert!(!output.contains(model.to_string_lossy().as_ref()));
+        }
         Ok(())
     }
 }

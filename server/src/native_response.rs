@@ -7,7 +7,10 @@
 
 use bonsai_prism_runtime::runtime::{Completion, Finish};
 use serde::Serialize;
-use std::io::Write as _;
+use std::{
+    io::Write as _,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     time::{Instant, timeout_at},
@@ -292,18 +295,37 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
     /// # Errors
     /// Returns value-free byte, deadline or I/O errors; the session must remain
     /// closed until reset if its terminal event could not be acknowledged.
-    pub async fn complete(mut self, completion: Completion) -> Result<(), ResponseError> {
+    pub async fn complete(self, completion: Completion) -> Result<(), ResponseError> {
+        let unused = AtomicBool::new(false);
+        self.complete_marking_terminal(completion, &unused).await
+    }
+
+    /// Deliver complete stop/length accounting, marking `terminal_written` once
+    /// the final bytes are written before flushing and shutting down the stream.
+    ///
+    /// # Errors
+    /// Returns value-free byte, deadline or I/O errors; the session must remain
+    /// closed until reset if its terminal event could not be acknowledged.
+    pub(crate) async fn complete_marking_terminal(
+        mut self,
+        completion: Completion,
+        terminal_written: &AtomicBool,
+    ) -> Result<(), ResponseError> {
         if completion.prompt_tokens != self.delivery.prompt_tokens {
             return Err(ResponseError::BackendMetadata);
         }
         let tail = self.parser.finish();
         self.delivery.deliver(tail).await?;
-        self.delivery.finish(completion).await
+        self.delivery.finish(completion, terminal_written).await
     }
 }
 
 impl<W: AsyncWrite + Unpin> Delivery<W> {
-    async fn finish(mut self, completion: Completion) -> Result<(), ResponseError> {
+    async fn finish(
+        mut self,
+        completion: Completion,
+        terminal_written: &AtomicBool,
+    ) -> Result<(), ResponseError> {
         let reason = match completion.finish {
             Finish::Stop => "stop",
             Finish::Length => "length",
@@ -322,7 +344,14 @@ impl<W: AsyncWrite + Unpin> Delivery<W> {
             self.frame(&stream_chunk(EmptyDelta {}, Some(reason), Some(usage)))
                 .await?;
             self.chunk(b"data: [DONE]\n\n").await?;
-            write_group(&mut self.client, &[b"0\r\n\r\n"], self.deadline, true).await
+            write_group(
+                &mut self.client,
+                &[b"0\r\n\r\n"],
+                self.deadline,
+                true,
+                Some(terminal_written),
+            )
+            .await
         } else {
             let bytes = serde_json::to_vec(&CompletionEnvelope {
                 choices: [CompletionChoice {
@@ -350,6 +379,7 @@ impl<W: AsyncWrite + Unpin> Delivery<W> {
                 &[head.as_bytes(), &bytes],
                 self.deadline,
                 true,
+                Some(terminal_written),
             )
             .await
         }
@@ -399,7 +429,7 @@ impl<W: AsyncWrite + Unpin> Delivery<W> {
 
     async fn start_stream(&mut self) -> Result<(), ResponseError> {
         if !self.started {
-            write_group(&mut self.client, &[STREAM_HEAD], self.deadline, false).await?;
+            write_group(&mut self.client, &[STREAM_HEAD], self.deadline, false, None).await?;
             self.started = true;
             self.frame(&stream_chunk(RoleDelta { role: "assistant" }, None, None))
                 .await?;
@@ -423,6 +453,7 @@ impl<W: AsyncWrite + Unpin> Delivery<W> {
             &[&self.frame_buffer],
             self.deadline,
             false,
+            None,
         )
         .await
     }
@@ -438,6 +469,7 @@ impl<W: AsyncWrite + Unpin> Delivery<W> {
             &[&self.frame_buffer],
             self.deadline,
             false,
+            None,
         )
         .await
     }
@@ -467,6 +499,7 @@ async fn write_group<W: AsyncWrite + Unpin>(
     pieces: &[&[u8]],
     supervisor_deadline: Option<Instant>,
     shutdown: bool,
+    terminal_written: Option<&AtomicBool>,
 ) -> Result<(), ResponseError> {
     let write_deadline = Instant::now() + CLIENT_WRITE_TIMEOUT;
     let deadline = supervisor_deadline.map_or(write_deadline, |limit| limit.min(write_deadline));
@@ -474,6 +507,9 @@ async fn write_group<W: AsyncWrite + Unpin>(
     timeout_at(deadline, async {
         for piece in pieces {
             client.write_all(piece).await?;
+        }
+        if let Some(flag) = terminal_written {
+            flag.store(true, Ordering::Release);
         }
         client.flush().await?;
         if shutdown {

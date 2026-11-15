@@ -2017,3 +2017,343 @@ fn private_canonical_body_gates_and_limits_multimodal_user_parts() -> TestResult
     ));
     Ok(())
 }
+
+struct TestPipeState {
+    bytes: std::collections::VecDeque<u8>,
+    closed: bool,
+}
+
+#[derive(Clone)]
+struct TestPipeShared {
+    lock: Arc<(std::sync::Mutex<TestPipeState>, std::sync::Condvar)>,
+}
+
+struct TestPipeSide {
+    shared: TestPipeShared,
+}
+
+fn test_pipe_pair() -> (TestPipeSide, TestPipeSide) {
+    let shared = TestPipeShared {
+        lock: Arc::new((
+            std::sync::Mutex::new(TestPipeState {
+                bytes: std::collections::VecDeque::new(),
+                closed: false,
+            }),
+            std::sync::Condvar::new(),
+        )),
+    };
+    (
+        TestPipeSide {
+            shared: shared.clone(),
+        },
+        TestPipeSide { shared },
+    )
+}
+
+fn pipe_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl Drop for TestPipeSide {
+    fn drop(&mut self) {
+        let mut state = pipe_lock(&self.shared.lock.0);
+        state.closed = true;
+        drop(state);
+        self.shared.lock.1.notify_all();
+    }
+}
+
+impl std::io::Read for TestPipeSide {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut state = pipe_lock(&self.shared.lock.0);
+        while state.bytes.is_empty() && !state.closed {
+            state = match self.shared.lock.1.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        let count = state.bytes.len().min(buf.len());
+        for slot in &mut buf[..count] {
+            *slot = state.bytes.pop_front().unwrap_or(0);
+        }
+        drop(state);
+        Ok(count)
+    }
+}
+
+impl std::io::Write for TestPipeSide {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut state = pipe_lock(&self.shared.lock.0);
+        if state.closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test pipe closed",
+            ));
+        }
+        state.bytes.extend(buf.iter().copied());
+        drop(state);
+        self.shared.lock.1.notify_all();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn pipe_write_frame(
+    writer: &mut impl std::io::Write,
+    stream_id: u32,
+    kind: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len()).map_err(std::io::Error::other)?;
+    let mut header = [0_u8; 9];
+    header[..4].copy_from_slice(&stream_id.to_be_bytes());
+    header[4] = kind;
+    header[5..9].copy_from_slice(&len.to_be_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+fn pipe_read_frame(reader: &mut impl std::io::Read) -> std::io::Result<(u32, u8, Vec<u8>)> {
+    let mut header = [0_u8; 9];
+    reader.read_exact(&mut header)?;
+    let stream_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let kind = header[4];
+    let len = usize::try_from(u32::from_be_bytes([
+        header[5], header[6], header[7], header[8],
+    ]))
+    .map_err(std::io::Error::other)?;
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok((stream_id, kind, payload))
+}
+
+fn pipe_read_stream(
+    reader: &mut impl std::io::Read,
+    expected_stream: u32,
+) -> std::io::Result<Vec<u8>> {
+    const KIND_DATA: u8 = 2;
+    const KIND_EOF: u8 = 3;
+    const KIND_RESET: u8 = 4;
+
+    let mut out = Vec::new();
+    loop {
+        let (stream_id, kind, payload) = pipe_read_frame(reader)?;
+        if stream_id != expected_stream && kind == KIND_RESET {
+            continue;
+        }
+        if stream_id != expected_stream {
+            return Err(std::io::Error::other(format!(
+                "unexpected stream {stream_id} while reading stream {expected_stream}"
+            )));
+        }
+        match kind {
+            KIND_DATA => out.extend_from_slice(&payload),
+            KIND_EOF => return Ok(out),
+            KIND_RESET => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "unexpected reset on completed stream",
+                ));
+            }
+            _ => return Err(std::io::Error::other("unexpected frame kind")),
+        }
+    }
+}
+
+fn pipe_request(route: &str, body: &[u8], authenticated: bool) -> Vec<u8> {
+    let method = if route.starts_with("/v1/chat/") || route == "/reset" {
+        "POST"
+    } else {
+        "GET"
+    };
+    let mut head = format!(
+        "{method} {route} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
+        crate::broker_pipe::BROKER_PIPE_HOST_PORT
+    );
+    if authenticated {
+        head.push_str("Authorization: Bearer ");
+        head.push_str(KEY);
+        head.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        head.push_str("Content-Type: application/json\r\nContent-Length: ");
+        head.push_str(&body.len().to_string());
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn run_broker_pipe_client_script(
+    mut p_to_c_w: TestPipeSide,
+    mut c_to_p_r: TestPipeSide,
+    body: &[u8],
+    observed_client: &Observation,
+    gate: &AtomicBool,
+) -> std::io::Result<()> {
+    use std::io::Read as _;
+
+    const KIND_OPEN: u8 = 1;
+    const KIND_DATA: u8 = 2;
+    const KIND_EOF: u8 = 3;
+    const KIND_RESET: u8 = 4;
+    const KIND_SERVER_READY: u8 = 5;
+
+    let mut ack = [0_u8; 8];
+    c_to_p_r.read_exact(&mut ack)?;
+    if &ack != b"SB2OKAY1" {
+        return Err(std::io::Error::other("missing SB2OKAY1 acknowledgement"));
+    }
+    if pipe_read_frame(&mut c_to_p_r)? != (0, KIND_SERVER_READY, Vec::new()) {
+        return Err(std::io::Error::other("missing KIND_SERVER_READY"));
+    }
+
+    let send_open_req = |writer: &mut TestPipeSide, id: u32, req: &[u8]| -> std::io::Result<()> {
+        pipe_write_frame(writer, id, KIND_OPEN, &[])?;
+        pipe_write_frame(writer, id, KIND_DATA, req)
+    };
+
+    send_open_req(&mut p_to_c_w, 1, &pipe_request("/health", &[], true))?;
+    let health =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 1)?).map_err(std::io::Error::other)?;
+    pipe_write_frame(&mut p_to_c_w, 1, KIND_EOF, &[])?;
+    assert!(health.starts_with("HTTP/1.1 200 OK"));
+
+    send_open_req(&mut p_to_c_w, 2, &pipe_request("/v1/models", &[], false))?;
+    let unauth =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 2)?).map_err(std::io::Error::other)?;
+    pipe_write_frame(&mut p_to_c_w, 2, KIND_EOF, &[])?;
+    assert!(unauth.starts_with("HTTP/1.1 401 Unauthorized"));
+
+    send_open_req(&mut p_to_c_w, 3, &pipe_request("/v1/models", &[], true))?;
+    let models =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 3)?).map_err(std::io::Error::other)?;
+    pipe_write_frame(&mut p_to_c_w, 3, KIND_EOF, &[])?;
+    assert!(models.starts_with("HTTP/1.1 200 OK"));
+    assert!(models.contains("Swift-Bonsai-2-PQ2_0"));
+
+    send_open_req(
+        &mut p_to_c_w,
+        4,
+        &pipe_request("/v1/chat/completions/input_tokens", body, true),
+    )?;
+    let counted =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 4)?).map_err(std::io::Error::other)?;
+    // Real broker drops BackendBody upon framed Content-Length completion, emitting KIND_RESET.
+    pipe_write_frame(&mut p_to_c_w, 4, KIND_RESET, &[])?;
+    assert!(counted.starts_with("HTTP/1.1 200 OK"));
+    assert!(counted.contains("\"input_tokens\":100"));
+
+    // Stream 5 stays half-open (no KIND_EOF), matching broker generation requests.
+    send_open_req(
+        &mut p_to_c_w,
+        5,
+        &pipe_request("/v1/chat/completions", body, true),
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while observed_client.executions.load(Ordering::Acquire) == 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker did not start generation",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    pipe_write_frame(&mut p_to_c_w, 5, KIND_RESET, &[])?;
+    let cancel_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !observed_client.generation_cancelled.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= cancel_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "KIND_RESET did not cancel active generation",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    send_open_req(&mut p_to_c_w, 6, &pipe_request("/reset", &[], true))?;
+    let reset_reply =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 6)?).map_err(std::io::Error::other)?;
+    pipe_write_frame(&mut p_to_c_w, 6, KIND_EOF, &[])?;
+    assert!(reset_reply.starts_with("HTTP/1.1 200 OK"));
+    assert!(reset_reply.contains("\"status\":\"ok\""));
+    assert_eq!(observed_client.resets.load(Ordering::Acquire), 1);
+
+    gate.store(true, Ordering::Release);
+    send_open_req(
+        &mut p_to_c_w,
+        7,
+        &pipe_request("/v1/chat/completions/input_tokens", body, true),
+    )?;
+    let recounted =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 7)?).map_err(std::io::Error::other)?;
+    pipe_write_frame(&mut p_to_c_w, 7, KIND_EOF, &[])?;
+    assert!(recounted.starts_with("HTTP/1.1 200 OK"));
+
+    // Stream 8 sends a second half-open completion after /reset and receives full SSE.
+    send_open_req(
+        &mut p_to_c_w,
+        8,
+        &pipe_request("/v1/chat/completions", body, true),
+    )?;
+    let completion =
+        String::from_utf8(pipe_read_stream(&mut c_to_p_r, 8)?).map_err(std::io::Error::other)?;
+    pipe_write_frame(&mut p_to_c_w, 8, KIND_RESET, &[])?;
+    assert!(completion.starts_with("HTTP/1.1 200 OK"));
+    assert!(completion.contains("draft"));
+    assert!(completion.contains("answer"));
+    Ok(())
+}
+
+#[test]
+fn broker_pipe_serves_authenticated_requests_cancels_in_place_and_recovers() -> TestResult {
+    use std::io::Write as _;
+
+    run(async {
+        let gate = Arc::new(AtomicBool::new(false));
+        let observed = Observation {
+            generation_gate: Some(Arc::clone(&gate)),
+            ..Observation::default()
+        };
+        let body = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+        let (mut p_to_c_w, p_to_c_r) = test_pipe_pair();
+        let (c_to_p_w, c_to_p_r) = test_pipe_pair();
+        p_to_c_w.write_all(b"SB2PIPE1")?;
+        p_to_c_w.write_all(KEY.as_bytes())?;
+        p_to_c_w.flush()?;
+
+        let (endpoint, pipe_key) = crate::broker_pipe::ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+        assert_eq!(pipe_key.as_str(), KEY);
+
+        let policy =
+            RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, pipe_key.as_str())
+                .map_err(|e| format!("{e:?}"))?;
+        let worker = Worker::with_placement(FakeEngine(observed.clone()), 42, Placement::Cpu)
+            .map_err(|e| format!("{e:?}"))?;
+
+        let observed_client = observed.clone();
+        let client_gate = Arc::clone(&gate);
+        let client_thread = std::thread::spawn(move || {
+            run_broker_pipe_client_script(p_to_c_w, c_to_p_r, &body, &observed_client, &client_gate)
+        });
+
+        serve_broker_pipe_with_worker(endpoint, &policy, worker)
+            .await
+            .map_err(|e| format!("serve_broker_pipe_with_worker failed: {e:?}"))?;
+        client_thread
+            .join()
+            .map_err(|_| "broker pipe test client thread panicked")??;
+        assert!(observed.terminated.load(Ordering::Acquire));
+        Ok(())
+    })
+}

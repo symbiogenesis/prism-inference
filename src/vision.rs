@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use bonsai_native_hash::Hasher;
 
+use crate::kernels::prefill::{MAX_TILE_TOKENS, ProjectionTile};
 use crate::kernels::{
-    MatvecBackend, MatvecScratch, RowParallelism, is_finite_slice, row_into, softmax,
-    validate_tensor,
+    MatvecBackend, RowParallelism, is_finite_slice, row_into, softmax, validate_tensor,
 };
 use crate::model::swift::MmprojLoadReceipt;
 use crate::model::{Model, Tensor};
@@ -322,10 +322,6 @@ impl SwiftVisionEncoder {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep vision encoding pipeline stages sequential and bounded."
-    )]
     fn encode_decoded(
         &self,
         decoded: &DecodedImage,
@@ -349,6 +345,7 @@ impl SwiftVisionEncoder {
             resized_h,
             self.config.mean,
             self.config.std,
+            &self.row_parallelism,
         )?;
 
         let patch_cols = resized_w / self.config.patch_size;
@@ -358,8 +355,13 @@ impl SwiftVisionEncoder {
         let n_pos = patch_cols * patch_rows;
         let n_tokens = nx * ny;
 
-        let mut scratch = MatvecScratch::with_backend(self.backend);
-        scratch.set_row_parallelism(self.row_parallelism.clone());
+        let mut tile = ProjectionTile::with_backend(self.backend);
+        tile.set_row_parallelism(self.row_parallelism.clone());
+        let mut projector = TiledProjector {
+            tile,
+            inputs: vec![Vec::new(); MAX_TILE_TOKENS],
+            outputs: vec![Vec::new(); MAX_TILE_TOKENS],
+        };
 
         let (mut hidden, patch_coords) = self.extract_and_embed_patches(
             &planar,
@@ -368,18 +370,14 @@ impl SwiftVisionEncoder {
             patch_rows,
             nx,
             ny,
-            &mut scratch,
+            &mut projector,
         )?;
 
-        let mut residual = vec![0.0_f32; hidden.len()];
-        let mut norm_buf = vec![0.0_f32; hidden.len()];
-        let mut qkv_buf = vec![0.0_f32; n_pos * 3 * self.config.hidden_size];
-        let mut q_buf = vec![0.0_f32; n_pos * self.config.hidden_size];
-        let mut k_buf = vec![0.0_f32; n_pos * self.config.hidden_size];
-        let mut v_buf = vec![0.0_f32; n_pos * self.config.hidden_size];
-        let mut attn_out_buf = vec![0.0_f32; n_pos * self.config.hidden_size];
-        let mut ffn_buf = vec![0.0_f32; self.config.intermediate_size];
-        let mut proj_buf = Vec::new();
+        let total_hidden = hidden.len();
+        let mut residual = vec![0.0_f32; total_hidden];
+        let mut norm_buf = vec![0.0_f32; total_hidden];
+        let mut attn = AttentionScratch::with_len(total_hidden);
+        let mut attn_out_buf = vec![0.0_f32; total_hidden];
         let rope_cache = build_vit_rope_cache(&self.config, &patch_coords)?;
 
         for block in &self.blocks {
@@ -392,6 +390,7 @@ impl SwiftVisionEncoder {
                 &block.ln1_b,
                 self.config.eps,
                 &mut norm_buf,
+                &self.row_parallelism,
             )?;
             run_self_attention(
                 block,
@@ -399,16 +398,14 @@ impl SwiftVisionEncoder {
                 n_pos,
                 &rope_cache,
                 &norm_buf,
-                &mut qkv_buf,
-                &mut q_buf,
-                &mut k_buf,
-                &mut v_buf,
+                &mut attn,
                 &mut attn_out_buf,
-                &mut proj_buf,
-                &mut scratch,
+                &mut projector,
+                &self.row_parallelism,
             )?;
-            for (h, (&res, &attn)) in hidden.iter_mut().zip(residual.iter().zip(&attn_out_buf)) {
-                *h = res + attn;
+            for (h, (&res, &attn_val)) in hidden.iter_mut().zip(residual.iter().zip(&attn_out_buf))
+            {
+                *h = res + attn_val;
             }
             if !is_finite_slice(&hidden) {
                 return Err(invalid("nonfinite values after ViT attention residual"));
@@ -423,6 +420,7 @@ impl SwiftVisionEncoder {
                 &block.ln2_b,
                 self.config.eps,
                 &mut norm_buf,
+                &self.row_parallelism,
             )?;
             run_mlp_block(
                 block,
@@ -430,10 +428,8 @@ impl SwiftVisionEncoder {
                 n_pos,
                 &norm_buf,
                 &residual,
-                &mut ffn_buf,
-                &mut proj_buf,
                 &mut hidden,
-                &mut scratch,
+                &mut projector,
             )?;
             if !is_finite_slice(&hidden) {
                 return Err(invalid("nonfinite values after ViT MLP residual"));
@@ -448,8 +444,9 @@ impl SwiftVisionEncoder {
             &self.post_ln_b,
             self.config.eps,
             &mut norm_buf,
+            &self.row_parallelism,
         )?;
-        let embeddings = self.run_merger(&norm_buf, n_tokens, &mut proj_buf, &mut scratch)?;
+        let embeddings = self.run_merger(&norm_buf, n_tokens, &mut projector)?;
         Ok(EncodedImage {
             grid_width: nx,
             grid_height: ny,
@@ -470,7 +467,7 @@ impl SwiftVisionEncoder {
         patch_rows: usize,
         nx: usize,
         ny: usize,
-        scratch: &mut MatvecScratch,
+        projector: &mut TiledProjector,
     ) -> Result<PatchEmbeddings> {
         let p = self.config.patch_size;
         let sm = self.config.spatial_merge;
@@ -478,54 +475,69 @@ impl SwiftVisionEncoder {
         let n_pos = patch_cols * patch_rows;
         let resized_h = patch_rows * p;
         let plane_len = resized_w * resized_h;
+        let patch_pixels = p * p * 3;
 
-        let mut hidden = vec![0.0_f32; n_pos * d];
         let mut coords = Vec::with_capacity(n_pos);
-        let mut patch_vec = vec![0.0_f32; p * p * 3];
-        let mut patch_out = Vec::new();
-        let mut pos_row = vec![0.0_f32; d];
-
-        let mut patch_idx = 0_usize;
         for by in 0..ny {
             for bx in 0..nx {
                 for dy in 0..sm {
                     for dx in 0..sm {
-                        let py = by * sm + dy;
-                        let px = bx * sm + dx;
-                        for c in 0..3 {
-                            let c_off = c * plane_len;
-                            let dst_c = c * p * p;
-                            for ky in 0..p {
-                                let src_row = c_off + (py * p + ky) * resized_w + px * p;
-                                let dst_row = dst_c + ky * p;
-                                patch_vec[dst_row..dst_row + p]
-                                    .copy_from_slice(&planar[src_row..src_row + p]);
-                            }
-                        }
-                        scratch
-                            .prepare(&self.patch_embd, &patch_vec)?
-                            .matvec_into(&self.patch_embd, &mut patch_out)?;
-                        bilinear_pos_embd(
-                            &self.pos_embd,
-                            self.config.pos_grid_side,
-                            d,
-                            patch_cols,
-                            patch_rows,
-                            px,
-                            py,
-                            &mut pos_row,
-                        )?;
-                        let dst = &mut hidden[patch_idx * d..(patch_idx + 1) * d];
-                        for ((out, (&val, &bias)), &pos) in dst
-                            .iter_mut()
-                            .zip(patch_out.iter().zip(&self.patch_bias))
-                            .zip(&pos_row)
-                        {
-                            *out = val + bias + pos;
-                        }
-                        coords.push((py, px));
-                        patch_idx += 1;
+                        coords.push((by * sm + dy, bx * sm + dx));
                     }
+                }
+            }
+        }
+
+        let mut hidden = vec![0.0_f32; n_pos * d];
+        let mut pos_row = vec![0.0_f32; d];
+        for (tile_idx, coord_chunk) in coords.chunks(MAX_TILE_TOKENS).enumerate() {
+            let chunk = coord_chunk.len();
+            for (t, &(py, px)) in coord_chunk.iter().enumerate() {
+                let patch_vec = &mut projector.inputs[t];
+                patch_vec.resize(patch_pixels, 0.0);
+                for c in 0..3 {
+                    let c_off = c * plane_len;
+                    let dst_c = c * p * p;
+                    for ky in 0..p {
+                        let src_row = c_off + (py * p + ky) * resized_w + px * p;
+                        let dst_row = dst_c + ky * p;
+                        patch_vec[dst_row..dst_row + p]
+                            .copy_from_slice(&planar[src_row..src_row + p]);
+                    }
+                }
+            }
+            projector.tile.project_with_previous(
+                None,
+                &self.patch_embd,
+                &projector.inputs[..chunk],
+                &mut projector.outputs[..chunk],
+                false,
+                &|| Ok(()),
+            )?;
+            let base_idx = tile_idx * MAX_TILE_TOKENS;
+            for (t, (&(py, px), patch_out)) in coord_chunk
+                .iter()
+                .zip(&projector.outputs[..chunk])
+                .enumerate()
+            {
+                bilinear_pos_embd(
+                    &self.pos_embd,
+                    self.config.pos_grid_side,
+                    d,
+                    patch_cols,
+                    patch_rows,
+                    px,
+                    py,
+                    &mut pos_row,
+                )?;
+                let patch_idx = base_idx + t;
+                let dst = &mut hidden[patch_idx * d..(patch_idx + 1) * d];
+                for ((out, (&val, &bias)), &pos) in dst
+                    .iter_mut()
+                    .zip(patch_out.iter().zip(&self.patch_bias))
+                    .zip(&pos_row)
+                {
+                    *out = val + bias + pos;
                 }
             }
         }
@@ -539,36 +551,79 @@ impl SwiftVisionEncoder {
         &self,
         normed: &[f32],
         n_tokens: usize,
-        proj_buf: &mut Vec<f32>,
-        scratch: &mut MatvecScratch,
+        projector: &mut TiledProjector,
     ) -> Result<Vec<f32>> {
         let merge_group = self.config.spatial_merge * self.config.spatial_merge;
         let merge_dim = self.config.hidden_size * merge_group;
         let proj_dim = self.config.projection_dim;
-        let mut hidden_merge = Vec::new();
         let mut out = Vec::new();
         out.try_reserve_exact(n_tokens * proj_dim)?;
 
-        for tok in 0..n_tokens {
-            let group = &normed[tok * merge_dim..(tok + 1) * merge_dim];
-            scratch
-                .prepare(&self.mm_0_w, group)?
-                .matvec_into(&self.mm_0_w, &mut hidden_merge)?;
-            for (v, &bias) in hidden_merge.iter_mut().zip(&self.mm_0_b) {
-                *v = gelu_tanh(*v + bias);
+        for tile_start in (0..n_tokens).step_by(MAX_TILE_TOKENS) {
+            let chunk = (n_tokens - tile_start).min(MAX_TILE_TOKENS);
+            for t in 0..chunk {
+                let tok = tile_start + t;
+                projector.inputs[t].resize(merge_dim, 0.0);
+                projector.inputs[t]
+                    .copy_from_slice(&normed[tok * merge_dim..(tok + 1) * merge_dim]);
             }
-            scratch
-                .prepare(&self.mm_2_w, &hidden_merge)?
-                .matvec_into(&self.mm_2_w, proj_buf)?;
-            for (&val, &bias) in proj_buf.iter().zip(&self.mm_2_b) {
-                let final_val = val + bias;
-                if !final_val.is_finite() {
-                    return Err(invalid("nonfinite value in multimodal merger projection"));
+            projector.tile.project_with_previous(
+                None,
+                &self.mm_0_w,
+                &projector.inputs[..chunk],
+                &mut projector.outputs[..chunk],
+                false,
+                &|| Ok(()),
+            )?;
+            for proj_row in &mut projector.outputs[..chunk] {
+                for (v, &bias) in proj_row.iter_mut().zip(&self.mm_0_b) {
+                    *v = gelu_tanh(*v + bias);
                 }
-                out.push(final_val);
+            }
+            std::mem::swap(&mut projector.inputs, &mut projector.outputs);
+            projector.tile.project_with_previous(
+                None,
+                &self.mm_2_w,
+                &projector.inputs[..chunk],
+                &mut projector.outputs[..chunk],
+                false,
+                &|| Ok(()),
+            )?;
+            for proj_row in &projector.outputs[..chunk] {
+                for (&val, &bias) in proj_row.iter().zip(&self.mm_2_b) {
+                    let final_val = val + bias;
+                    if !final_val.is_finite() {
+                        return Err(invalid("nonfinite value in multimodal merger projection"));
+                    }
+                    out.push(final_val);
+                }
             }
         }
         Ok(out)
+    }
+}
+
+struct TiledProjector {
+    tile: ProjectionTile,
+    inputs: Vec<Vec<f32>>,
+    outputs: Vec<Vec<f32>>,
+}
+
+struct AttentionScratch {
+    q_heads: Vec<f32>,
+    k_heads: Vec<f32>,
+    v_heads: Vec<f32>,
+    head_out: Vec<f32>,
+}
+
+impl AttentionScratch {
+    fn with_len(len: usize) -> Self {
+        Self {
+            q_heads: vec![0.0_f32; len],
+            k_heads: vec![0.0_f32; len],
+            v_heads: vec![0.0_f32; len],
+            head_out: vec![0.0_f32; len],
+        }
     }
 }
 
@@ -654,6 +709,10 @@ fn plan_grid_with_factor(
 type PatchEmbeddings = (Vec<f32>, Vec<(usize, usize)>);
 
 #[expect(
+    clippy::too_many_arguments,
+    reason = "Pass explicit source/target geometry, normalization constants and worker pool."
+)]
+#[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -667,6 +726,7 @@ fn resize_bicubic_normalize(
     dst_h: usize,
     mean: [f32; 3],
     std: [f32; 3],
+    row_parallelism: &RowParallelism,
 ) -> Result<Vec<f32>> {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return Err(invalid("invalid resize image geometry"));
@@ -687,24 +747,28 @@ fn resize_bicubic_normalize(
         let weights = catmull_rom_weights(fx);
         x_taps.push((idx, weights));
     }
-    for sy in 0..src_h {
-        let src_row = &rgb[sy * src_w * 3..(sy + 1) * src_w * 3];
-        let dst_row = &mut horiz[sy * dst_w * 3..(sy + 1) * dst_w * 3];
-        for (dx, &(idx, weights)) in x_taps.iter().enumerate() {
-            for c in 0..3 {
-                let mut sum = 0.0_f64;
-                for t in 0..4 {
-                    sum = f64::from(src_row[idx[t] * 3 + c]).mul_add(weights[t], sum);
+    let horiz_row_len = dst_w * 3;
+    row_parallelism.update_chunks(&mut horiz, horiz_row_len, |base_sy, chunk| {
+        for (offset, dst_row) in chunk.chunks_exact_mut(horiz_row_len).enumerate() {
+            let sy = base_sy + offset;
+            let src_row = &rgb[sy * src_w * 3..(sy + 1) * src_w * 3];
+            for (dst_px, &(idx, weights)) in dst_row.chunks_exact_mut(3).zip(&x_taps) {
+                for (c, dst_ch) in dst_px.iter_mut().enumerate() {
+                    let mut sum = 0.0_f64;
+                    for (&ix, &w) in idx.iter().zip(&weights) {
+                        sum = f64::from(src_row[ix * 3 + c]).mul_add(w, sum);
+                    }
+                    *dst_ch = sum as f32;
                 }
-                dst_row[dx * 3 + c] = sum as f32;
             }
         }
-    }
+        Ok(())
+    })?;
 
     let plane_len = dst_w * dst_h;
     let mut out = vec![0.0_f32; 3 * plane_len];
     let scale_y = (src_h as f64) / (dst_h as f64);
-    let inv_255 = 1.0_f32 / 255.0_f32;
+    let mut y_taps = Vec::with_capacity(dst_h);
     for dy in 0..dst_h {
         let sy = (dy as f64 + 0.5).mul_add(scale_y, -0.5);
         let iy = sy.floor() as isize;
@@ -716,16 +780,26 @@ fn resize_bicubic_normalize(
             clamp_index(iy + 2, src_h),
         ];
         let weights = catmull_rom_weights(fy);
-        for dx in 0..dst_w {
-            for c in 0..3 {
-                let mut sum = 0.0_f64;
-                for t in 0..4 {
-                    sum = f64::from(horiz[(idx[t] * dst_w + dx) * 3 + c]).mul_add(weights[t], sum);
+        y_taps.push((idx, weights));
+    }
+    let inv_255 = 1.0_f32 / 255.0_f32;
+    for (c, plane) in out.chunks_exact_mut(plane_len).enumerate() {
+        let mean_c = mean[c];
+        let std_c = std[c];
+        row_parallelism.update_chunks(plane, dst_w, |base_dy, chunk| {
+            for (offset, dst_row) in chunk.chunks_exact_mut(dst_w).enumerate() {
+                let &(idx, weights) = &y_taps[base_dy + offset];
+                for (dx, dst_ch) in dst_row.iter_mut().enumerate() {
+                    let mut sum = 0.0_f64;
+                    for (&iy, &w) in idx.iter().zip(&weights) {
+                        sum = f64::from(horiz[(iy * dst_w + dx) * 3 + c]).mul_add(w, sum);
+                    }
+                    let pixel = (sum as f32).round_ties_even().clamp(0.0, 255.0);
+                    *dst_ch = pixel.mul_add(inv_255, -mean_c) / std_c;
                 }
-                let pixel = (sum as f32).round_ties_even().clamp(0.0, 255.0);
-                out[c * plane_len + dy * dst_w + dx] = pixel.mul_add(inv_255, -mean[c]) / std[c];
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(out)
 }
@@ -869,21 +943,32 @@ fn build_vit_rope_cache(
     Ok(cache)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained for standalone RoPE unit test coverage alongside head-major apply_vit_rope_head."
+    )
+)]
 fn apply_vit_rope_patch(values: &mut [f32], num_heads: usize, d_head: usize, freqs: &[(f32, f32)]) {
-    let n_dims = d_head / 2;
     for head in values.chunks_exact_mut(d_head).take(num_heads) {
-        for (ic, &(cos_theta, sin_theta)) in freqs.iter().enumerate() {
-            let x0 = head[ic];
-            let x1 = head[ic + n_dims];
-            head[ic] = x1.mul_add(-sin_theta, x0 * cos_theta);
-            head[ic + n_dims] = x1.mul_add(cos_theta, x0 * sin_theta);
-        }
+        apply_vit_rope_head(head, d_head, freqs);
+    }
+}
+
+fn apply_vit_rope_head(head: &mut [f32], d_head: usize, freqs: &[(f32, f32)]) {
+    let n_dims = d_head / 2;
+    for (ic, &(cos_theta, sin_theta)) in freqs.iter().enumerate() {
+        let x0 = head[ic];
+        let x1 = head[ic + n_dims];
+        head[ic] = x1.mul_add(-sin_theta, x0 * cos_theta);
+        head[ic + n_dims] = x1.mul_add(cos_theta, x0 * sin_theta);
     }
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Reuse preallocated scratch buffers across all 27 ViT layers without inner heap allocation."
+    reason = "Reuse preallocated head-major scratch buffers across all 27 ViT layers without inner heap allocation."
 )]
 fn run_self_attention(
     block: &VitBlock,
@@ -891,80 +976,114 @@ fn run_self_attention(
     n_pos: usize,
     rope_cache: &[(f32, f32)],
     normed: &[f32],
-    qkv_buf: &mut [f32],
-    q_buf: &mut [f32],
-    k_buf: &mut [f32],
-    v_buf: &mut [f32],
+    attn: &mut AttentionScratch,
     attn_out_buf: &mut [f32],
-    proj_buf: &mut Vec<f32>,
-    scratch: &mut MatvecScratch,
+    projector: &mut TiledProjector,
+    row_parallelism: &RowParallelism,
+) -> Result<()> {
+    let d = config.hidden_size;
+    let d_head = d / config.num_heads;
+    let head_plane = n_pos * d_head;
+    fill_qkv_heads(block, config, n_pos, rope_cache, normed, attn, projector)?;
+
+    let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
+    row_parallelism.update_chunks(&mut attn.head_out, head_plane, |base_head, out_chunk| {
+        let mut scores_buf = vec![0.0_f32; 4 * n_pos];
+        for (offset, out_head) in out_chunk.chunks_exact_mut(head_plane).enumerate() {
+            let head = base_head + offset;
+            let q_head = &attn.q_heads[head * head_plane..(head + 1) * head_plane];
+            let k_head = &attn.k_heads[head * head_plane..(head + 1) * head_plane];
+            let v_head = &attn.v_heads[head * head_plane..(head + 1) * head_plane];
+            attend_head_four_queries(
+                q_head,
+                k_head,
+                v_head,
+                n_pos,
+                d_head,
+                kq_scale,
+                &mut scores_buf,
+                out_head,
+            )?;
+        }
+        Ok(())
+    })?;
+
+    project_attn_output(
+        block,
+        config,
+        n_pos,
+        &attn.head_out,
+        attn_out_buf,
+        projector,
+    )
+}
+
+fn fill_qkv_heads(
+    block: &VitBlock,
+    config: &VisionConfig,
+    n_pos: usize,
+    rope_cache: &[(f32, f32)],
+    normed: &[f32],
+    attn: &mut AttentionScratch,
+    projector: &mut TiledProjector,
 ) -> Result<()> {
     let d = config.hidden_size;
     let d_head = d / config.num_heads;
     let n_dims = d_head / 2;
-
-    for tok in 0..n_pos {
-        let x = &normed[tok * d..(tok + 1) * d];
-        scratch
-            .prepare(&block.attn_qkv_w, x)?
-            .matvec_into(&block.attn_qkv_w, proj_buf)?;
-        let qkv_tok = &mut qkv_buf[tok * 3 * d..(tok + 1) * 3 * d];
-        for (dst, (&val, &bias)) in qkv_tok
-            .iter_mut()
-            .zip(proj_buf.iter().zip(&block.attn_qkv_b))
-        {
-            *dst = val + bias;
+    let head_plane = n_pos * d_head;
+    for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
+        let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
+        for t in 0..chunk {
+            let tok = tile_start + t;
+            projector.inputs[t].resize(d, 0.0);
+            projector.inputs[t].copy_from_slice(&normed[tok * d..(tok + 1) * d]);
         }
-        let freqs = &rope_cache[tok * n_dims..(tok + 1) * n_dims];
-        let q_tok = &mut q_buf[tok * d..(tok + 1) * d];
-        q_tok.copy_from_slice(&qkv_tok[..d]);
-        apply_vit_rope_patch(q_tok, config.num_heads, d_head, freqs);
+        projector.tile.project_with_previous(
+            None,
+            &block.attn_qkv_w,
+            &projector.inputs[..chunk],
+            &mut projector.outputs[..chunk],
+            false,
+            &|| Ok(()),
+        )?;
+        for (t, proj_row) in projector.outputs[..chunk].iter().enumerate() {
+            let tok = tile_start + t;
+            let freqs = &rope_cache[tok * n_dims..(tok + 1) * n_dims];
+            for head in 0..config.num_heads {
+                let h_off = head * d_head;
+                let dst_off = head * head_plane + tok * d_head;
 
-        let k_tok = &mut k_buf[tok * d..(tok + 1) * d];
-        k_tok.copy_from_slice(&qkv_tok[d..2 * d]);
-        apply_vit_rope_patch(k_tok, config.num_heads, d_head, freqs);
-
-        v_buf[tok * d..(tok + 1) * d].copy_from_slice(&qkv_tok[2 * d..3 * d]);
-    }
-
-    let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
-    let mut scores = vec![0.0_f32; n_pos];
-    let mut concat = vec![0.0_f32; n_pos * d];
-    for head in 0..config.num_heads {
-        let h_off = head * d_head;
-        for q_tok in 0..n_pos {
-            let q = &q_buf[q_tok * d + h_off..q_tok * d + h_off + d_head];
-            for k_tok in 0..n_pos {
-                let k = &k_buf[k_tok * d + h_off..k_tok * d + h_off + d_head];
-                let mut dot = 0.0_f64;
-                for (&qv, &kv) in q.iter().zip(k) {
-                    dot = f64::from(qv).mul_add(f64::from(kv), dot);
+                let q_dst = &mut attn.q_heads[dst_off..dst_off + d_head];
+                for (dst, (&val, &bias)) in q_dst.iter_mut().zip(
+                    proj_row[h_off..h_off + d_head]
+                        .iter()
+                        .zip(&block.attn_qkv_b[h_off..h_off + d_head]),
+                ) {
+                    *dst = val + bias;
                 }
-                scores[k_tok] = narrow_f64_to_f32(dot)? * kq_scale;
-            }
-            softmax(&mut scores)?;
-            let out_head = &mut concat[q_tok * d + h_off..q_tok * d + h_off + d_head];
-            out_head.fill(0.0);
-            for (v_tok, &prob) in scores.iter().enumerate() {
-                let v = &v_buf[v_tok * d + h_off..v_tok * d + h_off + d_head];
-                for (acc, &vv) in out_head.iter_mut().zip(v) {
-                    *acc = prob.mul_add(vv, *acc);
+                apply_vit_rope_head(q_dst, d_head, freqs);
+
+                let k_off = d + h_off;
+                let k_dst = &mut attn.k_heads[dst_off..dst_off + d_head];
+                for (dst, (&val, &bias)) in k_dst.iter_mut().zip(
+                    proj_row[k_off..k_off + d_head]
+                        .iter()
+                        .zip(&block.attn_qkv_b[k_off..k_off + d_head]),
+                ) {
+                    *dst = val + bias;
+                }
+                apply_vit_rope_head(k_dst, d_head, freqs);
+
+                let v_off = 2 * d + h_off;
+                let v_dst = &mut attn.v_heads[dst_off..dst_off + d_head];
+                for (dst, (&val, &bias)) in v_dst.iter_mut().zip(
+                    proj_row[v_off..v_off + d_head]
+                        .iter()
+                        .zip(&block.attn_qkv_b[v_off..v_off + d_head]),
+                ) {
+                    *dst = val + bias;
                 }
             }
-        }
-    }
-
-    for tok in 0..n_pos {
-        let x = &concat[tok * d..(tok + 1) * d];
-        scratch
-            .prepare(&block.attn_out_w, x)?
-            .matvec_into(&block.attn_out_w, proj_buf)?;
-        let out_tok = &mut attn_out_buf[tok * d..(tok + 1) * d];
-        for (dst, (&val, &bias)) in out_tok
-            .iter_mut()
-            .zip(proj_buf.iter().zip(&block.attn_out_b))
-        {
-            *dst = val + bias;
         }
     }
     Ok(())
@@ -972,43 +1091,208 @@ fn run_self_attention(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Reuse layer scratch allocations across patches."
+    reason = "Keep 4-query tiled ViT attention kernels self-contained with caller-owned scratch."
 )]
+fn attend_head_four_queries(
+    q_head: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    n_pos: usize,
+    d_head: usize,
+    kq_scale: f32,
+    scores_buf: &mut [f32],
+    out_head: &mut [f32],
+) -> Result<()> {
+    let quad_end = (n_pos / 4) * 4;
+    let (s0, rest) = scores_buf.split_at_mut(n_pos);
+    let (s1, rest) = rest.split_at_mut(n_pos);
+    let (s2, s3) = rest.split_at_mut(n_pos);
+    let s3 = &mut s3[..n_pos];
+
+    for q_base in (0..quad_end).step_by(4) {
+        let q0 = &q_head[q_base * d_head..(q_base + 1) * d_head];
+        let q1 = &q_head[(q_base + 1) * d_head..(q_base + 2) * d_head];
+        let q2 = &q_head[(q_base + 2) * d_head..(q_base + 3) * d_head];
+        let q3 = &q_head[(q_base + 3) * d_head..(q_base + 4) * d_head];
+        for (k_tok, k) in k_head.chunks_exact(d_head).enumerate() {
+            let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            for ((((&qv0, &qv1), &qv2), &qv3), &kv) in q0.iter().zip(q1).zip(q2).zip(q3).zip(k) {
+                let kv_f64 = f64::from(kv);
+                d0 = f64::from(qv0).mul_add(kv_f64, d0);
+                d1 = f64::from(qv1).mul_add(kv_f64, d1);
+                d2 = f64::from(qv2).mul_add(kv_f64, d2);
+                d3 = f64::from(qv3).mul_add(kv_f64, d3);
+            }
+            s0[k_tok] = narrow_f64_to_f32(d0)? * kq_scale;
+            s1[k_tok] = narrow_f64_to_f32(d1)? * kq_scale;
+            s2[k_tok] = narrow_f64_to_f32(d2)? * kq_scale;
+            s3[k_tok] = narrow_f64_to_f32(d3)? * kq_scale;
+        }
+        softmax(s0)?;
+        softmax(s1)?;
+        softmax(s2)?;
+        softmax(s3)?;
+        let (o0, rest) = out_head[q_base * d_head..(q_base + 4) * d_head].split_at_mut(d_head);
+        let (o1, rest) = rest.split_at_mut(d_head);
+        let (o2, o3) = rest.split_at_mut(d_head);
+        o0.fill(0.0);
+        o1.fill(0.0);
+        o2.fill(0.0);
+        o3.fill(0.0);
+        for (v_tok, v) in v_head.chunks_exact(d_head).enumerate() {
+            let (p0, p1, p2, p3) = (s0[v_tok], s1[v_tok], s2[v_tok], s3[v_tok]);
+            for ((((a0, a1), a2), a3), &vv) in o0
+                .iter_mut()
+                .zip(o1.iter_mut())
+                .zip(o2.iter_mut())
+                .zip(o3.iter_mut())
+                .zip(v)
+            {
+                *a0 = p0.mul_add(vv, *a0);
+                *a1 = p1.mul_add(vv, *a1);
+                *a2 = p2.mul_add(vv, *a2);
+                *a3 = p3.mul_add(vv, *a3);
+            }
+        }
+    }
+
+    for q_tok in quad_end..n_pos {
+        let q = &q_head[q_tok * d_head..(q_tok + 1) * d_head];
+        let out_row = &mut out_head[q_tok * d_head..(q_tok + 1) * d_head];
+        attend_single_query(q, k_head, v_head, d_head, kq_scale, s0, out_row)?;
+    }
+    Ok(())
+}
+
+fn attend_single_query(
+    q: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    d_head: usize,
+    kq_scale: f32,
+    scores: &mut [f32],
+    out_row: &mut [f32],
+) -> Result<()> {
+    for (k_tok, k) in k_head.chunks_exact(d_head).enumerate() {
+        let mut dot = 0.0_f64;
+        for (&qv, &kv) in q.iter().zip(k) {
+            dot = f64::from(qv).mul_add(f64::from(kv), dot);
+        }
+        scores[k_tok] = narrow_f64_to_f32(dot)? * kq_scale;
+    }
+    softmax(scores)?;
+    out_row.fill(0.0);
+    for (v_tok, &prob) in scores.iter().enumerate() {
+        let v = &v_head[v_tok * d_head..(v_tok + 1) * d_head];
+        for (acc, &vv) in out_row.iter_mut().zip(v) {
+            *acc = prob.mul_add(vv, *acc);
+        }
+    }
+    Ok(())
+}
+
+fn project_attn_output(
+    block: &VitBlock,
+    config: &VisionConfig,
+    n_pos: usize,
+    head_out: &[f32],
+    attn_out_buf: &mut [f32],
+    projector: &mut TiledProjector,
+) -> Result<()> {
+    let d = config.hidden_size;
+    let d_head = d / config.num_heads;
+    let head_plane = n_pos * d_head;
+    for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
+        let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
+        for t in 0..chunk {
+            let tok = tile_start + t;
+            let dst = &mut projector.inputs[t];
+            dst.resize(d, 0.0);
+            for head in 0..config.num_heads {
+                let src_off = head * head_plane + tok * d_head;
+                dst[head * d_head..(head + 1) * d_head]
+                    .copy_from_slice(&head_out[src_off..src_off + d_head]);
+            }
+        }
+        projector.tile.project_with_previous(
+            None,
+            &block.attn_out_w,
+            &projector.inputs[..chunk],
+            &mut projector.outputs[..chunk],
+            false,
+            &|| Ok(()),
+        )?;
+        for (t, proj_row) in projector.outputs[..chunk].iter().enumerate() {
+            let out_tok = &mut attn_out_buf[(tile_start + t) * d..(tile_start + t + 1) * d];
+            for (dst, (&val, &bias)) in out_tok
+                .iter_mut()
+                .zip(proj_row.iter().zip(&block.attn_out_b))
+            {
+                *dst = val + bias;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_mlp_block(
     block: &VitBlock,
     config: &VisionConfig,
     n_pos: usize,
     normed: &[f32],
     residual: &[f32],
-    ffn_buf: &mut [f32],
-    proj_buf: &mut Vec<f32>,
     hidden: &mut [f32],
-    scratch: &mut MatvecScratch,
+    projector: &mut TiledProjector,
 ) -> Result<()> {
     let d = config.hidden_size;
-    for tok in 0..n_pos {
-        let x = &normed[tok * d..(tok + 1) * d];
-        scratch
-            .prepare(&block.ffn_up_w, x)?
-            .matvec_into(&block.ffn_up_w, proj_buf)?;
-        for (dst, (&val, &bias)) in ffn_buf.iter_mut().zip(proj_buf.iter().zip(&block.ffn_up_b)) {
-            *dst = gelu_tanh(val + bias);
+    for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
+        let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
+        for t in 0..chunk {
+            let tok = tile_start + t;
+            projector.inputs[t].resize(d, 0.0);
+            projector.inputs[t].copy_from_slice(&normed[tok * d..(tok + 1) * d]);
         }
-        scratch
-            .prepare(&block.ffn_down_w, ffn_buf)?
-            .matvec_into(&block.ffn_down_w, proj_buf)?;
-        let res = &residual[tok * d..(tok + 1) * d];
-        let out = &mut hidden[tok * d..(tok + 1) * d];
-        for (dst, (&r, (&val, &bias))) in out
-            .iter_mut()
-            .zip(res.iter().zip(proj_buf.iter().zip(&block.ffn_down_b)))
-        {
-            *dst = r + val + bias;
+        projector.tile.project_with_previous(
+            None,
+            &block.ffn_up_w,
+            &projector.inputs[..chunk],
+            &mut projector.outputs[..chunk],
+            false,
+            &|| Ok(()),
+        )?;
+        for proj_row in &mut projector.outputs[..chunk] {
+            for (dst, &bias) in proj_row.iter_mut().zip(&block.ffn_up_b) {
+                *dst = gelu_tanh(*dst + bias);
+            }
+        }
+        std::mem::swap(&mut projector.inputs, &mut projector.outputs);
+        projector.tile.project_with_previous(
+            None,
+            &block.ffn_down_w,
+            &projector.inputs[..chunk],
+            &mut projector.outputs[..chunk],
+            false,
+            &|| Ok(()),
+        )?;
+        for (t, proj_row) in projector.outputs[..chunk].iter().enumerate() {
+            let tok = tile_start + t;
+            let res = &residual[tok * d..(tok + 1) * d];
+            let out = &mut hidden[tok * d..(tok + 1) * d];
+            for (dst, (&r, (&val, &bias))) in out
+                .iter_mut()
+                .zip(res.iter().zip(proj_row.iter().zip(&block.ffn_down_b)))
+            {
+                *dst = r + val + bias;
+            }
         }
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit dimensions, parameters and worker pool for row-parallel LayerNorm."
+)]
 #[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
@@ -1023,30 +1307,40 @@ fn layer_norm_rows(
     bias: &[f32],
     eps: f32,
     output: &mut [f32],
+    row_parallelism: &RowParallelism,
 ) -> Result<()> {
-    if rows == 0 || cols == 0 || input.len() != rows * cols || output.len() != input.len() {
+    if rows == 0
+        || cols == 0
+        || input.len() != rows * cols
+        || output.len() != input.len()
+        || weight.len() != cols
+        || bias.len() != cols
+    {
         return Err(invalid("invalid LayerNorm dimensions"));
     }
     let inv_cols = 1.0_f64 / (cols as f64);
-    for r in 0..rows {
-        let src = &input[r * cols..(r + 1) * cols];
-        let dst = &mut output[r * cols..(r + 1) * cols];
-        let mut sum = 0.0_f64;
-        for &v in src {
-            sum += f64::from(v);
+    row_parallelism.update_chunks(output, cols, |base_row, chunk| {
+        for (offset, dst) in chunk.chunks_exact_mut(cols).enumerate() {
+            let r = base_row + offset;
+            let src = &input[r * cols..(r + 1) * cols];
+            let mut sum = 0.0_f64;
+            for &v in src {
+                sum += f64::from(v);
+            }
+            let mean = sum * inv_cols;
+            let mut var = 0.0_f64;
+            for &v in src {
+                let diff = f64::from(v) - mean;
+                var = diff.mul_add(diff, var);
+            }
+            let inv_std = 1.0_f64 / var.mul_add(inv_cols, f64::from(eps)).sqrt();
+            for ((d, &s), (&w, &b)) in dst.iter_mut().zip(src).zip(weight.iter().zip(bias)) {
+                let normalized = ((f64::from(s) - mean) * inv_std) as f32;
+                *d = normalized.mul_add(w, b);
+            }
         }
-        let mean = sum * inv_cols;
-        let mut var = 0.0_f64;
-        for &v in src {
-            let diff = f64::from(v) - mean;
-            var = diff.mul_add(diff, var);
-        }
-        let inv_std = 1.0_f64 / var.mul_add(inv_cols, f64::from(eps)).sqrt();
-        for ((d, &s), (&w, &b)) in dst.iter_mut().zip(src).zip(weight.iter().zip(bias)) {
-            let normalized = ((f64::from(s) - mean) * inv_std) as f32;
-            *d = normalized.mul_add(w, b);
-        }
-    }
+        Ok(())
+    })?;
     if !is_finite_slice(output) {
         return Err(invalid("nonfinite LayerNorm output"));
     }
@@ -1577,6 +1871,212 @@ mod tests {
         assert_eq!(second.sha256, image_out.sha256);
         assert!(Arc::ptr_eq(&second.embeddings, &image_out.embeddings));
         encoder.clear_cache()?;
+        Ok(())
+    }
+
+    fn varied_values(len: usize, seed: usize, scale: f32) -> Vec<f32> {
+        (0..len)
+            .map(|idx| {
+                let signed = i16::try_from((idx.wrapping_mul(17) + seed) % 29).unwrap_or(0) - 14;
+                f32::from(signed) * scale
+            })
+            .collect()
+    }
+
+    fn non_uniform_mmproj_model() -> Result<Model> {
+        let mut model = synthetic_mmproj_model()?;
+        let patch_elems = 2 * 2 * 3 * 32;
+        model.tensors.insert(
+            "v.patch_embd.weight".to_owned(),
+            f32_tensor(
+                "v.patch_embd.weight",
+                vec![2, 2, 3, 32],
+                &varied_values(patch_elems, 3, 0.015),
+            ),
+        );
+        model.tensors.insert(
+            "v.patch_embd.weight.1".to_owned(),
+            f32_tensor(
+                "v.patch_embd.weight.1",
+                vec![2, 2, 3, 32],
+                &varied_values(patch_elems, 11, 0.012),
+            ),
+        );
+        model.tensors.insert(
+            "v.patch_embd.bias".to_owned(),
+            f32_tensor("v.patch_embd.bias", vec![32], &varied_values(32, 5, 0.02)),
+        );
+        model.tensors.insert(
+            "v.position_embd.weight".to_owned(),
+            f32_tensor(
+                "v.position_embd.weight",
+                vec![32, 4],
+                &varied_values(32 * 4, 7, 0.01),
+            ),
+        );
+        model.tensors.insert(
+            "v.blk.0.attn_qkv.weight".to_owned(),
+            q8_0_tensor(
+                "v.blk.0.attn_qkv.weight",
+                32,
+                96,
+                &varied_values(32 * 96, 13, 0.025),
+            )?,
+        );
+        model.tensors.insert(
+            "v.blk.0.attn_qkv.bias".to_owned(),
+            f32_tensor(
+                "v.blk.0.attn_qkv.bias",
+                vec![96],
+                &varied_values(96, 2, 0.01),
+            ),
+        );
+        model.tensors.insert(
+            "v.blk.0.attn_out.weight".to_owned(),
+            q8_0_tensor(
+                "v.blk.0.attn_out.weight",
+                32,
+                32,
+                &varied_values(32 * 32, 19, 0.02),
+            )?,
+        );
+        model.tensors.insert(
+            "v.blk.0.attn_out.bias".to_owned(),
+            f32_tensor(
+                "v.blk.0.attn_out.bias",
+                vec![32],
+                &varied_values(32, 9, 0.01),
+            ),
+        );
+        model.tensors.insert(
+            "v.blk.0.ffn_up.weight".to_owned(),
+            q8_0_tensor(
+                "v.blk.0.ffn_up.weight",
+                32,
+                64,
+                &varied_values(32 * 64, 23, 0.02),
+            )?,
+        );
+        model.tensors.insert(
+            "v.blk.0.ffn_up.bias".to_owned(),
+            f32_tensor("v.blk.0.ffn_up.bias", vec![64], &varied_values(64, 4, 0.01)),
+        );
+        model.tensors.insert(
+            "v.blk.0.ffn_down.weight".to_owned(),
+            f16_tensor(
+                "v.blk.0.ffn_down.weight",
+                64,
+                32,
+                &varied_values(64 * 32, 29, 0.018),
+            )?,
+        );
+        model.tensors.insert(
+            "v.blk.0.ffn_down.bias".to_owned(),
+            f32_tensor(
+                "v.blk.0.ffn_down.bias",
+                vec![32],
+                &varied_values(32, 15, 0.01),
+            ),
+        );
+        model.tensors.insert(
+            "mm.0.weight".to_owned(),
+            q8_0_tensor(
+                "mm.0.weight",
+                128,
+                128,
+                &varied_values(128 * 128, 31, 0.012),
+            )?,
+        );
+        model.tensors.insert(
+            "mm.2.weight".to_owned(),
+            q8_0_tensor("mm.2.weight", 128, 32, &varied_values(128 * 32, 37, 0.015))?,
+        );
+        Ok(model)
+    }
+
+    #[test]
+    fn parallel_tiled_encoder_and_four_query_attention_match_scalar_bit_for_bit() -> Result<()> {
+        let model = non_uniform_mmproj_model()?;
+        let rgb: Vec<u8> = (0..16 * 12 * 3)
+            .map(|i| u8::try_from((i * 43 + 17) & 0xff).unwrap_or(0))
+            .collect();
+        let baseline =
+            SwiftVisionEncoder::from_model(&model, MatvecBackend::Scalar, RowParallelism::new(1)?)?;
+        // 16x12 with factor 4 (patch_size 2 * spatial_merge 2) preserves (16, 12) => n_pos = 48 > 32.
+        let expected = baseline.encode_rgb_image(&rgb, 16, 12, 16)?;
+        assert_eq!(expected.grid_width, 4);
+        assert_eq!(expected.grid_height, 3);
+
+        let workers_list: &[usize] = if cfg!(feature = "parallel-rows") {
+            &[1, 8, 12]
+        } else {
+            &[1]
+        };
+        for &workers in workers_list {
+            let encoder = SwiftVisionEncoder::from_model(
+                &model,
+                MatvecBackend::Auto,
+                RowParallelism::new(workers)?,
+            )?;
+            let actual = encoder.encode_rgb_image(&rgb, 16, 12, 16)?;
+            assert_eq!(actual.grid_width, expected.grid_width);
+            assert_eq!(actual.grid_height, expected.grid_height);
+            assert_eq!(
+                actual
+                    .embeddings
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .embeddings
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "vision encoder bit mismatch for Auto/{workers} workers"
+            );
+        }
+
+        // Verify 4-query tiled attention + odd tail at n_pos = 37 against single-query reference.
+        let n_pos = 37;
+        let d_head = 16;
+        let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
+        let q_head = varied_values(n_pos * d_head, 5, 0.2);
+        let k_head = varied_values(n_pos * d_head, 11, 0.2);
+        let v_head = varied_values(n_pos * d_head, 19, 0.2);
+
+        let mut single_scores = vec![0.0_f32; n_pos];
+        let mut expected_head = vec![0.0_f32; n_pos * d_head];
+        for q_tok in 0..n_pos {
+            attend_single_query(
+                &q_head[q_tok * d_head..(q_tok + 1) * d_head],
+                &k_head,
+                &v_head,
+                d_head,
+                kq_scale,
+                &mut single_scores,
+                &mut expected_head[q_tok * d_head..(q_tok + 1) * d_head],
+            )?;
+        }
+
+        let mut quad_scores = vec![0.0_f32; 4 * n_pos];
+        let mut actual_head = vec![0.0_f32; n_pos * d_head];
+        attend_head_four_queries(
+            &q_head,
+            &k_head,
+            &v_head,
+            n_pos,
+            d_head,
+            kq_scale,
+            &mut quad_scores,
+            &mut actual_head,
+        )?;
+        assert_eq!(
+            actual_head.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_head
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 }

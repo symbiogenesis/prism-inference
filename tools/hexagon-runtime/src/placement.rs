@@ -813,5 +813,41 @@ pub fn plan_three_processor_placement(
     })
 }
 
+/// Maximum Qwen3.5-27B decoder layers fitting inside X1 HTP v73's `3.58 GiB` persistent
+/// `fastrpc_mmap` ceiling (`blk.0..=26` = `168` `Q2_0` projections, `~2.55 GiB`).
+pub const X1_V73_MAX_NPU_LAYERS: usize = 27;
+
+/// Build an X1 HTP v73 27-layer NPU + Adreno GPU overflow heterogeneous placement plan.
+///
+/// Assigns up to [`X1_V73_MAX_NPU_LAYERS`] prefix layers (`blk.0..=26`) to Hexagon NPU and
+/// assigns all remaining decoder layers (`blk.27..total_layers`) to `gpu_backend`, leaving
+/// zero layers unassigned on Oryon CPU.
+///
+/// # Errors
+/// Rejects zero `total_layers`, `full_attention_interval == 0`, or non-GPU `gpu_backend`.
+pub fn plan_x1_v73_three_processor_placement(
+    total_layers: usize,
+    full_attention_interval: usize,
+    gpu_backend: AcceleratorTarget,
+) -> Result<HeterogeneousPlacementPlan> {
+    if !matches!(
+        gpu_backend,
+        AcceleratorTarget::AdrenoGpuOpenCl | AcceleratorTarget::AdrenoGpuVulkan
+    ) {
+        return Err(invalid(
+            "X1 HTP v73 placement requires an Adreno GPU backend",
+        ));
+    }
+    let npu_layers = total_layers.min(X1_V73_MAX_NPU_LAYERS);
+    let gpu_layers = total_layers.saturating_sub(npu_layers);
+    plan_three_processor_placement(
+        total_layers,
+        npu_layers,
+        gpu_layers,
+        full_attention_interval,
+        gpu_backend,
+    )
+}
+
 #[cfg(test)]
 mod tests;

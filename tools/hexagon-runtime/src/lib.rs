@@ -21,8 +21,11 @@ mod placement;
 pub use placement::{
     AcceleratorTarget, AdrenoQ2KernelKind, HeterogeneousLayerAssignment,
     HeterogeneousPlacementPlan, HybridPrefillSchedule, HybridPrefillStep, PlacedProjectionExecutor,
-    plan_hybrid_prefill_pipeline, plan_three_processor_placement,
+    X1_V73_MAX_NPU_LAYERS, plan_hybrid_prefill_pipeline, plan_three_processor_placement,
+    plan_x1_v73_three_processor_placement,
 };
+mod composite;
+pub use composite::{CompositeProjectionExecutor, CompositeTelemetry, HybridPrefillCoordinator};
 
 type Result<T> = bonsai_prism_runtime::Result<T>;
 

@@ -171,7 +171,7 @@ if ($CompilerLauncher) {
 $adapters = @{
     Pq2RowShapes = @{ Name = 'test-pq2-row-shapes'; Family = 'ggml' }
     Ptq1ElementMap = @{ Name = 'test-ptq1_0-element-map'; Family = 'ggml' }
-    Unicode = @{ Name = 'test-unicode'; Family = 'common' }
+    Unicode = @{ Name = 'test-unicode'; Family = 'independent' }
     MtpCatchupBatch = @{ Name = 'test-mtp-catchup-batch'; Family = 'common' }
     Jinja = @{ Name = 'test-jinja'; Family = 'common' }
     MtmdImpl = @{ Name = 'test-mtmd-impl'; Family = 'common' }

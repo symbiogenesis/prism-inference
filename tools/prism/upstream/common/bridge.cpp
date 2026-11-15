@@ -1,6 +1,5 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
-#include "unicode.h"
 #include "jinja.hpp"
 #include "tensor_graph.hpp"
 #include "grammar.hpp"
@@ -49,9 +48,6 @@ using wire_json = nlohmann::ordered_json;
 constexpr std::size_t max_file_bytes = 16 * 1024 * 1024;
 constexpr std::size_t max_response_bytes = 16 * 1024 * 1024;
 constexpr std::size_t max_operations = 128;
-constexpr std::size_t max_text_bytes = 64 * 1024;
-constexpr std::size_t max_expression_bytes = 8192;
-constexpr std::size_t max_expressions = 16;
 
 void require(bool condition, const char * message) {
     if (!condition) {
@@ -113,22 +109,6 @@ void validate_operation(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
     if (kind == "public-c-abi") {
         require_keys(operation, {"Kind"});
-    } else if (kind == "unicode-encode" || kind == "unicode-decode") {
-        auto adapted = operation; adapted.erase("Kind"); adapted["Op"] = kind;
-        prism_vocab_session::validate_unicode(adapted);
-    } else if (kind == "unicode-regex-split") {
-        require_keys(operation, {"Kind", "Text", "Expressions", "ByteEncoding"});
-        require(operation.at("Text").is_string() &&
-                operation.at("Text").get_ref<const std::string &>().size() <= max_text_bytes,
-                "Text must be a string of at most 65536 UTF-8 bytes");
-        require(operation.at("ByteEncoding").is_boolean(), "ByteEncoding must be boolean");
-        const auto & expressions = operation.at("Expressions");
-        require(expressions.is_array() && !expressions.empty() && expressions.size() <= max_expressions,
-                "Expressions must contain 1 through 16 strings");
-        for (const auto & expression : expressions) {
-            require(expression.is_string() && expression.get_ref<const std::string &>().size() <= max_expression_bytes,
-                    "expression must be a string of at most 8192 UTF-8 bytes");
-        }
     } else if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
     } else if (prism_tensor_graph::handles(kind)) {
@@ -174,10 +154,6 @@ void validate_operation(const wire_json & operation) {
 
 wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (kind == "unicode-encode" || kind == "unicode-decode") {
-        auto adapted = operation; adapted.erase("Kind"); adapted["Op"] = kind;
-        return prism_vocab_session::execute(adapted, nullptr);
-    }
     if (kind == "public-c-abi") {
         const auto value = prism_public_c_abi_observe();
         return wire_json{{"ModelParams", {{"Size", value.model_params_size}, {"Alignment", value.model_params_alignment}}},
@@ -242,12 +218,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_dspark::handles(kind)) {
         return prism_dspark::execute(operation);
-    }
-    if (kind == "unicode-regex-split") {
-        const auto pieces = unicode_regex_split(operation.at("Text").get<std::string>(),
-                operation.at("Expressions").get<std::vector<std::string>>(),
-                operation.at("ByteEncoding").get<bool>());
-        return wire_json{{"Pieces", pieces}};
     }
     throw std::runtime_error("unknown operation Kind");
 }

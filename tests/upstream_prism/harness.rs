@@ -100,6 +100,7 @@ mod reference_provider;
 mod reference_quantization;
 mod reference_reasoning;
 mod reference_threadpool;
+mod reference_unicode;
 mod schema_python;
 mod tokenizer_roundtrip;
 mod validator;
@@ -476,7 +477,7 @@ const CASES: &[Case] = &[
     register(
         "test-unicode",
         "tests/test-unicode.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         common::run_unicode,
     ),
     register(

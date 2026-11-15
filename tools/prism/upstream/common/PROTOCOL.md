@@ -9,33 +9,27 @@ schedule, tolerance and verdict. This adapter validates and serializes productio
 calls and raw observations; it contains no upstream test sources or assertions.
 
 Run `prism-upstream-common-bridge --input ABSOLUTE_PATH --output ABSOLUTE_PATH`.
-Input and output are bounded UTF-8 JSON files with this schema:
+Input and output are bounded UTF-8 JSON objects:
 
 ```json
-{"SchemaVersion":1,"Operations":[
-  {"Kind":"unicode-regex-split","Text":"text","Expressions":["expression"],"ByteEncoding":false}
-]}
+{"SchemaVersion":1,"Operations":[{"Kind":"<operation-kind>"}]}
 ```
 
 Every operation is validated before any production API executes. Operation fields are exact; unknown
 fields, duplicate object keys, unknown kinds and incorrect types are rejected.
 JSON nesting is limited to 160 levels for declarative
 graph transport. Request and response files are at most 16 MiB, and operations number 1 through 128.
-Text is at most 65,536 UTF-8 bytes; there are 1 through 16 expressions, each at most 8,192 UTF-8
-bytes. Paths must be absolute and distinct.
+Paths must be absolute and distinct.
 
-The adapter forwards Unicode inputs directly to `unicode_regex_split`.
-Results preserve input order:
-
-```json
-{"SchemaVersion":1,"Results":[{"Pieces":["piece"]}]}
-```
-
-`Pieces` contains the production split result without further encoding changes;
-the production function receives `ByteEncoding` exactly as supplied.
 A zero process exit means completion and a written
-response. Errors return a nonzero exit and a message on stderr. Discard any
+response (`{"SchemaVersion":1,"Results":[...]}`). Errors return a nonzero exit and a message on stderr. Discard any
 response from a failing process. The caller owns the timeout and file lifecycle.
+
+The former top-level `unicode-regex-split`, `unicode-encode` and `unicode-decode` file operations are
+retired. Those operations now belong to the independent Rust reference provider
+(`tests/upstream_prism/reference_unicode.rs`) selected by the source harness; the native common
+executable rejects them in file mode. Session-mode `unicode-encode`/`unicode-decode` primitives
+inside `--model-session` (`vocab_session.hpp`) remain unchanged.
 
 The former `mtp-first-decode-fits` native operation is retired. Its exact
 `Batch`, `Catchup`, `Sequences` i32 protocol and `{"Fits":boolean}` result now
@@ -444,9 +438,9 @@ rendering bytes are hex so partial UTF-8 is retained.
 
 `grammar-trace` also accepts explicit `accept-codepoint` actions (`Grammar`, `CodePoint`), calling
 `llama_grammar_accept` and returning the same exception, message and stack-size fields as token
-acceptance. File-mode `unicode-encode` and `unicode-decode` expose the existing session primitives
-with `Kind` replacing `Op`, returning parallel Values/Errors arrays. These calls perform no
-enumeration or acceptance comparisons.
+acceptance. Top-level file-mode `unicode-encode` and `unicode-decode` are retired alongside
+`unicode-regex-split` (handled by `reference_unicode.rs`); session-mode `vocab_session.hpp`
+primitives remain only on `--model-session`.
 
 `argument-enums`, `argument-parser-trace` and `remote-get-content` expose bounded production
 argument parsing and remote-file observations. The session-only resolution operations expose

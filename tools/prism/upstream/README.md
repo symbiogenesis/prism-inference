@@ -302,3 +302,18 @@ only the frozen GGUF model metadata header inputs and asserts against the pinned
 `common/quantization.hpp`, its include/dispatch and its CMake build edge are
 removed (leaving 31 checked-in C++ files across the bridge snapshot). Selecting
 `test-quant-type-selection` alone needs no native common bridge.
+
+## Retired Unicode regex-split native provider
+
+`--target rust-reference --case test-unicode` runs the original regex-split
+assertion through `tests/upstream_prism/reference_unicode.rs` using Rust's
+standard library and `fancy_regex`, without calling `bonsai_prism_runtime` or
+any native bridge. It also supplies top-level `unicode-encode` and
+`unicode-decode` operations for independent reference execution while leaving
+persistent `--model-session` primitives in `common/vocab_session.hpp` untouched.
+Ordinary `cpp` and `rust-reference` selections disclose
+`nativeReferenceReplay=false`.
+
+The `#include "unicode.h"` header include and top-level `unicode-*` dispatch
+in `common/bridge.cpp` are removed (31 checked-in C++ files remain across the
+bridge snapshot). Selecting `test-unicode` alone needs no native common bridge.

@@ -76,10 +76,15 @@ pub(super) fn run_unicode(engine: &Engine) -> Result<Value> {
     };
     let actual = pieces(&response_results(&response, 1)?[0])?;
     let expected = [" ~", "foo"];
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-unicode; nativeReferenceReplay=false"
+    };
     Ok(result(
         UNICODE_ID,
         actual == expected,
-        format!("1 original regex split assertion; expected={expected:?}; actual={actual:?}"),
+        format!("provider={provider}; 1 original regex split assertion; expected={expected:?}; actual={actual:?}"),
     ))
 }
 

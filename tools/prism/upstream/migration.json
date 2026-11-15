@@ -859,7 +859,7 @@
       "SourceSha256": "3f90e347bc639d914a360b197c75f9754d01b751a9a39a240d84b31f8303373a",
       "Category": "model-free",
       "Needs": [
-        "unicode_regex_split production API"
+        "independent clean-room Unicode regex-split reference provider (reference_unicode.rs)"
       ],
       "AssertionsToPort": "Exact regex [~][A-Za-z]+ or optional-space symbols or whitespace splits input space-tilde-foo into [space-tilde,foo].",
       "LegacyReferenceRequired": true,

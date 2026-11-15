@@ -722,8 +722,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
     ///
     /// Intended for `Hexagon v73` (`X1`) devices whose DSP/FastRPC secondary
     /// arena ceiling may admit a layer prefix rather than all 168 projections;
-    /// unselected tail tensors return `Ok(false)` from [`Self::execute_f32`] and
-    /// fall back cleanly to CPU or GPU execution.
+    /// unselected tail tensors return `false` from
+    /// [`Pq2ProjectionExecutor::supports_f32`] and fall back cleanly to CPU or
+    /// GPU execution.
     ///
     /// # Errors
     /// Rejects empty selections, already-bound executors, unsupported tensors

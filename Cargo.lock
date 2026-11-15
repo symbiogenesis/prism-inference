@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-gguf"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bonsai-native-hash",
  "bonsai-ternary",
@@ -136,11 +136,11 @@ dependencies = [
 
 [[package]]
 name = "bonsai-neon-dot"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "bonsai-prism"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cbindgen",
 ]
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "aho-corasick",
  "bonsai-gguf",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "bonsai-hexagon-native",
  "bonsai-hexagon-runtime",

@@ -69,7 +69,7 @@ impl HtpArchProfile {
         }
     }
 
-    /// Conservative default profile for Hexagon `v73` when FastRPC HVX/VTCM capability queries return zero.
+    /// Conservative default profile for Hexagon `v73` when `FastRPC` HVX/VTCM capability queries return zero.
     #[must_use]
     pub const fn v73_default() -> Self {
         Self {

@@ -2648,8 +2648,8 @@ pub(super) fn open_native_q2(
             return Err(Error::Contract);
         };
         // SAFETY: exact aligned pointer/FD/length for each secondary weight arena.
-        let extra_res = unsafe { (calls.map)(domain, extra_fd, extra_mem, 0, extra_bytes, 2) };
-        if extra_res != 0 {
+        let map_status = unsafe { (calls.map)(domain, extra_fd, extra_mem, 0, extra_bytes, 2) };
+        if map_status != 0 {
             // SAFETY: fresh secondary pointer failed DSP mapping and is not retained.
             unsafe {
                 (calls.free)(extra_mem);

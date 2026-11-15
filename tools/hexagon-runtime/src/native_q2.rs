@@ -5368,11 +5368,8 @@ mod tests {
         };
         let mut executor = NativeQ2Executor::new(&mut submitter, limits, 64 * 1024 * 1024)
             .with_resident_weights(16_384)?;
-        let prepared = executor.select_prefix_and_prewarm_tensors(&[
-            first.clone(),
-            second.clone(),
-            third.clone(),
-        ])?;
+        let prepared =
+            executor.select_prefix_and_prewarm_tensors(&[first.clone(), second, third.clone()])?;
         assert_eq!(prepared, 2);
         assert_eq!(executor.residency_statistics().tensors_prepared, 2);
 

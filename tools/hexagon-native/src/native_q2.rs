@@ -1323,6 +1323,10 @@ pub(crate) fn validate_weights(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Forwards explicit HTP profile alongside the 7-parameter Q2 frame layout"
+)]
 pub(crate) fn image_for_profile(
     profile: crate::HtpArchProfile,
     bytes: &mut [u8],

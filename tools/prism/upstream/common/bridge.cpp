@@ -12,7 +12,6 @@
 #undef LOG_ERR
 #undef LOG_CNT
 #include "sampling.hpp"
-#include "gguf.hpp"
 #include "chat_templates.hpp"
 #include "chat_parser.hpp"
 #include "chat_auto.hpp"
@@ -117,8 +116,6 @@ void validate_operation(const wire_json & operation) {
         prism_peg::validate(operation);
     } else if (prism_sampling::handles(kind)) {
         prism_sampling::validate(operation);
-    } else if (prism_gguf::handles(kind)) {
-        prism_gguf::validate(operation);
     } else if (prism_chat_templates::handles(kind)) {
         prism_chat_templates::validate(operation);
     } else if (prism_chat_parser::handles(kind)) {
@@ -170,9 +167,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_sampling::handles(kind)) {
         return prism_sampling::execute(operation);
-    }
-    if (prism_gguf::handles(kind)) {
-        return prism_gguf::execute(operation);
     }
     if (prism_chat_templates::handles(kind)) {
         return prism_chat_templates::execute(operation);

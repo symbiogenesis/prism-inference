@@ -93,6 +93,7 @@ mod recurrent_rollback;
 mod reference_allocation;
 mod reference_arena_graph;
 mod reference_batch_allocator;
+mod reference_gguf;
 mod reference_grammar_parser;
 mod reference_logging;
 mod reference_mtmd;
@@ -389,7 +390,7 @@ const CASES: &[Case] = &[
     register(
         "test-gguf",
         "tests/test-gguf.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         gguf::run,
     ),
     register(

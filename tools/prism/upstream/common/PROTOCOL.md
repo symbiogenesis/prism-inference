@@ -273,19 +273,27 @@ API and parses the same supplied inputs.
 production `Root` parser ID. Benchmark repetitions and timing belong to an
 explicit CI-only Rust benchmark entry, using these ordinary production operations.
 
-## Concurrent production logger
+## Retired native concurrent logger
+
+The native bridge rejects `concurrent-log`; its header, include, dispatch and
+build edge are retired. The production Rust and separate Rust reference adapters
+retain the following protocol and complete source schedule.
 
 `concurrent-log` takes exact fields `Kind`, `Workers`, `Finalize`. One through 32
 workers execute their supplied action arrays concurrently against the same
-production logger singleton. Worker arrays contain at most 16,384 actions, and
+logger owner. Worker arrays contain at most 16,384 actions, and
 all workers at most 65,536 combined. Actions are `emit` with exact `Level`
 (`info`, `warning`, `error`, `debug`) and `Text` (at most 1,024 bytes, no NUL), or
 `timestamps`/`prefix` with boolean `Value`. Each action also has its `Kind`.
 `Finalize` contains at most eight `flush`/`free` strings and must end with `free`.
 Workers join before finalization; captured worker exceptions fail the operation.
 The result is `Completed`, containing action completion counts per worker.
-This must be the final operation in a
-request because the production logger singleton cache is not reset after free.
+The independent reference accepts exactly one terminal logger operation per
+request, preserving the original singleton destruction boundary. Its bounded
+channel joins all producers before flush/free and joins the consumer before
+returning. Writer failures remain failures while queued producers are drained.
+Reports identify the independent provider and claim no native replay or
+output-content parity; the original source has no content assertions.
 
 ## CPU arena placement transport
 

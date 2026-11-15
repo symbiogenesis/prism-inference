@@ -466,8 +466,8 @@
       "SourceSha256": "f668c6d6987b0e8888a3823c0425971356c16ca77b44819236fb00c30e4b60c1",
       "Category": "model-free",
       "Needs": [
-        "common logger with concurrent methods",
-        "native worker dispatch or reusable per-request contexts"
+        "production Rust common logger with concurrent methods",
+        "independent bounded-channel Rust logger reference with joined producers and owned consumer"
       ],
       "AssertionsToPort": "8 worker threads x1000 mixed severity messages; concurrent timestamps/prefix toggles; join flush and explicit singleton free; hang/crash smoke behavior preserved.",
       "LegacyReferenceRequired": true,

@@ -53,5 +53,16 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
         .iter()
         .zip(&workers)
         .all(|(count, actions)| count.as_u64() == u64::try_from(actions.len()).ok());
-    Ok(result(ID, passed, "All eight original workers, 1,000 messages per worker, Windows CRT random schedules, concurrent timestamp/prefix changes, joins, flush and explicit logger free completed. Source has no output-content assertions.".to_owned()))
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-concurrent-logger; nativeReferenceReplay=false"
+    };
+    Ok(result(
+        ID,
+        passed,
+        format!(
+            "provider={provider}; all eight original workers, 1,000 messages per worker, Windows CRT random schedules, concurrent timestamp/prefix changes, joins, flush and explicit logger free completed. Source has no output-content assertions."
+        ),
+    ))
 }

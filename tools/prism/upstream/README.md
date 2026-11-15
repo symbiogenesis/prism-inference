@@ -82,10 +82,10 @@ The implementation binds reviewed upstream revision
 
 Retain the upstream MIT terms in [LICENSE](LICENSE). Source identities are reviewed
 source observations, not captured native output. Reports identify target
-`rust-reference` and `ObservationProvider.Kind: independent-rust-mathematical`,
+`rust-reference` and `ObservationProvider.Kind: independent-rust-reference`,
 with `NativeReferenceReplay`, `CompleteSourceGate` and `NativeRetirementQualified`
-false. The selector also admits the explicitly migrated reasoning-budget source
-below; it rejects other sources, full catalogs, benchmarks, diagnostics
+false. The selector also admits the explicitly migrated reasoning-budget and
+concurrent logger sources below; it rejects other sources, full catalogs, benchmarks, diagnostics
 and native bridge options. The ordinary owning `cpp` reference arm also uses
 this provider for the MTP source, preserving all six source predicates and the
 protected green ID. Its native include and dispatch are retired; the Rust
@@ -119,5 +119,30 @@ reference-result obligation, without requiring the retired implementation.
 
 `common/reasoning_budget.hpp`, its operative include/dispatch and its CMake edge
 are removed. Direct native requests for these operations reject. Complete owning
-hosted acceptance and the remaining 39 C++ files are separate gates; this removal
+hosted acceptance and the remaining C++ files are separate gates; this removal
 does not claim complete native retirement, model/codec parity or device behavior.
+
+## Retired concurrent logger native provider
+
+`--target rust-reference --case test-log` runs the unchanged complete Windows
+source schedule through `tests/upstream_prism/reference_logging.rs`. Eight
+producers issue 1,000 messages each with the original per-thread Windows CRT
+random severity and timestamp/prefix changes. They feed a bounded channel to
+a separate owner that writes, flushes and destroys its sink. The production Rust
+arm independently exercises its shared-mutex logger. All producers and the
+consumer join before success; writer failures remain sticky while pending
+channel messages drain. The original source's explicit destruction addresses
+Windows thread-startup/DLL-teardown hangs. It asserts no output contents.
+
+The reviewed assertion identity remains `tests/test-log.cpp` at upstream commit
+`b87ca7225456b06b0975b8239c66b5aecf07e37c`, SHA-256
+`f668c6d6987b0e8888a3823c0425971356c16ca77b44819236fb00c30e4b60c1`.
+The existing source ID, required reference green ID and MIT attribution remain.
+The ordinary `cpp` reference selector uses this separate Rust provider; reports
+and case details name it with `NativeReferenceReplay: false`. No content parity,
+fresh native execution, whole-source gate or full-retirement verdict is implied.
+
+`common/concurrency.hpp` and its native include, dispatch and build edges are
+removed. Direct native logger requests reject. Complete owning hosted acceptance
+and the remaining 38 C++ files are separate gates; backend geometry and separate
+performance schedules are unchanged.

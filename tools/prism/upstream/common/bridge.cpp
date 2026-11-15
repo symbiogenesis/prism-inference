@@ -8,14 +8,6 @@
 #include "grammar.hpp"
 #include "codec.hpp"
 #include "peg.hpp"
-// MTMD publishes its own logging macros; the concurrency adapter uses common's.
-#undef LOG_DBG
-#undef LOG_TRC
-#undef LOG_INF
-#undef LOG_WRN
-#undef LOG_ERR
-#undef LOG_CNT
-#include "concurrency.hpp"
 #include "arena_graph.hpp"
 #include "batch_allocator.hpp"
 #include "allocation.hpp"
@@ -151,8 +143,6 @@ void validate_operation(const wire_json & operation) {
         prism_codec::validate(operation);
     } else if (prism_peg::handles(kind)) {
         prism_peg::validate(operation);
-    } else if (kind == "concurrent-log") {
-        prism_concurrency::validate(operation);
     } else if (prism_arena::handles(kind)) {
         prism_arena::validate(operation);
     } else if (prism_batch_allocator::handles(kind)) {
@@ -230,9 +220,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_peg::handles(kind)) {
         return prism_peg::execute(operation);
-    }
-    if (kind == "concurrent-log") {
-        return prism_concurrency::execute(operation);
     }
     if (prism_arena::handles(kind)) {
         return prism_arena::execute(operation);
@@ -327,8 +314,6 @@ int main(int argc, char ** argv) {
         for (std::size_t index = 0; index < operations.size(); ++index) {
             const auto & operation = operations[index];
             validate_operation(operation);
-            require(operation.at("Kind") != "concurrent-log" || index + 1 == operations.size(),
-                    "concurrent-log must be the final operation because it frees the logger singleton");
         }
         wire_json results = wire_json::array();
         for (const auto & operation : operations) {

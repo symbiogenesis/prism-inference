@@ -46,6 +46,9 @@ fn first_decode_fits(batch: i32, catchup: i32, anchors: i32) -> bool {
 }
 
 pub(super) fn execute(value: &Value) -> Result<Value> {
+    if super::reference_logging::handles(value) {
+        return super::reference_logging::execute(value);
+    }
     if super::reference_reasoning::handles(value) {
         return super::reference_reasoning::execute(value);
     }
@@ -76,11 +79,12 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
 }
 
 pub(super) fn supports(id: &str) -> bool {
-    id == MTP_ID || id == super::reference_reasoning::ID
+    id == MTP_ID || id == super::reference_reasoning::ID || id == super::reference_logging::ID
 }
 
 pub(super) fn handles(value: &Value) -> bool {
-    super::reference_reasoning::handles(value)
+    super::reference_logging::handles(value)
+        || super::reference_reasoning::handles(value)
         || value["Operations"].as_array().is_some_and(|operations| {
             !operations.is_empty()
                 && operations
@@ -90,12 +94,12 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-mathematical", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID],
+    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_logging::ID],
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
-        "AdditionalProviders": [super::reference_reasoning::identity()],
+        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_logging::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }

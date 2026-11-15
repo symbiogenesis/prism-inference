@@ -1,7 +1,6 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
 #include "jinja.hpp"
-#include "grammar.hpp"
 #include "codec.hpp"
 #include "peg.hpp"
 // MTMD publishes its own logging macros; later common headers include log.h.
@@ -16,7 +15,6 @@
 #include "chat_auto.hpp"
 #include "vocab.hpp"
 #include "model_runtime.hpp"
-#include "json_schema.hpp"
 #include "chat_analysis.hpp"
 #include "arg_parser.hpp"
 #include "chat.hpp"
@@ -107,8 +105,6 @@ void validate_operation(const wire_json & operation) {
         require_keys(operation, {"Kind"});
     } else if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
-    } else if (prism_grammar::handles(kind)) {
-        prism_grammar::validate(operation);
     } else if (prism_codec::handles(kind)) {
         prism_codec::validate(operation);
     } else if (prism_peg::handles(kind)) {
@@ -121,8 +117,6 @@ void validate_operation(const wire_json & operation) {
         prism_chat_auto::validate(operation);
     } else if (prism_vocab::handles(kind)) {
         prism_vocab::validate(operation);
-    } else if (prism_json_schema::handles(kind)) {
-        prism_json_schema::validate(operation);
     } else if (prism_chat_analysis::handles(kind)) {
         prism_chat_analysis::validate(operation);
     } else if (prism_arg_parser::handles(kind)) {
@@ -153,9 +147,6 @@ wire_json execute(const wire_json & operation) {
     if (prism_jinja::handles(kind)) {
         return prism_jinja::execute(operation);
     }
-    if (prism_grammar::handles(kind)) {
-        return prism_grammar::execute(operation);
-    }
     if (prism_codec::handles(kind)) {
         return prism_codec::execute(operation);
     }
@@ -173,9 +164,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_vocab::handles(kind)) {
         return prism_vocab::execute(operation);
-    }
-    if (prism_json_schema::handles(kind)) {
-        return prism_json_schema::execute(operation);
     }
     if (prism_chat_analysis::handles(kind)) {
         return prism_chat_analysis::execute(operation);

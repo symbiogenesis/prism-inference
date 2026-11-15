@@ -94,7 +94,9 @@ mod reference_allocation;
 mod reference_arena_graph;
 mod reference_batch_allocator;
 mod reference_gguf;
+mod reference_grammar;
 mod reference_grammar_parser;
+mod reference_json_schema;
 mod reference_logging;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
@@ -288,7 +290,7 @@ const CASES: &[Case] = &[
     register(
         "test-gbnf-validator",
         "tests/test-gbnf-validator.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         validator::run,
     ),
     register(
@@ -337,7 +339,7 @@ const CASES: &[Case] = &[
     register(
         "test-json-schema-to-grammar",
         "tests/test-json-schema-to-grammar.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         json_schema::run,
     ),
     register(
@@ -535,13 +537,13 @@ const CASES: &[Case] = &[
     register(
         "test-llama-grammar",
         "tests/test-llama-grammar.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         llama_grammar::run,
     ),
     register(
         "test-grammar-integration",
         "tests/test-grammar-integration.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         grammar_integration::run,
     ),
     register(

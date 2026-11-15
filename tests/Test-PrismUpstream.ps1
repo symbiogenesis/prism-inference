@@ -196,7 +196,7 @@ $adapters = @{
     PegPythonDict = @{ Name = 'peg-python-dict'; Id = 'tests/peg-parser/test-python-dict-parser.cpp'; Family = 'common' }
     PegUnicode = @{ Name = 'peg-unicode'; Id = 'tests/peg-parser/test-unicode.cpp'; Family = 'common' }
     PegParser = @{ Name = 'test-peg-parser'; Family = 'common' }
-    BatchAllocator = @{ Name = 'test-batch-alloc'; Family = 'common' }
+    BatchAllocator = @{ Name = 'test-batch-alloc'; Family = 'independent' }
     Allocator = @{ Name = 'test-alloc'; Family = 'common' }
     Barrier = @{ Name = 'test-barrier'; Family = 'independent' }
     BackendSampler = @{ Name = 'test-backend-sampler'; Family = 'common' }

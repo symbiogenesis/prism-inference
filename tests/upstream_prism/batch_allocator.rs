@@ -974,11 +974,16 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     for (case, value) in cases.iter().zip(values) {
         failures.extend(compare(case, value)?);
     }
+    let provider = if engine.is_rust() {
+        "production-rust"
+    } else {
+        "independent-rust-batch-allocator; nativeReferenceReplay=false"
+    };
     Ok(result(
         ID,
         failures.is_empty(),
         format!(
-            "source={SOURCE_SHA}; all26 cases and198 original assertions plus3 additional observations; failures={}; examples={:?}",
+            "source={SOURCE_SHA}; provider={provider}; all26 cases and198 original assertions plus3 additional observations; failures={}; examples={:?}",
             failures.len(),
             failures.iter().take(12).collect::<Vec<_>>()
         ),

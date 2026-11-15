@@ -325,15 +325,20 @@ count comes from Graph; the pinned CPU backend defaults to four threads.
 
 ## Generic batch allocator trace
 
+This adapter is retired from the native bridge. The ordinary `cpp` reference
+selector and explicit `rust-reference` selection route `batch-allocator` to
+`tests/upstream_prism/reference_batch_allocator.rs` with `nativeReferenceReplay=false`.
+Direct native `batch-allocator` requests reject.
+
 `batch-allocator` takes exact fields `Kind`, `PositionsPerEmbedding` (1 or 4),
 `Actions` (1 through 64). An init action supplies raw token or embedding arrays,
 optional positions/sequence IDs/logit flags, embedding width, sequence limit,
 output-all flag, and optional `{Sequence,Min,Max}` input memory ranges. Other
-actions call production `split-simple`, `split-equal`, `split-seq`, `split-reset`
-or `reserve` APIs. Exact action fields are declared in `batch_allocator.hpp`.
+actions run `split-simple`, `split-equal`, `split-seq`, `split-reset` or
+`reserve` operations against an independent safe Rust state machine.
 Inputs are limited to 64 tokens, embedding width 8 and eight sequence IDs per
-token; negative IDs and an oversized sequence limit may reach production's own
-rejection paths. All requested array extents and scalar types are checked first.
+token; negative IDs and an oversized sequence limit reach explicit validation
+failure paths. All requested array extents and scalar types are checked first.
 
 The response is `Actions`, containing raw initialization status, allocator state
 and ubatch observations in action order. Snapshots include every supplied/derived

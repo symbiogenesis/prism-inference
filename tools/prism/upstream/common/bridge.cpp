@@ -14,7 +14,6 @@
 #undef LOG_ERR
 #undef LOG_CNT
 #include "arena_graph.hpp"
-#include "batch_allocator.hpp"
 #include "allocation.hpp"
 #include "sampling.hpp"
 #include "gguf.hpp"
@@ -144,8 +143,6 @@ void validate_operation(const wire_json & operation) {
         prism_peg::validate(operation);
     } else if (prism_arena::handles(kind)) {
         prism_arena::validate(operation);
-    } else if (prism_batch_allocator::handles(kind)) {
-        prism_batch_allocator::validate(operation);
     } else if (prism_allocation::handles(kind)) {
         prism_allocation::validate(operation);
     } else if (prism_sampling::handles(kind)) {
@@ -212,9 +209,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_arena::handles(kind)) {
         return prism_arena::execute(operation);
-    }
-    if (prism_batch_allocator::handles(kind)) {
-        return prism_batch_allocator::execute(operation);
     }
     if (prism_allocation::handles(kind)) {
         return prism_allocation::execute(operation);

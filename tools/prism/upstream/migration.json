@@ -151,7 +151,7 @@
       "SourceSha256": "341b3c4291cb46e412d6e750c2ab2e19131812d08ee3b236938c587e99341d79",
       "Category": "model-free",
       "Needs": [
-        "private llama_batch_allocr API and synthetic vocab/memory objects"
+        "production Rust batch allocator API and independent Rust batch-allocator state machine reference"
       ],
       "AssertionsToPort": "Every init/split/keep-tail/mrope case table and exact batch positions/sequence IDs/output flags; preserve invalid-input outcomes.",
       "LegacyReferenceRequired": true,

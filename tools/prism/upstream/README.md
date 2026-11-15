@@ -261,3 +261,16 @@ ordinary `cpp` and `rust-reference` selections disclose `nativeReferenceReplay=f
 `common/threadpool.hpp`, its include/dispatch and its CMake build edge are removed
 (leaving 34 checked-in C++ files across the bridge snapshot). Selecting
 `test-barrier` alone needs no native common bridge.
+
+## Retired batch-allocator native provider
+
+`--target rust-reference --case test-batch-alloc` runs all 26 cases and 198
+original assertions through `tests/upstream_prism/reference_batch_allocator.rs`
+using independent `SeqSet` bitsets, sequence-order checks, `KeepTail`
+prefix/single-sequence fallback and `ubatch` snapshot serialization, without
+calling `bonsai_prism_runtime` or any native bridge. Ordinary `cpp` and
+`rust-reference` selections disclose `nativeReferenceReplay=false`.
+
+`common/batch_allocator.hpp`, its include/dispatch and its CMake build edge are
+removed (leaving 33 checked-in C++ files across the bridge snapshot). Selecting
+`test-batch-alloc` alone needs no native common bridge.

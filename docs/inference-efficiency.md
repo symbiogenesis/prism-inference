@@ -219,6 +219,15 @@ start on ties, bounding token equalities below
 `propose_lookup_then_fallback` composes suffix/lookup drafting ahead of a
 secondary fallback drafter without allocating redundant scratch.
 
+## Constrained-decoding GSS and radix mask cache
+
+Constrained decoding in `src/grammar/` pairs a Graph-Structured Stack
+(`GrammarGss` with `GssCheckpoint` rollback for speculative branches), a shared
+UTF-8 prefix trie over vocabulary spellings (`VocabularyRadixTrie`) that
+evaluates common token prefixes once per step, and a state-keyed `BitSet` cache
+(`GrammarMaskCache`) for allowed-token masks while preserving partial UTF-8
+scalar semantics (`GrammarState::partial_utf8`).
+
 Runtime copies at most eight proposals into a reused stack buffer and tracks
 warm-buffer vs growth behavior through `Runtime::reallocation_witness`
 (`ReallocationWitness`); public `SuffixDrafter::propose` returns independently

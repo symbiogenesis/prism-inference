@@ -7,11 +7,14 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
 
+pub use super::gss::{GrammarGss, GssCheckpoint};
+pub use super::mask::{GrammarMaskCache, VocabularyRadixTrie};
+
 use super::{Element, Grammar};
 use crate::{Result, invalid};
 
 /// A checked instruction location in independently owned grammar storage.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Position {
     /// Rule index.
     pub rule: usize,
@@ -70,11 +73,11 @@ impl Clone for GrammarState {
     }
 }
 
-const fn end(element: Element) -> bool {
+pub(super) const fn end(element: Element) -> bool {
     element.kind == 0 || element.kind == 1
 }
 
-fn instruction(rules: &[Vec<Element>], position: Position) -> Result<Element> {
+pub(super) fn instruction(rules: &[Vec<Element>], position: Position) -> Result<Element> {
     rules
         .get(position.rule)
         .and_then(|rule| rule.get(position.element))
@@ -82,14 +85,14 @@ fn instruction(rules: &[Vec<Element>], position: Position) -> Result<Element> {
         .ok_or_else(|| invalid("grammar instruction position outside rule storage"))
 }
 
-const fn next(position: Position) -> Position {
+pub(super) const fn next(position: Position) -> Position {
     Position {
         rule: position.rule,
         element: position.element + 1,
     }
 }
 
-fn alternatives(rule: &[Element]) -> Vec<usize> {
+pub(super) fn alternatives(rule: &[Element]) -> Vec<usize> {
     std::iter::once(0)
         .chain(
             rule.iter()
@@ -100,7 +103,7 @@ fn alternatives(rule: &[Element]) -> Vec<usize> {
         .collect()
 }
 
-fn reject_left_recursion(rules: &[Vec<Element>]) -> Result<()> {
+pub(super) fn reject_left_recursion(rules: &[Vec<Element>]) -> Result<()> {
     // The native detector marks only an explicitly empty alternative. It
     // does not propagate emptiness through wrapper rule references. Preserve
     // that distinction: nested nullable repetitions such as ([x]*)* are valid
@@ -204,7 +207,7 @@ fn advance(rules: &[Vec<Element>], stack: Stack, output: &mut Vec<Stack>) -> Res
     Ok(())
 }
 
-fn match_character(
+pub(super) fn match_character(
     rules: &[Vec<Element>],
     mut position: Position,
     point: u32,
@@ -232,7 +235,7 @@ fn match_character(
     Ok((found == positive, position))
 }
 
-fn match_partial(
+pub(super) fn match_partial(
     rules: &[Vec<Element>],
     mut position: Position,
     partial: PartialUtf8,
@@ -278,7 +281,7 @@ fn match_partial(
     Ok(!positive)
 }
 
-const fn match_token(element: Element, token: i32) -> bool {
+pub(super) const fn match_token(element: Element, token: i32) -> bool {
     let token = u32::from_ne_bytes(token.to_ne_bytes());
     (element.value == token) == (element.kind == 8)
 }
@@ -308,7 +311,7 @@ fn accept_character(
 
 const MAX_DIAGNOSTIC_PREVIEW_BYTES: usize = 256;
 
-fn bounded_utf8_preview(bytes: &[u8]) -> String {
+pub(super) fn bounded_utf8_preview(bytes: &[u8]) -> String {
     let sample = &bytes[..bytes.len().min(MAX_DIAGNOSTIC_PREVIEW_BYTES)];
     let preview = String::from_utf8_lossy(sample);
     if bytes.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES && preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES
@@ -339,7 +342,7 @@ const fn is_valid_utf8_continuation(partial: PartialUtf8, byte: u8) -> bool {
     }
 }
 
-fn decode_utf8(bytes: &[u8], mut partial: PartialUtf8) -> (Vec<u32>, PartialUtf8) {
+pub(super) fn decode_utf8(bytes: &[u8], mut partial: PartialUtf8) -> (Vec<u32>, PartialUtf8) {
     let mut points = Vec::new();
     let mut position = 0;
     if !(0..=3).contains(&partial.remaining) {
@@ -474,6 +477,12 @@ impl GrammarState {
     #[must_use]
     pub fn stacks(&self) -> &[Vec<Position>] {
         &self.stacks
+    }
+
+    /// Returns the pending partial UTF-8 decoder state across token pieces.
+    #[must_use]
+    pub const fn partial_utf8(&self) -> PartialUtf8 {
+        self.partial
     }
 
     /// Captures only the pushdown stacks, retaining the originating identity.

@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::{Result, invalid};
 
+mod gss;
+mod mask;
 pub mod runtime;
 
 /// One flattened grammar instruction in the pinned production representation.

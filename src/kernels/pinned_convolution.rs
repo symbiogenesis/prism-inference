@@ -783,12 +783,13 @@ pub(crate) fn step_silu_tokens_in_place(
     coefficients: &[f32],
     width: usize,
 ) -> Result<()> {
-    step_tokens_inner::<true, false, false>(
+    step_tokens_inner::<true, false, false, false>(
         history,
         tokens,
         channels,
         coefficients,
         width,
+        1.0,
         ProjectionRows {
             rows: &[],
             offset: 0,
@@ -854,21 +855,23 @@ pub(crate) fn step_silu_token_rows_into_coefficients(
         history: None,
     };
     if coefficients.prepared {
-        step_tokens_inner::<true, true, true>(
+        step_tokens_inner::<true, true, true, false>(
             history,
             output,
             channels,
             coefficients.values,
             width,
+            1.0,
             projections,
         )
     } else {
-        step_tokens_inner::<true, true, false>(
+        step_tokens_inner::<true, true, false, false>(
             history,
             output,
             channels,
             coefficients.values,
             width,
+            1.0,
             projections,
         )
     }
@@ -892,6 +895,70 @@ pub(crate) fn step_silu_token_rows_from_coefficients(
     width: usize,
     output: &mut [f32],
 ) -> Result<()> {
+    step_token_rows_from_coefficients::<false>(
+        previous,
+        history,
+        rows,
+        channel_range,
+        coefficients,
+        width,
+        1.0,
+        output,
+    )
+}
+
+/// Convolves projected rows directly from immutable committed history, fuses
+/// pinned `SiLU` in registers, and applies per-token clamped L2 normalization
+/// in exact `f64` increasing-channel order matching [`super::l2_norm_in_place`].
+///
+/// # Errors
+/// Rejects invalid geometry, nonpositive/nonfinite `epsilon`, or nonfinite
+/// convolution inputs and outputs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep committed history, output, projected rows, prepared coefficients, width, and L2 epsilon explicit."
+)]
+pub(crate) fn step_silu_clamped_l2_token_rows_from_coefficients(
+    previous: &[f32],
+    history: &mut [f32],
+    rows: &[Vec<f32>],
+    channel_range: &std::ops::Range<usize>,
+    coefficients: CoefficientSlice<'_>,
+    width: usize,
+    epsilon: f32,
+    output: &mut [f32],
+) -> Result<()> {
+    step_token_rows_from_coefficients::<true>(
+        previous,
+        history,
+        rows,
+        channel_range,
+        coefficients,
+        width,
+        epsilon,
+        output,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Share validation and dispatch across plain SiLU and fused SiLU+clamped-L2 multi-token paths."
+)]
+fn step_token_rows_from_coefficients<const CLAMPED_L2: bool>(
+    previous: &[f32],
+    history: &mut [f32],
+    rows: &[Vec<f32>],
+    channel_range: &std::ops::Range<usize>,
+    coefficients: CoefficientSlice<'_>,
+    width: usize,
+    epsilon: f32,
+    output: &mut [f32],
+) -> Result<()> {
+    if CLAMPED_L2 && (!epsilon.is_finite() || epsilon <= 0.0) {
+        return Err(invalid(
+            "pinned convolution normalization requires positive finite epsilon",
+        ));
+    }
     let channels = channel_range
         .end
         .checked_sub(channel_range.start)
@@ -909,21 +976,23 @@ pub(crate) fn step_silu_token_rows_from_coefficients(
         history: Some(previous),
     };
     if coefficients.prepared {
-        step_tokens_inner::<true, true, true>(
+        step_tokens_inner::<true, true, true, CLAMPED_L2>(
             history,
             output,
             channels,
             coefficients.values,
             width,
+            epsilon,
             projections,
         )
     } else {
-        step_tokens_inner::<true, true, false>(
+        step_tokens_inner::<true, true, false, CLAMPED_L2>(
             history,
             output,
             channels,
             coefficients.values,
             width,
+            epsilon,
             projections,
         )
     }
@@ -944,18 +1013,29 @@ impl<'a> ProjectionRows<'a> {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Keep multi-token NEON register-sliding convolution, optional SiLU fusion and fallback together."
+    reason = "Keep multi-token NEON register-sliding convolution, optional SiLU/L2 fusion and fallback together."
 )]
-fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>(
+fn step_tokens_inner<
+    const SILU: bool,
+    const DIRECT: bool,
+    const PREPARED: bool,
+    const CLAMPED_L2: bool,
+>(
     history: &mut [f32],
     tokens: &mut [f32],
     channels: usize,
     coefficients: &[f32],
     width: usize,
+    epsilon: f32,
     projections: ProjectionRows<'_>,
 ) -> Result<()> {
     if width == 0 {
         return Err(invalid("pinned convolution requires coefficients"));
+    }
+    if CLAMPED_L2 && (!epsilon.is_finite() || epsilon <= 0.0) {
+        return Err(invalid(
+            "pinned convolution normalization requires positive finite epsilon",
+        ));
     }
     let hist_width = width - 1;
     if channels == 0
@@ -988,6 +1068,19 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
         let mut finite_mask = zero.is_finite();
+        let mut stack_squares = [0.0_f64; 32];
+        let mut heap_squares = Vec::new();
+        let squares: &mut [f64] = if CLAMPED_L2 {
+            if count <= stack_squares.len() {
+                &mut stack_squares[..count]
+            } else {
+                heap_squares.try_reserve_exact(count)?;
+                heap_squares.resize(count, 0.0);
+                &mut heap_squares
+            }
+        } else {
+            &mut []
+        };
         let (h_pairs, h_rem24) = history.as_chunks_mut::<24>();
         let (c_pairs, c_rem32) = coefficients.as_chunks::<32>();
         for (pair_idx, (h_pair, c_pair)) in h_pairs.iter_mut().zip(c_pairs).enumerate() {
@@ -1017,9 +1110,8 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
                 [h_source[14], h_source[17], h_source[20], h_source[23]],
             );
             let col = pair_idx * 8;
-            for token in 0..count {
-                let offset = token * channels + col;
-                let m_slice = &mut tokens[offset..offset + 8];
+            for (token, token_row) in tokens.chunks_exact_mut(channels).take(count).enumerate() {
+                let m_slice = &mut token_row[col..col + 8];
                 let projected = if DIRECT {
                     projections.chunk(token, col, 8)
                 } else {
@@ -1045,6 +1137,20 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
                         out1 / (one + super::pinned_activations::vector_exp_x4(neon, zero - out1));
                     s0.store_slice(&mut m_slice[0..4]);
                     s1.store_slice(&mut m_slice[4..8]);
+                    if CLAMPED_L2 {
+                        finite_mask = finite_mask & s0.is_finite() & s1.is_finite();
+                        let sq0 = (s0 * s0).to_array();
+                        let sq1 = (s1 * s1).to_array();
+                        let acc = &mut squares[token];
+                        *acc += f64::from(sq0[0]);
+                        *acc += f64::from(sq0[1]);
+                        *acc += f64::from(sq0[2]);
+                        *acc += f64::from(sq0[3]);
+                        *acc += f64::from(sq1[0]);
+                        *acc += f64::from(sq1[1]);
+                        *acc += f64::from(sq1[2]);
+                        *acc += f64::from(sq1[3]);
+                    }
                 } else {
                     out0.store_slice(&mut m_slice[0..4]);
                     out1.store_slice(&mut m_slice[4..8]);
@@ -1084,9 +1190,8 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
             let mut h_t2 =
                 f32x4::load_array(neon, [h_source[2], h_source[5], h_source[8], h_source[11]]);
             let col = (base_group + group) * 4;
-            for token in 0..count {
-                let offset = token * channels + col;
-                let m_chunk = &mut tokens[offset..offset + 4];
+            for (token, token_row) in tokens.chunks_exact_mut(channels).take(count).enumerate() {
+                let m_chunk = &mut token_row[col..col + 4];
                 let projected = if DIRECT {
                     projections.chunk(token, col, 4)
                 } else {
@@ -1100,8 +1205,18 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
                 let out = p.mul_add_precise(tap3, sum);
                 finite_mask &= out.is_finite();
                 if SILU {
-                    (out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out)))
-                        .store_slice(m_chunk);
+                    let silu =
+                        out / (one + super::pinned_activations::vector_exp_x4(neon, zero - out));
+                    silu.store_slice(m_chunk);
+                    if CLAMPED_L2 {
+                        finite_mask &= silu.is_finite();
+                        let sq = (silu * silu).to_array();
+                        let acc = &mut squares[token];
+                        *acc += f64::from(sq[0]);
+                        *acc += f64::from(sq[1]);
+                        *acc += f64::from(sq[2]);
+                        *acc += f64::from(sq[3]);
+                    }
                 } else {
                     out.store_slice(m_chunk);
                 }
@@ -1118,6 +1233,12 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
         }
         if !finite_mask.all_true() {
             return Err(invalid("nonfinite kernel output"));
+        }
+        if CLAMPED_L2 {
+            for (token_out, &sq_sum) in tokens.chunks_exact_mut(channels).zip(&*squares) {
+                let scale = l2_scale_from_squares(sq_sum, epsilon);
+                scale_l2_head_neon(neon, token_out, scale);
+            }
         }
         return Ok(());
     }
@@ -1136,6 +1257,9 @@ fn step_tokens_inner<const SILU: bool, const DIRECT: bool, const PREPARED: bool>
     // unsupported geometry or targets, preserving their failure mutation.
     for token_slice in tokens.chunks_exact_mut(channels) {
         step_in_place_inner::<SILU, PREPARED>(history, token_slice, coefficients, width)?;
+        if CLAMPED_L2 {
+            super::l2_norm_in_place(token_slice, epsilon);
+        }
     }
     Ok(())
 }
@@ -2475,6 +2599,139 @@ mod tests {
                             head_width,
                             epsilon,
                             &mut bad_next,
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verifies 0-ULP parity between fused and unfused token-row conv+SiLU+clamped-L2 across widths, token counts, and faults."
+    )]
+    fn x1_fused_step_silu_clamped_l2_token_rows_matches_unfused_bits_and_rejects_faults()
+    -> Result<()> {
+        let epsilon = 1e-6_f32;
+        for (channels, width, allow_prepared, tiny_sub_eps) in [
+            (4_usize, 4_usize, true, false),
+            (128, 4, true, false),
+            (128, 4, true, true),
+            (132, 4, true, false),
+            (132, 2, false, false),
+            (132, 2, false, true),
+        ] {
+            let hist_width = width - 1;
+            let previous: Vec<f32> = (0..channels * hist_width)
+                .map(|idx| {
+                    let base = [-0.75_f32, 0.5, -0.25, 1.125, -0.375, 0.0, -0.0][idx % 7];
+                    if tiny_sub_eps { base * 1e-10 } else { base }
+                })
+                .collect();
+            let coefficients_raw: Vec<f32> = (0..channels * width)
+                .map(|idx| {
+                    let base = [0.25_f32, -0.125, 0.5, -0.375, 0.75][idx % 5];
+                    if tiny_sub_eps { base * 1e-3 } else { base }
+                })
+                .collect();
+            let prepared_modes: &[bool] = if allow_prepared {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &prepared in prepared_modes {
+                let coeff = super::Coefficients::new(coefficients_raw.clone(), width, prepared);
+                for count in [1_usize, 3, 8, 17, 33] {
+                    let rows: Vec<Vec<f32>> = (0..count)
+                        .map(|tok| {
+                            (0..channels + 8)
+                                .map(|col| {
+                                    let base = [0.625_f32, -1.25, 0.25, -0.5, 1.5, -0.125]
+                                        [(tok + col) % 6];
+                                    if tiny_sub_eps { base * 1e-10 } else { base }
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let range = &(3..3 + channels);
+
+                    let mut ref_history = vec![f32::NAN; previous.len()];
+                    let mut ref_output = vec![f32::NAN; count * channels];
+                    super::step_silu_token_rows_from_coefficients(
+                        &previous,
+                        &mut ref_history,
+                        &rows,
+                        range,
+                        coeff.view(),
+                        width,
+                        &mut ref_output,
+                    )?;
+                    for head in ref_output.chunks_exact_mut(channels) {
+                        crate::kernels::l2_norm_in_place(head, epsilon);
+                    }
+
+                    let mut fused_history = vec![f32::NAN; previous.len()];
+                    let mut fused_output = vec![f32::NAN; count * channels];
+                    super::step_silu_clamped_l2_token_rows_from_coefficients(
+                        &previous,
+                        &mut fused_history,
+                        &rows,
+                        range,
+                        coeff.view(),
+                        width,
+                        epsilon,
+                        &mut fused_output,
+                    )?;
+
+                    assert_eq!(
+                        bits(&fused_output),
+                        bits(&ref_output),
+                        "output mismatch channels={channels} width={width} prepared={prepared} count={count} tiny={tiny_sub_eps}"
+                    );
+                    assert_eq!(bits(&fused_history), bits(&ref_history));
+                }
+
+                // Invalid epsilon and nonfinite rows reject without mutating committed previous.
+                let rows = vec![vec![0.5_f32; channels + 8]; 2];
+                let range = &(3..3 + channels);
+                for bad_eps in [0.0_f32, -1e-6, f32::NAN, f32::INFINITY] {
+                    let mut hist = previous.clone();
+                    let mut out = vec![-999.0_f32; 2 * channels];
+                    assert!(
+                        super::step_silu_clamped_l2_token_rows_from_coefficients(
+                            &previous,
+                            &mut hist,
+                            &rows,
+                            range,
+                            coeff.view(),
+                            width,
+                            bad_eps,
+                            &mut out,
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(bits(&hist), bits(&previous));
+                    assert_eq!(out, vec![-999.0_f32; 2 * channels]);
+                }
+
+                for fault in [f32::NAN, f32::INFINITY] {
+                    let mut bad_rows = rows.clone();
+                    bad_rows[1][3 + channels - 1] = fault;
+                    let mut hist = previous.clone();
+                    let mut out = vec![0.0_f32; 2 * channels];
+                    assert!(
+                        super::step_silu_clamped_l2_token_rows_from_coefficients(
+                            &previous,
+                            &mut hist,
+                            &bad_rows,
+                            range,
+                            coeff.view(),
+                            width,
+                            epsilon,
+                            &mut out,
                         )
                         .is_err()
                     );

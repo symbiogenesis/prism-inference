@@ -572,15 +572,28 @@ pub(super) fn recurrent_tile<'a>(
                         .convolution
                         .range(head * head_coeff..(head + 1) * head_coeff);
                     if matches!(arithmetic, Arithmetic::PinnedSwift) {
-                        crate::kernels::pinned_convolution::step_silu_token_rows_from_coefficients(
-                            &history[head * head_hist..(head + 1) * head_hist],
-                            head_conv,
-                            mixed_ref,
-                            &(head * width..(head + 1) * width),
-                            c_slice,
-                            geometry.convolution,
-                            head_out,
-                        )?;
+                        if head < qk_heads {
+                            crate::kernels::pinned_convolution::step_silu_clamped_l2_token_rows_from_coefficients(
+                                &history[head * head_hist..(head + 1) * head_hist],
+                                head_conv,
+                                mixed_ref,
+                                &(head * width..(head + 1) * width),
+                                c_slice,
+                                geometry.convolution,
+                                geometry.epsilon,
+                                head_out,
+                            )?;
+                        } else {
+                            crate::kernels::pinned_convolution::step_silu_token_rows_from_coefficients(
+                                &history[head * head_hist..(head + 1) * head_hist],
+                                head_conv,
+                                mixed_ref,
+                                &(head * width..(head + 1) * width),
+                                c_slice,
+                                geometry.convolution,
+                                head_out,
+                            )?;
+                        }
                     } else {
                         for (token, token_mixed) in mixed_ref.iter().enumerate() {
                             head_out[token * width..(token + 1) * width]
@@ -602,10 +615,10 @@ pub(super) fn recurrent_tile<'a>(
                             }
                             arithmetic.silu(head_mixed);
                         }
-                    }
-                    if head < qk_heads {
-                        for head_mixed in head_out.chunks_exact_mut(width) {
-                            l2_norm(head_mixed, geometry.epsilon);
+                        if head < qk_heads {
+                            for head_mixed in head_out.chunks_exact_mut(width) {
+                                l2_norm(head_mixed, geometry.epsilon);
+                            }
                         }
                     }
                 }

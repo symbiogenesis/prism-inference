@@ -97,10 +97,21 @@ fn projection_plan_digest(
             Some(None) => (1_u8, 0_u32),
             Some(Some(block)) => (2_u8, block),
         };
+        let chain_tensors = [&layer.gate, &layer.up, &layer.down];
+        let can_chain = !super::adapter_affects_any(
+            decoder.adapter.as_ref(),
+            decoder.adapter_scale,
+            &chain_tensors,
+        );
+        let can_swiglu = !super::adapter_affects_any(
+            decoder.adapter.as_ref(),
+            decoder.adapter_scale,
+            &[&layer.gate, &layer.up],
+        );
         hasher.update(&[
             hadamard_tag,
-            u8::from(executor.supports_f32_ffn_chain([&layer.gate, &layer.up, &layer.down])),
-            u8::from(executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up)),
+            u8::from(can_chain && executor.supports_f32_ffn_chain(chain_tensors)),
+            u8::from(can_swiglu && executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up)),
         ])?;
         hasher.update(&hadamard_block.to_le_bytes())?;
     }
@@ -170,18 +181,28 @@ impl Work {
             for tensor in [&layer.up, &layer.gate, &layer.down] {
                 add(tensor)?;
             }
-            if decoder.adapter.is_none()
-                && decoder.transforms.basis(&layer.gate) == decoder.transforms.basis(&layer.up)
-            {
+            if decoder.transforms.basis(&layer.gate) == decoder.transforms.basis(&layer.up) {
+                let chain_tensors = [&layer.gate, &layer.up, &layer.down];
+                let can_chain = !super::adapter_affects_any(
+                    decoder.adapter.as_ref(),
+                    decoder.adapter_scale,
+                    &chain_tensors,
+                );
+                let can_swiglu = !super::adapter_affects_any(
+                    decoder.adapter.as_ref(),
+                    decoder.adapter_scale,
+                    &[&layer.gate, &layer.up],
+                );
                 if let Some(hadamard_block) =
                     decoder.transforms.ffn_chain_hadamard_block_for(&layer.down)
-                    && executor.supports_f32_ffn_chain([&layer.gate, &layer.up, &layer.down])
+                    && can_chain
+                    && executor.supports_f32_ffn_chain(chain_tensors)
                 {
                     let extra = 2_u64 + u64::from(hadamard_block.is_some());
                     extra_hidden = extra_hidden
                         .checked_add(extra)
                         .ok_or_else(|| invalid("projection work count overflow"))?;
-                } else if executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up) {
+                } else if can_swiglu && executor.supports_f32_ffn_swiglu(&layer.gate, &layer.up) {
                     extra_hidden = extra_hidden
                         .checked_add(1)
                         .ok_or_else(|| invalid("projection work count overflow"))?;
@@ -413,11 +434,21 @@ mod tests {
     struct PlanTestExecutor {
         id: &'static str,
         supports_f32: bool,
+        supports_ffn_fusion: bool,
+        bounded: bool,
     }
 
     impl Pq2ProjectionExecutor for PlanTestExecutor {
         fn identity(&self) -> &str {
             self.id
+        }
+
+        fn operation_capacity(&self) -> Option<u64> {
+            self.bounded.then_some(1_000)
+        }
+
+        fn operation_count(&self, _tensor: &Tensor) -> Option<u64> {
+            self.bounded.then_some(1)
         }
 
         fn supports(&self, _tensor: &Tensor) -> bool {
@@ -426,6 +457,14 @@ mod tests {
 
         fn supports_f32(&self, _tensor: &Tensor) -> bool {
             self.supports_f32
+        }
+
+        fn supports_f32_ffn_swiglu(&self, _gate: &Tensor, _up: &Tensor) -> bool {
+            self.supports_ffn_fusion
+        }
+
+        fn supports_f32_ffn_chain(&self, _tensors: [&Tensor; 3]) -> bool {
+            self.supports_ffn_fusion
         }
 
         fn project(
@@ -519,6 +558,8 @@ mod tests {
         let mut exec_a = PlanTestExecutor {
             id: "plan-a",
             supports_f32: false,
+            supports_ffn_fusion: false,
+            bounded: false,
         };
         let proj_checkpoint = {
             let mut projected = decoder_a.with_projection_executor(&mut exec_a)?;
@@ -533,6 +574,8 @@ mod tests {
         let mut exec_b = PlanTestExecutor {
             id: "plan-b",
             supports_f32: false,
+            supports_ffn_fusion: false,
+            bounded: false,
         };
         let decoder_b = tiny_decoder(Arc::clone(&provenance))?;
         let mut projected_b = decoder_b.with_projection_executor(&mut exec_b)?;
@@ -545,6 +588,8 @@ mod tests {
         let mut exec_c = PlanTestExecutor {
             id: "plan-a",
             supports_f32: true,
+            supports_ffn_fusion: false,
+            bounded: false,
         };
         let decoder_c = tiny_decoder(provenance)?;
         let mut projected_c = decoder_c.with_projection_executor(&mut exec_c)?;
@@ -553,6 +598,96 @@ mod tests {
             proj_checkpoint.projection_plan_digest
         );
         assert!(projected_c.restore(&proj_checkpoint).is_err());
+        Ok(())
+    }
+
+    fn adapter_targeting(target: &Tensor) -> Result<crate::model::lora::RankOneAdapter> {
+        use std::collections::BTreeMap;
+        let base = crate::model::Model {
+            identity: "projection-adapter-base".to_owned(),
+            metadata: BTreeMap::from([(
+                "general.architecture".to_owned(),
+                bonsai_gguf::MetadataValue::from("qwen35"),
+            )]),
+            tensors: BTreeMap::from([(target.name.clone(), target.clone())]),
+        };
+        let factor = |name: &str| Tensor {
+            name: name.to_owned(),
+            dimensions: vec![128, 1],
+            kind: 0,
+            data: Arc::<[u8]>::from(1.0_f32.to_le_bytes().repeat(128)).into(),
+        };
+        let factor_b = |name: &str| Tensor {
+            name: name.to_owned(),
+            dimensions: vec![1, 128],
+            kind: 0,
+            data: Arc::<[u8]>::from(1.0_f32.to_le_bytes().repeat(128)).into(),
+        };
+        let factors = crate::model::Model {
+            identity: "projection-adapter-factors".to_owned(),
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_owned(),
+                    bonsai_gguf::MetadataValue::from("qwen35"),
+                ),
+                (
+                    "general.type".to_owned(),
+                    bonsai_gguf::MetadataValue::from("adapter"),
+                ),
+                (
+                    "adapter.type".to_owned(),
+                    bonsai_gguf::MetadataValue::from("lora"),
+                ),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    bonsai_gguf::MetadataValue::from(1.0_f32),
+                ),
+            ]),
+            tensors: BTreeMap::from([
+                (
+                    format!("{}.lora_a", target.name),
+                    factor(&format!("{}.lora_a", target.name)),
+                ),
+                (
+                    format!("{}.lora_b", target.name),
+                    factor_b(&format!("{}.lora_b", target.name)),
+                ),
+            ]),
+        };
+        crate::model::lora::RankOneAdapter::from_model(factors, &base)
+    }
+
+    #[test]
+    fn projection_work_and_digest_track_per_layer_lora_ffn_fusion() -> Result<()> {
+        let mut exec = PlanTestExecutor {
+            id: "fused-ffn-budget",
+            supports_f32: true,
+            supports_ffn_fusion: true,
+            bounded: true,
+        };
+        let provenance = Arc::new(());
+        let mut dec_zero = tiny_decoder(Arc::clone(&provenance))?;
+        dec_zero.adapter = Some(adapter_targeting(&dec_zero.layers[0].down)?);
+        dec_zero.adapter_scale = 0.0;
+        let zero_proj = dec_zero.with_projection_executor(&mut exec)?;
+        assert_eq!(zero_proj.work.map(|w| w.hidden), Some(9));
+
+        let mut dec_attn = tiny_decoder(Arc::clone(&provenance))?;
+        if let Attention::Full(attn) = &dec_attn.layers[0].attention {
+            dec_attn.adapter = Some(adapter_targeting(&attn.output)?);
+        }
+        dec_attn.adapter_scale = 1.3;
+        let attn_proj = dec_attn.with_projection_executor(&mut exec)?;
+        assert_eq!(attn_proj.work.map(|w| w.hidden), Some(9));
+        let attn_digest = attn_proj.plan_digest;
+        drop(attn_proj);
+
+        let mut dec_down = tiny_decoder(provenance)?;
+        dec_down.adapter = Some(adapter_targeting(&dec_down.layers[0].down)?);
+        dec_down.adapter_scale = 1.3;
+        let down_proj = dec_down.with_projection_executor(&mut exec)?;
+        assert_eq!(down_proj.work.map(|w| w.hidden), Some(8));
+        assert_ne!(attn_digest, down_proj.plan_digest);
         Ok(())
     }
 }

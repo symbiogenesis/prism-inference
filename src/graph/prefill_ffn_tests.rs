@@ -9,7 +9,7 @@ use super::super::ProjectionScratch;
 use super::{
     AdapterScratch, Arithmetic, Evaluation, Geometry, MatvecBackend, ProjectionTile,
     RankOneAdapter, RowParallelism, Tensor, TileReuse, Transforms, project_tile,
-    project_tile_ffn_swiglu,
+    project_tile_ffn_swiglu, try_project_tile_ffn_chain,
 };
 use crate::{Result, model::Model};
 
@@ -395,6 +395,525 @@ fn adapter_ffn_preparation_rejects_invalid_geometry_and_never_replays_failed_swi
             &format!("{name}: untouched later block up"),
         );
         assert_eq!(transformed.len(), 0);
+    }
+    Ok(())
+}
+
+fn pq2_tensor(name: &str, seed: u8) -> Tensor {
+    let mut block = [0_u8; 34];
+    block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+    for (index, byte) in block[2..].iter_mut().enumerate() {
+        *byte = match (usize::from(seed) + index) % 4 {
+            0 => 0xaa,
+            1 => 0x00,
+            2 => 0x56,
+            _ => 0x91,
+        };
+    }
+    Tensor {
+        name: name.into(),
+        dimensions: vec![128, 128],
+        kind: 142,
+        data: Arc::<[u8]>::from(block.repeat(128)).into(),
+    }
+}
+
+fn ffn_transforms(down_name: &str) -> Transforms {
+    Transforms {
+        block: 32,
+        weights: BTreeSet::from([down_name.to_owned()]),
+        signs: BTreeMap::from([(128, vec![1.0; 128])]),
+        ..Transforms::default()
+    }
+}
+
+const fn as_executor(
+    exec: &mut RecordingFfnExecutor,
+) -> &mut dyn crate::kernels::Pq2ProjectionExecutor {
+    exec
+}
+
+struct RecordingFfnExecutor {
+    arithmetic: Arithmetic,
+    transforms: Transforms,
+    geometry: Geometry,
+    chain_calls: usize,
+    swiglu_calls: usize,
+    project_calls: usize,
+}
+
+impl RecordingFfnExecutor {
+    fn cpu_matvec(&self, tensor: &Tensor, activation: &[f32], output: &mut Vec<f32>) -> Result<()> {
+        let mut scratch = self.arithmetic.scratch(MatvecBackend::Scalar);
+        scratch
+            .prepare(tensor, activation)?
+            .matvec_into(tensor, output)
+    }
+}
+
+impl crate::kernels::Pq2ProjectionExecutor for RecordingFfnExecutor {
+    fn identity(&self) -> &'static str {
+        "recording-ffn-test-executor"
+    }
+
+    fn supports(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn project(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[crate::kernels::Q8KBlock],
+        _fused: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(crate::invalid("unexpected quantized submission"))
+    }
+
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        tensor.kind == 142
+    }
+
+    fn project_f32(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.project_calls += 1;
+        self.cpu_matvec(tensor, activation, output)
+    }
+
+    fn supports_f32_ffn_swiglu(&self, gate: &Tensor, up: &Tensor) -> bool {
+        gate.kind == 142 && up.kind == 142
+    }
+
+    fn project_f32_ffn_swiglu(
+        &mut self,
+        gate: &Tensor,
+        up: &Tensor,
+        activation: &[f32],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.swiglu_calls += 1;
+        let mut gate_out = Vec::new();
+        self.cpu_matvec(gate, activation, &mut gate_out)?;
+        self.cpu_matvec(up, activation, output)?;
+        self.arithmetic.swiglu_in_place(&gate_out, output)
+    }
+
+    fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
+        tensors.iter().all(|tensor| tensor.kind == 142)
+    }
+
+    fn project_f32_ffn_chain(
+        &mut self,
+        [gate, up, down]: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.chain_calls += 1;
+        let mut mid = Vec::new();
+        let mut gate_out = Vec::new();
+        self.cpu_matvec(gate, activation, &mut gate_out)?;
+        self.cpu_matvec(up, activation, &mut mid)?;
+        self.arithmetic.swiglu_in_place(&gate_out, &mut mid)?;
+        let _ = (hadamard_block_size, pinned);
+        let mut rotated = Vec::new();
+        let down_input = if self.transforms.basis(down).0 {
+            self.transforms
+                .transform_into(down, &mid, &self.geometry, &mut rotated)?;
+            rotated.as_slice()
+        } else {
+            mid.as_slice()
+        };
+        self.cpu_matvec(down, down_input, output)?;
+        if let Some(residual) = residual {
+            super::super::add_finite(output, residual, "test ffn chain")?;
+        }
+        Ok(())
+    }
+}
+
+struct Pq2FfnFixture {
+    geometry: Geometry,
+    transforms: Transforms,
+    gate: Tensor,
+    up: Tensor,
+    down: Tensor,
+    down_adapter: RankOneAdapter,
+    attn_adapter: RankOneAdapter,
+}
+
+impl Pq2FfnFixture {
+    fn new() -> Result<Self> {
+        let gate = pq2_tensor("blk.0.ffn_gate.weight", 0);
+        let up = pq2_tensor("blk.0.ffn_up.weight", 1);
+        let down = pq2_tensor("blk.0.ffn_down.weight", 2);
+        let attn_out = pq2_tensor("blk.0.attn_output.weight", 3);
+        let adapter_for = |target: &Tensor| -> Result<RankOneAdapter> {
+            let base = Model {
+                metadata: BTreeMap::from([(
+                    "general.architecture".into(),
+                    MetadataValue::from("qwen35"),
+                )]),
+                tensors: BTreeMap::from([(target.name.clone(), target.clone())]),
+                identity: "pq2-adapter-base".into(),
+            };
+            let a_vals: Vec<f32> = (0..128)
+                .map(|i| if i % 3 == 0 { 0.125 } else { -0.0625 })
+                .collect();
+            let b_vals: Vec<f32> = (0..128)
+                .map(|i| if i % 2 == 0 { 0.25 } else { -0.125 })
+                .collect();
+            let a = tensor(&format!("{}.lora_a", target.name), &[128, 1], &a_vals);
+            let b = tensor(&format!("{}.lora_b", target.name), &[1, 128], &b_vals);
+            let factors = Model {
+                metadata: BTreeMap::from([
+                    ("general.architecture".into(), MetadataValue::from("qwen35")),
+                    ("general.type".into(), MetadataValue::from("adapter")),
+                    ("adapter.type".into(), MetadataValue::from("lora")),
+                    ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
+                ]),
+                tensors: BTreeMap::from([(a.name.clone(), a), (b.name.clone(), b)]),
+                identity: "pq2-adapter-factors".into(),
+            };
+            RankOneAdapter::from_model(factors, &base)
+        };
+        Ok(Self {
+            geometry: Geometry {
+                embedding: 128,
+                feed_forward: 128,
+                heads: 1,
+                kv_heads: 1,
+                head: 128,
+                rope: 64,
+                rope_sections: [32, 0, 0, 0],
+                rope_base: 10_000.0,
+                epsilon: 0.000_001,
+                ssm_head: 128,
+                ssm_keys: 1,
+                ssm_values: 1,
+                convolution: 4,
+            },
+            transforms: ffn_transforms(&down.name),
+            down_adapter: adapter_for(&down)?,
+            attn_adapter: adapter_for(&attn_out)?,
+            gate,
+            up,
+            down,
+        })
+    }
+
+    fn executor(&self, arithmetic: Arithmetic) -> RecordingFfnExecutor {
+        RecordingFfnExecutor {
+            arithmetic,
+            transforms: ffn_transforms(&self.down.name),
+            geometry: self.geometry.clone(),
+            chain_calls: 0,
+            swiglu_calls: 0,
+            project_calls: 0,
+        }
+    }
+
+    fn run_decode(
+        &self,
+        arithmetic: Arithmetic,
+        adapter: Option<&RankOneAdapter>,
+        scale: f32,
+        input: &[f32],
+        residual: &[f32],
+        executor: Option<&mut RecordingFfnExecutor>,
+    ) -> Result<(Vec<f32>, crate::graph::fusion::FusionStatistics)> {
+        let mut projection = ProjectionScratch {
+            matvec: arithmetic.scratch(MatvecBackend::Scalar),
+            ..ProjectionScratch::default()
+        };
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut evaluation = Evaluation {
+            geometry: &self.geometry,
+            arithmetic,
+            transforms: &self.transforms,
+            position: 0,
+            mrope_positions: [0; 4],
+            frequencies_ready: false,
+            projection: &mut projection,
+            adapter,
+            adapter_scale: scale,
+            adapter_scratch: &mut adapter_scratch,
+            executor: executor.map(as_executor),
+        };
+        let mut output = Vec::new();
+        if !evaluation.try_project_ffn_chain_into(
+            &self.gate,
+            &self.up,
+            &self.down,
+            input,
+            Some(residual),
+            &mut output,
+        )? {
+            let mut gate_out = Vec::new();
+            let mut up_out = Vec::new();
+            evaluation.project_ffn_swiglu_into(
+                &self.gate,
+                &self.up,
+                &self.down,
+                input,
+                &mut gate_out,
+                &mut up_out,
+            )?;
+            evaluation.project_into(&self.down, &up_out, &mut output)?;
+            output
+                .iter_mut()
+                .zip(residual)
+                .for_each(|(out, res)| *out += *res);
+        }
+        let stats = evaluation.projection.fusions;
+        Ok((output, stats))
+    }
+
+    fn run_tile(
+        &self,
+        arithmetic: Arithmetic,
+        adapter: Option<&RankOneAdapter>,
+        scale: f32,
+        inputs: &[Vec<f32>],
+        residuals: &[Vec<f32>],
+        mut executor: Option<&mut RecordingFfnExecutor>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+        let mut projection_scratch = arithmetic.scratch(MatvecBackend::Scalar);
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut outputs = vec![Vec::new(); inputs.len()];
+        let mut transformed = vec![Vec::new(); inputs.len()];
+        let mut gate_out = vec![Vec::new(); inputs.len()];
+        let mut up_out = vec![Vec::new(); inputs.len()];
+        if !try_project_tile_ffn_chain(
+            &self.transforms,
+            &self.geometry,
+            arithmetic,
+            adapter,
+            scale,
+            TileReuse::default(),
+            [&self.gate, &self.up, &self.down],
+            inputs,
+            Some(residuals),
+            &mut outputs,
+            &mut transformed,
+            &projector,
+            executor.as_deref_mut().map(as_executor),
+            &|| Ok(()),
+        )? {
+            let reuse = project_tile_ffn_swiglu(
+                &self.transforms,
+                &self.geometry,
+                arithmetic,
+                adapter,
+                scale,
+                &mut adapter_scratch,
+                &mut projection_scratch,
+                TileReuse::default(),
+                &self.gate,
+                &self.up,
+                &self.down,
+                inputs,
+                &mut gate_out,
+                &mut up_out,
+                &mut transformed,
+                &mut projector,
+                executor.as_deref_mut().map(as_executor),
+                &|| Ok(()),
+            )?;
+            let _ = project_tile(
+                &self.transforms,
+                &self.geometry,
+                arithmetic,
+                adapter,
+                scale,
+                &mut adapter_scratch,
+                &mut projection_scratch,
+                reuse,
+                &self.down,
+                &up_out,
+                &mut outputs,
+                &mut transformed,
+                &mut projector,
+                executor.map(as_executor),
+                &|| Ok(()),
+            )?;
+            for (out_row, res_row) in outputs.iter_mut().zip(residuals) {
+                out_row
+                    .iter_mut()
+                    .zip(res_row)
+                    .for_each(|(out, res)| *out += *res);
+            }
+        }
+        Ok(outputs)
+    }
+}
+
+fn verify_arithmetic_external_ffn_lora(
+    fixture: &Pq2FfnFixture,
+    arithmetic: Arithmetic,
+    inputs: &[Vec<f32>],
+    residuals: &[Vec<f32>],
+) -> Result<()> {
+    let (expected_zero, _) = fixture.run_decode(
+        arithmetic,
+        Some(&fixture.down_adapter),
+        0.0,
+        &inputs[0],
+        &residuals[0],
+        None,
+    )?;
+    let mut exec = fixture.executor(arithmetic);
+    let (actual_zero, summary_zero) = fixture.run_decode(
+        arithmetic,
+        Some(&fixture.down_adapter),
+        0.0,
+        &inputs[0],
+        &residuals[0],
+        Some(&mut exec),
+    )?;
+    same_bits(&actual_zero, &expected_zero, "decode scale=0 chain");
+    assert_eq!(summary_zero.external_ffn_chain.completed, 1);
+    assert_eq!(exec.chain_calls, 1);
+
+    let mut tile_exec = fixture.executor(arithmetic);
+    let tile_zero = fixture.run_tile(
+        arithmetic,
+        Some(&fixture.down_adapter),
+        0.0,
+        inputs,
+        residuals,
+        Some(&mut tile_exec),
+    )?;
+    assert_eq!(tile_exec.chain_calls, 2);
+    same_bits(&tile_zero[0], &expected_zero, "tile scale=0 chain");
+
+    let (expected_down, _) = fixture.run_decode(
+        arithmetic,
+        Some(&fixture.down_adapter),
+        1.3,
+        &inputs[0],
+        &residuals[0],
+        None,
+    )?;
+    let mut exec = fixture.executor(arithmetic);
+    let (actual_down, summary_down) = fixture.run_decode(
+        arithmetic,
+        Some(&fixture.down_adapter),
+        1.3,
+        &inputs[0],
+        &residuals[0],
+        Some(&mut exec),
+    )?;
+    same_bits(&actual_down, &expected_down, "decode down-only swiglu");
+    assert_eq!(summary_down.external_ffn_chain.completed, 0);
+    assert_eq!(summary_down.external_ffn_swiglu.completed, 1);
+    assert_eq!(exec.chain_calls, 0);
+    assert_eq!(exec.swiglu_calls, 1);
+    assert_eq!(exec.project_calls, 1);
+
+    let mut tile_exec = fixture.executor(arithmetic);
+    let tile_down = fixture.run_tile(
+        arithmetic,
+        Some(&fixture.down_adapter),
+        1.3,
+        inputs,
+        residuals,
+        Some(&mut tile_exec),
+    )?;
+    assert_eq!(tile_exec.chain_calls, 0);
+    assert_eq!(tile_exec.swiglu_calls, 2);
+    assert_eq!(tile_exec.project_calls, 2);
+    same_bits(&tile_down[0], &expected_down, "tile down-only swiglu");
+
+    // Non-FFN adapter (targeting attn_output only) unlocks full FFN chain even at nonzero scale.
+    let (expected_attn, _) = fixture.run_decode(
+        arithmetic,
+        Some(&fixture.attn_adapter),
+        1.3,
+        &inputs[0],
+        &residuals[0],
+        None,
+    )?;
+    let mut exec = fixture.executor(arithmetic);
+    let (actual_attn, summary_attn) = fixture.run_decode(
+        arithmetic,
+        Some(&fixture.attn_adapter),
+        1.3,
+        &inputs[0],
+        &residuals[0],
+        Some(&mut exec),
+    )?;
+    same_bits(&actual_attn, &expected_attn, "decode attn-only lora chain");
+    assert_eq!(summary_attn.external_ffn_chain.completed, 1);
+    assert_eq!(exec.chain_calls, 1);
+    Ok(())
+}
+
+#[test]
+fn external_ffn_chain_and_swiglu_unlock_for_inactive_and_down_only_lora() -> Result<()> {
+    let fixture = Pq2FfnFixture::new()?;
+    let input_a: Vec<f32> = (0..128)
+        .map(|i| if i % 2 == 0 { 0.375 } else { -0.25 })
+        .collect();
+    let input_b: Vec<f32> = (0..128)
+        .map(|i| if i % 5 == 0 { -0.5 } else { 0.125 })
+        .collect();
+    let inputs = vec![input_a, input_b];
+    let residuals = vec![vec![0.125; 128], vec![-0.25; 128]];
+    let untargeted_gate = pq2_tensor("blk.1.ffn_gate.weight", 0);
+    let untargeted_up = pq2_tensor("blk.1.ffn_up.weight", 1);
+    let untargeted_down = pq2_tensor("blk.1.ffn_down.weight", 2);
+
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        verify_arithmetic_external_ffn_lora(&fixture, arithmetic, &inputs, &residuals)?;
+
+        let mut proj = ProjectionScratch {
+            matvec: arithmetic.scratch(MatvecBackend::Scalar),
+            ..ProjectionScratch::default()
+        };
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut untargeted_exec = fixture.executor(arithmetic);
+        let mut eval = Evaluation {
+            geometry: &fixture.geometry,
+            arithmetic,
+            transforms: &fixture.transforms,
+            position: 0,
+            mrope_positions: [0; 4],
+            frequencies_ready: false,
+            projection: &mut proj,
+            adapter: Some(&fixture.down_adapter),
+            adapter_scale: 1.3,
+            adapter_scratch: &mut adapter_scratch,
+            executor: Some(&mut untargeted_exec),
+        };
+        let mut out = Vec::new();
+        assert!(eval.try_project_ffn_chain_into(
+            &untargeted_gate,
+            &untargeted_up,
+            &untargeted_down,
+            &inputs[0],
+            Some(&residuals[0]),
+            &mut out,
+        )?);
+        assert_eq!(untargeted_exec.chain_calls, 1);
     }
     Ok(())
 }

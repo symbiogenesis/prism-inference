@@ -4,9 +4,9 @@ use std::fmt::Write as _;
 
 use super::{
     Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerDelta, LayerState,
-    Qwen35, RecurrentAttention, Transforms, add, add_finite, attention_gate, checked_product,
-    finite, l2_norm, recurrent_decay, resize_attention_scores, resize_into, rope_frequencies,
-    row_into, sigmoid, small_float,
+    Qwen35, RecurrentAttention, Transforms, adapter_affects_any, add, add_finite, attention_gate,
+    checked_product, finite, l2_norm, recurrent_decay, resize_attention_scores, resize_into,
+    rope_frequencies, row_into, sigmoid, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -798,6 +798,7 @@ impl Qwen35 {
                 &self.geometry,
                 self.arithmetic,
                 self.adapter.as_ref(),
+                self.adapter_scale,
                 post_norm_reuse,
                 [&layer.gate, &layer.up, &layer.down],
                 &tile.normalized[..count],
@@ -2354,11 +2355,7 @@ fn project_tile_pair<'a>(
     // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
     // sequential base/adapter order, including their original error precedence.
     if executor.is_none()
-        && adapter.is_none_or(|adapter| {
-            tensors
-                .iter()
-                .all(|tensor| !adapter.affects_linear(&tensor.name, adapter_scale))
-        })
+        && !adapter_affects_any(adapter, adapter_scale, &tensors)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && ProjectionTile::supports_siblings(&tensors)
     {
@@ -2436,6 +2433,7 @@ fn try_project_tile_ffn_chain(
     geometry: &Geometry,
     arithmetic: Arithmetic,
     adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
     previous: TileReuse<'_>,
     tensors: [&Tensor; 3],
     inputs: &[Vec<f32>],
@@ -2450,7 +2448,7 @@ fn try_project_tile_ffn_chain(
     let Some(hadamard_block) = transforms.ffn_chain_hadamard_block_for(down) else {
         return Ok(false);
     };
-    if adapter.is_some()
+    if adapter_affects_any(adapter, adapter_scale, &tensors)
         || gate.kind != 142
         || up.kind != 142
         || down.kind != 142
@@ -2523,7 +2521,7 @@ fn project_tile_ffn_swiglu<'a>(
     mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
-    if adapter.is_none()
+    if !adapter_affects_any(adapter, adapter_scale, &[gate, up])
         && let Some(exec) = reborrow_executor(&mut executor)
         && gate.kind == 142
         && up.kind == 142
@@ -2815,11 +2813,7 @@ fn project_tile_triple<'a>(
     // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
     // sequential base/adapter order, including their original error precedence.
     if executor.is_none()
-        && adapter.is_none_or(|adapter| {
-            tensors
-                .iter()
-                .all(|tensor| !adapter.affects_linear(&tensor.name, adapter_scale))
-        })
+        && !adapter_affects_any(adapter, adapter_scale, &tensors)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
         && ProjectionTile::supports_siblings(&tensors)

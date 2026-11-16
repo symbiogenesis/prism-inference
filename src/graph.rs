@@ -3634,7 +3634,23 @@ impl Qwen35 {
     }
 }
 
+pub(super) fn adapter_affects_any(
+    adapter: Option<&RankOneAdapter>,
+    adapter_scale: f32,
+    tensors: &[&Tensor],
+) -> bool {
+    adapter.is_some_and(|adapter| {
+        tensors
+            .iter()
+            .any(|tensor| adapter.affects_linear(&tensor.name, adapter_scale))
+    })
+}
+
 impl Evaluation<'_, '_> {
+    fn adapter_affects_any(&self, tensors: &[&Tensor]) -> bool {
+        adapter_affects_any(self.adapter, self.adapter_scale, tensors)
+    }
+
     fn project_group_into<const N: usize>(
         &mut self,
         tensors: [&Tensor; N],
@@ -3776,7 +3792,7 @@ impl Evaluation<'_, '_> {
             return Ok(false);
         };
         let tensors = [gate_weight, up_weight, down_weight];
-        if self.adapter.is_some()
+        if self.adapter_affects_any(&tensors)
             || self.transforms.basis(gate_weight) != self.transforms.basis(up_weight)
             || !self
                 .executor
@@ -3836,7 +3852,7 @@ impl Evaluation<'_, '_> {
         gate: &mut Vec<f32>,
         up: &mut Vec<f32>,
     ) -> Result<()> {
-        if self.adapter.is_none()
+        if !self.adapter_affects_any(&[gate_weight, up_weight])
             && self.transforms.basis(gate_weight) == self.transforms.basis(up_weight)
             && self
                 .executor

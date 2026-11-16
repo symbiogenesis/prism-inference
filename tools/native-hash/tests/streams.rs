@@ -3,7 +3,7 @@
 
 use std::io::{self, Cursor, Read};
 
-use bonsai_native_hash::hash_reader;
+use bonsai_native_hash::{Hasher, hash_bytes, hash_reader};
 use sha2::{Digest, Sha256};
 
 fn hex(digest: [u8; 32]) -> String {
@@ -170,5 +170,38 @@ fn exact_length_empty_buffer_and_bounded_range_are_checked() -> io::Result<()> {
         <[u8; 32]>::from(Sha256::digest(b"abc"))
     );
     assert_eq!(source.position(), 3);
+    Ok(())
+}
+
+#[test]
+fn buffered_incremental_hasher_matches_reference_across_chunk_boundaries() -> io::Result<()> {
+    let input: Vec<u8> = (0..=255).cycle().take(200_000).collect();
+    let expected: [u8; 32] = Sha256::digest(&input).into();
+    assert_eq!(hash_bytes(b"")?, <[u8; 32]>::from(Sha256::digest(b"")));
+    assert_eq!(hash_bytes(&input)?, expected);
+
+    // Exercise empty updates, small fragments, exact 64 KiB buffer boundaries,
+    // overflow-past-partial-buffer, and large bypass slices.
+    let patterns: [&[usize]; 3] = [
+        &[0, 1, 3, 7, 64, 65_535, 1, 65_536, 0, 65_537],
+        &[4],
+        &[100, 70_000, 500, 65_536, 17],
+    ];
+    for pattern in patterns {
+        let mut hasher = Hasher::new()?;
+        let mut offset = 0;
+        let mut step = 0;
+        while offset < input.len() {
+            let size = pattern[step % pattern.len()].min(input.len() - offset);
+            hasher.update(&input[offset..offset + size])?;
+            offset += size;
+            step += 1;
+        }
+        hasher.update(&[])?;
+        assert_eq!(hasher.finish()?, expected);
+    }
+
+    let empty = Hasher::new()?;
+    assert_eq!(empty.finish()?, <[u8; 32]>::from(Sha256::digest(b"")));
     Ok(())
 }

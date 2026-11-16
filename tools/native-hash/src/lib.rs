@@ -75,10 +75,16 @@ pub fn hash_reader(
     hash.finish()
 }
 
+const HASH_BUFFER_BYTES: usize = 65_536;
+
 /// Incremental SHA-256 digest state backed by Windows CNG (`Win32_Security_Cryptography`).
 ///
 /// Uses hardware `ARMv8` SHA-2 instructions on Windows and the audited portable baseline elsewhere.
-pub struct Hasher(Sha256);
+/// Small updates are staged into a bounded buffer to reduce operating-system boundary calls.
+pub struct Hasher {
+    inner: Sha256,
+    buffer: Vec<u8>,
+}
 
 impl Hasher {
     /// Open a new incremental SHA-256 hash state.
@@ -86,32 +92,63 @@ impl Hasher {
     /// # Errors
     /// Returns an I/O error if the operating system cryptographic provider fails to initialize.
     pub fn new() -> io::Result<Self> {
-        Ok(Self(Sha256::new()?))
+        Ok(Self {
+            inner: Sha256::new()?,
+            buffer: Vec::new(),
+        })
     }
 
     /// Feed a contiguous slice of bytes into the SHA-256 digest state.
     ///
     /// # Errors
-    /// Returns an I/O error if the cryptographic provider rejects the update.
+    /// Returns an I/O error if the cryptographic provider rejects the update or
+    /// staging buffer allocation fails.
     pub fn update(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.0.update(bytes)
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.buffer.is_empty() && bytes.len() >= HASH_BUFFER_BYTES {
+            return self.inner.update(bytes);
+        }
+        let available = HASH_BUFFER_BYTES.saturating_sub(self.buffer.len());
+        if bytes.len() > available {
+            self.inner.update(&self.buffer)?;
+            self.buffer.clear();
+            if bytes.len() >= HASH_BUFFER_BYTES {
+                return self.inner.update(bytes);
+            }
+        }
+        if self.buffer.capacity() < HASH_BUFFER_BYTES {
+            self.buffer
+                .try_reserve_exact(HASH_BUFFER_BYTES.saturating_sub(self.buffer.len()))?;
+        }
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() == HASH_BUFFER_BYTES {
+            self.inner.update(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
     }
 
     /// Finalize the SHA-256 digest and return the 32-byte hash.
     ///
     /// # Errors
-    /// Returns an I/O error if the cryptographic provider fails to finalize.
-    pub fn finish(self) -> io::Result<[u8; 32]> {
-        self.0.finish()
+    /// Returns an I/O error if the cryptographic provider fails to flush or finalize.
+    pub fn finish(mut self) -> io::Result<[u8; 32]> {
+        if !self.buffer.is_empty() {
+            self.inner.update(&self.buffer)?;
+            self.buffer.clear();
+        }
+        self.inner.finish()
     }
 }
 
-/// Compute the 32-byte SHA-256 digest of an in-memory byte slice using [`Hasher`].
+/// Compute the 32-byte SHA-256 digest of an in-memory byte slice.
 ///
 /// # Errors
 /// Returns an I/O error if the cryptographic provider fails.
 pub fn hash_bytes(bytes: &[u8]) -> io::Result<[u8; 32]> {
-    let mut hasher = Hasher::new()?;
+    let mut hasher = Sha256::new()?;
     hasher.update(bytes)?;
     hasher.finish()
 }

@@ -36,6 +36,10 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// A checked tooling result.
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(windows)]
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+const HASH_BUFFER_BYTES: usize = 1_048_576;
+
 pub(crate) fn bad(message: impl Into<String>) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()).into()
 }
@@ -47,6 +51,7 @@ fn open_read(path: &Path) -> Result<File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(1); // FILE_SHARE_READ: deny write/delete during use.
+        options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
@@ -79,7 +84,9 @@ pub(crate) fn hash_range(file: &mut File, start: u64, length: u64) -> Result<Str
     let restore = file.stream_position()?;
     let result = (|| {
         file.seek(SeekFrom::Start(start))?;
-        let mut buffer = vec![0_u8; 65_536];
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(HASH_BUFFER_BYTES)?;
+        buffer.resize(HASH_BUFFER_BYTES, 0);
         let digest = bonsai_native_hash::hash_reader(
             &mut Read::by_ref(file).take(length),
             length,
@@ -193,6 +200,28 @@ impl VerifiedModel {
     /// Rejects missing tensors, payloads exceeding `max_bytes`, allocation
     /// failures, checked-offset overflow, and truncated or unreadable payloads.
     pub fn read_tensor(&mut self, index: usize, max_bytes: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.read_tensor_into(index, &mut bytes, max_bytes)?;
+        Ok(bytes)
+    }
+
+    /// Reads one tensor into caller-owned reusable storage within a byte budget.
+    ///
+    /// Existing bytes in `dst` are cleared before validation and on any error so
+    /// stale bytes are never retained. Capacity is reused across calls when large
+    /// enough. `max_bytes` is the remaining payload budget, rather than a fresh
+    /// budget for every tensor.
+    ///
+    /// # Errors
+    /// Rejects missing tensors, payloads exceeding `max_bytes`, allocation
+    /// failures, checked-offset overflow, and truncated or unreadable payloads.
+    pub fn read_tensor_into(
+        &mut self,
+        index: usize,
+        dst: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<()> {
+        dst.clear();
         let tensor = self
             .inspection
             .tensors
@@ -207,12 +236,16 @@ impl VerifiedModel {
             .data_offset
             .checked_add(tensor.offset)
             .ok_or_else(|| bad("GGUF: tensor payload offset overflow."))?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length)?;
-        bytes.resize(length, 0);
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut bytes)?;
-        Ok(bytes)
+        if length > dst.capacity() {
+            dst.try_reserve_exact(length)?;
+        }
+        dst.resize(length, 0);
+        if let Err(error) = self.file.read_exact(&mut dst[..length]) {
+            dst.clear();
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     /// Consumes the verified reader and transfers its retained metadata.

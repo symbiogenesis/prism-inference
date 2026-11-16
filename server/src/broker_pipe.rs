@@ -35,6 +35,7 @@ const KEY_HEX_BYTES: usize = 64;
 const HANDSHAKE_BYTES: usize = 8 + KEY_HEX_BYTES;
 const FRAME_HEADER_BYTES: usize = 9;
 const MAX_FRAME_PAYLOAD: usize = 16_384;
+const FREE_LIST_CAPACITY: usize = 32;
 const CHANNEL_CAPACITY: usize = 64;
 const MAX_TRACKED_RESETS: usize = 16;
 
@@ -51,6 +52,54 @@ fn scrub_bytes(bytes: &mut [u8]) {
         *byte = std::hint::black_box(0);
     }
     std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+struct BufferPool(Mutex<Vec<Vec<u8>>>);
+
+impl BufferPool {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(Vec::with_capacity(FREE_LIST_CAPACITY))))
+    }
+
+    fn take_zeroed(&self, len: usize) -> Vec<u8> {
+        let mut buf = {
+            let mut list = lock_unpoisoned(&self.0);
+            list.pop()
+                .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_PAYLOAD))
+        };
+        buf.resize(len, 0);
+        buf
+    }
+
+    fn take_from_slice(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut buf = {
+            let mut list = lock_unpoisoned(&self.0);
+            list.pop()
+                .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_PAYLOAD))
+        };
+        buf.clear();
+        buf.extend_from_slice(bytes);
+        buf
+    }
+
+    fn recycle(&self, mut buf: Vec<u8>) {
+        if !buf.is_empty() {
+            scrub_bytes(&mut buf);
+            buf.clear();
+        }
+        if !(MAX_FRAME_PAYLOAD..=MAX_FRAME_PAYLOAD * 2).contains(&buf.capacity()) {
+            return;
+        }
+        let mut list = lock_unpoisoned(&self.0);
+        if list.len() < FREE_LIST_CAPACITY {
+            list.push(buf);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock_unpoisoned(&self.0).len()
+    }
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -145,7 +194,7 @@ impl TxState {
         }
     }
 
-    fn record_reset(&mut self, stream_id: u32) {
+    fn record_reset(&mut self, stream_id: u32, pool: &BufferPool) {
         if !self.is_reset(stream_id) {
             if self.reset_streams.len() >= MAX_TRACKED_RESETS {
                 let _ = self.reset_streams.pop_front();
@@ -159,6 +208,7 @@ impl TxState {
                 if frame.kind == KIND_DATA {
                     removed_data = removed_data.saturating_add(1);
                 }
+                pool.recycle(frame.payload);
             } else {
                 retained.push_back(frame);
             }
@@ -210,6 +260,8 @@ impl Drop for TxCloser {
 pub(crate) struct ServerEndpoint {
     accept_rx: mpsc::Receiver<PipeConnection>,
     tx: Arc<TxShared>,
+    #[cfg(test)]
+    pool: Arc<BufferPool>,
     _closer: Arc<TxCloser>,
 }
 
@@ -264,26 +316,31 @@ impl ServerEndpoint {
         writer.flush()?;
 
         let tx = TxShared::new();
+        let pool = BufferPool::new();
         let closer = Arc::new(TxCloser(Arc::clone(&tx)));
         let (accept_tx, accept_rx) = mpsc::channel(1);
 
         let rx_tx = Arc::clone(&tx);
+        let rx_pool = Arc::clone(&pool);
         let rx_closer = Arc::clone(&closer);
         std::thread::Builder::new()
             .name("broker-pipe-rx".to_owned())
-            .spawn(move || run_reader(reader, &accept_tx, &rx_tx, &rx_closer))
+            .spawn(move || run_reader(reader, &accept_tx, &rx_tx, &rx_pool, &rx_closer))
             .map_err(|_| io::Error::other("failed to start broker-pipe reader thread"))?;
 
         let tx_worker = Arc::clone(&tx);
+        let tx_pool = Arc::clone(&pool);
         std::thread::Builder::new()
             .name("broker-pipe-tx".to_owned())
-            .spawn(move || run_writer(writer, &tx_worker))
+            .spawn(move || run_writer(writer, &tx_worker, &tx_pool))
             .map_err(|_| io::Error::other("failed to start broker-pipe writer thread"))?;
 
         Ok((
             Self {
                 accept_rx,
                 tx,
+                #[cfg(test)]
+                pool,
                 _closer: closer,
             },
             key,
@@ -340,6 +397,7 @@ pub(crate) struct PipeConnection {
     buffered: Vec<u8>,
     offset: usize,
     tx: Arc<TxShared>,
+    pool: Arc<BufferPool>,
     closer: Arc<TxCloser>,
     eof_enqueued: bool,
     pending_data_seq: u64,
@@ -348,10 +406,18 @@ pub(crate) struct PipeConnection {
 
 impl Drop for PipeConnection {
     fn drop(&mut self) {
+        let leftover = std::mem::take(&mut self.buffered);
+        self.pool.recycle(leftover);
+        self.rx.close();
+        while let Ok(item) = self.rx.try_recv() {
+            if let Ok(chunk) = item {
+                self.pool.recycle(chunk);
+            }
+        }
         if !self.eof_enqueued {
             let mut state = lock_unpoisoned(&self.tx.state);
             if !state.closed && !state.failed && !state.is_reset(self.stream_id) {
-                state.record_reset(self.stream_id);
+                state.record_reset(self.stream_id, &self.pool);
                 state.enqueued_seq = state.enqueued_seq.saturating_add(1);
                 state.queue.push_back(OutgoingFrame {
                     stream_id: self.stream_id,
@@ -376,14 +442,21 @@ impl AsyncRead for PipeConnection {
             return Poll::Ready(Ok(()));
         }
         while self.offset >= self.buffered.len() {
-            self.buffered.clear();
+            if self.buffered.capacity() >= MAX_FRAME_PAYLOAD {
+                let finished = std::mem::take(&mut self.buffered);
+                self.pool.recycle(finished);
+            } else {
+                self.buffered.clear();
+            }
             self.offset = 0;
             match self.rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
                 Poll::Ready(Some(Ok(chunk))) => {
-                    if !chunk.is_empty() {
+                    if chunk.is_empty() {
+                        self.pool.recycle(chunk);
+                    } else {
                         self.buffered = chunk;
                     }
                 }
@@ -394,7 +467,8 @@ impl AsyncRead for PipeConnection {
         buf.put_slice(&available[..count]);
         self.offset += count;
         if self.offset >= self.buffered.len() {
-            self.buffered.clear();
+            let finished = std::mem::take(&mut self.buffered);
+            self.pool.recycle(finished);
             self.offset = 0;
         }
         Poll::Ready(Ok(()))
@@ -429,13 +503,14 @@ impl AsyncWrite for PipeConnection {
                 return Poll::Pending;
             }
             let count = buf.len().min(MAX_FRAME_PAYLOAD);
+            let payload = self.pool.take_from_slice(&buf[..count]);
             state.enqueued_seq = state.enqueued_seq.saturating_add(1);
             let seq = state.enqueued_seq;
             state.queued_data_frames = state.queued_data_frames.saturating_add(1);
             state.queue.push_back(OutgoingFrame {
                 stream_id: self.stream_id,
                 kind: KIND_DATA,
-                payload: buf[..count].to_vec(),
+                payload,
             });
             drop(state);
             self.tx.writer_ready.notify_one();
@@ -546,23 +621,35 @@ fn read_header<R: Read>(reader: &mut R) -> io::Result<HeaderRead> {
 
 type ActiveStreamTx = Option<(u32, mpsc::Sender<io::Result<Vec<u8>>>)>;
 
-fn fail_reader_protocol(active: &mut ActiveStreamTx, tx: &Arc<TxShared>, error: &io::Error) {
+fn fail_reader_protocol(
+    active: &mut ActiveStreamTx,
+    tx: &Arc<TxShared>,
+    pool: &BufferPool,
+    error: &io::Error,
+) {
     if let Some((_, sender)) = active.take() {
         let _ = sender.blocking_send(Err(io::Error::new(error.kind(), "broker-pipe failed")));
     }
     let mut state = lock_unpoisoned(&tx.state);
     state.failed = true;
-    state.queue.clear();
+    for frame in state.queue.drain(..) {
+        pool.recycle(frame.payload);
+    }
     state.queued_data_frames = 0;
     state.wake_io();
     drop(state);
     tx.writer_ready.notify_one();
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Passes reader state, pool, and framing header explicitly without allocating a context struct."
+)]
 fn dispatch_reader_frame<R: Read>(
     reader: &mut R,
     accept_tx: &mpsc::Sender<PipeConnection>,
     tx: &Arc<TxShared>,
+    pool: &Arc<BufferPool>,
     closer: &Arc<TxCloser>,
     last_stream_id: &mut u32,
     active: &mut ActiveStreamTx,
@@ -586,6 +673,7 @@ fn dispatch_reader_frame<R: Read>(
                 buffered: Vec::new(),
                 offset: 0,
                 tx: Arc::clone(tx),
+                pool: Arc::clone(pool),
                 closer: Arc::clone(closer),
                 eof_enqueued: false,
                 pending_data_seq: 0,
@@ -603,12 +691,20 @@ fn dispatch_reader_frame<R: Read>(
                     "invalid data frame",
                 ));
             }
-            let mut payload = vec![0_u8; len];
-            reader.read_exact(&mut payload)?;
+            let mut payload = pool.take_zeroed(len);
+            if let Err(error) = reader.read_exact(&mut payload) {
+                pool.recycle(payload);
+                return Err(error);
+            }
             if let Some((active_id, sender)) = active
                 && *active_id == stream_id
             {
-                let _ = sender.blocking_send(Ok(payload));
+                if let Err(mpsc::error::SendError(Ok(returned))) = sender.blocking_send(Ok(payload))
+                {
+                    pool.recycle(returned);
+                }
+            } else {
+                pool.recycle(payload);
             }
         }
         KIND_EOF => {
@@ -633,7 +729,7 @@ fn dispatch_reader_frame<R: Read>(
                 ));
             }
             let mut state = lock_unpoisoned(&tx.state);
-            state.record_reset(stream_id);
+            state.record_reset(stream_id, pool);
             state.wake_io();
             drop(state);
             if active
@@ -657,6 +753,7 @@ fn run_reader<R: Read>(
     mut reader: R,
     accept_tx: &mpsc::Sender<PipeConnection>,
     tx: &Arc<TxShared>,
+    pool: &Arc<BufferPool>,
     closer: &Arc<TxCloser>,
 ) {
     let mut last_stream_id = 0_u32;
@@ -666,7 +763,7 @@ fn run_reader<R: Read>(
             Ok(HeaderRead::CleanEof) => break,
             Ok(HeaderRead::Frame(header)) => header,
             Err(error) => {
-                fail_reader_protocol(&mut active, tx, &error);
+                fail_reader_protocol(&mut active, tx, pool, &error);
                 break;
             }
         };
@@ -674,6 +771,7 @@ fn run_reader<R: Read>(
             &mut reader,
             accept_tx,
             tx,
+            pool,
             closer,
             &mut last_stream_id,
             &mut active,
@@ -682,14 +780,14 @@ fn run_reader<R: Read>(
             Ok(true) => {}
             Ok(false) => break,
             Err(error) => {
-                fail_reader_protocol(&mut active, tx, &error);
+                fail_reader_protocol(&mut active, tx, pool, &error);
                 break;
             }
         }
     }
 }
 
-fn run_writer<W: Write>(mut writer: W, tx: &Arc<TxShared>) {
+fn run_writer<W: Write>(mut writer: W, tx: &Arc<TxShared>, pool: &BufferPool) {
     let mut batch = Vec::new();
     loop {
         let batch_seq = {
@@ -710,6 +808,7 @@ fn run_writer<W: Write>(mut writer: W, tx: &Arc<TxShared>) {
                     if frame.kind == KIND_DATA {
                         state.record_dropped_data(frame.stream_id);
                     }
+                    pool.recycle(frame.payload);
                     continue;
                 }
                 batch.push(frame);
@@ -729,23 +828,28 @@ fn run_writer<W: Write>(mut writer: W, tx: &Arc<TxShared>) {
         };
 
         let mut io_result = Ok(());
-        for frame in &batch {
-            let Ok(payload_len) = u32::try_from(frame.payload.len()) else {
-                io_result = Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "broker-pipe frame exceeds u32 bound",
-                ));
-                break;
-            };
-            let header = encode_header(frame.stream_id, frame.kind, payload_len);
-            if let Err(error) = writer
-                .write_all(&header)
-                .and_then(|()| writer.write_all(&frame.payload))
-            {
-                io_result = Err(error);
-                break;
+        for frame in &mut batch {
+            let payload = std::mem::take(&mut frame.payload);
+            if io_result.is_ok() {
+                let write_result = match u32::try_from(payload.len()) {
+                    Ok(payload_len) => {
+                        let header = encode_header(frame.stream_id, frame.kind, payload_len);
+                        writer
+                            .write_all(&header)
+                            .and_then(|()| writer.write_all(&payload))
+                    }
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "broker-pipe frame exceeds u32 bound",
+                    )),
+                };
+                if let Err(error) = write_result {
+                    io_result = Err(error);
+                }
             }
+            pool.recycle(payload);
         }
+        batch.clear();
         if io_result.is_ok() {
             io_result = writer.flush();
         }
@@ -753,7 +857,9 @@ fn run_writer<W: Write>(mut writer: W, tx: &Arc<TxShared>) {
         let mut state = lock_unpoisoned(&tx.state);
         if io_result.is_err() {
             state.failed = true;
-            state.queue.clear();
+            for frame in state.queue.drain(..) {
+                pool.recycle(frame.payload);
+            }
             state.queued_data_frames = 0;
             state.wake_io();
             break;
@@ -979,8 +1085,41 @@ mod tests {
 
             drop(p_to_c_w);
             assert!(endpoint.accept().await?.is_none());
+            assert!(endpoint.pool.len() >= 1);
+            assert!(endpoint.pool.len() <= FREE_LIST_CAPACITY);
             Ok(())
         })
+    }
+
+    #[test]
+    fn buffer_pool_recycles_16kib_buffers_respects_bound_and_scrubs_bytes() {
+        let pool = BufferPool::new();
+        assert_eq!(pool.len(), 0);
+
+        let first = pool.take_from_slice(b"secret-payload");
+        assert!(first.capacity() >= MAX_FRAME_PAYLOAD);
+        let first_ptr = first.as_ptr();
+        pool.recycle(first);
+        assert_eq!(pool.len(), 1);
+
+        let second = pool.take_zeroed(16);
+        assert_eq!(pool.len(), 0);
+        assert_eq!(second.as_ptr(), first_ptr);
+        assert!(second.iter().all(|byte| *byte == 0));
+        pool.recycle(second);
+
+        pool.recycle(Vec::with_capacity(64));
+        pool.recycle(Vec::with_capacity(MAX_FRAME_PAYLOAD * 3));
+        assert_eq!(pool.len(), 1);
+
+        let mut held = Vec::with_capacity(FREE_LIST_CAPACITY + 4);
+        for _ in 0..(FREE_LIST_CAPACITY + 4) {
+            held.push(pool.take_zeroed(MAX_FRAME_PAYLOAD));
+        }
+        for buf in held {
+            pool.recycle(buf);
+        }
+        assert_eq!(pool.len(), FREE_LIST_CAPACITY);
     }
 
     #[test]

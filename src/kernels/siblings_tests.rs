@@ -146,3 +146,120 @@ fn bf16_siblings_reject_geometry_and_arithmetic_atomically_then_recover() -> Res
     assert_eq!(scratch.statistics().matrix_successes, 3);
     Ok(())
 }
+
+fn varied_pq2_weight(columns: usize, rows: usize, seed: usize) -> Tensor {
+    let blocks = columns / 128;
+    let scales: [u16; 8] = [
+        0x3555, 0x3c01, 0xb787, 0x3800, 0xb400, 0x0000, 0x8000, 0x3a00,
+    ];
+    let mut data = Vec::with_capacity(blocks * rows * 34);
+    for index in 0..blocks * rows {
+        let scale = scales[(index + seed) % scales.len()];
+        data.extend_from_slice(&scale.to_le_bytes());
+        for byte in 0..32_usize {
+            let mixed = (byte * 31 + index * 17 + seed * 13) % 256;
+            data.push(mixed.to_le_bytes()[0]);
+        }
+    }
+    Tensor {
+        name: "pq2-sibling-varied".to_owned(),
+        dimensions: vec![columns, rows],
+        kind: super::super::PQ2,
+        data: Arc::from(data),
+    }
+}
+
+#[test]
+fn pq2_siblings_sixteen_row_batching_matches_scalar_and_clears_atomically() -> Result<()> {
+    let columns = 512;
+    let input: Vec<f32> = (0..columns)
+        .map(|lane| [0.0, -0.0, 1.5, -3.25, 63.5, -128.0, 127.0][lane % 7])
+        .collect();
+    let siblings = [
+        varied_pq2_weight(columns, 68, 1),
+        varied_pq2_weight(columns, 133, 2),
+        varied_pq2_weight(columns, 65, 3),
+        varied_pq2_weight(columns, 17, 4),
+    ];
+
+    for pinned in [false, true] {
+        let mut scalar = if pinned {
+            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+        } else {
+            MatvecScratch::with_backend(MatvecBackend::Scalar)
+        };
+        let expected: Vec<Vec<u32>> = siblings
+            .iter()
+            .map(|tensor| {
+                let mut out = Vec::new();
+                super::super::matvec_into(tensor, &input, &mut out, &mut scalar)?;
+                Ok(out.into_iter().map(f32::to_bits).collect())
+            })
+            .collect::<Result<_>>()?;
+
+        let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
+            &[1, 4]
+        } else {
+            &[1]
+        };
+        for &workers in worker_counts {
+            let mut scratch = if pinned {
+                MatvecScratch::with_pinned_backend(MatvecBackend::ExperimentalNeon)
+            } else {
+                MatvecScratch::with_backend(MatvecBackend::ExperimentalNeon)
+            };
+            scratch.set_row_parallelism(RowParallelism::new(workers)?);
+
+            let mut outputs = std::array::from_fn::<_, 4, _>(|_| Vec::new());
+            {
+                let mut prepared = scratch.prepare(&siblings[0], &input)?;
+                prepared.matvec_pq2_siblings_into(
+                    &[&siblings[0], &siblings[1], &siblings[2], &siblings[3]],
+                    &mut outputs.each_mut(),
+                )?;
+            }
+            for (actual, exp) in outputs.iter().zip(&expected) {
+                let bits: Vec<u32> = actual.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(&bits, exp);
+            }
+
+            // Inject nonfinite scale inside a 16-row batch (row 10 of sibling 1).
+            let mut bad = siblings[1].clone();
+            let row_bytes = (columns / 128) * 34;
+            let mut bytes = bad.data.to_vec();
+            let bad_offset = 10 * row_bytes + 34;
+            bytes[bad_offset..bad_offset + 2].copy_from_slice(&0x7c01_u16.to_le_bytes());
+            bad.data = Arc::from(bytes);
+            {
+                let mut prepared = scratch.prepare(&siblings[0], &input)?;
+                let [o0, o1, o2, _] = &mut outputs;
+                assert!(
+                    prepared
+                        .matvec_pq2_siblings_into(
+                            &[&siblings[0], &bad, &siblings[2]],
+                            &mut [o0, o1, o2],
+                        )
+                        .is_err()
+                );
+            }
+            assert!(outputs[..3].iter().all(Vec::is_empty));
+            assert!(!scratch.diagnostics().succeeded);
+
+            // Subsequent valid sibling call recovers cleanly.
+            let mut recovered = std::array::from_fn::<_, 3, _>(|_| Vec::new());
+            {
+                let mut prepared = scratch.prepare(&siblings[0], &input)?;
+                prepared.matvec_pq2_siblings_into(
+                    &[&siblings[0], &siblings[1], &siblings[2]],
+                    &mut recovered.each_mut(),
+                )?;
+            }
+            assert!(scratch.diagnostics().succeeded);
+            for (actual, exp) in recovered.iter().zip(&expected[..3]) {
+                let bits: Vec<u32> = actual.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(&bits, exp);
+            }
+        }
+    }
+    Ok(())
+}

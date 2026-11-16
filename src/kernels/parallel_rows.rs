@@ -684,7 +684,7 @@ pub(super) fn fill_batched_chunk(
     target_env = "msvc",
     target_feature = "neon"
 ))]
-fn fill_sixteen_batched_chunk(
+pub(super) fn fill_sixteen_batched_chunk(
     chunk: &mut [f32],
     bytes: &[u8],
     row_bytes: usize,

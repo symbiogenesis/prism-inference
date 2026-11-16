@@ -110,41 +110,7 @@ impl PreparedMatvec<'_> {
             target_feature = "neon"
         ))]
         if matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon) {
-            let activations = super::packed_pq2::Consumer::new(&scratch.pq2_consumption)?;
-            let pinned = scratch.pinned_accumulation;
-            return scratch.row_parallelism.fill_siblings(
-                data,
-                row_bytes,
-                outputs,
-                |bytes, output| {
-                    super::parallel_rows::fill_batched_chunk(
-                        bytes,
-                        row_bytes,
-                        output,
-                        &|rows| {
-                            if pinned {
-                                activations.dot_eight_rows::<true>(rows)
-                            } else {
-                                activations.dot_eight_rows::<false>(rows)
-                            }
-                        },
-                        &|rows| {
-                            if pinned {
-                                activations.dot_four_rows::<true>(rows)
-                            } else {
-                                activations.dot_four_rows::<false>(rows)
-                            }
-                        },
-                        &|bytes| {
-                            if pinned {
-                                activations.dot_row::<true>(bytes)
-                            } else {
-                                activations.dot_row::<false>(bytes)
-                            }
-                        },
-                    )
-                },
-            );
+            return multiply_pq2_siblings_neon(scratch, data, row_bytes, outputs);
         }
         scratch
             .row_parallelism
@@ -155,4 +121,58 @@ impl PreparedMatvec<'_> {
                 Ok(())
             })
     }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn multiply_pq2_siblings_neon(
+    scratch: &super::MatvecScratch,
+    data: &[&[u8]],
+    row_bytes: usize,
+    outputs: &mut [&mut Vec<f32>],
+) -> Result<()> {
+    let activations = super::packed_pq2::Consumer::new(&scratch.pq2_consumption)?;
+    let pinned = scratch.pinned_accumulation;
+    scratch
+        .row_parallelism
+        .fill_siblings(data, row_bytes, outputs, |bytes, output| {
+            super::parallel_rows::fill_sixteen_batched_chunk(
+                output,
+                bytes,
+                row_bytes,
+                &|rows| {
+                    if pinned {
+                        activations.dot_sixteen_rows::<true>(rows)
+                    } else {
+                        activations.dot_sixteen_rows::<false>(rows)
+                    }
+                },
+                &|rows| {
+                    if pinned {
+                        activations.dot_eight_rows::<true>(rows)
+                    } else {
+                        activations.dot_eight_rows::<false>(rows)
+                    }
+                },
+                &|rows| {
+                    if pinned {
+                        activations.dot_four_rows::<true>(rows)
+                    } else {
+                        activations.dot_four_rows::<false>(rows)
+                    }
+                },
+                &|bytes| {
+                    if pinned {
+                        activations.dot_row::<true>(bytes)
+                    } else {
+                        activations.dot_row::<false>(bytes)
+                    }
+                },
+            )
+        })
 }

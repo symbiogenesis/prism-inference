@@ -138,6 +138,17 @@ const fn width(type_id: u32) -> Option<u64> {
     }
 }
 
+pub(crate) const fn stock_tensor_layout(type_id: u32, prism: bool) -> Option<(u64, u64)> {
+    match kind(type_id, prism) {
+        Some(info) => Some((info.block, info.bytes)),
+        None => None,
+    }
+}
+
+pub(crate) const fn scalar_width(type_id: u32) -> Option<u64> {
+    width(type_id)
+}
+
 struct Parser<'a> {
     // One fixed buffer serves scalar reads, skipped booleans and report hashes.
     // Every seek goes through this reader, preserving its logical file cursor.

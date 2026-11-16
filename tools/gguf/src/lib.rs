@@ -12,6 +12,7 @@ mod census;
 mod export;
 mod inspect;
 mod metadata;
+pub mod stream;
 
 #[cfg(feature = "report")]
 use std::fs;
@@ -28,6 +29,9 @@ use bonsai_native_hash::mmap::MappedReadOnlyFile;
 pub use bonsai_native_hash::mmap::{MappedSlice, WeakMappedSlice};
 pub use inspect::TensorDescriptor;
 pub use metadata::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
+pub use stream::{
+    IndexPolicy, IndexValue, IndexedTensor, ParsedIndex, read_index, read_index_cancellable,
+};
 
 /// The only supported private GGUF tensor dialect.
 pub const PRISM_DIALECT: &str = "Prism-73bfe6cc485554822f80c473a3c0c4f25e80f41b";

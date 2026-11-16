@@ -11,7 +11,10 @@ compact homogeneous arrays. The default `report` feature includes the CLI, JSON
 reports, census and export; `--no-default-features --lib` omits that tooling.
 Runtime metadata loading uses the same parser but omits report-only hashes,
 histograms and name lists. Header parsing uses one bounded 64 KiB buffer and
-does not interpret/materialize tensor payloads.
+does not interpret/materialize tensor payloads. For already-verified streams or
+mapped files, `read_index` and `read_index_cancellable` expose a policy-driven
+`Read + Seek` GGUF v2/v3 header and tensor-index parser (`IndexPolicy`) with
+selective array retention and cooperative cancellation.
 
 ## CLI
 

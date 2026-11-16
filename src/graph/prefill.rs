@@ -1003,7 +1003,7 @@ fn recurrent_state_only_tile<'a>(
         return Err(invalid("state-only tile requires recurrent state"));
     };
     check()?;
-    let previous_qkv_beta = project_tile_pair(
+    let previous_qkv = project_tile(
         transforms,
         geometry,
         arithmetic,
@@ -1012,17 +1012,16 @@ fn recurrent_state_only_tile<'a>(
         adapter_scratch,
         projection_scratch,
         previous_norm,
-        [&layer.qkv, &layer.beta],
+        &layer.qkv,
         &tile.normalized[..count],
         &mut tile.mixed[..count],
-        &mut tile.beta[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
         reborrow_executor(&mut executor),
         check,
     )?;
     check()?;
-    let _ = project_tile(
+    let _ = project_tile_pair(
         transforms,
         geometry,
         arithmetic,
@@ -1030,9 +1029,10 @@ fn recurrent_state_only_tile<'a>(
         adapter_scale,
         adapter_scratch,
         projection_scratch,
-        previous_qkv_beta,
-        &layer.alpha,
+        previous_qkv,
+        [&layer.beta, &layer.alpha],
         &tile.normalized[..count],
+        &mut tile.beta[..count],
         &mut tile.alpha[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
@@ -1216,14 +1216,20 @@ fn full_attention_tile(
     tile: &mut TiledPrefill,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
+    check()?;
+    if !*frequencies_ready {
+        for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
+            rope_frequencies(g, mrope_base + index, frequencies)?;
+        }
+        *frequencies_ready = true;
+    }
     // A one-token tile and the single-worker policy retain the ordinary
     // attention path. Multi-token packed history uses immutable causal views
     // after the common normalization/RoPE stage below.
     if count <= 1 || tile.projector.row_parallelism().workers() <= 1 {
         for index in 0..count {
-            check()?;
-            if !*frequencies_ready {
-                rope_frequencies(g, mrope_base + index, &mut tile.frequencies[index])?;
+            if index > 0 {
+                check()?;
             }
             std::mem::swap(
                 &mut attention_scratch.frequencies,
@@ -1271,16 +1277,7 @@ fn full_attention_tile(
             values.append(&tile.beta[index]);
             check()?;
         }
-        *frequencies_ready = true;
         return Ok(());
-    }
-
-    check()?;
-    if !*frequencies_ready {
-        for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
-            rope_frequencies(g, mrope_base + index, frequencies)?;
-        }
-        *frequencies_ready = true;
     }
     let query_gate_len = g.head * g.heads;
     for index in 0..count {

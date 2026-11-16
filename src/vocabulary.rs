@@ -44,9 +44,12 @@ impl TokenType {
 
 #[derive(Debug)]
 struct Entry {
-    end: usize,
+    end: u32,
     kind: TokenType,
 }
+
+const _: () = assert!(size_of::<Entry>() == 8);
+const _: () = assert!(MAX_VOCABULARY_BYTES <= 0xFFFF_FFFF);
 
 /// Validated output pieces with one bounded, contiguous byte allocation.
 ///
@@ -161,7 +164,7 @@ impl Vocabulary {
                 TokenType::Unknown | TokenType::Unused => {}
             }
             entries.push(Entry {
-                end: bytes.len(),
+                end: u32::try_from(bytes.len())?,
                 kind,
             });
         }
@@ -185,10 +188,12 @@ impl Vocabulary {
         if matches!(entry.kind, TokenType::Unknown | TokenType::Unused) {
             return Err(invalid(format!("vocabulary token {id} has no text piece")));
         }
-        let start = index
-            .checked_sub(1)
-            .map_or(0, |previous| self.entries[previous].end);
-        Ok(&self.bytes[start..entry.end])
+        let start = match index.checked_sub(1) {
+            Some(previous) => usize::try_from(self.entries[previous].end)?,
+            None => 0,
+        };
+        let end = usize::try_from(entry.end)?;
+        Ok(&self.bytes[start..end])
     }
 
     /// Reports the declared control type, without inspecting the token text.
@@ -256,4 +261,72 @@ fn decode_byte(token: &str) -> Result<u8> {
         return Err(invalid("byte token requires exact <0xHH> notation"));
     };
     Ok(u8::from_str_radix(hex, 16)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bonsai_gguf::MetadataValue;
+
+    #[test]
+    fn compact_entry_offset_bounds_and_piece_slicing() -> Result<()> {
+        assert_eq!(size_of::<Entry>(), 8);
+        assert!(MAX_VOCABULARY_BYTES <= usize::try_from(u32::MAX)?);
+
+        let metadata = Metadata::from([
+            ("tokenizer.ggml.model".to_owned(), "gpt2".into()),
+            ("tokenizer.ggml.pre".to_owned(), "qwen35".into()),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                vec!["<unk>", "Ġhi", "", "<|eos|>", "<0xFF>"].into(),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_owned(),
+                vec![2_i32, 1, 5, 3, 6].into(),
+            ),
+        ]);
+        let vocab = Vocabulary::from_metadata(&metadata, 5)?;
+        assert_eq!(vocab.vocab_size(), 5);
+        assert!(vocab.piece(0).is_err());
+        assert_eq!(vocab.piece(1)?, b" hi");
+        assert!(vocab.piece(2).is_err());
+        assert_eq!(vocab.piece(3)?, b"<|eos|>");
+        assert!(vocab.is_control(3)?);
+        assert_eq!(vocab.piece(4)?, &[0xff]);
+        assert!(vocab.piece(5).is_err());
+        assert!(vocab.piece(u32::MAX).is_err());
+
+        let max_chunks = MAX_VOCABULARY_BYTES / MAX_PIECE_BYTES;
+        let at_limit = Metadata::from([
+            ("tokenizer.ggml.model".to_owned(), "gpt2".into()),
+            ("tokenizer.ggml.pre".to_owned(), "qwen35".into()),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                vec!["a".repeat(MAX_PIECE_BYTES); max_chunks].into(),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_owned(),
+                MetadataValue::Array(MetadataArray::I32(vec![4; max_chunks])),
+            ),
+        ]);
+        let full = Vocabulary::from_metadata(&at_limit, max_chunks)?;
+        assert_eq!(
+            full.piece(u32::try_from(max_chunks - 1)?)?.len(),
+            MAX_PIECE_BYTES
+        );
+
+        let mut over_limit = at_limit;
+        if let Some(MetadataValue::Array(MetadataArray::String(tokens))) =
+            over_limit.get_mut("tokenizer.ggml.tokens")
+        {
+            tokens.push("b".to_owned());
+        }
+        if let Some(MetadataValue::Array(MetadataArray::I32(types))) =
+            over_limit.get_mut("tokenizer.ggml.token_type")
+        {
+            types.push(4);
+        }
+        assert!(Vocabulary::from_metadata(&over_limit, max_chunks + 1).is_err());
+        Ok(())
+    }
 }

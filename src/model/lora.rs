@@ -159,6 +159,22 @@ impl Scratch {
             },
         }
     }
+
+    pub(crate) fn apply_dense_b_dot(
+        &mut self,
+        lora_b: &[f32],
+        lora_dot: f32,
+        effective_scale: f32,
+        output: &mut [f32],
+    ) -> Result<()> {
+        lora_b_scale_and_finish(
+            lora_b,
+            &[lora_dot],
+            effective_scale,
+            output,
+            &mut self.correction,
+        )
+    }
 }
 
 impl RankOneAdapter {
@@ -426,7 +442,7 @@ impl RankOneAdapter {
         storage
     }
 
-    fn enable_sparse_a(&mut self) -> Result<()> {
+    pub(crate) fn enable_sparse_a(&mut self) -> Result<()> {
         let mut sparse_count = 0;
         for (target, factors) in &mut self.factors {
             if target == "token_embd.weight" {
@@ -504,6 +520,32 @@ impl RankOneAdapter {
     /// Keep this identical to the no-op admission in `linear_tokens`.
     pub(crate) fn affects_linear(&self, target: &str, scale: f32) -> bool {
         scale != 0.0 && possible_factor_target(target) && self.factors.contains_key(target)
+    }
+
+    /// Returns `(a_values, effective_scale_alpha, b_values)` for an active
+    /// dense rank-one target when `scale` is nonzero and `sparse_a` is absent.
+    pub(crate) fn dense_rank_one_factor(
+        &self,
+        name: &str,
+        scale: Option<f32>,
+    ) -> Option<(&[f32], f32, &[f32])> {
+        let scale = scale.filter(|&value| value.is_finite() && value != 0.0)?;
+        if !possible_factor_target(name) {
+            return None;
+        }
+        let factors = self.factors.get(name)?;
+        if factors.sparse_a.is_some() {
+            return None;
+        }
+        let effective_scale = scale * self.alpha;
+        if !effective_scale.is_finite() || effective_scale == 0.0 {
+            return None;
+        }
+        Some((
+            factors.a_values.as_slice(),
+            effective_scale,
+            factors.b_values.as_slice(),
+        ))
     }
 
     pub(crate) fn linear(
@@ -1165,6 +1207,88 @@ mod tests {
             assert_eq!(other.identity(), "reused-general-name");
             assert_ne!(other.execution_identity(), baseline.execution_identity());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn dense_rank_one_factor_gates_scale_target_and_sparse_mode() -> Result<()> {
+        let linear = "blk.0.ffn_down.weight";
+        let base = Model {
+            identity: "dense-factor-base".into(),
+            metadata: BTreeMap::from([(
+                "general.architecture".into(),
+                MetadataValue::from("qwen35"),
+            )]),
+            tensors: BTreeMap::from([(
+                linear.into(),
+                Tensor {
+                    name: linear.into(),
+                    dimensions: vec![4, 2],
+                    kind: 0,
+                    data: Arc::<[u8]>::from(vec![0_u8; 32]).into(),
+                },
+            )]),
+        };
+        let a_vals = [1.0_f32, 0.0, -0.5, 0.0];
+        let b_vals = [0.25_f32, -0.75];
+        let model = Model {
+            identity: "dense-factor-adapter".into(),
+            metadata: BTreeMap::from([
+                ("general.architecture".into(), MetadataValue::from("qwen35")),
+                ("general.type".into(), MetadataValue::from("adapter")),
+                ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora_alpha".into(), MetadataValue::from(2.0_f32)),
+            ]),
+            tensors: BTreeMap::from([
+                (
+                    format!("{linear}.lora_a"),
+                    Tensor {
+                        name: format!("{linear}.lora_a"),
+                        dimensions: vec![4, 1],
+                        kind: 0,
+                        data: Arc::<[u8]>::from(
+                            a_vals
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        )
+                        .into(),
+                    },
+                ),
+                (
+                    format!("{linear}.lora_b"),
+                    Tensor {
+                        name: format!("{linear}.lora_b"),
+                        dimensions: vec![1, 2],
+                        kind: 0,
+                        data: Arc::<[u8]>::from(
+                            b_vals
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        )
+                        .into(),
+                    },
+                ),
+            ]),
+        };
+        let mut adapter = RankOneAdapter::from_model(model, &base)?;
+        assert!(adapter.dense_rank_one_factor(linear, None).is_none());
+        assert!(adapter.dense_rank_one_factor(linear, Some(0.0)).is_none());
+        assert!(adapter.dense_rank_one_factor(linear, Some(-0.0)).is_none());
+        assert!(
+            adapter
+                .dense_rank_one_factor("blk.1.ffn_down.weight", Some(1.3))
+                .is_none()
+        );
+        let (a, scale_alpha, b) = adapter
+            .dense_rank_one_factor(linear, Some(1.3))
+            .ok_or_else(|| crate::invalid("expected dense rank-one factor"))?;
+        assert_eq!(a, &a_vals);
+        assert_eq!(scale_alpha.to_bits(), (1.3_f32 * 2.0_f32).to_bits());
+        assert_eq!(b, &b_vals);
+        adapter.enable_sparse_a()?;
+        assert!(adapter.dense_rank_one_factor(linear, Some(1.3)).is_none());
         Ok(())
     }
 }

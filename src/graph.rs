@@ -17,9 +17,9 @@ use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RmsNormWeights,
     RowParallelism, add_rms_norm_into, add_rms_norm_pinned_into, add_scaled_slice_in_place,
     add_slice_in_place, add_slice_in_place_all_finite, append_half_bits, f16_dot, float_dot,
-    is_finite_slice, l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into,
-    rms_norm_into, rms_norm_pinned_into, round_f16_slice, row, row_into, scale_slice_into, silu,
-    softmax_round_f16,
+    is_finite_slice, l2_norm_in_place, mul_sigmoid_in_place,
+    mul_slice_in_place, mul_slice_into, rms_norm_into, rms_norm_pinned_into, round_f16_slice, row,
+    row_into, scale_slice_into, silu, softmax_round_f16,
 };
 use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -3792,15 +3792,35 @@ impl Evaluation<'_, '_> {
             return Ok(false);
         };
         let tensors = [gate_weight, up_weight, down_weight];
-        if self.adapter_affects_any(&tensors)
+        if self.adapter_affects_any(&[gate_weight, up_weight])
             || self.transforms.basis(gate_weight) != self.transforms.basis(up_weight)
-            || !self
-                .executor
-                .as_deref()
-                .is_some_and(|exec| exec.supports_f32_ffn_chain(tensors))
         {
             return Ok(false);
         }
+        let down_lora = if self.adapter_affects_any(&[down_weight]) {
+            let Some(factor) = self.adapter.and_then(|adapter| {
+                adapter.dense_rank_one_factor(&down_weight.name, Some(self.adapter_scale))
+            }) else {
+                return Ok(false);
+            };
+            if !self
+                .executor
+                .as_deref()
+                .is_some_and(|exec| exec.supports_f32_ffn_chain_lora(tensors))
+            {
+                return Ok(false);
+            }
+            Some(factor)
+        } else {
+            if !self
+                .executor
+                .as_deref()
+                .is_some_and(|exec| exec.supports_f32_ffn_chain(tensors))
+            {
+                return Ok(false);
+            }
+            None
+        };
         let pre_transformed = self.projection.pre_transformed_len.take();
         let basis = self.transforms.basis(gate_weight);
         let activation = if basis.0 {
@@ -3830,13 +3850,37 @@ impl Evaluation<'_, '_> {
             .prepare_f32_executor(gate_weight, activation)?;
         if let Some(executor) = self.executor.as_deref_mut() {
             self.projection.fusions.external_ffn_chain.attempt();
-            prepared.matvec_ffn_chain_with_executor(
-                tensors,
-                residual,
-                hadamard_block,
-                output,
-                executor,
-            )?;
+            if let Some((lora_a, effective_scale, lora_b)) = down_lora {
+                let lora_dot = prepared.matvec_ffn_chain_lora_with_executor(
+                    tensors,
+                    residual,
+                    hadamard_block,
+                    lora_a,
+                    output,
+                    executor,
+                )?;
+                if let Err(err) = self.adapter_scratch.apply_dense_b_dot(
+                    lora_b,
+                    lora_dot,
+                    effective_scale,
+                    output,
+                ) {
+                    output.clear();
+                    return Err(err);
+                }
+                if let Err(err) = finite(output, "ffn chain lora output") {
+                    output.clear();
+                    return Err(err);
+                }
+            } else {
+                prepared.matvec_ffn_chain_with_executor(
+                    tensors,
+                    residual,
+                    hadamard_block,
+                    output,
+                    executor,
+                )?;
+            }
             self.projection.fusions.external_ffn_chain.complete();
             return Ok(true);
         }

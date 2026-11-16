@@ -437,6 +437,7 @@ struct RecordingFfnExecutor {
     arithmetic: Arithmetic,
     transforms: Transforms,
     geometry: Geometry,
+    allow_chain_lora: bool,
     chain_calls: usize,
     swiglu_calls: usize,
     project_calls: usize,
@@ -458,6 +459,10 @@ impl crate::kernels::Pq2ProjectionExecutor for RecordingFfnExecutor {
 
     fn supports(&self, _tensor: &Tensor) -> bool {
         false
+    }
+
+    fn supports_tile_tokens(&self) -> bool {
+        true
     }
 
     fn project(
@@ -538,6 +543,49 @@ impl crate::kernels::Pq2ProjectionExecutor for RecordingFfnExecutor {
         }
         Ok(())
     }
+
+    fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
+        self.allow_chain_lora && tensors.iter().all(|tensor| tensor.kind == 142)
+    }
+
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        [gate, up, down]: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<f32> {
+        self.chain_calls += 1;
+        let mut mid = Vec::new();
+        let mut gate_out = Vec::new();
+        self.cpu_matvec(gate, activation, &mut gate_out)?;
+        self.cpu_matvec(up, activation, &mut mid)?;
+        self.arithmetic.swiglu_in_place(&gate_out, &mut mid)?;
+        let _ = (hadamard_block_size, pinned);
+        let mut rank = Vec::new();
+        let adapter_scratch = self.arithmetic.scratch(MatvecBackend::Scalar);
+        crate::kernels::lora_a_dot(lora_a, &mid, &mut rank, &adapter_scratch)?;
+        let lora_dot = rank
+            .first()
+            .copied()
+            .ok_or_else(|| crate::invalid("missing lora dot"))?;
+        let mut rotated = Vec::new();
+        let down_input = if self.transforms.basis(down).0 {
+            self.transforms
+                .transform_into(down, &mid, &self.geometry, &mut rotated)?;
+            rotated.as_slice()
+        } else {
+            mid.as_slice()
+        };
+        self.cpu_matvec(down, down_input, output)?;
+        if let Some(residual) = residual {
+            super::super::add_finite(output, residual, "test ffn chain lora")?;
+        }
+        Ok(lora_dot)
+    }
 }
 
 struct Pq2FfnFixture {
@@ -615,6 +663,7 @@ impl Pq2FfnFixture {
             arithmetic,
             transforms: ffn_transforms(&self.down.name),
             geometry: self.geometry.clone(),
+            allow_chain_lora: false,
             chain_calls: 0,
             swiglu_calls: 0,
             project_calls: 0,
@@ -915,5 +964,415 @@ fn external_ffn_chain_and_swiglu_unlock_for_inactive_and_down_only_lora() -> Res
         )?);
         assert_eq!(untargeted_exec.chain_calls, 1);
     }
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verify no-residual, residual decode parity, and sparse fallback in one self-contained scale=1.3 LoRA chain check"
+)]
+fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_one_adapter()
+-> Result<()> {
+    let fixture = Pq2FfnFixture::new()?;
+    let input: Vec<f32> = (0..128)
+        .map(|i| if i % 2 == 0 { 0.375 } else { -0.25 })
+        .collect();
+    let residual = vec![0.125_f32; 128];
+
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        // 1. No-residual direct try_project_ffn_chain_into: bitwise identical to CPU RankOneAdapter at scale=1.3.
+        let mut expected_proj = ProjectionScratch {
+            matvec: arithmetic.scratch(MatvecBackend::Scalar),
+            ..ProjectionScratch::default()
+        };
+        let mut expected_adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut expected_eval = Evaluation {
+            geometry: &fixture.geometry,
+            arithmetic,
+            transforms: &fixture.transforms,
+            position: 0,
+            mrope_positions: [0; 4],
+            frequencies_ready: false,
+            projection: &mut expected_proj,
+            adapter: Some(&fixture.down_adapter),
+            adapter_scale: 1.3,
+            adapter_scratch: &mut expected_adapter_scratch,
+            executor: None,
+        };
+        let mut gate_out = Vec::new();
+        let mut up_out = Vec::new();
+        let mut expected_no_res = Vec::new();
+        expected_eval.project_ffn_swiglu_into(
+            &fixture.gate,
+            &fixture.up,
+            &fixture.down,
+            &input,
+            &mut gate_out,
+            &mut up_out,
+        )?;
+        expected_eval.project_into(&fixture.down, &up_out, &mut expected_no_res)?;
+
+        let mut exec_no_res = fixture.executor(arithmetic);
+        exec_no_res.allow_chain_lora = true;
+        let mut actual_proj = ProjectionScratch {
+            matvec: arithmetic.scratch(MatvecBackend::Scalar),
+            ..ProjectionScratch::default()
+        };
+        let mut actual_adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut actual_eval = Evaluation {
+            geometry: &fixture.geometry,
+            arithmetic,
+            transforms: &fixture.transforms,
+            position: 0,
+            mrope_positions: [0; 4],
+            frequencies_ready: false,
+            projection: &mut actual_proj,
+            adapter: Some(&fixture.down_adapter),
+            adapter_scale: 1.3,
+            adapter_scratch: &mut actual_adapter_scratch,
+            executor: Some(&mut exec_no_res),
+        };
+        let mut actual_no_res = Vec::new();
+        assert!(actual_eval.try_project_ffn_chain_into(
+            &fixture.gate,
+            &fixture.up,
+            &fixture.down,
+            &input,
+            None,
+            &mut actual_no_res,
+        )?);
+        same_bits(
+            &actual_no_res,
+            &expected_no_res,
+            "scale=1.3 fused ffn chain lora without residual",
+        );
+        assert_eq!(actual_eval.projection.fusions.external_ffn_chain.completed, 1);
+        assert_eq!(exec_no_res.chain_calls, 1);
+
+        // 2. With residual via run_decode: completes external_ffn_chain with zero swiglu/separate down calls.
+        let (expected_with_res, _) = fixture.run_decode(
+            arithmetic,
+            Some(&fixture.down_adapter),
+            1.3,
+            &input,
+            &residual,
+            None,
+        )?;
+        let mut exec = fixture.executor(arithmetic);
+        exec.allow_chain_lora = true;
+        let (actual_with_res, summary) = fixture.run_decode(
+            arithmetic,
+            Some(&fixture.down_adapter),
+            1.3,
+            &input,
+            &residual,
+            Some(&mut exec),
+        )?;
+        assert_eq!(summary.external_ffn_chain.completed, 1);
+        assert_eq!(summary.external_ffn_swiglu.completed, 0);
+        assert_eq!(exec.chain_calls, 1);
+        assert_eq!(exec.swiglu_calls, 0);
+        assert_eq!(exec.project_calls, 0);
+        for (idx, (&actual, &expected)) in
+            actual_with_res.iter().zip(&expected_with_res).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "scale=1.3 residual diff at {idx}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    // 3. Sparse LoRA A falls back cleanly without breaking chain fusion for dense adapters.
+    let sparse_base = Model {
+        metadata: BTreeMap::from([(
+            "general.architecture".into(),
+            MetadataValue::from("qwen35"),
+        )]),
+        tensors: BTreeMap::from([(fixture.down.name.clone(), fixture.down.clone())]),
+        identity: "pq2-sparse-adapter-base".into(),
+    };
+    let sparse_in: Vec<f32> = (0..128)
+        .map(|i| if i < 8 { 0.125 } else { 0.0 })
+        .collect();
+    let sparse_out = vec![0.25_f32; 128];
+    let mut sparse_down_adapter = RankOneAdapter::from_model(
+        Model {
+            metadata: BTreeMap::from([
+                ("general.architecture".into(), MetadataValue::from("qwen35")),
+                ("general.type".into(), MetadataValue::from("adapter")),
+                ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
+            ]),
+            tensors: BTreeMap::from([
+                (
+                    format!("{}.lora_a", fixture.down.name),
+                    tensor(&format!("{}.lora_a", fixture.down.name), &[128, 1], &sparse_in),
+                ),
+                (
+                    format!("{}.lora_b", fixture.down.name),
+                    tensor(&format!("{}.lora_b", fixture.down.name), &[1, 128], &sparse_out),
+                ),
+            ]),
+            identity: "pq2-sparse-adapter-factors".into(),
+        },
+        &sparse_base,
+    )?;
+    sparse_down_adapter.enable_sparse_a()?;
+    let mut sparse_exec = fixture.executor(Arithmetic::PinnedSwift);
+    sparse_exec.allow_chain_lora = true;
+    let (_, sparse_summary) = fixture.run_decode(
+        Arithmetic::PinnedSwift,
+        Some(&sparse_down_adapter),
+        1.3,
+        &input,
+        &residual,
+        Some(&mut sparse_exec),
+    )?;
+    assert_eq!(sparse_summary.external_ffn_chain.completed, 0);
+    assert_eq!(sparse_summary.external_ffn_swiglu.completed, 1);
+    assert_eq!(sparse_exec.chain_calls, 0);
+    Ok(())
+}
+
+struct MixedPhaseGateExecutor {
+    supports_tiles: bool,
+    f32_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::kernels::Pq2ProjectionExecutor for MixedPhaseGateExecutor {
+    fn identity(&self) -> &'static str {
+        "mixed-phase-gate-test"
+    }
+
+    fn supports(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        tensor.kind == 142
+    }
+
+    fn supports_tile_tokens(&self) -> bool {
+        self.supports_tiles
+    }
+
+    fn project(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[crate::kernels::Q8KBlock],
+        _fused: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(crate::invalid("unexpected Q8_K call"))
+    }
+
+    fn project_f32(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.f32_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut scratch = if pinned {
+            crate::kernels::MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+        } else {
+            crate::kernels::MatvecScratch::with_backend(MatvecBackend::Scalar)
+        };
+        scratch
+            .prepare(tensor, activation)?
+            .matvec_into(tensor, output)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Build a complete 128-wide single-layer full-attention + FFN PQ2 fixture"
+)]
+fn pq2_tiled_graph_fixture() -> Model {
+    let mut metadata = BTreeMap::new();
+    for (key, value) in [
+        ("general.architecture", MetadataValue::from("qwen35")),
+        ("qwen35.block_count", MetadataValue::from(1_u32)),
+        ("qwen35.context_length", MetadataValue::from(32_u32)),
+        ("qwen35.embedding_length", MetadataValue::from(128_u32)),
+        ("qwen35.feed_forward_length", MetadataValue::from(128_u32)),
+        ("qwen35.attention.head_count", MetadataValue::from(1_u32)),
+        ("qwen35.attention.head_count_kv", MetadataValue::from(1_u32)),
+        ("qwen35.attention.key_length", MetadataValue::from(128_u32)),
+        ("qwen35.attention.value_length", MetadataValue::from(128_u32)),
+        ("qwen35.rope.dimension_count", MetadataValue::from(64_u32)),
+        ("qwen35.rope.freq_base", MetadataValue::from(10_000.0_f32)),
+        (
+            "qwen35.attention.layer_norm_rms_epsilon",
+            MetadataValue::from(1e-6_f32),
+        ),
+        (
+            "qwen35.full_attention_interval",
+            MetadataValue::from(1_u32),
+        ),
+        ("qwen35.ssm.state_size", MetadataValue::from(1_u32)),
+        ("qwen35.ssm.group_count", MetadataValue::from(1_u32)),
+        ("qwen35.ssm.time_step_rank", MetadataValue::from(1_u32)),
+        ("qwen35.ssm.inner_size", MetadataValue::from(1_u32)),
+        ("qwen35.ssm.conv_kernel", MetadataValue::from(2_u32)),
+    ] {
+        metadata.insert(key.to_owned(), value);
+    }
+    metadata.insert(
+        "qwen35.rope.dimension_sections".to_owned(),
+        MetadataValue::from(vec![32_u32, 0, 0, 0]),
+    );
+    metadata.insert(
+        "qwen35.attention.recurrent_layers".to_owned(),
+        MetadataValue::from(vec![false]),
+    );
+    let f32_tensor = |name: &str, dimensions: &[usize], val: f32| -> Tensor {
+        let len: usize = dimensions.iter().product();
+        let vals: Vec<f32> = (0..len)
+            .map(|idx| if idx % 2 == 0 { val } else { -val * 0.5 })
+            .collect();
+        tensor(name, dimensions, &vals)
+    };
+    let pq2_rect = |name: &str, cols: usize, rows: usize, seed: u8| -> Tensor {
+        let mut block = [0_u8; 34];
+        block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        for (idx, byte) in block[2..].iter_mut().enumerate() {
+            *byte = u8::try_from((idx * 17 + usize::from(seed)) % 256).unwrap_or(0);
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![cols, rows],
+            kind: 142,
+            data: Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into(),
+        }
+    };
+    let tensors = BTreeMap::from([
+        (
+            "token_embd.weight".to_owned(),
+            f32_tensor("token_embd.weight", &[128, 2], 0.25),
+        ),
+        (
+            "output.weight".to_owned(),
+            f32_tensor("output.weight", &[128, 2], -0.25),
+        ),
+        (
+            "output_norm.weight".to_owned(),
+            tensor("output_norm.weight", &[128], &vec![1.0_f32; 128]),
+        ),
+        (
+            "blk.0.attn_norm.weight".to_owned(),
+            tensor("blk.0.attn_norm.weight", &[128], &vec![1.0_f32; 128]),
+        ),
+        (
+            "blk.0.post_attention_norm.weight".to_owned(),
+            tensor(
+                "blk.0.post_attention_norm.weight",
+                &[128],
+                &vec![1.0_f32; 128],
+            ),
+        ),
+        (
+            "blk.0.attn_q.weight".to_owned(),
+            pq2_rect("blk.0.attn_q.weight", 128, 256, 1),
+        ),
+        (
+            "blk.0.attn_k.weight".to_owned(),
+            pq2_rect("blk.0.attn_k.weight", 128, 128, 2),
+        ),
+        (
+            "blk.0.attn_v.weight".to_owned(),
+            pq2_rect("blk.0.attn_v.weight", 128, 128, 3),
+        ),
+        (
+            "blk.0.attn_output.weight".to_owned(),
+            pq2_rect("blk.0.attn_output.weight", 128, 128, 4),
+        ),
+        (
+            "blk.0.attn_q_norm.weight".to_owned(),
+            tensor("blk.0.attn_q_norm.weight", &[128], &vec![1.0_f32; 128]),
+        ),
+        (
+            "blk.0.attn_k_norm.weight".to_owned(),
+            tensor("blk.0.attn_k_norm.weight", &[128], &vec![1.0_f32; 128]),
+        ),
+        (
+            "blk.0.ffn_up.weight".to_owned(),
+            pq2_rect("blk.0.ffn_up.weight", 128, 128, 5),
+        ),
+        (
+            "blk.0.ffn_gate.weight".to_owned(),
+            pq2_rect("blk.0.ffn_gate.weight", 128, 128, 6),
+        ),
+        (
+            "blk.0.ffn_down.weight".to_owned(),
+            pq2_rect("blk.0.ffn_down.weight", 128, 128, 7),
+        ),
+    ]);
+    Model {
+        metadata,
+        tensors,
+        identity: "pq2-mixed-phase-tile-gate".to_owned(),
+    }
+}
+
+#[test]
+fn mixed_phase_tile_gate_skips_decode_executor_on_tiled_ingest_block_and_keeps_decode() -> Result<()>
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::Decoder as _;
+
+    let mut cpu_ref = super::super::Qwen35::new(pq2_tiled_graph_fixture(), 32)?;
+    let cpu_scratch = cpu_ref.tiled_prefill_scratch_bytes(8)?;
+    cpu_ref = cpu_ref.with_tiled_prefill(8, cpu_scratch)?;
+    cpu_ref.ingest_block(&[0, 1, 0, 1], &|| Ok(()))?;
+    let mut cpu_logits = Vec::new();
+    cpu_ref.evaluate_finite_into(1, &mut cpu_logits)?;
+
+    // Single-token decode executor (supports_tile_tokens = false) must NOT be called during
+    // tiled ingest_block, while evaluate_finite_into MUST still use the executor.
+    let mut mixed = super::super::Qwen35::new(pq2_tiled_graph_fixture(), 32)?;
+    let mixed_scratch = mixed.tiled_prefill_scratch_bytes(8)?;
+    mixed = mixed.with_tiled_prefill(8, mixed_scratch)?;
+    let mixed_calls = Arc::new(AtomicUsize::new(0));
+    mixed.set_projection_executor(Some(Box::new(MixedPhaseGateExecutor {
+        supports_tiles: false,
+        f32_calls: Arc::clone(&mixed_calls),
+    })));
+    mixed.ingest_block(&[0, 1, 0, 1], &|| Ok(()))?;
+    assert_eq!(mixed_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(mixed.tiled_prefill_statistics().completed_tokens, 4);
+    assert!(mixed.tiled_prefill_statistics().packed_projections > 0);
+    let mut mixed_logits = Vec::new();
+    mixed.evaluate_finite_into(1, &mut mixed_logits)?;
+    assert!(mixed_calls.load(Ordering::Relaxed) > 0);
+    same_bits(&mixed_logits, &cpu_logits, "mixed-phase decode parity");
+
+    // Verify supports_tile_tokens=true runs the external executor during ingest_block.
+    let mut tile_exec_check = super::super::Qwen35::new(pq2_tiled_graph_fixture(), 32)?;
+    let tile_scratch = tile_exec_check.tiled_prefill_scratch_bytes(8)?;
+    tile_exec_check = tile_exec_check.with_tiled_prefill(8, tile_scratch)?;
+    let tile_calls = Arc::new(AtomicUsize::new(0));
+    tile_exec_check.set_projection_executor(Some(Box::new(MixedPhaseGateExecutor {
+        supports_tiles: true,
+        f32_calls: Arc::clone(&tile_calls),
+    })));
+    tile_exec_check.ingest_block(&[0, 1], &|| Ok(()))?;
+    assert!(tile_calls.load(Ordering::Relaxed) > 0);
+    assert_eq!(tile_exec_check.tiled_prefill_statistics().completed_tokens, 2);
+    assert_eq!(
+        tile_exec_check.tiled_prefill_statistics().packed_projections,
+        0
+    );
     Ok(())
 }

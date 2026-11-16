@@ -483,6 +483,10 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
             && self.executor.supports_f32_ffn_chain(tensors)
     }
 
+    fn supports_tile_tokens(&self) -> bool {
+        self.executor.supports_tile_tokens()
+    }
+
     fn project_f32_ffn_chain(
         &mut self,
         tensors: [&Tensor; 3],
@@ -503,6 +507,45 @@ impl Pq2ProjectionExecutor for PlacedProjectionExecutor<'_> {
             activation,
             residual,
             hadamard_block_size,
+            pinned,
+            output,
+        );
+        if result.is_err() {
+            self.faulted = true;
+            output.clear();
+        }
+        result
+    }
+
+    fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
+        self.f32_groups
+            && !self.faulted
+            && tensors.iter().all(|&tensor| self.supports_f32(tensor))
+            && self.executor.supports_f32_ffn_chain_lora(tensors)
+    }
+
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<f32> {
+        if !self.supports_f32_ffn_chain_lora(tensors) {
+            output.clear();
+            return Err(invalid(
+                "unavailable explicit F32 FFN chain LoRA projection placement",
+            ));
+        }
+        let result = self.executor.project_f32_ffn_chain_lora(
+            tensors,
+            activation,
+            residual,
+            hadamard_block_size,
+            lora_a,
             pinned,
             output,
         );

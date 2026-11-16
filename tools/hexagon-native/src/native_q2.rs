@@ -794,6 +794,34 @@ pub trait NativeQ2Submitter {
         false
     }
 
+    /// Whether a full intra-layer FFN chain with an inline `F32` `ffn_down`
+    /// rank-one `LoRA` A dot side-branch is supported in one native queue packet.
+    fn supports_ffn_chain_lora(&self) -> bool {
+        false
+    }
+
+    /// Submit a full intra-layer FFN chain (`[gate_handle, up_handle, down_handle]`)
+    /// with an inline `F32` `ffn_down` rank-one `LoRA` A dot side-branch
+    /// (`lora_a · SwiGLU(gate(x), up(x))`), returning the single finite scalar
+    /// dot product alongside the `hidden`-length `output`.
+    ///
+    /// # Errors
+    /// Unsupported residency, foreign handles, mismatched dimensions,
+    /// nonfinite values or submission failures reject and close the session with
+    /// no CPU replay.
+    fn submit_resident_ffn_chain_lora(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        _lora_a: &[f32],
+        output: &mut [f32],
+    ) -> Result<f32, Error> {
+        output.fill(f32::NAN);
+        Err(Error::Contract)
+    }
+
     /// Submit two ordered full FFN chains in one bounded native queue packet.
     ///
     /// The member chains retain the single-token arithmetic and VTCM flags.
@@ -1024,6 +1052,29 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
         (**self).supports_ffn_chain_multi2()
     }
 
+    fn supports_ffn_chain_lora(&self) -> bool {
+        (**self).supports_ffn_chain_lora()
+    }
+
+    fn submit_resident_ffn_chain_lora(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        output: &mut [f32],
+    ) -> Result<f32, Error> {
+        (**self).submit_resident_ffn_chain_lora(
+            handles,
+            activation,
+            residual,
+            hadamard_block_size,
+            lora_a,
+            output,
+        )
+    }
+
     fn submit_resident_ffn_chain_multi2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -1069,10 +1120,16 @@ pub(crate) const fn layout(columns: usize, rows: usize) -> projection::Layout {
 pub(crate) const fn working_allocation(columns: usize, rows: usize) -> usize {
     let raw = layout(columns, rows).allocation;
     // Both token chains remain live through one correlated response. Reserve
-    // command bytes and eight maximum-width F32 regions per token even for
-    // small shapes whose packed-weight workspace would otherwise be smaller.
+    // command bytes, eight maximum-width F32 regions per token, and (when both
+    // FFN dimensions admit LoRA side-branch fusion) the 32-row F32 LoRA A matrix
+    // plus 128-byte scalar dot output without inflating small-shape test fixtures.
     let extent = if columns > rows { columns } else { rows };
-    let chain = (8192 + 2 * extent * 4 * 8).next_multiple_of(4096);
+    let lora_buf = if columns >= 128 && rows >= 128 {
+        32 * extent * 4 + 128
+    } else {
+        0
+    };
+    let chain = (8192 + 2 * extent * 4 * 8 + lora_buf).next_multiple_of(4096);
     let required = if raw > chain { raw } else { chain };
     if required > NATIVE_Q2_MAX_WORKING_BYTES {
         NATIVE_Q2_MAX_WORKING_BYTES
@@ -2154,6 +2211,7 @@ pub(crate) fn image_ffn_swiglu_multi2_resident(
 )]
 pub(crate) struct FfnFullChainLayout {
     pub(crate) output_offset: usize,
+    pub(crate) lora_out_offset: Option<usize>,
     pub(crate) output_end: usize,
     pub(crate) n_bufs: u32,
     pub(crate) n_tensors: u32,
@@ -2239,9 +2297,58 @@ pub(crate) fn image_ffn_full_chain_resident_for_profile(
         [activation],
         [residual],
         hadamard_block_size,
+        None,
     )?;
     Ok(FfnFullChainLayout {
         output_offset: active.output_offsets[0],
+        lora_out_offset: active.lora_out_offsets[0],
+        output_end: active.output_end,
+        n_bufs: active.n_bufs,
+        n_tensors: active.n_tensors,
+        n_ops: active.n_ops,
+    })
+}
+
+/// Build a full intra-layer FFN `dspqueue` packet with an inline `F32` `ffn_down`
+/// rank-one `LoRA` A dot side-branch (`lora_a · SwiGLU(gate(x), up(x))`) before
+/// optional `HTP_OP_HADAMARD` + `OP_MUL_MAT(down)` + optional `HTP_OP_ADD(residual)`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep full intra-layer FFN + LoRA A side-branch packet inputs together"
+)]
+pub(crate) fn image_ffn_full_chain_resident_lora_for_profile(
+    profile: crate::HtpArchProfile,
+    bytes: &mut [u8],
+    base: u64,
+    fd: u32,
+    arena_start: usize,
+    extra_arenas: &[HtpBufferDesc],
+    gate_handle: &NativeQ2WeightHandle,
+    up_handle: &NativeQ2WeightHandle,
+    down_handle: &NativeQ2WeightHandle,
+    activation: &[f32],
+    residual: Option<&[f32]>,
+    hadamard_block_size: Option<u32>,
+    lora_a: &[f32],
+) -> Result<FfnFullChainLayout, Error> {
+    let active = image_ffn_full_chain_resident_batch(
+        profile,
+        bytes,
+        base,
+        fd,
+        arena_start,
+        extra_arenas,
+        gate_handle,
+        up_handle,
+        down_handle,
+        [activation],
+        [residual],
+        hadamard_block_size,
+        Some(lora_a),
+    )?;
+    Ok(FfnFullChainLayout {
+        output_offset: active.output_offsets[0],
+        lora_out_offset: active.lora_out_offsets[0],
         output_end: active.output_end,
         n_bufs: active.n_bufs,
         n_tensors: active.n_tensors,
@@ -2286,6 +2393,7 @@ pub(crate) fn image_ffn_full_chain_resident(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FfnFullChainBatchLayout<const B: usize> {
     pub(crate) output_offsets: [usize; B],
+    pub(crate) lora_out_offsets: [Option<usize>; B],
     pub(crate) output_end: usize,
     pub(crate) n_bufs: u32,
     pub(crate) n_tensors: u32,
@@ -2321,6 +2429,7 @@ pub(crate) fn image_ffn_full_chain_resident_multi2_for_profile(
         activations,
         residuals,
         hadamard_block_size,
+        None,
     )
 }
 
@@ -2372,6 +2481,7 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
     activations: [&[f32]; B],
     residuals: [Option<&[f32]>; B],
     hadamard_block_size: Option<u32>,
+    lora_a: Option<&[f32]>,
 ) -> Result<FfnFullChainBatchLayout<B>, Error> {
     let hidden = gate_handle.columns;
     let ffn_dim = gate_handle.rows;
@@ -2391,12 +2501,31 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         || residuals
             .iter()
             .any(|res| res.is_some() != residuals[0].is_some())
+        || lora_a.is_some_and(|a| B != 1 || a.len() != ffn_dim || !is_finite_f32_slice(a))
     {
         return Err(Error::Contract);
     }
     if let Some(block_size) = hadamard_block_size {
         let block_usize = usize::try_from(block_size).map_err(|_| Error::Contract)?;
         if block_size < 32 || !block_size.is_power_of_two() || !ffn_dim.is_multiple_of(block_usize)
+        {
+            return Err(Error::Contract);
+        }
+    }
+    let lora_a_bytes = ffn_dim
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_mul(32))
+        .ok_or(Error::Contract)?;
+    let lora_vtcm_bytes = ffn_dim
+        .checked_mul(4)
+        .and_then(|row| row.checked_mul(5))
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or(Error::Contract)?;
+    if lora_a.is_some() {
+        let vtcm_limit = usize::try_from(profile.vtcm_bytes.min(NATIVE_Q2_VTCM_REQUEST_BYTES))
+            .map_err(|_| Error::Contract)?;
+        if lora_vtcm_bytes > vtcm_limit
+            || crate::htp_ops::requires_dma64_stride(u64::try_from(lora_a_bytes).map_err(|_| Error::Contract)?)
         {
             return Err(Error::Contract);
         }
@@ -2465,11 +2594,14 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
     let n_bufs_usize = 1 + extra_buf_count;
     let n_bufs = u32::try_from(n_bufs_usize).map_err(|_| Error::Contract)?;
     let member_tensors = 12
+        + usize::from(lora_a.is_some()) * 3
         + usize::from(hadamard_block_size.is_some()) * 2
         + usize::from(residuals[0].is_some()) * 3;
     let n_tensors_usize = member_tensors * B;
-    let member_ops =
-        4 + usize::from(hadamard_block_size.is_some()) + usize::from(residuals[0].is_some());
+    let member_ops = 4
+        + usize::from(lora_a.is_some())
+        + usize::from(hadamard_block_size.is_some())
+        + usize::from(residuals[0].is_some());
     let n_ops_usize = member_ops * B;
     let tensors_base = n_bufs_usize * 24;
     let ops_base = tensors_base + n_tensors_usize * 56;
@@ -2496,6 +2628,7 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
     }
 
     let mut output_offsets = [0_usize; B];
+    let mut lora_out_offsets = [None; B];
     let mut next_token_offset = cmd_pad;
     for token in 0..B {
         let activation = activations[token];
@@ -2513,15 +2646,36 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         } else {
             0
         };
+        let lora_a_offset = if lora_a.is_some() {
+            let off = next_offset;
+            next_offset = (off + lora_a_bytes).next_multiple_of(128);
+            off
+        } else {
+            0
+        };
         let gate_out_offset = next_offset;
         let up_out_offset = (gate_out_offset + ffn_bytes).next_multiple_of(128);
         let swiglu_out_offset = (up_out_offset + ffn_bytes).next_multiple_of(128);
-        let hadamard_out_offset = if hadamard_block_size.is_some() {
+        let lora_out_offset = if lora_a.is_some() {
             (swiglu_out_offset + ffn_bytes).next_multiple_of(128)
+        } else {
+            0
+        };
+        let after_swiglu_offset = if lora_a.is_some() {
+            (lora_out_offset + 128).next_multiple_of(128)
+        } else {
+            (swiglu_out_offset + ffn_bytes).next_multiple_of(128)
+        };
+        let hadamard_out_offset = if hadamard_block_size.is_some() {
+            after_swiglu_offset
         } else {
             swiglu_out_offset
         };
-        let down_out_offset = (hadamard_out_offset + ffn_bytes).next_multiple_of(128);
+        let down_out_offset = if hadamard_block_size.is_some() {
+            (hadamard_out_offset + ffn_bytes).next_multiple_of(128)
+        } else {
+            after_swiglu_offset
+        };
         let final_out_offset = if residual.is_some() {
             (down_out_offset + hidden_bytes).next_multiple_of(128)
         } else {
@@ -2605,9 +2759,15 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         }
         let glu_op_desc = ops_base + 2 * 232;
         let glu_flags = if vtcm_chain {
-            crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
-                .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
-                .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+            let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM);
+            if lora_a.is_some() {
+                // swiglu_out has two consumers (F32 LoRA A and Hadamard/down);
+                // keep it in the DSP-cached working buffer rather than VTCM.
+                base_flags
+            } else {
+                base_flags.union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+            }
         } else {
             crate::htp_ops::HtpOpPassFlags::NONE
         };
@@ -2626,7 +2786,69 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         let mut next_ti = 9_u16;
         let mut next_op = 3_usize;
 
-        // Optional Op 3: HTP_OP_HADAMARD (69) over [block_size, ffn_dim / block_size].
+        // Optional Op 3: F32 MUL_MAT(lora_a, swiglu_out) -> lora_out (M=32, N=1).
+        if lora_a.is_some() {
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti,
+                lora_a_offset,
+                lora_a_bytes,
+                ffn_dim,
+                32,
+            )?;
+            put32(working, tensors_base + usize::from(next_ti) * 56 + 12, 1);
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti + 1,
+                swiglu_out_offset,
+                ffn_bytes,
+                ffn_dim,
+                1,
+            )?;
+            write_f32_2d_tensor_desc(
+                working,
+                tensors_base,
+                next_ti + 2,
+                lora_out_offset,
+                128,
+                32,
+                1,
+            )?;
+            let lora_op_desc = ops_base + next_op * 232;
+            let kp = lora_op_desc + 72;
+            put32(working, lora_op_desc, crate::htp_ops::HtpOpCode::MulMat.id());
+            put32(
+                working,
+                lora_op_desc + 4,
+                crate::htp_ops::HtpOpPassFlags::NONE.bits(),
+            );
+            working[kp] = 4; // HTP_MM_KERNEL_HVX_F32_F32_VTCM.
+            working[kp + 4] = 1; // One compute thread.
+            working[kp + 6] = 4; // n_prefetch = 4.
+            put32(
+                working,
+                kp + 24,
+                u32::try_from(ffn_bytes).map_err(|_| Error::Contract)?,
+            );
+            put32(
+                working,
+                kp + 28,
+                u32::try_from(lora_vtcm_bytes).map_err(|_| Error::Contract)?,
+            );
+            for index in 0..5 {
+                put32(working, kp + 36 + index * 8, 1);
+            }
+            working[lora_op_desc + 200..lora_op_desc + 228].fill(0xff);
+            put16(working, lora_op_desc + 200, next_ti);
+            put16(working, lora_op_desc + 202, next_ti + 1);
+            put16(working, lora_op_desc + 220, next_ti + 2);
+            next_ti += 3;
+            next_op += 1;
+        }
+
+        // Optional Op: HTP_OP_HADAMARD (69) over [block_size, ffn_dim / block_size].
         if let Some(block_size) = hadamard_block_size {
             let block_cols = usize::try_from(block_size).map_err(|_| Error::Contract)?;
             let block_rows = ffn_dim / block_cols;
@@ -2657,8 +2879,12 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             )?;
             let had_op_desc = ops_base + next_op * 232;
             let had_flags = if vtcm_chain {
-                crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
-                    .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+                if lora_a.is_some() {
+                    crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM
+                } else {
+                    crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                        .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+                }
             } else {
                 crate::htp_ops::HtpOpPassFlags::NONE
             };
@@ -2676,7 +2902,7 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             next_op += 1;
         }
 
-        // Next Op: MUL_MAT(down) reading activation from VTCM.
+        // Next Op: MUL_MAT(down) reading activation from VTCM when kept in VTCM.
         let down_op_desc = ops_base + next_op * 232;
         write_member_descriptors(
             working,
@@ -2694,12 +2920,15 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             down_handle.hvx_workers,
         )?;
         let down_flags = if vtcm_chain {
-            let base_flags = crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM;
-            if residual.is_some() {
-                base_flags.union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+            let mut base_flags = if hadamard_block_size.is_some() || lora_a.is_none() {
+                crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM
             } else {
-                base_flags
+                crate::htp_ops::HtpOpPassFlags::NONE
+            };
+            if residual.is_some() {
+                base_flags = base_flags.union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM);
             }
+            base_flags
         } else {
             crate::htp_ops::HtpOpPassFlags::NONE
         };
@@ -2775,6 +3004,17 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
                 *dst = val.to_bits().to_le_bytes();
             }
         }
+        if let Some(lora_a_slice) = lora_a {
+            working[lora_a_offset..lora_a_offset + lora_a_bytes].fill(0);
+            for (dst, &val) in working[lora_a_offset..lora_a_offset + ffn_bytes]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(lora_a_slice)
+            {
+                *dst = val.to_bits().to_le_bytes();
+            }
+        }
         working[gate_out_offset..output_end]
             .as_chunks_mut::<4>()
             .0
@@ -2814,10 +3054,12 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             }
         }
         output_offsets[token] = final_out_offset;
+        lora_out_offsets[token] = lora_a.map(|_| lora_out_offset);
         next_token_offset = output_end.next_multiple_of(128);
     }
     Ok(FfnFullChainBatchLayout {
         output_offsets,
+        lora_out_offsets,
         output_end: next_token_offset,
         n_bufs,
         n_tensors: u32::try_from(n_tensors_usize).map_err(|_| Error::Contract)?,
@@ -4247,6 +4489,180 @@ mod tests {
             v73_reg
                 .prepare_validated(5120, 17_408, 460_062_721)?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verify every LoRA side-branch FFN chain descriptor, VTCM double-consume avoidance, alignment and poison region together"
+    )]
+    fn ffn_full_chain_lora_descriptors_avoid_vtcm_double_consume_and_poison_lora_out()
+    -> Result<(), Error> {
+        let mut reg = NativeQ2WeightRegistry::new(65_536)?;
+        let h_gate = reg.prepare_validated(128, 128, 4608)?.ok_or(Error::Contract)?;
+        let h_up = reg.prepare_validated(128, 128, 4608)?.ok_or(Error::Contract)?;
+        let h_down = reg.prepare_validated(128, 128, 4608)?.ok_or(Error::Contract)?;
+        let activation = [1.5_f32; 128];
+        let residual = [0.25_f32; 128];
+        let lora_a: Vec<f32> = (0..128)
+            .map(|idx| f32::from(i16::try_from(idx % 5).unwrap_or(0) - 2) * 0.5)
+            .collect();
+        let arena_start = working_allocation(128, 128);
+        let read_u32 = |buf: &[u8], off: usize| -> Result<u32, Error> {
+            Ok(u32::from_le_bytes(
+                buf[off..off + 4].try_into().map_err(|_| Error::Contract)?,
+            ))
+        };
+        for (hadamard, add, expected_ops, expected_tensors) in [
+            (None, false, 5_u32, 15_u32),
+            (Some(64), false, 6, 17),
+            (None, true, 6, 18),
+            (Some(64), true, 7, 20),
+        ] {
+            let mut arena = vec![0xff_u8; arena_start + 32_768];
+            let layout = image_ffn_full_chain_resident_lora_for_profile(
+                crate::HtpArchProfile::v81(),
+                &mut arena,
+                0x1000_0000,
+                7,
+                arena_start,
+                &[],
+                &h_gate,
+                &h_up,
+                &h_down,
+                &activation,
+                add.then_some(residual.as_slice()),
+                hadamard,
+                &lora_a,
+            )?;
+            assert_eq!(layout.n_bufs, 1);
+            assert_eq!(layout.n_ops, expected_ops);
+            assert_eq!(layout.n_tensors, expected_tensors);
+            let lora_off = layout.lora_out_offset.ok_or(Error::Contract)?;
+            assert!(lora_off + 128 <= layout.output_offset);
+            assert!(layout.output_end <= arena_start);
+            assert!(!output_valid(&arena[lora_off..lora_off + 128]));
+            assert!(!output_valid(
+                &arena[layout.output_offset..layout.output_offset + 512]
+            ));
+
+            let tensors_base = 24;
+            let ops_base = tensors_base + usize::try_from(expected_tensors).map_err(|_| Error::Contract)? * 56;
+            // Op 2 (GluSwiglu): reads src0/src1 from VTCM, MUST clear KEEP_DST_IN_VTCM.
+            let glu_op = ops_base + 2 * 232;
+            assert_eq!(
+                read_u32(&arena, glu_op)?,
+                crate::htp_ops::HtpOpCode::GluSwiglu.id()
+            );
+            assert_eq!(
+                read_u32(&arena, glu_op + 4)?,
+                crate::htp_ops::HtpOpPassFlags::READ_SRC0_FROM_VTCM
+                    .union(crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM)
+                    .bits()
+            );
+
+            // Op 3 (F32 MUL_MAT for lora_a): opcode=4, flags=0, kernel=4, n_threads=1, n_prefetch=4.
+            let lora_op = ops_base + 3 * 232;
+            assert_eq!(read_u32(&arena, lora_op)?, crate::htp_ops::HtpOpCode::MulMat.id());
+            assert_eq!(read_u32(&arena, lora_op + 4)?, 0);
+            assert_eq!(arena[lora_op + 72], 4);
+            assert_eq!(arena[lora_op + 76], 1);
+            assert_eq!(arena[lora_op + 78], 4);
+            assert_eq!(read_u32(&arena, lora_op + 72 + 24)?, 128 * 4);
+            assert_eq!(read_u32(&arena, lora_op + 72 + 28)?, 4 * 128 * 4 + 128 * 4 + 128);
+            // Verify lora_a weight tensor (ti=9) has flags=1, ne=[128,32], row 0 populated and rows 1..32 zeroed.
+            let lora_w_desc = tensors_base + 9 * 56;
+            let lora_a_buf = usize::try_from(u64::from_le_bytes(
+                arena[lora_w_desc..lora_w_desc + 8]
+                    .try_into()
+                    .map_err(|_| Error::Contract)?,
+            ))
+            .map_err(|_| Error::Contract)?;
+            assert_eq!(read_u32(&arena, lora_w_desc + 12)?, 1);
+            assert_eq!(read_u32(&arena, lora_w_desc + 24)?, 128);
+            assert_eq!(read_u32(&arena, lora_w_desc + 28)?, 32);
+            for (idx, chunk) in arena[lora_a_buf..lora_a_buf + 512]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(*chunk, lora_a[idx].to_le_bytes());
+            }
+            assert!(
+                arena[lora_a_buf + 512..lora_a_buf + 32 * 512]
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+
+            // Consumer of swiglu_out (Op 4: Hadamard if present, else down) clears READ_SRC*.
+            if hadamard.is_some() {
+                let had_op = ops_base + 4 * 232;
+                assert_eq!(read_u32(&arena, had_op)?, crate::htp_ops::HtpOpCode::Hadamard.id());
+                assert_eq!(
+                    read_u32(&arena, had_op + 4)?,
+                    crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM.bits()
+                );
+                let down_op = ops_base + 5 * 232;
+                let expected_down = if add {
+                    crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM
+                        .union(crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM)
+                        .bits()
+                } else {
+                    crate::htp_ops::HtpOpPassFlags::READ_SRC1_FROM_VTCM.bits()
+                };
+                assert_eq!(read_u32(&arena, down_op + 4)?, expected_down);
+            } else {
+                let down_op = ops_base + 4 * 232;
+                let expected_down = if add {
+                    crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM.bits()
+                } else {
+                    0
+                };
+                assert_eq!(read_u32(&arena, down_op + 4)?, expected_down);
+            }
+        }
+        // Reject nonfinite lora_a and mismatched length.
+        let mut bad_arena = vec![0_u8; arena_start + 32_768];
+        let mut bad_a = lora_a;
+        bad_a[17] = f32::NAN;
+        assert!(
+            image_ffn_full_chain_resident_lora_for_profile(
+                crate::HtpArchProfile::v81(),
+                &mut bad_arena,
+                0x1000_0000,
+                7,
+                arena_start,
+                &[],
+                &h_gate,
+                &h_up,
+                &h_down,
+                &activation,
+                None,
+                None,
+                &bad_a,
+            )
+            .is_err()
+        );
+        assert!(
+            image_ffn_full_chain_resident_lora_for_profile(
+                crate::HtpArchProfile::v81(),
+                &mut bad_arena,
+                0x1000_0000,
+                7,
+                arena_start,
+                &[],
+                &h_gate,
+                &h_up,
+                &h_down,
+                &activation,
+                None,
+                None,
+                &bad_a[..127],
+            )
+            .is_err()
         );
         Ok(())
     }

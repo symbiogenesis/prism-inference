@@ -501,11 +501,15 @@ impl Qwen35 {
             &mut **executor
         }
         let mut executor = self.projection_executor.take();
-        let result = self.ingest_prefill_block_with_executor(
-            tokens,
-            check,
-            executor.as_mut().map(coerce_executor),
-        );
+        let prefill_executor = if self.tiled_prefill.is_some() {
+            executor
+                .as_mut()
+                .map(coerce_executor)
+                .filter(|exec| exec.supports_tile_tokens())
+        } else {
+            executor.as_mut().map(coerce_executor)
+        };
+        let result = self.ingest_prefill_block_with_executor(tokens, check, prefill_executor);
         self.projection_executor = executor;
         result
     }

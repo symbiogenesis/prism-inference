@@ -72,6 +72,20 @@ impl Pq2ProjectionExecutor for RefusingExecutor {
         self.calls += 1;
         Err(invalid("unexpected F32 FFN chain"))
     }
+
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        _tensors: [&Tensor; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        _lora_a: &[f32],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<f32> {
+        self.calls += 1;
+        Err(invalid("unexpected F32 FFN chain LoRA"))
+    }
 }
 
 fn weight(name: &str) -> Tensor {
@@ -111,6 +125,21 @@ fn projection_precision_capabilities_gate_fused_and_group_callbacks() -> Result<
                 [&gate, &up, &down],
                 None,
                 None,
+                &mut output,
+                &mut executor
+            )
+            .is_err()
+    );
+    assert_eq!(output, Vec::<f32>::new());
+    output.push(17.0);
+    let lora_a = vec![0.25_f32; 128];
+    assert!(
+        prepared
+            .matvec_ffn_chain_lora_with_executor(
+                [&gate, &up, &down],
+                None,
+                None,
+                &lora_a,
                 &mut output,
                 &mut executor
             )
@@ -168,5 +197,127 @@ fn projection_precision_validates_group_geometry_before_capability_callback() ->
     assert_eq!(other, Vec::<f32>::new());
     assert_eq!(executor.capability_queries.get(), 0);
     assert_eq!(executor.calls, 0);
+    Ok(())
+}
+
+struct ChainLoraExecutor {
+    dot: f32,
+    output_val: f32,
+    calls: usize,
+}
+
+impl Pq2ProjectionExecutor for ChainLoraExecutor {
+    fn identity(&self) -> &'static str {
+        "chain-lora-test"
+    }
+
+    fn supports(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn project(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[Q8KBlock],
+        _fused: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(invalid("unexpected quantized submission"))
+    }
+
+    fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
+        tensors.iter().all(|tensor| tensor.kind == 142)
+    }
+
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        tensors: [&Tensor; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<f32> {
+        self.calls += 1;
+        assert_eq!(lora_a.len(), tensors[2].dimensions[0]);
+        output.clear();
+        output.resize(tensors[2].dimensions[1], self.output_val);
+        Ok(self.dot)
+    }
+}
+
+#[test]
+fn ffn_chain_lora_validates_lora_a_and_rejects_nonfinite_dot_before_publication() -> Result<()> {
+    let gate = weight("gate");
+    let up = weight("up");
+    let down = weight("down");
+    let input = vec![1.0_f32; 128];
+    let mut scratch = MatvecScratch::default();
+    let mut prepared = scratch.prepare_f32_executor(&gate, &input)?;
+    let mut exec = ChainLoraExecutor {
+        dot: 3.5,
+        output_val: 2.0,
+        calls: 0,
+    };
+    let mut output = Vec::new();
+    let dot = prepared.matvec_ffn_chain_lora_with_executor(
+        [&gate, &up, &down],
+        None,
+        None,
+        &vec![0.5_f32; 128],
+        &mut output,
+        &mut exec,
+    )?;
+    assert_eq!(dot, 3.5);
+    assert_eq!(output, vec![2.0_f32; 128]);
+    assert_eq!(exec.calls, 1);
+
+    // Mismatched or nonfinite lora_a refuses before calling executor.
+    assert!(
+        prepared
+            .matvec_ffn_chain_lora_with_executor(
+                [&gate, &up, &down],
+                None,
+                None,
+                &vec![0.5_f32; 127],
+                &mut output,
+                &mut exec,
+            )
+            .is_err()
+    );
+    assert_eq!(output, Vec::<f32>::new());
+    let mut nonfinite_a = vec![0.5_f32; 128];
+    nonfinite_a[17] = f32::NAN;
+    assert!(
+        prepared
+            .matvec_ffn_chain_lora_with_executor(
+                [&gate, &up, &down],
+                None,
+                None,
+                &nonfinite_a,
+                &mut output,
+                &mut exec,
+            )
+            .is_err()
+    );
+    assert_eq!(exec.calls, 1);
+
+    // Nonfinite scalar dot clears output and returns error.
+    exec.dot = f32::INFINITY;
+    assert!(
+        prepared
+            .matvec_ffn_chain_lora_with_executor(
+                [&gate, &up, &down],
+                None,
+                None,
+                &vec![0.5_f32; 128],
+                &mut output,
+                &mut exec,
+            )
+            .is_err()
+    );
+    assert_eq!(output, Vec::<f32>::new());
+    assert_eq!(exec.calls, 2);
     Ok(())
 }

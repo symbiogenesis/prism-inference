@@ -104,6 +104,29 @@ impl NativeQ2Submitter for RecordingSubmitter {
         !self.fail
     }
 
+    fn supports_ffn_chain_lora(&self) -> bool {
+        !self.fail
+    }
+
+    fn submit_resident_ffn_chain_lora(
+        &mut self,
+        _handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        output: &mut [f32],
+    ) -> Result<f32, Error> {
+        if residual.is_none_or(|values| values[0].to_bits() != 9.0_f32.to_bits())
+            || hadamard_block_size != Some(64)
+            || lora_a.is_empty()
+        {
+            return Err(Error::Contract);
+        }
+        self.complete("full-chain-lora", output, activation[0])?;
+        Ok(lora_a[0] * 2.0)
+    }
+
     fn submit_resident_ffn_chain_multi2(
         &mut self,
         _handles: [&NativeQ2WeightHandle; 3],
@@ -435,5 +458,43 @@ fn owned_session_forwards_paired_chain_capability_and_one_call() -> Result<(), E
             .is_err()
     );
     assert_eq!(session.0.calls, ["chain-multi2", "chain-multi2"]);
+    Ok(())
+}
+
+#[test]
+fn owned_session_forwards_ffn_chain_lora_capability_and_failure() -> Result<(), Error> {
+    let (mut session, handle) = fixture()?;
+    assert!(session.supports_ffn_chain_lora());
+    let activation = [3.0; 128];
+    let residual = [9.0; 128];
+    let lora_a = [2.5; 128];
+    let mut output = [f32::NAN; 32];
+    let dot = session.submit_resident_ffn_chain_lora(
+        [&handle; 3],
+        &activation,
+        Some(&residual),
+        Some(64),
+        &lora_a,
+        &mut output,
+    )?;
+    assert_eq!(dot, 5.0);
+    assert_eq!(output, [3.0; 32]);
+    assert_eq!(session.0.calls, ["full-chain-lora"]);
+    session.0.fail = true;
+    assert!(!session.supports_ffn_chain_lora());
+    assert!(
+        session
+            .submit_resident_ffn_chain_lora(
+                [&handle; 3],
+                &activation,
+                Some(&residual),
+                Some(64),
+                &lora_a,
+                &mut output
+            )
+            .is_err()
+    );
+    assert!(output.iter().all(|value| value.is_nan()));
+    assert_eq!(session.0.calls, ["full-chain-lora", "full-chain-lora"]);
     Ok(())
 }

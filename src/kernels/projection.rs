@@ -262,6 +262,12 @@ pub trait Pq2ProjectionExecutor {
         false
     }
 
+    /// Whether this executor natively batches multi-token prefill tiles rather
+    /// than handing tiled `ingest_block` execution off to CPU `SDOT` sibling tiles.
+    fn supports_tile_tokens(&self) -> bool {
+        false
+    }
+
     /// Execute a full intra-layer FFN chain (`[ffn_gate, ffn_up, ffn_down]` +
     /// `SwiGLU(gate(x), up(x))` + optional `Hadamard` + optional `residual` add)
     /// in a single executor submission.
@@ -279,6 +285,39 @@ pub trait Pq2ProjectionExecutor {
     ) -> Result<()> {
         Err(invalid(
             "projection executor does not support fused F32 FFN chain",
+        ))
+    }
+
+    /// Opt in to a full intra-layer FFN chain with an inline `ffn_down` rank-one
+    /// `LoRA` A dot side-branch (`lora_a · SwiGLU(gate(x), up(x))`) in a single
+    /// executor submission.
+    fn supports_f32_ffn_chain_lora(&self, _tensors: [&Tensor; 3]) -> bool {
+        false
+    }
+
+    /// Execute a full intra-layer FFN chain with an inline `ffn_down` rank-one
+    /// `LoRA` A dot side-branch (`lora_a · SwiGLU(gate(x), up(x))`) in a single
+    /// executor submission, returning the finite scalar dot product alongside `output`.
+    ///
+    /// # Errors
+    /// Rejects unsupported chains, mismatched `lora_a`, submission failures and
+    /// invalid output.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep full FFN chain inputs, LoRA A factor, precision policy and output together"
+    )]
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        _tensors: [&Tensor; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        _lora_a: &[f32],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<f32> {
+        Err(invalid(
+            "projection executor does not support fused F32 FFN chain LoRA",
         ))
     }
 
@@ -316,6 +355,35 @@ pub trait Pq2ProjectionExecutor {
 }
 
 impl PreparedMatvec<'_> {
+    fn validate_f32_ffn_chain(
+        &self,
+        tensors: [&Tensor; 3],
+        residual: Option<&[f32]>,
+    ) -> Result<(usize, usize)> {
+        let [gate, up, down] = tensors;
+        let (gate_cols, gate_rows, _) = dimensions(gate)?;
+        let (up_cols, up_rows, _) = dimensions(up)?;
+        let (down_cols, down_rows, _) = dimensions(down)?;
+        if !self.is_compatible(gate)?
+            || !self.is_compatible(up)?
+            || gate.kind != PQ2
+            || up.kind != PQ2
+            || down.kind != PQ2
+            || gate_cols != up_cols
+            || gate_rows != up_rows
+            || down_cols != gate_rows
+            || down_rows != gate_cols
+            || !gate_cols.is_multiple_of(128)
+            || !down_cols.is_multiple_of(128)
+            || residual.is_some_and(|res| res.len() != down_rows || !is_finite_slice(res))
+        {
+            return Err(invalid(
+                "incompatible prepared projection executor activation",
+            ));
+        }
+        Ok((down_cols, down_rows))
+    }
+
     /// Execute a full intra-layer FFN chain (`[gate, up, down]` + `SwiGLU` +
     /// optional `Hadamard` + optional `residual` add) in a single executor call
     /// when supported by `executor`.
@@ -331,24 +399,8 @@ impl PreparedMatvec<'_> {
         executor: &mut dyn Pq2ProjectionExecutor,
     ) -> Result<()> {
         let result = (|| {
-            let [gate, up, down] = tensors;
-            let (gate_cols, gate_rows, _) = dimensions(gate)?;
-            let (up_cols, up_rows, _) = dimensions(up)?;
-            let (down_cols, down_rows, _) = dimensions(down)?;
-            if !self.is_compatible(gate)?
-                || !self.is_compatible(up)?
-                || gate.kind != PQ2
-                || up.kind != PQ2
-                || down.kind != PQ2
-                || gate_cols != up_cols
-                || gate_rows != up_rows
-                || down_cols != gate_rows
-                || down_rows != gate_cols
-                || !gate_cols.is_multiple_of(128)
-                || !down_cols.is_multiple_of(128)
-                || residual.is_some_and(|res| res.len() != down_rows || !is_finite_slice(res))
-                || !executor.supports_f32_ffn_chain(tensors)
-            {
+            let (_, down_rows) = self.validate_f32_ffn_chain(tensors, residual)?;
+            if !executor.supports_f32_ffn_chain(tensors) {
                 return Err(invalid(
                     "incompatible prepared projection executor activation",
                 ));
@@ -368,6 +420,57 @@ impl PreparedMatvec<'_> {
                 return Err(invalid("non-finite value in runtime path"));
             }
             Ok(())
+        })();
+        if result.is_err() {
+            output.clear();
+        }
+        result
+    }
+
+    /// Execute a full intra-layer FFN chain with an inline `ffn_down` rank-one
+    /// `LoRA` A dot side-branch in a single executor call when supported by `executor`.
+    ///
+    /// Returns the finite scalar `lora_a · SwiGLU(gate(x), up(x))` alongside
+    /// `output`.
+    ///
+    /// # Errors
+    /// Rejects incompatible preparation, mismatched/nonfinite `lora_a`, executor
+    /// failures, nonfinite `lora_dot`, or incomplete/nonfinite output.
+    pub fn matvec_ffn_chain_lora_with_executor(
+        &mut self,
+        tensors: [&Tensor; 3],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        output: &mut Vec<f32>,
+        executor: &mut dyn Pq2ProjectionExecutor,
+    ) -> Result<f32> {
+        let result = (|| {
+            let (down_cols, down_rows) = self.validate_f32_ffn_chain(tensors, residual)?;
+            if lora_a.len() != down_cols
+                || !is_finite_slice(lora_a)
+                || !executor.supports_f32_ffn_chain_lora(tensors)
+            {
+                return Err(invalid(
+                    "incompatible prepared projection executor activation",
+                ));
+            }
+            let lora_dot = executor.project_f32_ffn_chain_lora(
+                tensors,
+                self.input,
+                residual,
+                hadamard_block_size,
+                lora_a,
+                self.scratch.pinned_accumulation,
+                output,
+            )?;
+            if output.len() != down_rows {
+                return Err(invalid("projection executor returned incomplete output"));
+            }
+            if !lora_dot.is_finite() || !is_finite_slice(output) {
+                return Err(invalid("non-finite value in runtime path"));
+            }
+            Ok(lora_dot)
         })();
         if result.is_err() {
             output.clear();

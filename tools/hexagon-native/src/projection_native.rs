@@ -587,6 +587,25 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         buffers: u32,
         expected_size: u32,
     ) -> bool {
+        self.read_counts_with_chain_lora(
+            sequence,
+            operations,
+            tensors,
+            buffers,
+            expected_size,
+            false,
+        )
+    }
+
+    fn read_counts_with_chain_lora(
+        &mut self,
+        sequence: u64,
+        operations: u32,
+        tensors: u32,
+        buffers: u32,
+        expected_size: u32,
+        allow_chain_lora7: bool,
+    ) -> bool {
         let started = Instant::now();
         let op_deadline = started + Duration::from_secs(3);
         let deadline = if self.limits.persistent {
@@ -647,8 +666,13 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 && descriptor.offset == self.expected.offset
                 && descriptor.flags == self.expected.flags
                 && descriptor.pointer == self.expected.pointer
-                && projection::response_counts_valid(
-                    &reply, sequence, operations, tensors, buffers,
+                && response_counts_valid_with_chain_lora(
+                    &reply,
+                    sequence,
+                    operations,
+                    tensors,
+                    buffers,
+                    allow_chain_lora7,
                 );
             if !self.report.queue.response_validated {
                 let _ = self.fail("projection-response-refused-pinned");
@@ -656,6 +680,52 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             return self.report.queue.response_validated;
         }
     }
+}
+
+fn request_counts_with_chain_lora(
+    sequence: u64,
+    operations: u32,
+    tensors: u32,
+    buffers: u32,
+    allow_chain_lora7: bool,
+) -> Result<[u8; compute::COMPUTE_REQUEST_BYTES], Error> {
+    if allow_chain_lora7 && (operations, tensors) == (7, 20) && (1..=4).contains(&buffers) {
+        let mut result = projection::request(sequence);
+        result[8..12].copy_from_slice(&buffers.to_le_bytes());
+        result[12..16].copy_from_slice(&tensors.to_le_bytes());
+        result[16..20].copy_from_slice(&operations.to_le_bytes());
+        return Ok(result);
+    }
+    projection::request_counts(sequence, operations, tensors, buffers)
+}
+
+fn response_counts_valid_with_chain_lora(
+    bytes: &[u8],
+    sequence: u64,
+    operations: u32,
+    tensors: u32,
+    buffers: u32,
+    allow_chain_lora7: bool,
+) -> bool {
+    if allow_chain_lora7
+        && (operations, tensors) == (7, 20)
+        && (1..=4).contains(&buffers)
+        && sequence != 0
+        && bytes.len() == compute::COMPUTE_RESPONSE_BYTES
+    {
+        let mut fixed = [0; compute::COMPUTE_RESPONSE_BYTES];
+        fixed.copy_from_slice(bytes);
+        let correlated = fixed[..8] == sequence.to_le_bytes()
+            && fixed[28..32] == buffers.to_le_bytes()
+            && fixed[32..36] == tensors.to_le_bytes()
+            && fixed[36..40] == operations.to_le_bytes();
+        fixed[..8].copy_from_slice(&1_u64.to_le_bytes());
+        fixed[28..32].copy_from_slice(&1_u32.to_le_bytes());
+        fixed[32..36].copy_from_slice(&3_u32.to_le_bytes());
+        fixed[36..40].copy_from_slice(&1_u32.to_le_bytes());
+        return correlated && compute::response_valid(&fixed);
+    }
+    projection::response_counts_valid(bytes, sequence, operations, tensors, buffers)
 }
 
 #[derive(Clone, Copy)]
@@ -1419,10 +1489,6 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         result
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep resident full FFN chain validation, scoped flush size and output publication together"
-    )]
     fn submit_native_resident_ffn_chain(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -1431,9 +1497,55 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
         hadamard_block_size: Option<u32>,
         output: &mut [f32],
     ) -> Result<(), Error> {
+        let _ = self.submit_native_resident_ffn_chain_inner(
+            handles,
+            activation,
+            residual,
+            hadamard_block_size,
+            None,
+            output,
+        )?;
+        Ok(())
+    }
+
+    fn submit_native_resident_ffn_chain_lora(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        output: &mut [f32],
+    ) -> Result<f32, Error> {
+        self.submit_native_resident_ffn_chain_inner(
+            handles,
+            activation,
+            residual,
+            hadamard_block_size,
+            Some(lora_a),
+            output,
+        )?
+        .ok_or_else(|| self.fail("projection-frame-refused-pinned"))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep resident full FFN chain validation, optional LoRA side-branch, scoped flush size and output publication together"
+    )]
+    fn submit_native_resident_ffn_chain_inner(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: Option<&[f32]>,
+        output: &mut [f32],
+    ) -> Result<Option<f32>, Error> {
         let result = (|| {
-            let batch_u32 =
-                4_u32 + u32::from(hadamard_block_size.is_some()) + u32::from(residual.is_some());
+            let batch_u32 = 4_u32
+                + u32::from(lora_a.is_some())
+                + u32::from(hadamard_block_size.is_some())
+                + u32::from(residual.is_some());
             let [gate_handle, up_handle, down_handle] = handles;
             let Some(next_operations) = self
                 .report
@@ -1476,6 +1588,9 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 || residual.is_some_and(|values| {
                     values.len() != columns || !native_q2::is_finite_f32_slice(values)
                 })
+                || lora_a.is_some_and(|values| {
+                    values.len() != rows || !native_q2::is_finite_f32_slice(values)
+                })
             {
                 return Err(self.fail("projection-input-refused-pinned"));
             }
@@ -1500,20 +1615,39 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             let image = unsafe {
                 std::slice::from_raw_parts_mut(self.memory.cast::<u8>(), allocation_bytes)
             };
-            let Ok(active) = native_q2::image_ffn_full_chain_resident_for_profile(
-                self.arch_profile,
-                image,
-                base,
-                self.expected.fd,
-                working_bytes,
-                &extra_descs[..self.extra_arena_count],
-                gate_handle,
-                up_handle,
-                down_handle,
-                activation,
-                residual,
-                hadamard_block_size,
-            ) else {
+            let built = if let Some(lora_a) = lora_a {
+                native_q2::image_ffn_full_chain_resident_lora_for_profile(
+                    self.arch_profile,
+                    image,
+                    base,
+                    self.expected.fd,
+                    working_bytes,
+                    &extra_descs[..self.extra_arena_count],
+                    gate_handle,
+                    up_handle,
+                    down_handle,
+                    activation,
+                    residual,
+                    hadamard_block_size,
+                    lora_a,
+                )
+            } else {
+                native_q2::image_ffn_full_chain_resident_for_profile(
+                    self.arch_profile,
+                    image,
+                    base,
+                    self.expected.fd,
+                    working_bytes,
+                    &extra_descs[..self.extra_arena_count],
+                    gate_handle,
+                    up_handle,
+                    down_handle,
+                    activation,
+                    residual,
+                    hadamard_block_size,
+                )
+            };
+            let Ok(active) = built else {
                 return Err(self.fail("projection-frame-refused-pinned"));
             };
             if active.n_ops != batch_u32 {
@@ -1524,9 +1658,14 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 return Err(Error::Contract);
             }
             let sequence = u64::from(next_writes);
-            let Ok(request) =
-                projection::request_counts(sequence, active.n_ops, active.n_tensors, active.n_bufs)
-            else {
+            let allow_chain_lora7 = lora_a.is_some();
+            let Ok(request) = request_counts_with_chain_lora(
+                sequence,
+                active.n_ops,
+                active.n_tensors,
+                active.n_bufs,
+                allow_chain_lora7,
+            ) else {
                 return Err(self.fail("projection-frame-refused-pinned"));
             };
             let active_descriptor_size = if self.dirty_resident_weights {
@@ -1557,19 +1696,20 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
                 return Err(self.fail("projection-write-refused-pinned"));
             }
             entered(self.report, "projection-queue-read-entered", self.progress);
-            if !self.read_counts(
+            if !self.read_counts_with_chain_lora(
                 sequence,
                 active.n_ops,
                 active.n_tensors,
                 active.n_bufs,
                 active_descriptor_size,
+                allow_chain_lora7,
             ) {
                 return Err(Error::Contract);
             }
             self.dirty_resident_weights = false;
             let member_bytes = size_of_val(output);
             // SAFETY: exact correlated response validated same FD, active prefix,
-            // pointer and the exact 12/14/15/17-tensor, 4/5/6-op chain geometry.
+            // pointer and the exact 12..=20-tensor, 4..=7-op chain geometry.
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     self.memory.cast::<u8>().wrapping_add(active.output_offset),
@@ -1579,6 +1719,28 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             if !native_q2::copy_and_validate_output(bytes, output) {
                 return Err(self.fail("projection-numeric-refused-pinned"));
             }
+            let lora_dot = if let Some(lora_off) = active.lora_out_offset {
+                // SAFETY: exact correlated response validated same FD, active prefix,
+                // pointer and the LoRA side-branch `lora_out[0]` offset inside `output_end`.
+                let lora_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.memory.cast::<u8>().wrapping_add(lora_off),
+                        size_of::<f32>(),
+                    )
+                };
+                let dot = f32::from_le_bytes([
+                    lora_bytes[0],
+                    lora_bytes[1],
+                    lora_bytes[2],
+                    lora_bytes[3],
+                ]);
+                if !dot.is_finite() {
+                    return Err(self.fail("projection-numeric-refused-pinned"));
+                }
+                Some(dot)
+            } else {
+                None
+            };
             if !self.within_deadline() {
                 return Err(Error::Contract);
             }
@@ -1586,7 +1748,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
             self.report.operations_completed = next_operations;
             self.report.queue_writes_completed = next_writes;
             entered(self.report, "projection-operation-complete", self.progress);
-            Ok(())
+            Ok(lora_dot)
         })();
         if result.is_err() {
             output.fill(f32::NAN);
@@ -2455,6 +2617,29 @@ impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
         !self.failed && self.mode.is_native_q2()
     }
 
+    fn supports_ffn_chain_lora(&self) -> bool {
+        !self.failed && self.mode.is_native_q2()
+    }
+
+    fn submit_resident_ffn_chain_lora(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        output: &mut [f32],
+    ) -> Result<f32, Error> {
+        self.submit_native_resident_ffn_chain_lora(
+            handles,
+            activation,
+            residual,
+            hadamard_block_size,
+            lora_a,
+            output,
+        )
+    }
+
     fn submit_resident_ffn_chain_multi2(
         &mut self,
         handles: [&NativeQ2WeightHandle; 3],
@@ -2992,6 +3177,32 @@ impl NativeQ2Submitter for NativeQ2Session {
 
     fn supports_ffn_chain_multi2(&self) -> bool {
         !self.failed
+    }
+
+    fn supports_ffn_chain_lora(&self) -> bool {
+        !self.failed
+    }
+
+    fn submit_resident_ffn_chain_lora(
+        &mut self,
+        handles: [&NativeQ2WeightHandle; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        output: &mut [f32],
+    ) -> Result<f32, Error> {
+        self.with_session(|session| {
+            NativeQ2Submitter::submit_resident_ffn_chain_lora(
+                session,
+                handles,
+                activation,
+                residual,
+                hadamard_block_size,
+                lora_a,
+                output,
+            )
+        })
     }
 
     fn submit_resident_ffn_chain_multi2(
@@ -5058,6 +5269,112 @@ mod tests {
             native_q2::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
                 + native_q2::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resident_native_q2_ffn_chain_lora_validates_scalar_dot_and_latches_bad_lora_out()
+    -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        let weights = resident_native_q2_weights_32().repeat(4);
+        let activation = [1.0_f32; 128];
+        let residual = [2.0_f32; 128];
+        let lora_a = [0.5_f32; 128];
+        for (hadamard, add, operations, tensors) in [
+            (None, false, 5_u32, 15_u32),
+            (Some(64), false, 6, 17),
+            (None, true, 6, 18),
+            (Some(64), true, 7, 20),
+        ] {
+            {
+                let mut state = STATE.lock().map_err(|_| Error::Contract)?;
+                state.writes = 0;
+                state.write_error = false;
+                state.stale_reply = false;
+                state.bad_numeric = false;
+                state.bad_member = None;
+            }
+            let limits = NativeQ2ProjectionLimits::new(128, 128, 16, Duration::from_secs(4))?
+                .with_resident_weights(16_384)?;
+            let mut memory = vec![0_u8; limits.allocation_bytes()];
+            let pointer = memory.as_mut_ptr().cast::<c_void>();
+            let expected = QueueBuffer {
+                fd: 7,
+                size: u32::try_from(memory.len()).map_err(|_| Error::Contract)?,
+                offset: 0,
+                flags: 0x90,
+                pointer,
+            };
+            let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
+            report.queue.poisoned = true;
+            let queue_write = WriteCall::Nonblocking(write);
+            let mut progress = |_: &Q2ProjectionReport| {};
+            let mut session = Session {
+                report: &mut report,
+                queue_write: &queue_write,
+                queue_read: read,
+                queue: null_mut(),
+                memory: pointer,
+                expected,
+                extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+                extra_arena_count: 0,
+                mapper: None,
+                limits: limits.common,
+                mode: Mode::NativeQ2 { columns: 128 },
+                resident_weights: HmxQ2WeightRegistry::new(0)?,
+                native_resident_weights: NativeQ2WeightRegistry::new(
+                    limits.resident_weight_bytes(),
+                )?,
+                dirty_resident_weights: false,
+                arch_profile: crate::HtpArchProfile::v81(),
+                work_deadline: Instant::now() + Duration::from_secs(1),
+                progress: &mut progress,
+                failed: false,
+            };
+            assert!(NativeQ2Submitter::supports_ffn_chain_lora(&session));
+            let handle = NativeQ2Submitter::prepare_weights(&mut session, 128, 128, &weights)?
+                .ok_or(Error::Contract)?;
+            let mut output = [99.0_f32; 128];
+            let dot = NativeQ2Submitter::submit_resident_ffn_chain_lora(
+                &mut session,
+                [&handle; 3],
+                &activation,
+                add.then_some(residual.as_slice()),
+                hadamard,
+                &lora_a,
+                &mut output,
+            )?;
+            // Op 3 is the LoRA F32 MUL_MAT -> mock writes 7.0 + 3 = 10.0 into lora_out.
+            assert_eq!(dot, 10.0);
+            let expected_value =
+                7.0 + f32::from(u8::try_from(operations - 1).map_err(|_| Error::Contract)?);
+            assert_eq!(output, [expected_value; 128]);
+            assert_eq!(session.report.operations_completed, operations);
+            assert_eq!(session.report.resident_submissions, 3);
+            {
+                let state = STATE.lock().map_err(|_| Error::Contract)?;
+                assert_eq!(state.n_tensors, tensors);
+                assert_eq!(state.batch_operations, operations);
+            }
+
+            // Poisoning Op 3 (lora_out) with NaN must reject and clear output to NaN.
+            STATE.lock().map_err(|_| Error::Contract)?.bad_member = Some(3);
+            assert!(
+                NativeQ2Submitter::submit_resident_ffn_chain_lora(
+                    &mut session,
+                    [&handle; 3],
+                    &activation,
+                    add.then_some(residual.as_slice()),
+                    hadamard,
+                    &lora_a,
+                    &mut output,
+                )
+                .is_err()
+            );
+            assert!(output.iter().all(|v| v.is_nan()));
+            assert!(session.failed);
+            assert!(!NativeQ2Submitter::supports_ffn_chain_lora(&session));
+        }
         Ok(())
     }
 }

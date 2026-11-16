@@ -2204,6 +2204,10 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             && down_rows.is_multiple_of(32)
     }
 
+    fn supports_f32_ffn_chain_lora_inner(&self, tensors: [&Tensor; 3]) -> bool {
+        self.submitter.supports_ffn_chain_lora() && self.supports_f32_ffn_chain_inner(tensors)
+    }
+
     /// Execute a fused `ffn_gate` + `ffn_up` + `HTP_OP_GLU_SWIGLU` chain across
     /// a tile of `F32` token activations, batching pairs of tokens into 6-op
     /// DSP queue submissions with per-token VTCM intermediate residency.
@@ -2424,35 +2428,82 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         hadamard_block_size: Option<u32>,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        let result = self.project_f32_ffn_chain_inner(
+        let result = self.project_f32_ffn_chain_common(
             tensors,
             activation,
             residual,
             hadamard_block_size,
+            None,
             output,
         );
         if result.is_err() {
             self.failed = true;
             output.clear();
         }
-        result
+        result.map(|_| ())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep full intra-layer FFN VTCM chain validation, resident preparation and statistics together."
-    )]
-    fn project_f32_ffn_chain_inner(
+    /// Execute a full intra-layer FFN chain with an inline `F32` `ffn_down`
+    /// rank-one `LoRA` A dot side-branch (`lora_a · SwiGLU(gate(x), up(x))`) in
+    /// one DSP queue submission, returning the finite scalar dot product.
+    ///
+    /// # Errors
+    /// Rejects unsupported sessions, non-resident or mismatched tensors,
+    /// mismatched/nonfinite `lora_a`, nonfinite inputs/outputs or failed
+    /// submissions, closing the executor on any failure.
+    pub fn project_f32_ffn_chain_lora(
         &mut self,
         tensors: [&Tensor; 3],
         activation: &[f32],
         residual: Option<&[f32]>,
         hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
         output: &mut Vec<f32>,
-    ) -> Result<()> {
+    ) -> Result<f32> {
+        let result = self.project_f32_ffn_chain_common(
+            tensors,
+            activation,
+            residual,
+            hadamard_block_size,
+            Some(lora_a),
+            output,
+        );
+        match result {
+            Ok(Some(dot)) => Ok(dot),
+            Ok(None) => {
+                self.failed = true;
+                output.clear();
+                Err(invalid("missing native Q2 FFN chain LoRA dot output"))
+            }
+            Err(err) => {
+                self.failed = true;
+                output.clear();
+                Err(err)
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep full intra-layer FFN VTCM chain validation, optional LoRA side-branch, resident preparation and statistics together."
+    )]
+    fn project_f32_ffn_chain_common(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: Option<&[f32]>,
+        output: &mut Vec<f32>,
+    ) -> Result<Option<f32>> {
         if self.failed {
             return Err(invalid(
                 "native Q2 Hexagon executor requires terminal teardown",
+            ));
+        }
+        if lora_a.is_some() && !self.submitter.supports_ffn_chain_lora() {
+            return Err(invalid(
+                "unsupported native Q2 Hexagon fused FFN chain LoRA submission",
             ));
         }
         let [gate, up, down] = tensors;
@@ -2480,6 +2531,12 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 return Err(invalid("mismatched FFN chain residual length"));
             }
             finite_slice(res)?;
+        }
+        if let Some(lora_a_vals) = lora_a {
+            if lora_a_vals.len() != ffn_dim {
+                return Err(invalid("mismatched FFN chain LoRA A length"));
+            }
+            finite_slice(lora_a_vals)?;
         }
         if let Some(block_size) = hadamard_block_size {
             let block_usize = usize::try_from(block_size)?;
@@ -2521,8 +2578,10 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 .map_err(|_| invalid("native Q2 output allocation failed"))?;
             output.resize(hidden, f32::NAN);
         }
-        let op_count =
-            4_u64 + u64::from(hadamard_block_size.is_some()) + u64::from(residual.is_some());
+        let op_count = 4_u64
+            + u64::from(lora_a.is_some())
+            + u64::from(hadamard_block_size.is_some())
+            + u64::from(residual.is_some());
         self.statistics.operations_attempted = self
             .statistics
             .operations_attempted
@@ -2535,13 +2594,29 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let gate_handle = &cache.handles[cache.projections[indices[0]].first_handle];
         let up_handle = &cache.handles[cache.projections[indices[1]].first_handle];
         let down_handle = &cache.handles[cache.projections[indices[2]].first_handle];
-        self.submitter.submit_resident_ffn_chain(
-            [gate_handle, up_handle, down_handle],
-            activation,
-            residual,
-            hadamard_block_size,
-            output.as_mut_slice(),
-        )?;
+        let lora_dot = if let Some(lora_a_vals) = lora_a {
+            let dot = self.submitter.submit_resident_ffn_chain_lora(
+                [gate_handle, up_handle, down_handle],
+                activation,
+                residual,
+                hadamard_block_size,
+                lora_a_vals,
+                output.as_mut_slice(),
+            )?;
+            if !dot.is_finite() {
+                return Err(invalid("nonfinite Hexagon projection value"));
+            }
+            Some(dot)
+        } else {
+            self.submitter.submit_resident_ffn_chain(
+                [gate_handle, up_handle, down_handle],
+                activation,
+                residual,
+                hadamard_block_size,
+                output.as_mut_slice(),
+            )?;
+            None
+        };
         finite_slice(output)?;
         self.statistics.operations_completed = self
             .statistics
@@ -2550,7 +2625,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         self.queue_writes_completed = self.queue_writes_completed.saturating_add(1);
         self.statistics.projections_completed =
             self.statistics.projections_completed.saturating_add(3);
-        Ok(())
+        Ok(lora_dot)
     }
     #[expect(
         clippy::too_many_lines,
@@ -2950,6 +3025,31 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
             activation,
             residual,
             hadamard_block_size,
+            output,
+        )
+    }
+
+    fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
+        self.supports_f32_ffn_chain_lora_inner(tensors)
+    }
+
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        tensors: [&Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<f32> {
+        Self::project_f32_ffn_chain_lora(
+            self,
+            tensors,
+            activation,
+            residual,
+            hadamard_block_size,
+            lora_a,
             output,
         )
     }
@@ -3838,6 +3938,34 @@ mod tests {
 
         fn supports_ffn_chain_multi2(&self) -> bool {
             self.batch_ffn
+        }
+
+        fn supports_ffn_chain_lora(&self) -> bool {
+            true
+        }
+
+        fn submit_resident_ffn_chain_lora(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activation: &[f32],
+            residual: Option<&[f32]>,
+            hadamard_block_size: Option<u32>,
+            lora_a: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<f32, hexagon_native_rpc::Error> {
+            self.submit_resident_ffn_chain(
+                handles,
+                activation,
+                residual,
+                hadamard_block_size,
+                output,
+            )?;
+            self.calls += 1;
+            let ffn_dim = handles[2].columns();
+            if lora_a.len() != ffn_dim {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            Ok(lora_a.iter().sum::<f32>())
         }
 
         fn submit_resident_ffn_chain_multi2(
@@ -5169,6 +5297,29 @@ mod tests {
         assert_eq!(ffn_executor.queue_writes_completed(), 5);
         assert_eq!(ffn_executor.statistics().operations_completed, 24);
         assert_eq!(ffn_executor.statistics().projections_completed, 15);
+
+        let lora_a = vec![0.25_f32; columns];
+        assert!(Pq2ProjectionExecutor::supports_f32_ffn_chain_lora(
+            &ffn_executor,
+            [&ffn_gate_128, &ffn_up_128, &ffn_down_128]
+        ));
+        let mut chain_lora_out = Vec::new();
+        let lora_dot = Pq2ProjectionExecutor::project_f32_ffn_chain_lora(
+            &mut ffn_executor,
+            [&ffn_gate_128, &ffn_up_128, &ffn_down_128],
+            &activation,
+            Some(&residual),
+            Some(64),
+            &lora_a,
+            true,
+            &mut chain_lora_out,
+        )?;
+        assert_eq!(lora_dot, 64.0);
+        assert_eq!(chain_lora_out.len(), columns);
+        assert_eq!(chain_lora_out[0], 778.0);
+        assert_eq!(ffn_executor.queue_writes_completed(), 6);
+        assert_eq!(ffn_executor.statistics().operations_completed, 31);
+        assert_eq!(ffn_executor.statistics().projections_completed, 18);
 
         let adapter_a = vec![0.5_f32; columns];
         let adapter_b = vec![2.0_f32; 64];

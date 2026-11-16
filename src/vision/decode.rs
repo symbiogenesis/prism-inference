@@ -1,7 +1,10 @@
 //! Bounded pure-Rust image decoding for PNG, PPM (P6), and `data:` URLs.
 //!
-//! Avoids external image/compression crate dependencies while enforcing strict
-//! pixel, dimension, checksum, and allocation bounds before decoding pixels.
+//! Uses `#![forbid(unsafe_code)]` `base64ct` and `fdeflate` alongside `crc32fast`
+//! while enforcing strict pixel, dimension, aspect-ratio, checksum, and allocation
+//! bounds before expanding pixels.
+
+use base64ct::{Base64, Encoding as _};
 
 use crate::{Result, invalid};
 
@@ -162,42 +165,14 @@ pub fn decode_base64(encoded: &str, limit: usize) -> Result<Vec<u8>> {
     }
     let mut output = Vec::new();
     output.try_reserve_exact(expected_len)?;
-    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
-        let is_last = index + 1 == quartets;
-        let a = decode_b64_digit(chunk[0])?;
-        let b = decode_b64_digit(chunk[1])?;
-        if is_last && pad == 2 {
-            if chunk[2] != b'=' || chunk[3] != b'=' || (b & 0x0f) != 0 {
-                return Err(invalid("invalid base64 2-byte padding"));
-            }
-            output.push((a << 2) | (b >> 4));
-        } else if is_last && pad == 1 {
-            let c = decode_b64_digit(chunk[2])?;
-            if chunk[3] != b'=' || (c & 0x03) != 0 {
-                return Err(invalid("invalid base64 1-byte padding"));
-            }
-            output.push((a << 2) | (b >> 4));
-            output.push((b << 4) | (c >> 2));
-        } else {
-            let c = decode_b64_digit(chunk[2])?;
-            let d = decode_b64_digit(chunk[3])?;
-            output.push((a << 2) | (b >> 4));
-            output.push((b << 4) | (c >> 2));
-            output.push((c << 6) | d);
-        }
+    output.resize(expected_len, 0);
+    let decoded_len = Base64::decode(bytes, &mut output)
+        .map_err(|_| invalid("invalid base64 payload"))?
+        .len();
+    if decoded_len != expected_len {
+        return Err(invalid("invalid base64 padding length"));
     }
     Ok(output)
-}
-
-fn decode_b64_digit(byte: u8) -> Result<u8> {
-    match byte {
-        b'A'..=b'Z' => Ok(byte - b'A'),
-        b'a'..=b'z' => Ok(byte - b'a' + 26),
-        b'0'..=b'9' => Ok(byte - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err(invalid("invalid base64 character")),
-    }
 }
 
 /// Decodes a non-interlaced 8-bit `PNG` (Gray, `GrayAlpha`, RGB, or RGBA) to `RGB8`.
@@ -556,529 +531,97 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-#[expect(
-    clippy::as_conversions,
-    reason = "Masking by 0xff restricts the constant index to 0..=255 for const CRC-32 tables."
-)]
-const fn build_png_crc32_tables() -> [[u32; 256]; 8] {
-    let mut tables = [[0_u32; 256]; 8];
-    let mut entry = 0_usize;
-    let mut entry_u32 = 0_u32;
-    while entry < 256 {
-        let mut crc = entry_u32;
-        let mut bit = 0;
-        while bit < 8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            bit += 1;
-        }
-        tables[0][entry] = crc;
-        entry += 1;
-        entry_u32 += 1;
-    }
-    let mut lane = 1;
-    while lane < 8 {
-        let mut idx = 0_usize;
-        while idx < 256 {
-            let prev = tables[lane - 1][idx];
-            tables[lane][idx] = (prev >> 8) ^ tables[0][(prev & 0xff) as usize];
-            idx += 1;
-        }
-        lane += 1;
-    }
-    tables
-}
-
-const PNG_CRC32_TABLES: [[u32; 256]; 8] = build_png_crc32_tables();
-
 fn png_crc32(chunk_type: [u8; 4], payload: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in &chunk_type {
-        let idx = usize::from(crc.to_le_bytes()[0] ^ byte);
-        crc = (crc >> 8) ^ PNG_CRC32_TABLES[0][idx];
-    }
-    let (blocks, tail) = payload.as_chunks::<8>();
-    for &block in blocks {
-        let lo = (u32::from_le_bytes([block[0], block[1], block[2], block[3]]) ^ crc).to_le_bytes();
-        crc = PNG_CRC32_TABLES[7][usize::from(lo[0])]
-            ^ PNG_CRC32_TABLES[6][usize::from(lo[1])]
-            ^ PNG_CRC32_TABLES[5][usize::from(lo[2])]
-            ^ PNG_CRC32_TABLES[4][usize::from(lo[3])]
-            ^ PNG_CRC32_TABLES[3][usize::from(block[4])]
-            ^ PNG_CRC32_TABLES[2][usize::from(block[5])]
-            ^ PNG_CRC32_TABLES[1][usize::from(block[6])]
-            ^ PNG_CRC32_TABLES[0][usize::from(block[7])];
-    }
-    for &byte in tail {
-        let idx = usize::from(crc.to_le_bytes()[0] ^ byte);
-        crc = (crc >> 8) ^ PNG_CRC32_TABLES[0][idx];
-    }
-    !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    const MOD_ADLER: u32 = 65_521;
-    let mut s1 = 1_u32;
-    let mut s2 = 0_u32;
-    for chunk in data.chunks(5_552) {
-        for &byte in chunk {
-            s1 += u32::from(byte);
-            s2 += s1;
-        }
-        s1 %= MOD_ADLER;
-        s2 %= MOD_ADLER;
-    }
-    (s2 << 16) | s1
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&chunk_type);
+    hasher.update(payload);
+    hasher.finalize()
 }
 
 fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    const CHUNK_GROWTH: usize = 32 * 1024;
     if data.len() < 6 {
         return Err(invalid("zlib stream too short"));
     }
-    let cmf = data[0];
-    let flg = data[1];
-    if (cmf & 0x0f) != 8
-        || (cmf >> 4) > 7
-        || !(u16::from(cmf) * 256 + u16::from(flg)).is_multiple_of(31)
-        || (flg & 0x20) != 0
-    {
-        return Err(invalid("unsupported or corrupt zlib header"));
-    }
+    let max_out = expected_len
+        .checked_add(1)
+        .ok_or_else(|| invalid("PNG scanline buffer overflow"))?;
+    let initial = max_out.min(CHUNK_GROWTH);
+    let mut output = Vec::new();
+    output.try_reserve_exact(initial)?;
+    output.resize(initial, 0);
 
-    let mut out = Vec::new();
-    out.try_reserve_exact(expected_len)?;
-    let mut reader = BitReader::new(&data[2..data.len() - 4]);
-
-    loop {
-        let bfinal = reader.read_bits(1)?;
-        let btype = reader.read_bits(2)?;
-        match btype {
-            0 => {
-                reader.align_byte();
-                let len = reader.read_u16_le()?;
-                let nlen = reader.read_u16_le()?;
-                if len != !nlen {
-                    return Err(invalid("corrupt uncompressed DEFLATE block length"));
-                }
-                let raw = reader.read_bytes(usize::from(len))?;
-                if out.len() + raw.len() > expected_len {
-                    return Err(invalid(
-                        "DEFLATE uncompressed output exceeds scanline bound",
-                    ));
-                }
-                out.extend_from_slice(raw);
+    let mut decoder = fdeflate::Decompressor::new();
+    let body_end = data.len() - 4;
+    let mut input_index = 0_usize;
+    let mut output_index = 0_usize;
+    while input_index < body_end {
+        let (consumed, produced) = decoder
+            .read(
+                &data[input_index..body_end],
+                &mut output,
+                output_index,
+                false,
+            )
+            .map_err(|_| invalid("corrupt PNG zlib stream"))?;
+        input_index += consumed;
+        output_index += produced;
+        if output_index > expected_len {
+            return Err(invalid("DEFLATE output exceeds scanline bound"));
+        }
+        if decoder.is_done() {
+            return Err(invalid("trailing bytes after PNG zlib stream"));
+        }
+        if consumed == 0 && produced == 0 {
+            if output.len() >= max_out {
+                return Err(invalid("DEFLATE output exceeds scanline bound"));
             }
-            1 => {
-                let (lit_tree, dist_tree) = fixed_trees()?;
-                decode_huffman_block(&mut reader, &lit_tree, &dist_tree, &mut out, expected_len)?;
-            }
-            2 => {
-                let (lit_tree, dist_tree) = read_dynamic_trees(&mut reader)?;
-                decode_huffman_block(&mut reader, &lit_tree, &dist_tree, &mut out, expected_len)?;
-            }
-            _ => return Err(invalid("reserved DEFLATE block type")),
-        }
-        if bfinal == 1 {
-            break;
+            let next_len = output.len().saturating_add(CHUNK_GROWTH).min(max_out);
+            output.try_reserve(next_len - output.len())?;
+            output.resize(next_len, 0);
         }
     }
-
-    let trailer = &data[data.len() - 4..];
-    let expected_adler = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    if adler32(&out) != expected_adler {
-        return Err(invalid("zlib Adler-32 checksum mismatch"));
-    }
-    Ok(out)
-}
-
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    bit_buf: u64,
-    bit_count: u8,
-}
-
-impl<'a> BitReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            pos: 0,
-            bit_buf: 0,
-            bit_count: 0,
+    for (idx, &byte) in data[body_end..].iter().enumerate() {
+        let (consumed, produced) = decoder
+            .read(
+                std::slice::from_ref(&byte),
+                &mut output,
+                output_index,
+                idx == 3,
+            )
+            .map_err(|_| invalid("corrupt PNG zlib trailer or Adler-32 mismatch"))?;
+        output_index += produced;
+        if consumed != 1 || output_index > expected_len {
+            return Err(invalid("PNG zlib trailer or scanline bound mismatch"));
+        }
+        if idx < 3 && decoder.is_done() {
+            return Err(invalid("trailing bytes after PNG zlib stream"));
         }
     }
-
-    fn fill_up_to(&mut self, needed: u8) {
-        while self.bit_count < needed {
-            let Some(&next) = self.bytes.get(self.pos) else {
-                break;
-            };
-            self.pos += 1;
-            self.bit_buf |= u64::from(next) << self.bit_count;
-            self.bit_count += 8;
-        }
+    if !decoder.is_done() || output_index != expected_len {
+        return Err(invalid("PNG decompressed byte count mismatch"));
     }
-
-    const fn consume_bits(&mut self, count: u8) {
-        self.bit_buf >>= count;
-        self.bit_count -= count;
-    }
-
-    fn ensure(&mut self, needed: u8) -> Result<()> {
-        while self.bit_count < needed {
-            let Some(&next) = self.bytes.get(self.pos) else {
-                return Err(invalid("unexpected EOF in DEFLATE bitstream"));
-            };
-            self.pos += 1;
-            self.bit_buf |= u64::from(next) << self.bit_count;
-            self.bit_count += 8;
-        }
-        Ok(())
-    }
-
-    fn read_bits(&mut self, count: u8) -> Result<u32> {
-        if count == 0 {
-            return Ok(0);
-        }
-        self.ensure(count)?;
-        let mask = (1_u64 << count) - 1;
-        let value = u32::try_from(self.bit_buf & mask)?;
-        self.consume_bits(count);
-        Ok(value)
-    }
-
-    fn align_byte(&mut self) {
-        let discard = self.bit_count % 8;
-        self.bit_buf >>= discard;
-        self.bit_count -= discard;
-        // Rewind any lookahead whole bytes loaded for Huffman LUT peeks so subsequent
-        // stored-block byte reads observe the exact stream position.
-        let buffered_bytes = usize::from(self.bit_count / 8);
-        self.pos -= buffered_bytes;
-        self.bit_buf = 0;
-        self.bit_count = 0;
-    }
-
-    fn read_u16_le(&mut self) -> Result<u16> {
-        let lo = self.read_bits(8)?;
-        let hi = self.read_bits(8)?;
-        u16::try_from(lo | (hi << 8)).map_err(|_| invalid("u16 read overflow"))
-    }
-
-    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        if self.bit_count != 0 {
-            return Err(invalid("internal DEFLATE byte alignment mismatch"));
-        }
-        let end = self
-            .pos
-            .checked_add(len)
-            .ok_or_else(|| invalid("DEFLATE slice overflow"))?;
-        let slice = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or_else(|| invalid("unexpected EOF reading stored DEFLATE block"))?;
-        self.pos = end;
-        Ok(slice)
-    }
-}
-
-const MAX_CODE_BITS: usize = 15;
-const HUFFMAN_LUT_BITS: usize = 9;
-const HUFFMAN_LUT_SIZE: usize = 1 << HUFFMAN_LUT_BITS;
-const HUFFMAN_LUT_MASK: u64 = (1_u64 << HUFFMAN_LUT_BITS) - 1;
-
-struct HuffmanTree {
-    counts: [u16; MAX_CODE_BITS + 1],
-    symbols: Vec<u16>,
-    // Packed `(code_len << 12) | symbol` for canonical codes up to 9 bits; 0 means slow path.
-    fast: [u16; HUFFMAN_LUT_SIZE],
-}
-
-impl HuffmanTree {
-    fn from_lengths(lengths: &[u8]) -> Result<Self> {
-        let mut counts = [0_u16; MAX_CODE_BITS + 1];
-        for &len in lengths {
-            let bits = usize::from(len);
-            if bits > MAX_CODE_BITS {
-                return Err(invalid("DEFLATE Huffman code exceeds 15 bits"));
-            }
-            if bits > 0 {
-                counts[bits] = counts[bits]
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("Huffman count overflow"))?;
-            }
-        }
-        let mut left = 1_i32;
-        for &count in &counts[1..] {
-            left <<= 1;
-            left -= i32::from(count);
-            if left < 0 {
-                return Err(invalid("oversubscribed DEFLATE Huffman code"));
-            }
-        }
-        let mut offsets = [0_u16; MAX_CODE_BITS + 1];
-        let mut total = 0_u16;
-        for bits in 1..=MAX_CODE_BITS {
-            offsets[bits] = total;
-            total = total
-                .checked_add(counts[bits])
-                .ok_or_else(|| invalid("Huffman symbol table overflow"))?;
-        }
-        let mut next_code = [0_u32; MAX_CODE_BITS + 1];
-        let mut code = 0_u32;
-        for bits in 1..=MAX_CODE_BITS {
-            code = (code + u32::from(counts[bits - 1])) << 1;
-            next_code[bits] = code;
-        }
-        let mut symbols = vec![0_u16; usize::from(total)];
-        let mut fast = [0_u16; HUFFMAN_LUT_SIZE];
-        for (sym, &len) in lengths.iter().enumerate() {
-            if len != 0 {
-                let len_usize = usize::from(len);
-                let slot = usize::from(offsets[len_usize]);
-                offsets[len_usize] += 1;
-                let sym_u16 =
-                    u16::try_from(sym).map_err(|_| invalid("Huffman symbol index overflow"))?;
-                symbols[slot] = sym_u16;
-
-                let cw = next_code[len_usize];
-                next_code[len_usize] = cw + 1;
-                if len_usize <= HUFFMAN_LUT_BITS && sym < 0x1000 {
-                    let cw16 =
-                        u16::try_from(cw).map_err(|_| invalid("Huffman codeword overflow"))?;
-                    let rev = usize::from(cw16.reverse_bits() >> (16 - len_usize));
-                    let packed = (u16::from(len) << 12) | sym_u16;
-                    let stride = 1_usize << len_usize;
-                    let mut entry_idx = rev;
-                    while entry_idx < HUFFMAN_LUT_SIZE {
-                        fast[entry_idx] = packed;
-                        entry_idx += stride;
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            counts,
-            symbols,
-            fast,
-        })
-    }
-
-    fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
-        const LUT_BITS_U8: u8 = 9;
-        const MAX_BITS_U8: u8 = 15;
-        reader.fill_up_to(LUT_BITS_U8);
-        if let Ok(fast_idx) = usize::try_from(reader.bit_buf & HUFFMAN_LUT_MASK)
-            && let Some(&entry) = self.fast.get(fast_idx)
-            && entry != 0
-        {
-            let bits = u8::try_from(entry >> 12).map_err(|_| invalid("Huffman length overflow"))?;
-            if reader.bit_count < bits {
-                return Err(invalid("unexpected EOF in DEFLATE bitstream"));
-            }
-            reader.consume_bits(bits);
-            return Ok(entry & 0x0fff);
-        }
-
-        reader.fill_up_to(MAX_BITS_U8);
-        let mut code = 0_i32;
-        let mut first = 0_i32;
-        let mut index = 0_i32;
-        for (bit_idx, &count) in self.counts[1..].iter().enumerate() {
-            let bit_pos = u8::try_from(bit_idx).map_err(|_| invalid("Huffman bit depth"))?;
-            if reader.bit_count <= bit_pos {
-                return Err(invalid("unexpected EOF in DEFLATE bitstream"));
-            }
-            let bit = i32::try_from((reader.bit_buf >> bit_pos) & 1)
-                .map_err(|_| invalid("Huffman bit conversion"))?;
-            code |= bit;
-            let count_i32 = i32::from(count);
-            if code - count_i32 < first {
-                let offset = usize::try_from(index + (code - first))
-                    .map_err(|_| invalid("Huffman lookup index"))?;
-                let sym = self
-                    .symbols
-                    .get(offset)
-                    .copied()
-                    .ok_or_else(|| invalid("invalid DEFLATE Huffman symbol"))?;
-                reader.consume_bits(bit_pos + 1);
-                return Ok(sym);
-            }
-            index += count_i32;
-            first += count_i32;
-            first <<= 1;
-            code <<= 1;
-        }
-        Err(invalid("corrupt DEFLATE Huffman code"))
-    }
-}
-
-fn fixed_trees() -> Result<(HuffmanTree, HuffmanTree)> {
-    let mut lit_lengths = [0_u8; 288];
-    lit_lengths[..144].fill(8);
-    lit_lengths[144..256].fill(9);
-    lit_lengths[256..280].fill(7);
-    lit_lengths[280..288].fill(8);
-    let dist_lengths = [5_u8; 32];
-    Ok((
-        HuffmanTree::from_lengths(&lit_lengths)?,
-        HuffmanTree::from_lengths(&dist_lengths)?,
-    ))
-}
-
-fn read_dynamic_trees(reader: &mut BitReader<'_>) -> Result<(HuffmanTree, HuffmanTree)> {
-    const ORDER: [usize; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
-    let hlit = usize::try_from(reader.read_bits(5)?)? + 257;
-    let hdist = usize::try_from(reader.read_bits(5)?)? + 1;
-    let hclen = usize::try_from(reader.read_bits(4)?)? + 4;
-    if hlit > 286 || hdist > 30 {
-        return Err(invalid(
-            "DEFLATE dynamic header lengths exceed RFC 1951 bounds",
-        ));
-    }
-    let mut code_lengths = [0_u8; 19];
-    for &idx in ORDER.iter().take(hclen) {
-        code_lengths[idx] =
-            u8::try_from(reader.read_bits(3)?).map_err(|_| invalid("code length overflow"))?;
-    }
-    let code_tree = HuffmanTree::from_lengths(&code_lengths)?;
-    let total = hlit + hdist;
-    let mut combined = Vec::with_capacity(total);
-    while combined.len() < total {
-        let sym = code_tree.decode(reader)?;
-        match sym {
-            0..=15 => combined.push(u8::try_from(sym).map_err(|_| invalid("symbol range"))?),
-            16 => {
-                let &prev = combined
-                    .last()
-                    .ok_or_else(|| invalid("DEFLATE repeat code at start of table"))?;
-                let repeat = usize::try_from(reader.read_bits(2)?)? + 3;
-                if combined.len() + repeat > total {
-                    return Err(invalid("DEFLATE code length table overflow"));
-                }
-                combined.resize(combined.len() + repeat, prev);
-            }
-            17 => {
-                let repeat = usize::try_from(reader.read_bits(3)?)? + 3;
-                if combined.len() + repeat > total {
-                    return Err(invalid("DEFLATE zero-repeat table overflow"));
-                }
-                combined.resize(combined.len() + repeat, 0);
-            }
-            18 => {
-                let repeat = usize::try_from(reader.read_bits(7)?)? + 11;
-                if combined.len() + repeat > total {
-                    return Err(invalid("DEFLATE long zero-repeat table overflow"));
-                }
-                combined.resize(combined.len() + repeat, 0);
-            }
-            _ => return Err(invalid("invalid DEFLATE code-length alphabet symbol")),
-        }
-    }
-    Ok((
-        HuffmanTree::from_lengths(&combined[..hlit])?,
-        HuffmanTree::from_lengths(&combined[hlit..])?,
-    ))
-}
-
-fn decode_huffman_block(
-    reader: &mut BitReader<'_>,
-    lit_tree: &HuffmanTree,
-    dist_tree: &HuffmanTree,
-    out: &mut Vec<u8>,
-    expected_len: usize,
-) -> Result<()> {
-    const LEN_BASE: [u16; 29] = [
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
-        131, 163, 195, 227, 258,
-    ];
-    const LEN_EXTRA: [u8; 29] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-    ];
-    const DIST_BASE: [u16; 30] = [
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-    ];
-    const DIST_EXTRA: [u8; 30] = [
-        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
-        13, 13,
-    ];
-
-    loop {
-        let sym = lit_tree.decode(reader)?;
-        match sym.cmp(&256) {
-            std::cmp::Ordering::Less => {
-                if out.len() >= expected_len {
-                    return Err(invalid("DEFLATE literal output exceeds scanline bound"));
-                }
-                out.push(u8::try_from(sym).map_err(|_| invalid("literal byte range"))?);
-            }
-            std::cmp::Ordering::Equal => return Ok(()),
-            std::cmp::Ordering::Greater => {
-                let len_idx =
-                    usize::from(sym.checked_sub(257).ok_or_else(|| invalid("bad length"))?);
-                let &base_len = LEN_BASE
-                    .get(len_idx)
-                    .ok_or_else(|| invalid("invalid DEFLATE length symbol"))?;
-                let extra_len = reader.read_bits(LEN_EXTRA[len_idx])?;
-                let length = usize::from(base_len) + usize::try_from(extra_len)?;
-
-                let dist_sym = usize::from(dist_tree.decode(reader)?);
-                let &base_dist = DIST_BASE
-                    .get(dist_sym)
-                    .ok_or_else(|| invalid("invalid DEFLATE distance symbol"))?;
-                let extra_dist = reader.read_bits(DIST_EXTRA[dist_sym])?;
-                let distance = usize::from(base_dist) + usize::try_from(extra_dist)?;
-                if distance == 0 || distance > out.len() {
-                    return Err(invalid(
-                        "DEFLATE backreference points before start of stream",
-                    ));
-                }
-                if out.len() + length > expected_len {
-                    return Err(invalid("DEFLATE copy exceeds scanline bound"));
-                }
-                for _ in 0..length {
-                    let byte = out[out.len() - distance];
-                    out.push(byte);
-                }
-            }
-        }
-    }
+    output.truncate(expected_len);
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn encode_b64(input: &[u8]) -> String {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in input.chunks(3) {
-            let b0 = u32::from(chunk[0]);
-            let b1 = chunk.get(1).copied().map_or(0, u32::from);
-            let b2 = chunk.get(2).copied().map_or(0, u32::from);
-            let triple = (b0 << 16) | (b1 << 8) | b2;
-            out.push(char::from(
-                TABLE[usize::try_from((triple >> 18) & 63).unwrap_or(0)],
-            ));
-            out.push(char::from(
-                TABLE[usize::try_from((triple >> 12) & 63).unwrap_or(0)],
-            ));
-            out.push(if chunk.len() > 1 {
-                char::from(TABLE[usize::try_from((triple >> 6) & 63).unwrap_or(0)])
-            } else {
-                '='
-            });
-            out.push(if chunk.len() > 2 {
-                char::from(TABLE[usize::try_from(triple & 63).unwrap_or(0)])
-            } else {
-                '='
-            });
+    fn test_adler32(data: &[u8]) -> u32 {
+        const MOD_ADLER: u32 = 65_521;
+        let mut s1 = 1_u32;
+        let mut s2 = 0_u32;
+        for chunk in data.chunks(5_552) {
+            for &byte in chunk {
+                s1 += u32::from(byte);
+                s2 += s1;
+            }
+            s1 %= MOD_ADLER;
+            s2 %= MOD_ADLER;
         }
-        out
+        (s2 << 16) | s1
     }
 
     fn write_chunk(out: &mut Vec<u8>, kind: [u8; 4], payload: &[u8]) -> Result<()> {
@@ -1106,8 +649,25 @@ mod tests {
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&(!len).to_le_bytes());
         out.extend_from_slice(remaining);
-        out.extend_from_slice(&adler32(raw).to_be_bytes());
+        out.extend_from_slice(&test_adler32(raw).to_be_bytes());
         Ok(out)
+    }
+
+    fn build_png_from_zlib(
+        width: u32,
+        height: u32,
+        color_type: u8,
+        zlib: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
+        write_chunk(&mut png, *b"IHDR", &ihdr)?;
+        write_chunk(&mut png, *b"IDAT", zlib)?;
+        write_chunk(&mut png, *b"IEND", &[])?;
+        Ok(png)
     }
 
     fn build_test_png(
@@ -1116,21 +676,16 @@ mod tests {
         color_type: u8,
         raw_scanlines: &[u8],
     ) -> Result<Vec<u8>> {
-        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
-        let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&width.to_be_bytes());
-        ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
-        write_chunk(&mut png, *b"IHDR", &ihdr)?;
-        write_chunk(&mut png, *b"IDAT", &stored_zlib(raw_scanlines)?)?;
-        write_chunk(&mut png, *b"IEND", &[])?;
-        Ok(png)
+        build_png_from_zlib(width, height, color_type, &stored_zlib(raw_scanlines)?)
     }
 
     #[test]
     fn base64_ppm_and_png_filters_decode_cleanly() -> Result<()> {
         let ppm = b"P6\n# test comment\n2 1\n255\n\x01\x02\x03\xff\x80\x00";
-        let url = format!("data:image/x-portable-pixmap;base64,{}", encode_b64(ppm));
+        let url = format!(
+            "data:image/x-portable-pixmap;base64,{}",
+            Base64::encode_string(ppm)
+        );
         let (decoded, raw) = decode_image_data_url(&url)?;
         assert_eq!(raw, ppm);
         assert_eq!(
@@ -1149,7 +704,7 @@ mod tests {
             1, 255, 255, 255, 255, 1, 0, 1, 0, // row 1 Sub: px0=(255,255,255), px1=(0,255,0)
         ];
         let png = build_test_png(2, 2, 6, &raw_png_lines)?;
-        let png_url = format!("data:image/png;base64,{}", encode_b64(&png));
+        let png_url = format!("data:image/png;base64,{}", Base64::encode_string(&png));
         let (decoded_png, _) = decode_image_data_url(&png_url)?;
         assert_eq!(
             decoded_png.rgb,
@@ -1208,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn png_crc32_table_matches_bitwise_reference() {
+    fn png_crc32_matches_bitwise_reference() {
         let mut payload = Vec::new();
         for len in 0..=40_usize {
             assert_eq!(
@@ -1223,50 +778,9 @@ mod tests {
     }
 
     #[test]
-    fn huffman_lut_decodes_fixed_long_and_mixed_stored_blocks() -> Result<()> {
-        // Test HuffmanTree LUT + slow fallback for >9-bit codewords (10-bit symbol 10, 11-bit symbol 11).
-        let mut lengths = vec![0_u8; 12];
-        for length in lengths.iter_mut().take(9) {
-            *length = 4;
-        }
-        lengths[9] = 5;
-        lengths[10] = 10;
-        lengths[11] = 11;
-        // Canonical prefixes for 9x4-bit (0000..1000), 1x5-bit (10010),
-        // let's use exact complete lengths summing to 1: wait make code complete at 11 bits:
-        // Wait HuffmanTree accepts incomplete trees as long as left >= 0!
-        // Compute exact canonical MSB codes:
-        // len 4: count=9 -> 0000..1000; next at 5 = 10010 (sym 9);
-        // next at 10 = (10011 << 5) = 0b10_0110_0000 (sym 10);
-        // next at 11 = (0b10_0110_0001 << 1) = 0b100_1100_0010 (sym 11).
-        let tree = HuffmanTree::from_lengths(&lengths)?;
-        let mut stream = Vec::new();
-        let mut acc = 0_u32;
-        let mut acc_bits = 0_u8;
-        let code3 = (0b0011_u32).reverse_bits() >> (32 - 4);
-        let code9 = (0b10010_u32).reverse_bits() >> (32 - 5);
-        let code10 = (0b10_0110_0000_u32).reverse_bits() >> (32 - 10);
-        let code11 = (0b100_1100_0010_u32).reverse_bits() >> (32 - 11);
-        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code3, 4);
-        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code9, 5);
-        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code10, 10);
-        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code11, 11);
-        if acc_bits > 0 {
-            stream.push((acc & 0xff).to_le_bytes()[0]);
-        }
-        let mut reader = BitReader::new(&stream);
-        assert_eq!(tree.decode(&mut reader)?, 3);
-        assert_eq!(tree.decode(&mut reader)?, 9);
-        assert_eq!(tree.decode(&mut reader)?, 10);
-        assert_eq!(tree.decode(&mut reader)?, 11);
-        assert!(tree.decode(&mut reader).is_err());
-
-        // Reject unpopulated canonical 15-bit bit sequence ("corrupt DEFLATE Huffman code").
-        let mut bad_reader = BitReader::new(&[0xff_u8, 0xff]);
-        assert!(tree.decode(&mut bad_reader).is_err());
-
+    fn deflate_decodes_compressed_and_mixed_blocks_and_rejects_corrupt_streams() -> Result<()> {
         // Test mixed DEFLATE zlib stream: Block 1 fixed Huffman (BFINAL=0) [0, 10, 20] + EOB,
-        // followed by Block 2 stored (BFINAL=1) [30] so align_byte rewinds lookahead bytes.
+        // followed by Block 2 stored (BFINAL=1) [30].
         let mut zlib = vec![0x78, 0x9c];
         let mut deflate_acc = 0_u32;
         let mut deflate_bits = 0_u8;
@@ -1276,36 +790,58 @@ mod tests {
             let (cw, len) = fixed_lit_code(sym);
             push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, cw, len);
         }
-        // Start stored block (BFINAL=1, BTYPE=0) right inside bitstream, then byte-align.
         push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, 1, 1); // BFINAL=1
         push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, 0, 2); // BTYPE=0 (stored)
         if deflate_bits > 0 {
             zlib.push((deflate_acc & 0xff).to_le_bytes()[0]);
         }
-        let stored_payload = [30_u8];
         let len_u16 = 1_u16;
         zlib.extend_from_slice(&len_u16.to_le_bytes());
         zlib.extend_from_slice(&(!len_u16).to_le_bytes());
-        zlib.extend_from_slice(&stored_payload);
-        zlib.extend_from_slice(&adler32(&[0, 10, 20, 30]).to_be_bytes());
+        zlib.push(30_u8);
+        zlib.extend_from_slice(&test_adler32(&[0, 10, 20, 30]).to_be_bytes());
 
-        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
-        let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&1_u32.to_be_bytes());
-        ihdr.extend_from_slice(&1_u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        write_chunk(&mut png, *b"IHDR", &ihdr)?;
-        write_chunk(&mut png, *b"IDAT", &zlib)?;
-        write_chunk(&mut png, *b"IEND", &[])?;
-        let decoded = decode_png(&png)?;
+        let decoded = decode_png(&build_png_from_zlib(1, 1, 2, &zlib)?)?;
         assert_eq!(decoded.rgb, vec![10, 20, 30]);
+
+        // Compressed fdeflate stream round-trip (larger than initial 32 KiB buffer).
+        let row_count = 130_u32;
+        let row_bytes = 256_usize * 3;
+        let mut raw_large = Vec::with_capacity(usize::try_from(row_count)? * (row_bytes + 1));
+        for y in 0..row_count {
+            raw_large.push(0); // None filter
+            for x in 0..row_bytes {
+                raw_large.push(u8::try_from((usize::try_from(y)? * 17 + x) & 0xff).unwrap_or(0));
+            }
+        }
+        let compressed_zlib = fdeflate::compress_to_vec(&raw_large);
+        let decoded_large = decode_png(&build_png_from_zlib(256, row_count, 2, &compressed_zlib)?)?;
+        assert_eq!(
+            decoded_large.rgb.len(),
+            256 * usize::try_from(row_count)? * 3
+        );
+
+        // Corrupt Adler-32 trailer must be rejected even with valid chunk CRC.
+        let mut bad_adler = zlib.clone();
+        let last_idx = bad_adler.len() - 1;
+        bad_adler[last_idx] ^= 1;
+        assert!(decode_png(&build_png_from_zlib(1, 1, 2, &bad_adler)?).is_err());
+
+        // Trailing garbage after valid zlib trailer must be rejected.
+        let mut trailing = zlib;
+        trailing.push(0x00);
+        assert!(decode_png(&build_png_from_zlib(1, 1, 2, &trailing)?).is_err());
+
+        // Overlong uncompressed IDAT payload exceeding expected scanline length must be rejected.
+        let overlong = stored_zlib(&[0, 10, 20, 30, 40])?;
+        assert!(decode_png(&build_png_from_zlib(1, 1, 2, &overlong)?).is_err());
         Ok(())
     }
 
     #[test]
     fn decode_image_data_url_raw_and_early_ihdr_budget_guard() -> Result<()> {
         let png = build_test_png(1, 1, 2, &[0, 11, 22, 33])?;
-        let url = format!("data:image/png;base64,{}", encode_b64(&png));
+        let url = format!("data:image/png;base64,{}", Base64::encode_string(&png));
         let (fmt, raw) = decode_image_data_url_raw(&url)?;
         assert_eq!(fmt, ImageContainerFormat::Png);
         assert_eq!(raw, png);

@@ -235,7 +235,11 @@ fn packed_production_prefill_matches_serial_causal_state_and_reserved_scores() -
                 actual.attention_scratch.scores = vec![f32::NAN; count * (63 + count) / 2];
                 actual.run(arithmetic, &|| Ok(()))?;
                 actual.assert_same(&expected)?;
-                let expected_rows = if count == 1 { 4 } else { count };
+                let expected_rows = if count == 1 {
+                    actual.geometry.heads
+                } else {
+                    count
+                };
                 assert_eq!(
                     actual.attention_scratch.scores.len(),
                     expected_rows * (63 + count)
@@ -248,8 +252,9 @@ fn packed_production_prefill_matches_serial_causal_state_and_reserved_scores() -
                     count,
                 )?;
                 assert_eq!(reservation, count * 128 * size_of::<f32>());
-                // Singleton tiles use the ordinary four-worker score reserve.
-                let combined_reservation = reservation.max(4 * 128 * size_of::<f32>());
+                // Singleton tiles use the ordinary 24-head grouped decode score reserve.
+                let combined_reservation =
+                    reservation.max(actual.geometry.heads * 128 * size_of::<f32>());
                 assert!(
                     combined_reservation
                         >= actual.attention_scratch.scores.len() * size_of::<f32>()

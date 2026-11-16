@@ -1270,38 +1270,36 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn constrained_sampler_masks_neg_infinity_gates_eog_and_rejects_dead_ends_without_rng_advance()
-    -> Result<()> {
-        use crate::sampling::{Greedy, ReferenceSampler, Sampling};
+    #[derive(Clone)]
+    struct RecordingNegInfSampler {
+        observed: Vec<Vec<u32>>,
+        forced_choice: Option<u32>,
+        draws: usize,
+    }
 
-        #[derive(Clone)]
-        struct RecordingNegInfSampler {
-            observed: Vec<Vec<u32>>,
-            forced_choice: Option<u32>,
-            draws: usize,
-        }
-
-        impl Sampler for RecordingNegInfSampler {
-            fn sample(&mut self, logits: &[f32]) -> Result<u32> {
-                self.observed
-                    .push(logits.iter().map(|value| value.to_bits()).collect());
-                self.draws += 1;
-                if let Some(forced) = self.forced_choice {
-                    return Ok(forced);
-                }
-                let mut best_idx = 0_usize;
-                let mut best_val = f32::NEG_INFINITY;
-                for (idx, &val) in logits.iter().enumerate() {
-                    if val > best_val {
-                        best_val = val;
-                        best_idx = idx;
-                    }
-                }
-                Ok(u32::try_from(best_idx)?)
+    impl Sampler for RecordingNegInfSampler {
+        fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+            self.observed
+                .push(logits.iter().map(|value| value.to_bits()).collect());
+            self.draws += 1;
+            if let Some(forced) = self.forced_choice {
+                return Ok(forced);
             }
+            let mut best_idx = 0_usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (idx, &val) in logits.iter().enumerate() {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = idx;
+                }
+            }
+            Ok(u32::try_from(best_idx)?)
         }
+    }
 
+    type ConstrainedTestCandidates = (Arc<[Candidate]>, Arc<[u32]>);
+
+    fn constrained_test_candidates() -> Result<ConstrainedTestCandidates> {
         let vocab: Vec<&[u8]> = vec![b"a", b"b", b"c", b""];
         let candidates: Arc<[Candidate]> = vocab
             .iter()
@@ -1309,7 +1307,12 @@ mod tests {
             .map(|(idx, piece)| Candidate::from_piece(u32::try_from(idx)?, piece))
             .collect::<Result<Vec<_>>>()?
             .into();
-        let eog: Arc<[u32]> = Arc::from([3_u32]);
+        Ok((candidates, Arc::from([3_u32])))
+    }
+
+    #[test]
+    fn constrained_sampler_masks_neg_infinity_and_gates_eog() -> Result<()> {
+        let (candidates, eog) = constrained_test_candidates()?;
         let grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"ab\"")?, "root")?;
 
         let mut masked_sampler = GrammarConstrainedSampler::new(
@@ -1318,15 +1321,14 @@ mod tests {
                 forced_choice: None,
                 draws: 0,
             },
-            grammar.clone(),
-            Arc::clone(&candidates),
-            Arc::clone(&eog),
+            grammar,
+            candidates,
+            eog,
         )?;
 
         // Step 1: only token 0 ("a") is legal; EOG (3) has highest logit but must be masked to -inf.
         assert!(!masked_sampler.grammar().is_accepting());
-        let first = masked_sampler.sample(&[1.0, 5.0, 4.0, 10.0])?;
-        assert_eq!(first, 0);
+        assert_eq!(masked_sampler.sample(&[1.0, 5.0, 4.0, 10.0])?, 0);
         assert_eq!(
             masked_sampler.inner().observed[0],
             [
@@ -1339,17 +1341,23 @@ mod tests {
         assert!(!masked_sampler.grammar().is_accepting());
 
         // Step 2: only token 1 ("b") is legal.
-        let second = masked_sampler.sample(&[9.0, 2.0, 8.0, 10.0])?;
-        assert_eq!(second, 1);
+        assert_eq!(masked_sampler.sample(&[9.0, 2.0, 8.0, 10.0])?, 1);
         assert!(masked_sampler.grammar().is_accepting());
 
         // Step 3: grammar is accepting; only EOG (3) is legal and grammar stays accepting.
-        let third = masked_sampler.sample(&[9.0, 8.0, 7.0, -2.0])?;
-        assert_eq!(third, 3);
+        assert_eq!(masked_sampler.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
         assert!(masked_sampler.grammar().is_accepting());
         assert_eq!(masked_sampler.inner().draws, 3);
+        Ok(())
+    }
 
-        // Greedy and ReferenceSampler also work cleanly through finite-compaction fallback.
+    #[test]
+    fn constrained_sampler_greedy_reference_and_dead_end_errors() -> Result<()> {
+        use crate::sampling::{Greedy, ReferenceSampler, Sampling};
+
+        let (candidates, eog) = constrained_test_candidates()?;
+        let grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"ab\"")?, "root")?;
+
         let mut greedy = GrammarConstrainedSampler::new(
             Greedy,
             grammar.clone(),
@@ -1375,12 +1383,15 @@ mod tests {
             Arc::clone(&eog),
         )?;
         let mut cloned = reference.clone();
-        assert_eq!(reference.sample(&[1.0, 5.0, 4.0, 10.0])?, 0);
-        assert_eq!(cloned.sample(&[1.0, 5.0, 4.0, 10.0])?, 0);
-        assert_eq!(reference.sample(&[9.0, 2.0, 8.0, 10.0])?, 1);
-        assert_eq!(cloned.sample(&[9.0, 2.0, 8.0, 10.0])?, 1);
-        assert_eq!(reference.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
-        assert_eq!(cloned.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
+        for logits in [
+            [1.0, 5.0, 4.0, 10.0],
+            [9.0, 2.0, 8.0, 10.0],
+            [9.0, 8.0, 7.0, -2.0],
+        ] {
+            let left = reference.sample(&logits)?;
+            let right = cloned.sample(&logits)?;
+            assert_eq!(left, right);
+        }
 
         // Dead-end grammar (zero allowed tokens) fails BEFORE advancing inner sampler RNG.
         let dead_grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"z\"")?, "root")?;

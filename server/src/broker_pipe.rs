@@ -762,8 +762,8 @@ fn fail_reader_protocol(
 fn decode_verified_section(
     payload: &[u8; VERIFIED_SECTION_PAYLOAD_BYTES],
 ) -> io::Result<VerifiedSectionDescriptor> {
-    let slot = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let handle = u64::from_be_bytes([
+    let slot = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let handle = u64::from_le_bytes([
         payload[4],
         payload[5],
         payload[6],
@@ -773,7 +773,7 @@ fn decode_verified_section(
         payload[10],
         payload[11],
     ]);
-    let byte_len = u64::from_be_bytes([
+    let byte_len = u64::from_le_bytes([
         payload[12],
         payload[13],
         payload[14],
@@ -1346,9 +1346,9 @@ mod tests {
 
     fn encode_section_payload(slot: u32, handle: u64, byte_len: u64, sha256: [u8; 32]) -> [u8; 52] {
         let mut out = [0_u8; 52];
-        out[..4].copy_from_slice(&slot.to_be_bytes());
-        out[4..12].copy_from_slice(&handle.to_be_bytes());
-        out[12..20].copy_from_slice(&byte_len.to_be_bytes());
+        out[..4].copy_from_slice(&slot.to_le_bytes());
+        out[4..12].copy_from_slice(&handle.to_le_bytes());
+        out[12..20].copy_from_slice(&byte_len.to_le_bytes());
         out[20..52].copy_from_slice(&sha256);
         out
     }

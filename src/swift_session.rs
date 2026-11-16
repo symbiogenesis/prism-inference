@@ -2676,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_checkpoints_charge_explicit_state_budgets_and_reject_invalid_bounds() -> Result<()> {
+    fn branch_checkpoints_validate_bounds_and_disabled_rejections() -> Result<()> {
         use super::{
             BranchCheckpoints, MAX_REUSABLE_CHECKPOINTS, validate_execution_capacity_with_reuse,
         };
@@ -2695,9 +2695,7 @@ mod tests {
         let cache = KvCachePolicy::Rotated4;
         let base = NON_CONTEXT_MEMORY_BYTES
             + u64::try_from(context)? * context_token_memory_bytes(cache);
-        let state_budget = u64::try_from(selected_state_budget(context, cache)?)?;
 
-        // Default checkpoints=1 with Disabled or Latest adds no extra process reserve.
         for reuse in [PromptReuse::Disabled, PromptReuse::Latest] {
             validate_execution_capacity_with_reuse(
                 context,
@@ -2745,6 +2743,21 @@ mod tests {
                 .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn branch_checkpoints_charge_state_budgets_across_reuse_modes() -> Result<()> {
+        use super::{
+            BranchCheckpoints, MAX_REUSABLE_CHECKPOINTS, validate_execution_capacity_with_reuse,
+        };
+        use crate::runtime::PromptReuse;
+
+        let context = 8_192;
+        let cache = KvCachePolicy::Rotated4;
+        let base = NON_CONTEXT_MEMORY_BYTES
+            + u64::try_from(context)? * context_token_memory_bytes(cache);
+        let state_budget = u64::try_from(selected_state_budget(context, cache)?)?;
 
         // PromptEndAndLatest with slots=1 charges 1 * selected_state_budget.
         let prompt_end_required = base + state_budget;

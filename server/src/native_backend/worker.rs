@@ -395,6 +395,114 @@ impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for WorkerThreadHexago
             )
         })
     }
+
+    fn supports_f32_ffn_chain(
+        &self,
+        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+    ) -> bool {
+        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
+            slot.as_ref().is_some_and(|executor| {
+                bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain(
+                    executor, tensors,
+                )
+            })
+        })
+    }
+
+    fn project_f32_ffn_chain(
+        &mut self,
+        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> bonsai_prism_runtime::Result<()> {
+        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+            let Some(executor) = slot.as_mut() else {
+                output.clear();
+                return Err(std::io::Error::other("missing worker Hexagon executor").into());
+            };
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain(
+                executor,
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                pinned,
+                output,
+            )
+        })
+    }
+
+    fn project_f32_ffn_chain_tokens(
+        &mut self,
+        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+        activations: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+        hadamard_block_size: Option<u32>,
+        pinned: bool,
+        outputs: &mut [Vec<f32>],
+    ) -> bonsai_prism_runtime::Result<()> {
+        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+            let Some(executor) = slot.as_mut() else {
+                for output in outputs.iter_mut() {
+                    output.clear();
+                }
+                return Err(std::io::Error::other("missing worker Hexagon executor").into());
+            };
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain_tokens(
+                executor,
+                tensors,
+                activations,
+                residuals,
+                hadamard_block_size,
+                pinned,
+                outputs,
+            )
+        })
+    }
+
+    fn supports_f32_ffn_chain_lora(
+        &self,
+        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+    ) -> bool {
+        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
+            slot.as_ref().is_some_and(|executor| {
+                bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain_lora(
+                    executor, tensors,
+                )
+            })
+        })
+    }
+
+    fn project_f32_ffn_chain_lora(
+        &mut self,
+        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+        activation: &[f32],
+        residual: Option<&[f32]>,
+        hadamard_block_size: Option<u32>,
+        lora_a: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> bonsai_prism_runtime::Result<f32> {
+        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
+            let Some(executor) = slot.as_mut() else {
+                output.clear();
+                return Err(std::io::Error::other("missing worker Hexagon executor").into());
+            };
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain_lora(
+                executor,
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                lora_a,
+                pinned,
+                output,
+            )
+        })
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]

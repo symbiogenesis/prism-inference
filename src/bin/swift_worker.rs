@@ -212,13 +212,16 @@ fn serve_request(
 fn serve_with_cancellation(
     session: &mut SwiftSession,
     rx: &mpsc::Receiver<Result<Vec<u8>>>,
+    recycle_tx: &mpsc::SyncSender<Vec<u8>>,
     cancellation: &Cancellation,
     output: &mut impl Write,
 ) -> Result<()> {
     write_readiness(session, output)?;
     while let Ok(frame_result) = rx.recv() {
-        let bytes = frame_result?;
+        let mut bytes = frame_result?;
         serve_request(session, output, &bytes, cancellation)?;
+        bytes.clear();
+        let _ = recycle_tx.try_send(bytes);
     }
     Ok(())
 }
@@ -234,6 +237,7 @@ fn main() -> ExitCode {
     let result = load().and_then(|mut session| {
         let cancellation = Cancellation::default();
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(1);
+        let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(2);
         let reader_cancel = cancellation.clone();
         let handle = std::thread::Builder::new()
             .name("swift-stdin".to_owned())
@@ -241,6 +245,11 @@ fn main() -> ExitCode {
                 let mut input = BufReader::with_capacity(8192, io::stdin().lock());
                 let mut bytes = Vec::new();
                 loop {
+                    if bytes.capacity() == 0
+                        && let Ok(recycled) = recycle_rx.try_recv()
+                    {
+                        bytes = recycled;
+                    }
                     match frame(&mut input, &mut bytes) {
                         Ok(true) => {
                             let frame_bytes = std::mem::take(&mut bytes);
@@ -260,8 +269,13 @@ fn main() -> ExitCode {
                     }
                 }
             })?;
-        let outcome =
-            serve_with_cancellation(&mut session, &rx, &cancellation, &mut io::stdout().lock());
+        let outcome = serve_with_cancellation(
+            &mut session,
+            &rx,
+            &recycle_tx,
+            &cancellation,
+            &mut io::stdout().lock(),
+        );
         drop(rx);
         if handle.is_finished() {
             let _ = handle.join();

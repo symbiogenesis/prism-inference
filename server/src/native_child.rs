@@ -552,12 +552,12 @@ async fn serve_prepared(
             result
         }
         PreparedTransport::BrokerPipe { endpoint, key } => {
-            crate::native_backend::serve_broker_pipe_with_placement(
+            Box::pin(crate::native_backend::serve_broker_pipe_with_placement(
                 endpoint,
                 session,
                 key.as_str(),
                 placement,
-            )
+            ))
             .await
         }
     };
@@ -1466,6 +1466,263 @@ mod tests {
                 "private-inference-startup-failed stage=environment errorKind=PermissionDenied osCode="
             ));
             assert!(!output.contains(model.to_string_lossy().as_ref()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_cpu_prefill_gdn_enforces_f16_and_non_speculative_pairing() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
+        };
+        let (_directory, [model, key, _adapter]) = files()?;
+        let reserve = 64 * 1024 * 1024_u64;
+        let prefill_mem = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES + reserve;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        for (mode, expected_chunkwise) in [("sequential", false), ("wy-f32", true)] {
+            let mut args = base.clone();
+            args.extend(
+                [
+                    "--kv-cache",
+                    "f16",
+                    "--context-tokens",
+                    "8192",
+                    "--memory-limit-bytes",
+                    &prefill_mem.to_string(),
+                    "--cpu-prefill-tokens",
+                    "16",
+                    "--cpu-prefill-scratch-bytes",
+                    &reserve.to_string(),
+                    "--cpu-prefill-gdn",
+                    mode,
+                ]
+                .map(OsString::from),
+            );
+            let parsed = parse(args.clone())?;
+            assert_eq!(
+                parsed.cpu_prefill.map(CpuPrefill::chunkwise_gdn),
+                Some(expected_chunkwise)
+            );
+            args.extend(["--cpu-prefill-gdn", mode].map(OsString::from));
+            assert!(parse(args).is_err());
+        }
+
+        for bad in [
+            vec!["--cpu-prefill-gdn", "wy-f32"],
+            vec!["--cpu-prefill-gdn", "sequential"],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                &prefill_mem.to_string(),
+                "--cpu-prefill-tokens",
+                "16",
+                "--cpu-prefill-scratch-bytes",
+                &reserve.to_string(),
+                "--cpu-prefill-gdn",
+                "triangular",
+            ],
+            vec![
+                "--kv-cache",
+                "rsq4",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                &prefill_mem.to_string(),
+                "--cpu-prefill-tokens",
+                "16",
+                "--cpu-prefill-scratch-bytes",
+                &reserve.to_string(),
+                "--cpu-prefill-gdn",
+                "wy-f32",
+            ],
+        ] {
+            let mut args = base.clone();
+            args.extend(bad.into_iter().map(OsString::from));
+            assert!(parse(args).is_err());
+        }
+        let (_dir2, spec_base, _spec_mem) = speculation_arguments()?;
+        let mut spec_gdn = spec_base;
+        spec_gdn.extend(
+            [
+                "--cpu-prefill-gdn",
+                "wy-f32",
+                "--cpu-speculative-tokens",
+                "4",
+                "--cpu-verification-scratch-bytes",
+                "16777216",
+                "--cpu-speculative-checkpoint-bytes",
+                &STATE_MEMORY_BYTES.to_string(),
+            ]
+            .map(OsString::from),
+        );
+        assert!(parse(spec_gdn).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_prompt_end_and_branch_checkpoints_enforce_budgets() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, MAX_REUSABLE_CHECKPOINTS, NON_CONTEXT_MEMORY_BYTES,
+            STATE_MEMORY_BYTES,
+        };
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base_mem = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        let default_cfg = parse(base.clone())?;
+        assert_eq!(default_cfg.prompt_reuse, PromptReuse::Disabled);
+        assert_eq!(default_cfg.branch_checkpoints.checkpoints(), 1);
+        assert_eq!(default_cfg.branch_checkpoints.checkpoint_bytes(), None);
+
+        let state_u64 = u64::try_from(STATE_MEMORY_BYTES).map_err(io::Error::other)?;
+        let prompt_end_mem = base_mem + state_u64;
+        let mut prompt_end_args = base.clone();
+        prompt_end_args.extend(
+            [
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                &prompt_end_mem.to_string(),
+                "--prompt-reuse",
+                "prompt-end-and-latest",
+            ]
+            .map(OsString::from),
+        );
+        let prompt_end_cfg = parse(prompt_end_args.clone())?;
+        assert_eq!(prompt_end_cfg.prompt_reuse, PromptReuse::PromptEndAndLatest);
+        assert_eq!(prompt_end_cfg.branch_checkpoints.checkpoints(), 1);
+        prompt_end_args[14] = (prompt_end_mem - 1).to_string().into();
+        assert!(parse(prompt_end_args).is_err());
+
+        for slots in 2..=MAX_REUSABLE_CHECKPOINTS {
+            let slots_u64 = u64::try_from(slots).map_err(io::Error::other)?;
+            let branch_bytes = slots_u64 * state_u64;
+            let total_mem = base_mem + branch_bytes;
+            for mode in ["latest", "prompt-end-and-latest"] {
+                let mut args = base.clone();
+                args.extend(
+                    [
+                        "--kv-cache",
+                        "f16",
+                        "--context-tokens",
+                        "8192",
+                        "--memory-limit-bytes",
+                        &total_mem.to_string(),
+                        "--prompt-reuse",
+                        mode,
+                        "--prompt-reuse-checkpoints",
+                        &slots.to_string(),
+                        "--prompt-reuse-checkpoint-bytes",
+                        &branch_bytes.to_string(),
+                    ]
+                    .map(OsString::from),
+                );
+                let cfg = parse(args.clone())?;
+                assert_eq!(cfg.branch_checkpoints.checkpoints(), slots);
+                assert_eq!(
+                    cfg.branch_checkpoints.checkpoint_bytes(),
+                    Some(usize::try_from(branch_bytes).map_err(io::Error::other)?)
+                );
+                let mut low_mem = args.clone();
+                low_mem[14] = (total_mem - 1).to_string().into();
+                assert!(parse(low_mem).is_err());
+                let mut low_branch = args;
+                low_branch[20] = (branch_bytes - 1).to_string().into();
+                assert!(parse(low_branch).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_branch_checkpoints_reject_missing_capacity_and_invalid_ranges() -> io::Result<()>
+    {
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+        for bad in [
+            vec!["--prompt-reuse", "prompt-end-and-latest"],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "4",
+            ],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                "30000000000",
+                "--prompt-reuse",
+                "disabled",
+                "--prompt-reuse-checkpoints",
+                "2",
+            ],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                "30000000000",
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "0",
+            ],
+            vec![
+                "--kv-cache",
+                "f16",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                "30000000000",
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "9",
+            ],
+        ] {
+            let mut args = base.clone();
+            args.extend(bad.into_iter().map(OsString::from));
+            assert!(parse(args).is_err());
         }
         Ok(())
     }

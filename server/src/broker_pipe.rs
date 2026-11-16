@@ -16,7 +16,7 @@ use std::{
     io::{self, Read, Write},
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
@@ -44,6 +44,9 @@ const KIND_DATA: u8 = 2;
 const KIND_EOF: u8 = 3;
 const KIND_RESET: u8 = 4;
 const KIND_SERVER_READY: u8 = 5;
+const KIND_VERIFIED_SECTION: u8 = 6;
+const VERIFIED_SECTION_PAYLOAD_BYTES: usize = 52;
+const MAX_VERIFIED_SECTIONS: usize = 8;
 
 static STDIO_CLAIMED: AtomicBool = AtomicBool::new(false);
 
@@ -256,10 +259,53 @@ impl Drop for TxCloser {
     }
 }
 
+/// Broker-attested inherited section descriptor received before server readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    unreachable_pub,
+    reason = "broker_pipe is crate-private until attested section intake is exposed externally."
+)]
+pub struct VerifiedSectionDescriptor {
+    /// Unique section slot or artifact kind identifier.
+    pub slot: u32,
+    /// Inherited raw handle value supplied by the parent broker.
+    pub handle: u64,
+    /// Byte length of the verified section payload.
+    pub byte_len: u64,
+    /// Expected SHA-256 digest of the verified section bytes.
+    pub sha256: [u8; 32],
+}
+
+struct SectionState {
+    sections: Vec<VerifiedSectionDescriptor>,
+    ready: bool,
+}
+
+struct SectionShared {
+    state: Mutex<SectionState>,
+    #[cfg(test)]
+    updated: Condvar,
+}
+
+impl SectionShared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SectionState {
+                sections: Vec::new(),
+                ready: false,
+            }),
+            #[cfg(test)]
+            updated: Condvar::new(),
+        })
+    }
+}
+
 /// Child-side acceptor for sequential broker-pipe streams.
 pub(crate) struct ServerEndpoint {
     accept_rx: mpsc::Receiver<PipeConnection>,
     tx: Arc<TxShared>,
+    sections: Arc<SectionShared>,
+    verified_sections: OnceLock<Vec<VerifiedSectionDescriptor>>,
     #[cfg(test)]
     pool: Arc<BufferPool>,
     _closer: Arc<TxCloser>,
@@ -316,16 +362,27 @@ impl ServerEndpoint {
         writer.flush()?;
 
         let tx = TxShared::new();
+        let sections = SectionShared::new();
         let pool = BufferPool::new();
         let closer = Arc::new(TxCloser(Arc::clone(&tx)));
         let (accept_tx, accept_rx) = mpsc::channel(1);
 
         let rx_tx = Arc::clone(&tx);
+        let rx_sections = Arc::clone(&sections);
         let rx_pool = Arc::clone(&pool);
         let rx_closer = Arc::clone(&closer);
         std::thread::Builder::new()
             .name("broker-pipe-rx".to_owned())
-            .spawn(move || run_reader(reader, &accept_tx, &rx_tx, &rx_pool, &rx_closer))
+            .spawn(move || {
+                run_reader(
+                    reader,
+                    &accept_tx,
+                    &rx_tx,
+                    &rx_sections,
+                    &rx_pool,
+                    &rx_closer,
+                );
+            })
             .map_err(|_| io::Error::other("failed to start broker-pipe reader thread"))?;
 
         let tx_worker = Arc::clone(&tx);
@@ -339,6 +396,8 @@ impl ServerEndpoint {
             Self {
                 accept_rx,
                 tx,
+                sections,
+                verified_sections: OnceLock::new(),
                 #[cfg(test)]
                 pool,
                 _closer: closer,
@@ -347,11 +406,70 @@ impl ServerEndpoint {
         ))
     }
 
+    /// Returns broker-attested section descriptors received before server readiness.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Consumed by attested section mapping during service integration."
+        )
+    )]
+    #[expect(
+        unreachable_pub,
+        reason = "broker_pipe is crate-private until attested section intake is exposed externally."
+    )]
+    pub fn verified_sections(&self) -> &[VerifiedSectionDescriptor] {
+        self.verified_sections.get().map_or(&[], Vec::as_slice)
+    }
+
+    #[cfg(test)]
+    fn wait_for_verified_sections(&self, expected: usize) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut guard = lock_unpoisoned(&self.sections.state);
+        while guard.sections.len() < expected {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for verified section intake",
+                ));
+            };
+            guard = match self.sections.updated.wait_timeout(guard, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        drop(guard);
+        Ok(())
+    }
+
     /// Emits `KIND_SERVER_READY` once model loading and worker startup finish.
     ///
     /// # Errors
-    /// Returns `BrokenPipe` if the broker pipe has already failed or closed.
+    /// Returns `BrokenPipe` if the broker pipe has already failed or closed, or
+    /// `AlreadyExists` if readiness was already emitted.
     pub(crate) fn mark_ready(&self) -> io::Result<()> {
+        {
+            let state = lock_unpoisoned(&self.tx.state);
+            if state.closed || state.failed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "broker pipe closed before readiness",
+                ));
+            }
+        }
+        let snapshot = {
+            let mut section_state = lock_unpoisoned(&self.sections.state);
+            if section_state.ready {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "broker pipe already marked ready",
+                ));
+            }
+            section_state.ready = true;
+            section_state.sections.clone()
+        };
+        let _ = self.verified_sections.set(snapshot);
         let mut state = lock_unpoisoned(&self.tx.state);
         if state.closed || state.failed {
             return Err(io::Error::new(
@@ -641,6 +759,82 @@ fn fail_reader_protocol(
     tx.writer_ready.notify_one();
 }
 
+fn decode_verified_section(
+    payload: &[u8; VERIFIED_SECTION_PAYLOAD_BYTES],
+) -> io::Result<VerifiedSectionDescriptor> {
+    let slot = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let handle = u64::from_be_bytes([
+        payload[4],
+        payload[5],
+        payload[6],
+        payload[7],
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+    ]);
+    let byte_len = u64::from_be_bytes([
+        payload[12],
+        payload[13],
+        payload[14],
+        payload[15],
+        payload[16],
+        payload[17],
+        payload[18],
+        payload[19],
+    ]);
+    if handle == 0 || handle == u64::MAX || handle == u64::from(u32::MAX) || byte_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid verified section handle or byte length",
+        ));
+    }
+    let mut sha256 = [0_u8; 32];
+    sha256.copy_from_slice(&payload[20..52]);
+    Ok(VerifiedSectionDescriptor {
+        slot,
+        handle,
+        byte_len,
+        sha256,
+    })
+}
+
+fn handle_verified_section_frame<R: Read>(
+    reader: &mut R,
+    sections: &Arc<SectionShared>,
+    stream_id: u32,
+    len: usize,
+    last_stream_id: u32,
+) -> io::Result<()> {
+    if stream_id != 0 || len != VERIFIED_SECTION_PAYLOAD_BYTES || last_stream_id != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid verified section control frame",
+        ));
+    }
+    let mut payload = [0_u8; VERIFIED_SECTION_PAYLOAD_BYTES];
+    reader.read_exact(&mut payload)?;
+    let descriptor = decode_verified_section(&payload)?;
+    let mut section_state = lock_unpoisoned(&sections.state);
+    if section_state.ready
+        || section_state.sections.len() >= MAX_VERIFIED_SECTIONS
+        || section_state
+            .sections
+            .iter()
+            .any(|existing| existing.slot == descriptor.slot)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rejected verified section descriptor",
+        ));
+    }
+    section_state.sections.push(descriptor);
+    drop(section_state);
+    #[cfg(test)]
+    sections.updated.notify_all();
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Passes reader state, pool, and framing header explicitly without allocating a context struct."
@@ -649,6 +843,7 @@ fn dispatch_reader_frame<R: Read>(
     reader: &mut R,
     accept_tx: &mpsc::Sender<PipeConnection>,
     tx: &Arc<TxShared>,
+    sections: &Arc<SectionShared>,
     pool: &Arc<BufferPool>,
     closer: &Arc<TxCloser>,
     last_stream_id: &mut u32,
@@ -739,6 +934,9 @@ fn dispatch_reader_frame<R: Read>(
                 *active = None;
             }
         }
+        KIND_VERIFIED_SECTION => {
+            handle_verified_section_frame(reader, sections, stream_id, len, *last_stream_id)?;
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -753,6 +951,7 @@ fn run_reader<R: Read>(
     mut reader: R,
     accept_tx: &mpsc::Sender<PipeConnection>,
     tx: &Arc<TxShared>,
+    sections: &Arc<SectionShared>,
     pool: &Arc<BufferPool>,
     closer: &Arc<TxCloser>,
 ) {
@@ -771,6 +970,7 @@ fn run_reader<R: Read>(
             &mut reader,
             accept_tx,
             tx,
+            sections,
             pool,
             closer,
             &mut last_stream_id,
@@ -1140,6 +1340,178 @@ mod tests {
             p_to_c_w.flush()?;
             assert!(endpoint.accept().await.is_err());
             drop(p_to_c_w);
+            Ok(())
+        })
+    }
+
+    fn encode_section_payload(slot: u32, handle: u64, byte_len: u64, sha256: [u8; 32]) -> [u8; 52] {
+        let mut out = [0_u8; 52];
+        out[..4].copy_from_slice(&slot.to_be_bytes());
+        out[4..12].copy_from_slice(&handle.to_be_bytes());
+        out[12..20].copy_from_slice(&byte_len.to_be_bytes());
+        out[20..52].copy_from_slice(&sha256);
+        out
+    }
+
+    #[test]
+    fn verified_section_frames_store_up_to_eight_before_ready_and_preserve_streams() -> io::Result<()>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (mut p_to_c_w, p_to_c_r) = memory_channel();
+            let (c_to_p_w, mut c_to_p_r) = memory_channel();
+            p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+            p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+            let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+            let mut ack = [0_u8; 8];
+            c_to_p_r.read_exact(&mut ack)?;
+            assert_eq!(&ack, HANDSHAKE_RESPONSE_MAGIC);
+            assert_eq!(endpoint.verified_sections(), []);
+
+            let mut expected = Vec::new();
+            for idx in 0..MAX_VERIFIED_SECTIONS {
+                let slot = u32::try_from(idx + 1).map_err(io::Error::other)?;
+                let handle = 0x1000_u64 + u64::from(slot) * 4;
+                let byte_len = 4096_u64 * u64::from(slot);
+                let digest = [u8::try_from(idx + 0x10).map_err(io::Error::other)?; 32];
+                let payload = encode_section_payload(slot, handle, byte_len, digest);
+                write_frame(&mut p_to_c_w, 0, KIND_VERIFIED_SECTION, &payload)?;
+                expected.push(VerifiedSectionDescriptor {
+                    slot,
+                    handle,
+                    byte_len,
+                    sha256: digest,
+                });
+            }
+            endpoint.wait_for_verified_sections(MAX_VERIFIED_SECTIONS)?;
+            endpoint.mark_ready()?;
+            assert_eq!(
+                read_frame(&mut c_to_p_r)?,
+                (0, KIND_SERVER_READY, Vec::new())
+            );
+            assert_eq!(endpoint.verified_sections(), expected.as_slice());
+
+            write_frame(&mut p_to_c_w, 1, KIND_OPEN, &[])?;
+            write_frame(&mut p_to_c_w, 1, KIND_DATA, b"ping")?;
+            write_frame(&mut p_to_c_w, 1, KIND_EOF, &[])?;
+            let mut conn = endpoint
+                .accept()
+                .await?
+                .ok_or_else(|| io::Error::other("missing stream after verified sections"))?;
+            let mut req = Vec::new();
+            conn.read_to_end(&mut req).await?;
+            assert_eq!(req, b"ping");
+            conn.write_all(b"pong").await?;
+            conn.shutdown().await?;
+            drop(conn);
+            assert_eq!(
+                read_frame(&mut c_to_p_r)?,
+                (1, KIND_DATA, b"pong".to_vec())
+            );
+            assert_eq!(read_frame(&mut c_to_p_r)?, (1, KIND_EOF, Vec::new()));
+            drop(p_to_c_w);
+            assert!(endpoint.accept().await?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn verified_section_frames_reject_malformed_duplicate_invalid_handle_stream_overflow_and_post_ready()
+    -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let valid = encode_section_payload(1, 0x104, 8192, [0xAA; 32]);
+
+            // 1. Non-zero stream ID, wrong payload lengths, zero byte_len, zero/invalid handles.
+            for (stream_id, payload) in [
+                (1_u32, valid.to_vec()),
+                (0, Vec::new()),
+                (0, vec![0_u8; 51]),
+                (0, vec![0_u8; 53]),
+                (0, encode_section_payload(1, 0x104, 0, [0xAA; 32]).to_vec()),
+                (0, encode_section_payload(1, 0, 8192, [0xAA; 32]).to_vec()),
+                (
+                    0,
+                    encode_section_payload(1, u64::MAX, 8192, [0xAA; 32]).to_vec(),
+                ),
+                (
+                    0,
+                    encode_section_payload(1, u64::from(u32::MAX), 8192, [0xAA; 32]).to_vec(),
+                ),
+            ] {
+                let (mut p_to_c_w, p_to_c_r) = memory_channel();
+                let (c_to_p_w, mut c_to_p_r) = memory_channel();
+                p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+                p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+                let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+                let mut ack = [0_u8; 8];
+                c_to_p_r.read_exact(&mut ack)?;
+                write_frame(&mut p_to_c_w, stream_id, KIND_VERIFIED_SECTION, &payload)?;
+                assert!(endpoint.accept().await.is_err());
+                drop(p_to_c_w);
+            }
+
+            // 2. Duplicate slot rejected.
+            {
+                let (mut p_to_c_w, p_to_c_r) = memory_channel();
+                let (c_to_p_w, mut c_to_p_r) = memory_channel();
+                p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+                p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+                let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+                let mut ack = [0_u8; 8];
+                c_to_p_r.read_exact(&mut ack)?;
+                write_frame(&mut p_to_c_w, 0, KIND_VERIFIED_SECTION, &valid)?;
+                let duplicate = encode_section_payload(1, 0x208, 4096, [0xBB; 32]);
+                write_frame(&mut p_to_c_w, 0, KIND_VERIFIED_SECTION, &duplicate)?;
+                assert!(endpoint.accept().await.is_err());
+                drop(p_to_c_w);
+            }
+
+            // 3. More than 8 attested sections rejected.
+            {
+                let (mut p_to_c_w, p_to_c_r) = memory_channel();
+                let (c_to_p_w, mut c_to_p_r) = memory_channel();
+                p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+                p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+                let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+                let mut ack = [0_u8; 8];
+                c_to_p_r.read_exact(&mut ack)?;
+                for idx in 0..=MAX_VERIFIED_SECTIONS {
+                    let slot = u32::try_from(idx + 1).map_err(io::Error::other)?;
+                    let payload = encode_section_payload(
+                        slot,
+                        0x100 + u64::from(slot),
+                        4096,
+                        [0xCC; 32],
+                    );
+                    write_frame(&mut p_to_c_w, 0, KIND_VERIFIED_SECTION, &payload)?;
+                }
+                assert!(endpoint.accept().await.is_err());
+                drop(p_to_c_w);
+            }
+
+            // 4. Post-ready KIND_VERIFIED_SECTION frame rejected.
+            {
+                let (mut p_to_c_w, p_to_c_r) = memory_channel();
+                let (c_to_p_w, mut c_to_p_r) = memory_channel();
+                p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+                p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+                let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+                let mut ack = [0_u8; 8];
+                c_to_p_r.read_exact(&mut ack)?;
+                endpoint.mark_ready()?;
+                assert_eq!(
+                    read_frame(&mut c_to_p_r)?,
+                    (0, KIND_SERVER_READY, Vec::new())
+                );
+                write_frame(&mut p_to_c_w, 0, KIND_VERIFIED_SECTION, &valid)?;
+                assert!(endpoint.accept().await.is_err());
+                drop(p_to_c_w);
+            }
             Ok(())
         })
     }

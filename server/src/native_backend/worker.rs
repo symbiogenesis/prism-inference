@@ -472,7 +472,7 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<ProjectionStartup> {
     if session.representation() != bonsai_prism_runtime::model::swift::Representation::Pq2
-        || session.cpu_prefill().is_some()
+        || session.cpu_speculation().is_some()
     {
         return None;
     }

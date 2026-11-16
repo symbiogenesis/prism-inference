@@ -1174,6 +1174,160 @@ fn private_cpu_speculation_rejects_missing_or_mismatched_graph_and_recovery_prof
 }
 
 #[test]
+fn private_cpu_prefill_gdn_wy_f32_and_mixed_phase_hexagon_startup_bind_readiness() -> TestResult {
+    use bonsai_prism_runtime::{graph::KvCachePolicy, swift_session::CpuPrefill};
+    use profile::ProjectionStartup;
+
+    run(async {
+        for (chunkwise, suffix) in [(false, ""), (true, ":gdn-wy-f32-v1")] {
+            for startup in [
+                ProjectionStartup::NativeQ2 {
+                    resident_tensors: 168,
+                    resident_weight_bytes: 2_888_663_040,
+                    host_metadata_bytes: 524_128,
+                },
+                ProjectionStartup::NativeQ2Partial {
+                    architecture: 73,
+                    resident_tensors: 84,
+                    resident_weight_bytes: 1_444_331_520,
+                    host_metadata_bytes: 262_064,
+                },
+            ] {
+                let mut prefill = CpuPrefill::new(16, 64 * 1024 * 1024)?;
+                if chunkwise {
+                    prefill = prefill.with_chunkwise_gdn();
+                }
+                let identity: Arc<str> = Arc::from(format!(
+                    "{}:cpu-tiled-ffn-v1:16{suffix}",
+                    cpu_base_graph_identity(KvCachePolicy::F16),
+                ));
+                let observed = Observation {
+                    kv_cache: Some(KvCachePolicy::F16),
+                    cpu_prefill: Some(prefill),
+                    startup_graph_identity: Some(identity.clone()),
+                    startup_projection: Some(startup),
+                    ..Observation::default()
+                };
+                let mut worker =
+                    Worker::with_placement(FakeEngine(observed), 42, Placement::Auto)
+                        .map_err(|error| format!("{error:?}"))?;
+                let (result, reply) = perform(&mut worker, request("/v1/models", &[], true)).await?;
+                assert_eq!(result, Ok(()));
+                let end = reply
+                    .array_windows()
+                    .position(|part| part == b"\r\n\r\n")
+                    .ok_or("missing readiness response head")?
+                    + 4;
+                let body: Value = serde_json::from_slice(&reply[end..])?;
+                let model = &body["data"][0];
+                assert_eq!(model["cpu_prefill_tokens"], 16);
+                assert_eq!(
+                    model["cpu_prefill_gdn"],
+                    if chunkwise {
+                        json!("wy-f32")
+                    } else {
+                        Value::Null
+                    }
+                );
+                assert_eq!(model["startup_graph_identity"], identity.as_ref());
+                assert_ne!(model["startup_projection"]["effective"], "cpu");
+            }
+        }
+
+        // Chunkwise GDN requires `:gdn-wy-f32-v1` exactly at the tail on FP16 without speculation.
+        let chunkwise = CpuPrefill::new(8, 64 * 1024 * 1024)?.with_chunkwise_gdn();
+        for (cache, identity) in [
+            (
+                KvCachePolicy::F16,
+                "verified-model:kv-f16:cpu-tiled-ffn-v1:8",
+            ),
+            (
+                KvCachePolicy::F16,
+                "verified-model:kv-f16:gdn-wy-f32-v1:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1",
+            ),
+            (
+                KvCachePolicy::Rotated4,
+                "verified-model:kv-rsq4-d256-rht3-v1:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1",
+            ),
+        ] {
+            let observed = Observation {
+                kv_cache: Some(cache),
+                cpu_prefill: Some(chunkwise),
+                startup_graph_identity: Some(Arc::from(identity)),
+                ..Observation::default()
+            };
+            assert!(matches!(
+                Worker::new(FakeEngine(observed), 42),
+                Err(NativeBackendError::Configuration)
+            ));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn private_prompt_end_and_multi_branch_checkpoints_validate_and_bind_readiness() -> TestResult {
+    use bonsai_prism_runtime::runtime::PromptReuse;
+
+    run(async {
+        let observed = Observation {
+            prompt_reuse: PromptReuse::PromptEndAndLatest,
+            prompt_reuse_checkpoints: Some(4),
+            ..Observation::default()
+        };
+        let mut worker =
+            Worker::new(FakeEngine(observed), 42).map_err(|error| format!("{error:?}"))?;
+        let (result, reply) = perform(&mut worker, request("/v1/models", &[], true)).await?;
+        assert_eq!(result, Ok(()));
+        let end = reply
+            .array_windows()
+            .position(|part| part == b"\r\n\r\n")
+            .ok_or("missing readiness response head")?
+            + 4;
+        let body: Value = serde_json::from_slice(&reply[end..])?;
+        assert_eq!(body["data"][0]["prompt_reuse"], "prompt-end-and-latest");
+        assert_eq!(body["data"][0]["prompt_reuse_checkpoints"], 4);
+
+        for bad_slots in [0_usize, 9] {
+            let observed = Observation {
+                prompt_reuse: PromptReuse::PromptEndAndLatest,
+                prompt_reuse_checkpoints: Some(bad_slots),
+                ..Observation::default()
+            };
+            assert!(matches!(
+                Worker::new(FakeEngine(observed), 42),
+                Err(NativeBackendError::Configuration)
+            ));
+        }
+        let disabled_multi = Observation {
+            prompt_reuse: PromptReuse::Disabled,
+            prompt_reuse_checkpoints: Some(2),
+            ..Observation::default()
+        };
+        assert!(matches!(
+            Worker::new(FakeEngine(disabled_multi), 42),
+            Err(NativeBackendError::Configuration)
+        ));
+        let default_prompt_end = ModelProfile {
+            prompt_reuse: PromptReuse::PromptEndAndLatest,
+            prompt_reuse_checkpoints: 1,
+            ..ModelProfile::default()
+        }
+        .readiness(42);
+        assert_eq!(
+            default_prompt_end["data"][0]["prompt_reuse"],
+            "prompt-end-and-latest"
+        );
+        assert!(
+            default_prompt_end["data"][0]
+                .get("prompt_reuse_checkpoints")
+                .is_none()
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts() -> TestResult {
     use bonsai_prism_runtime::kernels::MAX_ROW_WORKERS;
     run(async {

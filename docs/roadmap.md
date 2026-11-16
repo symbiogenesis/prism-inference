@@ -38,10 +38,17 @@ Completed structural and efficiency implementations in source (awaiting a
 reviewed Foundation bundle, Runner repin, full-model parity and X1/X2 device
 qualification) cover Windows zero-copy mapped GGUF loading (`MappedReadOnlyFile`
 / `MappedSlice` with `PrefetchVirtualMemory`, chunked CNG SHA-256 and parallel
-payload validation), zero-alloc spin-then-park `NativeRowPool`, bit-exact
-`G in {2, 3, 6}` grouped GQA packed-KV decode and tiled-prefill attention,
-`adapter_affects_any` external FFN/SwiGLU unlocking under inactive or
-`ffn_down`-only rank-1 LoRA, atomic checkpoint/restore identity checks, checkpoint buffer recycling,
+payload validation), `--broker-pipe` `KIND_VERIFIED_SECTION` 52-byte LE handle
+intake, verified `"SB2HQ2C1"` `NativeQ2ArenaCache` sealing and
+`Qwen35::release_executor_resident_host_weights` host weight release, zero-alloc
+spin-then-park `NativeRowPool`, bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
+decode and tiled-prefill attention with `[token][head]` consumer-layout packed
+probabilities and KV-group-aligned balanced tail partitions, `adapter_affects_any`
+and full Hexagon `ffn_down` LoRA side-branch fusion (`supports_ffn_chain_lora` /
+`submit_resident_ffn_chain_lora`), opt-in `--cpu-prefill-gdn wy-f32`
+(`:gdn-wy-f32-v1`), mixed-phase CPU tiled prefill with Hexagon decode handoff,
+bounded `1..=8` `BranchCheckpoints`, `GrammarConstrainedSampler` speculation,
+atomic checkpoint/restore identity checks, checkpoint buffer recycling,
 transient vs `PromptEndAndLatest` checkpoints, `HybridCheckpointBoundary`,
 atomic conv shifts, mid-tile `state_consistent` and GDN decay/norm guards,
 bounded speculative verification telemetry (`SpeculativeStats`),

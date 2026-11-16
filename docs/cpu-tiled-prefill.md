@@ -33,9 +33,18 @@ Readiness binds `cpu_prefill_tokens`, `cpu_prefill_scratch_bytes` and
 `startup_graph_identity`; requests cannot alter them.
 
 FP16/K4/V4/K4/V3 retain their selected causal attention arithmetic, without
-expanded packed history. This profile uses sequential GDN, skips implicit Hexagon
-discovery/installation and supports explicit latest-prefix reuse. Reset/scale
-changes retain tile policy. Triangular GDN remains a separate FP16 selection.
+expanded packed history. FP16 tiled prefill supports both sequential GDN and
+opt-in chunkwise `CpuPrefill::with_chunkwise_gdn` (`--cpu-prefill-gdn wy-f32`,
+using the `:gdn-wy-f32-v1` graph profile when CPU speculation is off); other
+profiles remain sequential GDN. Under mixed-phase handoff (`--cpu-prefill-tokens`
+without CPU speculation), `install_default_hexagon_executor` keeps the resident
+Hexagon decode executor active while tile projections stay CPU-side
+(`supports_tile_tokens() == false`). Explicit prompt-reuse policies
+(`latest` and bounded `prompt-end-and-latest` checkpoints) remain supported, and
+reset/scale changes retain tile policy. Triangular GDN remains a separate FP16
+selection. In packed-KV tiled attention, consumer-layout `[token][head]` packed
+probabilities and KV-group-aligned balanced `partition_heads` / `TileTask`
+partitioning eliminate tail scatter/transpose work across workers.
 
 ## Explicit target-verification consumer
 

@@ -108,7 +108,9 @@ position alignment, `KvCache::same_representation` /
 `PackedCache::same_representation`, packed page/tail partitions, and
 `ProjectedQwen35`'s SHA-256 `projection_plan_digest` (including per-layer active
 LoRA FFN fusion via `adapter_affects_any`: keeping `external_ffn_chain` when
-`[ffn_gate, ffn_up, ffn_down]` have no active LoRA and `external_ffn_swiglu` when
+`[ffn_gate, ffn_up, ffn_down]` have no active LoRA, full FFN-chain LoRA
+side-branch fusion via `supports_ffn_chain_lora` /
+`supports_f32_ffn_chain_lora` when supported, or `external_ffn_swiglu` when
 `[ffn_gate, ffn_up]` are untargeted or inactive) before clearing or mutating
 live state; `Qwen35::restore` clears `frequencies_ready` cleanly. Nonempty
 snapshots remain complete. `Qwen35` tracks `state_consistent` across
@@ -123,14 +125,26 @@ skips already empty state; scale reset still renews identity/provenance.
 Transient verification/rollback snapshots recycle without inserting into or
 evicting reusable prefix cache entries. Opt-in
 `PromptReuse::PromptEndAndLatest` retains the latest prompt-end checkpoint across
-assistant output; `HybridCheckpointBoundary::reconcile` computes the maximal
-shared boundary across token history, KV page alignment (or exact unaligned KV
-bounds), non-truncatable recurrent GDN/conv state and representation/adapter
-identity (`KvCache::truncate_to` and `PackedCache::truncate_to` stay pure-KV).
-Optional prefix replacement preserves older prefixes if capture/replacement
-fails. Count eviction follows successful capture; byte-pressure eviction precedes
-allocation to honor the hard bound. [Session profiles](swift-session-profiles.md)
-define adapter-scale provenance, latest reuse and reset-only terminal ingestion.
+assistant output, and `BranchCheckpoints` (`1..=8`, configured via
+`--prompt-reuse-checkpoints` and `--prompt-reuse-checkpoint-bytes`) bounds
+sparse multi-branch prefix reuse within explicit state budgets.
+`HybridCheckpointBoundary::reconcile` computes the maximal shared boundary across
+token history, KV page alignment (or exact unaligned KV bounds), non-truncatable
+recurrent GDN/conv state and representation/adapter identity
+(`KvCache::truncate_to` and `PackedCache::truncate_to` stay pure-KV). Optional
+prefix replacement preserves older prefixes if capture/replacement fails. Count
+eviction follows successful capture; byte-pressure eviction precedes allocation
+to honor the hard bound. Bounded grammar-constrained speculation uses
+`GrammarConstrainedSampler` (`GrammarState::is_accepting`, `accept_candidate`,
+and `filter_candidates`) so verification tokens honor exact grammar legality
+and rollback contracts. On Windows `--broker-pipe`, `ServerEndpoint::verified_sections`
+intakes `KIND_VERIFIED_SECTION` (`6`) 52-byte little-endian section descriptors;
+after Hexagon `NativeQ2` intake (`"SB2HQ2C1"` `NativeQ2ArenaCache` verified with
+`bonsai_native_hash`), `Qwen35::release_executor_resident_host_weights` releases
+resident mapped host weight views (`TensorBytes::release_mapped`) when
+`tiled_prefill` is absent and an external executor is attached.
+[Session profiles](swift-session-profiles.md) define adapter-scale provenance,
+latest reuse and reset-only terminal ingestion.
 
 ### Timing
 

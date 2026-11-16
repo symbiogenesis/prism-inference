@@ -38,10 +38,17 @@ and pinned aligned-row accumulation are preserved.
 For external `Pq2ProjectionExecutor` sessions, per-layer active-target gating
 (`adapter_affects_any`) keeps `external_ffn_chain` enabled whenever
 `[ffn_gate, ffn_up, ffn_down]` have no active LoRA (`scale == 0.0` or untargeted
-layers) and unlocks `external_ffn_swiglu` (`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`)
-across all 64 Swift layers under active `RankOneAdapter` (since `ffn_gate` and
-`ffn_up` are never targeted, preserving original-basis `up` for CPU `ffn_down`
-plus its LoRA delta while binding `projection_plan_digest`).
+layers). When `ffn_down` carries an active rank-1 `RankOneAdapter` and
+`ffn_gate`/`ffn_up` remain untargeted, executors exposing
+`supports_ffn_chain_lora` / `supports_f32_ffn_chain_lora` keep the full
+`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU + ffn_down` VTCM chain active via
+`submit_resident_ffn_chain_lora` / `project_f32_ffn_chain_lora`, evaluating the
+`ffn_down` side-branch from `RankOneAdapter::dense_rank_one_factor` and a single
+finite scalar `lora_dot` without spilling intermediate FFN activations back to
+host DRAM. When FFN-chain LoRA side-branch fusion is unavailable on the
+executor, gating falls back to `external_ffn_swiglu`
+(`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`, preserving original-basis `up` for
+CPU `ffn_down` plus its LoRA delta), while binding `projection_plan_digest`.
 
 Identical immutable B payloads share storage only after kind/shape/byte equality.
 Correction scratch holds one rank value and one output-width vector, separate

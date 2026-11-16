@@ -25,6 +25,101 @@ pub struct DecodedImage {
     pub rgb: Vec<u8>,
 }
 
+/// Supported container formats encoded in `data:` image URLs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageContainerFormat {
+    /// Portable Network Graphics (`data:image/png;base64,...`).
+    Png,
+    /// Binary Portable Pixmap (`data:image/x-portable-pixmap;base64,...`).
+    Ppm,
+}
+
+/// Visual token and grid budget enforced on container headers before pixel inflation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageDimensionBudget {
+    /// Minimum planned vision tokens (`>= 1`).
+    pub min_tokens: usize,
+    /// Maximum planned vision tokens (`>= min_tokens`).
+    pub max_tokens: usize,
+    /// Spatial patch-merge factor (`patch_size * spatial_merge`).
+    pub grid_factor: usize,
+}
+
+impl ImageDimensionBudget {
+    /// Validate static token/grid bounds before parsing container payloads.
+    ///
+    /// # Errors
+    /// Rejects zero factors/bounds, `min_tokens > max_tokens`, or pixel-bound overflows.
+    pub fn validate_bounds(self) -> Result<()> {
+        if self.grid_factor == 0 || self.min_tokens == 0 || self.min_tokens > self.max_tokens {
+            return Err(invalid("invalid vision grid planning bounds"));
+        }
+        let factor_sq = self
+            .grid_factor
+            .checked_mul(self.grid_factor)
+            .ok_or_else(|| invalid("vision factor area overflow"))?;
+        self.max_tokens
+            .checked_mul(factor_sq)
+            .ok_or_else(|| invalid("vision max pixel bound overflow"))?;
+        Ok(())
+    }
+
+    /// Validate header image dimensions against budget and `200:1` aspect ratio rules.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds, zero dimensions, or extreme aspect ratios before pixel decode.
+    pub fn validate_dimensions(self, width: usize, height: usize) -> Result<()> {
+        self.validate_bounds()?;
+        if width == 0 || height == 0 {
+            return Err(invalid("invalid vision grid planning bounds"));
+        }
+        let min_side = width.min(height);
+        let max_side = width.max(height);
+        if max_side > min_side.saturating_mul(200) {
+            return Err(invalid("image aspect ratio exceeds 200:1 bound"));
+        }
+        Ok(())
+    }
+}
+
+/// Extracts and decodes the raw compressed container bytes from one `data:` image URL.
+///
+/// Allows callers to hash compressed bytes and consult caches before PNG/PPM pixel inflation.
+///
+/// # Errors
+/// Rejects unsupported media types, oversized URLs or payloads, and invalid RFC 4648 base64.
+pub fn decode_image_data_url_raw(url: &str) -> Result<(ImageContainerFormat, Vec<u8>)> {
+    if url.len() > MAX_DATA_URL_BYTES {
+        return Err(invalid("image data URL exceeds 16 MiB limit"));
+    }
+    let (format, payload) = if let Some(rest) = url.strip_prefix("data:image/png;base64,") {
+        (ImageContainerFormat::Png, rest)
+    } else if let Some(rest) = url.strip_prefix("data:image/x-portable-pixmap;base64,") {
+        (ImageContainerFormat::Ppm, rest)
+    } else {
+        return Err(invalid("unsupported image data URL scheme or media type"));
+    };
+    let raw = decode_base64(payload, MAX_ENCODED_IMAGE_BYTES)?;
+    Ok((format, raw))
+}
+
+/// Decodes raw PNG or PPM container bytes into `RGB8`, guarding dimensions before pixel inflation.
+///
+/// # Errors
+/// Rejects invalid budgets, out-of-bounds header dimensions, malformed headers,
+/// corrupted checksums, or invalid compressed streams.
+pub fn decode_encoded_image_within(
+    format: ImageContainerFormat,
+    raw: &[u8],
+    budget: ImageDimensionBudget,
+) -> Result<DecodedImage> {
+    budget.validate_bounds()?;
+    match format {
+        ImageContainerFormat::Png => decode_png_with_budget(raw, Some(budget)),
+        ImageContainerFormat::Ppm => decode_ppm_with_budget(raw, Some(budget)),
+    }
+}
+
 /// Decodes one `data:image/png;base64,...` or `data:image/x-portable-pixmap;base64,...` URL.
 ///
 /// Returns the decoded bitmap along with the raw compressed payload bytes before
@@ -34,21 +129,10 @@ pub struct DecodedImage {
 /// Rejects unsupported media types, oversized payloads, invalid RFC 4648 base64,
 /// malformed container headers, corrupted checksums, or out-of-bounds images.
 pub fn decode_image_data_url(url: &str) -> Result<(DecodedImage, Vec<u8>)> {
-    if url.len() > MAX_DATA_URL_BYTES {
-        return Err(invalid("image data URL exceeds 16 MiB limit"));
-    }
-    let (is_png, payload) = if let Some(rest) = url.strip_prefix("data:image/png;base64,") {
-        (true, rest)
-    } else if let Some(rest) = url.strip_prefix("data:image/x-portable-pixmap;base64,") {
-        (false, rest)
-    } else {
-        return Err(invalid("unsupported image data URL scheme or media type"));
-    };
-    let raw = decode_base64(payload, MAX_ENCODED_IMAGE_BYTES)?;
-    let image = if is_png {
-        decode_png(&raw)?
-    } else {
-        decode_ppm(&raw)?
+    let (format, raw) = decode_image_data_url_raw(url)?;
+    let image = match format {
+        ImageContainerFormat::Png => decode_png(&raw)?,
+        ImageContainerFormat::Ppm => decode_ppm(&raw)?,
     };
     Ok((image, raw))
 }
@@ -121,11 +205,18 @@ fn decode_b64_digit(byte: u8) -> Result<u8> {
 /// # Errors
 /// Rejects malformed headers, unsupported bit depths/color types/interlacing,
 /// bad CRC-32 or Adler-32 checksums, corrupt DEFLATE streams, or oversized bitmaps.
+pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage> {
+    decode_png_with_budget(bytes, None)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Keep PNG chunk validation and zlib/filter dispatch explicit."
 )]
-pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage> {
+fn decode_png_with_budget(
+    bytes: &[u8],
+    budget: Option<ImageDimensionBudget>,
+) -> Result<DecodedImage> {
     const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
     if bytes.len() > MAX_ENCODED_IMAGE_BYTES || !bytes.starts_with(&PNG_SIG) {
         return Err(invalid("invalid or oversized PNG signature"));
@@ -198,6 +289,9 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage> {
                 {
                     return Err(invalid("unsupported PNG IHDR format or dimensions"));
                 }
+                if let Some(dim_budget) = budget {
+                    dim_budget.validate_dimensions(width, height)?;
+                }
                 header = Some((width, height, color_type));
             }
             b"IDAT" => {
@@ -262,6 +356,13 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage> {
 /// Rejects malformed headers, unsupported bit depths, comments > bounds, or
 /// truncated/trailing pixel bytes.
 pub fn decode_ppm(bytes: &[u8]) -> Result<DecodedImage> {
+    decode_ppm_with_budget(bytes, None)
+}
+
+fn decode_ppm_with_budget(
+    bytes: &[u8],
+    budget: Option<ImageDimensionBudget>,
+) -> Result<DecodedImage> {
     if bytes.len() > MAX_ENCODED_IMAGE_BYTES {
         return Err(invalid("PPM payload exceeds size limit"));
     }
@@ -286,6 +387,9 @@ pub fn decode_ppm(bytes: &[u8]) -> Result<DecodedImage> {
     }
     if pos >= bytes.len() || !bytes[pos].is_ascii_whitespace() {
         return Err(invalid("PPM header must end with single whitespace byte"));
+    }
+    if let Some(dim_budget) = budget {
+        dim_budget.validate_dimensions(width, height)?;
     }
     pos += 1;
     let expected = width
@@ -452,14 +556,62 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-fn png_crc32(chunk_type: [u8; 4], payload: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in chunk_type.iter().chain(payload.iter()) {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
+#[expect(
+    clippy::as_conversions,
+    reason = "Masking by 0xff restricts the constant index to 0..=255 for const CRC-32 tables."
+)]
+const fn build_png_crc32_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0_u32; 256]; 8];
+    let mut entry = 0_usize;
+    let mut entry_u32 = 0_u32;
+    while entry < 256 {
+        let mut crc = entry_u32;
+        let mut bit = 0;
+        while bit < 8 {
             let mask = (crc & 1).wrapping_neg();
             crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            bit += 1;
         }
+        tables[0][entry] = crc;
+        entry += 1;
+        entry_u32 += 1;
+    }
+    let mut lane = 1;
+    while lane < 8 {
+        let mut idx = 0_usize;
+        while idx < 256 {
+            let prev = tables[lane - 1][idx];
+            tables[lane][idx] = (prev >> 8) ^ tables[0][(prev & 0xff) as usize];
+            idx += 1;
+        }
+        lane += 1;
+    }
+    tables
+}
+
+const PNG_CRC32_TABLES: [[u32; 256]; 8] = build_png_crc32_tables();
+
+fn png_crc32(chunk_type: [u8; 4], payload: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for &byte in &chunk_type {
+        let idx = usize::from(crc.to_le_bytes()[0] ^ byte);
+        crc = (crc >> 8) ^ PNG_CRC32_TABLES[0][idx];
+    }
+    let (blocks, tail) = payload.as_chunks::<8>();
+    for &block in blocks {
+        let lo = (u32::from_le_bytes([block[0], block[1], block[2], block[3]]) ^ crc).to_le_bytes();
+        crc = PNG_CRC32_TABLES[7][usize::from(lo[0])]
+            ^ PNG_CRC32_TABLES[6][usize::from(lo[1])]
+            ^ PNG_CRC32_TABLES[5][usize::from(lo[2])]
+            ^ PNG_CRC32_TABLES[4][usize::from(lo[3])]
+            ^ PNG_CRC32_TABLES[3][usize::from(block[4])]
+            ^ PNG_CRC32_TABLES[2][usize::from(block[5])]
+            ^ PNG_CRC32_TABLES[1][usize::from(block[6])]
+            ^ PNG_CRC32_TABLES[0][usize::from(block[7])];
+    }
+    for &byte in tail {
+        let idx = usize::from(crc.to_le_bytes()[0] ^ byte);
+        crc = (crc >> 8) ^ PNG_CRC32_TABLES[0][idx];
     }
     !crc
 }
@@ -556,6 +708,22 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    fn fill_up_to(&mut self, needed: u8) {
+        while self.bit_count < needed {
+            let Some(&next) = self.bytes.get(self.pos) else {
+                break;
+            };
+            self.pos += 1;
+            self.bit_buf |= u64::from(next) << self.bit_count;
+            self.bit_count += 8;
+        }
+    }
+
+    const fn consume_bits(&mut self, count: u8) {
+        self.bit_buf >>= count;
+        self.bit_count -= count;
+    }
+
     fn ensure(&mut self, needed: u8) -> Result<()> {
         while self.bit_count < needed {
             let Some(&next) = self.bytes.get(self.pos) else {
@@ -575,15 +743,20 @@ impl<'a> BitReader<'a> {
         self.ensure(count)?;
         let mask = (1_u64 << count) - 1;
         let value = u32::try_from(self.bit_buf & mask)?;
-        self.bit_buf >>= count;
-        self.bit_count -= count;
+        self.consume_bits(count);
         Ok(value)
     }
 
-    const fn align_byte(&mut self) {
+    fn align_byte(&mut self) {
         let discard = self.bit_count % 8;
         self.bit_buf >>= discard;
         self.bit_count -= discard;
+        // Rewind any lookahead whole bytes loaded for Huffman LUT peeks so subsequent
+        // stored-block byte reads observe the exact stream position.
+        let buffered_bytes = usize::from(self.bit_count / 8);
+        self.pos -= buffered_bytes;
+        self.bit_buf = 0;
+        self.bit_count = 0;
     }
 
     fn read_u16_le(&mut self) -> Result<u16> {
@@ -610,10 +783,15 @@ impl<'a> BitReader<'a> {
 }
 
 const MAX_CODE_BITS: usize = 15;
+const HUFFMAN_LUT_BITS: usize = 9;
+const HUFFMAN_LUT_SIZE: usize = 1 << HUFFMAN_LUT_BITS;
+const HUFFMAN_LUT_MASK: u64 = (1_u64 << HUFFMAN_LUT_BITS) - 1;
 
 struct HuffmanTree {
     counts: [u16; MAX_CODE_BITS + 1],
     symbols: Vec<u16>,
+    // Packed `(code_len << 12) | symbol` for canonical codes up to 9 bits; 0 means slow path.
+    fast: [u16; HUFFMAN_LUT_SIZE],
 }
 
 impl HuffmanTree {
@@ -646,34 +824,85 @@ impl HuffmanTree {
                 .checked_add(counts[bits])
                 .ok_or_else(|| invalid("Huffman symbol table overflow"))?;
         }
+        let mut next_code = [0_u32; MAX_CODE_BITS + 1];
+        let mut code = 0_u32;
+        for bits in 1..=MAX_CODE_BITS {
+            code = (code + u32::from(counts[bits - 1])) << 1;
+            next_code[bits] = code;
+        }
         let mut symbols = vec![0_u16; usize::from(total)];
+        let mut fast = [0_u16; HUFFMAN_LUT_SIZE];
         for (sym, &len) in lengths.iter().enumerate() {
             if len != 0 {
-                let slot = usize::from(offsets[usize::from(len)]);
-                offsets[usize::from(len)] += 1;
-                symbols[slot] =
+                let len_usize = usize::from(len);
+                let slot = usize::from(offsets[len_usize]);
+                offsets[len_usize] += 1;
+                let sym_u16 =
                     u16::try_from(sym).map_err(|_| invalid("Huffman symbol index overflow"))?;
+                symbols[slot] = sym_u16;
+
+                let cw = next_code[len_usize];
+                next_code[len_usize] = cw + 1;
+                if len_usize <= HUFFMAN_LUT_BITS && sym < 0x1000 {
+                    let cw16 =
+                        u16::try_from(cw).map_err(|_| invalid("Huffman codeword overflow"))?;
+                    let rev = usize::from(cw16.reverse_bits() >> (16 - len_usize));
+                    let packed = (u16::from(len) << 12) | sym_u16;
+                    let stride = 1_usize << len_usize;
+                    let mut entry_idx = rev;
+                    while entry_idx < HUFFMAN_LUT_SIZE {
+                        fast[entry_idx] = packed;
+                        entry_idx += stride;
+                    }
+                }
             }
         }
-        Ok(Self { counts, symbols })
+        Ok(Self {
+            counts,
+            symbols,
+            fast,
+        })
     }
 
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+        const LUT_BITS_U8: u8 = 9;
+        const MAX_BITS_U8: u8 = 15;
+        reader.fill_up_to(LUT_BITS_U8);
+        if let Ok(fast_idx) = usize::try_from(reader.bit_buf & HUFFMAN_LUT_MASK)
+            && let Some(&entry) = self.fast.get(fast_idx)
+            && entry != 0
+        {
+            let bits = u8::try_from(entry >> 12).map_err(|_| invalid("Huffman length overflow"))?;
+            if reader.bit_count < bits {
+                return Err(invalid("unexpected EOF in DEFLATE bitstream"));
+            }
+            reader.consume_bits(bits);
+            return Ok(entry & 0x0fff);
+        }
+
+        reader.fill_up_to(MAX_BITS_U8);
         let mut code = 0_i32;
         let mut first = 0_i32;
         let mut index = 0_i32;
-        for &count in &self.counts[1..] {
-            code |= i32::try_from(reader.read_bits(1)?)
+        for (bit_idx, &count) in self.counts[1..].iter().enumerate() {
+            let bit_pos = u8::try_from(bit_idx).map_err(|_| invalid("Huffman bit depth"))?;
+            if reader.bit_count <= bit_pos {
+                return Err(invalid("unexpected EOF in DEFLATE bitstream"));
+            }
+            let bit = i32::try_from((reader.bit_buf >> bit_pos) & 1)
                 .map_err(|_| invalid("Huffman bit conversion"))?;
+            code |= bit;
             let count_i32 = i32::from(count);
             if code - count_i32 < first {
                 let offset = usize::try_from(index + (code - first))
                     .map_err(|_| invalid("Huffman lookup index"))?;
-                return self
+                let sym = self
                     .symbols
                     .get(offset)
                     .copied()
-                    .ok_or_else(|| invalid("invalid DEFLATE Huffman symbol"));
+                    .ok_or_else(|| invalid("invalid DEFLATE Huffman symbol"))?;
+                reader.consume_bits(bit_pos + 1);
+                return Ok(sym);
             }
             index += count_i32;
             first += count_i32;
@@ -942,6 +1171,164 @@ mod tests {
         let last = png.len() - 1;
         png[last] ^= 1; // corrupt IEND CRC
         assert!(decode_png(&png).is_err());
+        Ok(())
+    }
+
+    fn bitwise_png_crc32(chunk_type: [u8; 4], payload: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for &byte in chunk_type.iter().chain(payload.iter()) {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn push_bits_lsb(out: &mut Vec<u8>, acc: &mut u32, acc_bits: &mut u8, val: u32, bits: u8) {
+        *acc |= val << *acc_bits;
+        *acc_bits += bits;
+        while *acc_bits >= 8 {
+            out.push((*acc & 0xff).to_le_bytes()[0]);
+            *acc >>= 8;
+            *acc_bits -= 8;
+        }
+    }
+
+    fn fixed_lit_code(sym: u16) -> (u32, u8) {
+        let (msb_code, bits) = match sym {
+            0..=143 => (u32::from(sym) + 0b0011_0000, 8_u8),
+            144..=255 => (u32::from(sym - 144) + 0b1_1001_0000, 9_u8),
+            256..=279 => (u32::from(sym - 256), 7_u8),
+            _ => (u32::from(sym - 280) + 0b1100_0000, 8_u8),
+        };
+        let rev = msb_code.reverse_bits() >> (32 - bits);
+        (rev, bits)
+    }
+
+    #[test]
+    fn png_crc32_table_matches_bitwise_reference() {
+        let mut payload = Vec::new();
+        for len in 0..=40_usize {
+            assert_eq!(
+                png_crc32(*b"IDAT", &payload),
+                bitwise_png_crc32(*b"IDAT", &payload),
+                "CRC mismatch at payload length {len}"
+            );
+            let next_byte = u8::try_from((len * 73 + 19) & 0xff).unwrap_or(0);
+            payload.push(next_byte);
+        }
+        assert_eq!(png_crc32(*b"IEND", &[]), bitwise_png_crc32(*b"IEND", &[]));
+    }
+
+    #[test]
+    fn huffman_lut_decodes_fixed_long_and_mixed_stored_blocks() -> Result<()> {
+        // Test HuffmanTree LUT + slow fallback for >9-bit codewords (10-bit symbol 10, 11-bit symbol 11).
+        let mut lengths = vec![0_u8; 12];
+        for length in lengths.iter_mut().take(9) {
+            *length = 4;
+        }
+        lengths[9] = 5;
+        lengths[10] = 10;
+        lengths[11] = 11;
+        // Canonical prefixes for 9x4-bit (0000..1000), 1x5-bit (10010),
+        // let's use exact complete lengths summing to 1: wait make code complete at 11 bits:
+        // Wait HuffmanTree accepts incomplete trees as long as left >= 0!
+        // Compute exact canonical MSB codes:
+        // len 4: count=9 -> 0000..1000; next at 5 = 10010 (sym 9);
+        // next at 10 = (10011 << 5) = 0b10_0110_0000 (sym 10);
+        // next at 11 = (0b10_0110_0001 << 1) = 0b100_1100_0010 (sym 11).
+        let tree = HuffmanTree::from_lengths(&lengths)?;
+        let mut stream = Vec::new();
+        let mut acc = 0_u32;
+        let mut acc_bits = 0_u8;
+        let code3 = (0b0011_u32).reverse_bits() >> (32 - 4);
+        let code9 = (0b10010_u32).reverse_bits() >> (32 - 5);
+        let code10 = (0b10_0110_0000_u32).reverse_bits() >> (32 - 10);
+        let code11 = (0b100_1100_0010_u32).reverse_bits() >> (32 - 11);
+        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code3, 4);
+        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code9, 5);
+        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code10, 10);
+        push_bits_lsb(&mut stream, &mut acc, &mut acc_bits, code11, 11);
+        if acc_bits > 0 {
+            stream.push((acc & 0xff).to_le_bytes()[0]);
+        }
+        let mut reader = BitReader::new(&stream);
+        assert_eq!(tree.decode(&mut reader)?, 3);
+        assert_eq!(tree.decode(&mut reader)?, 9);
+        assert_eq!(tree.decode(&mut reader)?, 10);
+        assert_eq!(tree.decode(&mut reader)?, 11);
+        assert!(tree.decode(&mut reader).is_err());
+
+        // Reject unpopulated canonical 15-bit bit sequence ("corrupt DEFLATE Huffman code").
+        let mut bad_reader = BitReader::new(&[0xff_u8, 0xff]);
+        assert!(tree.decode(&mut bad_reader).is_err());
+
+        // Test mixed DEFLATE zlib stream: Block 1 fixed Huffman (BFINAL=0) [0, 10, 20] + EOB,
+        // followed by Block 2 stored (BFINAL=1) [30] so align_byte rewinds lookahead bytes.
+        let mut zlib = vec![0x78, 0x9c];
+        let mut deflate_acc = 0_u32;
+        let mut deflate_bits = 0_u8;
+        push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, 0, 1); // BFINAL=0
+        push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, 1, 2); // BTYPE=1 (fixed)
+        for sym in [0_u16, 10, 20, 256] {
+            let (cw, len) = fixed_lit_code(sym);
+            push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, cw, len);
+        }
+        // Start stored block (BFINAL=1, BTYPE=0) right inside bitstream, then byte-align.
+        push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, 1, 1); // BFINAL=1
+        push_bits_lsb(&mut zlib, &mut deflate_acc, &mut deflate_bits, 0, 2); // BTYPE=0 (stored)
+        if deflate_bits > 0 {
+            zlib.push((deflate_acc & 0xff).to_le_bytes()[0]);
+        }
+        let stored_payload = [30_u8];
+        let len_u16 = 1_u16;
+        zlib.extend_from_slice(&len_u16.to_le_bytes());
+        zlib.extend_from_slice(&(!len_u16).to_le_bytes());
+        zlib.extend_from_slice(&stored_payload);
+        zlib.extend_from_slice(&adler32(&[0, 10, 20, 30]).to_be_bytes());
+
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&1_u32.to_be_bytes());
+        ihdr.extend_from_slice(&1_u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        write_chunk(&mut png, *b"IHDR", &ihdr)?;
+        write_chunk(&mut png, *b"IDAT", &zlib)?;
+        write_chunk(&mut png, *b"IEND", &[])?;
+        let decoded = decode_png(&png)?;
+        assert_eq!(decoded.rgb, vec![10, 20, 30]);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_image_data_url_raw_and_early_ihdr_budget_guard() -> Result<()> {
+        let png = build_test_png(1, 1, 2, &[0, 11, 22, 33])?;
+        let url = format!("data:image/png;base64,{}", encode_b64(&png));
+        let (fmt, raw) = decode_image_data_url_raw(&url)?;
+        assert_eq!(fmt, ImageContainerFormat::Png);
+        assert_eq!(raw, png);
+        let budget = ImageDimensionBudget {
+            min_tokens: 1,
+            max_tokens: 64,
+            grid_factor: 32,
+        };
+        let decoded = decode_encoded_image_within(fmt, &raw, budget)?;
+        assert_eq!(decoded.rgb, vec![11, 22, 33]);
+
+        // Craft a 300x1 IHDR (> 200:1 aspect ratio) followed by corrupt IDAT bytes;
+        // early IHDR validation must fail before inspecting IDAT/zlib payloads.
+        let mut wide_corrupt = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&300_u32.to_be_bytes());
+        ihdr.extend_from_slice(&1_u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        write_chunk(&mut wide_corrupt, *b"IHDR", &ihdr)?;
+        wide_corrupt.extend_from_slice(&999_u32.to_be_bytes()); // truncated/corrupt IDAT
+        assert!(
+            decode_encoded_image_within(ImageContainerFormat::Png, &wide_corrupt, budget).is_err()
+        );
         Ok(())
     }
 }

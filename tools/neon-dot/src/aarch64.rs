@@ -3158,3 +3158,1364 @@ pub(super) fn dot_ptq1_4x4_groups(
     }
     None
 }
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_f32x4(values: &[f32; 4]) -> core::arch::aarch64::float32x4_t {
+    // SAFETY: `values` is a valid 4-element `f32` array reference and `vld1q_f32` requires no alignment.
+    unsafe { core::arch::aarch64::vld1q_f32(values.as_ptr()) }
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_u16x4(vec: core::arch::aarch64::uint16x4_t, out: &mut [u16; 4]) {
+    // SAFETY: `out` is a valid mutable 4-element `u16` array reference and `vst1_u16` requires no alignment.
+    unsafe { core::arch::aarch64::vst1_u16(out.as_mut_ptr(), vec) };
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_u16x8(vec: core::arch::aarch64::uint16x8_t, out: &mut [u16; 8]) {
+    // SAFETY: `out` is a valid mutable 8-element `u16` array reference and `vst1q_u16` requires no alignment.
+    unsafe { core::arch::aarch64::vst1q_u16(out.as_mut_ptr(), vec) };
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn narrow_f32_four(values: [f32; 4]) -> [u16; 4] {
+    // SAFETY: compiled only with baseline AArch64 NEON; fixed-array extents cover all accesses.
+    unsafe { narrow_f32_four_neon(values) }
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn narrow_f32_four_neon(values: [f32; 4]) -> [u16; 4] {
+    use core::arch::aarch64::{
+        vandq_u32, vcvt_f16_f32, vdupq_n_u32, vmaxvq_u32, vreinterpret_u16_f16,
+        vreinterpretq_u32_f32,
+    };
+    let raw = load_f32x4(&values);
+    let abs_bits = vandq_u32(vreinterpretq_u32_f32(raw), vdupq_n_u32(0x7fff_ffff));
+    if vmaxvq_u32(abs_bits) > 0x7f80_0000 {
+        return values.map(super::half::scalar_half_bits);
+    }
+    let mut out = [0_u16; 4];
+    store_u16x4(vreinterpret_u16_f16(vcvt_f16_f32(raw)), &mut out);
+    out
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn narrow_f32_eight(values: &[f32; 8]) -> [u16; 8] {
+    // SAFETY: compiled only with baseline AArch64 NEON; fixed-array extents cover all accesses.
+    unsafe { narrow_f32_eight_neon(values) }
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn narrow_f32_eight_neon(values: &[f32; 8]) -> [u16; 8] {
+    use core::arch::aarch64::{
+        vandq_u32, vcvt_f16_f32, vcvt_high_f16_f32, vdupq_n_u32, vmaxq_u32, vmaxvq_u32,
+        vreinterpretq_u16_f16, vreinterpretq_u32_f32,
+    };
+    let (halves, _) = values.as_chunks::<4>();
+    let lo = load_f32x4(&halves[0]);
+    let hi = load_f32x4(&halves[1]);
+    let mask = vdupq_n_u32(0x7fff_ffff);
+    let abs_lo = vandq_u32(vreinterpretq_u32_f32(lo), mask);
+    let abs_hi = vandq_u32(vreinterpretq_u32_f32(hi), mask);
+    if vmaxvq_u32(vmaxq_u32(abs_lo, abs_hi)) > 0x7f80_0000 {
+        return values.map(super::half::scalar_half_bits);
+    }
+    let half_lo = vcvt_f16_f32(lo);
+    let half = vcvt_high_f16_f32(half_lo, hi);
+    let mut out = [0_u16; 8];
+    store_u16x8(vreinterpretq_u16_f16(half), &mut out);
+    out
+}
+
+#[cfg(target_feature = "neon")]
+pub(super) fn narrow_f32_slice_to_f16(src: &[f32], dst: &mut [u16]) -> bool {
+    // SAFETY: compiled only with baseline AArch64 NEON.
+    unsafe { narrow_f32_slice_to_f16_neon(src, dst) }
+}
+
+#[cfg(target_feature = "neon")]
+#[target_feature(enable = "neon")]
+fn narrow_f32_slice_to_f16_neon(src: &[f32], dst: &mut [u16]) -> bool {
+    use core::arch::aarch64::{
+        vandq_u32, vcvt_f16_f32, vcvt_high_f16_f32, vdupq_n_u32, vmaxq_u32, vmaxvq_u32,
+        vreinterpretq_u16_f16, vreinterpretq_u32_f32,
+    };
+    let (src_chunks, src_tail) = src.as_chunks::<8>();
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<8>();
+    let mask = vdupq_n_u32(0x7fff_ffff);
+    for (src_chunk, dst_chunk) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        let (halves, _) = src_chunk.as_chunks::<4>();
+        let lo = load_f32x4(&halves[0]);
+        let hi = load_f32x4(&halves[1]);
+        let abs_lo = vandq_u32(vreinterpretq_u32_f32(lo), mask);
+        let abs_hi = vandq_u32(vreinterpretq_u32_f32(hi), mask);
+        if vmaxvq_u32(vmaxq_u32(abs_lo, abs_hi)) >= 0x477f_f000 {
+            return false;
+        }
+        let half = vcvt_high_f16_f32(vcvt_f16_f32(lo), hi);
+        store_u16x8(vreinterpretq_u16_f16(half), dst_chunk);
+    }
+    super::half::portable_narrow_slice(src_tail, dst_tail)
+}
+
+#[cfg(target_feature = "neon")]
+pub(super) fn quantize_row_q8_0(input: &[f32], out: &mut [super::kquants::Q8_0ActBlock]) {
+    // SAFETY: compiled only with baseline AArch64 NEON.
+    unsafe { quantize_row_q8_0_neon(input, out) }
+}
+
+#[cfg(target_feature = "neon")]
+#[target_feature(enable = "neon")]
+fn quantize_row_q8_0_neon(input: &[f32], out: &mut [super::kquants::Q8_0ActBlock]) {
+    use core::arch::aarch64::{
+        vabsq_f32, vcombine_s16, vcvtnq_s32_f32, vdupq_n_f32, vdupq_n_s8, vmaxq_f32, vmaxq_s8,
+        vmaxvq_f32, vmulq_f32, vqmovn_s16, vqmovn_s32,
+    };
+    let (chunks, _) = input.as_chunks::<32>();
+    for (src, block) in chunks.iter().zip(out.iter_mut()) {
+        let quads = src.as_chunks::<4>().0;
+        let max_v0 = vmaxq_f32(
+            vmaxq_f32(
+                vabsq_f32(load_f32x4(&quads[0])),
+                vabsq_f32(load_f32x4(&quads[1])),
+            ),
+            vmaxq_f32(
+                vabsq_f32(load_f32x4(&quads[2])),
+                vabsq_f32(load_f32x4(&quads[3])),
+            ),
+        );
+        let max_v1 = vmaxq_f32(
+            vmaxq_f32(
+                vabsq_f32(load_f32x4(&quads[4])),
+                vabsq_f32(load_f32x4(&quads[5])),
+            ),
+            vmaxq_f32(
+                vabsq_f32(load_f32x4(&quads[6])),
+                vabsq_f32(load_f32x4(&quads[7])),
+            ),
+        );
+        let amax = vmaxvq_f32(vmaxq_f32(max_v0, max_v1));
+        if amax == 0.0 || !amax.is_finite() {
+            block.d = 0.0;
+            block.qs = [0; 32];
+            continue;
+        }
+        let d_val = amax / 127.0_f32;
+        let id_v = vdupq_n_f32(127.0_f32 / amax);
+        let min_q = vdupq_n_s8(-127);
+        let (out_halves, _) = block.qs.as_chunks_mut::<16>();
+        for (half_idx, out_half) in out_halves.iter_mut().enumerate() {
+            let base = half_idx * 4;
+            let q0 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base]), id_v));
+            let q1 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base + 1]), id_v));
+            let q2 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base + 2]), id_v));
+            let q3 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base + 3]), id_v));
+            let i16_01 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+            let i16_23 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+            let packed = vmaxq_s8(vcombine_s8(vqmovn_s16(i16_01), vqmovn_s16(i16_23)), min_q);
+            store_s8x16(packed, out_half);
+        }
+        block.d = d_val;
+    }
+}
+
+#[cfg(target_feature = "neon")]
+pub(super) fn quantize_row_q8_k(input: &[f32], out: &mut [super::kquants::Q8_KActBlock]) {
+    // SAFETY: compiled only with baseline AArch64 NEON.
+    unsafe { quantize_row_q8_k_neon(input, out) }
+}
+
+#[cfg(target_feature = "neon")]
+#[target_feature(enable = "neon")]
+fn quantize_row_q8_k_neon(input: &[f32], out: &mut [super::kquants::Q8_KActBlock]) {
+    use core::arch::aarch64::{
+        vabsq_f32, vaddvq_s16, vcombine_s16, vcvtnq_s32_f32, vdupq_n_f32, vdupq_n_s8, vmaxq_f32,
+        vmaxq_s8, vmaxvq_f32, vmulq_f32, vqmovn_s16, vqmovn_s32,
+    };
+    let (chunks, _) = input.as_chunks::<256>();
+    for (src, block) in chunks.iter().zip(out.iter_mut()) {
+        let quads = src.as_chunks::<4>().0;
+        let mut max_v0 = vdupq_n_f32(0.0);
+        let mut max_v1 = vdupq_n_f32(0.0);
+        for pair in quads.as_chunks::<2>().0 {
+            max_v0 = vmaxq_f32(max_v0, vabsq_f32(load_f32x4(&pair[0])));
+            max_v1 = vmaxq_f32(max_v1, vabsq_f32(load_f32x4(&pair[1])));
+        }
+        let amax = vmaxvq_f32(vmaxq_f32(max_v0, max_v1));
+        if amax == 0.0 || !amax.is_finite() {
+            block.d = 0.0;
+            block.qs = [0; 256];
+            block.bsums = [0; 16];
+            continue;
+        }
+        let d_val = amax / 127.0_f32;
+        let id_v = vdupq_n_f32(127.0_f32 / amax);
+        let min_q = vdupq_n_s8(-127);
+        let qs_groups = block.qs.as_chunks_mut::<16>().0;
+        for (group_idx, (q_out, bsum_slot)) in
+            qs_groups.iter_mut().zip(block.bsums.iter_mut()).enumerate()
+        {
+            let base = group_idx * 4;
+            let q0 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base]), id_v));
+            let q1 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base + 1]), id_v));
+            let q2 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base + 2]), id_v));
+            let q3 = vcvtnq_s32_f32(vmulq_f32(load_f32x4(&quads[base + 3]), id_v));
+            let i16_01 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+            let i16_23 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+            let packed = vmaxq_s8(vcombine_s8(vqmovn_s16(i16_01), vqmovn_s16(i16_23)), min_q);
+            store_s8x16(packed, q_out);
+            *bsum_slot = vaddvq_s16(vpaddlq_s8(packed));
+        }
+        block.d = d_val;
+    }
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn accum_8lanes_16(
+    acc_lo: &mut int32x4_t,
+    acc_hi: &mut int32x4_t,
+    w_vec: int8x16_t,
+    a_vec: int8x16_t,
+    scale_i16: i16,
+) {
+    use core::arch::aarch64::{
+        vdupq_n_s16, vget_high_s16, vget_low_s16, vmlal_high_s8, vmlal_s16, vmull_s8,
+    };
+    let prod0 = vmull_s8(vget_low_s8(w_vec), vget_low_s8(a_vec));
+    let sum16 = vmlal_high_s8(prod0, w_vec, a_vec);
+    let scale_vec = vdupq_n_s16(scale_i16);
+    *acc_lo = vmlal_s16(*acc_lo, vget_low_s16(sum16), vget_low_s16(scale_vec));
+    *acc_hi = vmlal_s16(*acc_hi, vget_high_s16(sum16), vget_low_s16(scale_vec));
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn dot_kquant_8lanes_q4_k(
+    block: &[u8; 144],
+    values: &[i8; 256],
+    sums: &[i16; 16],
+) -> ([i32; 8], i32) {
+    // SAFETY: compiled only with baseline AArch64 NEON; fixed-size array extents guarantee valid bounds.
+    unsafe { dot_kquant_8lanes_q4_k_neon(block, values, sums) }
+}
+
+#[cfg(target_feature = "neon")]
+#[target_feature(enable = "neon")]
+fn dot_kquant_8lanes_q4_k_neon(
+    block: &[u8; 144],
+    values: &[i8; 256],
+    sums: &[i16; 16],
+) -> ([i32; 8], i32) {
+    use core::arch::aarch64::{
+        vaddq_s16, vdupq_n_s16, vget_high_s16, vget_low_s16, vmlal_high_s8, vmlal_s16, vmull_s8,
+    };
+    let mut acc_lo = vdupq_n_s32(0);
+    let mut acc_hi = vdupq_n_s32(0);
+    let mut min_sum = 0_i32;
+    let Ok(scales) = <&[u8; 12]>::try_from(&block[4..16]) else {
+        return ([0; 8], 0);
+    };
+    let a_groups = values.as_chunks::<16>().0;
+    let mask_0f = vdupq_n_u8(0x0f);
+    for chunk in 0..4 {
+        let group_lo = chunk * 2;
+        let group_hi = group_lo + 1;
+        let (sc_lo, min_lo) = super::kquants::unpack_q4_k_scale_min(group_lo, scales);
+        let (sc_hi, min_hi) = super::kquants::unpack_q4_k_scale_min(group_hi, scales);
+        min_sum +=
+            i32::from(min_lo) * (i32::from(sums[2 * group_lo]) + i32::from(sums[2 * group_lo + 1]));
+        min_sum +=
+            i32::from(min_hi) * (i32::from(sums[2 * group_hi]) + i32::from(sums[2 * group_hi + 1]));
+
+        let qs_off = 16 + chunk * 32;
+        let raw0 = load_u8x16(&block[qs_off..qs_off + 16].as_chunks::<16>().0[0]);
+        let raw1 = load_u8x16(&block[qs_off + 16..qs_off + 32].as_chunks::<16>().0[0]);
+
+        let lo0 = vreinterpretq_s8_u8(vandq_u8(raw0, mask_0f));
+        let lo1 = vreinterpretq_s8_u8(vandq_u8(raw1, mask_0f));
+        let a_lo0 = load_s8x16(&a_groups[chunk * 4]);
+        let a_lo1 = load_s8x16(&a_groups[chunk * 4 + 1]);
+        let sum_lo0 = vmlal_high_s8(vmull_s8(vget_low_s8(lo0), vget_low_s8(a_lo0)), lo0, a_lo0);
+        let sum_lo1 = vmlal_high_s8(vmull_s8(vget_low_s8(lo1), vget_low_s8(a_lo1)), lo1, a_lo1);
+        let sum_lo = vaddq_s16(sum_lo0, sum_lo1);
+        let sc_lo_vec = vdupq_n_s16(i16::from(sc_lo));
+        acc_lo = vmlal_s16(acc_lo, vget_low_s16(sum_lo), vget_low_s16(sc_lo_vec));
+        acc_hi = vmlal_s16(acc_hi, vget_high_s16(sum_lo), vget_low_s16(sc_lo_vec));
+
+        let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4));
+        let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4));
+        let a_hi0 = load_s8x16(&a_groups[chunk * 4 + 2]);
+        let a_hi1 = load_s8x16(&a_groups[chunk * 4 + 3]);
+        let sum_hi0 = vmlal_high_s8(vmull_s8(vget_low_s8(hi0), vget_low_s8(a_hi0)), hi0, a_hi0);
+        let sum_hi1 = vmlal_high_s8(vmull_s8(vget_low_s8(hi1), vget_low_s8(a_hi1)), hi1, a_hi1);
+        let sum_hi = vaddq_s16(sum_hi0, sum_hi1);
+        let sc_hi_vec = vdupq_n_s16(i16::from(sc_hi));
+        acc_lo = vmlal_s16(acc_lo, vget_low_s16(sum_hi), vget_low_s16(sc_hi_vec));
+        acc_hi = vmlal_s16(acc_hi, vget_high_s16(sum_hi), vget_low_s16(sc_hi_vec));
+    }
+    let mut lo_out = [0_i32; 4];
+    let mut hi_out = [0_i32; 4];
+    store_s32x4(acc_lo, &mut lo_out);
+    store_s32x4(acc_hi, &mut hi_out);
+    (
+        [
+            lo_out[0], lo_out[1], lo_out[2], lo_out[3], hi_out[0], hi_out[1], hi_out[2], hi_out[3],
+        ],
+        min_sum,
+    )
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn dot_kquant_8lanes_q6_k(block: &[u8; 210], values: &[i8; 256]) -> [i32; 8] {
+    // SAFETY: compiled only with baseline AArch64 NEON; fixed-size array extents guarantee valid bounds.
+    unsafe { dot_kquant_8lanes_q6_k_neon(block, values) }
+}
+
+#[cfg(target_feature = "neon")]
+#[target_feature(enable = "neon")]
+fn dot_kquant_8lanes_q6_k_neon(block: &[u8; 210], values: &[i8; 256]) -> [i32; 8] {
+    let mut acc_lo = vdupq_n_s32(0);
+    let mut acc_hi = vdupq_n_s32(0);
+    let a_groups = values.as_chunks::<16>().0;
+    for half_idx in 0..2 {
+        for quarter in 0..4 {
+            let g_base = half_idx * 8 + quarter * 2;
+            let (w0, w1, s0, s1) = unpack_q6_k_32(block, half_idx, quarter);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::as_conversions,
+                reason = "s0 originates from a signed i8 Q6_K sub-scale in -128..=127."
+            )]
+            accum_8lanes_16(
+                &mut acc_lo,
+                &mut acc_hi,
+                w0,
+                load_s8x16(&a_groups[g_base]),
+                s0 as i16,
+            );
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::as_conversions,
+                reason = "s1 originates from a signed i8 Q6_K sub-scale in -128..=127."
+            )]
+            accum_8lanes_16(
+                &mut acc_lo,
+                &mut acc_hi,
+                w1,
+                load_s8x16(&a_groups[g_base + 1]),
+                s1 as i16,
+            );
+        }
+    }
+    let mut lo_out = [0_i32; 4];
+    let mut hi_out = [0_i32; 4];
+    store_s32x4(acc_lo, &mut lo_out);
+    store_s32x4(acc_hi, &mut hi_out);
+    [
+        lo_out[0], lo_out[1], lo_out[2], lo_out[3], hi_out[0], hi_out[1], hi_out[2], hi_out[3],
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn unpack_q6_k_32(
+    block: &[u8; 210],
+    half_idx: usize,
+    quarter: usize,
+) -> (int8x16_t, int8x16_t, i32, i32) {
+    use core::arch::aarch64::{vdupq_n_s8, vorrq_u8, vshlq_n_u8};
+    let low_off = half_idx * 64 + (quarter % 2) * 32;
+    let high_off = 128 + half_idx * 32;
+    let ql0 = load_u8x16(&block[low_off..low_off + 16].as_chunks::<16>().0[0]);
+    let ql1 = load_u8x16(&block[low_off + 16..low_off + 32].as_chunks::<16>().0[0]);
+    let low0 = if quarter < 2 {
+        vandq_u8(ql0, vdupq_n_u8(0x0f))
+    } else {
+        vshrq_n_u8(ql0, 4)
+    };
+    let low1 = if quarter < 2 {
+        vandq_u8(ql1, vdupq_n_u8(0x0f))
+    } else {
+        vshrq_n_u8(ql1, 4)
+    };
+    let qh0 = load_u8x16(&block[high_off..high_off + 16].as_chunks::<16>().0[0]);
+    let qh1 = load_u8x16(&block[high_off + 16..high_off + 32].as_chunks::<16>().0[0]);
+    let mask_03 = vdupq_n_u8(0x03);
+    let hi0 = match quarter {
+        0 => vandq_u8(qh0, mask_03),
+        1 => vandq_u8(vshrq_n_u8(qh0, 2), mask_03),
+        2 => vandq_u8(vshrq_n_u8(qh0, 4), mask_03),
+        _ => vandq_u8(vshrq_n_u8(qh0, 6), mask_03),
+    };
+    let hi1 = match quarter {
+        0 => vandq_u8(qh1, mask_03),
+        1 => vandq_u8(vshrq_n_u8(qh1, 2), mask_03),
+        2 => vandq_u8(vshrq_n_u8(qh1, 4), mask_03),
+        _ => vandq_u8(vshrq_n_u8(qh1, 6), mask_03),
+    };
+    let bias = vdupq_n_s8(32);
+    let w0 = vsubq_s8(
+        vreinterpretq_s8_u8(vorrq_u8(low0, vshlq_n_u8(hi0, 4))),
+        bias,
+    );
+    let w1 = vsubq_s8(
+        vreinterpretq_s8_u8(vorrq_u8(low1, vshlq_n_u8(hi1, 4))),
+        bias,
+    );
+    let s_base = 192 + half_idx * 8 + quarter * 2;
+    let s0 = i32::from(block[s_base].cast_signed());
+    let s1 = i32::from(block[s_base + 1].cast_signed());
+    (w0, w1, s0, s1)
+}
+
+pub(super) fn quant_dot_q8_0_row(
+    w_row: &[u8],
+    act: &[super::kquants::Q8_0ActBlock],
+) -> Option<f32> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q8_0_row_dotprod(w_row, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q8_0_row_dotprod(w_row: &[u8], act: &[super::kquants::Q8_0ActBlock]) -> f32 {
+    let mut sum = 0.0_f32;
+    for (wb, ab) in w_row.as_chunks::<34>().0.iter().zip(act.iter()) {
+        let w_d = super::kquants::f16_bits_to_f32([wb[0], wb[1]]);
+        let a_halves = ab.qs.as_chunks::<16>().0;
+        let q0 = vreinterpretq_s8_u8(load_u8x16(&wb[2..18].as_chunks::<16>().0[0]));
+        let q1 = vreinterpretq_s8_u8(load_u8x16(&wb[18..34].as_chunks::<16>().0[0]));
+        let dot = vaddvq_s32(sdot32_vec(
+            q0,
+            q1,
+            load_s8x16(&a_halves[0]),
+            load_s8x16(&a_halves[1]),
+        ));
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "Matches non-FMA Q8_0 accumulation semantics."
+        )]
+        {
+            sum += w_d * (ab.d * super::kquants::i32_to_f32(dot));
+        }
+    }
+    sum
+}
+
+pub(super) fn quant_dot_q8_0_4rows(
+    rows: [&[u8]; 4],
+    act: &[super::kquants::Q8_0ActBlock],
+) -> Option<[f32; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q8_0_4rows_dotprod(rows, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q8_0_4rows_dotprod(
+    rows: [&[u8]; 4],
+    act: &[super::kquants::Q8_0ActBlock],
+) -> [f32; 4] {
+    let mut acc = [0.0_f32; 4];
+    let r0 = rows[0].as_chunks::<34>().0;
+    let r1 = rows[1].as_chunks::<34>().0;
+    let r2 = rows[2].as_chunks::<34>().0;
+    let r3 = rows[3].as_chunks::<34>().0;
+    for (idx, ab) in act.iter().enumerate() {
+        let a_halves = ab.qs.as_chunks::<16>().0;
+        let a0 = load_s8x16(&a_halves[0]);
+        let a1 = load_s8x16(&a_halves[1]);
+        let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+        let d_bits: [u16; 4] = blocks.map(|b| u16::from_le_bytes([b[0], b[1]]));
+        let d_vals = super::widen_f16_four(&d_bits);
+        for row_idx in 0..4 {
+            let blk = blocks[row_idx];
+            let q0 = vreinterpretq_s8_u8(load_u8x16(&blk[2..18].as_chunks::<16>().0[0]));
+            let q1 = vreinterpretq_s8_u8(load_u8x16(&blk[18..34].as_chunks::<16>().0[0]));
+            let dot = vaddvq_s32(sdot32_vec(q0, q1, a0, a1));
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA Q8_0 accumulation semantics."
+            )]
+            {
+                acc[row_idx] += d_vals[row_idx] * (ab.d * super::kquants::i32_to_f32(dot));
+            }
+        }
+    }
+    acc
+}
+
+pub(super) fn quant_gemm_q8_0_4x2(
+    rows: [&[u8]; 4],
+    act0: &[super::kquants::Q8_0ActBlock],
+    act1: &[super::kquants::Q8_0ActBlock],
+) -> Option<[[f32; 2]; 4]> {
+    if !has_i8mm() {
+        return None;
+    }
+    // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm`, `dotprod`, and baseline `neon`.
+    Some(unsafe { quant_gemm_q8_0_4x2_i8mm(rows, act0, act1) })
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn quant_gemm_q8_0_4x2_i8mm(
+    rows: [&[u8]; 4],
+    act0: &[super::kquants::Q8_0ActBlock],
+    act1: &[super::kquants::Q8_0ActBlock],
+) -> [[f32; 2]; 4] {
+    let mut acc = [[0.0_f32; 2]; 4];
+    let r0 = rows[0].as_chunks::<34>().0;
+    let r1 = rows[1].as_chunks::<34>().0;
+    let r2 = rows[2].as_chunks::<34>().0;
+    let r3 = rows[3].as_chunks::<34>().0;
+    for (idx, (ab0, ab1)) in act0.iter().zip(act1.iter()).enumerate() {
+        let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+        let w_quants = blocks.map(|b| &b[2..34].as_chunks::<32>().0[0]);
+        let tile = smmla_q8_0_4x2_i8mm(w_quants, [&ab0.qs, &ab1.qs]);
+        let d_bits: [u16; 4] = blocks.map(|b| u16::from_le_bytes([b[0], b[1]]));
+        let d_vals = super::widen_f16_four(&d_bits);
+        for row_idx in 0..4 {
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA Q8_0 accumulation semantics."
+            )]
+            {
+                acc[row_idx][0] +=
+                    d_vals[row_idx] * (ab0.d * super::kquants::i32_to_f32(tile[row_idx][0]));
+                acc[row_idx][1] +=
+                    d_vals[row_idx] * (ab1.d * super::kquants::i32_to_f32(tile[row_idx][1]));
+            }
+        }
+    }
+    acc
+}
+
+pub(super) fn quant_dot_q4_k_row(
+    w_row: &[u8],
+    act: &[super::kquants::Q8_KActBlock],
+) -> Option<f32> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q4_k_row_dotprod(w_row, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q4_k_row_dotprod(w_row: &[u8], act: &[super::kquants::Q8_KActBlock]) -> f32 {
+    let mut acc = 0.0_f64;
+    let mask_0f = vdupq_n_u8(0x0f);
+    for (block, ab) in w_row.as_chunks::<144>().0.iter().zip(act.iter()) {
+        let Ok(scales) = <&[u8; 12]>::try_from(&block[4..16]) else {
+            continue;
+        };
+        let a_groups = ab.qs.as_chunks::<16>().0;
+        let mut mint = 0_i32;
+        let mut sumi = 0_i32;
+        let d_act = f64::from(ab.d);
+        let [d_w_f, dmin_w_f, _, _] = super::widen_f16_four(&[
+            u16::from_le_bytes([block[0], block[1]]),
+            u16::from_le_bytes([block[2], block[3]]),
+            0,
+            0,
+        ]);
+        let d_w = f64::from(d_w_f);
+        let dmin_w = f64::from(dmin_w_f);
+        let mut sc_arr = [0_i32; 8];
+        for (group, sc_slot) in sc_arr.iter_mut().enumerate() {
+            let (sc_val, min_val) = super::kquants::unpack_q4_k_scale_min(group, scales);
+            *sc_slot = i32::from(sc_val);
+            let b_pair = i32::from(ab.bsums[2 * group]) + i32::from(ab.bsums[2 * group + 1]);
+            mint += i32::from(min_val) * b_pair;
+        }
+        for chunk in 0..4 {
+            let qs_off = 16 + chunk * 32;
+            let raw0 = load_u8x16(&block[qs_off..qs_off + 16].as_chunks::<16>().0[0]);
+            let raw1 = load_u8x16(&block[qs_off + 16..qs_off + 32].as_chunks::<16>().0[0]);
+            let lo0 = vreinterpretq_s8_u8(vandq_u8(raw0, mask_0f));
+            let lo1 = vreinterpretq_s8_u8(vandq_u8(raw1, mask_0f));
+            let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4));
+            let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4));
+            let d_lo = vaddvq_s32(sdot32_vec(
+                lo0,
+                lo1,
+                load_s8x16(&a_groups[chunk * 4]),
+                load_s8x16(&a_groups[chunk * 4 + 1]),
+            ));
+            let d_hi = vaddvq_s32(sdot32_vec(
+                hi0,
+                hi1,
+                load_s8x16(&a_groups[chunk * 4 + 2]),
+                load_s8x16(&a_groups[chunk * 4 + 3]),
+            ));
+            sumi += d_lo * sc_arr[chunk * 2] + d_hi * sc_arr[chunk * 2 + 1];
+        }
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "Matches non-FMA Q4_K block accumulation order."
+        )]
+        {
+            acc += (d_w * d_act) * f64::from(sumi) - (dmin_w * d_act) * f64::from(mint);
+        }
+    }
+    super::kquants::f64_to_f32(acc)
+}
+
+pub(super) fn quant_dot_q4_k_4rows(
+    rows: [&[u8]; 4],
+    act: &[super::kquants::Q8_KActBlock],
+) -> Option<[f32; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q4_k_4rows_dotprod(rows, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q4_k_4rows_dotprod(
+    rows: [&[u8]; 4],
+    act: &[super::kquants::Q8_KActBlock],
+) -> [f32; 4] {
+    let mut acc = [0.0_f64; 4];
+    let r0 = rows[0].as_chunks::<144>().0;
+    let r1 = rows[1].as_chunks::<144>().0;
+    let r2 = rows[2].as_chunks::<144>().0;
+    let r3 = rows[3].as_chunks::<144>().0;
+    let mask_0f = vdupq_n_u8(0x0f);
+    for (idx, ab) in act.iter().enumerate() {
+        let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+        let a_groups = ab.qs.as_chunks::<16>().0;
+        let bsum_pairs: [i32; 8] =
+            std::array::from_fn(|g| i32::from(ab.bsums[2 * g]) + i32::from(ab.bsums[2 * g + 1]));
+        let d_act = f64::from(ab.d);
+        let d_f16: [u16; 8] = [
+            u16::from_le_bytes([blocks[0][0], blocks[0][1]]),
+            u16::from_le_bytes([blocks[1][0], blocks[1][1]]),
+            u16::from_le_bytes([blocks[2][0], blocks[2][1]]),
+            u16::from_le_bytes([blocks[3][0], blocks[3][1]]),
+            u16::from_le_bytes([blocks[0][2], blocks[0][3]]),
+            u16::from_le_bytes([blocks[1][2], blocks[1][3]]),
+            u16::from_le_bytes([blocks[2][2], blocks[2][3]]),
+            u16::from_le_bytes([blocks[3][2], blocks[3][3]]),
+        ];
+        let [d_weights, dmin_weights] = super::widen_f16_eight(&d_f16);
+        let scales = blocks.map(|b| {
+            let mut sc_arr = [0_i32; 8];
+            let mut min_arr = [0_i32; 8];
+            if let Ok(raw_sc) = <&[u8; 12]>::try_from(&b[4..16]) {
+                for g in 0..8 {
+                    let (sc_v, m_v) = super::kquants::unpack_q4_k_scale_min(g, raw_sc);
+                    sc_arr[g] = i32::from(sc_v);
+                    min_arr[g] = i32::from(m_v);
+                }
+            }
+            (sc_arr, min_arr)
+        });
+        let mut mint = [0_i32; 4];
+        for r in 0..4 {
+            let mut m_sum = 0_i32;
+            for g in 0..8 {
+                m_sum += scales[r].1[g] * bsum_pairs[g];
+            }
+            mint[r] = m_sum;
+        }
+        let mut sumi = [0_i32; 4];
+        for chunk in 0..4 {
+            let a_lo0 = load_s8x16(&a_groups[chunk * 4]);
+            let a_lo1 = load_s8x16(&a_groups[chunk * 4 + 1]);
+            let a_hi0 = load_s8x16(&a_groups[chunk * 4 + 2]);
+            let a_hi1 = load_s8x16(&a_groups[chunk * 4 + 3]);
+            let qs_off = 16 + chunk * 32;
+            for r in 0..4 {
+                let raw0 = load_u8x16(&blocks[r][qs_off..qs_off + 16].as_chunks::<16>().0[0]);
+                let raw1 = load_u8x16(&blocks[r][qs_off + 16..qs_off + 32].as_chunks::<16>().0[0]);
+                let lo0 = vreinterpretq_s8_u8(vandq_u8(raw0, mask_0f));
+                let lo1 = vreinterpretq_s8_u8(vandq_u8(raw1, mask_0f));
+                let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4));
+                let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4));
+                let dot_lo = vaddvq_s32(sdot32_vec(lo0, lo1, a_lo0, a_lo1));
+                let dot_hi = vaddvq_s32(sdot32_vec(hi0, hi1, a_hi0, a_hi1));
+                sumi[r] += dot_lo * scales[r].0[chunk * 2] + dot_hi * scales[r].0[chunk * 2 + 1];
+            }
+        }
+        for r in 0..4 {
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA Q4_K block accumulation order."
+            )]
+            {
+                acc[r] += (f64::from(d_weights[r]) * d_act) * f64::from(sumi[r])
+                    - (f64::from(dmin_weights[r]) * d_act) * f64::from(mint[r]);
+            }
+        }
+    }
+    acc.map(super::kquants::f64_to_f32)
+}
+
+pub(super) fn quant_gemm_q4_k_4x2(
+    rows: [&[u8]; 4],
+    act0: &[super::kquants::Q8_KActBlock],
+    act1: &[super::kquants::Q8_KActBlock],
+) -> Option<[[f32; 2]; 4]> {
+    if !has_i8mm() {
+        return None;
+    }
+    // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm`, `dotprod`, and baseline `neon`.
+    Some(unsafe { quant_gemm_q4_k_4x2_i8mm(rows, act0, act1) })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Unrolls two-token SMMLA accumulators for four Q4_K weight rows in registers."
+)]
+#[target_feature(enable = "neon,i8mm")]
+fn quant_gemm_q4_k_4x2_i8mm(
+    rows: [&[u8]; 4],
+    act0: &[super::kquants::Q8_KActBlock],
+    act1: &[super::kquants::Q8_KActBlock],
+) -> [[f32; 2]; 4] {
+    use core::arch::aarch64::vmulq_s32;
+    let mut acc = [[0.0_f64; 2]; 4];
+    let r0 = rows[0].as_chunks::<144>().0;
+    let r1 = rows[1].as_chunks::<144>().0;
+    let r2 = rows[2].as_chunks::<144>().0;
+    let r3 = rows[3].as_chunks::<144>().0;
+    let mask_0f = vdupq_n_u8(0x0f);
+    for (idx, (ab0, ab1)) in act0.iter().zip(act1.iter()).enumerate() {
+        let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+        let a0_g = ab0.qs.as_chunks::<16>().0;
+        let a1_g = ab1.qs.as_chunks::<16>().0;
+        let bsum0: [i32; 8] =
+            std::array::from_fn(|g| i32::from(ab0.bsums[2 * g]) + i32::from(ab0.bsums[2 * g + 1]));
+        let bsum1: [i32; 8] =
+            std::array::from_fn(|g| i32::from(ab1.bsums[2 * g]) + i32::from(ab1.bsums[2 * g + 1]));
+        let d_act0 = f64::from(ab0.d);
+        let d_act1 = f64::from(ab1.d);
+        let d_f16: [u16; 8] = [
+            u16::from_le_bytes([blocks[0][0], blocks[0][1]]),
+            u16::from_le_bytes([blocks[1][0], blocks[1][1]]),
+            u16::from_le_bytes([blocks[2][0], blocks[2][1]]),
+            u16::from_le_bytes([blocks[3][0], blocks[3][1]]),
+            u16::from_le_bytes([blocks[0][2], blocks[0][3]]),
+            u16::from_le_bytes([blocks[1][2], blocks[1][3]]),
+            u16::from_le_bytes([blocks[2][2], blocks[2][3]]),
+            u16::from_le_bytes([blocks[3][2], blocks[3][3]]),
+        ];
+        let [d_weights, dmin_weights] = super::widen_f16_eight(&d_f16);
+        let scales = blocks.map(|b| {
+            let mut sc_arr = [0_i32; 8];
+            let mut min_arr = [0_i32; 8];
+            if let Ok(raw_sc) = <&[u8; 12]>::try_from(&b[4..16]) {
+                for g in 0..8 {
+                    let (sc_v, m_v) = super::kquants::unpack_q4_k_scale_min(g, raw_sc);
+                    sc_arr[g] = i32::from(sc_v);
+                    min_arr[g] = i32::from(m_v);
+                }
+            }
+            (sc_arr, min_arr)
+        });
+        let mut mint = [[0_i32; 2]; 4];
+        for r in 0..4 {
+            let mut m0 = 0_i32;
+            let mut m1 = 0_i32;
+            for g in 0..8 {
+                m0 += scales[r].1[g] * bsum0[g];
+                m1 += scales[r].1[g] * bsum1[g];
+            }
+            mint[r] = [m0, m1];
+        }
+        let mut sum01 = vdupq_n_s32(0);
+        let mut sum23 = vdupq_n_s32(0);
+        for chunk in 0..4 {
+            let qs_off = 16 + chunk * 32;
+            let mut lo01 = vdupq_n_s32(0);
+            let mut lo23 = vdupq_n_s32(0);
+            let mut hi01 = vdupq_n_s32(0);
+            let mut hi23 = vdupq_n_s32(0);
+            for sub in 0..2 {
+                let a0_lo = load_s8x16(&a0_g[chunk * 4 + sub]);
+                let a1_lo = load_s8x16(&a1_g[chunk * 4 + sub]);
+                let a_lo_0 = vcombine_s8(vget_low_s8(a0_lo), vget_low_s8(a1_lo));
+                let a_lo_1 = vcombine_s8(vget_high_s8(a0_lo), vget_high_s8(a1_lo));
+
+                let a0_hi = load_s8x16(&a0_g[chunk * 4 + 2 + sub]);
+                let a1_hi = load_s8x16(&a1_g[chunk * 4 + 2 + sub]);
+                let a_hi_0 = vcombine_s8(vget_low_s8(a0_hi), vget_low_s8(a1_hi));
+                let a_hi_1 = vcombine_s8(vget_high_s8(a0_hi), vget_high_s8(a1_hi));
+
+                let off = qs_off + sub * 16;
+                let r0_raw = load_u8x16(&blocks[0][off..off + 16].as_chunks::<16>().0[0]);
+                let r1_raw = load_u8x16(&blocks[1][off..off + 16].as_chunks::<16>().0[0]);
+                let r2_raw = load_u8x16(&blocks[2][off..off + 16].as_chunks::<16>().0[0]);
+                let r3_raw = load_u8x16(&blocks[3][off..off + 16].as_chunks::<16>().0[0]);
+
+                let l0 = vreinterpretq_s8_u8(vandq_u8(r0_raw, mask_0f));
+                let l1 = vreinterpretq_s8_u8(vandq_u8(r1_raw, mask_0f));
+                let l2 = vreinterpretq_s8_u8(vandq_u8(r2_raw, mask_0f));
+                let l3 = vreinterpretq_s8_u8(vandq_u8(r3_raw, mask_0f));
+                lo01 = smmla_s32(lo01, vcombine_s8(vget_low_s8(l0), vget_low_s8(l1)), a_lo_0);
+                lo01 = smmla_s32(
+                    lo01,
+                    vcombine_s8(vget_high_s8(l0), vget_high_s8(l1)),
+                    a_lo_1,
+                );
+                lo23 = smmla_s32(lo23, vcombine_s8(vget_low_s8(l2), vget_low_s8(l3)), a_lo_0);
+                lo23 = smmla_s32(
+                    lo23,
+                    vcombine_s8(vget_high_s8(l2), vget_high_s8(l3)),
+                    a_lo_1,
+                );
+
+                let h0 = vreinterpretq_s8_u8(vshrq_n_u8(r0_raw, 4));
+                let h1 = vreinterpretq_s8_u8(vshrq_n_u8(r1_raw, 4));
+                let h2 = vreinterpretq_s8_u8(vshrq_n_u8(r2_raw, 4));
+                let h3 = vreinterpretq_s8_u8(vshrq_n_u8(r3_raw, 4));
+                hi01 = smmla_s32(hi01, vcombine_s8(vget_low_s8(h0), vget_low_s8(h1)), a_hi_0);
+                hi01 = smmla_s32(
+                    hi01,
+                    vcombine_s8(vget_high_s8(h0), vget_high_s8(h1)),
+                    a_hi_1,
+                );
+                hi23 = smmla_s32(hi23, vcombine_s8(vget_low_s8(h2), vget_low_s8(h3)), a_hi_0);
+                hi23 = smmla_s32(
+                    hi23,
+                    vcombine_s8(vget_high_s8(h2), vget_high_s8(h3)),
+                    a_hi_1,
+                );
+            }
+            let g_lo = chunk * 2;
+            let g_hi = chunk * 2 + 1;
+            let sc_lo01 = load_s32x4(&[
+                scales[0].0[g_lo],
+                scales[0].0[g_lo],
+                scales[1].0[g_lo],
+                scales[1].0[g_lo],
+            ]);
+            let sc_hi01 = load_s32x4(&[
+                scales[0].0[g_hi],
+                scales[0].0[g_hi],
+                scales[1].0[g_hi],
+                scales[1].0[g_hi],
+            ]);
+            let sc_lo23 = load_s32x4(&[
+                scales[2].0[g_lo],
+                scales[2].0[g_lo],
+                scales[3].0[g_lo],
+                scales[3].0[g_lo],
+            ]);
+            let sc_hi23 = load_s32x4(&[
+                scales[2].0[g_hi],
+                scales[2].0[g_hi],
+                scales[3].0[g_hi],
+                scales[3].0[g_hi],
+            ]);
+            sum01 = vaddq_s32(sum01, vmulq_s32(lo01, sc_lo01));
+            sum01 = vaddq_s32(sum01, vmulq_s32(hi01, sc_hi01));
+            sum23 = vaddq_s32(sum23, vmulq_s32(lo23, sc_lo23));
+            sum23 = vaddq_s32(sum23, vmulq_s32(hi23, sc_hi23));
+        }
+        let mut f01 = [0_i32; 4];
+        let mut f23 = [0_i32; 4];
+        store_s32x4(sum01, &mut f01);
+        store_s32x4(sum23, &mut f23);
+        let sums = [
+            [f01[0], f01[1]],
+            [f01[2], f01[3]],
+            [f23[0], f23[1]],
+            [f23[2], f23[3]],
+        ];
+        for r in 0..4 {
+            let dw = f64::from(d_weights[r]);
+            let dm = f64::from(dmin_weights[r]);
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA Q4_K block accumulation order."
+            )]
+            {
+                acc[r][0] +=
+                    (dw * d_act0) * f64::from(sums[r][0]) - (dm * d_act0) * f64::from(mint[r][0]);
+                acc[r][1] +=
+                    (dw * d_act1) * f64::from(sums[r][1]) - (dm * d_act1) * f64::from(mint[r][1]);
+            }
+        }
+    }
+    acc.map(|pair| pair.map(super::kquants::f64_to_f32))
+}
+
+pub(super) fn quant_dot_q4_k_repacked8(
+    strip: &[u8],
+    act: &[super::kquants::Q8_KActBlock],
+) -> Option<[f32; 8]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q4_k_repacked8_dotprod(strip, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q4_k_repacked8_dotprod(
+    strip: &[u8],
+    act: &[super::kquants::Q8_KActBlock],
+) -> [f32; 8] {
+    let mut acc = [0.0_f64; 8];
+    let mask_0f = vdupq_n_u8(0x0f);
+    for (block, ab) in strip.as_chunks::<1184>().0.iter().zip(act.iter()) {
+        let a_groups = ab.qs.as_chunks::<16>().0;
+        let bsum_pairs: [i32; 8] =
+            std::array::from_fn(|g| i32::from(ab.bsums[2 * g]) + i32::from(ab.bsums[2 * g + 1]));
+        let d_act = f64::from(ab.d);
+        let d_f16: [u16; 8] =
+            std::array::from_fn(|r| u16::from_le_bytes([block[r * 2], block[r * 2 + 1]]));
+        let dmin_f16: [u16; 8] =
+            std::array::from_fn(|r| u16::from_le_bytes([block[16 + r * 2], block[16 + r * 2 + 1]]));
+        let sc_bytes = &block[32..96];
+        let m_bytes = &block[96..160];
+        let mut mint = [0_i32; 8];
+        for g in 0..8 {
+            let b_pair = bsum_pairs[g];
+            let m_row = &m_bytes[g * 8..(g + 1) * 8];
+            for r in 0..8 {
+                mint[r] += i32::from(m_row[r]) * b_pair;
+            }
+        }
+        let mut sumi = [0_i32; 8];
+        for chunk in 0..4 {
+            let a_lo0 = load_s8x16(&a_groups[chunk * 4]);
+            let a_lo1 = load_s8x16(&a_groups[chunk * 4 + 1]);
+            let a_hi0 = load_s8x16(&a_groups[chunk * 4 + 2]);
+            let a_hi1 = load_s8x16(&a_groups[chunk * 4 + 3]);
+            let qs_base = 160 + chunk * 256;
+            let sc_lo = &sc_bytes[(chunk * 2) * 8..(chunk * 2 + 1) * 8];
+            let sc_hi = &sc_bytes[(chunk * 2 + 1) * 8..(chunk * 2 + 2) * 8];
+            for r in 0..8 {
+                let row_qs = qs_base + r * 32;
+                let raw0 = load_u8x16(&block[row_qs..row_qs + 16].as_chunks::<16>().0[0]);
+                let raw1 = load_u8x16(&block[row_qs + 16..row_qs + 32].as_chunks::<16>().0[0]);
+                let lo0 = vreinterpretq_s8_u8(vandq_u8(raw0, mask_0f));
+                let lo1 = vreinterpretq_s8_u8(vandq_u8(raw1, mask_0f));
+                let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4));
+                let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4));
+                let d_lo = vaddvq_s32(sdot32_vec(lo0, lo1, a_lo0, a_lo1));
+                let d_hi = vaddvq_s32(sdot32_vec(hi0, hi1, a_hi0, a_hi1));
+                sumi[r] += d_lo * i32::from(sc_lo[r]) + d_hi * i32::from(sc_hi[r]);
+            }
+        }
+        let d_w = super::widen_f16_eight(&d_f16);
+        let dmin_w = super::widen_f16_eight(&dmin_f16);
+        for r in 0..8 {
+            let dw = f64::from(d_w[r / 4][r % 4]) * d_act;
+            let dm = f64::from(dmin_w[r / 4][r % 4]) * d_act;
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA repacked Q4_K block accumulation order."
+            )]
+            {
+                acc[r] += dw * f64::from(sumi[r]) - dm * f64::from(mint[r]);
+            }
+        }
+    }
+    acc.map(super::kquants::f64_to_f32)
+}
+
+pub(super) fn quant_gemm_q4_k_repacked8_8x2(
+    strip: &[u8],
+    act0: &[super::kquants::Q8_KActBlock],
+    act1: &[super::kquants::Q8_KActBlock],
+) -> Option<[[f32; 2]; 8]> {
+    if !has_i8mm() {
+        return None;
+    }
+    // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm`, `dotprod`, and baseline `neon`.
+    Some(unsafe { quant_gemm_q4_k_repacked8_8x2_i8mm(strip, act0, act1) })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Unrolls two-token SMMLA accumulators for an 8-row repacked strip in registers."
+)]
+#[target_feature(enable = "neon,i8mm")]
+fn quant_gemm_q4_k_repacked8_8x2_i8mm(
+    strip: &[u8],
+    act0: &[super::kquants::Q8_KActBlock],
+    act1: &[super::kquants::Q8_KActBlock],
+) -> [[f32; 2]; 8] {
+    use core::arch::aarch64::vmulq_s32;
+    let mut acc = [[0.0_f64; 2]; 8];
+    let mask_0f = vdupq_n_u8(0x0f);
+    for (block, (ab0, ab1)) in strip
+        .as_chunks::<1184>()
+        .0
+        .iter()
+        .zip(act0.iter().zip(act1.iter()))
+    {
+        let a0_g = ab0.qs.as_chunks::<16>().0;
+        let a1_g = ab1.qs.as_chunks::<16>().0;
+        let bsum0: [i32; 8] =
+            std::array::from_fn(|g| i32::from(ab0.bsums[2 * g]) + i32::from(ab0.bsums[2 * g + 1]));
+        let bsum1: [i32; 8] =
+            std::array::from_fn(|g| i32::from(ab1.bsums[2 * g]) + i32::from(ab1.bsums[2 * g + 1]));
+        let d_act0 = f64::from(ab0.d);
+        let d_act1 = f64::from(ab1.d);
+        let d_f16: [u16; 8] =
+            std::array::from_fn(|r| u16::from_le_bytes([block[r * 2], block[r * 2 + 1]]));
+        let dmin_f16: [u16; 8] =
+            std::array::from_fn(|r| u16::from_le_bytes([block[16 + r * 2], block[16 + r * 2 + 1]]));
+        let sc_bytes = &block[32..96];
+        let m_bytes = &block[96..160];
+        let mut mint = [[0_i32; 2]; 8];
+        for g in 0..8 {
+            let b0 = bsum0[g];
+            let b1 = bsum1[g];
+            let m_row = &m_bytes[g * 8..(g + 1) * 8];
+            for r in 0..8 {
+                let m_val = i32::from(m_row[r]);
+                mint[r][0] += m_val * b0;
+                mint[r][1] += m_val * b1;
+            }
+        }
+        let mut sum_pairs = [vdupq_n_s32(0); 4];
+        for chunk in 0..4 {
+            let mut lo_acc = [vdupq_n_s32(0); 4];
+            let mut hi_acc = [vdupq_n_s32(0); 4];
+            let qs_base = 160 + chunk * 256;
+            for sub in 0..2 {
+                let a0_lo = load_s8x16(&a0_g[chunk * 4 + sub]);
+                let a1_lo = load_s8x16(&a1_g[chunk * 4 + sub]);
+                let a_lo_0 = vcombine_s8(vget_low_s8(a0_lo), vget_low_s8(a1_lo));
+                let a_lo_1 = vcombine_s8(vget_high_s8(a0_lo), vget_high_s8(a1_lo));
+
+                let a0_hi = load_s8x16(&a0_g[chunk * 4 + 2 + sub]);
+                let a1_hi = load_s8x16(&a1_g[chunk * 4 + 2 + sub]);
+                let a_hi_0 = vcombine_s8(vget_low_s8(a0_hi), vget_low_s8(a1_hi));
+                let a_hi_1 = vcombine_s8(vget_high_s8(a0_hi), vget_high_s8(a1_hi));
+
+                for pair in 0..4 {
+                    let o0 = qs_base + (pair * 2) * 32 + sub * 16;
+                    let o1 = qs_base + (pair * 2 + 1) * 32 + sub * 16;
+                    let raw0 = load_u8x16(&block[o0..o0 + 16].as_chunks::<16>().0[0]);
+                    let raw1 = load_u8x16(&block[o1..o1 + 16].as_chunks::<16>().0[0]);
+                    let l0 = vreinterpretq_s8_u8(vandq_u8(raw0, mask_0f));
+                    let l1 = vreinterpretq_s8_u8(vandq_u8(raw1, mask_0f));
+                    lo_acc[pair] = smmla_s32(
+                        lo_acc[pair],
+                        vcombine_s8(vget_low_s8(l0), vget_low_s8(l1)),
+                        a_lo_0,
+                    );
+                    lo_acc[pair] = smmla_s32(
+                        lo_acc[pair],
+                        vcombine_s8(vget_high_s8(l0), vget_high_s8(l1)),
+                        a_lo_1,
+                    );
+
+                    let h0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4));
+                    let h1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4));
+                    hi_acc[pair] = smmla_s32(
+                        hi_acc[pair],
+                        vcombine_s8(vget_low_s8(h0), vget_low_s8(h1)),
+                        a_hi_0,
+                    );
+                    hi_acc[pair] = smmla_s32(
+                        hi_acc[pair],
+                        vcombine_s8(vget_high_s8(h0), vget_high_s8(h1)),
+                        a_hi_1,
+                    );
+                }
+            }
+            let sc_lo = &sc_bytes[(chunk * 2) * 8..(chunk * 2 + 1) * 8];
+            let sc_hi = &sc_bytes[(chunk * 2 + 1) * 8..(chunk * 2 + 2) * 8];
+            for pair in 0..4 {
+                let s0 = i32::from(sc_lo[pair * 2]);
+                let s1 = i32::from(sc_lo[pair * 2 + 1]);
+                let h0 = i32::from(sc_hi[pair * 2]);
+                let h1 = i32::from(sc_hi[pair * 2 + 1]);
+                let vec_scale_low = load_s32x4(&[s0, s0, s1, s1]);
+                let vec_scale_high = load_s32x4(&[h0, h0, h1, h1]);
+                sum_pairs[pair] =
+                    vaddq_s32(sum_pairs[pair], vmulq_s32(lo_acc[pair], vec_scale_low));
+                sum_pairs[pair] =
+                    vaddq_s32(sum_pairs[pair], vmulq_s32(hi_acc[pair], vec_scale_high));
+            }
+        }
+        let d_w = super::widen_f16_eight(&d_f16);
+        let dmin_w = super::widen_f16_eight(&dmin_f16);
+        for (pair, &pair_vec) in sum_pairs.iter().enumerate() {
+            let mut vals = [0_i32; 4];
+            store_s32x4(pair_vec, &mut vals);
+            let r0 = pair * 2;
+            let r1 = pair * 2 + 1;
+            let dw0 = f64::from(d_w[r0 / 4][r0 % 4]);
+            let dm0 = f64::from(dmin_w[r0 / 4][r0 % 4]);
+            let dw1 = f64::from(d_w[r1 / 4][r1 % 4]);
+            let dm1 = f64::from(dmin_w[r1 / 4][r1 % 4]);
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA repacked Q4_K block accumulation order."
+            )]
+            {
+                acc[r0][0] +=
+                    (dw0 * d_act0) * f64::from(vals[0]) - (dm0 * d_act0) * f64::from(mint[r0][0]);
+                acc[r0][1] +=
+                    (dw0 * d_act1) * f64::from(vals[1]) - (dm0 * d_act1) * f64::from(mint[r0][1]);
+                acc[r1][0] +=
+                    (dw1 * d_act0) * f64::from(vals[2]) - (dm1 * d_act0) * f64::from(mint[r1][0]);
+                acc[r1][1] +=
+                    (dw1 * d_act1) * f64::from(vals[3]) - (dm1 * d_act1) * f64::from(mint[r1][1]);
+            }
+        }
+    }
+    acc.map(|pair| pair.map(super::kquants::f64_to_f32))
+}
+
+pub(super) fn quant_dot_q6_k_row(
+    w_row: &[u8],
+    act: &[super::kquants::Q8_KActBlock],
+) -> Option<f32> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q6_k_row_dotprod(w_row, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q6_k_row_dotprod(w_row: &[u8], act: &[super::kquants::Q8_KActBlock]) -> f32 {
+    let mut acc = 0.0_f64;
+    let zero = vdupq_n_s32(0);
+    for (block, ab) in w_row.as_chunks::<210>().0.iter().zip(act.iter()) {
+        let a_groups = ab.qs.as_chunks::<16>().0;
+        let d_act = f64::from(ab.d);
+        let d_w = f64::from(super::kquants::f16_bits_to_f32([block[208], block[209]]));
+        let mut sumi = 0_i32;
+        for half_idx in 0..2 {
+            for quarter in 0..4 {
+                let g_base = half_idx * 8 + quarter * 2;
+                let a0 = load_s8x16(&a_groups[g_base]);
+                let a1 = load_s8x16(&a_groups[g_base + 1]);
+                let (w0, w1, s0, s1) = unpack_q6_k_32(block, half_idx, quarter);
+                let d0 = vaddvq_s32(vdotq_s32(zero, w0, a0));
+                let d1 = vaddvq_s32(vdotq_s32(zero, w1, a1));
+                sumi += d0 * s0 + d1 * s1;
+            }
+        }
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "Matches non-FMA Q6_K block accumulation order."
+        )]
+        {
+            acc += (d_w * d_act) * f64::from(sumi);
+        }
+    }
+    super::kquants::f64_to_f32(acc)
+}
+
+pub(super) fn quant_dot_q6_k_4rows(
+    rows: [&[u8]; 4],
+    act: &[super::kquants::Q8_KActBlock],
+) -> Option<[f32; 4]> {
+    if !has_dotprod() {
+        return None;
+    }
+    // SAFETY: `has_dotprod()` verified that the CPU supports `dotprod` and baseline `neon`.
+    Some(unsafe { quant_dot_q6_k_4rows_dotprod(rows, act) })
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn quant_dot_q6_k_4rows_dotprod(
+    rows: [&[u8]; 4],
+    act: &[super::kquants::Q8_KActBlock],
+) -> [f32; 4] {
+    let mut acc = [0.0_f64; 4];
+    let r0 = rows[0].as_chunks::<210>().0;
+    let r1 = rows[1].as_chunks::<210>().0;
+    let r2 = rows[2].as_chunks::<210>().0;
+    let r3 = rows[3].as_chunks::<210>().0;
+    let zero = vdupq_n_s32(0);
+    for (idx, ab) in act.iter().enumerate() {
+        let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+        let a_groups = ab.qs.as_chunks::<16>().0;
+        let d_act = f64::from(ab.d);
+        let d_bits: [u16; 4] = blocks.map(|b| u16::from_le_bytes([b[208], b[209]]));
+        let d_weights = super::widen_f16_four(&d_bits);
+        let mut sumi = [0_i32; 4];
+        for half_idx in 0..2 {
+            for quarter in 0..4 {
+                let g_base = half_idx * 8 + quarter * 2;
+                let a0 = load_s8x16(&a_groups[g_base]);
+                let a1 = load_s8x16(&a_groups[g_base + 1]);
+                for r in 0..4 {
+                    let (w0, w1, s0, s1) = unpack_q6_k_32(blocks[r], half_idx, quarter);
+                    let d0 = vaddvq_s32(vdotq_s32(zero, w0, a0));
+                    let d1 = vaddvq_s32(vdotq_s32(zero, w1, a1));
+                    sumi[r] += d0 * s0 + d1 * s1;
+                }
+            }
+        }
+        for r in 0..4 {
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA Q6_K block accumulation order."
+            )]
+            {
+                acc[r] += (f64::from(d_weights[r]) * d_act) * f64::from(sumi[r]);
+            }
+        }
+    }
+    acc.map(super::kquants::f64_to_f32)
+}
+
+pub(super) fn quant_gemm_q6_k_4x2(
+    rows: [&[u8]; 4],
+    act0: &[super::kquants::Q8_KActBlock],
+    act1: &[super::kquants::Q8_KActBlock],
+) -> Option<[[f32; 2]; 4]> {
+    if !has_i8mm() {
+        return None;
+    }
+    // SAFETY: `has_i8mm()` verified that the CPU supports `i8mm`, `dotprod`, and baseline `neon`.
+    Some(unsafe { quant_gemm_q6_k_4x2_i8mm(rows, act0, act1) })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Unrolls two-token SMMLA accumulators for four Q6_K weight rows in registers."
+)]
+#[target_feature(enable = "neon,i8mm")]
+fn quant_gemm_q6_k_4x2_i8mm(
+    rows: [&[u8]; 4],
+    act0: &[super::kquants::Q8_KActBlock],
+    act1: &[super::kquants::Q8_KActBlock],
+) -> [[f32; 2]; 4] {
+    use core::arch::aarch64::vmulq_s32;
+    let mut acc = [[0.0_f64; 2]; 4];
+    let r0 = rows[0].as_chunks::<210>().0;
+    let r1 = rows[1].as_chunks::<210>().0;
+    let r2 = rows[2].as_chunks::<210>().0;
+    let r3 = rows[3].as_chunks::<210>().0;
+    for (idx, (ab0, ab1)) in act0.iter().zip(act1.iter()).enumerate() {
+        let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+        let a0_g = ab0.qs.as_chunks::<16>().0;
+        let a1_g = ab1.qs.as_chunks::<16>().0;
+        let d_act0 = f64::from(ab0.d);
+        let d_act1 = f64::from(ab1.d);
+        let d_bits: [u16; 4] = blocks.map(|b| u16::from_le_bytes([b[208], b[209]]));
+        let d_weights = super::widen_f16_four(&d_bits);
+        let mut sum01 = vdupq_n_s32(0);
+        let mut sum23 = vdupq_n_s32(0);
+        for half_idx in 0..2 {
+            for quarter in 0..4 {
+                let g_base = half_idx * 8 + quarter * 2;
+                let a0_lo = load_s8x16(&a0_g[g_base]);
+                let a1_lo = load_s8x16(&a1_g[g_base]);
+                let a_g0_lo = vcombine_s8(vget_low_s8(a0_lo), vget_low_s8(a1_lo));
+                let a_g0_hi = vcombine_s8(vget_high_s8(a0_lo), vget_high_s8(a1_lo));
+
+                let a0_hi = load_s8x16(&a0_g[g_base + 1]);
+                let a1_hi = load_s8x16(&a1_g[g_base + 1]);
+                let a_g1_lo = vcombine_s8(vget_low_s8(a0_hi), vget_low_s8(a1_hi));
+                let a_g1_hi = vcombine_s8(vget_high_s8(a0_hi), vget_high_s8(a1_hi));
+
+                let (w0_0, w0_1, s0_0, s0_1) = unpack_q6_k_32(blocks[0], half_idx, quarter);
+                let (w1_0, w1_1, s1_0, s1_1) = unpack_q6_k_32(blocks[1], half_idx, quarter);
+                let (w2_0, w2_1, s2_0, s2_1) = unpack_q6_k_32(blocks[2], half_idx, quarter);
+                let (w3_0, w3_1, s3_0, s3_1) = unpack_q6_k_32(blocks[3], half_idx, quarter);
+
+                let g0_01 = smmla_s32(
+                    smmla_s32(
+                        vdupq_n_s32(0),
+                        vcombine_s8(vget_low_s8(w0_0), vget_low_s8(w1_0)),
+                        a_g0_lo,
+                    ),
+                    vcombine_s8(vget_high_s8(w0_0), vget_high_s8(w1_0)),
+                    a_g0_hi,
+                );
+                let g1_01 = smmla_s32(
+                    smmla_s32(
+                        vdupq_n_s32(0),
+                        vcombine_s8(vget_low_s8(w0_1), vget_low_s8(w1_1)),
+                        a_g1_lo,
+                    ),
+                    vcombine_s8(vget_high_s8(w0_1), vget_high_s8(w1_1)),
+                    a_g1_hi,
+                );
+                sum01 = vaddq_s32(
+                    sum01,
+                    vmulq_s32(g0_01, load_s32x4(&[s0_0, s0_0, s1_0, s1_0])),
+                );
+                sum01 = vaddq_s32(
+                    sum01,
+                    vmulq_s32(g1_01, load_s32x4(&[s0_1, s0_1, s1_1, s1_1])),
+                );
+
+                let g0_23 = smmla_s32(
+                    smmla_s32(
+                        vdupq_n_s32(0),
+                        vcombine_s8(vget_low_s8(w2_0), vget_low_s8(w3_0)),
+                        a_g0_lo,
+                    ),
+                    vcombine_s8(vget_high_s8(w2_0), vget_high_s8(w3_0)),
+                    a_g0_hi,
+                );
+                let g1_23 = smmla_s32(
+                    smmla_s32(
+                        vdupq_n_s32(0),
+                        vcombine_s8(vget_low_s8(w2_1), vget_low_s8(w3_1)),
+                        a_g1_lo,
+                    ),
+                    vcombine_s8(vget_high_s8(w2_1), vget_high_s8(w3_1)),
+                    a_g1_hi,
+                );
+                sum23 = vaddq_s32(
+                    sum23,
+                    vmulq_s32(g0_23, load_s32x4(&[s2_0, s2_0, s3_0, s3_0])),
+                );
+                sum23 = vaddq_s32(
+                    sum23,
+                    vmulq_s32(g1_23, load_s32x4(&[s2_1, s2_1, s3_1, s3_1])),
+                );
+            }
+        }
+        let mut f01 = [0_i32; 4];
+        let mut f23 = [0_i32; 4];
+        store_s32x4(sum01, &mut f01);
+        store_s32x4(sum23, &mut f23);
+        let sums = [
+            [f01[0], f01[1]],
+            [f01[2], f01[3]],
+            [f23[0], f23[1]],
+            [f23[2], f23[3]],
+        ];
+        for r in 0..4 {
+            let dw = f64::from(d_weights[r]);
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Matches non-FMA Q6_K block accumulation order."
+            )]
+            {
+                acc[r][0] += (dw * d_act0) * f64::from(sums[r][0]);
+                acc[r][1] += (dw * d_act1) * f64::from(sums[r][1]);
+            }
+        }
+    }
+    acc.map(|pair| pair.map(super::kquants::f64_to_f32))
+}

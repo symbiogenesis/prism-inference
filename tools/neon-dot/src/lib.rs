@@ -13,7 +13,13 @@ mod scaled;
 pub use scaled::Pq2Activation;
 
 mod half;
-pub use half::{widen_f16_eight, widen_f16_four};
+pub use half::{
+    narrow_f32_eight, narrow_f32_four, narrow_f32_slice_to_f16, scalar_half_bits, widen_f16_eight,
+    widen_f16_four,
+};
+
+/// Quantized row dot products, 8-row repacking, and activation quantizers.
+pub mod kquants;
 
 mod bf16;
 pub use bf16::dot_bf16_rows;

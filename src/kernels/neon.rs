@@ -364,22 +364,6 @@ pub(super) fn prepare_pq2_activations(
 }
 
 #[inline]
-pub(super) fn f16_u32x4_to_f32_x4(neon: Neon, raw: u32x4<Neon>) -> f32x4<Neon> {
-    let sign = (raw & 0x8000) << 16;
-    let exp = (raw >> 10) & 31;
-    let mant = raw & 1023;
-    let normal_bits = sign | ((exp + 112) << 23) | (mant << 13);
-    let inf_nan_bits = sign | (u32x4::splat(neon, 255) << 23) | (mant << 13);
-    let subnormal_mag =
-        mant.to_float::<f32x4<Neon>>() * f32x4::splat(neon, f32::from_bits(0x3380_0000));
-    let subnormal_bits = sign | subnormal_mag.bitcast::<u32x4<Neon>>();
-    let is_zero_exp = exp.simd_eq(u32x4::splat(neon, 0));
-    let is_max_exp = exp.simd_eq(u32x4::splat(neon, 31));
-    let selected = is_zero_exp.select(subnormal_bits, is_max_exp.select(inf_nan_bits, normal_bits));
-    selected.bitcast::<f32x4<Neon>>()
-}
-
-#[inline]
 pub(super) fn f16_bits_to_f32_x4(neon: Neon, bits: [u16; 4]) -> f32x4<Neon> {
     f32x4::load_array(neon, bonsai_neon_dot::widen_f16_four(&bits))
 }
@@ -403,30 +387,16 @@ pub(super) fn f16_pair_x4_to_f32_x4(
 }
 
 #[inline]
-fn half_bits_u32x4(neon: Neon, v: f32x4<Neon>) -> u32x4<Neon> {
-    let mut base = (v.abs() * f32x4::splat(neon, f32::from_bits(0x7780_0000)))
-        * f32x4::splat(neon, f32::from_bits(0x0880_0000));
-    let bits = v.bitcast::<u32x4<Neon>>();
-    let doubled = bits + bits;
-    let exponent_bias = (doubled & 0xff00_0000).max(u32x4::splat(neon, 0x7100_0000));
-    base += ((exponent_bias >> 1) + u32x4::splat(neon, 0x0780_0000)).bitcast::<f32x4<Neon>>();
-    let rounded = base.bitcast::<u32x4<Neon>>();
-    let normal_mag = ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff);
-    let magnitude = doubled
-        .simd_gt(u32x4::splat(neon, 0xff00_0000))
-        .select(u32x4::splat(neon, 0x7e00), normal_mag);
-    (((bits >> 16) & 0x8000) | magnitude) & 0xffff
-}
-
-#[inline]
 pub(super) fn round_f16_x4(neon: Neon, v: f32x4<Neon>) -> f32x4<Neon> {
-    f16_u32x4_to_f32_x4(neon, half_bits_u32x4(neon, v))
+    f32x4::load_array(
+        neon,
+        bonsai_neon_dot::widen_f16_four(&half_bits_x4(neon, v)),
+    )
 }
 
 #[inline]
-pub(super) fn half_bits_x4(neon: Neon, v: f32x4<Neon>) -> [u16; 4] {
-    let bits = half_bits_u32x4(neon, v);
-    [bits[0], bits[1], bits[2], bits[3]].map(|lane| u16::try_from(lane).unwrap_or(0))
+pub(super) fn half_bits_x4(_neon: Neon, v: f32x4<Neon>) -> [u16; 4] {
+    bonsai_neon_dot::narrow_f32_four([v[0], v[1], v[2], v[3]])
 }
 
 #[inline]
@@ -1253,18 +1223,14 @@ pub(super) fn round_bf16_into(input: &[f32], output: &mut Vec<f32>) -> Option<Re
 
 #[inline]
 pub(super) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) -> bool {
-    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+    if fearless_simd::Level::baseline().as_neon().is_none() {
         return false;
-    };
-    let (chunks, tail) = values.as_chunks::<8>();
-    let mut converted = [0_u16; 8];
-    for chunk in chunks {
-        let low = half_bits_u32x4(neon, f32x4::from_slice(neon, &chunk[..4]));
-        let high = half_bits_u32x4(neon, f32x4::from_slice(neon, &chunk[4..]));
-        low.narrow(high).store_slice(&mut converted);
-        output.extend_from_slice(&converted);
     }
-    output.extend(tail.iter().copied().map(super::half_bits));
+    let (chunks, tail) = values.as_chunks::<8>();
+    for chunk in chunks {
+        output.extend_from_slice(&bonsai_neon_dot::narrow_f32_eight(chunk));
+    }
+    output.extend(tail.iter().copied().map(bonsai_neon_dot::scalar_half_bits));
     true
 }
 

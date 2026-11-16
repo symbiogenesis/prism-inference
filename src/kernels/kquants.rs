@@ -298,6 +298,18 @@ fn dot_q4_q5_k_block(
     Ok(())
 }
 
+#[cfg_attr(
+    all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ),
+    expect(
+        dead_code,
+        reason = "ARM64 NEON 8-lane Q6_K kernel handles kind 14 when experimental-neon is enabled."
+    )
+)]
 fn dot_q6_k_block(
     block_bytes: &[u8],
     q8k: &Q8KBlock,
@@ -347,6 +359,54 @@ pub(super) fn dot(kind: u32, weights: &[u8], input: &[Q8KBlock]) -> Result<f32> 
     }
     let mut sum = 0.0_f32;
     let mut lanes = [0.0_f32; 8];
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    if kind == 12 {
+        for (weights, input) in weights.as_chunks::<144>().0.iter().zip(input) {
+            let block_d = scale(weights)?;
+            let block_minimum = scale(&weights[2..4])?;
+            let activation_scale = finite(input.scale)?;
+            let (integers, minimum_sum) = bonsai_neon_dot::kquants::dot_kquant_8lanes_q4_k(
+                weights,
+                &input.values,
+                &input.sums,
+            );
+            let d = block_d * activation_scale;
+            for (lane, integer) in lanes.iter_mut().zip(integers) {
+                *lane += d * integer as f32;
+            }
+            sum -= (block_minimum * activation_scale) * minimum_sum as f32;
+        }
+        for lane in lanes {
+            sum += lane;
+        }
+        return finite(sum);
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    if kind == 14 {
+        for (weights, input) in weights.as_chunks::<210>().0.iter().zip(input) {
+            let block_d = scale(&weights[208..210])?;
+            let activation_scale = finite(input.scale)?;
+            let integers = bonsai_neon_dot::kquants::dot_kquant_8lanes_q6_k(weights, &input.values);
+            let d = block_d * activation_scale;
+            for (lane, integer) in lanes.iter_mut().zip(integers) {
+                *lane += d * integer as f32;
+            }
+        }
+        for lane in lanes {
+            sum += lane;
+        }
+        return finite(sum);
+    }
     for (block_bytes, q8k) in weights.chunks_exact(size).zip(input) {
         let activation_scale = finite(q8k.scale)?;
         match kind {
@@ -360,6 +420,12 @@ pub(super) fn dot(kind: u32, weights: &[u8], input: &[Q8KBlock]) -> Result<f32> 
                 &mut lanes,
                 &mut sum,
             )?,
+            #[cfg(not(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            )))]
             14 => dot_q6_k_block(block_bytes, q8k, activation_scale, &mut lanes)?,
             _ => return Err(invalid("unknown K quant kind")),
         }

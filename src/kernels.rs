@@ -2815,26 +2815,51 @@ impl PreparedMatvec<'_> {
     }
 }
 
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "The converted binary16 sign and magnitude occupy at most sixteen bits."
+#[cfg_attr(
+    not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    )),
+    expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "The converted binary16 sign and magnitude occupy at most sixteen bits."
+    )
 )]
 pub(crate) fn half_bits(value: f32) -> u16 {
-    // Port of ggml_compute_fp32_to_fp16; the shift/add path rounds ties to
-    // even via native f32 arithmetic and includes subnormals and signed zero.
-    let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
-    let bits = value.to_bits();
-    let doubled = bits.wrapping_add(bits);
-    let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
-    base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
-    let rounded = base.to_bits();
-    let magnitude = if doubled > 0xff00_0000 {
-        0x7e00
-    } else {
-        ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff)
-    };
-    ((bits >> 16) & 0x8000 | magnitude) as u16
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    {
+        bonsai_neon_dot::scalar_half_bits(value)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    )))]
+    {
+        // Port of ggml_compute_fp32_to_fp16; the shift/add path rounds ties to
+        // even via native f32 arithmetic and includes subnormals and signed zero.
+        let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
+        let bits = value.to_bits();
+        let doubled = bits.wrapping_add(bits);
+        let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
+        base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
+        let rounded = base.to_bits();
+        let magnitude = if doubled > 0xff00_0000 {
+            0x7e00
+        } else {
+            ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff)
+        };
+        ((bits >> 16) & 0x8000 | magnitude) as u16
+    }
 }
 
 /// Rounds to IEEE binary16, returning its exactly expanded binary32 value.

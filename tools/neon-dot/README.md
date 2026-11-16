@@ -5,10 +5,12 @@
 dot-product primitives, plus non-widening `u8x16` base-3 division-by-multiplication
 `PTQ1_0` trit unpacking (`decode_ptq1_trits_i8`).
 
-The crate also provides exact binary16 widening, ordered BF16 row reductions
-through `dot_bf16_rows`, and bounded packed rotated-scalar KV operations in
-`kv_quant`. Floating-point paths retain their documented scale, reduction-order
-and finite-value checks.
+The crate also provides exact binary16 widening, GGML-compatible binary16
+narrowing/slicing, ordered BF16 row reductions through `dot_bf16_rows`,
+symmetric `Q8_0`/`Q8_K` activation quantizers, `SDOT`/`I8MM` quantized row,
+8-row repacked, and 2-token GEMM kernels in `kquants`, and bounded packed
+rotated-scalar KV operations in `kv_quant`. Floating-point paths retain their
+documented scale, reduction-order and finite-value checks.
 
 Public entry points use fixed arrays or checked borrowed slices. Optional
 `dotprod` and `i8mm` paths require runtime capability checks (`has_dotprod`,

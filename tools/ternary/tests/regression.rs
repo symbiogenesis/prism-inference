@@ -7,7 +7,7 @@
 
 use bonsai_ternary::{
     Error, Pq2Block, Q8KBlock, checked_float_to_half, float_to_half, half_to_float, pack_ptq,
-    unpack_ptq,
+    unpack_ptq, unpack_q4_k_scale_min,
 };
 
 fn zeros(scale: u16) -> Pq2Block {
@@ -191,4 +191,34 @@ fn half_to_float_and_float_to_half_preserve_ggml_round_trip_and_bounds() {
     assert_eq!(float_to_half(f32::from_bits(0xffff_ffff)), 0xfe00);
     assert_eq!(checked_float_to_half(f32::from_bits(0x7f80_0001)), None);
     assert_eq!(checked_float_to_half(f32::from_bits(0xffff_ffff)), None);
+}
+
+#[test]
+fn unpack_q4_k_scale_min_round_trips_all_eight_six_bit_groups() {
+    for scale in 0_u8..64 {
+        for min in 0_u8..64 {
+            let mut packed = [0_u8; 12];
+            for group in 0..8 {
+                let s = (scale.wrapping_add(u8::try_from(group * 7).unwrap_or(0))) & 63;
+                let m = (min.wrapping_add(u8::try_from(group * 11).unwrap_or(0))) & 63;
+                if group < 4 {
+                    packed[group] |= s;
+                    packed[group + 4] |= m;
+                } else {
+                    packed[group + 4] = (s & 15) | ((m & 15) << 4);
+                    packed[group - 4] |= (s >> 4) << 6;
+                    packed[group] |= (m >> 4) << 6;
+                }
+            }
+            for group in 0..8 {
+                let expected_s = (scale.wrapping_add(u8::try_from(group * 7).unwrap_or(0))) & 63;
+                let expected_m = (min.wrapping_add(u8::try_from(group * 11).unwrap_or(0))) & 63;
+                assert_eq!(
+                    unpack_q4_k_scale_min(group, &packed),
+                    (expected_s, expected_m),
+                    "group={group}, scale={scale}, min={min}"
+                );
+            }
+        }
+    }
 }

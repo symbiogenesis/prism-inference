@@ -7,10 +7,10 @@
     reason = "Pinned scale fitting retains exact-zero branches, native normal-equation names and arithmetic products."
 )]
 
-use super::super::{finite, half_bits};
+use super::super::finite;
 use super::{block_bytes, scale_min};
 use crate::{Result, invalid};
-use bonsai_ternary::half_to_float;
+use bonsai_ternary::{checked_float_to_half, half_to_float};
 
 fn nearest(value: f32) -> Result<i32> {
     if !value.is_finite() || value.abs() > 4_194_303.0 {
@@ -22,10 +22,7 @@ fn nearest(value: f32) -> Result<i32> {
 }
 
 fn half(value: f32) -> Result<u16> {
-    finite(value)?;
-    let bits = half_bits(value);
-    finite(half_to_float(bits))?;
-    Ok(bits)
+    checked_float_to_half(value).ok_or_else(|| invalid("non-finite K quant scale"))
 }
 
 fn signed_maximum(input: &[f32]) -> f32 {

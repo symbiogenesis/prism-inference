@@ -11,9 +11,11 @@ finite negative/subnormal scale bits are preserved. Unpacking accepts only
 canonical bytes: repacking must reproduce the input exactly.
 
 `half_to_float` converts every binary16 pattern, preserving signed zero and NaN
-payload bits. `Q8KBlock` preserves the native 292-byte activation ABI, including
-group sums; the consuming kernel validates activation scales. This crate supplies
-no inference kernel or model loader.
+payload bits, while `float_to_half` / `checked_float_to_half` convert `binary32`
+to GGML-compatible `binary16` bits and `unpack_q4_k_scale_min` unpacks 6-bit
+`Q4_K` sub-block scales and minima. `Q8KBlock` preserves the native 292-byte
+activation ABI, including group sums; the consuming kernel validates activation
+scales. This crate supplies no inference kernel or model loader.
 
 The codec contract is [Prism 73bfe6cc](https://github.com/PrismML-Eng/llama.cpp/tree/73bfe6cc485554822f80c473a3c0c4f25e80f41b);
 [PRISM-NOTICE.txt](PRISM-NOTICE.txt) retains its MIT notice. Regressions cover packed

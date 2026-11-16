@@ -12,7 +12,9 @@
 mod scaled;
 pub use scaled::Pq2Activation;
 
-pub use bonsai_ternary::{checked_float_to_half, float_to_half, half_to_float};
+pub use bonsai_ternary::{
+    checked_float_to_half, float_to_half, half_to_float, unpack_q4_k_scale_min,
+};
 
 mod half;
 pub use half::{
@@ -20,7 +22,7 @@ pub use half::{
     widen_f16_four, widen_f16_slice,
 };
 
-/// Packed 8-lane K-quant integer dot products.
+/// K-quant activation quantizers, `SDOT`/`I8MM` row/strip/tile kernels, and 8-lane dots.
 pub mod kquants;
 
 mod bf16;

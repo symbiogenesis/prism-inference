@@ -120,6 +120,21 @@ pub fn checked_float_to_half(value: f32) -> Option<u16> {
     ((value.to_bits() & 0x7fff_ffff) < 0x477f_f000).then(|| float_to_half(value))
 }
 
+/// Unpacks the 6-bit sub-block scale and minimum `(scale, min)` pair for `group` (`0..8`)
+/// from a 12-byte GGML `Q4_K` scales slice (`scales.len() >= 12`).
+#[inline]
+#[must_use]
+pub const fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
+    if group < 4 {
+        (scales[group] & 63, scales[group + 4] & 63)
+    } else {
+        (
+            (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
+            (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+        )
+    }
+}
+
 const fn check_scale(bytes: &[u8]) -> Result<(), Error> {
     let scale = u16::from_le_bytes([bytes[0], bytes[1]]);
     if matches!(scale, 0 | 0x8000) || scale & 0x7c00 == 0x7c00 {

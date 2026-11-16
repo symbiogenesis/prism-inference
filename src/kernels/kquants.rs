@@ -37,17 +37,8 @@ pub(super) const fn block_bytes(kind: u32) -> Option<usize> {
 }
 
 fn scale_min(group: usize, packed: &[u8]) -> (i16, i16) {
-    if group < 4 {
-        (
-            i16::from(packed[group] & 63),
-            i16::from(packed[group + 4] & 63),
-        )
-    } else {
-        (
-            i16::from((packed[group + 4] & 15) | ((packed[group - 4] >> 6) << 4)),
-            i16::from((packed[group + 4] >> 4) | ((packed[group] >> 6) << 4)),
-        )
-    }
+    let (scale_val, min_val) = bonsai_ternary::unpack_q4_k_scale_min(group, packed);
+    (i16::from(scale_val), i16::from(min_val))
 }
 
 struct Block {

@@ -330,6 +330,7 @@ impl SuffixDrafter {
         Ok(draft)
     }
 
+    #[cfg(test)]
     pub(crate) fn propose_into(
         history: &[u32],
         config: SuffixDraftConfig,
@@ -811,13 +812,732 @@ impl GdnVerifyTape {
     }
 }
 
+/// Maximum number of history tokens indexed by one incremental [`SuffixTree`].
+pub const MAX_SUFFIX_TREE_TOKENS: usize = 262_144;
+
+/// Maximum nodes supported in one [`DraftTreeTopology`] causal verification mask.
+pub const MAX_DRAFT_TREE_NODES: usize = 16;
+
+const NO_INDEX: u32 = u32::MAX;
+const MAX_TRACKED_CONT_PER_NODE: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct ContEntry {
+    token: u32,
+    count: u32,
+    next: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SuffixEdge {
+    first_token: u32,
+    child: u32,
+    next: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SuffixNode {
+    edge_end: u32,
+    parent_depth: u8,
+    depth: u8,
+    last_end: u32,
+    total_count: u32,
+    cont_len: u8,
+    first_cont: u32,
+    first_edge: u32,
+}
+
+impl SuffixNode {
+    const fn empty() -> Self {
+        Self {
+            edge_end: 0,
+            parent_depth: 0,
+            depth: 0,
+            last_end: 0,
+            total_count: 0,
+            cont_len: 0,
+            first_cont: NO_INDEX,
+            first_edge: NO_INDEX,
+        }
+    }
+}
+
+/// Summary returned by [`SuffixTree::propose_adaptive`] alongside the drafted tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AdaptiveSuffixDraft {
+    /// Number of proposed draft continuation tokens written into the caller buffer.
+    pub len: usize,
+    /// Suffix match depth observed when proposing the first draft token.
+    pub matched_tokens: usize,
+    /// Cumulative empirical continuation confidence in `[0.0, 1.0]` across the accepted chain.
+    pub confidence: f64,
+}
+
+/// Incremental compressed reverse-suffix radix trie over committed prompt and decode tokens.
+///
+/// Supports $O(\text{max\_match\_tokens})$ speculative continuation queries independent of
+/// committed context length up to [`MAX_SUFFIX_TREE_TOKENS`], while tracking per-node
+/// recency and bounded Misra-Gries empirical continuation counts for adaptive gating.
+#[derive(Clone, Debug, Default)]
+pub struct SuffixTree {
+    history: Vec<u32>,
+    nodes: Vec<SuffixNode>,
+    edges: Vec<SuffixEdge>,
+    cont_entries: Vec<ContEntry>,
+}
+
+impl SuffixTree {
+    /// Create an empty incremental suffix radix tree with no upfront heap allocation.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            history: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            cont_entries: Vec::new(),
+        }
+    }
+
+    /// Create an empty incremental suffix radix tree with preallocated capacity for `max_tokens`.
+    ///
+    /// # Errors
+    /// Rejects `max_tokens > MAX_SUFFIX_TREE_TOKENS` or fallible allocation exhaustion.
+    pub fn with_capacity(max_tokens: usize) -> Result<Self> {
+        if max_tokens > MAX_SUFFIX_TREE_TOKENS {
+            return Err(invalid("suffix tree capacity exceeds maximum token bound"));
+        }
+        let mut tree = Self::new();
+        if max_tokens > 0 {
+            tree.history.try_reserve_exact(max_tokens)?;
+            tree.nodes.try_reserve(max_tokens.saturating_mul(2))?;
+            tree.edges.try_reserve(max_tokens)?;
+            tree.cont_entries
+                .try_reserve(max_tokens.saturating_mul(2))?;
+        }
+        Ok(tree)
+    }
+
+    /// Number of history tokens currently indexed by this tree.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Whether no history tokens are indexed in this tree.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.history.is_empty()
+    }
+
+    /// Remove all indexed tokens while preserving allocated slab capacities.
+    pub fn clear(&mut self) {
+        self.history.clear();
+        self.nodes.clear();
+        self.edges.clear();
+        self.cont_entries.clear();
+    }
+
+    /// Synchronize the suffix tree incrementally against a target committed token history.
+    ///
+    /// When `tokens` extends the previously indexed sequence, only newly committed suffix
+    /// tokens are inserted; rollbacks or branch switches rebuild cleanly within capacity.
+    ///
+    /// # Errors
+    /// Rejects `tokens.len() > MAX_SUFFIX_TREE_TOKENS` or fallible allocation failure.
+    pub fn sync(&mut self, tokens: &[u32]) -> Result<()> {
+        if tokens.len() > MAX_SUFFIX_TREE_TOKENS {
+            return Err(invalid("suffix tree history exceeds maximum token bound"));
+        }
+        if tokens.len() >= self.history.len() && tokens.starts_with(&self.history) {
+            for &token in &tokens[self.history.len()..] {
+                self.push(token)?;
+            }
+            return Ok(());
+        }
+        self.clear();
+        self.history.try_reserve(tokens.len())?;
+        self.nodes.try_reserve(tokens.len().saturating_mul(2))?;
+        self.edges.try_reserve(tokens.len())?;
+        for &token in tokens {
+            self.push(token)?;
+        }
+        Ok(())
+    }
+
+    /// Append one committed token to the history and index the completed preceding suffix.
+    ///
+    /// # Errors
+    /// Rejects growth past [`MAX_SUFFIX_TREE_TOKENS`] or fallible allocation failure.
+    pub fn push(&mut self, token: u32) -> Result<()> {
+        if self.history.len() >= MAX_SUFFIX_TREE_TOKENS {
+            return Err(invalid("suffix tree history exceeds maximum token bound"));
+        }
+        self.history.try_reserve(1)?;
+        self.nodes.try_reserve(2)?;
+        self.edges.try_reserve(2)?;
+        self.cont_entries
+            .try_reserve(MAX_SUFFIX_MATCH_TOKENS + 1 + MAX_TRACKED_CONT_PER_NODE)?;
+
+        if self.nodes.is_empty() {
+            self.nodes.push(SuffixNode::empty());
+        }
+        let end = self.history.len();
+        self.history.push(token);
+        if end == 0 {
+            return Ok(());
+        }
+
+        let max_depth = end.min(MAX_SUFFIX_MATCH_TOKENS);
+        let end_u32 = u32::try_from(end)?;
+        let max_depth_u8 = u8::try_from(max_depth)?;
+        self.nodes[0].last_end = end_u32;
+        self.nodes[0].total_count = self.nodes[0].total_count.saturating_add(1);
+
+        let mut node_idx = 0_usize;
+        let mut depth = 0_usize;
+        while depth < max_depth {
+            let next_rev_token = self.history[end - 1 - depth];
+            let Some((edge_idx, child_u32)) = self.find_edge(node_idx, next_rev_token) else {
+                self.attach_leaf(node_idx, end_u32, depth, max_depth_u8, token)?;
+                break;
+            };
+            let child_idx = usize::try_from(child_u32)?;
+            let child = self.nodes[child_idx];
+            let child_end = usize::try_from(child.edge_end)?;
+            let edge_len = usize::from(child.depth - child.parent_depth);
+            let compare_len = edge_len.min(max_depth - depth);
+            let mut matched = 1_usize;
+            while matched < compare_len {
+                let hist_tok = self.history[child_end - 1 - (depth + matched)];
+                let new_tok = self.history[end - 1 - (depth + matched)];
+                if hist_tok != new_tok {
+                    break;
+                }
+                matched += 1;
+            }
+            if matched < edge_len {
+                let split_depth = depth + matched;
+                let internal_u32 =
+                    self.split_child(edge_idx, child_idx, split_depth, end_u32, token)?;
+                if split_depth < max_depth {
+                    let internal_idx = usize::try_from(internal_u32)?;
+                    self.attach_leaf(internal_idx, end_u32, split_depth, max_depth_u8, token)?;
+                }
+                break;
+            }
+            self.nodes[child_idx].last_end = end_u32;
+            self.nodes[child_idx].total_count = self.nodes[child_idx].total_count.saturating_add(1);
+            self.record_node_continuation(child_idx, token)?;
+            node_idx = child_idx;
+            depth = usize::from(child.depth);
+        }
+        Ok(())
+    }
+
+    fn find_edge(&self, node_idx: usize, first_token: u32) -> Option<(usize, u32)> {
+        let mut cur = self.nodes[node_idx].first_edge;
+        while cur != NO_INDEX {
+            let Ok(edge_idx) = usize::try_from(cur) else {
+                return None;
+            };
+            let edge = self.edges[edge_idx];
+            if edge.first_token == first_token {
+                return Some((edge_idx, edge.child));
+            }
+            cur = edge.next;
+        }
+        None
+    }
+
+    fn attach_leaf(
+        &mut self,
+        parent_idx: usize,
+        end_u32: u32,
+        parent_depth: usize,
+        depth: u8,
+        cont_token: u32,
+    ) -> Result<()> {
+        let leaf_u32 = u32::try_from(self.nodes.len())?;
+        let cont_idx = u32::try_from(self.cont_entries.len())?;
+        self.cont_entries.push(ContEntry {
+            token: cont_token,
+            count: 1,
+            next: NO_INDEX,
+        });
+        let parent_depth_u8 = u8::try_from(parent_depth)?;
+        self.nodes.push(SuffixNode {
+            edge_end: end_u32,
+            parent_depth: parent_depth_u8,
+            depth,
+            last_end: end_u32,
+            total_count: 1,
+            cont_len: 1,
+            first_cont: cont_idx,
+            first_edge: NO_INDEX,
+        });
+        let first_token = self.history[usize::try_from(end_u32)? - 1 - parent_depth];
+        let edge_u32 = u32::try_from(self.edges.len())?;
+        self.edges.push(SuffixEdge {
+            first_token,
+            child: leaf_u32,
+            next: self.nodes[parent_idx].first_edge,
+        });
+        self.nodes[parent_idx].first_edge = edge_u32;
+        Ok(())
+    }
+
+    fn split_child(
+        &mut self,
+        incoming_edge_idx: usize,
+        child_idx: usize,
+        split_depth: usize,
+        new_end_u32: u32,
+        cont_token: u32,
+    ) -> Result<u32> {
+        let old_child = self.nodes[child_idx];
+        let cloned_cont = self.clone_cont_list(old_child.first_cont)?;
+        let split_depth_u8 = u8::try_from(split_depth)?;
+        let child_split_tok = self.history[usize::try_from(old_child.edge_end)? - 1 - split_depth];
+        let edge_to_old_u32 = u32::try_from(self.edges.len())?;
+        self.edges.push(SuffixEdge {
+            first_token: child_split_tok,
+            child: u32::try_from(child_idx)?,
+            next: NO_INDEX,
+        });
+        self.nodes[child_idx].parent_depth = split_depth_u8;
+
+        let internal_u32 = u32::try_from(self.nodes.len())?;
+        let internal_idx = self.nodes.len();
+        self.nodes.push(SuffixNode {
+            edge_end: old_child.edge_end,
+            parent_depth: old_child.parent_depth,
+            depth: split_depth_u8,
+            last_end: new_end_u32,
+            total_count: old_child.total_count.saturating_add(1),
+            cont_len: old_child.cont_len,
+            first_cont: cloned_cont,
+            first_edge: edge_to_old_u32,
+        });
+        self.edges[incoming_edge_idx].child = internal_u32;
+        self.record_node_continuation(internal_idx, cont_token)?;
+        Ok(internal_u32)
+    }
+
+    fn clone_cont_list(&mut self, mut cur: u32) -> Result<u32> {
+        let mut head = NO_INDEX;
+        while cur != NO_INDEX {
+            let entry = self.cont_entries[usize::try_from(cur)?];
+            let next_cur = entry.next;
+            let new_idx = u32::try_from(self.cont_entries.len())?;
+            self.cont_entries.push(ContEntry {
+                token: entry.token,
+                count: entry.count,
+                next: head,
+            });
+            head = new_idx;
+            cur = next_cur;
+        }
+        Ok(head)
+    }
+
+    fn record_node_continuation(&mut self, node_idx: usize, token: u32) -> Result<()> {
+        let mut cur = self.nodes[node_idx].first_cont;
+        let mut empty_slot = NO_INDEX;
+        while cur != NO_INDEX {
+            let idx = usize::try_from(cur)?;
+            if self.cont_entries[idx].token == token {
+                self.cont_entries[idx].count = self.cont_entries[idx].count.saturating_add(1);
+                return Ok(());
+            }
+            if self.cont_entries[idx].count == 0 && empty_slot == NO_INDEX {
+                empty_slot = cur;
+            }
+            cur = self.cont_entries[idx].next;
+        }
+        if usize::from(self.nodes[node_idx].cont_len) < MAX_TRACKED_CONT_PER_NODE {
+            let new_idx = u32::try_from(self.cont_entries.len())?;
+            self.cont_entries.push(ContEntry {
+                token,
+                count: 1,
+                next: self.nodes[node_idx].first_cont,
+            });
+            self.nodes[node_idx].first_cont = new_idx;
+            self.nodes[node_idx].cont_len = self.nodes[node_idx].cont_len.saturating_add(1);
+            return Ok(());
+        }
+        if empty_slot != NO_INDEX {
+            let idx = usize::try_from(empty_slot)?;
+            self.cont_entries[idx].token = token;
+            self.cont_entries[idx].count = 1;
+            return Ok(());
+        }
+        let mut dec = self.nodes[node_idx].first_cont;
+        while dec != NO_INDEX {
+            let idx = usize::try_from(dec)?;
+            self.cont_entries[idx].count = self.cont_entries[idx].count.saturating_sub(1);
+            dec = self.cont_entries[idx].next;
+        }
+        Ok(())
+    }
+
+    fn best_suffix_match(&self, max_match: usize, suffix_ext: &[u32]) -> Result<(usize, usize)> {
+        let hist_len = self.history.len();
+        if hist_len <= 1 || self.nodes.is_empty() || max_match == 0 {
+            return Ok((0, 0));
+        }
+        let query_at = |rev_idx: usize| -> Option<u32> {
+            if rev_idx < suffix_ext.len() {
+                suffix_ext.get(suffix_ext.len() - 1 - rev_idx).copied()
+            } else {
+                let hist_back = rev_idx - suffix_ext.len();
+                hist_len
+                    .checked_sub(1 + hist_back)
+                    .and_then(|pos| self.history.get(pos).copied())
+            }
+        };
+
+        let mut node_idx = 0_usize;
+        let mut depth = 0_usize;
+        let mut best_len = 0_usize;
+        let mut best_node = 0_usize;
+
+        while depth < max_match {
+            let Some(next_q) = query_at(depth) else {
+                break;
+            };
+            let Some((_, child_u32)) = self.find_edge(node_idx, next_q) else {
+                break;
+            };
+            let child_idx = usize::try_from(child_u32)?;
+            let child = self.nodes[child_idx];
+            let child_end = usize::try_from(child.edge_end)?;
+            let edge_len = usize::from(child.depth - child.parent_depth);
+            let compare_len = edge_len.min(max_match - depth);
+
+            best_len = depth + 1;
+            best_node = child_idx;
+
+            let mut matched = 1_usize;
+            while matched < compare_len {
+                let Some(q_tok) = query_at(depth + matched) else {
+                    break;
+                };
+                let edge_tok = self.history[child_end - 1 - (depth + matched)];
+                if edge_tok != q_tok {
+                    break;
+                }
+                matched += 1;
+                best_len = depth + matched;
+            }
+            if matched < edge_len {
+                break;
+            }
+            node_idx = child_idx;
+            depth = usize::from(child.depth);
+        }
+        Ok((best_len, best_node))
+    }
+
+    fn best_empirical_continuation(&self, node_idx: usize) -> Result<(u32, u32, u32)> {
+        let node = self.nodes[node_idx];
+        let recent_tok = self.history[usize::try_from(node.last_end)?];
+        let mut best_tok = recent_tok;
+        let mut best_count = 0_u32;
+        let mut recent_count = 0_u32;
+
+        let mut cur = node.first_cont;
+        while cur != NO_INDEX {
+            let entry = self.cont_entries[usize::try_from(cur)?];
+            if entry.token == recent_tok {
+                recent_count = entry.count;
+            }
+            if entry.count > best_count {
+                best_count = entry.count;
+                best_tok = entry.token;
+            }
+            cur = entry.next;
+        }
+        if recent_count == best_count {
+            best_tok = recent_tok;
+        }
+        Ok((best_tok, best_count.max(1), node.total_count.max(1)))
+    }
+
+    /// Propose up to `config.max_draft_tokens.min(remaining_tokens)` continuation tokens
+    /// matching [`SuffixDrafter::propose`] (longest match, breaking ties by most recent span).
+    ///
+    /// # Errors
+    /// Rejects an invalid [`SuffixDraftConfig`] or fallible allocation failure.
+    pub fn propose(&self, config: SuffixDraftConfig, remaining_tokens: usize) -> Result<Vec<u32>> {
+        let mut storage = [0_u32; MAX_SPECULATIVE_DRAFT_TOKENS];
+        let count = self.propose_into(config, remaining_tokens, &mut storage)?;
+        let mut draft = Vec::new();
+        draft.try_reserve_exact(count)?;
+        draft.extend_from_slice(&storage[..count]);
+        Ok(draft)
+    }
+
+    /// Propose continuation tokens directly into a fixed stack buffer without heap allocation.
+    ///
+    /// Leaves `storage` untouched if `config` is invalid.
+    ///
+    /// # Errors
+    /// Rejects an invalid [`SuffixDraftConfig`] or internal index overflow.
+    pub fn propose_into(
+        &self,
+        config: SuffixDraftConfig,
+        remaining_tokens: usize,
+        storage: &mut [u32; MAX_SPECULATIVE_DRAFT_TOKENS],
+    ) -> Result<usize> {
+        config.validate()?;
+        let limit = config.max_draft_tokens.min(remaining_tokens);
+        if limit == 0 || self.history.len() <= config.min_match_tokens {
+            return Ok(0);
+        }
+        let max_len = config.max_match_tokens.min(self.history.len() - 1);
+        let (matched_len, best_node) = self.best_suffix_match(max_len, &[])?;
+        if matched_len < config.min_match_tokens || best_node == 0 {
+            return Ok(0);
+        }
+        let start = usize::try_from(self.nodes[best_node].last_end)?;
+        let available = self.history.len().saturating_sub(start).min(limit);
+        storage[..available].copy_from_slice(&self.history[start..start + available]);
+        Ok(available)
+    }
+
+    /// Propose a confidence-gated continuation chain using per-node empirical continuation counts.
+    ///
+    /// Extends step-by-step from the most frequent continuation (tie-breaking by recency) while
+    /// both the suffix match meets `config.min_match_tokens` and cumulative empirical confidence
+    /// remains `>= min_confidence`.
+    ///
+    /// # Errors
+    /// Rejects an invalid [`SuffixDraftConfig`], non-finite `min_confidence` outside `[0.0, 1.0]`,
+    /// or internal index overflow.
+    pub fn propose_adaptive(
+        &self,
+        config: SuffixDraftConfig,
+        min_confidence: f64,
+        remaining_tokens: usize,
+        storage: &mut [u32; MAX_SPECULATIVE_DRAFT_TOKENS],
+    ) -> Result<AdaptiveSuffixDraft> {
+        config.validate()?;
+        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+            return Err(invalid(
+                "adaptive suffix confidence threshold must lie in [0.0, 1.0]",
+            ));
+        }
+        let limit = config.max_draft_tokens.min(remaining_tokens);
+        if limit == 0 || self.history.len() <= config.min_match_tokens {
+            return Ok(AdaptiveSuffixDraft::default());
+        }
+        let max_len = config.max_match_tokens.min(self.history.len() - 1);
+        let mut draft_len = 0_usize;
+        let mut first_matched = 0_usize;
+        let mut cumulative_confidence = 1.0_f64;
+
+        for step in 0..limit {
+            let (matched_len, best_node) =
+                self.best_suffix_match(max_len, &storage[..draft_len])?;
+            if matched_len < config.min_match_tokens || best_node == 0 {
+                break;
+            }
+            let (cand_token, count, total) = self.best_empirical_continuation(best_node)?;
+            let step_conf = (f64::from(count) / f64::from(total)).clamp(0.0, 1.0);
+            let next_conf = cumulative_confidence * step_conf;
+            if next_conf < min_confidence {
+                break;
+            }
+            if step == 0 {
+                first_matched = matched_len;
+            }
+            storage[step] = cand_token;
+            draft_len += 1;
+            cumulative_confidence = next_conf;
+        }
+        Ok(AdaptiveSuffixDraft {
+            len: draft_len,
+            matched_tokens: first_matched,
+            confidence: if draft_len == 0 {
+                0.0
+            } else {
+                cumulative_confidence
+            },
+        })
+    }
+}
+
+/// Bounded packed causal ancestor topology for up to [`MAX_DRAFT_TREE_NODES`] tree-draft tokens.
+///
+/// Stores topological parent links, precomputed `u16` ancestor attention masks, and deterministic
+/// greedy tree-branch verification without heap-allocated DAG matrices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DraftTreeTopology {
+    len: usize,
+    parents: [Option<usize>; MAX_DRAFT_TREE_NODES],
+    ancestor_masks: [u16; MAX_DRAFT_TREE_NODES],
+    depths: [u8; MAX_DRAFT_TREE_NODES],
+}
+
+impl DraftTreeTopology {
+    /// Validate and construct a causal draft tree from `parents` in topological order.
+    ///
+    /// `None` denotes a direct child of the committed prefix; `Some(parent)` must satisfy
+    /// `parent < node_index`.
+    ///
+    /// # Errors
+    /// Rejects empty trees, trees exceeding [`MAX_DRAFT_TREE_NODES`], or non-topological parents.
+    pub fn from_parents(parents: &[Option<usize>]) -> Result<Self> {
+        if parents.is_empty() || parents.len() > MAX_DRAFT_TREE_NODES {
+            return Err(invalid("draft tree node count outside contract bounds"));
+        }
+        let mut stored_parents = [None; MAX_DRAFT_TREE_NODES];
+        let mut ancestor_masks = [0_u16; MAX_DRAFT_TREE_NODES];
+        let mut depths = [0_u8; MAX_DRAFT_TREE_NODES];
+        for (idx, &parent) in parents.iter().enumerate() {
+            let bit = 1_u16 << u32::try_from(idx)?;
+            let (mask, depth) = match parent {
+                None => (bit, 1_u8),
+                Some(parent_idx) => {
+                    if parent_idx >= idx {
+                        return Err(invalid(
+                            "draft tree parent index must precede child in topological order",
+                        ));
+                    }
+                    (
+                        ancestor_masks[parent_idx] | bit,
+                        depths[parent_idx].saturating_add(1),
+                    )
+                }
+            };
+            stored_parents[idx] = parent;
+            ancestor_masks[idx] = mask;
+            depths[idx] = depth;
+        }
+        Ok(Self {
+            len: parents.len(),
+            parents: stored_parents,
+            ancestor_masks,
+            depths,
+        })
+    }
+
+    /// Construct a linear chain topology of `len` nodes (`1..=MAX_DRAFT_TREE_NODES`).
+    ///
+    /// # Errors
+    /// Rejects `len == 0` or `len > MAX_DRAFT_TREE_NODES`.
+    pub fn chain(len: usize) -> Result<Self> {
+        if len == 0 || len > MAX_DRAFT_TREE_NODES {
+            return Err(invalid("draft chain node count outside contract bounds"));
+        }
+        let mut parents = [None; MAX_DRAFT_TREE_NODES];
+        for (idx, slot) in parents[..len].iter_mut().enumerate().skip(1) {
+            *slot = Some(idx - 1);
+        }
+        Self::from_parents(&parents[..len])
+    }
+
+    /// Number of draft nodes in this tree (`1..=MAX_DRAFT_TREE_NODES`).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Always `false` since valid draft trees contain at least one node.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Return the packed `u16` ancestor bitmask for `node` (inclusive of `node`), or `None`.
+    #[must_use]
+    pub const fn ancestor_mask(&self, node: usize) -> Option<u16> {
+        if node < self.len {
+            Some(self.ancestor_masks[node])
+        } else {
+            None
+        }
+    }
+
+    /// Whether `query_node` causally attends to `key_node` in this draft tree.
+    #[must_use]
+    pub fn attends(&self, query_node: usize, key_node: usize) -> bool {
+        if query_node >= self.len || key_node >= self.len {
+            return false;
+        }
+        let bit = 1_u16.checked_shl(u32::try_from(key_node).unwrap_or(u32::MAX));
+        bit.is_some_and(|mask_bit| (self.ancestor_masks[query_node] & mask_bit) != 0)
+    }
+
+    /// Return the 1-based depth from the committed prefix to `node`, or `None` if out of bounds.
+    #[must_use]
+    pub fn depth(&self, node: usize) -> Option<usize> {
+        if node < self.len {
+            Some(usize::from(self.depths[node]))
+        } else {
+            None
+        }
+    }
+
+    /// Verify candidate tree nodes against greedy target predictions (`root_greedy` at the
+    /// committed prefix and `node_greedy_next[i]` emitted after evaluating node `i`), returning
+    /// the longest accepted draft token sequence together with its trailing bonus or correction token.
+    ///
+    /// Equal-depth accepted paths tie-break deterministically toward the lowest terminal node index.
+    ///
+    /// # Errors
+    /// Rejects slice lengths that do not equal [`Self::len`].
+    pub fn verify_greedy_tree(
+        &self,
+        draft_tokens: &[u32],
+        root_greedy: u32,
+        node_greedy_next: &[u32],
+    ) -> Result<(Vec<u32>, u32)> {
+        if draft_tokens.len() != self.len || node_greedy_next.len() != self.len {
+            return Err(invalid(
+                "draft tree verification slice length mismatch with topology",
+            ));
+        }
+        let mut accepted = [false; MAX_DRAFT_TREE_NODES];
+        let mut best_terminal: Option<usize> = None;
+        let mut best_depth = 0_u8;
+        for idx in 0..self.len {
+            let is_accepted = self.parents[idx].map_or_else(
+                || draft_tokens[idx] == root_greedy,
+                |parent| accepted[parent] && draft_tokens[idx] == node_greedy_next[parent],
+            );
+            accepted[idx] = is_accepted;
+            if is_accepted && self.depths[idx] > best_depth {
+                best_depth = self.depths[idx];
+                best_terminal = Some(idx);
+            }
+        }
+        let Some(mut cur) = best_terminal else {
+            return Ok((Vec::new(), root_greedy));
+        };
+        let bonus = node_greedy_next[cur];
+        let mut path = Vec::new();
+        path.try_reserve_exact(usize::from(best_depth))?;
+        loop {
+            path.push(draft_tokens[cur]);
+            match self.parents[cur] {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        path.reverse();
+        Ok((path, bonus))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, GdnVerifyTape,
-        MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS, SpeculativeStats, SuffixDraftConfig,
-        SuffixDrafter, VerifiedRound, cumulative_rejection_complement, mtp_first_decode_fits,
-        propose_lookup_then_fallback, suffix_match_start, verify_stochastic_step,
+        DFLASH2_DEFAULT_TAP_LAYERS, DFlash2DraftConfig, DraftTreeTopology, GdnVerifyTape,
+        MAX_DRAFT_TREE_NODES, MAX_SPECULATIVE_DRAFT_TOKENS, MAX_SUFFIX_MATCH_TOKENS,
+        SpeculativeStats, SuffixDraftConfig, SuffixDrafter, SuffixTree, VerifiedRound,
+        cumulative_rejection_complement, mtp_first_decode_fits, propose_lookup_then_fallback,
+        suffix_match_start, verify_stochastic_step,
     };
     use crate::Result;
 
@@ -1319,6 +2039,148 @@ mod tests {
         for (lhs, rhs) in replay_state.iter().zip(&sequential_state) {
             assert_eq!(lhs.to_bits(), rhs.to_bits());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_tree_exhaustively_matches_reference_and_incremental_sync() -> Result<()> {
+        let mut tree = SuffixTree::new();
+        for length in 0..=10 {
+            for bits in 0_u32..1 << length {
+                let history = (0..length)
+                    .map(|index| (bits >> index) & 1)
+                    .collect::<Vec<_>>();
+                tree.sync(&history)?;
+                assert_eq!(tree.len(), history.len());
+                for min_match in 1..=5 {
+                    for max_match in min_match..=5 {
+                        for draft in [1, 4, MAX_SPECULATIVE_DRAFT_TOKENS] {
+                            let config = SuffixDraftConfig::new(min_match, max_match, draft)?;
+                            for remaining in [0, 1, 3, MAX_SPECULATIVE_DRAFT_TOKENS] {
+                                let expected =
+                                    reference_suffix_continuation(&history, config, remaining);
+                                assert_eq!(tree.propose(config, remaining)?, expected);
+                                let mut buf = [u32::MAX; MAX_SPECULATIVE_DRAFT_TOKENS];
+                                let count = tree.propose_into(config, remaining, &mut buf)?;
+                                assert_eq!(&buf[..count], expected);
+                                assert!(buf[count..].iter().all(|&tok| tok == u32::MAX));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_tree_periodic_near_match_and_incremental_extension_match_reference() -> Result<()> {
+        let distinct = (0_u32..2048).collect::<Vec<_>>();
+        let periodic = distinct.iter().map(|token| token % 97).collect::<Vec<_>>();
+        let mut near_match = periodic.clone();
+        near_match[2047 - MAX_SUFFIX_MATCH_TOKENS / 2] = u32::MAX;
+        let mut constant = distinct.clone();
+        constant.fill(7);
+
+        let mut tree = SuffixTree::with_capacity(2048)?;
+        for history in [&distinct, &periodic, &near_match, &constant] {
+            // Feed in chunks to exercise incremental sync extension and rebuilds.
+            tree.clear();
+            for chunk in history.chunks(137) {
+                let target_len = tree.len() + chunk.len();
+                tree.sync(&history[..target_len])?;
+            }
+            for min_match in [1, 2, MAX_SUFFIX_MATCH_TOKENS] {
+                let config = SuffixDraftConfig::new(
+                    min_match,
+                    MAX_SUFFIX_MATCH_TOKENS,
+                    MAX_SPECULATIVE_DRAFT_TOKENS,
+                )?;
+                let expected =
+                    reference_suffix_continuation(history, config, MAX_SPECULATIVE_DRAFT_TOKENS);
+                assert_eq!(
+                    tree.propose(config, MAX_SPECULATIVE_DRAFT_TOKENS)?,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_tree_adaptive_draft_gates_low_confidence_ambiguity() -> Result<()> {
+        // After [10, 20], 3 occurrences continue with [30, 40] and 1 most-recent occurrence
+        // continues with [99, 88]. Most-recent tie favors [99, 88], whereas adaptive empirical
+        // confidence selects the dominant [30] with confidence 0.75 at step 1, and gates below
+        // 0.80 threshold.
+        let mut tree = SuffixTree::new();
+        let history = [
+            10, 20, 30, 40, // opp 1
+            10, 20, 30, 40, // opp 2
+            10, 20, 30, 40, // opp 3
+            10, 20, 99, 88, // opp 4 (most recent)
+            10, 20,
+        ];
+        tree.sync(&history)?;
+        let config = SuffixDraftConfig::new(2, 8, 4)?;
+        let mut out = [0_u32; MAX_SPECULATIVE_DRAFT_TOKENS];
+
+        let high = tree.propose_adaptive(config, 0.80, 4, &mut out)?;
+        assert_eq!(high.len, 0);
+
+        let medium = tree.propose_adaptive(config, 0.70, 4, &mut out)?;
+        assert!(medium.len >= 2);
+        assert_eq!(&out[..2], &[30, 40]);
+        assert!(medium.confidence >= 0.70 && medium.confidence <= 0.75 + 1e-12);
+        assert_eq!(medium.matched_tokens, 2);
+
+        assert!(tree.propose_adaptive(config, -0.1, 4, &mut out).is_err());
+        assert!(
+            tree.propose_adaptive(config, f64::NAN, 4, &mut out)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn draft_tree_topology_computes_ancestor_masks_and_verifies_deepest_path() -> Result<()> {
+        // Tree:
+        // root -> 0 (tok 10, next=20)
+        //   0 -> 1 (tok 20, next=30)
+        //     1 -> 3 (tok 30, next=40)
+        //   0 -> 2 (tok 21, next=99)
+        // root -> 4 (tok 11, next=50)
+        let tree = DraftTreeTopology::from_parents(&[None, Some(0), Some(0), Some(1), None])?;
+        assert_eq!(tree.len(), 5);
+        assert!(!tree.is_empty());
+        assert_eq!(tree.ancestor_mask(0), Some(0b0_0001));
+        assert_eq!(tree.ancestor_mask(1), Some(0b0_0011));
+        assert_eq!(tree.ancestor_mask(2), Some(0b0_0101));
+        assert_eq!(tree.ancestor_mask(3), Some(0b0_1011));
+        assert_eq!(tree.ancestor_mask(4), Some(0b1_0000));
+        assert!(tree.attends(3, 0));
+        assert!(tree.attends(3, 1));
+        assert!(!tree.attends(3, 2));
+        assert!(!tree.attends(3, 4));
+        assert_eq!(tree.depth(3), Some(3));
+
+        let (accepted, bonus) =
+            tree.verify_greedy_tree(&[10, 20, 21, 30, 11], 10, &[20, 30, 99, 40, 50])?;
+        assert_eq!(accepted, [10, 20, 30]);
+        assert_eq!(bonus, 40);
+
+        let (none_accepted, correction) =
+            tree.verify_greedy_tree(&[10, 20, 21, 30, 11], 77, &[20, 30, 99, 40, 50])?;
+        assert_eq!(none_accepted, [0_u32; 0]);
+        assert_eq!(correction, 77);
+
+        let chain = DraftTreeTopology::chain(MAX_DRAFT_TREE_NODES)?;
+        assert_eq!(
+            chain.depth(MAX_DRAFT_TREE_NODES - 1),
+            Some(MAX_DRAFT_TREE_NODES)
+        );
+        assert!(DraftTreeTopology::from_parents(&[Some(0)]).is_err());
+        assert!(DraftTreeTopology::from_parents(&[]).is_err());
         Ok(())
     }
 }

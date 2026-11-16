@@ -213,11 +213,15 @@ full-model parity controls.
 ## Suffix proposals
 
 The opt-in suffix drafter uses reverse-Z matching with a maximum 64-token window
-and 64-byte prefix table. It preserves overlap, longest match and most-recent
-start on ties, bounding token equalities below
+and 64-byte prefix table, alongside an online Ukkonen `SuffixTree` (`sync` /
+`propose_into`) that maintains longest-match, most-recent-start proposals across
+incremental extensions without re-scanning full token history. Both paths
+preserve overlap and bound token equalities below
 `2 * (history tokens + maximum match tokens)`.
 `propose_lookup_then_fallback` composes suffix/lookup drafting ahead of a
 secondary fallback drafter without allocating redundant scratch.
+`AdaptiveSuffixDraft` gates low-confidence candidates, and `DraftTreeTopology`
+computes 64-bit ancestor masks for parallel tree verification.
 
 ## Constrained-decoding GSS and radix mask cache
 

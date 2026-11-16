@@ -4,7 +4,7 @@ use crate::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid,
     sampling::{FiniteLogits, Greedy, Sampler},
     speculative::{
-        MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixDrafter,
+        MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixTree,
         VerifiedRound,
     },
 };
@@ -311,6 +311,7 @@ pub struct Runtime<D: Decoder> {
     retain_prompt_end: bool,
     recycled_checkpoints: Vec<D::Checkpoint>,
     batch_logits: Vec<Vec<f32>>,
+    suffix_tree: SuffixTree,
     reallocation_witness: ReallocationWitness,
     faulted: bool,
 }
@@ -399,6 +400,7 @@ impl Runtime<crate::graph::Qwen35> {
         self.checkpoints.clear();
         self.prompt_end_checkpoint = None;
         self.recycled_checkpoints.clear();
+        self.suffix_tree.clear();
         self.tokens.clear();
         self.media_spans.clear();
         mutable_logits(&mut self.logits).clear();
@@ -446,6 +448,7 @@ impl<D: Decoder> Runtime<D> {
             retain_prompt_end: false,
             recycled_checkpoints,
             batch_logits,
+            suffix_tree: SuffixTree::new(),
             reallocation_witness: ReallocationWitness::default(),
             faulted: false,
         })
@@ -582,6 +585,7 @@ impl<D: Decoder> Runtime<D> {
         if let Some(snapshot) = self.prompt_end_checkpoint.take() {
             self.recycle_snapshot(snapshot);
         }
+        self.suffix_tree.clear();
         self.tokens.clear();
         self.media_spans.clear();
         mutable_logits(&mut self.logits).clear();
@@ -2192,8 +2196,8 @@ impl<D: Decoder> Runtime<D> {
         while completion.generated_tokens < options.max_tokens {
             check()?;
             let remaining_budget = options.max_tokens - completion.generated_tokens;
-            let draft_len = SuffixDrafter::propose_into(
-                &self.tokens,
+            self.suffix_tree.sync(&self.tokens)?;
+            let draft_len = self.suffix_tree.propose_into(
                 suffix_config,
                 remaining_budget,
                 &mut draft_storage,

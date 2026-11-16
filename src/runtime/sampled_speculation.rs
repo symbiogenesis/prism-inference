@@ -3,7 +3,7 @@
 use super::{
     Arc, Cancellation, Completion, Decoder, Finish, FiniteLogits, Generation, Instant,
     MAX_SPECULATIVE_DRAFT_TOKENS, Prefill, PromptEndCapture, Result, Runtime, Sampler, Snapshot,
-    SpeculativeStats, SuffixDraftConfig, SuffixDrafter, VerifiedRound, check_deadline, invalid,
+    SpeculativeStats, SuffixDraftConfig, VerifiedRound, check_deadline, invalid,
 };
 
 struct SampledSuffixEffects<'a, S, E> {
@@ -243,8 +243,8 @@ impl<D: Decoder> Runtime<D> {
         while completion.generated_tokens < options.max_tokens {
             check()?;
             let remaining = options.max_tokens - completion.generated_tokens;
-            let proposed = SuffixDrafter::propose_into(
-                &self.tokens,
+            self.suffix_tree.sync(&self.tokens)?;
+            let proposed = self.suffix_tree.propose_into(
                 suffix_config,
                 remaining.min(capacity.max(1)),
                 &mut storage,
@@ -491,6 +491,7 @@ impl<D: Decoder> Runtime<D> {
 mod tests {
     use super::*;
     use crate::runtime::Limits;
+    use crate::speculative::SuffixDrafter;
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Duration;

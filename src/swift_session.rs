@@ -1273,6 +1273,7 @@ impl SwiftSession {
             .as_ref()
             .ok_or_else(|| invalid("Swift vision projector is not loaded"))?;
         let raw_messages = parse_multimodal_messages(messages)?;
+        validate_multimodal_budget(&raw_messages, output_tokens, self.context_tokens())?;
         let encoded_images =
             encode_parsed_images(&raw_messages, vision.as_ref(), self.max_image_tokens)?;
         let mut part_lists = Vec::with_capacity(raw_messages.len());
@@ -1643,6 +1644,31 @@ fn validate_vision_token_budget(max_image_tokens: usize) -> Result<()> {
     if !(MIN_IMAGE_TOKENS..=MAX_IMAGE_TOKENS).contains(&max_image_tokens) {
         return Err(invalid(
             "Swift image token budget must be from 64 through 4096",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_multimodal_budget(
+    messages: &[ParsedMessage],
+    output_tokens: usize,
+    context_tokens: usize,
+) -> Result<()> {
+    if output_tokens == 0 || output_tokens > swift::MAX_OUTPUT_TOKENS {
+        return Err(invalid(
+            "Swift multimodal output reservation exceeds supported bounds",
+        ));
+    }
+    let image_count = messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter(|part| matches!(part, ParsedPart::ImageUrl { .. }))
+        .count();
+    // Each image emits at least `<|vision_start|><|image_pad|><|vision_end|>` plus prompt framing.
+    let min_image_tokens = image_count.saturating_mul(3);
+    if output_tokens.saturating_add(min_image_tokens) >= context_tokens {
+        return Err(invalid(
+            "Swift multimodal prompt reservation exceeds context budget",
         ));
     }
     Ok(())
@@ -2299,6 +2325,15 @@ mod tests {
         }
         let overflow = serde_json::json!([{"role": "user", "content": too_many}]);
         assert!(super::parse_multimodal_messages(&overflow).is_err());
+
+        // Reject invalid output reservations or impossible multimodal context budgets early.
+        assert!(super::validate_multimodal_budget(&parsed, 0, 1024).is_err());
+        assert!(
+            super::validate_multimodal_budget(&parsed, super::swift::MAX_OUTPUT_TOKENS + 1, 65536)
+                .is_err()
+        );
+        assert!(super::validate_multimodal_budget(&parsed, 1021, 1024).is_err());
+        super::validate_multimodal_budget(&parsed, 64, 1024)?;
         Ok(())
     }
 }

@@ -495,10 +495,10 @@ impl KvCache {
     }
 }
 
-// Match the existing contiguous head partitions exactly. Each worker consumes
-// its heads sequentially, so their probability rows have disjoint lifetimes.
+// Match the balanced contiguous head partitions. Each worker consumes its
+// heads sequentially, so their probability rows have disjoint lifetimes.
 pub(super) fn score_rows(heads: usize, parallelism: &RowParallelism) -> usize {
-    heads.div_ceil(heads.div_ceil(parallelism.workers()).max(1))
+    heads.min(parallelism.workers().max(1))
 }
 
 const fn grouped_head_unit(heads_per_kv: usize, heads: usize) -> usize {
@@ -511,6 +511,84 @@ const fn grouped_head_unit(heads_per_kv: usize, heads: usize) -> usize {
     } else {
         1
     }
+}
+
+#[derive(Clone, Copy)]
+struct HeadPartition {
+    base_head: usize,
+    chunk_heads: usize,
+    unit: usize,
+}
+
+fn partition_heads(
+    heads: usize,
+    kv_heads: usize,
+    workers: usize,
+) -> ([HeadPartition; MAX_ROW_WORKERS], usize) {
+    let mut partitions = [HeadPartition {
+        base_head: 0,
+        chunk_heads: 0,
+        unit: 1,
+    }; MAX_ROW_WORKERS];
+    if heads == 0 {
+        return (partitions, 0);
+    }
+    let task_count = heads.min(workers.max(1)).min(MAX_ROW_WORKERS);
+    if kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
+        let base = heads / task_count;
+        let rem = heads % task_count;
+        let mut cursor = 0;
+        for (index, slot) in partitions[..task_count].iter_mut().enumerate() {
+            let chunk_heads = base + usize::from(index < rem);
+            *slot = HeadPartition {
+                base_head: cursor,
+                chunk_heads,
+                unit: 1,
+            };
+            cursor += chunk_heads;
+        }
+        return (partitions, task_count);
+    }
+    let heads_per_kv = heads / kv_heads;
+    if task_count <= kv_heads {
+        let kv_base = kv_heads / task_count;
+        let kv_rem = kv_heads % task_count;
+        let kv_unit = grouped_head_unit(heads_per_kv, heads_per_kv);
+        let mut cursor = 0;
+        for (index, slot) in partitions[..task_count].iter_mut().enumerate() {
+            let chunk_kv = kv_base + usize::from(index < kv_rem);
+            let chunk_heads = chunk_kv * heads_per_kv;
+            *slot = HeadPartition {
+                base_head: cursor,
+                chunk_heads,
+                unit: kv_unit,
+            };
+            cursor += chunk_heads;
+        }
+        return (partitions, task_count);
+    }
+    // Distribute workers evenly across KV heads, then split each KV head's
+    // query heads by quotient+remainder so no worker spans a KV boundary.
+    let w_base = task_count / kv_heads;
+    let w_rem = task_count % kv_heads;
+    let mut task_idx = 0;
+    let mut cursor = 0;
+    for kv in 0..kv_heads {
+        let w_k = w_base + usize::from(kv < w_rem);
+        let h_base = heads_per_kv / w_k;
+        let h_rem = heads_per_kv % w_k;
+        for sub in 0..w_k {
+            let chunk_heads = h_base + usize::from(sub < h_rem);
+            partitions[task_idx] = HeadPartition {
+                base_head: cursor,
+                chunk_heads,
+                unit: grouped_head_unit(heads_per_kv, chunk_heads),
+            };
+            cursor += chunk_heads;
+            task_idx += 1;
+        }
+    }
+    (partitions, task_idx)
 }
 
 pub(super) fn group_score_rows(
@@ -531,13 +609,16 @@ pub(super) fn group_score_rows(
     if kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
         return tasks;
     }
-    let chunk_heads = heads.div_ceil(parallelism.workers());
-    let unit = grouped_head_unit(heads / kv_heads, chunk_heads);
-    tasks.saturating_mul(unit)
+    let (partitions, count) = partition_heads(heads, kv_heads, parallelism.workers());
+    partitions[..count]
+        .iter()
+        .map(|part| part.unit)
+        .fold(0_usize, usize::saturating_add)
 }
 
 struct AttentionTask<'a> {
     base_head: usize,
+    unit: usize,
     attended: &'a mut [f32],
     scores: &'a mut [f32],
 }
@@ -713,29 +794,30 @@ fn attend_with_layout(
     value_cache.prepared_ready = false;
     let tokens = keys.len / keys.width;
     let stride = checked_sum(tokens, 1)?;
-    let chunk_heads = heads.div_ceil(parallelism.workers());
-    let task_count = score_rows(heads, parallelism);
-    let heads_per_kv = heads
-        .checked_div(key_cache.heads)
-        .filter(|_| key_cache.heads > 0)
-        .unwrap_or(0);
-    let unit = grouped_head_unit(heads_per_kv, chunk_heads);
-    let expected_score_rows = if grouped_scores {
-        task_count.saturating_mul(unit)
-    } else {
-        task_count
-    };
     if heads == 0
+        || key_cache.heads == 0
         || !heads.is_multiple_of(key_cache.heads)
         || key_cache.heads != value_cache.heads
         || keys.len != values.len
         || queries.len() != heads * HEAD_DIM
         || attended.len() != queries.len()
         || projected.len() != 2 * queries.len()
-        || scores.len() != checked_product(&[expected_score_rows, stride])?
         || current_key.len() != keys.width
         || current_value.len() != values.width
     {
+        return Err(invalid("invalid packed attention geometry"));
+    }
+    let heads_per_kv = heads / key_cache.heads;
+    let (partitions, task_count) = partition_heads(heads, key_cache.heads, parallelism.workers());
+    let expected_score_rows = if grouped_scores {
+        partitions[..task_count]
+            .iter()
+            .map(|part| part.unit)
+            .fold(0_usize, usize::saturating_add)
+    } else {
+        task_count
+    };
+    if scores.len() != checked_product(&[expected_score_rows, stride])? {
         return Err(invalid("invalid packed attention geometry"));
     }
     prepare_current(key_cache, value_cache, current_key, current_value)?;
@@ -756,9 +838,7 @@ fn attend_with_layout(
         attended,
         scores,
         stride,
-        chunk_heads,
-        task_count,
-        unit,
+        &partitions[..task_count],
         grouped_scores,
         parallelism,
     )?;
@@ -767,49 +847,54 @@ fn attend_with_layout(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Dispatch grouped or stack-buffered attention chunks across row workers cleanly."
-)]
 fn dispatch_attend_tasks(
     input: &PackedAttention<'_>,
     attended: &mut [f32],
     scores: &mut [f32],
     stride: usize,
-    chunk_heads: usize,
-    task_count: usize,
-    unit: usize,
+    partitions: &[HeadPartition],
     grouped_scores: bool,
     parallelism: &RowParallelism,
 ) -> Result<()> {
-    if task_count == 1 {
+    if partitions.len() == 1 {
+        let part = partitions[0];
         if grouped_scores {
-            return input.attend_chunk_with_scores(0, attended, scores, stride, unit);
+            return input.attend_chunk_with_scores(
+                part.base_head,
+                attended,
+                scores,
+                stride,
+                part.unit,
+            );
         }
-        return input.attend_chunk_stack_buffered(0, attended, scores, stride, unit);
-    }
-    let score_chunk_len = if grouped_scores {
-        unit * stride
-    } else {
-        stride
-    };
-    // Keep the bounded borrowed task descriptors on the stack. This preserves
-    // the original worker partitions and earliest-chunk failure order without
-    // allocating a task vector or extra score matrices across worker boundaries.
-    let mut tasks: [Option<AttentionTask<'_>>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
-    for (index, ((attended, scores), task)) in attended
-        .chunks_mut(chunk_heads * HEAD_DIM)
-        .zip(scores.chunks_exact_mut(score_chunk_len))
-        .zip(&mut tasks)
-        .enumerate()
-    {
-        *task = Some(AttentionTask {
-            base_head: index * chunk_heads,
+        return input.attend_chunk_stack_buffered(
+            part.base_head,
             attended,
             scores,
+            stride,
+            part.unit,
+        );
+    }
+    // Keep the bounded borrowed task descriptors on the stack. This preserves
+    // balanced worker partitions and earliest-chunk failure order without
+    // allocating a task vector or extra score matrices across worker boundaries.
+    let mut tasks: [Option<AttentionTask<'_>>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
+    let mut rem_attended = attended;
+    let mut rem_scores = scores;
+    for (part, task) in partitions.iter().zip(&mut tasks) {
+        let (att_chunk, att_tail) = rem_attended.split_at_mut(part.chunk_heads * HEAD_DIM);
+        rem_attended = att_tail;
+        let score_rows_for_task = if grouped_scores { part.unit } else { 1 };
+        let (score_chunk, score_tail) = rem_scores.split_at_mut(score_rows_for_task * stride);
+        rem_scores = score_tail;
+        *task = Some(AttentionTask {
+            base_head: part.base_head,
+            unit: part.unit,
+            attended: att_chunk,
+            scores: score_chunk,
         });
     }
-    parallelism.update_chunks(&mut tasks[..task_count], 1, |_, tasks| {
+    parallelism.update_chunks(&mut tasks[..partitions.len()], 1, |_, tasks| {
         for task in tasks.iter_mut().flatten() {
             if grouped_scores {
                 input.attend_chunk_with_scores(
@@ -817,7 +902,7 @@ fn dispatch_attend_tasks(
                     task.attended,
                     task.scores,
                     stride,
-                    unit,
+                    task.unit,
                 )?;
             } else {
                 input.attend_chunk_stack_buffered(
@@ -825,12 +910,18 @@ fn dispatch_attend_tasks(
                     task.attended,
                     task.scores,
                     stride,
-                    unit,
+                    task.unit,
                 )?;
             }
         }
         Ok(())
     })
+}
+
+struct TileTask<'a> {
+    base_token: usize,
+    attended: &'a mut [Vec<f32>],
+    scores: &'a mut [f32],
 }
 
 /// Attend already encoded tile rows against their own causal prefixes. Each
@@ -883,12 +974,9 @@ pub(super) fn attend_tile(
         {
             return Err(invalid("invalid packed attention tile geometry"));
         }
-        parallelism.update_paired_chunks(
-            attended,
-            1,
-            scores,
-            end,
-            |base_token, output_chunk, scores_chunk| {
+        let run_tile_chunk =
+            |base_token: usize, output_chunk: &mut [Vec<f32>], scores_chunk: &mut [f32]| -> Result<()> {
+                let unit = grouped_head_unit(heads / keys.heads, heads);
                 for (offset, (output, scores)) in output_chunk
                     .iter_mut()
                     .zip(scores_chunk.chunks_exact_mut(end))
@@ -908,7 +996,6 @@ pub(super) fn attend_tile(
                         scale,
                         arithmetic,
                     };
-                    let unit = grouped_head_unit(heads / keys.heads, heads);
                     input.attend_chunk_stack_buffered(
                         0,
                         output,
@@ -918,8 +1005,36 @@ pub(super) fn attend_tile(
                     )?;
                 }
                 Ok(())
-            },
-        )
+            };
+        let task_count = count.min(parallelism.workers().max(1)).min(MAX_ROW_WORKERS);
+        if task_count == 1 {
+            return run_tile_chunk(0, attended, scores);
+        }
+        let base_tokens = count / task_count;
+        let rem_tokens = count % task_count;
+        let mut tasks: [Option<TileTask<'_>>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
+        let mut rem_attended = &mut *attended;
+        let mut rem_scores = scores;
+        let mut token_cursor = 0;
+        for (index, task) in tasks[..task_count].iter_mut().enumerate() {
+            let chunk_tokens = base_tokens + usize::from(index < rem_tokens);
+            let (att_chunk, att_tail) = rem_attended.split_at_mut(chunk_tokens);
+            rem_attended = att_tail;
+            let (score_chunk, score_tail) = rem_scores.split_at_mut(chunk_tokens * end);
+            rem_scores = score_tail;
+            *task = Some(TileTask {
+                base_token: token_cursor,
+                attended: att_chunk,
+                scores: score_chunk,
+            });
+            token_cursor += chunk_tokens;
+        }
+        parallelism.update_chunks(&mut tasks[..task_count], 1, |_, tasks| {
+            for task in tasks.iter_mut().flatten() {
+                run_tile_chunk(task.base_token, task.attended, task.scores)?;
+            }
+            Ok(())
+        })
     })();
     if result.is_err() {
         for row in attended {

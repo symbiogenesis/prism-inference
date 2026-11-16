@@ -921,9 +921,12 @@ fn attention_bits(
     {
         key_cache.quantizer.encode(key, output)?;
     }
-    let chunk_heads = heads.div_ceil(parallelism.workers());
-    for (chunk, actual) in scores.chunks_exact(keys.len / keys.width + 1).enumerate() {
-        let last_head = ((chunk + 1) * chunk_heads).min(heads) - 1;
+    let (partitions, task_count) = partition_heads(heads, key_cache.heads, parallelism.workers());
+    for (part, actual) in partitions[..task_count]
+        .iter()
+        .zip(scores.chunks_exact(keys.len / keys.width + 1))
+    {
+        let last_head = part.base_head + part.chunk_heads - 1;
         let expected = defensive_probabilities(
             key_cache,
             &current,
@@ -1193,7 +1196,7 @@ fn grouped_gqa_decode_preserves_exact_bits_across_worker_counts() -> Result<()> 
     let tokens = 19;
     let stride = tokens + 1;
     let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
-        &[1, 4, 6, 8, 12]
+        &[1, 4, 5, 6, 7, 8, 10, 12, 16, 18]
     } else {
         &[1]
     };
@@ -1284,7 +1287,7 @@ fn grouped_gqa_tile_preserves_exact_bits_across_worker_counts() -> Result<()> {
     let kv_heads = 4;
     let tokens = 19;
     let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
-        &[1, 4, 6, 8, 12]
+        &[1, 4, 5, 6, 7, 8, 10, 12, 16, 18]
     } else {
         &[1]
     };
@@ -1447,6 +1450,230 @@ fn packed_group_chunked_probabilities_preserve_exact_bits_across_64_token_bounda
                     "chunked group probabilities mismatch for policy={policy:?} tokens={tokens} workers={workers}"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn balanced_head_partitions_match_exact_bounds_and_worker_utilization() -> Result<()> {
+    let heads = 24;
+    let kv_heads = 4;
+    let (keys, values) = populated_caches(KvCachePolicy::Rotated4, kv_heads, 4, false)?;
+    let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 18]
+    } else {
+        &[1]
+    };
+    for &workers in worker_counts {
+        let parallelism = RowParallelism::new(workers)?;
+        let rows = score_rows(heads, &parallelism);
+        let group_rows = group_score_rows(&keys, &values, heads, &parallelism);
+        let (partitions, count) = partition_heads(heads, kv_heads, workers);
+        assert_eq!(count, heads.min(workers));
+        assert_eq!(rows, count);
+        let active = &partitions[..count];
+        let total_heads: usize = active.iter().map(|part| part.chunk_heads).sum();
+        let total_units: usize = active.iter().map(|part| part.unit).sum();
+        assert_eq!(total_heads, heads);
+        assert_eq!(group_rows, total_units);
+        let mut expected_base = 0;
+        for part in active {
+            assert!(part.chunk_heads > 0);
+            assert_eq!(part.base_head, expected_base);
+            assert!(part.chunk_heads.is_multiple_of(part.unit));
+            if count >= kv_heads {
+                assert_eq!(
+                    part.base_head / 6,
+                    (part.base_head + part.chunk_heads - 1) / 6
+                );
+            }
+            expected_base += part.chunk_heads;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn balanced_parallel_tile_preserves_exact_bits_across_non_dividing_workers() -> Result<()> {
+    let heads = 24;
+    let kv_heads = 4;
+    let base = 4;
+    let count = 17;
+    let (mut keys, mut values) = populated_caches(KvCachePolicy::Rotated4, kv_heads, base, false)?;
+    for token in 0..count {
+        let salt = u16::try_from(token)?;
+        let key = input(keys.width, 21 + salt)?;
+        let value = input(values.width, 31 + salt)?;
+        prepare_tile_append(&mut keys, &mut values, &key, &value)?;
+        keys.append(&key);
+        values.append(&value);
+    }
+    let queries: Vec<Vec<f32>> = (0..count)
+        .map(|t| input(heads * HEAD_DIM, 13 + u16::try_from(t).unwrap_or(0)))
+        .collect::<Result<_>>()?;
+    let projected: Vec<Vec<f32>> = (0..count)
+        .map(|t| input(2 * heads * HEAD_DIM, 17 + u16::try_from(t).unwrap_or(0)))
+        .collect::<Result<_>>()?;
+    let mut serial_out = vec![vec![0.0_f32; heads * HEAD_DIM]; count];
+    let mut serial_scores = vec![0.0_f32; count * (base + count)];
+    attend_tile(
+        &keys,
+        &values,
+        &queries,
+        &projected,
+        &mut serial_out,
+        &mut serial_scores,
+        base,
+        heads,
+        1.0 / 16.0,
+        super::super::Arithmetic::PinnedSwift,
+        &RowParallelism::default(),
+    )?;
+    for workers in [4, 5, 6, 7, 8, 10, 12, 16] {
+        let parallelism = RowParallelism::new(workers)?;
+        let mut out = vec![vec![0.0_f32; heads * HEAD_DIM]; count];
+        let mut scores = vec![0.0_f32; count * (base + count)];
+        attend_tile(
+            &keys,
+            &values,
+            &queries,
+            &projected,
+            &mut out,
+            &mut scores,
+            base,
+            heads,
+            1.0 / 16.0,
+            super::super::Arithmetic::PinnedSwift,
+            &parallelism,
+        )?;
+        assert!(
+            out.iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .eq(serial_out.iter().flatten().map(|v| v.to_bits())),
+            "attend_tile non-dividing mismatch for workers={workers}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn balanced_parallel_attention_preserves_earliest_error_across_24_heads() -> Result<()> {
+    let heads = 24;
+    let kv_heads = 4;
+    let tokens = 11;
+    let stride = tokens + 1;
+    let (mut keys, mut values) =
+        populated_caches(KvCachePolicy::Rotated4Keys3Values, kv_heads, tokens, false)?;
+    let frozen_keys = packed_bytes(&keys);
+    let frozen_values = packed_bytes(&values);
+    let current_key = input(kv_heads * HEAD_DIM, 61)?;
+    let current_value = input(kv_heads * HEAD_DIM, 73)?;
+    let mut queries = input(heads * HEAD_DIM, 29)?;
+    let mut projected = input(2 * heads * HEAD_DIM, 43)?;
+    projected[(2 * (heads - 1) + 1) * HEAD_DIM + 7] = f32::NAN;
+    for early_head in [None, Some(5), Some(13), Some(19)] {
+        if let Some(head) = early_head {
+            queries[head * HEAD_DIM + 3] = f32::NAN;
+        }
+        let mut expected_error = None;
+        for workers in [1, 4, 5, 6, 7, 8, 10, 12, 16] {
+            let parallelism = RowParallelism::new(workers)?;
+            let mut attended = vec![13.0_f32; heads * HEAD_DIM];
+            let rows = group_score_rows(&keys, &values, heads, &parallelism);
+            let mut scores = vec![17.0_f32; rows * stride];
+            let err = attend_with_group_scores(
+                &mut keys,
+                &mut values,
+                &queries,
+                &projected,
+                &current_key,
+                &current_value,
+                &mut attended,
+                &mut scores,
+                heads,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &parallelism,
+            )
+            .err()
+            .ok_or_else(|| invalid("expected nonfinite error"))?
+            .to_string();
+            if let Some(expected) = &expected_error {
+                assert_eq!(&err, expected, "workers={workers}, early_head={early_head:?}");
+            } else {
+                expected_error = Some(err);
+            }
+            assert_eq!(packed_bytes(&keys), frozen_keys);
+            assert_eq!(packed_bytes(&values), frozen_values);
+        }
+        if let Some(head) = early_head {
+            queries[head * HEAD_DIM + 3] = 0.25;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn balanced_parallel_tile_preserves_earliest_token_error_across_workers() -> Result<()> {
+    let heads = 24;
+    let kv_heads = 4;
+    let base = 4;
+    let count = 17;
+    let (mut keys, mut values) = populated_caches(KvCachePolicy::Rotated4, kv_heads, base, false)?;
+    for token in 0..count {
+        let salt = u16::try_from(token)?;
+        let key = input(keys.width, 21 + salt)?;
+        let value = input(values.width, 31 + salt)?;
+        prepare_tile_append(&mut keys, &mut values, &key, &value)?;
+        keys.append(&key);
+        values.append(&value);
+    }
+    let mut queries: Vec<Vec<f32>> = (0..count)
+        .map(|t| input(heads * HEAD_DIM, 13 + u16::try_from(t).unwrap_or(0)))
+        .collect::<Result<_>>()?;
+    let mut projected: Vec<Vec<f32>> = (0..count)
+        .map(|t| input(2 * heads * HEAD_DIM, 17 + u16::try_from(t).unwrap_or(0)))
+        .collect::<Result<_>>()?;
+    projected[count - 1][(2 * (heads - 1) + 1) * HEAD_DIM + 5] = f32::NAN;
+    for early_token in [None, Some(3), Some(9)] {
+        if let Some(token) = early_token {
+            queries[token][5 * HEAD_DIM + 1] = f32::NAN;
+        }
+        let mut expected_error = None;
+        for workers in [1, 4, 5, 6, 7, 8, 10, 12, 16] {
+            let parallelism = RowParallelism::new(workers)?;
+            let mut out = vec![vec![13.0_f32; heads * HEAD_DIM]; count];
+            let mut scores = vec![17.0_f32; count * (base + count)];
+            let err = attend_tile(
+                &keys,
+                &values,
+                &queries,
+                &projected,
+                &mut out,
+                &mut scores,
+                base,
+                heads,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &parallelism,
+            )
+            .err()
+            .ok_or_else(|| invalid("expected nonfinite tile error"))?
+            .to_string();
+            assert!(out.iter().all(Vec::is_empty));
+            if let Some(expected) = &expected_error {
+                assert_eq!(&err, expected, "workers={workers}, early_token={early_token:?}");
+            } else {
+                expected_error = Some(err);
+            }
+        }
+        if let Some(token) = early_token {
+            queries[token][5 * HEAD_DIM + 1] = 0.25;
         }
     }
     Ok(())

@@ -396,3 +396,114 @@ fn six_head_prefill_long_prefix_and_paired_chunks_match_causal_oracle() -> crate
     }
     Ok(())
 }
+
+#[test]
+fn six_head_prefill_24_head_gqa_matches_oracle_across_non_dividing_workers() -> crate::Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts = [1, 4, 5, 6, 7, 8, 10, 12, 16];
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = [1];
+    let base = 17;
+    for count in [5, 7, 10, 16, 24] {
+        let fixture = fixture_with_geometry(24, 4, 128, base, count)?;
+        let expected: Vec<_> = (0..count)
+            .map(|token| reference(&fixture, base + token, token))
+            .collect::<crate::Result<_>>()?;
+        let score_stride = 6 * (base + count);
+        for workers in worker_counts {
+            let parallelism = RowParallelism::new(workers)?;
+            let mut actual = vec![vec![19.0; fixture.geometry.heads * fixture.geometry.head]; count];
+            let mut scores = vec![19.0; count * score_stride];
+            parallelism.update_paired_chunks(
+                &mut actual,
+                1,
+                &mut scores,
+                score_stride,
+                |first, outputs, scores| {
+                    let end = first + outputs.len();
+                    attend_tile_chunk(
+                        &fixture.geometry,
+                        base + first,
+                        &fixture.queries[first..end],
+                        &fixture.projected[first..end],
+                        &fixture.keys,
+                        &fixture.values,
+                        &fixture.current_keys[first..end],
+                        &fixture.current_values[first..end],
+                        outputs,
+                        scores,
+                        score_stride,
+                        0.125,
+                    )
+                },
+            )?;
+            assert!(
+                actual
+                    .iter()
+                    .flatten()
+                    .map(|value| value.to_bits())
+                    .eq(expected.iter().flatten().map(|value| value.to_bits())),
+                "24-head prefill mismatch for count={count}, workers={workers}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-rows")]
+#[test]
+fn six_head_prefill_24_head_gqa_preserves_earliest_error_across_workers() -> crate::Result<()> {
+    let base = 17;
+    let count = 17;
+    let mut fixture = fixture_with_geometry(24, 4, 128, base, count)?;
+    let width = fixture.geometry.head;
+    fixture.queries[count - 1][23 * width] = f32::NAN;
+    let score_stride = 6 * (base + count);
+    for early_token in [None, Some(3), Some(11)] {
+        if let Some(token) = early_token {
+            fixture.queries[token][6 * width] = f32::NAN;
+        }
+        let mut expected_error = None;
+        for workers in [1, 4, 5, 6, 7, 8, 10, 12, 16] {
+            let parallelism = RowParallelism::new(workers)?;
+            let mut actual = vec![vec![19.0; fixture.geometry.heads * width]; count];
+            let mut scores = vec![19.0; count * score_stride];
+            let err = parallelism
+                .update_paired_chunks(
+                    &mut actual,
+                    1,
+                    &mut scores,
+                    score_stride,
+                    |first, outputs, scores| {
+                        let end = first + outputs.len();
+                        attend_tile_chunk(
+                            &fixture.geometry,
+                            base + first,
+                            &fixture.queries[first..end],
+                            &fixture.projected[first..end],
+                            &fixture.keys,
+                            &fixture.values,
+                            &fixture.current_keys[first..end],
+                            &fixture.current_values[first..end],
+                            outputs,
+                            scores,
+                            score_stride,
+                            0.125,
+                        )
+                    },
+                )
+                .err()
+                .ok_or_else(|| crate::invalid("expected nonfinite error"))?
+                .to_string();
+            if let Some(expected) = &expected_error {
+                assert_eq!(&err, expected, "workers={workers}, early_token={early_token:?}");
+            } else {
+                expected_error = Some(err);
+            }
+        }
+        if let Some(token) = early_token {
+            fixture.queries[token][6 * width] = 0.25;
+        }
+    }
+    Ok(())
+}
